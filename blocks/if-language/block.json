@@ -1,0 +1,37 @@
+{
+	"$schema": "https://schemas.wp.org/trunk/block.json",
+	"apiVersion": 3,
+	"name": "perflocale/if-language",
+	"version": "1.0.0",
+	"title": "Show If Language",
+	"category": "theme",
+	"icon": "filter",
+	"description": "Wrap inner content so it only renders when the visitor's language matches the selected set.",
+	"keywords": [ "language", "conditional", "multilingual", "perflocale" ],
+	"textdomain": "perflocale",
+	"supports": {
+		"html": false,
+		"align": false,
+		"color": {
+			"background": false,
+			"text": false
+		},
+		"spacing": {
+			"margin": false,
+			"padding": false
+		}
+	},
+	"attributes": {
+		"languages": {
+			"type": "array",
+			"default": [],
+			"items": { "type": "string" }
+		},
+		"invert": {
+			"type": "boolean",
+			"default": false
+		}
+	},
+	"editorScript": "file:./index.js",
+	"editorStyle": "perflocale-block-editor"
+}

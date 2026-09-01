@@ -1,0 +1,316 @@
+/* Dashboard page — visual language mirrors the Settings page: native
+ * form-table rows, widefat tables, and the WP admin accent color under
+ * the shared PluginNav strip (styles in admin-core.css). Chrome is
+ * deliberately minimal so the page reads as native WordPress. */
+
+/* Two-column layout: main content + tools rail. */
+.perflocale-dash-cols {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 280px;
+	gap: 28px;
+	align-items: start;
+}
+
+.perflocale-dash-cols__main {
+	min-width: 0;
+}
+
+/* Not sticky: with conditional/addon pages the nav
+ * strip can wrap to two rows, and any fixed offset would pin the rail
+ * underneath it. The rail is short; it doesn't need to follow scroll. */
+.perflocale-dash-cols__rail {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.perflocale-dash-panel {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	padding: 14px 16px;
+}
+
+.perflocale-dash-panel__title {
+	margin: 0 0 10px;
+	font-size: 13px;
+	font-weight: 600;
+	color: #1d2327;
+}
+
+.perflocale-dash-panel .description {
+	margin: 8px 0 0;
+	font-size: 12px;
+}
+
+/* Overview: language list inside the form-table value column. */
+.perflocale-dash-langs {
+	display: flex;
+	flex-direction: column;
+	max-width: 520px;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	background: #fff;
+	overflow: hidden;
+}
+
+a.perflocale-dash-langs__row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 9px 14px;
+	text-decoration: none;
+	color: #1d2327;
+	font-size: 13px;
+	border-bottom: 1px solid #f0f0f1;
+	transition: background-color 0.1s;
+}
+
+a.perflocale-dash-langs__row:last-child {
+	border-bottom: none;
+}
+
+a.perflocale-dash-langs__row:hover,
+a.perflocale-dash-langs__row:focus {
+	background-color: #f6f7f7;
+	color: var(--wp-admin-theme-color, #2271b1);
+}
+
+a.perflocale-dash-langs__row:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: -2px;
+}
+
+.perflocale-dash-langs__flag {
+	font-size: 15px;
+	line-height: 1;
+	flex-shrink: 0;
+}
+
+.perflocale-dash-langs__name {
+	font-weight: 600;
+}
+
+.perflocale-dash-langs__code {
+	color: #50575e;
+	font-size: 12px;
+}
+
+.perflocale-dash-langs__badge {
+	margin-right: auto;
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--wp-admin-theme-color, #2271b1);
+	background: #f0f6fc;
+	border: 1px solid #c5d9ed;
+	padding: 1px 8px;
+	border-radius: 3px;
+	flex-shrink: 0;
+}
+
+/* Progress bars — WP accent fill, neutral track. */
+.perflocale-dash-bar {
+	max-width: 520px;
+	height: 10px;
+	background: #dcdcde;
+	border-radius: 5px;
+	overflow: hidden;
+}
+
+.perflocale-dash-bar--slim {
+	height: 8px;
+	border-radius: 4px;
+	flex: 1;
+	max-width: none;
+}
+
+.perflocale-dash-bar__fill {
+	height: 100%;
+	background: var(--wp-admin-theme-color, #2271b1);
+	border-radius: inherit;
+	transition: width 0.4s ease;
+}
+
+.perflocale-dash-bar__caption {
+	margin: 8px 0 4px;
+	font-size: 13px;
+	color: #1d2327;
+}
+
+/* Translation Progress section. */
+.perflocale-dash-section-title {
+	margin: 28px 0 4px;
+	font-size: 18px;
+}
+
+.perflocale-dash-h3 {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+	margin: 20px 0 8px;
+	font-size: 15px;
+}
+
+.perflocale-dash-h3__count {
+	font-size: 12px;
+	font-weight: 400;
+	color: #646970;
+}
+
+.perflocale-dash-table {
+	max-width: 900px;
+}
+
+.perflocale-dash-table__lang-col {
+	width: 200px;
+}
+
+.perflocale-dash-table__lang-col .perflocale-dash-langs__flag {
+	margin-left: 6px;
+}
+
+.perflocale-dash-table__bar-col {
+	width: 34%;
+}
+
+.perflocale-dash-table__bar-wrap {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.perflocale-dash-table__pct {
+	font-size: 12px;
+	font-weight: 600;
+	color: #1d2327;
+	min-width: 36px;
+	text-align: left;
+}
+
+.perflocale-dash-table__num {
+	width: 90px;
+	text-align: right;
+}
+
+.perflocale-dash-table__zero {
+	color: #a7aaad;
+}
+
+.perflocale-dash-table__attn {
+	color: var(--perflocale-amber-text, #b45309);
+	font-weight: 600;
+}
+
+.perflocale-dash-table__warn {
+	color: var(--perflocale-red-text, #b91c1c);
+	font-weight: 600;
+}
+
+.perflocale-dash-empty {
+	margin: 8px 0;
+	font-size: 13px;
+	color: #50575e;
+}
+
+.perflocale-dash-legend {
+	max-width: 900px;
+	margin-top: 14px;
+}
+
+/* Rail link rows. */
+.perflocale-dash-links {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.perflocale-dash-links a {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	text-decoration: none;
+	font-size: 13px;
+	width: fit-content;
+}
+
+.perflocale-dash-links a .dashicons {
+	font-size: 16px;
+	width: 16px;
+	height: 16px;
+	color: #646970;
+}
+
+.perflocale-dash-links__external.dashicons {
+	font-size: 12px;
+	width: 12px;
+	height: 12px;
+	color: #a7aaad;
+}
+
+/* Subtle gold accent on the review link's star, so it reads as an invitation
+   rather than another grey utility row. Colour only - geometry is inherited
+   from `.perflocale-dash-links a .dashicons` above. */
+.perflocale-dash-links a .perflocale-dash-links__star.dashicons {
+	color: #dba617;
+}
+
+/* Responsive. */
+@media screen and (max-width: 1100px) {
+	.perflocale-dash-cols {
+			grid-template-columns: minmax(0, 1fr) 240px;
+			gap: 20px;
+		}
+}
+
+@media screen and (max-width: 960px) {
+	.perflocale-dash-cols {
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+	.perflocale-dash-cols__rail {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+			gap: 14px;
+		}
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-dash-langs {
+			max-width: none;
+		}
+
+	.perflocale-dash-bar {
+			max-width: none;
+		}
+
+	.perflocale-dash-table__lang-col {
+			width: auto;
+		}
+
+	.perflocale-dash-table__bar-col {
+			width: auto;
+			min-width: 140px;
+		}
+
+	/* WP-admin enlarges .dashicons on mobile; keep the compact 16px icons
+		 * inside the rail link rows. */
+	.perflocale-dash-links a .dashicons {
+			font-size: 16px;
+			width: 16px;
+			height: 16px;
+			line-height: 16px;
+		}
+
+	.perflocale-dash-links .perflocale-dash-links__external {
+			font-size: 12px;
+			width: 12px;
+			height: 12px;
+			line-height: 12px;
+		}
+}
+
+@media screen and (max-width: 480px) {
+	.perflocale-dash-cols__rail {
+			grid-template-columns: 1fr;
+		}
+}

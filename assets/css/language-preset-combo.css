@@ -1,0 +1,133 @@
+/**
+ * Searchable language-preset combobox styling.
+ * Loaded only on the Languages add/edit screen.
+ */
+
+.perflocale-combo {
+	position: relative;
+	max-width: 540px;
+}
+
+.perflocale-combo__input {
+	width: 100%;
+	padding: 8px 36px 8px 12px;
+	font-size: 14px;
+	line-height: 1.5;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	background: #fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%2350575e' stroke-width='1.5'><path d='M2 4l4 4 4-4'/></svg>") no-repeat right 12px center;
+	box-sizing: border-box;
+	transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.perflocale-combo__input:focus {
+	outline: none;
+	border-color: #2271b1;
+	box-shadow: 0 0 0 1px #2271b1;
+}
+
+.perflocale-combo__list {
+	position: absolute;
+	top: calc(100% + 4px);
+	left: 0;
+	right: 0;
+	max-height: 320px;
+	overflow-y: auto;
+	margin: 0;
+	padding: 4px 0;
+	list-style: none;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.05);
+	z-index: 100;
+}
+
+.perflocale-combo.is-open .perflocale-combo__input {
+	border-bottom-left-radius: 0;
+	border-bottom-right-radius: 0;
+}
+
+.perflocale-combo__option {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+	padding: 7px 12px;
+	cursor: pointer;
+	font-size: 13px;
+	line-height: 1.4;
+	color: #1d2327;
+}
+
+.perflocale-combo__option.is-active,
+.perflocale-combo__option:hover {
+	background: #f0f6fc;
+}
+
+.perflocale-combo__option[hidden],
+.perflocale-combo__group-label[hidden] {
+	display: none;
+}
+
+.perflocale-combo__flag {
+	flex: 0 0 auto;
+	font-size: 16px;
+	line-height: 1;
+	width: 22px;
+	text-align: center;
+}
+
+.perflocale-combo__label {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.perflocale-combo__native {
+	color: #50575e;
+	font-weight: normal;
+}
+
+.perflocale-combo__locale {
+	flex: 0 0 auto;
+	font-size: 11px;
+	color: #646970;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	background: #f6f7f7;
+	padding: 1px 6px;
+	border-radius: 3px;
+}
+
+.perflocale-combo__group-label {
+	padding: 6px 12px 4px;
+	font-size: 10px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: #646970;
+	pointer-events: none;
+	border-top: 1px solid #f0f0f1;
+	margin-top: 2px;
+}
+
+.perflocale-combo__group-label:first-child {
+	border-top: none;
+	margin-top: 0;
+}
+
+.perflocale-combo__status {
+	display: none;
+	padding: 14px 12px;
+	color: #646970;
+	font-style: italic;
+	font-size: 13px;
+	text-align: center;
+}
+
+@media screen and (max-width: 600px) {
+	.perflocale-combo {
+		max-width: 100%;
+	}
+}

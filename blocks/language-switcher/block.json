@@ -1,0 +1,91 @@
+{
+	"$schema": "https://schemas.wp.org/trunk/block.json",
+	"apiVersion": 3,
+	"name": "perflocale/language-switcher",
+	"version": "1.0.0",
+	"title": "Language Switcher",
+	"category": "widgets",
+	"icon": "translation",
+	"description": "Display a language switcher for visitors to change languages.",
+	"keywords": [ "language", "translation", "multilingual", "perflocale" ],
+	"textdomain": "perflocale",
+	"supports": {
+		"html": false,
+		"align": [ "left", "center", "right", "wide", "full" ],
+		"className": true,
+		"spacing": {
+			"padding": true,
+			"margin": true
+		},
+		"color": {
+			"background": true,
+			"text": true
+		},
+		"typography": {
+			"fontSize": true
+		}
+	},
+	"attributes": {
+		"display": {
+			"type": "string",
+			"default": "dropdown"
+		},
+		"layout": {
+			"type": "string",
+			"default": "horizontal"
+		},
+		"style": {
+			"type": "string",
+			"default": "flags_names"
+		},
+		"nameFormat": {
+			"type": "string",
+			"default": "native"
+		},
+		"triggerFormat": {
+			"type": "string",
+			"default": "inherit"
+		},
+		"hideCurrent": {
+			"type": "boolean",
+			"default": true
+		},
+		"showUntranslated": {
+			"type": "boolean",
+			"default": false
+		},
+		"untranslatedLink": {
+			"type": "string",
+			"default": "homepage"
+		},
+		"arrowStyle": {
+			"type": "string",
+			"default": "single"
+		},
+		"showFlags": {
+			"type": "boolean",
+			"default": true
+		},
+		"showNames": {
+			"type": "boolean",
+			"default": true
+		},
+		"fontSize": {
+			"type": "number",
+			"default": 14
+		},
+		"flagSize": {
+			"type": "number",
+			"default": 20
+		},
+		"gap": {
+			"type": "number",
+			"default": 8
+		}
+	},
+	"editorScript": "file:./index.js",
+	"style": "perflocale-frontend",
+	"blockHooks": {
+		"core/site-title": "after"
+	}
+}

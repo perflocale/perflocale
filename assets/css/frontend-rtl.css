@@ -1,0 +1,316 @@
+/**
+ * PerfLocale - Frontend Language Switcher Styles
+ *
+ * Single CSS surface for every switcher path - block, widget, shortcode,
+ * Blocksy/Kadence/Neve addons, Customizer floating, nav-menu append. All
+ * paths route through LanguageSwitcherBlock::render() and emit the same
+ * `.perflocale-switcher-block` class hierarchy.
+ *
+ * @package PerfLocale
+ */
+
+/* Gutenberg Block / Widget / Shortcode - shared switcher styles.
+ * Per-instance values flow in via CSS custom properties set inline on
+ * the .perflocale-switcher-block element:
+ *   --perflocale-gap, --perflocale-font-size, --perflocale-flag-size
+ * Static layout (display:flex, list-reset, etc.) lives here in CSS.
+ */
+.perflocale-switcher-block ul {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-wrap: wrap;
+	flex-direction: row;
+	gap: var(--perflocale-gap, 6px);
+	font-size: var(--perflocale-font-size, inherit);
+}
+
+.perflocale-switcher-block--vertical ul {
+	flex-direction: column;
+}
+
+.perflocale-switcher-block li {
+	margin: 0;
+	padding: 0;
+}
+
+.perflocale-switcher-block__item {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--perflocale-gap, 6px);
+	text-decoration: none;
+	color: inherit;
+	padding: 4px 10px;
+	border-radius: 6px;
+	transition: background 0.15s, color 0.15s;
+}
+
+a.perflocale-switcher-block__item:hover {
+	background: #f3f4f6;
+	color: inherit;
+}
+
+.perflocale-switcher-block__item--current {
+	font-weight: 600;
+	background: #eef2ff;
+	color: #1e40af;
+	border-radius: 6px;
+	padding: 4px 10px;
+}
+
+/* Simple display mode - plain text, no backgrounds or hover effects. */
+.perflocale-switcher-block--simple .perflocale-switcher-block__item {
+	padding: 0;
+	border-radius: 0;
+	background: none;
+	transition: none;
+}
+
+.perflocale-switcher-block--simple a.perflocale-switcher-block__item:hover {
+	background: none;
+	opacity: 0.7;
+}
+
+.perflocale-switcher-block--simple .perflocale-switcher-block__item--current {
+	background: none;
+	padding: 0;
+	border-radius: 0;
+}
+
+.perflocale-switcher-block__flag {
+	display: inline-block;
+	line-height: 1;
+	flex-shrink: 0;
+	font-size: var(--perflocale-flag-size, inherit);
+}
+
+.perflocale-switcher-block__label {
+	white-space: nowrap;
+}
+
+
+/* Dropdown switcher.
+ *
+ * Structure:
+ *   <nav class="… perflocale-switcher-block--dropdown">  (block-level)
+ *     <div class="perflocale-dd__anchor">                (inline-block)
+ *       <button class="perflocale-dd__trigger">…</button>
+ *       <div    class="perflocale-dd__panel" role="listbox">…</div>
+ *     </div>
+ *   </nav>
+ *
+ * Every colour / spacing / timing value is a `--perflocale-dd-*` CSS
+ * custom property; themes recolour or resize the switcher by
+ * overriding the relevant vars on the wrapper.
+ */
+.perflocale-switcher-block.perflocale-switcher-block--dropdown {
+	--perflocale-dd-bg:                #fff;
+	--perflocale-dd-text:              #1f2937;
+	--perflocale-dd-border:            #d1d5db;
+	--perflocale-dd-border-hover:      #9ca3af;
+	--perflocale-dd-focus-border:      #3b82f6;
+	--perflocale-dd-focus-ring:        rgba( 59, 130, 246, 0.2 );
+	--perflocale-dd-panel-bg:          #fff;
+	--perflocale-dd-panel-border:      #e5e7eb;
+	--perflocale-dd-panel-shadow:      0 4px 16px rgba( 0, 0, 0, 0.1 ), 0 1px 3px rgba( 0, 0, 0, 0.06 );
+	--perflocale-dd-option-text:       #374151;
+	--perflocale-dd-option-hover-bg:   #f3f4f6;
+	--perflocale-dd-option-hover-text: #1f2937;
+	--perflocale-dd-active-bg:         #eef2ff;
+	--perflocale-dd-active-text:       #1e40af;
+	--perflocale-dd-active-hover-bg:   #e0e7ff;
+
+	--perflocale-dd-trigger-padding-block:  7px;
+	--perflocale-dd-trigger-padding-inline: 12px;
+	--perflocale-dd-trigger-gap:            6px;
+	--perflocale-dd-trigger-radius:         8px;
+	--perflocale-dd-trigger-border-width:   1px;
+	--perflocale-dd-trigger-focus-ring:     2px;
+
+	--perflocale-dd-panel-offset:         4px;
+	--perflocale-dd-panel-radius:         8px;
+	--perflocale-dd-panel-border-width:   1px;
+	--perflocale-dd-panel-padding-block:  4px;
+	--perflocale-dd-panel-padding-inline: 0;
+	--perflocale-dd-panel-z-index:        9999;
+
+	--perflocale-dd-option-padding-block:  8px;
+	--perflocale-dd-option-padding-inline: 14px;
+	--perflocale-dd-option-gap:            8px;
+
+	--perflocale-dd-arrow-size:    0.85em;
+	--perflocale-dd-arrow-opacity: 0.5;
+
+	--perflocale-dd-transition-duration:        0.15s;
+	--perflocale-dd-option-transition-duration: 0.1s;
+
+	display: block;
+	font-size: var(--perflocale-font-size, inherit);
+}
+
+.perflocale-dd__anchor {
+	display: inline-block;
+	position: relative;
+	vertical-align: top;
+}
+
+.perflocale-dd__trigger {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--perflocale-dd-trigger-gap, 6px);
+	padding-block:  var(--perflocale-dd-trigger-padding-block, 7px);
+	padding-inline: var(--perflocale-dd-trigger-padding-inline, 12px);
+	border: var(--perflocale-dd-trigger-border-width, 1px) solid var(--perflocale-dd-border, #d1d5db);
+	border-radius: var(--perflocale-dd-trigger-radius, 8px);
+	background: var(--perflocale-dd-bg, #fff);
+	cursor: pointer;
+	color: var(--perflocale-dd-text, #1f2937);
+	font-size: inherit;
+	font-family: inherit;
+	line-height: 1.4;
+	transition: border-color var(--perflocale-dd-transition-duration, 0.15s), box-shadow var(--perflocale-dd-transition-duration, 0.15s);
+}
+
+.perflocale-dd__trigger:hover {
+	border-color: var(--perflocale-dd-border-hover, #9ca3af);
+}
+
+.perflocale-dd__trigger:focus {
+	outline: none;
+}
+
+.perflocale-dd__trigger:focus-visible {
+	outline: none;
+	border-color: var(--perflocale-dd-focus-border, #3b82f6);
+	box-shadow: 0 0 0 var(--perflocale-dd-trigger-focus-ring, 2px) var(--perflocale-dd-focus-ring, rgba( 59, 130, 246, 0.2 ));
+}
+
+.perflocale-dd__arrow {
+	width:  var(--perflocale-dd-arrow-size, 0.85em);
+	height: var(--perflocale-dd-arrow-size, 0.85em);
+	flex-shrink: 0;
+	transition: transform var(--perflocale-dd-transition-duration, 0.15s);
+	opacity: var(--perflocale-dd-arrow-opacity, 0.5);
+}
+
+.perflocale-dd__trigger[aria-expanded="true"] .perflocale-dd__arrow {
+	transform: rotate(-180deg);
+}
+
+.perflocale-dd__flag {
+	line-height: 1;
+	font-size: var(--perflocale-flag-size, inherit);
+}
+
+.perflocale-dd__panel {
+	display: none;
+	position: absolute;
+	inset-block-start:  calc( 100% + var(--perflocale-dd-panel-offset, 4px) );
+	inset-inline-start: 0;
+	min-width: 100%;
+	background: var(--perflocale-dd-panel-bg, #fff);
+	border: var(--perflocale-dd-panel-border-width, 1px) solid var(--perflocale-dd-panel-border, #e5e7eb);
+	border-radius: var(--perflocale-dd-panel-radius, 8px);
+	box-shadow: var(--perflocale-dd-panel-shadow, 0 4px 16px rgba( 0, 0, 0, 0.1 ), 0 1px 3px rgba( 0, 0, 0, 0.06 ));
+	z-index: var(--perflocale-dd-panel-z-index, 9999);
+	overflow: hidden;
+	padding-block:  var(--perflocale-dd-panel-padding-block, 4px);
+	padding-inline: var(--perflocale-dd-panel-padding-inline, 0);
+}
+
+.perflocale-dd__panel.perflocale-dd--open {
+	display: block;
+}
+
+.perflocale-dd__option {
+	display: flex;
+	align-items: center;
+	gap: var(--perflocale-dd-option-gap, 8px);
+	padding-block:  var(--perflocale-dd-option-padding-block, 8px);
+	padding-inline: var(--perflocale-dd-option-padding-inline, 14px);
+	color: var(--perflocale-dd-option-text, #374151);
+	text-decoration: none;
+	font-size: inherit;
+	line-height: 1.4;
+	transition: background var(--perflocale-dd-option-transition-duration, 0.1s);
+	white-space: nowrap;
+}
+
+.perflocale-dd__option:hover {
+	background: var(--perflocale-dd-option-hover-bg, #f3f4f6);
+	color: var(--perflocale-dd-option-hover-text, #1f2937);
+}
+
+/* Keyboard focus indicator for listbox options. The panel clips the default
+   UA outline (overflow), so use an inset ring (negative offset) that stays
+   visible inside the dropdown. */
+.perflocale-dd__option:focus-visible {
+	background: var(--perflocale-dd-option-hover-bg, #f3f4f6);
+	outline: 2px solid var(--perflocale-dd-focus-border, #3b82f6);
+	outline-offset: -2px;
+}
+
+.perflocale-dd__option--active {
+	background: var(--perflocale-dd-active-bg, #eef2ff);
+	color: var(--perflocale-dd-active-text, #1e40af);
+	font-weight: 600;
+}
+
+.perflocale-dd__option--active:hover {
+	background: var(--perflocale-dd-active-hover-bg, #e0e7ff);
+}
+
+@media ( prefers-reduced-motion: reduce ) {
+	.perflocale-dd__trigger,
+	.perflocale-dd__arrow,
+	.perflocale-dd__option {
+		transition: none;
+	}
+}
+
+/* Floating switcher (Customizer-driven overlay).
+ * Chrome is fully static; position comes from one of four modifier classes
+ * matching the user's choice in the Customizer. The --with-admin-bar
+ * modifier offsets the top-anchored variants around the WP admin bar.
+ */
+.perflocale-floating-switcher {
+	position: fixed;
+	z-index: 9999;
+	background: #fff;
+	border: 1px solid #e0e0e0;
+	border-radius: 8px;
+	padding: 8px 12px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.perflocale-floating-switcher--bottom-right {
+	bottom: 20px;
+	left: 20px;
+}
+
+.perflocale-floating-switcher--bottom-left {
+	bottom: 20px;
+	right: 20px;
+}
+
+.perflocale-floating-switcher--top-right {
+	top: 20px;
+	left: 20px;
+}
+
+.perflocale-floating-switcher--top-left {
+	top: 20px;
+	right: 20px;
+}
+
+.perflocale-floating-switcher--top-right.perflocale-floating-switcher--with-admin-bar,
+.perflocale-floating-switcher--top-left.perflocale-floating-switcher--with-admin-bar {
+	top: calc(20px + var(--wp-admin--admin-bar--height, 32px));
+}
+
+/* Floating switcher (Customizer) */
+.perflocale-floating-switcher .perflocale-switcher-block__item {
+	padding: 3px 8px;
+}
+

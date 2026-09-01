@@ -1,0 +1,1706 @@
+/**
+ * PerfLocale - Admin Styles
+ *
+ * Card-based layout, language badges, status indicators, settings tabs,
+ * and toast notifications.
+ *
+ * @package PerfLocale
+ */
+/* ==========================================================================
+ CSS Custom Properties
+ ========================================================================== */
+:root {
+	--perflocale-green: #22c55e;
+	--perflocale-green-bg: #dcfce7;
+	--perflocale-green-text: #15803d;       /* WCAG AA on white/light bg */
+	--perflocale-amber: #f59e0b;
+	--perflocale-amber-bg: #fef3c7;
+	--perflocale-amber-text: #b45309;       /* WCAG AA on white/light bg */
+	--perflocale-red: #ef4444;
+	--perflocale-red-bg: #fee2e2;
+	--perflocale-red-text: #b91c1c;         /* WCAG AA on white/light bg */
+	--perflocale-blue: #3b82f6;
+	--perflocale-blue-bg: #dbeafe;
+	--perflocale-gray: #9ca3af;
+	--perflocale-gray-bg: #f3f4f6;
+	--perflocale-gray-text: #4b5563;        /* WCAG AA on white/light bg */
+
+	--perflocale-card-bg: #fff;
+	--perflocale-card-border: #e5e7eb;
+	--perflocale-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+	--perflocale-card-radius: 8px;
+
+	--perflocale-text: #1f2937;
+	--perflocale-text-light: #6b7280;
+	--perflocale-border: #d1d5db;
+	--perflocale-bg: #f9fafb;
+	--perflocale-bg-hover: #f3f4f6;
+	--perflocale-primary: #3b82f6;
+	--perflocale-primary-dark: #2563eb;
+}
+
+/* ==========================================================================
+ Translation Status Badges (Post List Column)
+ ========================================================================== */
+.perflocale-lang-badges {
+	display: inline-flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+
+.perflocale-badge {
+	display: inline-block;
+	padding: 2px 7px;
+	border-radius: 4px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.4;
+	text-decoration: none;
+	cursor: default;
+}
+
+a.perflocale-badge {
+	cursor: pointer;
+}
+
+a.perflocale-badge:hover {
+	opacity: 0.85;
+}
+
+a.perflocale-badge:focus {
+	outline: 2px solid var(--perflocale-blue);
+	outline-offset: 1px;
+}
+
+.perflocale-badge--green {
+	background: var(--perflocale-green-bg);
+	color: #166534;
+}
+
+.perflocale-badge--none {
+	background: var(--perflocale-gray-bg);
+	color: var(--perflocale-gray-text);
+}
+
+.perflocale-badge--current {
+	font-weight: 700;
+	box-shadow: inset 0 0 0 1.5px currentColor;
+}
+
+/* Section headings */
+.perflocale-dash-section {
+	margin-top: 28px;
+}
+
+.perflocale-dash-section h2 {
+	font-size: 16px;
+	font-weight: 600;
+	color: #1d2327;
+	margin: 0 0 14px;
+	padding: 0;
+}
+
+.perflocale-dash-card {
+	background: #fff;
+	border: 1px solid #e0e0e0;
+	border-radius: 8px;
+	overflow: hidden;
+}
+
+.perflocale-dash-card__body:not(:empty) {
+	padding: 4px 0;
+}
+
+/* Quick Actions */
+.perflocale-dash-action {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	background: #fff;
+	border: 1px solid #e0e0e0;
+	border-radius: 8px;
+	padding: 12px 20px;
+	text-decoration: none;
+	color: #1d2327;
+	font-size: 13px;
+	font-weight: 500;
+	transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.perflocale-dash-action:hover {
+	border-color: var(--perflocale-blue);
+	box-shadow: 0 0 0 1px var(--perflocale-blue);
+	color: var(--perflocale-blue);
+}
+
+.perflocale-dash-action .dashicons {
+	font-size: 18px;
+	width: 18px;
+	height: 18px;
+	color: #646970;
+}
+
+.perflocale-dash-action:hover .dashicons {
+	color: var(--perflocale-blue);
+}
+
+/* Language list */
+.perflocale-lang-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0;
+	background: #fff;
+	border: 1px solid #e0e0e0;
+	border-radius: 8px;
+	overflow: hidden;
+}
+
+.perflocale-lang-item {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	padding: 14px 18px;
+	border-bottom: 1px solid #f0f0f0;
+	transition: background 0.1s;
+}
+
+.perflocale-lang-item:last-child {
+	border-bottom: none;
+}
+
+.perflocale-lang-item:hover {
+	background: #fafafa;
+}
+
+/* Drag-handle for the reorderable Languages list. The button sits at the
+   left of each row, near-invisible at rest (low contrast) and intensifies
+   on row hover. Cursor flips to grabbing while the user holds it. */
+.perflocale-lang-item__handle {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 28px;
+	padding: 0;
+	margin-right: -6px;
+	background: transparent;
+	border: none;
+	border-radius: 4px;
+	color: #c0c4c8;
+	cursor: grab;
+	flex-shrink: 0;
+	opacity: 0;
+	transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+	touch-action: none;
+}
+
+.perflocale-lang-item:hover .perflocale-lang-item__handle,
+.perflocale-lang-item__handle:focus-visible {
+	opacity: 1;
+}
+
+.perflocale-lang-item__handle:hover {
+	color: var(--wp-admin-theme-color, #2271b1);
+	background: #f0f6fc;
+}
+
+.perflocale-lang-item__handle:active {
+	cursor: grabbing;
+}
+
+.perflocale-lang-item__handle:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: 2px;
+}
+
+/* Dragging state: lift the row, fade slightly, hint at "in transit". */
+.perflocale-lang-item.is-dragging {
+	opacity: 0.4;
+	background: #fff;
+}
+
+/* Drop indicator: a 2px line marks the insertion point above the row the
+   pointer is hovering over. Pure CSS, no extra DOM. */
+.perflocale-lang-item.is-drop-before {
+	box-shadow: inset 0 2px 0 0 var(--wp-admin-theme-color, #2271b1);
+}
+
+.perflocale-lang-item.is-drop-after {
+	box-shadow: inset 0 -2px 0 0 var(--wp-admin-theme-color, #2271b1);
+}
+
+/* Live-region toast that confirms the reorder was saved. */
+.perflocale-lang-list__status {
+	min-height: 20px;
+	margin: 8px 4px 0;
+	font-size: 12px;
+	color: #50575e;
+	transition: opacity 0.2s ease;
+}
+
+.perflocale-lang-list__status.is-saving {
+	color: #646970;
+}
+
+.perflocale-lang-list__status.is-saved {
+	color: #1f7a3e;
+}
+
+.perflocale-lang-list__status.is-error {
+	color: #b32d2e;
+}
+
+@media screen and (max-width: 600px) {
+	.perflocale-lang-item {
+			flex-wrap: wrap;
+		}
+}
+
+/* ==========================================================================
+ Settings Page Tabs
+ ========================================================================== */
+.perflocale-settings-nav {
+	display: flex;
+	gap: 0;
+	border-bottom: 2px solid var(--perflocale-card-border);
+	margin-bottom: 24px;
+	position: sticky;
+	top: 32px;
+	background: var(--perflocale-bg);
+	z-index: 10;
+	padding-top: 8px;
+}
+
+.perflocale-settings-nav__tab {
+	padding: 10px 20px;
+	font-size: 14px;
+	font-weight: 500;
+	color: var(--perflocale-text-light);
+	text-decoration: none;
+	border-bottom: 2px solid transparent;
+	margin-bottom: -2px;
+	cursor: pointer;
+	background: none;
+	border-top: none;
+	border-left: none;
+	border-right: none;
+	transition: color 0.15s, border-color 0.15s;
+}
+
+.perflocale-settings-nav__tab:hover {
+	color: var(--perflocale-text);
+}
+
+.perflocale-settings-nav__tab--active {
+	color: var(--perflocale-primary);
+	border-bottom-color: var(--perflocale-primary);
+	font-weight: 600;
+}
+
+.perflocale-settings-section {
+	display: none;
+}
+
+.perflocale-settings-section--active {
+	display: block;
+}
+
+/* ==========================================================================
+ Meta Box Styles
+ ========================================================================== */
+/* Meta Box - Compact Translation Panel */
+.perflocale-mb {
+	margin: -6px -12px -12px;
+}
+
+.perflocale-mb__row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 6px 12px;
+	border-bottom: 1px solid #f0f0f0;
+}
+
+.perflocale-mb__row:last-of-type {
+	border-bottom: none;
+}
+
+.perflocale-mb__row--active {
+	background: #f9f9f9;
+}
+
+.perflocale-mb__lang {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.perflocale-mb__badge {
+	flex-shrink: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 26px;
+	height: 20px;
+	padding: 0 4px;
+	border-radius: 3px;
+	background: #f0f0f0;
+	font-size: 10px;
+	font-weight: 700;
+	color: #50575e;
+	letter-spacing: 0.03em;
+}
+
+.perflocale-mb__name {
+	font-size: 12px;
+	color: #50575e;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.perflocale-mb__action {
+	flex-shrink: 0;
+}
+
+.perflocale-mb__status {
+	display: inline-block;
+	padding: 1px 7px;
+	border-radius: 9px;
+	font-size: 10px;
+	font-weight: 600;
+	line-height: 1.6;
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+a.perflocale-mb__status {
+	cursor: pointer;
+}
+
+a.perflocale-mb__status:hover {
+	opacity: 0.8;
+}
+
+.perflocale-mb__status--green {
+	background: var(--perflocale-green-bg);
+	color: #166534;
+}
+
+.perflocale-mb__create {
+	display: inline-block;
+	padding: 1px 7px;
+	border: 1px dashed #c0c0c0;
+	border-radius: 9px;
+	font-size: 10px;
+	font-weight: 600;
+	line-height: 1.4;
+	color: var(--wp-admin-theme-color, #2271b1);
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+.perflocale-mb__create:hover {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	background: #f0f7ff;
+	color: var(--wp-admin-theme-color-darker-10, #135e96);
+}
+
+/* Term edit screen - translation panel inside table row */
+.perflocale-term-translations {
+	border: 1px solid #e0e0e0;
+	border-radius: 4px;
+	overflow: hidden;
+	max-width: 360px;
+}
+
+.perflocale-term-translations .perflocale-mb__row {
+	padding: 7px 10px;
+}
+
+.perflocale-term-translations .perflocale-mb__row:last-of-type {
+	border-bottom: none;
+}
+
+/* ==========================================================================
+ Strings Page
+ ========================================================================== */
+/* Pagination — matches WP admin style. Scoped to PerfLocale list pages
+   so the styling doesn't leak into core list tables (Posts, Pages, etc.).
+   Add new list-page wrap classes here when creating one — every selector
+   in this block needs the same comma-separated entry. */
+.perflocale-strings-page .tablenav{
+	margin: 12px 0;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+}
+
+/* Base font-size on PerfLocale list pages. WP admin's 13px felt cramped
+ for data-dense tables; 14px is the native WP_List_Table size on most
+ screens and gives our pages the same visual weight as Posts/Pages. */
+.perflocale-strings-page,
+.perflocale-strings-page .wp-list-table th,
+.perflocale-strings-page .wp-list-table td,
+.perflocale-strings-page .perflocale-str-toolbar__count,
+.perflocale-strings-page .perflocale-str-search__input,
+.perflocale-strings-page .perflocale-str-filter,
+.perflocale-strings-page .perflocale-str-filter select,
+.perflocale-strings-page .perflocale-str-filter input,
+.perflocale-strings-page .perflocale-str-filter button,
+.perflocale-strings-page .tablenav select,
+.perflocale-strings-page .tablenav input,
+.perflocale-strings-page .tablenav button{
+	font-size: 14px;
+}
+
+.perflocale-strings-page .tablenav-pages{
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	font-size: 14px;
+	color: #646970;
+	margin-left: auto;
+	float: none;
+}
+
+.perflocale-strings-page .tablenav-pages .page-numbers{
+	display: inline-block;
+	min-width: 28px;
+	padding: 4px 8px;
+	text-align: center;
+	text-decoration: none;
+	font-size: 14px;
+	border: 1px solid #dcdcde;
+	border-radius: 3px;
+	background: #f6f7f7;
+	color: #2c3338;
+	cursor: pointer;
+	transition: background 0.1s, border-color 0.1s;
+}
+
+.perflocale-strings-page .tablenav-pages .page-numbers:hover{
+	background: #fff;
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	color: var(--wp-admin-theme-color, #2271b1);
+}
+
+.perflocale-strings-page .tablenav-pages .page-numbers.current{
+	background: var(--wp-admin-theme-color, #2271b1);
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	color: #fff;
+	font-weight: 600;
+	cursor: default;
+}
+
+.perflocale-strings-page .tablenav-pages .page-numbers.dots{
+	border: none;
+	background: none;
+	cursor: default;
+	padding: 4px 2px;
+	min-width: auto;
+}
+
+.perflocale-strings-page .tablenav-pages .page-numbers.prev,
+.perflocale-strings-page .tablenav-pages .page-numbers.next{
+	font-weight: 700;
+}
+
+/* Mobile: WP admin's default tablenav stacks Save + pagination awkwardly
+   below 782px (the WP admin mobile breakpoint), with WP core forcing the
+   pagination buttons to a much bigger touch-target size that overflows
+   the row. Reclaim the layout: stack Save above pagination on its own
+   line, center the pagination, let it wrap, and keep the compact 28px
+   button size we use on desktop instead of WP core's mobile override. */
+@media screen and (max-width: 782px) {
+	.perflocale-strings-page .tablenav,
+		.perflocale-str-save-row {
+			flex-direction: column;
+			align-items: stretch;
+			gap: 12px;
+		}
+
+	.perflocale-strings-page .tablenav-pages,
+		.perflocale-str-save-row .tablenav-pages {
+			margin: 0 auto;
+			flex-wrap: wrap;
+			justify-content: center;
+			row-gap: 6px;
+		}
+
+	/* Override WP core's `@media (max-width: 782px)` rule that bumps
+		   `.tablenav-pages .page-numbers` to 8px / 12px padding and 36px+
+		   touch-target height. Keep our compact 28px buttons with a touch-
+		   target hit area provided by margin instead of intrinsic size. */
+	.perflocale-strings-page .tablenav-pages .page-numbers{
+			min-width: 32px;
+			min-height: 32px;
+			padding: 4px 8px;
+			line-height: 1.4;
+			font-size: 14px;
+			box-sizing: border-box;
+		}
+
+	/* Hide the prev / next chevrons' extra padding on very small viewports;
+		   their numeric neighbours already provide direct jumps. */
+	.perflocale-strings-page .tablenav-pages .page-numbers.dots{
+			min-width: 14px;
+			padding: 4px 0;
+		}
+}
+
+.perflocale-str-toolbar {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 12px;
+	margin: 16px 0;
+}
+
+.perflocale-str-toolbar__left {
+	display: flex;
+	gap: 8px;
+	align-items: center;
+	flex-wrap: wrap;
+}
+
+.perflocale-str-toolbar__right {
+	display: flex;
+	gap: 8px;
+	align-items: center;
+}
+
+.perflocale-str-toolbar__count {
+	font-size: 14px;
+	color: #646970;
+}
+
+/* Translations page variant: count sits on the SAME flex row as the
+   bulk-actions controls, anchored to the right edge. The wrapping flex
+   container is `.tablenav.perflocale-bulk-tablenav-top`, which uses
+   `justify-content: space-between` so this `.alignright` block lands
+   opposite the bulkactions block on the left. */
+.perflocale-str-toolbar__count--inline {
+	/* Plain inline-block so the text node between </strong> and "items"
+	   keeps its whitespace — inline-flex collapsed it into "34items". */
+	display: inline-block;
+	margin-left: auto;
+	font-size: 14px;
+	line-height: 30px;
+	color: #646970;
+}
+
+.perflocale-str-search {
+	display: flex;
+	gap: 4px;
+}
+
+.perflocale-str-search__input {
+	width: 280px;
+	padding: 5px 10px;
+	font-size: 14px;
+	border: 1px solid #c0c0c0;
+	border-radius: 4px;
+}
+
+.perflocale-str-search__input:focus {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	box-shadow: 0 0 0 1px var(--wp-admin-theme-color, #2271b1);
+	outline: none;
+}
+
+/* ─── Bulk MT-translate toolbar ──────────────────────────────────────
+   Sits between the filter tablenav and the data table on the Strings
+   page. Only renders when MT is enabled, the user has the use_mt cap,
+   and there's at least one non-default target language. */
+.perflocale-str-mt-toolbar {
+	background: #fcfcfc;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	padding: 12px 14px;
+	margin: 8px 0 16px;
+}
+
+.perflocale-str-mt-toolbar__chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 14px 6px 12px;
+	background: #fff;
+	border: 1.5px solid #dcdcde;
+	border-radius: 999px;
+	font-size: 12px;
+	line-height: 1.5;
+	color: #50575e;
+	cursor: pointer;
+	user-select: none;
+	transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.perflocale-str-mt-toolbar__chip:hover {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	background: #f6fafd;
+	color: #1d2327;
+}
+
+.perflocale-str-mt-toolbar__chip:has(.perflocale-str-mt-toolbar__chip-input:checked) {
+	background: #f0f6fc;
+	border-color: var(--wp-admin-theme-color, #2271b1);
+}
+
+.perflocale-str-mt-toolbar__chip-input:checked + .perflocale-str-mt-toolbar__chip-label {
+	color: var(--wp-admin-theme-color, #2271b1);
+	font-weight: 600;
+}
+
+.perflocale-str-mt-toolbar__chip:has(.perflocale-str-mt-toolbar__chip-input:focus-visible) {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: 2px;
+}
+
+.perflocale-str-mt-toolbar__status {
+	margin: 0;
+	flex: 1 1 200px;
+	min-height: 20px;
+	font-size: 13px;
+	color: #646970;
+	text-align: left;
+}
+
+.perflocale-str-mt-toolbar__status.is-busy    { color: var(--wp-admin-theme-color, #2271b1); }
+
+.perflocale-str-mt-toolbar__status.is-success { color: #008a20; }
+
+.perflocale-str-mt-toolbar__status.is-warn    { color: #b25500; }
+
+.perflocale-str-mt-toolbar__status.is-error   { color: #d63638; }
+
+/* Shared empty-state look — applied as a <td class="perflocale-empty-row">
+   inside a table tbody (Translations). The two
+   classes resolve to the same visual so the empty state is consistent
+   across every admin list page. Text aligns left (matching the rest of
+   the table column-content) rather than centered — center-aligned text
+   inside a wide table makes the message look like a floating tooltip
+   detached from the table grid. */
+.perflocale-str-empty {
+	padding: 16px 12px;
+	color: #646970;
+	text-align: left;
+	font-size: 13px;
+}
+
+/* The dashicon previously rendered above the message is hidden so the
+   The empty state matches the other admin list pages (which carry
+   only a centered text message). The element stays in the markup so any
+   third-party CSS targeting it doesn't break. */
+.perflocale-str-empty .dashicons {
+	display: none;
+}
+
+.perflocale-str-empty p {
+	margin: 0;
+	font-size: 13px;
+}
+
+/*
+ * Language column header layout — shared by StringsPage (per-string
+ * translation matrix) and TranslationsPage (per-post translation status
+ * grid). Renders inline: flag + native-name on a single row. Native
+ * name truncates with ellipsis when the column is narrow, so the
+ * column width is the constraint, not the content.
+ */
+.perflocale-th-lang {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	max-width: 100%;
+	min-width: 0;
+	line-height: 1.25;
+}
+
+.perflocale-th-lang__flag {
+	font-size: 16px;
+	line-height: 1;
+	flex-shrink: 0;
+}
+
+.perflocale-th-lang__name {
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 13px;
+	color: #1d2327;
+	min-width: 0;
+}
+
+/* Horizontal-scroll wrapper for wide admin tables.
+ Prevents column compression at narrow viewports by letting the table
+ exceed the viewport width and scrolling within this container instead
+ of the whole page. */
+.perflocale-table-responsive {
+	overflow-x: auto;
+	-webkit-overflow-scrolling: touch;
+	width: 100%;
+}
+
+.perflocale-table-responsive > .wp-list-table {
+	min-width: 720px;
+}
+
+.perflocale-table-responsive > .perflocale-str-edit-table {
+	min-width: 960px;
+}
+
+.perflocale-table-responsive > .perflocale-translations-table {
+	min-width: 820px;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-str-toolbar {
+			flex-direction: column;
+			align-items: stretch;
+		}
+
+	.perflocale-str-toolbar__left,
+		.perflocale-str-toolbar__right {
+			width: 100%;
+		}
+
+	.perflocale-str-toolbar__right {
+			justify-content: space-between;
+		}
+
+	.perflocale-str-search {
+			gap: 6px;
+			align-items: center;
+			flex-wrap: wrap;
+		}
+
+	.perflocale-str-search__input,
+		.perflocale-str-search input[type="search"],
+		.perflocale-str-search input[type="text"] {
+			flex: 1 1 120px;
+			min-width: 0;
+			width: auto;
+			height: 40px;
+			min-height: 40px;
+			box-sizing: border-box;
+			margin: 0;
+		}
+
+	.perflocale-str-search select {
+			flex: 0 1 140px;
+			min-width: 0;
+			height: 40px;
+			min-height: 40px;
+			box-sizing: border-box;
+			margin: 0;
+		}
+
+	.perflocale-str-search .button,
+		.perflocale-str-search button[type="submit"] {
+			flex: 0 0 auto;
+			height: 40px;
+			min-height: 40px;
+			line-height: 1;
+			box-sizing: border-box;
+			white-space: nowrap;
+			margin: 0;
+		}
+
+	.perflocale-strings-page .tablenav.top,
+		.perflocale-strings-page .tablenav.bottom:not(.perflocale-str-save-row){
+			flex-direction: column;
+			align-items: stretch;
+			gap: 10px;
+		}
+
+	/* WP-admin core hides .tablenav .actions at ≤782px; re-show them so
+		   PerfLocale filter dropdowns remain reachable on phones and tablets.
+		   Filter rows render as block, bulk-action rows render as flex (so the
+		   dropdown + Apply + count sit on one row). */
+	.perflocale-strings-page .tablenav .alignleft.actions:not(.bulkactions){
+			display: block !important;
+			float: none;
+			width: 100%;
+			padding-top: 0;
+		}
+
+	.perflocale-strings-page .tablenav .alignleft.actions.bulkactions{
+			display: flex !important;
+			float: none;
+			padding-top: 0;
+		}
+
+	.perflocale-strings-page .tablenav-pages{
+			margin-left: 0;
+			justify-content: center;
+			flex-wrap: wrap;
+			row-gap: 6px;
+			gap: 6px;
+		}
+
+	.perflocale-str-filter {
+			width: 100%;
+			display: flex;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: 8px;
+		}
+
+	.perflocale-str-filter select,
+		.perflocale-strings-page .tablenav select{
+			max-width: 100%;
+			flex: 1 1 140px;
+			min-width: 0;
+			height: 40px;
+			min-height: 40px;
+			box-sizing: border-box;
+			margin: 0;
+		}
+
+	.perflocale-str-filter button,
+		.perflocale-str-filter .button,
+		.perflocale-str-filter a.button {
+			flex: 0 0 auto;
+			height: 40px;
+			min-height: 40px;
+			line-height: 1;
+			box-sizing: border-box;
+			margin: 0;
+		}
+
+	/* Touch-friendly pagination buttons on mobile/tablet. */
+	.perflocale-strings-page .tablenav-pages .page-numbers{
+			min-width: 40px;
+			min-height: 40px;
+			padding: 8px 12px;
+			font-size: 15px;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			box-sizing: border-box;
+		}
+
+	.perflocale-strings-page .tablenav-pages .page-numbers.dots{
+			min-width: auto;
+			min-height: auto;
+			padding: 8px 4px;
+		}
+
+	/* Bulk actions row: dropdown grows, Apply stays alongside, count sits
+		   on the right end of the same row. Higher specificity than the
+		   `.tablenav.top` column-stack rule above. */
+	.perflocale-strings-page .tablenav.perflocale-bulk-tablenav-top{
+			flex-direction: row;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: 8px 12px;
+		}
+
+	.perflocale-strings-page .perflocale-bulkactions,
+		.perflocale-strings-page .tablenav .bulkactions{
+			display: flex;
+			gap: 10px;
+			align-items: center;
+			flex: 0 1 auto;
+			min-width: 0;
+		}
+
+	.perflocale-strings-page .perflocale-bulkactions select,
+		.perflocale-strings-page .tablenav .bulkactions select{
+			flex: 0 1 180px;
+			max-width: 240px;
+			min-width: 0;
+			height: 40px;
+			min-height: 40px;
+			box-sizing: border-box;
+			margin: 0;
+		}
+
+	.perflocale-strings-page .perflocale-bulkactions .button,
+		.perflocale-strings-page .tablenav .bulkactions .button{
+			flex: 0 0 auto;
+			height: 40px;
+			min-height: 40px;
+			line-height: 1;
+			box-sizing: border-box;
+			margin: 0;
+		}
+
+	.perflocale-strings-page .perflocale-str-toolbar__count--inline{
+			flex: 0 0 auto;
+			margin-left: auto;
+		}
+
+	.perflocale-strings-page .perflocale-bulk-tablenav-top .tablenav-pages{
+			flex: 0 0 auto;
+			margin-left: auto;
+			justify-content: flex-end;
+		}
+
+	/* Consistent vertical rhythm between toolbar sections on mobile. */
+	.perflocale-str-toolbar {
+			margin: 12px 0;
+			gap: 10px;
+		}
+
+	.perflocale-strings-page .tablenav {
+			margin: 12px 0;
+		}
+
+	.perflocale-strings-page .tablenav.bottom {
+			margin-top: 16px;
+		}
+
+	.perflocale-bulk-tablenav-top {
+			margin-top: 12px;
+		}
+}
+
+@media screen and (max-width: 600px) {
+	.perflocale-strings-page .wrap > h1.wp-heading-inline {
+			font-size: 20px;
+		}
+
+	.perflocale-strings-page .page-title-action {
+			margin-top: 6px;
+		}
+}
+
+/* ==========================================================================
+ Button + dashicon alignment (perflocale-btn-icon)
+
+ The old `vertical-align: text-bottom` trick for centering a dashicon inside
+ a button lines up correctly on WP 6.x's Fresh admin scheme but drops the
+ icon low on WP 7.0's Modern scheme (Modern raised the button line-height).
+
+ inline-flex + align-items:center is theme-agnostic — alignment depends on
+ the flex container's cross-axis, not the inherited text baseline. The size
+ modifiers (--md, --sm) downscale the default 20×20 dashicon to the sizes
+ we want inside admin buttons; without them the icon overpowers the text.
+ ========================================================================== */
+/* Chained selectors lift specificity to 0,2,0 — matching WP core's
+ * `.wrap .page-title-action` and `.wrap .add-new-h2`, which would
+ * otherwise win the cascade and keep `display: inline-block`. The
+ * three-pronged selector covers every host element we attach to: the
+ * <button>/<input class="button">, the .page-title-action link, and the
+ * page-header info-badge spans on the Addons page. */
+.perflocale-btn-icon.perflocale-btn-icon,
+.button.perflocale-btn-icon,
+a.perflocale-btn-icon,
+.page-title-action.perflocale-btn-icon {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	white-space: nowrap;
+}
+
+/* WP 7's `.wp-core-ui .button .dashicons { line-height: 1.9 }` rule has
+ * specificity 0,3,0 and would otherwise inflate our flex-aligned icon
+ * boxes to ~30 px (1.9 × 16 px font), shoving the icon off the baseline.
+ * Chaining our class twice + the element selector gives 0,4,0 — beating
+ * WP's rule on raw specificity, no `!important` needed. The chained
+ * class is a no-op when the element only carries it once. */
+.perflocale-btn-icon.perflocale-btn-icon .dashicons.dashicons {
+	line-height: 1;
+	vertical-align: baseline;
+}
+
+.perflocale-btn-icon--md.perflocale-btn-icon--md .dashicons.dashicons {
+	width: 16px;
+	height: 16px;
+	font-size: 16px;
+}
+
+.perflocale-btn-icon--sm.perflocale-btn-icon--sm .dashicons.dashicons {
+	width: 12px;
+	height: 12px;
+	font-size: 12px;
+}
+
+/* Safety net: any existing inline `vertical-align: text-bottom;` on a
+ * dashicon inside our flex container becomes a no-op (vertical-align
+ * doesn't apply to flex items). No !important needed. */
+@keyframes perflocale-spin {
+	to {
+		transform: rotate(360deg);
+	}
+
+}
+
+/* ==========================================================================
+ Gutenberg Document Panel - Translations
+ ========================================================================== */
+.perflocale-panel-rows {
+	display: flex;
+	flex-direction: column;
+	gap: 0;
+}
+
+.perflocale-panel-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 8px 0;
+	border-bottom: 1px solid #e0e0e0;
+}
+
+.perflocale-panel-row:last-child {
+	border-bottom: none;
+	padding-bottom: 0;
+}
+
+.perflocale-panel-row:first-child {
+	padding-top: 0;
+}
+
+.perflocale-panel-row--current {
+	opacity: 0.65;
+}
+
+.perflocale-panel-row__info {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+}
+
+.perflocale-panel-row__action {
+	flex-shrink: 0;
+}
+
+.perflocale-panel-badge {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 28px;
+	height: 22px;
+	padding: 0 6px;
+	border-radius: 4px;
+	background: #f0f0f0;
+	color: #50575e;
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.02em;
+	/* Multi-character codes like EN-GB, ZH-CN, PT-BR were wrapping
+	   inside the pill on narrow editor sidebars — `nowrap` keeps them
+	   on one line and `flex-shrink: 0` stops the surrounding flex row
+	   from squeezing the pill below its content width. */
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+
+.perflocale-panel-name {
+	font-size: 13px;
+	color: #50575e;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	/* Flex shrinkability — without `min-width: 0` on a flex item, the
+	   content's intrinsic width acts as the floor and ellipsis never
+	   kicks in. With it, long names like "English (United Kingdom)"
+	   gracefully truncate instead of pushing the slug pill to wrap. */
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.perflocale-panel-status {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 10px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.5;
+	white-space: nowrap;
+}
+
+a.perflocale-panel-status:hover {
+	opacity: 0.8;
+}
+
+.perflocale-panel-edit {
+	display: inline-block;
+	padding: 2px 10px;
+	border-radius: 10px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.5;
+	text-decoration: none;
+	background: #dcfce7;
+	color: #166534;
+}
+
+.perflocale-panel-edit:hover {
+	background: #bbf7d0;
+	color: #166534;
+}
+
+.perflocale-panel-create {
+	display: inline-flex;
+	align-items: center;
+	padding: 3px 10px;
+	border: 1px dashed #c0c0c0;
+	border-radius: 10px;
+	background: none;
+	color: var(--wp-admin-theme-color, #2271b1);
+	font-size: 11px;
+	font-weight: 600;
+	cursor: pointer;
+	white-space: nowrap;
+	transition: border-color 0.15s, background 0.15s;
+}
+
+.perflocale-panel-create:hover {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	background: #f0f7ff;
+}
+
+.perflocale-panel-create:disabled {
+	opacity: 0.5;
+	cursor: wait;
+}
+
+.perflocale-panel-loading {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 0;
+	color: #757575;
+	font-size: 13px;
+}
+
+.perflocale-panel-spinner {
+	display: inline-block;
+	width: 14px;
+	height: 14px;
+	border: 2px solid #e0e0e0;
+	border-top-color: var(--wp-admin-theme-color, #2271b1);
+	border-radius: 50%;
+	animation: perflocale-spin 0.6s linear infinite;
+}
+
+/* ==========================================================================
+ Responsive Breakpoints
+ ========================================================================== */
+@media screen and (max-width: 960px) {
+	.perflocale-settings-nav {
+			flex-wrap: wrap;
+			position: static;
+		}
+
+	.perflocale-settings-nav__tab {
+			padding: 8px 14px;
+			font-size: 13px;
+		}
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-toast {
+			left: 16px;
+			right: 16px;
+			bottom: 16px;
+			min-width: 0;
+			max-width: none;
+		}
+
+	.perflocale-language-table {
+			font-size: 13px;
+		}
+
+	.perflocale-language-table th,
+		.perflocale-language-table td {
+			padding: 8px;
+		}
+}
+
+@media screen and (max-width: 600px) {
+	.perflocale-dialog {
+			padding: 18px;
+		}
+}
+
+.perflocale-translations-table .perflocale-flag {
+	line-height: 1;
+}
+
+/* Tone palette — pastel fill + saturated text for AA contrast. */
+.perflocale-status-badge--empty        { background: #f0f0f1; color: #50575e; }
+
+.perflocale-status-badge--published    { background: #edfaef; color: #00623a; }
+
+.perflocale-status-badge--draft        { background: #e7f1fd; color: #0046a6; }
+
+.perflocale-status-badge--pending      { background: #fcf3d9; color: #7a5b00; }
+
+.perflocale-status-badge--needs-update { background: #fce7e7; color: #8a1f11; }
+
+a.perflocale-status-badge--published:hover,
+a.perflocale-status-badge--published:focus    { background: #d8f4dd; }
+
+a.perflocale-status-badge--draft:hover,
+a.perflocale-status-badge--draft:focus        { background: #d3e6fb; }
+
+a.perflocale-status-badge--pending:hover,
+a.perflocale-status-badge--pending:focus      { background: #f8e9b8; }
+
+a.perflocale-status-badge--needs-update:hover,
+a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
+
+/* Empty-state row — shared across every admin list table (Assignments,
+   Translations). Matches the .perflocale-str-empty div style
+   above for visual consistency. */
+.perflocale-empty-row {
+	text-align: left;
+	padding: 16px 12px;
+	color: #646970;
+	font-size: 13px;
+}
+
+/* ==========================================================================
+ WooCommerce → Multi-currency settings table
+ The rate cell may contain an "Auto-synced" caption below the input. With
+ the default `vertical-align: middle` on <td>, that taller cell pushes
+ inputs in sibling cells out of alignment. Anchor every cell at the top
+ instead so all inputs sit at the same y-coordinate regardless of the
+ caption.
+ ========================================================================== */
+.perflocale-mc-currency-table td {
+	vertical-align: top;
+	padding-top: 10px;
+	padding-bottom: 10px;
+}
+
+.perflocale-mc-currency-table .perflocale-mc-rate-note {
+	display: block;
+	margin-top: 4px;
+	font-size: 11px;
+	color: #888;
+}
+
+/* ============================================================
+   Bulk-actions UI (Translations admin page).
+   Uses HTML5 form="..." attribute to bind checkboxes/buttons
+   to a form declared elsewhere in the document — keeps per-row
+   action <form>s from being illegally nested inside a wrapper.
+   ============================================================ */
+.perflocale-bulkactions {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.perflocale-bulkactions select,
+.perflocale-bulkactions input[type="date"] {
+	margin: 0;
+	max-width: 220px;
+}
+
+.perflocale-bulkactions [hidden] {
+	display: none !important;
+}
+
+.perflocale-bulk-tablenav-top {
+	margin-top: 12px;
+}
+
+/* WP-Posts-style check column on the two bulk-actions list tables.
+   The pages use `widefat fixed` (table-layout: fixed), so a leading
+   <col style="width:2.2em"> nails the column width regardless of the
+   later % widths on title/status/etc. The cell padding mirrors WP core's
+   list-tables.css exactly. */
+.perflocale-strings-page .wp-list-table > colgroup col.check-column,
+.perflocale-translations .wp-list-table > colgroup col.check-column {
+	width: 2.2em;
+}
+
+.perflocale-strings-page .wp-list-table > * > tr > .check-column,
+.perflocale-translations .wp-list-table > * > tr > .check-column {
+	width: 2.2em !important;
+	min-width: 2.2em;
+	max-width: 2.2em;
+	padding: 0;
+	vertical-align: middle;
+	box-sizing: border-box;
+}
+
+/* The label fills the cell so clicking anywhere in the column toggles the
+   checkbox (matches the larger click-target behaviour the user expects on
+   WP-admin tables). The label includes the screen-reader text inside it
+   for accessibility. */
+.perflocale-strings-page .wp-list-table .check-column .perflocale-cb-label,
+.perflocale-translations .wp-list-table .check-column .perflocale-cb-label {
+	display: flex;
+	align-items: center;
+	justify-content: flex-start;
+	width: 100%;
+	min-height: 38px;
+	padding: 0 0 0 8px;
+	margin: 0;
+	cursor: pointer;
+	box-sizing: border-box;
+}
+
+.wp-list-table .check-column input[type="checkbox"][data-perflocale-bulk-row],
+.wp-list-table .check-column input[type="checkbox"][data-perflocale-bulk-select-all] {
+	margin: 0;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-settings-section .form-table th,
+		.perflocale-settings-section .form-table td {
+			padding-block: 8px;
+		}
+
+	.perflocale-settings-section .form-table input[type="text"],
+		.perflocale-settings-section .form-table input[type="email"],
+		.perflocale-settings-section .form-table input[type="url"],
+		.perflocale-settings-section .form-table input[type="password"],
+		.perflocale-settings-section .form-table select,
+		.perflocale-settings-section .form-table textarea {
+			max-width: 100%;
+			box-sizing: border-box;
+		}
+
+	.perflocale-dash-action {
+			width: 100%;
+			justify-content: flex-start;
+		}
+}
+
+@media screen and (max-width: 600px) {
+	.perflocale-settings-section .form-table {
+			margin-top: 8px;
+		}
+}
+
+@media screen and (max-width: 480px) {
+	.perflocale-strings-page .wrap > h1.wp-heading-inline,
+		.perflocale-translations .wrap > h1.wp-heading-inline{
+			display: block;
+		}
+
+	.perflocale-strings-page .wrap > .page-title-action,
+		.perflocale-translations .wrap > .page-title-action{
+			display: inline-block;
+			margin-top: 8px;
+		}
+
+	.perflocale-settings .nav-tab-wrapper .nav-tab,
+		.perflocale-addons-nav__item a {
+			padding-inline: 12px;
+		}
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-settings .nav-tab-wrapper {
+			display: none !important;
+		}
+}
+
+.perflocale-settings .nav-tab-wrapper {
+	border-bottom: 1px solid #c3c4c7;
+	padding: 0;
+	margin: 16px 0 24px;
+}
+
+.perflocale-settings .nav-tab-wrapper .nav-tab {
+	margin: 0;
+	padding: 10px 18px;
+	background: transparent;
+	border: none;
+	border-bottom: 2px solid transparent;
+	margin-bottom: -1px;
+	font-size: 14px;
+	font-weight: 500;
+	color: #50575e;
+	line-height: 1.4;
+	box-shadow: none;
+	transition: color 0.15s, border-color 0.15s;
+}
+
+.perflocale-settings .nav-tab-wrapper .nav-tab:hover,
+.perflocale-settings .nav-tab-wrapper .nav-tab:focus {
+	color: #1d2327;
+	background: transparent;
+	border-color: transparent;
+	border-bottom-color: #c3c4c7;
+	box-shadow: none;
+}
+
+.perflocale-settings .nav-tab-wrapper .nav-tab.nav-tab-active,
+.perflocale-settings .nav-tab-wrapper .nav-tab.nav-tab-active:hover,
+.perflocale-settings .nav-tab-wrapper .nav-tab.nav-tab-active:focus {
+	color: var(--wp-admin-theme-color, #2271b1);
+	border-color: transparent;
+	border-bottom-color: var(--wp-admin-theme-color, #2271b1);
+	background: transparent;
+	font-weight: 600;
+	box-shadow: none;
+}
+
+.perflocale-settings .nav-tab-wrapper .nav-tab:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: -2px;
+}
+
+/* PerfLocale data tables on mobile — keeps all cells visible (overrides
+ * WP's hide-non-primary mobile rule) and relies on the
+ * `.perflocale-table-responsive` wrapper for horizontal scroll. The
+ * `:not([style*="display:none"])` qualifier preserves the inline
+ * `style="display:none;"` that Screen Options emits for user-hidden
+ * columns. */
+@media screen and (max-width: 782px) {
+	.perflocale-table-responsive .wp-list-table > thead > tr > th:not([style*="display:none"]),
+		.perflocale-table-responsive .wp-list-table > tbody > tr > td:not([style*="display:none"]),
+		.perflocale-table-responsive .wp-list-table > tfoot > tr > th:not([style*="display:none"]) {
+			display: table-cell !important;
+		}
+
+	.perflocale-table-responsive .wp-list-table > tbody > tr > td.column-primary {
+			padding-right: 10px !important;
+		}
+
+	.perflocale-table-responsive .wp-list-table tr:not(.inline-edit-row):not(.no-items) > td:not(.column-primary):not(.check-column) {
+			padding: 8px 10px !important;
+		}
+
+	.perflocale-table-responsive .wp-list-table tr:not(.inline-edit-row):not(.no-items) > td:not(.column-primary)::before {
+			display: none !important;
+		}
+
+	.perflocale-table-responsive .wp-list-table tr:not(.inline-edit-row):not(.no-items) > td:not(.check-column) {
+			position: static !important;
+		}
+
+	.perflocale-table-responsive .wp-list-table .row-actions {
+			left: auto !important;
+			opacity: 1 !important;
+			position: static !important;
+			padding: 2px 0 0 !important;
+		}
+
+	.perflocale-table-responsive .wp-list-table .toggle-row {
+			display: none !important;
+		}
+
+	.perflocale-table-responsive {
+			scrollbar-width: thin;
+			scrollbar-color: #8c8f94 transparent;
+		}
+
+	.perflocale-table-responsive::-webkit-scrollbar {
+			height: 10px;
+		}
+
+	.perflocale-table-responsive::-webkit-scrollbar-thumb {
+			background: #8c8f94;
+			border-radius: 5px;
+		}
+
+	.perflocale-table-responsive::-webkit-scrollbar-track {
+			background: #f0f0f1;
+			border-radius: 5px;
+		}
+
+	.perflocale-table-responsive .perflocale-str-edit-table .perflocale-str-input {
+			font-size: 13px;
+		}
+
+	.perflocale-table-responsive .perflocale-translations-table .perflocale-status-badge {
+			min-width: 0;
+			padding: 3px 9px;
+			font-size: 11px;
+			white-space: nowrap;
+		}
+
+	.perflocale-table-responsive .perflocale-jobs-table th,
+		.perflocale-table-responsive .perflocale-jobs-table td {
+			min-width: 80px;
+		}
+
+	.perflocale-table-responsive .perflocale-jobs-table .perflocale-jobs-progress {
+			min-width: 100px;
+		}
+
+	.perflocale-translations .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row),
+		.perflocale-jobs .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) {
+			height: auto;
+			display: flex;
+			flex-direction: column;
+			align-items: stretch;
+			gap: 10px;
+			padding: 6px 0;
+		}
+
+	.perflocale-translations .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) .alignleft,
+		.perflocale-translations .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) .alignright,
+		.perflocale-jobs .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) .alignleft,
+		.perflocale-jobs .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) .alignright {
+			float: none;
+			width: 100%;
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			margin: 0;
+		}
+
+	.perflocale-translations .tablenav select,
+		.perflocale-translations .tablenav input[type="search"],
+		.perflocale-strings-page .perflocale-str-filter select,
+		.perflocale-strings-page .perflocale-str-filter input[type="search"],
+		.perflocale-strings-page .perflocale-str-filter input[type="text"] {
+			flex: 1 1 140px;
+			min-width: 0;
+			max-width: 100%;
+			min-height: 40px !important;
+			height: 40px !important;
+			line-height: normal !important;
+			padding: 6px 12px !important;
+			font-size: 14px !important;
+			margin: 0 !important;
+		}
+
+	.perflocale-translations .perflocale-str-filter,
+		.perflocale-strings-page .perflocale-str-filter {
+			display: flex;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: 6px;
+			width: 100%;
+		}
+
+	.perflocale-translations .tablenav .button{
+			flex-shrink: 0;
+			min-height: 40px;
+		}
+
+	.perflocale-translations .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) .tablenav-pages,
+		.perflocale-jobs .tablenav:not(.perflocale-bulk-tablenav-top):not(.perflocale-str-save-row) .tablenav-pages {
+			margin-left: 0;
+			margin-bottom: 0;
+			justify-content: flex-start;
+			flex-wrap: wrap;
+			row-gap: 4px;
+		}
+}
+
+/* ==========================================================================
+ Shared PerfLocale admin nav strip (.perflocale-nav-tabs)
+ Rendered by Admin\PluginNav on every plugin page except Settings (which
+ keeps its own per-section strip; those rules live above, scoped to
+ .perflocale-settings). Same underline treatment, but this strip stays
+ visible on mobile — wrapping down to 481px, scrolling below that — so
+ its sticky offset tracks the admin bar: 32px desktop, 46px <=782px, 0
+ below 600px where core un-fixes the bar.
+ ========================================================================== */
+.perflocale-nav-tabs {
+	position: sticky;
+	top: 32px;
+	z-index: 10;
+	display: flex;
+	align-items: flex-end;
+	background: #f0f0f1;
+	border-bottom: 1px solid #c3c4c7;
+	padding: 0;
+	margin: 16px 0 24px;
+}
+
+.perflocale-nav-tabs__items {
+	flex: 1 1 auto;
+	display: flex;
+	align-items: flex-end;
+	flex-wrap: wrap;
+}
+
+.perflocale-nav-tabs .nav-tab {
+	margin: 0;
+	padding: 10px 16px;
+	background: transparent;
+	border: none;
+	border-bottom: 2px solid transparent;
+	margin-bottom: -1px;
+	font-size: 14px;
+	font-weight: 500;
+	color: #50575e;
+	line-height: 1.4;
+	box-shadow: none;
+	transition: color 0.15s, border-color 0.15s;
+}
+
+.perflocale-nav-tabs .nav-tab:hover,
+.perflocale-nav-tabs .nav-tab:focus {
+	color: #1d2327;
+	background: transparent;
+	border-color: transparent;
+	border-bottom-color: #c3c4c7;
+	box-shadow: none;
+}
+
+.perflocale-nav-tabs .nav-tab.nav-tab-active,
+.perflocale-nav-tabs .nav-tab.nav-tab-active:hover,
+.perflocale-nav-tabs .nav-tab.nav-tab-active:focus {
+	color: var(--wp-admin-theme-color, #2271b1);
+	border-color: transparent;
+	border-bottom-color: var(--wp-admin-theme-color, #2271b1);
+	background: transparent;
+	font-weight: 600;
+	box-shadow: none;
+}
+
+.perflocale-nav-tabs .nav-tab:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: -2px;
+}
+
+.perflocale-nav-tabs__help {
+	margin-left: auto;
+	color: #50575e;
+	flex-shrink: 0;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-nav-tabs {
+			top: 46px;
+		}
+
+	.perflocale-nav-tabs .nav-tab {
+			padding: 10px 12px;
+			font-size: 13px;
+		}
+}
+
+@media screen and (max-width: 600px) {
+	.perflocale-nav-tabs {
+			top: 0;
+		}
+}
+
+@media screen and (max-width: 480px) {
+	.perflocale-nav-tabs {
+			overflow-x: auto;
+			scrollbar-width: none;
+			-ms-overflow-style: none;
+		}
+
+	.perflocale-nav-tabs::-webkit-scrollbar {
+			display: none;
+		}
+
+	.perflocale-nav-tabs__items {
+			flex-wrap: nowrap;
+		}
+
+	.perflocale-nav-tabs .nav-tab {
+			white-space: nowrap;
+			padding: 10px 10px;
+
+			/* The scroll container clips the -1px overhang, which would cut
+			 * the active underline to a sliver — keep tabs inside the box. */
+			margin-bottom: 0;
+		}
+}

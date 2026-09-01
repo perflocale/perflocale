@@ -1,0 +1,120 @@
+/**
+ * PerfLocale - WP Dashboard widget (translation overview).
+ *
+ * Self-contained (no dependency on admin.css variables) since it loads
+ * on the Dashboard screen only. Pure CSS coverage bar — no JS.
+ */
+
+.perflocale-dashwidget__stats {
+	display: flex;
+	gap: 10px;
+	margin: 0 0 14px;
+}
+
+.perflocale-dashwidget__metric {
+	flex: 1 1 0;
+	text-align: center;
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 8px;
+	padding: 14px 6px 11px;
+	box-shadow: 0 1px 1px rgba( 0, 0, 0, 0.04 );
+}
+
+.perflocale-dashwidget__value {
+	display: block;
+	font-size: 26px;
+	font-weight: 700;
+	line-height: 1.1;
+	color: #1d2327;
+	letter-spacing: -0.01em;
+}
+
+.perflocale-dashwidget__metric:last-child .perflocale-dashwidget__value {
+	color: #2271b1;
+}
+
+.perflocale-dashwidget__label {
+	display: block;
+	margin-top: 5px;
+	font-size: 10px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: #787c82;
+}
+
+.perflocale-dashwidget__bar {
+	height: 8px;
+	background: #e9eaec;
+	border-radius: 999px;
+	overflow: hidden;
+	margin: 0 0 7px;
+}
+
+.perflocale-dashwidget__bar-fill {
+	display: block;
+	height: 100%;
+	min-width: 0;
+	background: linear-gradient( 90deg, #2271b1, #2eb67d );
+	border-radius: 999px;
+	transition: width 0.4s ease;
+}
+
+.perflocale-dashwidget__caption {
+	margin: 0 0 14px;
+	font-size: 12px;
+	color: #787c82;
+}
+
+.perflocale-dashwidget__langs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin: 0 0 16px;
+}
+
+.perflocale-dashwidget__chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	background: #f6f7f7;
+	border: 1px solid #dcdcde;
+	border-radius: 999px;
+	padding: 3px 11px 3px 9px;
+	font-size: 12px;
+	font-weight: 500;
+	color: #1d2327;
+	line-height: 1.6;
+}
+
+/* Chips rendered as <a> link to each language's edit screen. */
+a.perflocale-dashwidget__chip {
+	text-decoration: none;
+	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+a.perflocale-dashwidget__chip:hover,
+a.perflocale-dashwidget__chip:focus {
+	background: #fff;
+	border-color: #2271b1;
+	color: #2271b1;
+}
+
+.perflocale-dashwidget__flag {
+	font-size: 15px;
+	line-height: 1;
+}
+
+.perflocale-dashwidget__actions {
+	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.perflocale-dashwidget__empty {
+	margin: 0 0 12px;
+	color: #787c82;
+}

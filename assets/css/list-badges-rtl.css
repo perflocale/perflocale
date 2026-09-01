@@ -1,0 +1,73 @@
+/**
+ * PerfLocale - List-table Language Badges
+ *
+ * Extracted from admin.css for the post/term list-table contexts. Loaded
+ * by Admin/Assets when the current screen is edit.php / edit-tags.php for a
+ * translatable post type or taxonomy. Avoids shipping the full ~92 KB
+ * admin.css just for the badge column.
+ *
+ * Stays in sync with admin.css's "Translation Status Badges" section so the
+ * fuller admin page still shows the same badges on PerfLocale screens.
+ *
+ * @package PerfLocale
+ */
+
+/* ==========================================================================
+ CSS Custom Properties (subset used by the badges)
+ ========================================================================== */
+
+:root {
+	--perflocale-green-bg: #dcfce7;
+	--perflocale-gray-bg: #f3f4f6;
+	--perflocale-gray-text: #4b5563;
+	--perflocale-blue: #3b82f6;
+}
+
+/* ==========================================================================
+ Translation Status Badges (Post / Term List Column)
+ ========================================================================== */
+
+.perflocale-lang-badges {
+	display: inline-flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+
+.perflocale-badge {
+	display: inline-block;
+	padding: 2px 7px;
+	border-radius: 4px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.4;
+	text-decoration: none;
+	cursor: default;
+}
+
+a.perflocale-badge {
+	cursor: pointer;
+}
+
+a.perflocale-badge:hover {
+	opacity: 0.85;
+}
+
+a.perflocale-badge:focus {
+	outline: 2px solid var(--perflocale-blue);
+	outline-offset: 1px;
+}
+
+.perflocale-badge--green {
+	background: var(--perflocale-green-bg);
+	color: #166534;
+}
+
+.perflocale-badge--none {
+	background: var(--perflocale-gray-bg);
+	color: var(--perflocale-gray-text);
+}
+
+.perflocale-badge--current {
+	font-weight: 700;
+	box-shadow: inset 0 0 0 1.5px currentColor;
+}

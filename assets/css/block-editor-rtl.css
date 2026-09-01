@@ -1,0 +1,41 @@
+/**
+ * PerfLocale - Block editor styles (admin only).
+ *
+ * Loaded via enqueue_block_editor_assets. Used by ConditionalContent
+ * and any future editor-side UI. Keeps the editor look consistent with
+ * the rest of the plugin (card palette, blue accents).
+ */
+
+.perflocale-conditional-block {
+	position: relative;
+	border: 1px dashed #c3c4c7;
+	border-radius: 4px;
+	background: #f6f7f7;
+}
+
+.perflocale-conditional-block__header {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	background: #eef4fb;
+	border-bottom: 1px dashed #c3c4c7;
+	font-size: 12px;
+	line-height: 1.4;
+	color: #1e3a5f;
+	border-top-right-radius: 4px;
+	border-top-left-radius: 4px;
+}
+
+.perflocale-conditional-block__icon {
+	font-size: 14px;
+	line-height: 1;
+}
+
+.perflocale-conditional-block__label {
+	font-weight: 500;
+}
+
+.perflocale-conditional-block__inner {
+	padding: 12px;
+}

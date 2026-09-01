@@ -1,0 +1,350 @@
+/* Language Switcher Info Box (Settings tab) */
+.perflocale-switcher-info {
+	background: #f8faff;
+	border: 1px solid #dbeafe;
+	border-radius: 8px;
+	padding: 18px 20px;
+	margin: 8px 0 12px;
+}
+
+.perflocale-switcher-info__header {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-bottom: 8px;
+	color: #1e40af;
+}
+
+.perflocale-switcher-info__header .dashicons {
+	color: #3b82f6;
+}
+
+.perflocale-switcher-info p {
+	margin: 0 0 14px;
+	font-size: 13px;
+	color: #4b5563;
+}
+
+.perflocale-switcher-info__methods {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 10px;
+}
+
+.perflocale-switcher-info__method {
+	display: flex;
+	gap: 10px;
+	background: #fff;
+	border: 1px solid #e5e7eb;
+	border-radius: 6px;
+	padding: 12px 14px;
+}
+
+.perflocale-switcher-info__method > .dashicons {
+	color: var(--perflocale-gray-text);
+	margin-top: 1px;
+	flex-shrink: 0;
+}
+
+.perflocale-switcher-info__method strong {
+	display: block;
+	font-size: 13px;
+	color: #1d2327;
+	margin-bottom: 2px;
+}
+
+.perflocale-switcher-info__method span {
+	font-size: 12px;
+	color: var(--perflocale-gray-text);
+	line-height: 1.4;
+}
+
+.perflocale-switcher-info__code {
+	display: inline-block;
+	margin-top: 4px;
+	padding: 3px 8px;
+	background: #f3f4f6;
+	border: 1px solid #d1d5db;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 12px;
+	color: #1d2327;
+	cursor: pointer;
+	transition: background 0.2s, border-color 0.2s;
+	user-select: all;
+}
+
+.perflocale-switcher-info__code:hover {
+	background: #e5e7eb;
+	border-color: var(--wp-admin-theme-color, #2271b1);
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-switcher-info__methods {
+			grid-template-columns: 1fr;
+		}
+}
+
+/* ==========================================================================
+ Settings Page - Addons Tab
+ ========================================================================== */
+.perflocale-addons-wrap {
+	display: flex;
+	gap: 0;
+	margin-top: 16px;
+}
+
+.perflocale-addons-nav {
+	width: 200px;
+	flex-shrink: 0;
+	border-left: 1px solid #c3c4c7;
+	padding-left: 0;
+}
+
+.perflocale-addons-nav ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.perflocale-addons-nav__item a {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 10px 16px;
+	text-decoration: none;
+	color: #1d2327;
+	border-right: 3px solid transparent;
+	font-size: 13px;
+	line-height: 1.4;
+}
+
+.perflocale-addons-nav__item a:hover {
+	background: #f0f0f1;
+}
+
+.perflocale-addons-nav__item--active a {
+	background: #fff;
+	border-right-color: var(--wp-admin-theme-color, #2271b1);
+	font-weight: 600;
+	color: var(--wp-admin-theme-color, #2271b1);
+}
+
+.perflocale-addons-nav__status {
+	font-size: 11px;
+	font-weight: 400;
+	padding: 1px 7px;
+	border-radius: 10px;
+	background: #f0f0f1;
+	color: #50575e;
+	white-space: nowrap;
+}
+
+.perflocale-addons-nav__status--on {
+	background: #edf7ed;
+	color: #1e7e1e;
+}
+
+.perflocale-addons-content {
+	flex: 1;
+	min-width: 0;
+	padding-right: 24px;
+}
+
+/* Responsive overrides for PerfLocale admin pages. */
+@media screen and (max-width: 960px) {
+	.perflocale-addons-content {
+			padding-right: 16px;
+		}
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-addons-wrap {
+			flex-direction: column;
+			gap: 0;
+		}
+
+	.perflocale-addons-nav {
+			width: 100%;
+			flex-shrink: 0;
+			border-left: none;
+			border-bottom: 1px solid #c3c4c7;
+			padding-left: 0;
+			margin-bottom: 16px;
+			overflow: visible;
+		}
+
+	.perflocale-addons-nav ul {
+			display: flex;
+			overflow-x: auto;
+			-webkit-overflow-scrolling: touch;
+			gap: 2px;
+			padding: 0 0 4px;
+			scrollbar-width: none;
+		}
+
+	.perflocale-addons-nav ul::-webkit-scrollbar {
+			display: none;
+		}
+
+	.perflocale-addons-nav__item {
+			flex-shrink: 0;
+		}
+
+	/* 44 px min-height for touch targets (Apple HIG / Material baseline). */
+	.perflocale-addons-nav__item a {
+			padding: 10px 14px;
+			border-right: none;
+			border-bottom: 3px solid transparent;
+			min-height: 44px;
+			box-sizing: border-box;
+			white-space: nowrap;
+		}
+
+	.perflocale-addons-nav__item--active a {
+			border-right-color: transparent;
+			border-bottom-color: var(--wp-admin-theme-color, #2271b1);
+		}
+
+	.perflocale-addons-content {
+			padding-right: 0;
+			padding-left: 0;
+			min-width: 0;
+		}
+
+	.perflocale-switcher-info__code {
+			word-break: break-all;
+			max-width: 100%;
+			box-sizing: border-box;
+		}
+}
+
+@media screen and (max-width: 480px) {
+	.perflocale-switcher-info__method {
+			padding: 10px 12px;
+		}
+}
+
+/* Settings Page tab navigation — underline tab strip on desktop,
+ * native <select> picker on mobile. */
+.perflocale-settings-tabs-mobile {
+	display: none;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-settings-tabs-mobile {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+			margin: 16px 0 24px;
+			padding: 0;
+			font-size: 14px;
+		}
+
+	.perflocale-settings-tabs-mobile__label {
+			flex-shrink: 0;
+			font-weight: 600;
+			color: #1d2327;
+		}
+
+	.perflocale-settings-tabs-mobile__select {
+			flex: 1 1 auto;
+			min-width: 0;
+			min-height: 44px;
+			padding: 10px 12px 10px 36px;
+			font-size: 14px;
+			font-weight: 500;
+			color: #1d2327;
+			background: #fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' width='12' height='12'><path d='M3 4.5L6 7.5L9 4.5' stroke='%2350575e' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>") no-repeat left 12px center;
+			border: 1px solid #c3c4c7;
+			border-radius: 6px;
+			box-shadow: 0 1px 2px rgba( 0, 0, 0, 0.04 );
+			cursor: pointer;
+			line-height: 1.4;
+		}
+
+	.perflocale-settings-tabs-mobile__select:hover {
+			border-color: #8c8f94;
+		}
+
+	.perflocale-settings-tabs-mobile__select:focus,
+		.perflocale-settings-tabs-mobile__select:focus-visible {
+			outline: none;
+			border-color: var(--wp-admin-theme-color, #2271b1);
+			box-shadow: 0 0 0 2px rgba( 34, 113, 177, 0.2 );
+		}
+
+	.perflocale-settings-tabs-mobile__go {
+			flex-shrink: 0;
+			min-height: 44px;
+		}
+}
+
+@media screen and (max-width: 480px) {
+	.perflocale-settings-tabs-mobile {
+			flex-direction: column;
+			align-items: stretch;
+			gap: 6px;
+		}
+
+	.perflocale-settings-tabs-mobile__label {
+			font-size: 12px;
+			text-transform: uppercase;
+			letter-spacing: 0.04em;
+			color: #50575e;
+		}
+}
+
+/* Migration cards (Settings → Export & Import).
+   One card per detected source plugin. Logical properties throughout so the
+   RTL twin needs no directional overrides. */
+.perflocale-migration-cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+	gap: 16px;
+	margin-block-start: 12px;
+	max-inline-size: 960px;
+}
+
+.perflocale-migration-card {
+	border: 1px solid #dcdcde;
+	border-radius: 8px;
+	background: #fff;
+	padding: 16px 18px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.perflocale-migration-card__title {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+	line-height: 1.3;
+	color: #1e1e1e;
+}
+
+.perflocale-migration-card__covers {
+	margin: 0;
+	color: #646970;
+	font-size: 13px;
+	line-height: 1.5;
+	flex-grow: 1;
+}
+
+.perflocale-migration-card form {
+	margin: 0;
+}
+
+.perflocale-migration-card__found {
+	margin: 0;
+	color: #00a32a;
+	font-weight: 600;
+	font-size: 12px;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-migration-cards {
+			grid-template-columns: 1fr;
+		}
+}

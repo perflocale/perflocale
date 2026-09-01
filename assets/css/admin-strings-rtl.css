@@ -1,0 +1,604 @@
+/* Bottom row on the Strings page: Save Translations button on the left,
+   pagination on the right end of the same row. */
+.perflocale-str-save-row {
+	flex-wrap: wrap;
+	gap: 10px;
+}
+
+.perflocale-str-save-row__save {
+	flex: 0 0 auto;
+}
+
+.perflocale-str-save-row .tablenav-pages {
+	margin-right: auto;
+}
+
+.perflocale-str-save-row__save + .tablenav-pages,
+.perflocale-str-save-row .tablenav-pages:only-child {
+	margin-right: auto;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-str-save-row__save {
+			align-self: flex-start;
+		}
+}
+
+.perflocale-str-mt-toolbar__inner {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px 24px;
+	align-items: center;
+}
+
+.perflocale-str-mt-toolbar__group {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.perflocale-str-mt-toolbar__label {
+	font-weight: 600;
+	font-size: 13px;
+	color: #1d2327;
+}
+
+.perflocale-str-mt-toolbar__chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+.perflocale-str-mt-toolbar__chip-input {
+	margin: 0;
+	cursor: pointer;
+}
+
+.perflocale-str-mt-toolbar__overwrite {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 13px;
+	color: #50575e;
+}
+
+.perflocale-str-mt-toolbar__count {
+	font-weight: 400;
+	color: rgba(255, 255, 255, 0.85);
+	margin-right: 2px;
+}
+
+/* Action row sits beneath the chip/overwrite row. Status text on the
+   left, buttons on the right — single flex row with a wrap fallback. */
+.perflocale-str-mt-toolbar__action-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px 16px;
+	margin-top: 12px;
+}
+
+.perflocale-str-mt-toolbar__group--actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	flex: 0 0 auto;
+}
+
+/* Check-column tightening — WP defaults give it 2.2em which feels
+   roomy next to the dense Strings table. */
+.perflocale-str-edit-table .check-column {
+	width: 32px;
+	padding: 8px 4px;
+}
+
+@media (max-width: 782px) {
+	.perflocale-str-mt-toolbar__inner {
+			gap: 10px;
+		}
+
+	.perflocale-str-mt-toolbar__action-row {
+			flex-direction: column;
+			align-items: stretch;
+		}
+
+	.perflocale-str-mt-toolbar__group--actions {
+			width: 100%;
+		}
+
+	.perflocale-str-mt-toolbar__group--actions .button {
+			flex: 1 1 auto;
+		}
+}
+
+.perflocale-str-context {
+	display: inline-block;
+	margin-right: 4px;
+	padding: 1px 5px;
+	border-radius: 3px;
+	background: #f0f0f0;
+	font-size: 11px;
+	color: #646970;
+}
+
+.perflocale-str-domain {
+	font-size: 11px;
+	background: none;
+	padding: 0;
+	color: #646970;
+}
+
+/* String edit table */
+.perflocale-str-edit-table {
+	table-layout: fixed;
+}
+
+.perflocale-str-edit-table th.sorted a,
+.perflocale-str-edit-table th.sortable a {
+	display: flex;
+	align-items: center;
+}
+
+.perflocale-str-edit-table__th-lang {
+	width: 180px;
+	text-align: center !important;
+}
+
+.perflocale-str-edit-table__td-lang {
+	vertical-align: top !important;
+	padding: 6px 8px !important;
+}
+
+.perflocale-str-original {
+	font-size: 13px;
+	color: #1d2327;
+	word-break: break-word;
+}
+
+.perflocale-str-original--has-ph {
+	/* `display: inline-block` so the left-border + background wrap as one
+	   continuous block when the source spans multiple lines, instead of
+	   breaking at line wraps and leaving the bar on only the first line. */
+	display: inline-block;
+	background: linear-gradient(to left, #fefce8 0%, transparent 100%);
+	padding: 1px 4px;
+	border-radius: 3px;
+	border-right: 3px solid #eab308;
+}
+
+.perflocale-str-meta {
+	font-size: 11px;
+	color: #646970;
+	margin-top: 3px;
+}
+
+/* Inline input + expand button */
+.perflocale-str-input-wrap {
+	display: flex;
+	gap: 0;
+	position: relative;
+}
+
+/* Per-cell overlay icons sitting in the top-right of an input wrap. The
+   needs-update warning sits at right:32px (just to the left of the
+   expand-editor button); the AI quality score pill sits to the left of
+   needs-update when both are visible — the `right:52px` modifier on the
+   element wins over the default `right:32px`. */
+.perflocale-str-needs-update {
+	position: absolute;
+	top: 2px;
+	left: 32px;
+	color: #dba617;
+	font-size: 16px;
+	z-index: 1;
+	cursor: help;
+}
+
+
+
+
+.perflocale-str-input {
+	flex: 1;
+	min-width: 0;
+	padding: 4px 6px;
+	font-size: 12px;
+	border: 1px solid #dcdcde;
+	border-radius: 0 3px 3px 0;
+	box-sizing: border-box;
+	transition: border-color 0.15s;
+}
+
+.perflocale-str-input:focus {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	box-shadow: 0 0 0 1px var(--wp-admin-theme-color, #2271b1);
+	outline: none;
+	z-index: 1;
+}
+
+.perflocale-str-input--filled {
+	border-color: var(--perflocale-green);
+	background: #f8fdf9;
+}
+
+.perflocale-str-input--needs-update {
+	border-color: #dba617;
+	background: #fef9e7;
+}
+
+/* Live placeholder-validation: red-tinted border + warning icon at the
+   right edge whenever the row's translation is missing source-string
+   sprintf placeholders. Mirrors the modal's chip feedback so users see
+   the same signal whether they edit inline or in the popup. */
+.perflocale-str-input--invalid {
+	border-color: #d63638;
+	background: #fef2f2;
+	padding-left: 28px;
+}
+
+.perflocale-str-input--invalid:focus {
+	border-color: #d63638;
+	box-shadow: 0 0 0 1px #d63638;
+}
+
+.perflocale-str-input-warn {
+	position: absolute;
+	top: 50%;
+	left: 38px;
+	transform: translateY(-50%);
+	color: #d63638;
+	font-size: 14px;
+	line-height: 1;
+	pointer-events: auto;
+	cursor: help;
+	z-index: 2;
+}
+
+.perflocale-str-expand-btn {
+	display: flex;
+	align-items: center;
+	padding: 0 6px;
+	border: 1px solid #dcdcde;
+	border-right: none;
+	border-radius: 3px 0 0 3px;
+	background: #f6f7f7;
+	cursor: pointer;
+	color: #646970;
+	transition: background 0.15s, color 0.15s;
+}
+
+.perflocale-str-expand-btn:hover {
+	background: var(--wp-admin-theme-color, #2271b1);
+	color: #fff;
+	border-color: var(--wp-admin-theme-color, #2271b1);
+}
+
+.perflocale-str-expand-btn .dashicons {
+	font-size: 14px;
+	width: 14px;
+	height: 14px;
+}
+
+/* Translation editor modal */
+.perflocale-str-modal {
+	position: fixed;
+	inset: 0;
+	z-index: 100000;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+}
+
+.perflocale-str-modal__backdrop {
+	position: absolute;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.5);
+}
+
+.perflocale-str-modal__dialog {
+	position: relative;
+	width: calc(100% - 32px);
+	max-width: 640px;
+	max-height: calc(100% - 32px);
+	background: #fff;
+	border-radius: 8px;
+	box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	box-sizing: border-box;
+}
+
+.perflocale-str-modal__header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 16px 20px;
+	border-bottom: 1px solid #e0e0e0;
+}
+
+.perflocale-str-modal__header h2 {
+	margin: 0;
+	font-size: 16px;
+	font-weight: 600;
+}
+
+.perflocale-str-modal__close {
+	background: none;
+	border: none;
+	font-size: 22px;
+	cursor: pointer;
+	color: #646970;
+	padding: 4px;
+	line-height: 1;
+}
+
+.perflocale-str-modal__close:hover {
+	color: #d63638;
+}
+
+.perflocale-str-modal__body {
+	padding: 20px;
+	overflow-y: auto;
+	flex: 1;
+}
+
+.perflocale-str-modal__body label {
+	display: block;
+	font-size: 12px;
+	font-weight: 600;
+	color: #646970;
+	text-transform: uppercase;
+	letter-spacing: 0.03em;
+	margin-bottom: 4px;
+}
+
+.perflocale-str-modal__text {
+	background: #f6f7f7;
+	border: 1px solid #e0e0e0;
+	border-radius: 4px;
+	padding: 10px 12px;
+	font-size: 14px;
+	color: #1d2327;
+	word-break: break-word;
+	margin-bottom: 14px;
+	font-family: monospace;
+}
+
+.perflocale-str-modal__context {
+	margin-bottom: 14px;
+}
+
+.perflocale-str-modal__context div {
+	font-size: 13px;
+	color: #646970;
+	font-style: italic;
+}
+
+.perflocale-str-modal__placeholders {
+	margin-bottom: 14px;
+}
+
+.perflocale-str-modal__placeholders small {
+	font-weight: 400;
+	color: #646970;
+}
+
+.perflocale-str-modal__ph-list {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-top: 4px;
+}
+
+.perflocale-str-modal__ph-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 3px 8px 3px 10px;
+	border: 1px solid transparent;
+	border-radius: 999px;
+	background: transparent;
+	font-size: 12px;
+	font-weight: 600;
+	cursor: pointer;
+	transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+	line-height: 1.4;
+	text-decoration: none;
+}
+
+.perflocale-str-modal__ph-chip code {
+	background: transparent;
+	padding: 0;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12px;
+	font-weight: 600;
+}
+
+/* The leading icon dot — pure CSS, scales with chip color via currentColor. */
+.perflocale-str-modal__ph-icon {
+	display: inline-block;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	background: currentColor;
+	flex-shrink: 0;
+	transition: background 0.15s;
+	position: relative;
+}
+
+/* PRESENT: green pill, filled-circle icon. */
+.perflocale-str-modal__ph-chip.is-present {
+	background: #ecfdf5;
+	border-color: #6ee7b7;
+	color: #047857;
+}
+
+.perflocale-str-modal__ph-chip.is-present:hover {
+	background: #d1fae5;
+	border-color: #34d399;
+}
+
+.perflocale-str-modal__ph-chip.is-present .perflocale-str-modal__ph-icon::after {
+	content: "";
+	position: absolute;
+	inset: 2px 1px 2px 1px;
+	background: #ecfdf5;
+	clip-path: polygon(20% 50%, 45% 75%, 80% 25%, 75% 20%, 45% 65%, 25% 45%);
+}
+
+/* MISSING: red pill, hollow-circle icon. Default state on first open. */
+.perflocale-str-modal__ph-chip.is-missing,
+.perflocale-str-modal__ph-chip:not(.is-present):not(.is-extra):not(.is-missing) {
+	background: #fef2f2;
+	border-color: #fca5a5;
+	color: #b91c1c;
+}
+
+.perflocale-str-modal__ph-chip.is-missing:hover,
+.perflocale-str-modal__ph-chip:not(.is-present):not(.is-extra):not(.is-missing):hover {
+	background: #fee2e2;
+	border-color: #f87171;
+}
+
+.perflocale-str-modal__ph-chip.is-missing .perflocale-str-modal__ph-icon,
+.perflocale-str-modal__ph-chip:not(.is-present):not(.is-extra):not(.is-missing) .perflocale-str-modal__ph-icon {
+	background: transparent;
+	border: 2px solid currentColor;
+	box-sizing: border-box;
+}
+
+/* EXTRA: amber pill, signals over-count. */
+.perflocale-str-modal__ph-chip.is-extra {
+	background: #fffbeb;
+	border-color: #fcd34d;
+	color: #92400e;
+}
+
+.perflocale-str-modal__ph-chip.is-extra:hover {
+	background: #fef3c7;
+	border-color: #fbbf24;
+}
+
+.perflocale-str-modal__ph-chip:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: 2px;
+}
+
+.perflocale-str-modal__ph-status {
+	margin: 8px 0 0;
+	font-size: 12px;
+	color: #646970;
+	min-height: 1.4em;
+	line-height: 1.4;
+}
+
+.perflocale-str-modal__ph-status.is-clean {
+	color: #047857;
+}
+
+.perflocale-str-modal__ph-status.is-dirty {
+	color: #b91c1c;
+}
+
+/* Apply button picks up a small warning dot when validation flags an
+   issue. The dot is purely informational — clicking still allows save
+   after a confirm dialog (placeholder collapses are sometimes valid). */
+.perflocale-str-modal__footer .button-primary.has-warning {
+	position: relative;
+	padding-left: 28px;
+}
+
+.perflocale-str-modal__footer .button-primary.has-warning::after {
+	content: "";
+	position: absolute;
+	left: 10px;
+	top: 50%;
+	transform: translateY(-50%);
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: #f59e0b;
+	box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.25);
+}
+
+.perflocale-str-modal__translation {
+	margin-bottom: 0;
+}
+
+.perflocale-str-modal__translation textarea {
+	width: 100%;
+	padding: 10px 12px;
+	font-size: 14px;
+	border: 1px solid #c0c0c0;
+	border-radius: 4px;
+	resize: vertical;
+	box-sizing: border-box;
+	font-family: monospace;
+}
+
+.perflocale-str-modal__translation textarea:focus {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	box-shadow: 0 0 0 1px var(--wp-admin-theme-color, #2271b1);
+	outline: none;
+}
+
+.perflocale-str-modal__footer {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	padding: 14px 20px;
+	border-top: 1px solid #e0e0e0;
+	background: #f9f9f9;
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-str-save-row {
+			flex-direction: row;
+			align-items: center;
+			justify-content: space-between;
+		}
+}
+
+@media screen and (max-width: 782px) {
+	.perflocale-str-modal__dialog {
+			width: calc(100% - 16px);
+			max-width: none;
+			max-height: calc(100% - 16px);
+			border-radius: 10px;
+		}
+
+	.perflocale-str-modal__header {
+			padding: 14px 16px;
+		}
+
+	.perflocale-str-modal__body {
+			padding: 16px;
+		}
+
+	.perflocale-str-modal__footer {
+			padding: 12px 16px;
+			gap: 6px;
+			flex-wrap: wrap;
+		}
+
+	.perflocale-str-modal__footer .button {
+			min-height: 40px;
+			flex: 1 1 auto;
+		}
+
+	.perflocale-str-modal__ph-chip {
+			min-height: 36px;
+			padding: 6px 12px;
+			font-size: 13px;
+		}
+
+	.perflocale-str-expand-btn {
+			min-width: 32px;
+			min-height: 32px;
+			justify-content: center;
+		}
+}

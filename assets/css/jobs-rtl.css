@@ -1,0 +1,118 @@
+/* PerfLocale — Background Jobs admin page. */
+
+.perflocale-jobs-table td {
+	vertical-align: middle;
+}
+
+.perflocale-jobs-status {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 10px;
+	font-size: 11px;
+	font-weight: 600;
+}
+
+.perflocale-jobs-status.queued   { background: #f0f0f1; color: #3c434a; }
+.perflocale-jobs-status.running  { background: #dceaff; color: #0a4b78; }
+.perflocale-jobs-status.complete { background: #dff4dd; color: #1b5e20; }
+.perflocale-jobs-status.failed   { background: #fde0e0; color: #8a1f1f; }
+.perflocale-jobs-status.canceled { background: #fff1cc; color: #6e4a00; }
+
+.perflocale-jobs-progress {
+	width: 100%;
+	height: 6px;
+	background: #e4e4e7;
+	border-radius: 3px;
+	overflow: hidden;
+	margin-top: 4px;
+}
+
+.perflocale-jobs-progress > span {
+	display: block;
+	height: 100%;
+	background: #2271b1;
+	transition: width 0.2s ease;
+}
+
+/* Expandable detail row (lazily fetched via /jobs/{id}). */
+.perflocale-jobs-detail-row > td {
+	background: #f6f7f7;
+	padding: 14px 18px;
+	border-top: 1px dashed #c3c4c7;
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.perflocale-jobs-detail-loading,
+.perflocale-jobs-detail-error {
+	margin: 0;
+	color: #50575e;
+	font-style: italic;
+}
+
+.perflocale-jobs-detail-error {
+	color: #8a1f1f;
+	font-style: normal;
+}
+
+dl.perflocale-jobs-detail {
+	display: grid;
+	grid-template-columns: max-content 1fr;
+	gap: 6px 16px;
+	margin: 0;
+}
+
+dl.perflocale-jobs-detail dt {
+	font-weight: 600;
+	color: #50575e;
+	white-space: nowrap;
+}
+
+dl.perflocale-jobs-detail dd {
+	margin: 0;
+	min-width: 0;
+}
+
+dl.perflocale-jobs-detail pre {
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	padding: 8px 10px;
+	margin: 0;
+	max-height: 240px;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-family: Menlo, Consolas, monospace;
+	font-size: 12px;
+	line-height: 1.45;
+}
+
+ul.perflocale-jobs-log {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	max-height: 200px;
+	overflow-y: auto;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	background: #fff;
+}
+
+ul.perflocale-jobs-log li {
+	padding: 6px 10px;
+	border-bottom: 1px solid #f0f0f1;
+	font-family: Menlo, Consolas, monospace;
+	font-size: 12px;
+}
+
+ul.perflocale-jobs-log li:last-child {
+	border-bottom: none;
+}
+
+.perflocale-jobs-log-when {
+	color: #50575e;
+	margin-left: 8px;
+	display: inline-block;
+	min-width: 60px;
+}

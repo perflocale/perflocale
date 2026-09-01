@@ -1,0 +1,31 @@
+.pl-fb-editor{display:flex;flex-direction:column;gap:8px;max-width:900px;background:#fff;border:1px solid #dcdcde;border-radius:4px;padding:8px;}
+.pl-fb-row{display:flex;align-items:center;gap:14px;padding:10px 12px;background:#f6f7f7;border-radius:6px;border:1px solid #e5e5e7;}
+.pl-fb-row__label{display:flex;align-items:center;gap:8px;flex:0 0 160px;font-weight:600;color:#1d2327;cursor:default;}
+.pl-fb-row__label .pl-fb-flag{font-size:18px;line-height:1;}
+.pl-fb-row__body{flex:1 1 auto;display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:32px;padding:2px;border:1px dashed transparent;border-radius:6px;transition:background .15s,border-color .15s;}
+.pl-fb-row__body:not(:has(> .pl-fb-chip)) .pl-fb-empty{display:inline;}
+.pl-fb-row__body--active{background:#eef6fc;border-color:#2271b1;}
+.pl-fb-empty{display:none;color:#50575e;font-style:italic;font-size:12px;padding:0 6px;}
+.pl-fb-chip{display:inline-flex;align-items:center;gap:4px;background:#fff;border:1px solid #c3c4c7;border-radius:18px;padding:3px 4px 3px 4px;line-height:1.6;font-size:13px;box-shadow:0 1px 2px rgba(0,0,0,.04);cursor:grab;user-select:none;transition:transform .12s,box-shadow .15s,opacity .15s;}
+.pl-fb-chip:hover{box-shadow:0 2px 6px rgba(0,0,0,.08);}
+.pl-fb-chip:active{cursor:grabbing;}
+.pl-fb-chip:focus-visible{outline:2px solid #2271b1;outline-offset:2px;}
+.pl-fb-chip--dragging{opacity:.35;transform:scale(.97);box-shadow:none;}
+.pl-fb-chip--drop-before{box-shadow:-3px 0 0 0 #2271b1;}
+.pl-fb-chip--drop-after{box-shadow:3px 0 0 0 #2271b1;}
+.pl-fb-chip__grip{display:inline-flex;align-items:center;justify-content:center;width:14px;color:#8c8f94;font-size:12px;letter-spacing:-2px;cursor:grab;user-select:none;}
+.pl-fb-chip:active .pl-fb-chip__grip{cursor:grabbing;}
+.pl-fb-chip__pos{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;background:#2271b1;color:#fff;border-radius:10px;font-size:11px;font-weight:600;}
+.pl-fb-chip__name{padding:0 4px;}
+.pl-fb-chip__remove{background:none;border:0;cursor:pointer;padding:2px 5px;color:#50575e;font-size:14px;line-height:1;border-radius:3px;}
+.pl-fb-chip__remove:hover{background:#fcebeb;color:#d63638;}
+.pl-fb-row__picker{min-width:170px;height:30px;padding:0 26px 0 10px;border:1px dashed #8c8f94;background:#fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='%23646970' d='M4 6l4 4 4-4z'/></svg>") no-repeat right 8px center;background-size:14px;border-radius:18px;color:#2271b1;font-size:13px;font-weight:500;-webkit-appearance:none;-moz-appearance:none;appearance:none;cursor:pointer;transition:border-color .15s,background-color .15s;}
+.pl-fb-row__picker:hover{border-color:#2271b1;background-color:#f0f6fc;}
+.pl-fb-row__picker:focus{outline:none;border-color:#2271b1;box-shadow:0 0 0 1px #2271b1;}
+.pl-fb-row__body--full .pl-fb-row__picker{display:none;}
+
+/* Redirect-priority editor: single-row sortable chip list. Reuses the
+ * .pl-fb-chip styling for chips and adds its own minimal wrapper. */
+.pl-prio-editor{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 12px;background:#f6f7f7;border:1px solid #e5e5e7;border-radius:6px;max-width:600px;min-height:44px;}
+.pl-prio-chip{cursor:grab;}
+.pl-prio-chip:active{cursor:grabbing;}
