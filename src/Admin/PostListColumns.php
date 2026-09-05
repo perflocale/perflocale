@@ -281,9 +281,13 @@ final class PostListColumns {
 	/**
 	 * Batch-preload translations for all posts in the admin list.
 	 *
-	 * @param array<int, \WP_Post> $posts Posts from the query.
-	 * @param \WP_Query            $query The query.
-	 * @return array<int, \WP_Post> Unmodified posts.
+	 * Members that are not WP_Post instances are ignored: the_posts fires
+	 * before WP_Query normalises its members (wp-includes/class-wp-query.php),
+	 * so a sparse result can carry a null member.
+	 *
+	 * @param array<int, mixed> $posts Posts from the query; non-WP_Post members are skipped.
+	 * @param \WP_Query         $query The query.
+	 * @return array<int, mixed> The same array, unmodified.
 	 */
 	public function preload_translations_batch( array $posts, \WP_Query $query ): array {
 		if ( empty( $posts ) || ! is_admin() ) {
@@ -299,16 +303,28 @@ final class PostListColumns {
 		// on sites above the eager-link-map cap), turning a 20-row admin
 		// list into 30+ ms of avoidable work. Below the cap this is a
 		// no-op (eager-link-map already serves these as µs).
-		$post_ids = array_map( static fn( \WP_Post $p ): int => (int) $p->ID, $posts );
-		$repo     = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
+		$post_ids = [];
+
+		foreach ( $posts as $p ) {
+			if ( $p instanceof \WP_Post ) {
+				$post_ids[] = (int) $p->ID;
+			}
+		}
+
+		$repo = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 		$repo->prime_translations( \PerfLocale\Enum\ObjectType::Post, $post_ids );
 
 		// Collect all translation IDs so we can prime the WP post cache in one batch.
 		$all_translation_ids = [];
 
 		foreach ( $posts as $post ) {
-			$translations                              = $manager->get_translations( $post->ID );
-			$this->preloaded_translations[ $post->ID ] = $translations;
+			if ( ! ( $post instanceof \WP_Post ) ) {
+				continue;
+			}
+
+			$pid                                  = (int) $post->ID;
+			$translations                         = $manager->get_translations( $pid );
+			$this->preloaded_translations[ $pid ] = $translations;
 
 			foreach ( $translations as $translated_id ) {
 				if ( is_int( $translated_id ) && $translated_id > 0 ) {

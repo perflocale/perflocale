@@ -37,17 +37,47 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 
 	/**
 	 * {@inheritDoc}
+	 *
+	 * @throws \RuntimeException When Action Scheduler refuses the enqueue.
 	 */
 	public function enqueue( string $hook, array $args, string $job_id ): string {
-		as_enqueue_async_action( $hook, [ $job_id, $args ], self::GROUP );
+		// as_enqueue_async_action() documents 0 as "there was an error scheduling
+		// the action" — AS not initialised, or a `pre_as_enqueue_async_action`
+		// short-circuit that returned a non-int. Ignoring it returned the
+		// PerfLocale job id regardless, so Dispatcher::enqueue() reported
+		// mode:queued for a job with no action behind it and the row sat in
+		// `queued` until the 6-hour stuck sweep force-failed it. Throw instead,
+		// so Dispatcher's existing catch deletes the orphaned JobState row and
+		// reports mode:error — the contract WpCronRunner already honours through
+		// schedule_or_throw().
+		$action_id = as_enqueue_async_action( $hook, [ $job_id, $args ], self::GROUP );
+
+		if ( (int) $action_id <= 0 ) {
+			throw new \RuntimeException(
+				esc_html( 'Action Scheduler refused the async action for hook ' . $hook )
+			);
+		}
+
 		return $job_id;
 	}
 
 	/**
 	 * {@inheritDoc}
+	 *
+	 * @throws \RuntimeException When Action Scheduler refuses the scheduled action.
 	 */
 	public function schedule( int $timestamp, string $hook, array $args, string $job_id ): string {
-		as_schedule_single_action( max( time(), $timestamp ), $hook, [ $job_id, $args ], self::GROUP );
+		// Same zero-means-failure contract as enqueue(). This is the delayed
+		// retry / resume / busy-reschedule path, so swallowing the failure lost
+		// the job silently: the row stayed `queued` with no action behind it.
+		$action_id = as_schedule_single_action( max( time(), $timestamp ), $hook, [ $job_id, $args ], self::GROUP );
+
+		if ( (int) $action_id <= 0 ) {
+			throw new \RuntimeException(
+				esc_html( 'Action Scheduler refused the scheduled action for hook ' . $hook )
+			);
+		}
+
 		return $job_id;
 	}
 

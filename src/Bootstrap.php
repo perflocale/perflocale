@@ -74,19 +74,36 @@ final class Bootstrap {
 		$conflict = self::detect_conflicting_plugin();
 
 		if ( $conflict !== null ) {
-			add_action(
-				'admin_notices',
-				static function () use ( $conflict ): void {
-					printf(
-						'<div class="notice notice-error"><p><strong>PerfLocale</strong>: %s</p></div>',
-						sprintf(
-						/* translators: %s: conflicting plugin name */
-							esc_html__( 'Cannot run while %s is active. Please deactivate one of the two multilingual plugins to avoid conflicts.', 'perflocale' ),
-							esc_html( $conflict )
-						)
-					);
-				}
-			);
+			$notice = static function () use ( $conflict ): void {
+				printf(
+					'<div class="notice notice-error"><p><strong>PerfLocale</strong>: %1$s %2$s</p></div>',
+					sprintf(
+					/* translators: %s: conflicting plugin name */
+						esc_html__( 'Cannot run while %s is active. Please deactivate one of the two multilingual plugins to avoid conflicts.', 'perflocale' ),
+						esc_html( $conflict )
+					),
+					sprintf(
+					/* translators: %s: conflicting plugin name */
+						esc_html__( 'Your %s translations stay in the database: after deactivating it, import them from Settings &rarr; Export &amp; Import, or with `wp perflocale migrate`.', 'perflocale' ),
+						esc_html( $conflict )
+					)
+				);
+			};
+
+			// BOTH hooks. Core dispatches these as if/elseif — `admin_notices`
+			// on ordinary screens, `network_admin_notices` in Network Admin —
+			// so registering both can never double-print, and registering only
+			// the first left the one operator most likely to hit this with no
+			// signal at all: a network-activated Polylang or WPML is detected
+			// here (detect_conflicting_plugin() merges `active_sitewide_plugins`),
+			// but the person who network-activated it works in Network Admin,
+			// where `admin_notices` never fires. They saw nothing, and
+			// `wp perflocale migrate` does not exist either — CLI registration
+			// sits far below this `return` — so the CLI told them nothing
+			// either. The second sentence exists because "deactivate your
+			// multilingual plugin" is alarming advice without it.
+			add_action( 'admin_notices', $notice );
+			add_action( 'network_admin_notices', $notice );
 
 			return;
 		}
@@ -145,6 +162,21 @@ final class Bootstrap {
 		// parse_request where the full detection happens.
 		$router = $plugin->get( 'router' );
 		add_filter( 'locale', [ $router, 'filter_locale' ] );
+
+		// Resolve the language query-variable name HERE, before
+		// detect_locale_early() can resolve it as a side effect.
+		//
+		// detect_locale_early() runs on the front end only, and in query mode
+		// it calls UrlConverter::query_var(), which memoises. Admin requests
+		// take the early-return above it and so used to resolve the name later
+		// — after plugins_loaded, with more filters registered. A site whose
+		// filter was registered from a normal plugin therefore routed on `lang`
+		// on the front end and on the filtered name in wp-admin. Priming it
+		// unconditionally here means both contexts freeze the same value at the
+		// same point in the load, which is what UrlConverter::query_var()'s
+		// contract promises.
+		Router\UrlConverter::query_var();
+
 		$router->detect_locale_early();
 
 		// Rewrite manager: registers language-prefixed rewrite rules.
@@ -364,7 +396,7 @@ final class Bootstrap {
 							// failure as addressed. Internal keys (_
 							// prefix excluding _thumbnail_id which is
 							// covered by featured_image) are excluded.
-							$meta_keys = get_post_meta( $post_id );
+							$meta_keys     = get_post_meta( $post_id );
 							$has_user_meta = false;
 							if ( is_array( $meta_keys ) ) {
 								foreach ( array_keys( $meta_keys ) as $key ) {
@@ -840,9 +872,25 @@ final class Bootstrap {
 					$addon_id,
 					'boot',
 					(int) $failures[ $addon_id ],
-					$e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine()
+					\PerfLocale\Util\PathRedactor::redact( $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() )
 				);
 				continue;
+			}
+
+			// Booted cleanly, so retire any historical failure — the counter
+			// AND the operator-visible record, which are the same fact.
+			// AddonRegistry::boot_addons() does this for plugin addons; this
+			// loop had no success branch at all, so a theme addon that failed
+			// once (very often just a request landing mid-file-write during an
+			// update) carried a red admin notice forever with no way out but a
+			// WP-CLI command. Scoped to the `boot` stage: a failed migration
+			// or uninstall is a separate fact a successful boot does not
+			// invalidate. Only runs when a failure was actually recorded, so
+			// the ordinary path pays nothing.
+			if ( isset( $failures[ $addon_id ] ) ) {
+				unset( $failures[ $addon_id ] );
+				update_option( 'perflocale_addon_failures', $failures, true );
+				Addon\AddonMigrationErrors::clear_stage( $addon_id, 'boot' );
 			}
 
 			// Mark as already booted so AddonRegistry doesn't double-boot it.
@@ -1388,11 +1436,9 @@ final class Bootstrap {
 		// state (including any cascade-deleted rows from
 		// LanguageRepository::delete). Mirrors the slug-repo pattern above.
 
-
 		// Translation Memory cache key includes language IDs. When a
 		// language is renamed/deleted, the cascade in
 		// LanguageRepository::delete drops the TM rows but the per-
-
 
 		// Scheduled cleanup for abandoned import temp files.
 		//
@@ -1441,79 +1487,106 @@ final class Bootstrap {
 		// vanilla site without AS, every `add_action( 'action_scheduler_*' )`
 		// is wasted: WP stores the callback in $wp_filter, AS never fires,
 		// callback never runs.
-		if ( class_exists( 'ActionScheduler' ) || class_exists( 'ActionScheduler_Store' ) ) {
-			// Action Scheduler's default "action failure" timeout is 5
-			// minutes — actions that haven't returned in that window are
-			// re-claimed and re-fired. Our long-running migration / import /
-			// scan jobs can legitimately run for many minutes, so without
-			// raising this filter AS would silently retry while the original
-			// worker is still alive (the per-job lock blocks the second
-			// instance from running, but the operator sees ghost "failed
-			// (timed out)" actions in AS admin). Match `STUCK_TIMEOUT` so AS
-			// gives up on the same cadence as our own watchdog.
-			add_filter(
-				'action_scheduler_failure_period',
-				static function (): int {
-					return Background\JobState::STUCK_TIMEOUT;
-				}
-			);
+		// DEFERRED TO `init`. Bootstrap::init() runs while the plugin file is
+		// being included, and Action Scheduler is not loaded then on a stock
+		// WooCommerce site — it is absent at `plugins_loaded` too, appearing
+		// only between there and `init`. So this guard used to evaluate FALSE
+		// and NOTHING in this block ever registered: verified at runtime with
+		// WooCommerce active, `has_filter( 'action_scheduler_failure_period' )`
+		// was false and the AS→JobState failure bridge — the thing that stops a
+		// killed worker leaving a row `running` until the six-hour watchdog —
+		// did not exist. Priority 1 is early enough to precede any queue run.
+		add_action(
+			'init',
+			static function (): void {
+				if ( class_exists( 'ActionScheduler' ) || class_exists( 'ActionScheduler_Store' ) ) {
+					// Action Scheduler's default "action failure" timeout is 5
+					// minutes — actions that haven't returned in that window are
+					// re-claimed and re-fired. Our long-running migration / import /
+					// scan jobs can legitimately run for many minutes, so without
+					// raising this filter AS would silently retry while the original
+					// worker is still alive (the per-job lock blocks the second
+					// instance from running, but the operator sees ghost "failed
+					// (timed out)" actions in AS admin). Match `STUCK_TIMEOUT` so AS
+					// gives up on the same cadence as our own watchdog.
+					//
+					// SCOPED, because this filter is store-wide: Action Scheduler hands
+					// the callback no action context, so raising it unconditionally
+					// would extend the failure window for EVERY plugin's actions — a
+					// stuck WooCommerce or Jetpack action would sit un-reclaimed for six
+					// hours instead of five minutes. Only extend it while one of OUR
+					// long jobs is actually in flight; otherwise return whatever AS or
+					// another filter proposed, untouched.
+					add_filter(
+						'action_scheduler_failure_period',
+						static function ( $time_limit ) {
+							if ( ! Background\JobState::has_long_job_in_flight() ) {
+								return $time_limit;
+							}
 
-			// Bridge Action Scheduler failure states to JobState. When a worker
-			// triggers a PHP fatal, hits AS's timeout, or fires the shutdown
-			// monitor, AS marks its own action failed but our JobState row stays
-			// `running` until our watchdog catches it ~6h later. These three
-			// hooks close that gap so the Jobs admin UI matches *Tools →
-			// Scheduled Actions* within one cron tick.
-			//
-			// Multisite note: AS uses `$wpdb->prefix . 'actionscheduler_*'`
-			// tables (per-blog, NOT $base_prefix), and AS's queue runner is
-			// registered per blog. The failure hook therefore fires in the
-			// SAME blog context that owns the action — no switch_to_blog is
-			// needed here. JobState options also live on that blog. Verified
-			// 2026-05-18: action_id is per-blog, so a stray cross-blog handler
-			// would resolve action_id to a DIFFERENT action in the wrong blog.
-			$bridge_as_failure = static function ( $action_id, $exception_or_timeout = null ) {
-				if ( ! class_exists( '\\ActionScheduler' ) ) {
-					return;
+							return max( (int) $time_limit, Background\JobState::STUCK_TIMEOUT );
+						}
+					);
+
+					// Bridge Action Scheduler failure states to JobState. When a worker
+					// triggers a PHP fatal, hits AS's timeout, or fires the shutdown
+					// monitor, AS marks its own action failed but our JobState row stays
+					// `running` until our watchdog catches it ~6h later. These three
+					// hooks close that gap so the Jobs admin UI matches *Tools →
+					// Scheduled Actions* within one cron tick.
+					//
+					// Multisite note: AS uses `$wpdb->prefix . 'actionscheduler_*'`
+					// tables (per-blog, NOT $base_prefix), and AS's queue runner is
+					// registered per blog. The failure hook therefore fires in the
+					// SAME blog context that owns the action — no switch_to_blog is
+					// needed here. JobState options also live on that blog. Verified
+					// 2026-05-18: action_id is per-blog, so a stray cross-blog handler
+					// would resolve action_id to a DIFFERENT action in the wrong blog.
+					$bridge_as_failure = static function ( $action_id, $exception_or_timeout = null ) {
+						if ( ! class_exists( '\\ActionScheduler' ) ) {
+							return;
+						}
+						try {
+							$action = \ActionScheduler::store()->fetch_action( (int) $action_id );
+						} catch ( \Throwable $e ) {
+							return;
+						}
+						if ( ! is_object( $action ) || ! method_exists( $action, 'get_group' )
+						|| $action->get_group() !== Background\ActionSchedulerRunner::GROUP ) {
+							return;
+						}
+						$as_args = method_exists( $action, 'get_args' ) ? $action->get_args() : [];
+						$job_id  = isset( $as_args[0] ) ? (string) $as_args[0] : '';
+						if ( $job_id === '' || ! Background\JobState::is_safe_id( $job_id ) ) {
+							return;
+						}
+						$state = Background\JobState::get( $job_id );
+						if ( ! $state ) {
+							return;
+						}
+						$status = (string) ( $state['status'] ?? '' );
+						if ( in_array( $status, [ 'complete', 'failed', 'canceled' ], true ) ) {
+							return;
+						}
+						$detail = '';
+						if ( $exception_or_timeout instanceof \Throwable ) {
+							$detail = ': ' . $exception_or_timeout->getMessage();
+						} elseif ( is_array( $exception_or_timeout ) && isset( $exception_or_timeout['message'] ) ) {
+							$detail = ': ' . (string) $exception_or_timeout['message'];
+						}
+						Background\JobState::mark_failed(
+							$job_id,
+							/* translators: %s is an optional AS-supplied error message starting with ": ". */
+							sprintf( __( '[AS marked failed] Worker terminated before completion%s', 'perflocale' ), $detail )
+						);
+					};
+					add_action( 'action_scheduler_failed_execution', $bridge_as_failure, 10, 2 );
+					add_action( 'action_scheduler_failed_action', $bridge_as_failure, 10, 2 );
+					add_action( 'action_scheduler_unexpected_shutdown', $bridge_as_failure, 10, 2 );
 				}
-				try {
-					$action = \ActionScheduler::store()->fetch_action( (int) $action_id );
-				} catch ( \Throwable $e ) {
-					return;
-				}
-				if ( ! is_object( $action ) || ! method_exists( $action, 'get_group' )
-				|| $action->get_group() !== Background\ActionSchedulerRunner::GROUP ) {
-					return;
-				}
-				$as_args = method_exists( $action, 'get_args' ) ? $action->get_args() : [];
-				$job_id  = isset( $as_args[0] ) ? (string) $as_args[0] : '';
-				if ( $job_id === '' || ! Background\JobState::is_safe_id( $job_id ) ) {
-					return;
-				}
-				$state = Background\JobState::get( $job_id );
-				if ( ! $state ) {
-					return;
-				}
-				$status = (string) ( $state['status'] ?? '' );
-				if ( in_array( $status, [ 'complete', 'failed', 'canceled' ], true ) ) {
-					return;
-				}
-				$detail = '';
-				if ( $exception_or_timeout instanceof \Throwable ) {
-					$detail = ': ' . $exception_or_timeout->getMessage();
-				} elseif ( is_array( $exception_or_timeout ) && isset( $exception_or_timeout['message'] ) ) {
-					$detail = ': ' . (string) $exception_or_timeout['message'];
-				}
-				Background\JobState::mark_failed(
-					$job_id,
-					/* translators: %s is an optional AS-supplied error message starting with ": ". */
-					sprintf( __( '[AS marked failed] Worker terminated before completion%s', 'perflocale' ), $detail )
-				);
-			};
-			add_action( 'action_scheduler_failed_execution', $bridge_as_failure, 10, 2 );
-			add_action( 'action_scheduler_failed_action', $bridge_as_failure, 10, 2 );
-			add_action( 'action_scheduler_unexpected_shutdown', $bridge_as_failure, 10, 2 );
-		}
+			},
+			1
+		);
 
 		// Weekly GC for `perflocale_mt_usage_YYYY_MM` options. The MT usage
 		// admin UI only ever reads the current month + the last 12 months;
@@ -1646,7 +1719,6 @@ final class Bootstrap {
 			}
 		);
 
-
 		// Hourly stuck-job watchdog — same multisite consideration as GC.
 		add_action(
 			'perflocale_jobs_watchdog',
@@ -1654,7 +1726,6 @@ final class Bootstrap {
 				Background\JobState::run_recurring_for_blog( (int) $blog_id, [ Background\JobState::class, 'watchdog' ] );
 			}
 		);
-
 
 		// Schedule both recurring events under the current engine.
 		//
@@ -1844,7 +1915,6 @@ final class Bootstrap {
 			3
 		);
 
-
 		Background\WorkerRegistry::register(
 			'bulk_string_translate',
 			static fn(): Background\AbstractJob => new Background\Jobs\BulkStringTranslateJob()
@@ -1928,7 +1998,6 @@ final class Bootstrap {
 			},
 			20
 		);
-
 
 		/** @hook perflocale/loaded Fires after all PerfLocale services are registered. */
 		do_action( 'perflocale/loaded', $plugin );
@@ -2092,7 +2161,6 @@ final class Bootstrap {
 				$blog_arg
 			);
 		}
-
 
 		// First call after install / after a `delete_option` (e.g. via
 		// uninstall preserve-purge that wiped settings) - seed the
@@ -2647,7 +2715,7 @@ final class Bootstrap {
 
 						if ( $target_lang !== $default_lang ) {
 							try {
-								$translated_title = $mt_provider->translate(
+								$translated_title   = $mt_provider->translate(
 									$original_title,
 									$default_lang,
 									$target_lang
@@ -3990,5 +4058,4 @@ final class Bootstrap {
 			}
 		);
 	}
-
 }

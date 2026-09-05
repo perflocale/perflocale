@@ -189,6 +189,17 @@ final class DataImporter {
 			return $result;
 		}
 
+		// Undo ledger for everything this envelope writes OUTSIDE the table
+		// transaction. Settings, add-on settings, the disabled-add-on list and
+		// role grants all live in wp_options, and they are applied BEFORE the
+		// table import opens its transaction - so when the table import fails
+		// and rolls back, the tables returned to their pre-import state while
+		// those four kept the incoming bundle's values. The operator was left
+		// with the old data under the new settings and the new capability
+		// grants, and nothing said so. Each section pushes a closure that puts
+		// its own slice back; the catch below runs them in reverse.
+		$undo = [];
+
 		// Import settings - route through the Settings class so values are
 		// validated against the DEFAULTS whitelist and sanitized per type.
 		// Use the DI singleton (not `new Settings()`) so the in-process
@@ -211,6 +222,20 @@ final class DataImporter {
 			$incoming = array_intersect_key( $data['settings'], array_flip( $known ) );
 
 			if ( $incoming !== [] ) {
+				// Raw option, not $settings->all(): restoring the exact stored
+				// value round-trips even keys this build would drop.
+				$previous_settings = get_option( 'perflocale_settings' );
+
+				$undo[] = static function () use ( $previous_settings, $settings ): void {
+					if ( false === $previous_settings ) {
+						delete_option( 'perflocale_settings' );
+					} else {
+						update_option( 'perflocale_settings', $previous_settings );
+					}
+
+					$settings->reset_cache();
+				};
+
 				$settings->update( $incoming );
 			}
 
@@ -265,6 +290,11 @@ final class DataImporter {
 				$merged = array_intersect_key( $merged, $incoming );
 			}
 
+			$undo[] = static function () use ( $current ): void {
+				update_option( 'perflocale_addon_settings', $current, false );
+				\PerfLocale\Addon\AddonSettings::reset_static_caches();
+			};
+
 			update_option( 'perflocale_addon_settings', $merged, false );
 			\PerfLocale\Addon\AddonSettings::reset_static_caches();
 			++$result['imported'];
@@ -277,6 +307,12 @@ final class DataImporter {
 		// the registry so it gets the same id-validation, byte cap,
 		// write-lock, and bootable-cache flush as the admin/CLI toggles.
 		if ( isset( $data['disabled_addons'] ) && is_array( $data['disabled_addons'] ) ) {
+			$previous_disabled = \PerfLocale\Addon\AddonRegistry::get_disabled();
+
+			$undo[] = static function () use ( $previous_disabled ): void {
+				\PerfLocale\Addon\AddonRegistry::set_disabled_list( $previous_disabled );
+			};
+
 			\PerfLocale\Addon\AddonRegistry::set_disabled_list( $data['disabled_addons'] );
 			++$result['imported'];
 		}
@@ -286,6 +322,33 @@ final class DataImporter {
 		// rare, but cache flushes and admin hooks can trigger them) see the
 		// imported permission shape, not the local one.
 		if ( isset( $data['roles'] ) && is_array( $data['roles'] ) ) {
+			// One option holds every role and every capability for this site,
+			// so snapshotting it captures the Translator rebuild and each
+			// per-role grant in a single value. `role_key` is WP_Roles' own
+			// name for it, already blog-prefixed on multisite.
+			$roles_option      = function_exists( 'wp_roles' ) ? (string) wp_roles()->role_key : '';
+			$previous_roles    = $roles_option !== '' ? get_option( $roles_option ) : false;
+			$previous_caps_ver = get_option( 'perflocale_caps_version' );
+
+			$undo[] = static function () use ( $roles_option, $previous_roles, $previous_caps_ver ): void {
+				if ( $roles_option !== '' && is_array( $previous_roles ) ) {
+					update_option( $roles_option, $previous_roles );
+				}
+
+				if ( false === $previous_caps_ver ) {
+					delete_option( 'perflocale_caps_version' );
+				} else {
+					update_option( 'perflocale_caps_version', is_numeric( $previous_caps_ver ) ? (int) $previous_caps_ver : 0, false );
+				}
+
+				// WP_Roles caches the option in a singleton built once per
+				// request; without this the restored option would not be
+				// visible to current_user_can() for the rest of the request.
+				if ( function_exists( 'wp_roles' ) ) {
+					wp_roles()->for_site();
+				}
+			};
+
 			$this->restore_roles( $data['roles'] );
 			++$result['imported'];
 		}
@@ -418,12 +481,37 @@ final class DataImporter {
 					// gone, so zero inserts is always fatal.
 					$scoped_wipe = ( ( $wipe_plan[ $table_name ] ?? null ) !== null );
 
-					if (
-						$replace
-						&& $table_result['imported'] === 0
-						&& count( $rows ) > 0
-						&& ( ! $scoped_wipe || $table_result['failed'] > 0 )
-					) {
+					// A replace is a RESTORE, and a restore is all-or-nothing.
+					// The pre-import rows for this table were deleted a few
+					// lines above, inside this same transaction, so a row the
+					// database refused is not a row that "failed to merge" -
+					// it is a row the operator no longer has anywhere. Before
+					// this gate, 6,808 of 6,809 links committed and the import
+					// reported success with the error buried in a list.
+					// `failed` counts only REAL errors: duplicate-key skips
+					// (the legitimate collision on a scoped wipe, where rows
+					// of another type survive and share the id space) are
+					// counted separately and never reach here.
+					if ( $replace && $table_result['failed'] > 0 ) {
+						throw new \RuntimeException(
+							sprintf(
+								/* translators: 1: table name, 2: failed row count, 3: total row count, 4: first database error */
+								'Replace import aborted: table "%1$s" could not insert %2$d of %3$d rows; rolling back so no data is lost. %4$s',
+								$table_name,
+								$table_result['failed'],
+								count( $rows ),
+								! empty( $table_result['errors'] ) ? (string) $table_result['errors'][0] : ''
+							)
+						);
+					}
+
+					// Systematic failure with no per-row error to point at:
+					// a non-empty section inserted nothing. Unscoped tables
+					// were emptied outright, so zero inserts is always fatal.
+					// A scoped wipe reaching here has failed === 0: every row
+					// duplicate-skipped against surviving rows of another
+					// type, which is an ordinary partial import.
+					if ( $replace && $table_result['imported'] === 0 && ! $scoped_wipe ) {
 						throw new \RuntimeException(
 							sprintf(
 								/* translators: 1: table name, 2: row count */
@@ -445,6 +533,21 @@ final class DataImporter {
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$wpdb->query( 'ROLLBACK' );
 				}
+
+				// The tables are back where they started; put the envelope's
+				// out-of-transaction writes back too, newest first. Each undo
+				// is best-effort and independent - one that throws must not
+				// stop the others or replace the original failure, which is
+				// what the operator actually needs to see.
+				foreach ( array_reverse( $undo ) as $rollback ) {
+					try {
+						$rollback();
+					} catch ( \Throwable $undo_error ) {
+						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+						error_log( 'PerfLocale DataImporter: could not roll back an imported settings/roles section - ' . $undo_error->getMessage() );
+					}
+				}
+
 				throw $e;
 			}
 
@@ -1201,8 +1304,24 @@ final class DataImporter {
 			++$batch_count;
 
 			// Periodically free memory.
+			//
+			// wp_cache_flush_runtime(), NOT wp_cache_flush(). The intent here is
+			// only to drop the in-process object-cache array so a large import
+			// does not grow without bound. wp_cache_flush() does that too — but
+			// on a site with a persistent backend it ALSO empties Redis or
+			// Memcached for the whole site, evicting every other plugin's cached
+			// data every 500 rows. A 50k-row import did that a hundred times,
+			// leaving the site cold long after the import finished.
+			//
+			// With no persistent cache the two are identical (core's default
+			// implementation simply forwards to wp_cache_flush), so this is
+			// strictly a no-op there and a large win where a drop-in is active.
 			if ( $batch_count % self::BATCH_SIZE === 0 ) {
-				wp_cache_flush();
+				if ( function_exists( 'wp_cache_flush_runtime' ) ) {
+					wp_cache_flush_runtime();
+				} else {
+					wp_cache_flush();
+				}
 			}
 		}
 

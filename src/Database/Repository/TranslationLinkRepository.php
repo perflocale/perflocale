@@ -121,11 +121,18 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$results = $this->wpdb->get_results(
 			$this->wpdb->prepare(
-				"SELECT {$status_expr} AS status, COUNT(*) as count
+				// Alias deliberately NOT `status`: for GROUP BY, MySQL resolves an
+				// unqualified name against the FROM columns FIRST and only then
+				// against SELECT aliases, and `l.status` is a real column — so
+				// `GROUP BY status` grouped by the STORED status and silently
+				// merged an 'empty'/publish row with an 'empty'/draft row while
+				// emitting two rows keyed 'published'. `effective_status` exists on
+				// no joined table, so it can only bind to the CASE expression.
+				"SELECT {$status_expr} AS effective_status, COUNT(*) as count
 				FROM %i l
 				{$join}
 				WHERE {$where}
-				GROUP BY status",
+				GROUP BY effective_status",
 				array_merge( [ $this->table(), $groups_table ], $args )
 			)
 		);
@@ -134,7 +141,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 
 		if ( is_array( $results ) ) {
 			foreach ( $results as $row ) {
-				$counts[ $row->status ] = (int) $row->count;
+				$counts[ $row->effective_status ] = (int) $row->count;
 			}
 		}
 
@@ -196,7 +203,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 					WHEN l.status = 'empty' AND p.post_status = 'publish' THEN 'published'
 					WHEN l.status = 'empty' AND p.post_status = 'draft' THEN 'draft'
 					ELSE l.status
-				END AS status,
+				END AS effective_status,
 				COUNT(*) AS cnt
 			FROM %i l
 			INNER JOIN %i g ON l.group_id = g.id
@@ -204,7 +211,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 			WHERE g.type = 'post'
 				AND l.language_id IN ({$lang_ph})
 				AND p.post_type IN ({$pt_ph})
-			GROUP BY l.language_id, p.post_type, status";
+			GROUP BY l.language_id, p.post_type, effective_status";
 
 		$args = array_merge( $lang_ids, $pt_safe );
 
@@ -219,7 +226,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		foreach ( $rows as $row ) {
 			$lid = (int) $row->lid;
 			$pt  = (string) $row->pt;
-			$matrix[ $lid ][ $pt ][ (string) $row->status ] = (int) $row->cnt;
+			$matrix[ $lid ][ $pt ][ (string) $row->effective_status ] = (int) $row->cnt;
 		}
 
 		return $matrix;

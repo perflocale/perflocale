@@ -689,8 +689,111 @@ final class TranslationsController extends RestController {
 			// string (e.g. "bogus") would write a status no query matches,
 			// orphaning the translation from the admin list and the front end.
 			$requested_status = sanitize_key( $request->get_param( 'status' ) );
+			$status_obj       = get_post_status_object( $requested_status );
 
-			if ( in_array( $requested_status, get_post_stati(), true ) ) {
+			// An UNREGISTERED status is ignored, not rejected — the other
+			// fields in the same request still apply. That leniency is the
+			// documented contract and is pinned by cov-api-abilities I5/I6,
+			// which sends status=bogus alongside a title and content and
+			// requires both to land. Turning it into a 400 is an announced API
+			// change, not part of this security fix, so it is deliberately not
+			// made here. Nothing is written for an unknown status, so no
+			// capability question arises for it.
+			//
+			// is_object(), not instanceof stdClass: core builds these with a
+			// cast today, and a future WP_Post_Status class must not silently
+			// disable the capability gates below.
+			if ( is_object( $status_obj ) ) {
+				// A STATUS TRANSITION IS NOT AN EDIT. Reaching this method proves
+				// `perflocale_translate` plus `edit_post` on the target, and until
+				// now that was the only gate — so a role holding edit rights but
+				// deliberately denied publish/delete rights (the bundled Translator
+				// role is exactly that) could publish or trash content through
+				// here. Core refuses the same transition on wp/v2/posts.
+				//
+				// Worse, the target is not always a translation: for the DEFAULT
+				// language PostTranslationManager::get_translation_id() resolves a
+				// post to ITSELF, so the source post was reachable too.
+				//
+				// Mirror WP_REST_Posts_Controller::handle_status_param(): map the
+				// capability from the TARGET's own post type so custom post types
+				// with a custom capability_type are gated by their own caps, not
+				// by hard-coded 'post' names.
+				$target_type = get_post_type_object( (string) get_post_type( $translated_id ) );
+
+				if ( ! $target_type instanceof \WP_Post_Type ) {
+					return $this->error(
+						'invalid_status',
+						__( 'Unknown post type for this translation.', 'perflocale' ),
+						400
+					);
+				}
+
+				// Trash is a deletion. Use the same gate delete_translation() uses,
+				// so the two routes cannot disagree about who may remove content.
+				if ( 'trash' === $requested_status && ! current_user_can( 'delete_post', $translated_id ) ) {
+					return $this->error(
+						'rest_forbidden',
+						__( 'You cannot trash this translation.', 'perflocale' ),
+						403
+					);
+				}
+
+				// THE POLICY THIS ENDPOINT IMPLEMENTS: it sets EDITORIAL statuses
+				// only. Editorial means anything a person picks in a status
+				// dropdown — draft, pending, a workflow plugin's "in review", a
+				// custom public or private state. It does NOT mean the statuses
+				// core registers with `internal => true`, which are lifecycle
+				// bookkeeping and are never a legitimate target here.
+				//
+				// Denying them is not tidiness. `auto-draft` is COLLECTED BY
+				// CORE: wp_delete_auto_drafts(), on the daily
+				// wp_scheduled_auto_draft_delete cron, runs
+				// `wp_delete_post( $id, true )` — a FORCE delete, no trash, no
+				// undo — over every auto-draft whose POST_DATE is more than
+				// seven days old. post_date, not post_modified. An article
+				// published last month already satisfies that, so setting it to
+				// auto-draft does not buy a week's grace: core destroys it on
+				// the next cron run.
+				//
+				// So a role holding edit rights but deliberately denied delete
+				// rights — the bundled Translator role is exactly that — could
+				// set a translation, or via get_translation_id() a
+				// DEFAULT-language SOURCE post, to auto-draft and have core
+				// permanently delete it within a day. The trash gate above
+				// cannot see that coming, because auto-draft is not trash.
+				//
+				// `inherit` is the other one: it makes the post take its
+				// parent's status, and on a post with no parent the result is
+				// content that editorial queries no longer return.
+				//
+				// `trash` is `internal` too, but it is a real editorial action
+				// and is gated on delete_post immediately above, so it is
+				// exempt here rather than double-handled.
+				if ( ! empty( $status_obj->internal ) && 'trash' !== $requested_status ) {
+					return $this->error(
+						'rest_forbidden',
+						__( 'That status cannot be set through this endpoint.', 'perflocale' ),
+						403
+					);
+				}
+
+				// Anything publicly visible, privately published, or scheduled is a
+				// publish action. `public` also covers custom statuses registered by
+				// other plugins, so this needs no allowlist. `draft` and `pending`
+				// are deliberately NOT gated here — drafting is the translator's job.
+				$is_publish_transition = ! empty( $status_obj->public )
+					|| ! empty( $status_obj->private )
+					|| 'future' === $requested_status;
+
+				if ( $is_publish_transition && ! current_user_can( $target_type->cap->publish_posts ) ) {
+					return $this->error(
+						'rest_forbidden',
+						__( 'You are not allowed to publish this translation.', 'perflocale' ),
+						403
+					);
+				}
+
 				$update_data['post_status'] = $requested_status;
 			}
 		}
@@ -703,6 +806,28 @@ final class TranslationsController extends RestController {
 			$result            = wp_update_post( wp_slash( $update_data ), true );
 
 			if ( is_wp_error( $result ) ) {
+				// A refusal caused by the CLIENT'S OWN status value is a 4xx, not
+				// a 5xx. The gate above admits any registered, non-internal
+				// editorial status — including the protected workflow states other
+				// plugins register, which is deliberate — but WordPress itself can
+				// still refuse one (a status hidden from both admin lists is the
+				// case that surfaced this). Reporting the server as broken for a
+				// value the caller chose sends clients into retry loops and buries
+				// real 500s in the log. Nothing was written: the post keeps its
+				// previous status either way.
+				if ( isset( $update_data['post_status'] ) ) {
+					return $this->error(
+						'translation_status_rejected',
+						sprintf(
+							/* translators: 1: requested post status, 2: reason reported by WordPress */
+							__( 'WordPress refused the status "%1$s" for this post: %2$s', 'perflocale' ),
+							(string) $update_data['post_status'],
+							$result->get_error_message()
+						),
+						400
+					);
+				}
+
 				return $this->error( 'translation_update_failed', $result->get_error_message(), 500 );
 			}
 		}

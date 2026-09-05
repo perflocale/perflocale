@@ -1509,10 +1509,26 @@ final class Helper {
 	 *
 	 * This matches WordPress core's `wp-content/plugins/index.php` convention
 	 * and WooCommerce's `woocommerce_uploads/` pattern (`class-wc-install.php`
-	 * `create_files()`). Nginx hosts: `.htaccess` is ignored at the server
-	 * layer, but `autoindex off` (Nginx default) blocks directory listings
-	 * anyway, and the random filename tokens we use in temp/exports filenames
-	 * (62^16 ≈ 5×10^28) provide the real access control.
+	 * `create_files()`).
+	 *
+	 * IMPORTANT: `.htaccess` is honoured by Apache and LiteSpeed ONLY. Nginx
+	 * and Caddy ignore it outright, and so does Apache configured with
+	 * `AllowOverride None`. On those hosts an anonymous GET of the exact file
+	 * URL returns 200 with the full body — measured, not assumed. So the file
+	 * this function writes is defence in depth and NEVER the access control.
+	 * What actually protects a plugin-written upload there is the CSPRN in its
+	 * filename: `AdminController` names import temp files with
+	 * `wp_generate_password( 16, false )` (62^16 ≈ 5×10^28) and
+	 * `DataExportJob::default_export_path()` names exports with 32 characters
+	 * — the same length WP core uses for privacy exports, which live in this
+	 * same public tree (`wp_privacy_generate_personal_data_export_file()`). Do
+	 * not shorten either token on the strength of this file. (The export token
+	 * WAS 6 characters while this docblock claimed 62^16; the 62^16 figure was
+	 * only ever true of the import temp names.)
+	 *
+	 * Directory listings are covered separately and on every server:
+	 * `autoindex off` is the nginx default and `index.php` neutralises
+	 * `Options +Indexes` on Apache.
 	 *
 	 * IIS / `web.config`: deliberately NOT written. The WP plugin convention
 	 * is `.htaccess` + `index.*` only; IIS is a vanishing minority of WP
@@ -1534,21 +1550,36 @@ final class Helper {
 			return;
 		}
 
-		$fs = self::filesystem();
-		if ( ! $fs instanceof \WP_Filesystem_Base ) {
-			return;
-		}
-
 		$mode = defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644;
 
-		$htaccess = trailingslashit( $dir ) . '.htaccess';
-		if ( ! $fs->exists( $htaccess ) ) {
-			$fs->put_contents( $htaccess, "Deny from all\n", $mode );
-		}
+		// Helper::filesystem() returns null on an FS_METHOD=ftpext host, and
+		// wherever WP_Filesystem() cannot assemble credentials. This used to
+		// `return` there, which wrote NEITHER file — so precisely the hosts
+		// least likely to be well configured got no `.htaccess` AND no
+		// `index.php`, leaving the directory browsable under
+		// `Options +Indexes` even on Apache. Fall back to a direct write: the
+		// directory was created by wp_mkdir_p() as this same PHP user moments
+		// earlier, so if anything can write here, this can.
+		$fs    = self::filesystem();
+		$files = [
+			trailingslashit( $dir ) . '.htaccess' => "Deny from all\n",
+			trailingslashit( $dir ) . 'index.php' => "<?php\n// Silence is golden.\n",
+		];
 
-		$index = trailingslashit( $dir ) . 'index.php';
-		if ( ! $fs->exists( $index ) ) {
-			$fs->put_contents( $index, "<?php\n// Silence is golden.\n", $mode );
+		foreach ( $files as $file => $contents ) {
+			if ( $fs instanceof \WP_Filesystem_Base ) {
+				if ( ! $fs->exists( $file ) ) {
+					$fs->put_contents( $file, $contents, $mode );
+				}
+				continue;
+			}
+
+			if ( file_exists( $file ) ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents, WordPress.PHP.NoSilencedErrors.Discouraged -- WP_Filesystem being unavailable is the entire reason this branch exists, so there is nothing to route through; @ keeps an unwritable directory from emitting a warning into an AJAX/REST body, exactly as gc_stale_upload_files() does above.
+			@file_put_contents( $file, $contents );
 		}
 	}
 

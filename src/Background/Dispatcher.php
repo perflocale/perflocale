@@ -53,7 +53,7 @@ final class Dispatcher {
 	 *
 	 * @param AbstractJob          $job  Job descriptor.
 	 * @param array<string, mixed> $args Worker args.
-	 * @return array{mode: string, job_id?: string, result?: array<string,mixed>, error?: string}
+	 * @return array{mode: string, job_id?: string, duplicate?: bool, result?: array<string,mixed>, error?: string}
 	 */
 	public static function dispatch( AbstractJob $job, array $args ): array {
 		// Capability check on the dispatch side. The worker hook re-runs
@@ -119,7 +119,7 @@ final class Dispatcher {
 	 *
 	 * @param AbstractJob          $job  Job descriptor.
 	 * @param array<string, mixed> $args Worker args.
-	 * @return array{mode: string, job_id: string}|array{mode: string, error: string}
+	 * @return array{mode: string, job_id: string, duplicate?: bool}|array{mode: string, error: string}
 	 */
 	/**
 	 * Maximum serialised size of `$args` accepted by an async dispatch.
@@ -176,6 +176,46 @@ final class Dispatcher {
 					$max_depth
 				),
 			];
+		}
+
+		// Idempotent admission. Two identical dispatches - a double-clicked
+		// admin button, a retried REST call, the same `--async` command run
+		// twice - used to create two independent jobs for one logical
+		// operation. The default per-type concurrency of 1 serialises them, so
+		// on a stock install the second mostly re-walks work the first already
+		// did; but an operator who raises
+		// `perflocale/jobs/max_concurrent/{type}` to overlap same-type work
+		// gets both running at once, and then the provider is called twice for
+		// every string and paid for twice, with an unlinked draft left behind.
+		//
+		// Scoped to the exact operation (type + identical args + this blog),
+		// never a global lock: different work of the same type still runs in
+		// parallel exactly as before.
+		/**
+		 * Filter whether an identical in-flight job blocks a new dispatch.
+		 *
+		 * Return false to allow duplicate admission (the pre-1.0.2 behaviour).
+		 *
+		 * @hook perflocale/jobs/deduplicate_admission
+		 * @param bool        $enabled Default true.
+		 * @param string      $type    Job type slug.
+		 * @param array       $args    Worker args.
+		 */
+		if ( (bool) apply_filters( 'perflocale/jobs/deduplicate_admission', true, $job->get_type(), $args ) ) {
+			$in_flight = JobState::find_active_duplicate( $job->get_type(), $args );
+
+			if ( $in_flight !== null ) {
+				JobState::append_log(
+					$in_flight,
+					__( 'An identical dispatch arrived while this job was still in flight; it was folded into this job instead of starting a second one.', 'perflocale' )
+				);
+
+				return [
+					'mode'      => 'async',
+					'job_id'    => $in_flight,
+					'duplicate' => true,
+				];
+			}
 		}
 
 		$runner = JobRunnerFactory::pick();

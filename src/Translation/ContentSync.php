@@ -37,6 +37,15 @@ final class ContentSync {
 	private readonly PostTranslationManager $manager;
 
 	/**
+	 * Cache manager. Held so a sibling whose row needed no write still gets
+	 * its object caches flushed - that is where the public
+	 * `perflocale/cache/flush_object` purge signal comes from.
+	 *
+	 * @var CacheManager
+	 */
+	private readonly CacheManager $cache;
+
+	/**
 	 * Short TTL for the cross-request sync lock (seconds).
 	 *
 	 * Long enough to outlive a normal sync; short enough that a crashed
@@ -52,6 +61,7 @@ final class ContentSync {
 	 */
 	public function __construct( Settings $settings, CacheManager $cache ) {
 		$this->settings = $settings;
+		$this->cache    = $cache;
 		$this->manager  = new PostTranslationManager( $cache, $settings );
 	}
 
@@ -258,10 +268,12 @@ final class ContentSync {
 			// explicitly declared mirror. Keys added via the public
 			// `perflocale/sync_fields` filter stay mirror (documented as
 			// "fields synced across translations").
-			$seed_only = array_values( array_diff(
-				array_unique( array_merge( $addon_keys, array_diff( $sync_fields, $before_for_post ) ) ),
-				$mirror_keys
-			) );
+			$seed_only = array_values(
+				array_diff(
+					array_unique( array_merge( $addon_keys, array_diff( $sync_fields, $before_for_post ) ) ),
+					$mirror_keys
+				)
+			);
 
 			$translations = $this->manager->get_translations( $post_id );
 
@@ -501,10 +513,11 @@ final class ContentSync {
 		];
 
 		// Collect post-level updates, fetch source post only once if needed.
-		$update       = [ 'ID' => $target_id ];
-		$needs_source = false;
-		$has_meta     = false;
-		$has_thumb    = false;
+		$identical_fields_dropped = false;
+		$update                   = [ 'ID' => $target_id ];
+		$needs_source             = false;
+		$has_meta                 = false;
+		$has_thumb                = false;
 
 		foreach ( $fields as $field ) {
 			if ( $field === 'featured_image' ) {
@@ -573,6 +586,85 @@ final class ContentSync {
 				}
 			}
 
+			// Drop every field the sibling already holds. wp_update_post()
+			// rewrites the row and fires save_post / post_updated /
+			// transition_post_status even when all values are identical, so a
+			// source save that touched none of the synced fields still cost one
+			// full post write per translation. $current is read under the same
+			// sibling lock the write is made under, so it is the row
+			// wp_update_post() goes on to merge into.
+			//
+			// This decides only WHETHER to write. wp_insert_post() still
+			// reconciles the columns it owns on any write that does happen.
+			if ( count( $update ) > 1 ) {
+				$current = get_post( $target_id );
+
+				if ( $current instanceof \WP_Post ) {
+					// Numeric columns compare as integers (post_author is a numeric
+					// string on WP_Post), the rest as strings.
+					$sibling_now = [
+						'menu_order'     => (int) $current->menu_order,
+						'post_author'    => (int) $current->post_author,
+						'post_parent'    => (int) $current->post_parent,
+						'comment_status' => (string) $current->comment_status,
+						'ping_status'    => (string) $current->ping_status,
+					];
+
+					// Fields wp_insert_post() replaces when the incoming value is
+					// empty: comment_status becomes 'closed' on an update,
+					// ping_status the post type's default, post_author the current
+					// user. An empty value is therefore never "already held" - the
+					// row would end up holding what core substitutes, not what we
+					// compared. menu_order and post_parent are plain int casts and
+					// need no such exception, so a legitimate 0 still compares.
+					$normalised_when_empty = [
+						'post_author'    => true,
+						'comment_status' => true,
+						'ping_status'    => true,
+					];
+
+					foreach ( $sibling_now as $key => $sibling_value ) {
+						if ( ! array_key_exists( $key, $update )
+							|| ( isset( $normalised_when_empty[ $key ] ) && empty( $update[ $key ] ) ) ) {
+							continue;
+						}
+
+						$incoming = is_int( $sibling_value ) ? (int) $update[ $key ] : (string) $update[ $key ];
+
+						if ( $incoming === $sibling_value ) {
+							unset( $update[ $key ] );
+							$identical_fields_dropped = true;
+						}
+					}
+
+					// post_date, post_date_gmt and edit_date are one package, not
+					// three values. edit_date is a control flag: without it
+					// wp_update_post() sets $clear_date on a sibling that is a
+					// draft/pending/auto-draft with a zero post_date_gmt and
+					// rewrites its post_date to the current time
+					// (wp-includes/post.php). The trio may only be dropped when
+					// doing so leaves nothing to write at all; any write that still
+					// happens carries all three exactly as built above.
+					$other_fields = array_diff_key(
+						$update,
+						[
+							'ID'            => true,
+							'post_date'     => true,
+							'post_date_gmt' => true,
+							'edit_date'     => true,
+						]
+					);
+
+					if ( $other_fields === []
+						&& isset( $update['post_date'] )
+						&& (string) $update['post_date'] === (string) $current->post_date
+						&& (string) ( $update['post_date_gmt'] ?? '' ) === (string) $current->post_date_gmt ) {
+						unset( $update['post_date'], $update['post_date_gmt'], $update['edit_date'] );
+						$identical_fields_dropped = true;
+					}
+				}
+			}
+
 			// Only call wp_update_post if there are actual fields to update.
 			if ( count( $update ) > 1 ) {
 				$result = wp_update_post( $update, true );
@@ -585,6 +677,14 @@ final class ContentSync {
 					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic; one line per vetoed sibling update.
 					error_log( sprintf( 'PerfLocale ContentSync: wp_update_post failed for sibling %d: %s', $target_id, $result->get_error_message() ) );
 				}
+			} elseif ( $identical_fields_dropped ) {
+				// The row already held every value, so no write and therefore
+				// no save_post -> CacheInvalidator::on_save_post for this
+				// sibling. Flush its object caches here instead: integrations
+				// purge their CDN from `perflocale/cache/flush_object`, and
+				// that signal has to keep arriving for a sibling whenever the
+				// write it used to ride on would have happened.
+				$this->cache->flush_object( $target_id, 'post' );
 			}
 		}
 

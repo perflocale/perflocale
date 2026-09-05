@@ -59,6 +59,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   - `perflocale/breaker/cooldown_seconds/{key}` (int, default 300) —
  *     OPEN duration before the breaker probes again.
  *
+ *   - `perflocale/breaker/probe_lease_seconds` (int, key-aware) — how long
+ *     the single HALF_OPEN probe holds its turn. Defaults to the breaker's
+ *     own cooldown, clamped to 30-300s.
+ *
  * Per-key filters fall back to the generic `perflocale/breaker/*`
  * variant (no `{key}` suffix) so site owners can tune all breakers at
  * once or just one specific breaker.
@@ -76,6 +80,11 @@ final class Breaker {
 	 * breaker, autoload off.
 	 */
 	private const TRANSIENT_PREFIX = 'perflocale_breaker_';
+
+	/**
+	 * {@see Lock} name prefix for the HALF_OPEN single-probe lease.
+	 */
+	private const PROBE_LOCK_PREFIX = 'breaker_probe_';
 
 	/**
 	 * Defaults — every per-key filter falls back to these if no per-key
@@ -123,8 +132,9 @@ final class Breaker {
 		}
 
 		if ( $state['state'] === self::STATE_HALF_OPEN ) {
-			// Probe state — allow the call through.
-			return false;
+			// Probe state — exactly ONE caller may go through. Everyone else
+			// keeps getting the refusal until that probe reports back.
+			return ! self::claim_probe( $key );
 		}
 
 		// OPEN: check cooldown.
@@ -134,10 +144,78 @@ final class Breaker {
 			// Cooldown elapsed → promote to HALF_OPEN and allow probe.
 			$state['state'] = self::STATE_HALF_OPEN;
 			self::write_state( $key, $state );
-			return false;
+			return ! self::claim_probe( $key );
 		}
 
 		return true;
+	}
+
+	/**
+	 * Try to take the single-probe lease for a HALF_OPEN breaker.
+	 *
+	 * The state transient alone cannot enforce "one probe": every caller
+	 * that reads HALF_OPEN reads the same value and lets itself through, so
+	 * N concurrent callers all probed a provider that had just failed hard
+	 * enough to open the breaker — N paid calls, N timeouts, and N chances
+	 * to re-open it. The lease is a {@see Lock} row: `INSERT IGNORE` on the
+	 * options unique key, so InnoDB picks exactly one winner, and the TTL
+	 * means a probe that dies without reporting cannot wedge the breaker.
+	 *
+	 * Only reachable in HALF_OPEN — the CLOSED hot path returns before it,
+	 * so a healthy provider pays nothing for this.
+	 *
+	 * @param string $key Breaker key.
+	 * @return bool True when this caller owns the probe.
+	 */
+	private static function claim_probe( string $key ): bool {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			// No database to arbitrate the lease (early boot, or a harness
+			// with stubbed storage). Fall back to the pre-lease behaviour and
+			// let the probe through: one extra probe against a degraded
+			// provider is a far better outcome than a fatal raised by the
+			// very code whose job is to keep a failing dependency from taking
+			// the site down. Same fallback the streak counter takes.
+			return true;
+		}
+
+		/**
+		 * Filter how long a single HALF_OPEN probe may hold its lease.
+		 *
+		 * Defaults to the breaker's own cooldown, clamped to 30-300s: long
+		 * enough to cover a slow provider timeout, short enough that a
+		 * killed worker's lease frees up well inside one cooldown.
+		 *
+		 * @hook perflocale/breaker/probe_lease_seconds
+		 * @param int    $seconds Lease TTL.
+		 * @param string $key     Breaker key.
+		 */
+		$ttl = (int) apply_filters(
+			'perflocale/breaker/probe_lease_seconds',
+			min( 300, max( 30, self::cooldown_seconds( $key ) ) ),
+			$key
+		);
+
+		return Lock::acquire( self::PROBE_LOCK_PREFIX . self::sanitize_key( $key ), max( 1, $ttl ) );
+	}
+
+	/**
+	 * Release the single-probe lease. Called the moment the probe reports
+	 * back (either way), so the next HALF_OPEN window is immediately
+	 * available instead of waiting out the lease TTL.
+	 *
+	 * @param string $key Breaker key.
+	 * @return void
+	 */
+	private static function release_probe( string $key ): void {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return;
+		}
+
+		Lock::release( self::PROBE_LOCK_PREFIX . self::sanitize_key( $key ) );
 	}
 
 	/**
@@ -177,6 +255,7 @@ final class Breaker {
 					'reason'        => $reason,
 				]
 			);
+			self::release_probe( $key );
 			return;
 		}
 
@@ -227,6 +306,18 @@ final class Breaker {
 		if ( $state['failures'] >= $threshold ) {
 			$state['state']     = self::STATE_OPEN;
 			$state['opened_at'] = $now;
+		} elseif ( self::read_state( $key )['state'] !== self::STATE_CLOSED ) {
+			// Publishing is the one step that is NOT atomic: the counter is
+			// decided by the database, but the state transient is a blind
+			// whole-array write. During a failure storm a caller whose count
+			// stayed below the threshold can land its write AFTER a peer that
+			// crossed it, replacing `open` with a stale `closed/n` — and the
+			// breaker that had just tripped starts forwarding calls again.
+			// The re-read in the elseif above stands this caller down when
+			// someone already opened it. Not a CAS (transients offer none),
+			// but it closes the window from "the whole call" to "these two
+			// lines", and it only runs on the sub-threshold failure path.
+			return;
 		}
 
 		self::write_state( $key, $state );
@@ -257,6 +348,7 @@ final class Breaker {
 
 		self::write_state( $key, self::initial_state() );
 		self::clear_streak_counter( $key );
+		self::release_probe( $key );
 	}
 
 	/**
@@ -271,6 +363,7 @@ final class Breaker {
 		$sanitized = self::sanitize_key( $key );
 		delete_transient( self::TRANSIENT_PREFIX . $sanitized );
 		self::clear_streak_counter( $key );
+		self::release_probe( $key );
 		self::index_remove( $sanitized );
 	}
 
@@ -553,7 +646,25 @@ final class Breaker {
 		// Defensive defaults: pad missing keys so callers never have to
 		// branch on isset(). Catches the case where a schema-extension
 		// added a new field after the transient was last written.
-		return array_merge( self::initial_state(), $stored );
+		$state = array_merge( self::initial_state(), $stored );
+
+		// Coerce the shape as well as the keys. Breaker state lives in a
+		// transient, i.e. in whatever object cache the host runs - shared
+		// with every other plugin, and restorable from a stale dump. An
+		// array or object where a timestamp belongs turns `time() - $x` into
+		// a fatal TypeError on a path whose entire job is to keep a failing
+		// dependency from taking the site down. Anything that is not a plain
+		// scalar counts as absent.
+		foreach ( [ 'failures', 'first_failure', 'last_failure', 'opened_at' ] as $int_field ) {
+			$state[ $int_field ] = is_numeric( $state[ $int_field ] ) ? max( 0, (int) $state[ $int_field ] ) : 0;
+		}
+
+		$state['state']  = in_array( $state['state'], [ self::STATE_CLOSED, self::STATE_OPEN, self::STATE_HALF_OPEN ], true )
+			? $state['state']
+			: self::STATE_CLOSED;
+		$state['reason'] = is_scalar( $state['reason'] ) ? (string) $state['reason'] : '';
+
+		return $state;
 	}
 
 	/**

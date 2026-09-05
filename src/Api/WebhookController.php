@@ -315,10 +315,14 @@ final class WebhookController extends RestController {
 	 * to probe internal services. Block the common cases here. Sites that
 	 * genuinely need internal delivery can opt in via the filter.
 	 *
-	 * @param string $url Raw URL.
+	 * @param string $url        Raw URL.
+	 * @param bool   $filterable Whether to run the `perflocale/webhooks/url_safe`
+	 *   filter on the verdict. True for every caller-supplied URL; the AAAA
+	 *   re-entry below passes false so a site's filter is never handed a
+	 *   synthetic `https://[<ipv6>]/` URL nobody registered.
 	 * @return bool True if safe to deliver to.
 	 */
-	private function is_url_safe( string $url ): bool {
+	private function is_url_safe( string $url, bool $filterable = true ): bool {
 		$parts = wp_parse_url( $url );
 
 		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
@@ -441,6 +445,26 @@ final class WebhookController extends RestController {
 				// Loopback 127.0.0.0/8 - not covered by NO_RES_RANGE.
 				$safe = false;
 			}
+
+			// AAAA blind spot. gethostbyname() is IPv4-only, so a hostname
+			// publishing A=<public> alongside AAAA=::1 passes everything above
+			// and a dual-stack box may still deliver over the IPv6 answer.
+			// Re-enter this method with each AAAA literal rather than restating
+			// the rules, so the IPv4-mapped unwrap and the fc00::/fe80:: byte
+			// checks apply verbatim; $filterable is false so the public
+			// url_safe filter is not handed a URL nobody registered. An IP
+			// literal never reaches this branch, so the recursion is one level
+			// deep. Mirrors AbstractProvider::validate_url(); keep in sync.
+			foreach ( ( $safe ? self::resolve_aaaa( $host ) : [] ) as $ipv6 ) {
+				if ( ! $this->is_url_safe( 'https://[' . $ipv6 . ']/', false ) ) {
+					$safe = false;
+					break;
+				}
+			}
+		}
+
+		if ( ! $filterable ) {
+			return $safe;
 		}
 
 		/**
@@ -454,6 +478,49 @@ final class WebhookController extends RestController {
 		 * @param string $url Raw URL being evaluated.
 		 */
 		return (bool) apply_filters( 'perflocale/webhooks/url_safe', $safe, $url );
+	}
+
+	/**
+	 * Resolve a hostname's AAAA records, cached for 5 minutes.
+	 *
+	 * Fails OPEN when `dns_get_record` is unavailable (some managed hosts
+	 * disable it): refusing every webhook there would break delivery on those
+	 * sites to close a hole the A-record gate already covers in the ordinary
+	 * case. Twin of
+	 * {@see \PerfLocale\MachineTranslation\AbstractProvider::resolve_aaaa()};
+	 * keep them in sync.
+	 *
+	 * @param string $host Hostname (never an IP literal — the caller checks first).
+	 * @return array<int, string> IPv6 literals; empty when there are none or the
+	 *   lookup is unavailable.
+	 */
+	private static function resolve_aaaa( string $host ): array {
+		if ( ! function_exists( 'dns_get_record' ) ) {
+			return [];
+		}
+
+		$cache_key = 'perflocale_dns6_' . md5( $host );
+		$cached    = get_transient( $cache_key );
+
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- dns_get_record() warns on a temporary resolver failure; the is_array() test below handles it and this lookup fails open by design.
+		$records   = @dns_get_record( $host, DNS_AAAA );
+		$addresses = [];
+
+		foreach ( ( is_array( $records ) ? $records : [] ) as $record ) {
+			$ipv6 = is_array( $record ) ? (string) ( $record['ipv6'] ?? '' ) : '';
+
+			if ( $ipv6 !== '' ) {
+				$addresses[] = $ipv6;
+			}
+		}
+
+		set_transient( $cache_key, $addresses, 5 * MINUTE_IN_SECONDS );
+
+		return $addresses;
 	}
 
 	/**
@@ -1110,11 +1177,27 @@ final class WebhookController extends RestController {
 					$jitter = 30;
 				}
 
-				BackgroundEvents::enqueue(
+				// enqueue() returns a truthful boolean. Discarding it meant a
+				// refused admission (an Action Scheduler store error, a
+				// pre_schedule_event veto, a duplicate) produced NO retry and NO
+				// record: the delivery simply vanished. Fall through to the
+				// durable failure log instead, which is bounded and already
+				// exists — deliberately NOT a synchronous retry or a busy wait.
+				$deferred = BackgroundEvents::enqueue(
 					self::RETRY_HOOK,
 					[ $webhook_id, $event, $data, $timestamp, $attempt, $delivery_id, $breaker_deferrals + 1 ],
 					max( 30, $cooldown ) + $jitter
 				);
+
+				if ( ! $deferred ) {
+					$this->record_failure(
+						$webhook_id,
+						$event,
+						$timestamp,
+						'Retry could not be scheduled while the circuit breaker was open; the delivery was dropped.'
+					);
+				}
+
 				return;
 			}
 
@@ -1229,11 +1312,24 @@ final class WebhookController extends RestController {
 
 			$delay = max( 1, $base_delay + $jitter );
 
-			BackgroundEvents::enqueue(
+			$scheduled = BackgroundEvents::enqueue(
 				self::RETRY_HOOK,
 				[ $webhook_id, $event, $data, $timestamp, $attempt + 1, $delivery_id ],
 				$delay
 			);
+
+			// Same reasoning as the deferral path above: if the scheduler refuses
+			// the retry there will be no further attempt, so this is the last
+			// chance to leave a durable record. Without it the `else` below was
+			// skipped too and the failure was lost entirely.
+			if ( ! $scheduled ) {
+				$this->record_failure(
+					$webhook_id,
+					$event,
+					$timestamp,
+					$error . ' (retry could not be scheduled; no further attempt will be made)'
+				);
+			}
 		} else {
 			$this->record_failure( $webhook_id, $event, $timestamp, $error );
 		}
@@ -1268,13 +1364,29 @@ final class WebhookController extends RestController {
 			// Strip ASCII control chars / NULs that could break the
 			// rendered table on the admin page, then bound to 200 chars.
 			$error = (string) preg_replace( '/[\x00-\x1F\x7F]+/', ' ', $error );
+
+			// The paragraph above assumes a WP_Error message carries no
+			// secret. That holds for the transports WordPress ships, but the
+			// message is composed by whatever handles the request: a
+			// site-local `pre_http_request` filter, a custom transport or a
+			// proxy integration can fold the outgoing request - including the
+			// webhook signing secret - into it, and this log is rendered to
+			// every manage_options account. Mask credential-shaped runs so the
+			// assumption is enforced rather than merely documented.
+			$error = \PerfLocale\Util\SecretMasker::mask( $error );
 		}
 
 		// Serialize the read-modify-write through a lock so two webhook
 		// deliveries failing in the same tick don't both read the pre-write
 		// log, both append their own entry, and lose one record on the
 		// second update_option().
-		Lock::with(
+		// Lock::with() returns null when it could not take the lock — it is a
+		// NON-BLOCKING mutex, so contention means the critical section never ran.
+		// Discarding that meant a real delivery failure could go unrecorded while
+		// the admin failure log showed nothing at all. Log the miss instead of
+		// retrying or waiting: the section is deliberately short and a busy wait
+		// here would be worse than a missing row.
+		$logged = Lock::with(
 			'webhook_failure_log',
 			5,
 			function () use ( $webhook_id, $event, $timestamp, $error ): void {
@@ -1300,6 +1412,17 @@ final class WebhookController extends RestController {
 				update_option( self::FAILURES_KEY, $log, false );
 			}
 		);
+
+		if ( null === $logged ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log(
+				sprintf(
+					'PerfLocale WebhookController: webhook %s failed for event %s, but the failure log was locked and the entry was not recorded.',
+					$webhook_id,
+					$event
+				)
+			);
+		}
 	}
 
 	/**
@@ -1309,7 +1432,10 @@ final class WebhookController extends RestController {
 	 * @return void
 	 */
 	private function clear_failure( string $webhook_id ): void {
-		Lock::with(
+		// A lock miss here leaves a stale failure row visible in the admin until
+		// the next successful delivery clears it. Self-healing, but the operator
+		// is looking at a failure that no longer exists, so make it observable.
+		$cleared = Lock::with(
 			'webhook_failure_log',
 			5,
 			function () use ( $webhook_id ): void {
@@ -1333,6 +1459,15 @@ final class WebhookController extends RestController {
 				}
 			}
 		);
+		if ( null === $cleared ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log(
+				sprintf(
+					'PerfLocale WebhookController: webhook %s delivered successfully, but the failure log was locked so its stale failure rows remain until the next success.',
+					$webhook_id
+				)
+			);
+		}
 	}
 
 	/**

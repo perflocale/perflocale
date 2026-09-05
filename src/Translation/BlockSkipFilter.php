@@ -139,6 +139,21 @@ final class BlockSkipFilter {
 		$content = (string) $translated[1];
 
 		foreach ( $map as $placeholder => $original_html ) {
+			// The protected subtree exists ONLY in the stash at this point, so
+			// a provider that dropped or rewrote the placeholder comment would
+			// have us persist a post with that content deleted. Keep the
+			// untranslated source instead: losing a translation is recoverable,
+			// losing the content is not. Same contract as the string path,
+			// which rejects a translation that lost a mask token outright.
+			if ( strpos( $content, $placeholder ) === false ) {
+				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent content-loss point.
+				error_log( 'PerfLocale BlockSkipFilter: the machine-translation provider did not return every "do not translate" placeholder; keeping the source content for this post.' );
+
+				$translated[1] = (string) $original[1];
+
+				return $translated;
+			}
+
 			$content = str_replace( $placeholder, $original_html, $content );
 		}
 
@@ -174,17 +189,38 @@ final class BlockSkipFilter {
 
 			if ( $is_skip ) {
 				$original = (string) ( $block['innerHTML'] ?? '' );
+				$has_kids = ! empty( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] );
 
-				if ( $original !== '' ) {
+				if ( $original !== '' || $has_kids ) {
 					// Plain HTML-comment placeholder so it round-trips through
 					// providers unchanged (they treat comments as
 					// untranslatable boilerplate in HTML mode).
 					$token = '<!-- perflocale-skip-' . wp_generate_uuid4() . ' -->';
 
-					$placeholders[ $token ] = $original;
+					// Stash the ENTIRE serialized subtree - delimiters, attrs,
+					// innerHTML AND every innerBlock. Stashing only innerHTML
+					// while overwriting innerContent with a single string chunk
+					// DELETED the children: serialize_blocks() rebuilds a block
+					// by walking innerContent and emitting the next innerBlock
+					// for each NULL entry, so a chunk list containing no NULLs
+					// drops every child. A protected Quote kept its cite and
+					// lost its paragraph; a protected Group lost everything
+					// inside it.
+					$placeholders[ $token ] = serialize_block( $block );
 
-					$block['innerHTML']    = $token;
-					$block['innerContent'] = [ $token ];
+					// Replace the whole node with a freeform block
+					// (blockName === null), which serialize_block() renders as
+					// its innerHTML verbatim - i.e. the bare token. The
+					// wrapper's own delimiters and attribute JSON therefore
+					// never reach the provider either, which is what the
+					// "whole block subtree is preserved" contract always said.
+					$block = [
+						'blockName'    => null,
+						'attrs'        => [],
+						'innerBlocks'  => [],
+						'innerHTML'    => $token,
+						'innerContent' => [ $token ],
+					];
 				}
 
 				// Don't recurse - the whole block subtree is preserved.

@@ -93,6 +93,8 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param callable             $progress `function(int, int): void` —
 	 *                                       reports (processed, total).
 	 * @return array<string, mixed> `created`, `skipped`, `failed`, `first_error`.
+	 * @throws \RuntimeException When machine translation is disabled for the site
+	 *                            after the job was queued.
 	 */
 	public function execute( array $args, callable $progress ): array {
 		// Meta-field MT is per-dispatch opt-in (the curated key registry is
@@ -114,6 +116,19 @@ final class BulkTranslateJob extends AbstractJob {
 		$plugin   = Plugin::get_instance();
 		$settings = $plugin->get( 'settings' );
 		$cache    = $plugin->get( 'cache' );
+
+		// Re-check the MASTER switch at worker time, not just at dispatch. A
+		// bulk run can sit in the queue for hours; an operator who turns machine
+		// translation off in Settings expects the queued work to stop, not to
+		// keep spending provider budget. WorkerRegistry re-validates the
+		// dispatching user's capability before execute() but knows nothing about
+		// MT settings. Same exception and same message as
+		// BulkStringTranslateJob::execute(), so both bulk paths report an
+		// operator disable identically, and SiteTranslateJob inherits the gate
+		// because it runs every chunk through this method.
+		if ( ! $settings->mt_enabled() ) {
+			throw new \RuntimeException( esc_html__( 'Machine translation is disabled in settings.', 'perflocale' ) );
+		}
 
 		// Resolve language ID → object once so the inner loop is just
 		// dictionary lookups.
@@ -217,12 +232,31 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @return void
 	 */
 	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, object $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error ): void {
+		// `perflocale_use_mt` is the capability that authorises SPENDING the
+		// provider; `perflocale_manage_translations` — the one WorkerRegistry
+		// re-validates at worker time — only authorises running the job. A queued
+		// bulk run can sit for hours, so evaluate the MT capability here instead
+		// of trusting the dispatch-time decision. Evaluated ONCE (the identity
+		// cannot change inside the loop) and folded into the existing per-row
+		// gate, so a revoked capability produces exactly the "skipped" accounting
+		// an unauthorised post already produces rather than a new failure shape.
+		$can_use_mt = current_user_can( 'perflocale_use_mt' );
+
+		// Say WHY the run did nothing. Without this the job completes with every
+		// row "skipped" and an empty error, which reads as "there was nothing to
+		// translate" rather than "the dispatching user lost the capability" — the
+		// operator has no way to tell those apart from the Jobs page or the REST
+		// detail endpoint.
+		if ( ! $can_use_mt && $first_error === '' ) {
+			$first_error = __( 'Machine translation is not permitted for the dispatching user (perflocale_use_mt).', 'perflocale' );
+		}
+
 		foreach ( $source_ids as $source_id ) {
 			// Re-check the per-row capability inside the worker. The
 			// dispatch-side capability gate is `perflocale_manage_translations`;
 			// individual posts still respect `edit_post` so a user can't
 			// trigger MT for content they couldn't otherwise edit.
-			if ( ! current_user_can( 'edit_post', $source_id ) ) {
+			if ( ! $can_use_mt || ! current_user_can( 'edit_post', $source_id ) ) {
 				$skipped   += count( $target_ids );
 				$processed += count( $target_ids );
 				$tick( $processed );

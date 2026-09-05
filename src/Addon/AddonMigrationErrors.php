@@ -118,6 +118,39 @@ final class AddonMigrationErrors {
 	}
 
 	/**
+	 * Clear one addon's records for a single stage.
+	 *
+	 * Narrower than {@see clear()} on purpose. A successful boot proves the
+	 * `boot` records are stale; it says nothing about a failed migration or a
+	 * failed custom uninstall, which are separate facts the operator still
+	 * needs to see.
+	 *
+	 * @param string $addon_id Addon identifier.
+	 * @param string $stage    Stage label to drop, e.g. 'boot'.
+	 * @return int Number of records removed.
+	 */
+	public static function clear_stage( string $addon_id, string $stage ): int {
+		return (int) self::with_lock(
+			static function () use ( $addon_id, $stage ): int {
+				$records = (array) get_option( self::OPTION, [] );
+				$before  = count( $records );
+
+				$records = array_filter(
+					$records,
+					static fn( $r ) => ( $r['addon_id'] ?? '' ) !== $addon_id || ( $r['stage'] ?? '' ) !== $stage
+				);
+
+				if ( count( $records ) === $before ) {
+					return 0;
+				}
+
+				update_option( self::OPTION, $records, false );
+				return $before - count( $records );
+			}
+		);
+	}
+
+	/**
 	 * Get all recorded errors.
 	 *
 	 * @return array<string, array<string, mixed>>
@@ -200,7 +233,7 @@ final class AddonMigrationErrors {
 		}
 		printf(
 			'</ul><p>%s</p></div>',
-			esc_html__( 'Clear via: wp perflocale addon errors --clear', 'perflocale' )
+			esc_html__( 'Clear via WP CLI: wp perflocale addon errors --clear', 'perflocale' )
 		);
 	}
 }

@@ -12,6 +12,7 @@ namespace PerfLocale\Api;
 use PerfLocale\Concurrency\Lock;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\MachineTranslation\CostEstimator;
+use PerfLocale\Translation\MtRateLimiter;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -556,120 +557,12 @@ final class MachineTranslateController extends RestController {
 	 * @return \WP_Error|null WP_Error on denial, null when allowed.
 	 */
 	private function enforce_rate_limit( int $user_id ): ?\WP_Error {
-		if ( $user_id <= 0 ) {
-			// Uncredentialed requests never reach here (admin_permissions
-			// gate), but defend in depth just in case.
-			return null;
-		}
-
-		/**
-		 * Filter the per-user hourly MT request ceiling.
-		 *
-		 * @hook perflocale/mt/rate_limit
-		 * @param int $limit Max requests per hour per user. Default 500.
-		 */
-		$limit  = (int) apply_filters( 'perflocale/mt/rate_limit', 500 );
-		$window = HOUR_IN_SECONDS;
-
-		/**
-		 * Filter the site-wide hourly MT request ceiling. Applies across
-		 * ALL users summed together — bounds the total provider-quota burn
-		 * a hostile editor or compromised account can cause within an hour.
-		 * Set to 0 to disable the site cap (per-user cap still applies).
-		 *
-		 * @hook perflocale/mt/rate_limit_site
-		 * @param int $limit Max requests per hour, summed across all users. Default 5000.
-		 */
-		$site_limit = (int) apply_filters( 'perflocale/mt/rate_limit_site', 5000 );
-
-		if ( $limit <= 0 && $site_limit <= 0 ) {
-			return null; // Both caps disabled — no throttling.
-		}
-
-		$key      = 'perflocale_mt_rl_' . $user_id;
-		$site_key = 'perflocale_mt_rl_site';
-
-		// Per-user + site lock around the read-check-write so concurrent /machine-translate
-		// requests can't both read the pre-increment count, pass the < limit check, and
-		// each write count+1. We hold the GLOBAL lock (not per-user) so the site counter
-		// is also serialized — without that, the site cap has the same race as the per-user
-		// cap used to. The sibling /block-translate endpoint MUST use the same lock name to
-		// share the counter; both shipped using 'mt_rl_<user_id>' previously.
-		$result = Lock::with(
-			'mt_rl_global',
-			5,
-			function () use ( $key, $site_key, $limit, $site_limit, $window ): \WP_Error|bool {
-				$now = time();
-
-				$state = get_transient( $key );
-				if ( ! is_array( $state ) || ! isset( $state['count'], $state['window_start'] )
-					|| $now - (int) $state['window_start'] >= $window ) {
-					$state = [ 'count' => 0, 'window_start' => $now ];
-				}
-
-				$site_state = get_transient( $site_key );
-				if ( ! is_array( $site_state ) || ! isset( $site_state['count'], $site_state['window_start'] )
-					|| $now - (int) $site_state['window_start'] >= $window ) {
-					$site_state = [ 'count' => 0, 'window_start' => $now ];
-				}
-
-				if ( $limit > 0 && (int) $state['count'] >= $limit ) {
-					$retry_after = max( 1, $window - ( $now - (int) $state['window_start'] ) );
-					return new \WP_Error(
-						'rate_limited',
-						sprintf(
-							/* translators: 1: request limit, 2: retry-after seconds */
-							__( 'Machine translation rate limit reached (%1$d/hour). Try again in %2$d seconds.', 'perflocale' ),
-							$limit,
-							$retry_after
-						),
-						[ 'status' => 429 ]
-					);
-				}
-
-				if ( $site_limit > 0 && (int) $site_state['count'] >= $site_limit ) {
-					$retry_after = max( 1, $window - ( $now - (int) $site_state['window_start'] ) );
-					return new \WP_Error(
-						'rate_limited_site',
-						sprintf(
-							/* translators: 1: site-wide request limit, 2: retry-after seconds */
-							__( 'Site-wide machine translation rate limit reached (%1$d/hour total). Try again in %2$d seconds.', 'perflocale' ),
-							$site_limit,
-							$retry_after
-						),
-						[ 'status' => 429 ]
-					);
-				}
-
-				$state['count']++;
-				$site_state['count']++;
-
-				// TTL a little past the window so the transient survives right up
-				// to window roll-over; the inline reset above handles expiry too.
-				set_transient( $key, $state, $window + 60 );
-				set_transient( $site_key, $site_state, $window + 60 );
-
-				// Sentinel, NOT null: Lock::with() returns null for a lock
-				// miss, so a null success here would be indistinguishable
-				// and turn every allowed request into a 429.
-				return true;
-			}
-		);
-
-		// CRITICAL: Lock::with returns null when it couldn't acquire (another
-		// request holds it). Fail CLOSED rather than open — a request that
-		// can't take the lock cannot have its count incremented, so treating
-		// the miss as "allow" lets concurrent callers stampede past the cap.
-		// Returning 429 with a small Retry-After is what the client should
-		// see; retrying after a beat will almost always succeed.
-		if ( $result === null ) {
-			return new \WP_Error(
-				'rate_limit_lock_busy',
-				esc_html__( 'Machine translation rate-limit check is busy. Retry shortly.', 'perflocale' ),
-				[ 'status' => 429, 'retry_after' => 2 ]
-			);
-		}
-
-		return $result instanceof \WP_Error ? $result : null;
+		// Delegates to the shared policy. This method used to hold the whole
+		// implementation, and BlockTranslateController held a second copy;
+		// the `perflocale/translate-post` Ability, added later, had no copy at
+		// all and therefore no rate limit. Keeping a thin wrapper here
+		// preserves this class's gate ordering and error codes exactly while
+		// leaving exactly one implementation to change.
+		return MtRateLimiter::admit( $user_id );
 	}
 }

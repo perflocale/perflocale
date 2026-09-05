@@ -179,7 +179,12 @@ final class AddonUninstaller {
 				false,
 				null
 			);
-			/** @hook perflocale/addon/uninstalled */
+			/**
+			 * Fires after an addon uninstall completes, including this
+			 * skipped-by-filter exit.
+			 *
+			 * @hook perflocale/addon/uninstalled
+			 */
 			do_action( 'perflocale/addon/uninstalled', $addon_id, $result );
 			return $result;
 		}
@@ -191,7 +196,7 @@ final class AddonUninstaller {
 		} catch ( \InvalidArgumentException $e ) {
 			AddonMigrationErrors::record( $addon_id, 'purge_validation', 'hard', $e->getMessage() );
 			// Fail closed - do not touch anything.
-			return new PurgeResult(
+			$result = new PurgeResult(
 				$plan,
 				0,
 				0,
@@ -205,6 +210,19 @@ final class AddonUninstaller {
 				false,
 				null
 			);
+
+			// Notify on this exit too. Every other way out of purge() — the
+			// filter opt-out above and the normal completion below — fires this
+			// action, and HasCustomUninstall documents it as the terminal step
+			// of the purge contract. Staying silent exactly on the failure path
+			// is the worst case for an integrator: the one outcome they most
+			// need to hear about was the one that never arrived. The result
+			// carries the validation message in `errors`, so a listener can
+			// still tell a fail-closed purge from a successful one.
+			/** @hook perflocale/addon/uninstalled */
+			do_action( 'perflocale/addon/uninstalled', $addon_id, $result );
+
+			return $result;
 		}
 
 		// Optional: run the addon's before_uninstall callback.
@@ -675,7 +693,7 @@ final class AddonUninstaller {
 					...array_values( $keys )
 				)
 			);
-			// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 			$total += $cnt;
 		}
 

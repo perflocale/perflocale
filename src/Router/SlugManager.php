@@ -146,9 +146,14 @@ final class SlugManager {
 	 * slug translations one-by-one when rendering permalinks, we
 	 * batch-load them all in a single query here.
 	 *
-	 * @param array<int, \WP_Post> $posts Posts returned by WP_Query.
-	 * @param \WP_Query            $query The WP_Query instance.
-	 * @return array<int, \WP_Post> Unmodified posts (this is a filter).
+	 * Members that are not WP_Post instances are ignored: WP_Query::get_posts()
+	 * runs the_posts BEFORE its array_map( 'get_post' ) normalisation
+	 * (wp-includes/class-wp-query.php), so a sparse result from an earlier
+	 * filter or a hard-delete race can hand this callback a null member.
+	 *
+	 * @param array<int, mixed> $posts Posts returned by WP_Query; non-WP_Post members are skipped.
+	 * @param \WP_Query         $query The WP_Query instance.
+	 * @return array<int, mixed> The same array, unmodified (this is a filter).
 	 */
 	public function preload_slugs( array $posts, \WP_Query $query ): array {
 		if ( empty( $posts ) || is_admin() ) {
@@ -212,6 +217,10 @@ final class SlugManager {
 			$all_lang_ids = $gate['all_lang_ids'] === [] ? [ $language_id ] : $gate['all_lang_ids'];
 
 			foreach ( $posts as $p ) {
+				if ( ! ( $p instanceof \WP_Post ) ) {
+					continue;
+				}
+
 				$pid = (int) $p->ID;
 
 				foreach ( $all_lang_ids as $lid ) {
@@ -226,7 +235,17 @@ final class SlugManager {
 
 		$language_id  = $gate['language_id'];
 		$all_lang_ids = $gate['all_lang_ids'];
-		$post_ids     = array_map( static fn( \WP_Post $p ) => (int) $p->ID, $posts );
+		$post_ids     = [];
+
+		foreach ( $posts as $p ) {
+			if ( $p instanceof \WP_Post ) {
+				$post_ids[] = (int) $p->ID;
+			}
+		}
+
+		if ( $post_ids === [] ) {
+			return $posts;
+		}
 
 		// Fast path: if every (post, current_language) pair is already cached,
 		// the batch is a no-op. Second and later WP_Query executions (sidebars,

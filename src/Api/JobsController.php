@@ -40,13 +40,24 @@ final class JobsController extends RestController {
 	protected $rest_base = 'jobs';
 
 	/**
-	 * Per-request memo of JobState rows keyed by job id. Populated by the
-	 * permission_callback so the matching handler doesn't re-issue the same
+	 * Per-request memo of JobState rows keyed by BLOG ID + job id. Populated by
+	 * the permission_callback so the matching handler doesn't re-issue the same
 	 * DB read. WP_REST_Server reuses the same controller instance for a
 	 * permission_callback + callback pair within one REST dispatch, so this
 	 * memo's lifetime exactly matches what we need. Callers that must observe
 	 * post-mutation state (cancel_job / retry_job after their write) call
 	 * JobState::get() directly to bypass the stale entry.
+	 *
+	 * The blog id is part of the key because the jobs table is per-blog while
+	 * this memo is not. A controller instance that outlives a switch_to_blog()
+	 * — a CLI or worker context rather than a normal REST dispatch — otherwise
+	 * answered the second blog with the first blog's row. Reproduced on a real
+	 * network: the same id planted `complete` on blog 1 and `queued` on blog 2
+	 * returned `complete` for both, and a terminal-state guard read the wrong
+	 * blog's status. Reaching it needs a job id present in two blogs, which for
+	 * wp_generate_uuid4() ids means a collision — so this is hardening, not a
+	 * live hole, but it is the same per-blog-state-in-shared-memory class that
+	 * has bitten this codebase before.
 	 *
 	 * @var array<string, array<string, mixed>|null>
 	 */
@@ -60,12 +71,14 @@ final class JobsController extends RestController {
 	 * @return array<string, mixed>|null
 	 */
 	private function get_job_state( string $id ): ?array {
-		if ( array_key_exists( $id, $this->job_state_memo ) ) {
-			return $this->job_state_memo[ $id ];
+		$key = ( function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0 ) . ':' . $id;
+
+		if ( array_key_exists( $key, $this->job_state_memo ) ) {
+			return $this->job_state_memo[ $key ];
 		}
 
-		$this->job_state_memo[ $id ] = JobState::get( $id );
-		return $this->job_state_memo[ $id ];
+		$this->job_state_memo[ $key ] = JobState::get( $id );
+		return $this->job_state_memo[ $key ];
 	}
 
 	/**
@@ -516,6 +529,31 @@ final class JobsController extends RestController {
 			}
 		}
 
+		// `result` is not automatically safe just because the caller cleared
+		// user_can_read(). For a data_export job it is
+		// `[ 'path' => …, 'bytes' => … ]`, and `path` names a full site dump
+		// sitting in wp-content/uploads until somebody downloads it. The cap
+		// that got the caller this far — `perflocale_manage_translations` —
+		// is granted to EDITORS by default (TranslatorRole::EDITOR_CAPS),
+		// while BOTH running an export and downloading one require
+		// `perflocale_import_export`, which is Administrator-only. So an
+		// Editor deliberately denied the download endpoint could read the
+		// filename here and then fetch the file directly — and on a server
+		// that ignores .htaccess (nginx, Caddy, Apache with AllowOverride
+		// None) that fetch needs no authentication at all.
+		//
+		// So gate the path on the DOWNLOAD capability, not on $show_args:
+		// whoever may not have the artifact may not learn where it is. Keyed
+		// on the field name rather than the job type so an addon job that
+		// returns a path is covered too. Everything else in `result`
+		// (`bytes`, counts) stays visible, so the Jobs UI still shows that
+		// the job finished and how large the output was.
+		$result = (array) ( $state['result'] ?? [] );
+
+		if ( isset( $result['path'] ) && ! current_user_can( 'perflocale_import_export' ) ) {
+			unset( $result['path'] );
+		}
+
 		return [
 			'id'               => (string) ( $state['id'] ?? '' ),
 			'type'             => (string) ( $state['type'] ?? '' ),
@@ -529,7 +567,7 @@ final class JobsController extends RestController {
 			'processed'        => (int) ( $state['processed'] ?? 0 ),
 			'attempts'         => (int) ( $state['attempts'] ?? 0 ),
 			'error'            => (string) ( $state['error'] ?? '' ),
-			'result'           => (array) ( $state['result'] ?? [] ),
+			'result'           => $result,
 			'log'              => array_values( (array) ( $state['log'] ?? [] ) ),
 			'created_by'       => (int) ( $state['created_by'] ?? 0 ),
 			'created_by_label' => $created_by_label,

@@ -298,9 +298,42 @@ final class LanguagesController extends RestController {
 			);
 		}
 
+		$slug = sanitize_key( $request->get_param( 'slug' ) ?? '' );
+
+		// Pre-flight BOTH unique keys before touching the table. The languages
+		// table has two: slug and locale. Without this, a duplicate rode
+		// straight into the INSERT, which failed on the UNIQUE key, printed a
+		// raw wpdb error under WP_DEBUG, and came back as a generic 500 —
+		// indistinguishable from a real outage. The admin form and the CLI
+		// both pre-flight the same two keys; this brings REST into line, with
+		// 409 Conflict so a client can tell "already exists" from "broken".
+		if ( $repo->find_by_slug( $slug ) ) {
+			return $this->error(
+				'slug_exists',
+				sprintf(
+					/* translators: %s: slug that already exists */
+					__( 'A language with the slug %s already exists. Each language must have a unique URL identifier.', 'perflocale' ),
+					$slug
+				),
+				409
+			);
+		}
+
+		if ( $repo->find_by_locale( $locale ) ) {
+			return $this->error(
+				'locale_exists',
+				sprintf(
+					/* translators: %s: locale that already exists */
+					__( 'A language with the locale %s already exists. Each language must have a unique WordPress locale.', 'perflocale' ),
+					$locale
+				),
+				409
+			);
+		}
+
 		$id = $repo->insert(
 			[
-				'slug'           => sanitize_key( $request->get_param( 'slug' ) ?? '' ),
+				'slug'           => $slug,
 				'locale'         => $locale,
 				'name'           => sanitize_text_field( $request->get_param( 'name' ) ?? '' ),
 				'native_name'    => sanitize_text_field( $request->get_param( 'native_name' ) ?? '' ),
@@ -404,7 +437,23 @@ final class LanguagesController extends RestController {
 			}
 		}
 
-		$repo->update( (int) $language->id, $data );
+		$written = $repo->update( (int) $language->id, $data );
+
+		// update() returns false only when the write actually failed - it
+		// returns true for a write that changed no rows - so a false here means
+		// the row on disk does NOT match what we are about to echo back. A PATCH
+		// that carried no recognised field is a different thing: $data is empty,
+		// wpdb::update() builds an UPDATE with no SET clause and returns false
+		// for a request that asked for nothing. Only report a failure the caller
+		// actually asked for, so the no-op PATCH keeps its 200 (and its cache
+		// flush and perflocale/language/updated hook) exactly as before.
+		if ( $data !== [] && ! $written ) {
+			return $this->error(
+				'update_failed',
+				__( 'The language could not be updated; nothing was changed.', 'perflocale' ),
+				500
+			);
+		}
 
 		$updated = $repo->find( (int) $language->id );
 

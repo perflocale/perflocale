@@ -130,9 +130,22 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 			return $properties;
 		}
 
-		// Replace the form markup with the translated version.
-		if ( ! empty( $translated_post->post_content ) ) {
-			$properties['form'] = $translated_post->post_content;
+		// CF7 keeps the authoritative form grammar in `_form` post meta and
+		// reads it back from there itself (retrieve_property(),
+		// includes/contact-form.php:332-346). post_content is NOT the form:
+		// save() (:1263) stores an implode() over wpcf7_array_flatten( $props ),
+		// a flattened dump of EVERY property - mail recipients, CC/BCC,
+		// additional_headers, the mail body, attachment paths, messages,
+		// additional_settings. CF7 renders prop( 'form' ) verbatim (:886), so
+		// copying post_content in here published the whole mail configuration
+		// into the public HTML of any page embedding the translated form. Read
+		// the property, never the dump; when the translation carries no `_form`,
+		// fall through to the source form CF7 already resolved - fail closed,
+		// the direction CF7 itself takes.
+		$translated_form = get_post_meta( $translated_id, '_form', true );
+
+		if ( is_string( $translated_form ) && $translated_form !== '' ) {
+			$properties['form'] = $translated_form;
 		}
 
 		// Replace translatable message properties from post meta.

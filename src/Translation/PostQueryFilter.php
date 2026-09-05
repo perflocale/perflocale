@@ -2571,7 +2571,11 @@ final class PostQueryFilter {
 				// an infinite 302/301 loop, because clean_fallback_sentinel
 				// strips the sentinel before the walker's fuse can hold.
 				if ( $this->settings->get_url_mode() === 'query' ) {
-					unset( $passthrough['lang'] );
+					// Strip the CONFIGURED name, not the literal 'lang'. With the
+					// name filtered, a hard-coded key left the stale value in the
+					// target URL and the fallback walker re-fired on an identical
+					// URL — the infinite redirect the comment above describes.
+					unset( $passthrough[ \PerfLocale\Router\UrlConverter::query_var() ] );
 				}
 
 				if ( $passthrough !== [] ) {

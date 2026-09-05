@@ -134,18 +134,8 @@ final class StringScanJob extends AbstractJob {
 			$total += $this->count_top_level_php( $child_theme );
 		}
 
-		$plugins_root = trailingslashit( WP_PLUGIN_DIR );
-
-		foreach ( (array) get_option( 'active_plugins', [] ) as $plugin_file ) {
-			if ( str_starts_with( (string) $plugin_file, 'perflocale/' ) ) {
-				continue;
-			}
-
-			$plugin_dir = $plugins_root . dirname( (string) $plugin_file );
-
-			if ( is_dir( $plugin_dir ) ) {
-				$total += $this->count_top_level_php( $plugin_dir );
-			}
+		foreach ( $this->plugin_target_dirs() as $plugin_dir ) {
+			$total += $this->count_top_level_php( $plugin_dir );
 		}
 
 		if ( defined( 'WPMU_PLUGIN_DIR' ) && is_dir( WPMU_PLUGIN_DIR ) ) {
@@ -167,6 +157,67 @@ final class StringScanJob extends AbstractJob {
 		$files = glob( rtrim( $dir, '/' ) . '/*.php' );
 
 		return is_array( $files ) ? count( $files ) : 0;
+	}
+
+	/**
+	 * Plugin directories this scan must cover: site-active PLUS network-active.
+	 *
+	 * `active_plugins` alone misses every NETWORK-activated plugin on
+	 * multisite — those live in the network-wide `active_sitewide_plugins`
+	 * site-option, keyed by plugin file with the activation timestamp as the
+	 * value. Their strings were therefore never scanned and never translatable,
+	 * and, worse, scan_all() still armed `perflocale_strings_last_full_scan`
+	 * afterwards. That marker is the ONLY liveness signal
+	 * StringRepository::gc_stale_strings() has, so strings the scan never
+	 * reached could age past the 90-day retention and be deleted together with
+	 * their translations.
+	 *
+	 * Shared with {@see estimate_all_targets_size()} so the dispatch-threshold
+	 * estimate measures exactly the set the run walks.
+	 *
+	 * @return list<string> Absolute plugin directories, deduped.
+	 */
+	private function plugin_target_dirs(): array {
+		$plugins_root = trailingslashit( WP_PLUGIN_DIR );
+		$plugin_files = (array) get_option( 'active_plugins', [] );
+
+		if ( is_multisite() ) {
+			$plugin_files = array_merge(
+				$plugin_files,
+				array_keys( (array) get_site_option( 'active_sitewide_plugins', [] ) )
+			);
+		}
+
+		$dirs = [];
+
+		foreach ( $plugin_files as $plugin_file ) {
+			// Skip our own plugin so its strings stay out of the catalogue.
+			if ( str_starts_with( (string) $plugin_file, 'perflocale/' ) ) {
+				continue;
+			}
+
+			$relative = dirname( (string) $plugin_file );
+
+			// A SINGLE-FILE plugin (`hello.php`) has a dirname of '.', which
+			// resolves to the plugins ROOT — and the scanner recurses, so that
+			// one entry would walk every plugin on the site on every scan.
+			// There is no directory of its own to scan, so skip it rather than
+			// turn one file into a full-tree crawl. Same reasoning for an
+			// empty or absolute-root dirname from a malformed entry.
+			if ( $relative === '.' || $relative === '' || $relative === DIRECTORY_SEPARATOR ) {
+				continue;
+			}
+
+			$plugin_dir = $plugins_root . $relative;
+
+			if ( is_dir( $plugin_dir ) ) {
+				$dirs[] = $plugin_dir;
+			}
+		}
+
+		// Dedupe — a plugin can be both site- and network-active, and symlinks
+		// can resolve identically.
+		return array_values( array_unique( $dirs ) );
 	}
 
 	/**
@@ -228,16 +279,8 @@ final class StringScanJob extends AbstractJob {
 			$targets[] = $child_theme;
 		}
 
-		$plugins_root = trailingslashit( WP_PLUGIN_DIR );
-		foreach ( (array) get_option( 'active_plugins', [] ) as $plugin_file ) {
-			// Skip our own plugin so its strings stay out of the catalogue.
-			if ( str_starts_with( (string) $plugin_file, 'perflocale/' ) ) {
-				continue;
-			}
-			$plugin_dir = $plugins_root . dirname( (string) $plugin_file );
-			if ( is_dir( $plugin_dir ) ) {
-				$targets[] = $plugin_dir;
-			}
+		foreach ( $this->plugin_target_dirs() as $plugin_dir ) {
+			$targets[] = $plugin_dir;
 		}
 
 		if ( defined( 'WPMU_PLUGIN_DIR' ) && is_dir( WPMU_PLUGIN_DIR ) ) {
@@ -290,8 +333,25 @@ final class StringScanJob extends AbstractJob {
 		// the 90-day GC delete strings — and their translations — that are
 		// still very much in use. Leaving the marker untouched keeps the GC
 		// disarmed, which fails safe.
-		if ( $skipped === [] ) {
+		if ( $skipped === [] && $domain === '' ) {
 			update_option( 'perflocale_strings_last_full_scan', time(), false );
+		} elseif ( $skipped === [] ) {
+			// Every target was readable, but the run was filtered to ONE text
+			// domain, so it only re-stamped last_seen_at for that domain's rows;
+			// every other domain's strings look untouched to the GC. Arming the
+			// GLOBAL marker would let gc_stale_strings() delete them, and their
+			// translations, once they aged past the retention window. No shipped
+			// surface dispatches mode='all' with a domain — AdminController::
+			// process_string_scan passes ['mode' => 'all'] and nothing else — so
+			// this guard is here to make sure adding one later cannot silently
+			// turn the GC into a data-loss path.
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a filtered scan.
+			error_log(
+				sprintf(
+					'[PerfLocale] String scan was filtered to text domain "%s"; it carries no liveness signal for other domains, so the stale-string GC stays disarmed.',
+					$domain
+				)
+			);
 		} else {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a partial scan.
 			error_log(

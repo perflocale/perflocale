@@ -205,6 +205,8 @@ final class SettingsPage {
 						</p>
 						<p>
 							<a href="<?php echo esc_url( network_admin_url( 'site-new.php' ) ); ?>"><?php echo esc_html__( 'Add a site to the network', 'perflocale' ); ?></a>
+							<span style="color:#c3c4c7;"> &middot; </span>
+							<a href="https://perflocale.com/docs/multisite/#url-modes" target="_blank" rel="noopener"><?php echo esc_html__( 'URL modes on a network', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 						</p>
 					</div>
 					<?php
@@ -826,11 +828,69 @@ final class SettingsPage {
 	 */
 	private function render_addons_tab(): void {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$subtab  = isset( $_GET['subtab'] ) ? sanitize_key( $_GET['subtab'] ) : '';
-		$subtabs = $this->get_addon_subtabs();
+		$subtab    = isset( $_GET['subtab'] ) ? sanitize_key( $_GET['subtab'] ) : '';
+		$subtabs   = $this->get_addon_subtabs();
+		$requested = $subtab;
 
 		if ( $subtab === '' || ! isset( $subtabs[ $subtab ] ) ) {
 			$subtab = array_key_first( $subtabs );
+		}
+
+		// Nothing to configure. This is the DEFAULT state of a fresh install —
+		// Machine Translation is off until enabled, WooCommerce may not be
+		// installed, and no third-party addon has registered editable fields —
+		// so it is the first thing many people see when they click "Addons".
+		// It used to fall through to the form below with $subtab = null, which
+		// rendered an empty nav, an empty table and a lone "Save Changes"
+		// button that saved nothing: a blank screen with no explanation.
+		if ( $subtab === null ) {
+			$addons_url = admin_url( 'admin.php?page=perflocale-addons' );
+			?>
+			<div class="perflocale-addons-wrap perflocale-addons-wrap--empty">
+				<p><strong><?php echo esc_html__( 'No addon settings to show yet.', 'perflocale' ); ?></strong></p>
+				<p>
+					<?php
+					if ( $requested !== '' ) {
+						printf(
+							/* translators: %s: the addon subtab slug the URL asked for, e.g. machine-translation */
+							esc_html__( 'This page has no settings for %s. That addon is either turned off or not installed on this site.', 'perflocale' ),
+							'<code>' . esc_html( $requested ) . '</code>'
+						);
+					} else {
+						echo esc_html__( 'Settings appear here once an addon that has options is switched on.', 'perflocale' );
+					}
+					?>
+				</p>
+				<p>
+					<?php echo esc_html__( 'Machine Translation, WooCommerce and any third-party addons are switched on from the Addons screen. Come back here afterwards to configure them.', 'perflocale' ); ?>
+				</p>
+				<p>
+					<a class="button button-primary" href="<?php echo esc_url( $addons_url ); ?>">
+						<?php echo esc_html__( 'Go to Addons', 'perflocale' ); ?>
+					</a>
+				</p>
+			</div>
+			<?php
+			return;
+		}
+
+		// A subtab was named in the URL but is not available — say so instead of
+		// silently showing a different one, which reads as "my settings vanished".
+		if ( $requested !== '' && $requested !== $subtab ) {
+			?>
+			<div class="notice notice-warning inline">
+				<p>
+					<?php
+					printf(
+						/* translators: 1: requested addon subtab slug, 2: label of the subtab shown instead */
+						esc_html__( 'There are no settings for %1$s on this site — it is turned off or not installed. Showing %2$s instead.', 'perflocale' ),
+						'<code>' . esc_html( $requested ) . '</code>',
+						'<strong>' . esc_html( (string) ( $subtabs[ $subtab ] ?? $subtab ) ) . '</strong>'
+					);
+					?>
+				</p>
+			</div>
+			<?php
 		}
 
 		// Status indicators for built-in features.
@@ -1126,6 +1186,10 @@ final class SettingsPage {
 					<p class="description">
 						<?php echo esc_html__( 'Query parameter mode works with every permalink structure — including Plain — and every server. The default language always uses clean URLs without the parameter.', 'perflocale' ); ?>
 					</p>
+					<p class="description" style="margin-top:6px;">
+						<?php echo esc_html__( 'Subdirectory needs no DNS work and concentrates SEO value on one hostname; subdomain and domain-per-language require DNS, a TLS certificate, and — on multisite — every language hostname registered as a site.', 'perflocale' ); ?>
+						<a href="https://perflocale.com/docs/url-routing/#url-structure" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the four URL modes', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					</p>
 				</fieldset>
 
 				<?php
@@ -1221,7 +1285,7 @@ final class SettingsPage {
 				</label>
 				<p class="description">
 				<?php echo esc_html__( 'Uses a GeoIP API to detect the visitor\'s country. When more than one redirect mechanism is enabled, the order set in "Redirect Priority" below decides which runs first.', 'perflocale' ); ?>
-				<a href="https://perflocale.com/docs/geo-redirect/" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Provider comparison & setup', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+				<a href="https://perflocale.com/docs/geo-redirect/#settings" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Provider comparison & setup', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 			</p>
 			</td>
 		</tr>
@@ -1326,7 +1390,7 @@ final class SettingsPage {
 					</p>
 					<p class="description" style="margin-top:6px;">
 						<?php echo esc_html__( 'Register a provider with the perflocale/geo/providers filter, or return a country code directly from perflocale/geo/lookup_country - a one-liner when your CDN already sends one, such as Cloudflare CF-IPCountry.', 'perflocale' ); ?>
-						<a href="https://perflocale.com/docs/geo-redirect/" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Provider examples', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+						<a href="https://perflocale.com/docs/geo-redirect/#geoip-provider" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Provider examples', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 				<?php else : ?>
 					<select id="perflocale-geo-provider" name="geo_provider">
@@ -1446,7 +1510,7 @@ final class SettingsPage {
 					<option value="redirect_default" <?php selected( $missing_action, 'redirect_default' ); ?>><?php echo esc_html__( 'Redirect to default language version', 'perflocale' ); ?></option>
 				</select>
 				<p class="description" style="margin-top:4px;">
-					<a href="https://perflocale.com/docs/language-fallbacks/" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the three modes (SEO + UX tradeoffs)', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/language-fallbacks/#seo" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the three modes (SEO + UX tradeoffs)', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
 		</tr>
@@ -1476,7 +1540,7 @@ final class SettingsPage {
 			<td>
 				<p class="description" style="margin-bottom:10px;">
 					<?php echo esc_html__( 'When a translation is missing, fall back to these languages in order. The first one that has a published translation wins - a single redirect is issued, never a chain of hops. If every slot is empty or unresolved, the "Missing Translation Action" above applies.', 'perflocale' ); ?>
-					<a href="https://perflocale.com/docs/language-fallbacks/" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Fallback chain docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/language-fallbacks/#seo" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Fallback chain docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 
 <div class="pl-fb-editor" data-max="<?php echo esc_attr( (string) $max_fb ); ?>">
@@ -1879,6 +1943,10 @@ final class SettingsPage {
 					<input type="checkbox" name="translate_slugs" value="1" <?php checked( $translate_slugs ); ?>>
 					<?php echo esc_html__( 'Allow post and term slugs to be translated per language.', 'perflocale' ); ?>
 				</label>
+				<p class="description" style="margin-top:6px;">
+					<?php echo esc_html__( 'Term archives use the clean per-language slug PerfLocale records — German stays at /de/tutorials/ rather than the unique tutorials-de the database needed — but the plugin does not translate slugs for you.', 'perflocale' ); ?>
+					<a href="https://perflocale.com/docs/url-routing/#translated-slugs" target="_blank" rel="noopener"><?php echo esc_html__( 'How display slugs work', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+				</p>
 			</td>
 		</tr>
 
@@ -2004,7 +2072,7 @@ final class SettingsPage {
 					<?php endif; ?>
 				</select>
 				<p class="description" style="margin-top:6px;">
-					<a href="https://perflocale.com/docs/machine-translation/" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare providers', 'perflocale' ); ?></a>
+					<a href="https://perflocale.com/docs/machine-translation/#providers" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare providers', 'perflocale' ); ?></a>
 					<span style="color:#c3c4c7;"> · </span>
 					<a href="https://perflocale.com/docs/api-key-constants/" target="_blank" rel="noopener"><?php echo esc_html__( 'Set API keys via wp-config constants', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
@@ -2076,6 +2144,10 @@ final class SettingsPage {
 			<td>
 				<input type="number" id="perflocale-mt-char-limit" name="mt_monthly_char_limit" value="<?php echo absint( $char_limit ); ?>" class="regular-text" min="0" step="1000">
 				<p class="description"><?php echo esc_html__( 'Maximum characters to send to the translation API per month. Set to 0 for unlimited.', 'perflocale' ); ?></p>
+				<p class="description" style="margin-top:6px;">
+					<?php echo esc_html__( 'This is the only ceiling on what your translation provider can bill you in a month — 0 means unlimited, which with auto-translate on publish leaves the spend uncapped.', 'perflocale' ); ?>
+					<a href="https://perflocale.com/docs/machine-translation/#char-limit" target="_blank" rel="noopener"><?php echo esc_html__( 'What happens when the cap is reached', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+				</p>
 			</td>
 		</tr>
 
@@ -2289,7 +2361,7 @@ final class SettingsPage {
 				</label>
 				<p class="description" style="margin-top:6px;">
 					<?php echo esc_html__( 'Adds two small pieces of structured data to the SEO plugin you already use (Yoast, Rank Math, AIOSEO, SEOPress, Slim SEO, The SEO Framework): the current page\'s language, and pointers to its translations. Helps Google show the right language in search, and helps AI crawlers understand your site. Recommended.', 'perflocale' ); ?>
-					<a href="https://perflocale.com/docs/seo-schema/" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Schema enrichment docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/seo-schema/#what-gets-added" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Schema enrichment docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
 		</tr>
@@ -2613,6 +2685,10 @@ final class SettingsPage {
 					<p class="description" style="margin: 0 0 0 24px;">
 						<?php echo esc_html__( 'Loads translations from the database on demand via gettext filter. No file generation needed - useful for development or read-only file systems.', 'perflocale' ); ?>
 					</p>
+					<p class="description" style="margin-top:6px;">
+						<?php echo esc_html__( 'Keep Files unless your filesystem is read-only or the translations directory is not writable — that is the only reason to choose Database.', 'perflocale' ); ?>
+						<a href="https://perflocale.com/docs/production-tuning/#string-mode" target="_blank" rel="noopener"><?php echo esc_html__( 'Which storage mode to use', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					</p>
 				</fieldset>
 			</td>
 		</tr>
@@ -2726,7 +2802,7 @@ final class SettingsPage {
 						/* translators: 1: URL of the background jobs admin page, 2: URL of the background-jobs documentation page. */
 						wp_kses_post( __( 'Background jobs appear under <a href="%1$s">PerfLocale → Jobs</a> while they run. <a href="%2$s" target="_blank" rel="noopener">Learn more →</a>', 'perflocale' ) ),
 						esc_url( admin_url( 'admin.php?page=perflocale-jobs' ) ),
-						esc_url( 'https://perflocale.com/docs/background-jobs/' )
+						esc_url( 'https://perflocale.com/docs/background-jobs/#settings' )
 					);
 					?>
 				</p>
@@ -2872,6 +2948,7 @@ final class SettingsPage {
 				</label>
 				<p class="description" style="margin-top:6px;">
 					<?php echo esc_html__( 'Exposes a cache-friendly public REST endpoint that a Cloudflare Worker, Vercel Edge function, or Netlify Edge function can read to pre-route visitors to the correct language before the request reaches PHP. Also adds an `edge_hint` detection method you can add to your detection order.', 'perflocale' ); ?>
+					<a href="https://perflocale.com/docs/edge-integration/#restricting-access" target="_blank" rel="noopener"><?php echo esc_html__( 'Restricting access to the endpoint', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 				<?php if ( $edge_enabled ) : ?>
 					<p class="description" style="margin-top:6px;">
@@ -2901,7 +2978,7 @@ final class SettingsPage {
 				</label>
 				<p class="description" style="margin-top:6px;">
 					<?php echo esc_html__( 'Adds a Cache-Tag header to every frontend page with tags like lang:bg_BG, post:123, home. Compatible with Cloudflare (Cache-Tag), Bunny (Cache-Tag), and Fastly (rename to Surrogate-Key via filter). Enables surgical purges instead of flushing the entire edge cache on every save.', 'perflocale' ); ?>
-					<a href="https://perflocale.com/docs/cache-tags/" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'CDN setup examples', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/cache-tags/#cdn-support" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'CDN setup examples', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 				<?php if ( ! $cache_tags_on ) : ?>
 					<p class="description" style="margin-top:6px; color:#646970;">
@@ -3122,6 +3199,10 @@ final class SettingsPage {
 							<strong><?php echo esc_html__( 'Replace', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'delete all existing data first', 'perflocale' ); ?>
 						</label>
 					</fieldset>
+					<p class="description" style="margin-top:0;">
+						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale tables before loading, so anything the uploaded bundle does not carry is gone; Merge only adds.', 'perflocale' ); ?>
+						<a href="https://perflocale.com/docs/export-import/#merge-vs-replace" target="_blank" rel="noopener"><?php echo esc_html__( 'Merge vs Replace — what Replace clears', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					</p>
 					<p class="description" style="margin-top:0;">
 						<?php echo esc_html__( 'Tip: re-importing the same backup in Merge mode creates fresh translation_groups rows (the table has no natural key) — the matching links de-duplicate via their (object_id, language_id) UNIQUE constraint, so the duplicate groups are linked to nothing and are swept by the daily orphan-group GC. For deterministic re-imports use Replace mode.', 'perflocale' ); ?>
 					</p>

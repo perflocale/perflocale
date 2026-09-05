@@ -1724,7 +1724,13 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		$translated_id = $manager->get_translation_id( $product_id, $current_slug );
 
-		if ( $translated_id && $translated_id !== $product_id ) {
+		// Never point a guest at a draft, pending or private sibling — the same
+		// rule the cart LABEL applies in translated_product_title(). Failing the
+		// check falls through to url_converter->convert() at the end of this
+		// method, which is exactly what an UNTRANSLATED product already gets, so
+		// the link stays inside the current language instead of pointing at a
+		// target the visitor cannot open.
+		if ( $translated_id && $translated_id !== $product_id && $this->is_publicly_viewable_translation( (int) $translated_id ) ) {
 			// Use the translated product's permalink.
 			$translated_permalink = get_permalink( $translated_id );
 
@@ -1894,9 +1900,46 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return null;
 		}
 
+		// The cart, mini-cart and checkout render for GUESTS. A translation is
+		// created as a DRAFT, so "linked but not public yet" is the normal state
+		// of half-finished work, not an edge case — swapping its title in
+		// publishes unreleased copy to anyone holding an item in their basket.
+		// Keep the source label instead. Same rule the cross-sell mapper already
+		// applies in map_related_ids_to_language().
+		if ( ! $this->is_publicly_viewable_translation( (int) $translated_id ) ) {
+			return null;
+		}
+
 		$title = get_the_title( $translated_id );
 
 		return $title !== '' ? $title : null;
+	}
+
+	/**
+	 * Whether a translated post may be shown to the current visitor.
+	 *
+	 * Core's own visibility rule (WP 5.7+) with a status fallback for older
+	 * cores — the same six lines PerfLocaleAcf, PerfLocalePods and
+	 * PerfLocaleMetabox already ship. Deliberately NOT pushed down into
+	 * PostTranslationManager::get_translation_id(): the editor, the
+	 * Translations page and every translation workflow legitimately resolve
+	 * drafts, so the rule belongs at the PUBLIC display consumer.
+	 *
+	 * @param int $post_id Translated post ID.
+	 * @return bool
+	 */
+	private function is_publicly_viewable_translation( int $post_id ): bool {
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		if ( function_exists( 'is_post_publicly_viewable' ) ) {
+			return (bool) is_post_publicly_viewable( $post_id );
+		}
+
+		$status = get_post_status( $post_id );
+
+		return is_string( $status ) && in_array( $status, get_post_stati( [ 'public' => true ] ), true );
 	}
 
 	/**
@@ -2598,7 +2641,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				</label>
 				<p class="description">
 					<?php echo esc_html__( 'Prices are converted on the fly using the exchange rate below, and checkout and orders are processed in the displayed (per-language) currency. Make sure your payment gateway accepts each currency you enable.', 'perflocale' ); ?>
-					<a href="https://perflocale.com/docs/woocommerce/" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'WooCommerce multilingual setup', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/woocommerce/#per-language-currency" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'WooCommerce multilingual setup', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
 		</tr>
@@ -2778,7 +2821,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				<p class="description" style="margin-top:6px;">
 					<?php echo esc_html__( 'Register a rate provider with the perflocale/woocommerce/exchange_rate_providers filter, or supply rates directly from perflocale/woocommerce/exchange_rates_fetched.', 'perflocale' ); ?>
 					<br>
-					<a href="https://perflocale.com/docs/exchange-rates/" target="_blank" rel="noopener"><?php echo esc_html__( 'Exchange rate providers docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/exchange-rates/#sync-intervals" target="_blank" rel="noopener"><?php echo esc_html__( 'Exchange rate providers docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
 		</tr>

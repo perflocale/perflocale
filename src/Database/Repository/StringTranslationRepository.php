@@ -420,9 +420,15 @@ final class StringTranslationRepository {
 	 * Used by the stale-string migration path when a source text changes
 	 * but the translations should be reused (marked as needs_update later).
 	 *
+	 * Never deletes the source rows unless the UPDATE that copies them
+	 * reported success, so a database failure cannot leave the translations
+	 * with no home.
+	 *
 	 * @param int $from_id Source string ID.
 	 * @param int $to_id Destination string ID.
-	 * @return int Rows affected.
+	 * @return int Rows moved, 0 when there was nothing to move, or -1 when the
+	 *             UPDATE failed - in which case nothing was deleted and every
+	 *             row is still attached to $from_id.
 	 */
 	public function move_translations( int $from_id, int $to_id ): int {
 		if ( $from_id <= 0 || $to_id <= 0 || $from_id === $to_id ) {
@@ -440,12 +446,25 @@ final class StringTranslationRepository {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared
 
+		// A failed UPDATE moved NOTHING - every row is still attached to
+		// $from_id, and the DELETE below is the destination-wins cleanup for
+		// rows the UNIQUE key refused to move. Running it after a failure
+		// deletes the only remaining copy of those translations. A transaction
+		// is not the answer here: START TRANSACTION silently no-ops on a
+		// MyISAM-default host (which is exactly why ENGINE=InnoDB is written
+		// out on all nine tables), so ORDER is the mechanism - never delete a
+		// source the move did not confirm it copied. Report the failure and
+		// leave the rows alone; the caller aborts its cascade on a negative.
+		if ( $result === false ) {
+			return -1;
+		}
+
 		// Clean up any rows that couldn't move due to a pre-existing
 		// row at the target (unique conflict from IGNORE).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->delete( $this->table(), [ 'string_id' => $from_id ], [ '%d' ] );
 
-		return $result === false ? 0 : (int) $result;
+		return (int) $result;
 	}
 
 	/**

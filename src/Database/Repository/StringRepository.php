@@ -1214,6 +1214,10 @@ final class StringRepository implements RepositoryInterface {
 			}
 		}
 
+		// Set when a translation move fails. Every cleanup DELETE in this
+		// method is gated on it staying false - see the move loop below.
+		$move_failed = false;
+
 		if ( $grouped_ids !== [] ) {
 			// Bind the id list with %d placeholders (values are integers, but
 			// prepare() makes that explicit and scanner-verifiable). Table
@@ -1236,8 +1240,28 @@ final class StringRepository implements RepositoryInterface {
 
 			// Move every existing translation row from each old string to
 			// the new one. One UPDATE per old string — already minimal.
+			//
+			// A move that FAILS leaves that string's translations on the OLD
+			// string (move_translations() returns -1 and skips its own cleanup
+			// DELETE). Everything after this loop that deletes is therefore
+			// gated on $move_failed: the old rows are the last remaining copy
+			// and there is no transaction to bring them back.
 			foreach ( $grouped_ids as $old_id ) {
-				$translations_repo->move_translations( $old_id, $new_string_id );
+				if ( $translations_repo->move_translations( $old_id, $new_string_id ) < 0 ) {
+					$move_failed = true;
+
+					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent data-loss point.
+					error_log(
+						sprintf(
+							'PerfLocale StringRepository: moving translations from string %1$d to %2$d failed; the stale-string cleanup was skipped so the existing translations are not deleted. wpdb error: %3$s',
+							$old_id,
+							$new_string_id,
+							(string) $this->wpdb->last_error
+						)
+					);
+
+					break;
+				}
 			}
 
 			if ( $lang_ids !== [] ) {
@@ -1286,9 +1310,22 @@ final class StringRepository implements RepositoryInterface {
 				}
 			}
 
-			// Batched cleanup (was: two DELETEs per old string).
-			$this->wpdb->query( $this->wpdb->prepare( "DELETE FROM %i WHERE group_id IN ({$gid_ph})", array_merge( [ $links_table ], $gid_list ) ) );
-			$this->wpdb->query( $this->wpdb->prepare( "DELETE FROM %i WHERE id IN ({$gid_ph})", array_merge( [ $groups_table ], $gid_list ) ) );
+			// Batched cleanup (was: two DELETEs per old string). Skipped when
+			// a move failed, because these DELETEs remove the links and groups
+			// that still point at translations which never made it across.
+			if ( ! $move_failed ) {
+				$this->wpdb->query( $this->wpdb->prepare( "DELETE FROM %i WHERE group_id IN ({$gid_ph})", array_merge( [ $links_table ], $gid_list ) ) );
+				$this->wpdb->query( $this->wpdb->prepare( "DELETE FROM %i WHERE id IN ({$gid_ph})", array_merge( [ $groups_table ], $gid_list ) ) );
+			}
+		}
+
+		if ( $move_failed ) {
+			// Leave the old strings, groups, links and translations exactly
+			// where they are. A migration that did not happen is recoverable -
+			// the operator still has every translation, and the daily
+			// stale-string GC reclaims the rows once they stop being seen. A
+			// half-applied migration that deleted them is not recoverable.
+			return;
 		}
 
 		// Orphaned strings - drop their translations.

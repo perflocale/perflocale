@@ -157,10 +157,6 @@ a.perflocale-dash-langs__row:focus-visible {
 	color: #646970;
 }
 
-.perflocale-dash-table {
-	max-width: 900px;
-}
-
 .perflocale-dash-table__lang-col {
 	width: 200px;
 }
@@ -213,7 +209,6 @@ a.perflocale-dash-langs__row:focus-visible {
 }
 
 .perflocale-dash-legend {
-	max-width: 900px;
 	margin-top: 14px;
 }
 

@@ -208,6 +208,26 @@ final class DeepLProvider extends AbstractProvider {
 			);
 		}
 
+		// Cardinality contract: one translation per text sent, in order. The
+		// batch is then mapped BY INDEX onto the caller's strings, so a short
+		// or over-long reply does not degrade gracefully - it silently shifts
+		// every later translation onto the wrong source. Core's
+		// TranslationService already refuses a mismatched batch, but this
+		// provider is a public class a third party can call directly, and the
+		// check that protects them costs one integer comparison per batch.
+		if ( count( $data['translations'] ) !== count( $filtered ) ) {
+			throw new \RuntimeException(
+				esc_html(
+					sprintf(
+						/* translators: 1: number of translations returned, 2: number of texts sent */
+						__( 'DeepL returned %1$d translations for %2$d texts; refusing to map them by position.', 'perflocale' ),
+						count( $data['translations'] ),
+						count( $filtered )
+					)
+				)
+			);
+		}
+
 		$results   = [];
 		$originals = array_values( $texts );
 

@@ -157,8 +157,21 @@ final class XliffExporter {
 		// it through writeRaw produced a document neither the importer nor any
 		// CAT tool could parse. Strip every char outside the legal XML range
 		// (wp_check_invalid_utf8 first so preg_replace can't null on bad UTF-8).
+		//
+		// The allowed set is XML 1.0's Char production verbatim:
+		// #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF].
+		// The last alternative was missing, so every supplementary-plane
+		// character — emoji, rare CJK, Deseret, Gothic, mathematical
+		// alphanumerics — was silently deleted from the export. The result
+		// stayed well-formed, which is exactly why a well-formedness check
+		// never caught it. U+FFFE / U+FFFF remain excluded, as XML requires.
+		//
+		// Deliberately NOT passing $strip = true here: on the declared 6.4
+		// floor that branch returns iconv()'s false on PHP 8, and this file
+		// declares strict_types=1, so the preg_replace() below would throw a
+		// TypeError out of the REST handler on any input with one bad byte.
 		$text = wp_check_invalid_utf8( $text );
-		$text = (string) preg_replace( '/[^\x{09}\x{0A}\x{0D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}]/u', '', $text );
+		$text = (string) preg_replace( '/[^\x{09}\x{0A}\x{0D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u', '', $text );
 
 		$writer->writeRaw( '<![CDATA[' . str_replace( ']]>', ']]]]><![CDATA[>', $text ) . ']]>' );
 	}

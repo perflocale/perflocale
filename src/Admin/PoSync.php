@@ -229,6 +229,37 @@ final class PoSync {
 	}
 
 	/**
+	 * Make a language's string translations visible on both serving paths.
+	 *
+	 * Drops the per-language gettext map so database mode rebuilds it, and
+	 * regenerates the `.l10n` bundles in files mode. Without it an import only
+	 * takes effect after an unrelated admin save or the caches' natural TTL.
+	 *
+	 * Also run after a rolled-back replace: that pass deleted and re-read rows
+	 * before aborting, so anything it cached describes a state the database has
+	 * since discarded.
+	 *
+	 * @param object $lang Language row (needs `id`).
+	 * @return void
+	 */
+	private static function flush_language_caches( object $lang ): void {
+		$plugin = \PerfLocale\Plugin::get_instance();
+		$cache  = $plugin->get( 'cache' );
+
+		if ( ! $cache instanceof \PerfLocale\Cache\CacheManager ) {
+			return;
+		}
+
+		$cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
+		$cache->invalidate_group( 'perflocale_strings' );
+		$cache->invalidate_group( 'perflocale_trans' );
+
+		if ( $plugin->get( 'settings' )->get( 'string_translation_mode' ) === 'files' ) {
+			( new \PerfLocale\Strings\TranslationFileGenerator( $cache ) )->generate_all( [ (int) $lang->id ] );
+		}
+	}
+
+	/**
 	 * Import a PO file into the strings + string_translations tables.
 	 *
 	 * Each PO entry becomes (or matches) a row in `strings`; the row is linked
@@ -262,6 +293,10 @@ final class PoSync {
 	 * break the count down so callers can render an accurate notice
 	 * instead of an "8 imported, 22001 skipped" lump that hides the fact
 	 * most of those 22001 are msgid-only entries (no translation to upsert).
+	 *
+	 * @throws \Throwable Re-thrown after the replace-mode transaction is rolled
+	 *                     back, so an unexpected failure can never leave the
+	 *                     wipe committed without its re-import.
 	 */
 	public static function import_from_file( string $path, string $lang_slug, bool $replace = false ): array {
 		$result = [
@@ -360,329 +395,374 @@ final class PoSync {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		}
 
-		// Iterate entries. PO::$entries is keyed by Translation_Entry::key().
-		foreach ( (array) $po->entries as $entry ) {
-			if ( ! $entry instanceof \Translation_Entry ) {
-				continue;
-			}
+		// A replace has already DELETEd every translation for this language a
+		// few lines above, inside the open transaction. From here on, ANY exit
+		// that is not a clean COMMIT has to ROLLBACK explicitly: relying on the
+		// connection tearing down only covers a fatal, and a Throwable caught
+		// by an outer handler (REST, CLI, a job worker) would otherwise leave
+		// the transaction open for whatever runs next on that connection to
+		// commit - publishing the wipe without the re-import.
+		try {
 
-			$singular = (string) ( $entry->singular ?? '' );
-
-			if ( $singular === '' ) {
-				continue; // Empty msgid is the PO header — skip.
-			}
-
-			++$result['total_entries'];
-
-			$raw_context = $entry->context !== null ? (string) $entry->context : '';
-			$domain      = self::extract_domain( (string) ( $entry->extracted_comments ?? '' ) );
-
-			// A single PO entry is normally one source row, but a standard
-			// gettext PLURAL entry (msgid + msgid_plural, msgstr[0..N] in one
-			// entry) carries two source forms. PerfLocale's own exporter emits
-			// singular/plural as two separate context-tagged entries, so its
-			// round-trip never enters the plural branch; but an externally
-			// authored PO (e.g. a translate.wordpress.org language pack) packs
-			// both forms into one entry. Split it into the two rows the scanner
-			// and loader expect so the plural form isn't dropped and the
-			// singular lands where _n() looks it up instead of context ''.
-			$forms = self::entry_to_forms( $entry, $singular, $raw_context, $domain );
-
-			$has_translation = false;
-			foreach ( $forms as $form ) {
-				if ( $form['translation'] !== '' ) {
-					$has_translation = true;
-					break;
-				}
-			}
-
-			if ( ! $has_translation ) {
-				// No translation on any form; nothing to upsert. Dominant case
-				// for a fresh PO the translator hasn't filled in, or an export
-				// that carried every source string regardless of status. Track
-				// it separately so the UI can say "msgid-only" instead of
-				// lumping it under generic "skipped".
-				++$result['no_translation'];
-				++$result['skipped'];
-				continue;
-			}
-
-			// gettext semantics: a fuzzy translation is msgmerge's guess
-			// copied from a DIFFERENT source string — explicitly marked
-			// unreliable. Every standard consumer (msgfmt, Poedit, Loco)
-			// excludes fuzzy by default; importing it as authoritative would
-			// display wrong text. PerfLocale's own exports never carry flags,
-			// so this only affects externally-edited PO files.
-			if ( in_array( 'fuzzy', (array) $entry->flags, true ) ) {
-				++$result['fuzzy_skipped'];
-				++$result['skipped'];
-				continue;
-			}
-
-			foreach ( $forms as $form ) {
-				$singular = $form['original'];
-				$context  = $form['context'];
-				$msgstr   = $form['translation'];
-
-				if ( $msgstr === '' ) {
-					continue; // This form has no translation yet; skip it.
+			// Iterate entries. PO::$entries is keyed by Translation_Entry::key().
+			foreach ( (array) $po->entries as $entry ) {
+				if ( ! $entry instanceof \Translation_Entry ) {
+					continue;
 				}
 
-				// Find or create the source string row. Primary lookup by the
-				// canonical sha256 original_hash — a UNIQUE indexed O(1) probe
-				// on the exact (domain, context, original) tuple; the plain
-				// (original, context, domain) SELECT scanned the TEXT column.
-				// group_id rides along: the serving layer's map query INNER
-				// JOINs translation_links, so the upsert below must mark the
-				// group translated for this language or the imported text is
-				// never served.
-				// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$string_row      = $wpdb->get_row(
-					$wpdb->prepare(
-						'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
-						$strings_table,
-						StringRepository::compute_hash( $domain, $context, $singular )
-					)
-				);
-				$string_id       = $string_row ? (int) $string_row->id : 0;
-				$string_group_id = $string_row ? (int) $string_row->group_id : 0;
+				$singular = (string) ( $entry->singular ?? '' );
 
-				// Fallback: gettext PO format normalizes line endings to \n.
-				// WP-core's PO::unpoify reads back any \r in the source as \n,
-				// so a row stored with \r\n or lone \r won't byte-match the
-				// import's $singular without normalization.
-				//
-				// Two-step normalize on the stored side so the comparison
-				// matches gettext semantics exactly:
-				// \r\n → \n   (CRLF collapses to LF)
-				// lone \r → \n  (any remaining lone CR becomes LF)
-				//
-				// CHAR(13) / CHAR(10) avoid $wpdb->prepare's backslash
-				// escaping of the query body — '\r' / '\n' literals get
-				// double-escaped and stop matching.
-				//
-				// GATED on the msgid containing \n: a stored row that differs
-				// only by CR/CRLF normalizes to a form that HAS \n, so its PO
-				// msgid must too. Without the gate, this non-sargable
-				// REPLACE() scan (it computes REPLACE over every candidate
-				// TEXT row) ran once per NEW entry — quadratic on first-time
-				// imports of large external PO files.
-				if ( $string_id === 0 && $singular !== '' && str_contains( $singular, "\n" ) ) {
+				if ( $singular === '' ) {
+					continue; // Empty msgid is the PO header — skip.
+				}
+
+				++$result['total_entries'];
+
+				$raw_context = $entry->context !== null ? (string) $entry->context : '';
+				$domain      = self::extract_domain( (string) ( $entry->extracted_comments ?? '' ) );
+
+				// A single PO entry is normally one source row, but a standard
+				// gettext PLURAL entry (msgid + msgid_plural, msgstr[0..N] in one
+				// entry) carries two source forms. PerfLocale's own exporter emits
+				// singular/plural as two separate context-tagged entries, so its
+				// round-trip never enters the plural branch; but an externally
+				// authored PO (e.g. a translate.wordpress.org language pack) packs
+				// both forms into one entry. Split it into the two rows the scanner
+				// and loader expect so the plural form isn't dropped and the
+				// singular lands where _n() looks it up instead of context ''.
+				$forms = self::entry_to_forms( $entry, $singular, $raw_context, $domain );
+
+				$has_translation = false;
+				foreach ( $forms as $form ) {
+					if ( $form['translation'] !== '' ) {
+						$has_translation = true;
+						break;
+					}
+				}
+
+				if ( ! $has_translation ) {
+					// No translation on any form; nothing to upsert. Dominant case
+					// for a fresh PO the translator hasn't filled in, or an export
+					// that carried every source string regardless of status. Track
+					// it separately so the UI can say "msgid-only" instead of
+					// lumping it under generic "skipped".
+					++$result['no_translation'];
+					++$result['skipped'];
+					continue;
+				}
+
+				// gettext semantics: a fuzzy translation is msgmerge's guess
+				// copied from a DIFFERENT source string — explicitly marked
+				// unreliable. Every standard consumer (msgfmt, Poedit, Loco)
+				// excludes fuzzy by default; importing it as authoritative would
+				// display wrong text. PerfLocale's own exports never carry flags,
+				// so this only affects externally-edited PO files.
+				if ( in_array( 'fuzzy', (array) $entry->flags, true ) ) {
+					++$result['fuzzy_skipped'];
+					++$result['skipped'];
+					continue;
+				}
+
+				foreach ( $forms as $form ) {
+					$singular = $form['original'];
+					$context  = $form['context'];
+					$msgstr   = $form['translation'];
+
+					if ( $msgstr === '' ) {
+						continue; // This form has no translation yet; skip it.
+					}
+
+					// Find or create the source string row. Primary lookup by the
+					// canonical sha256 original_hash — a UNIQUE indexed O(1) probe
+					// on the exact (domain, context, original) tuple; the plain
+					// (original, context, domain) SELECT scanned the TEXT column.
+					// group_id rides along: the serving layer's map query INNER
+					// JOINs translation_links, so the upsert below must mark the
+					// group translated for this language or the imported text is
+					// never served.
+					// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$string_row      = $wpdb->get_row(
 						$wpdb->prepare(
-							'SELECT id, group_id FROM %i
-						 WHERE REPLACE(REPLACE(original, CONCAT(CHAR(13), CHAR(10)), CHAR(10)), CHAR(13), CHAR(10)) = %s
-						   AND context = %s
-						   AND domain = %s
-						 LIMIT 1',
+							'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
 							$strings_table,
-							$singular,
-							$context,
-							$domain
+							StringRepository::compute_hash( $domain, $context, $singular )
 						)
 					);
 					$string_id       = $string_row ? (int) $string_row->id : 0;
 					$string_group_id = $string_row ? (int) $string_row->group_id : 0;
-				}
 
-				// True only when THIS iteration minted the group it is about to
-				// link under, so it is known to be `type = 'string'` without
-				// re-reading it. Every other path — an existing row, or the
-				// row recovered after losing the UNIQUE-hash race — carries a
-				// group_id from the table that has to be verified.
-				$group_verified = false;
+					// Fallback: gettext PO format normalizes line endings to \n.
+					// WP-core's PO::unpoify reads back any \r in the source as \n,
+					// so a row stored with \r\n or lone \r won't byte-match the
+					// import's $singular without normalization.
+					//
+					// Two-step normalize on the stored side so the comparison
+					// matches gettext semantics exactly:
+					// \r\n → \n   (CRLF collapses to LF)
+					// lone \r → \n  (any remaining lone CR becomes LF)
+					//
+					// CHAR(13) / CHAR(10) avoid $wpdb->prepare's backslash
+					// escaping of the query body — '\r' / '\n' literals get
+					// double-escaped and stop matching.
+					//
+					// GATED on the msgid containing \n: a stored row that differs
+					// only by CR/CRLF normalizes to a form that HAS \n, so its PO
+					// msgid must too. Without the gate, this non-sargable
+					// REPLACE() scan (it computes REPLACE over every candidate
+					// TEXT row) ran once per NEW entry — quadratic on first-time
+					// imports of large external PO files.
+					if ( $string_id === 0 && $singular !== '' && str_contains( $singular, "\n" ) ) {
+						$string_row      = $wpdb->get_row(
+							$wpdb->prepare(
+								'SELECT id, group_id FROM %i
+							 WHERE REPLACE(REPLACE(original, CONCAT(CHAR(13), CHAR(10)), CHAR(10)), CHAR(13), CHAR(10)) = %s
+							   AND context = %s
+							   AND domain = %s
+							 LIMIT 1',
+								$strings_table,
+								$singular,
+								$context,
+								$domain
+							)
+						);
+						$string_id       = $string_row ? (int) $string_row->id : 0;
+						$string_group_id = $string_row ? (int) $string_row->group_id : 0;
+					}
 
-				if ( $string_id === 0 ) {
-					// Create the source row exactly as the scanner does: a canonical
-						// sha256 original_hash + a dedicated type='string' group. The
-						// previous hand-rolled md5 hash with group_id 0 produced an
-						// orphan that never rendered in DB mode and collided into a
-						// DUPLICATE on the next scan (which keys by the sha256 hash).
-						$groups_table = Schema::table( 'translation_groups' );
+					// True only when THIS iteration minted the group it is about to
+					// link under, so it is known to be `type = 'string'` without
+					// re-reading it. Every other path — an existing row, or the
+					// row recovered after losing the UNIQUE-hash race — carries a
+					// group_id from the table that has to be verified.
+					$group_verified = false;
 
-						// insert_id is read only after a CONFIRMED insert: on a
-						// failed one it can still hold a PRIOR row's id rather
-						// than 0, depending on the mysqli driver — the same
-						// reason BulkStringTranslateJob::mint_string_group()
-						// refuses to trust it. Trusting it here would file the
-						// new string under a group that belongs to something
-						// else, which is the exact shape upsert_link() then
-						// rewrites through the group_lang unique key.
-						$group_inserted = $wpdb->insert( $groups_table, [ 'type' => 'string' ], [ '%s' ] );
-						$group_id       = false !== $group_inserted ? (int) $wpdb->insert_id : 0;
+					if ( $string_id === 0 ) {
+						// Create the source row exactly as the scanner does: a canonical
+							// sha256 original_hash + a dedicated type='string' group. The
+							// previous hand-rolled md5 hash with group_id 0 produced an
+							// orphan that never rendered in DB mode and collided into a
+							// DUPLICATE on the next scan (which keys by the sha256 hash).
+							$groups_table = Schema::table( 'translation_groups' );
 
-					if ( $group_id > 0 ) {
-						$inserted = $wpdb->insert(
-							$strings_table,
-							[
-								'original'      => $singular,
-								'context'       => $context,
-								'domain'        => $domain,
-								'original_hash' => StringRepository::compute_hash( $domain, $context, $singular ),
-								'group_id'      => $group_id,
-								'created_at'    => current_time( 'mysql', true ),
-							],
-							[ '%s', '%s', '%s', '%s', '%d', '%s' ]
+							// insert_id is read only after a CONFIRMED insert: on a
+							// failed one it can still hold a PRIOR row's id rather
+							// than 0, depending on the mysqli driver — the same
+							// reason BulkStringTranslateJob::mint_string_group()
+							// refuses to trust it. Trusting it here would file the
+							// new string under a group that belongs to something
+							// else, which is the exact shape upsert_link() then
+							// rewrites through the group_lang unique key.
+							$group_inserted = $wpdb->insert( $groups_table, [ 'type' => 'string' ], [ '%s' ] );
+							$group_id       = false !== $group_inserted ? (int) $wpdb->insert_id : 0;
+
+						if ( $group_id > 0 ) {
+							$inserted = $wpdb->insert(
+								$strings_table,
+								[
+									'original'      => $singular,
+									'context'       => $context,
+									'domain'        => $domain,
+									'original_hash' => StringRepository::compute_hash( $domain, $context, $singular ),
+									'group_id'      => $group_id,
+									'created_at'    => current_time( 'mysql', true ),
+								],
+								[ '%s', '%s', '%s', '%s', '%d', '%s' ]
+							);
+
+							if ( false !== $inserted && (int) $wpdb->insert_id > 0 ) {
+								$string_id       = (int) $wpdb->insert_id;
+								$string_group_id = $group_id;
+								$group_verified  = true;
+							} else {
+								// Lost the UNIQUE-hash race: drop the orphan group and
+								// recover the existing row by its canonical hash.
+								$wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
+								$string_row      = $wpdb->get_row(
+									$wpdb->prepare(
+										'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
+										$strings_table,
+										StringRepository::compute_hash( $domain, $context, $singular )
+									)
+								);
+								$string_id       = $string_row ? (int) $string_row->id : 0;
+								$string_group_id = $string_row ? (int) $string_row->group_id : 0;
+							}
+						}
+					}
+
+					if ( $string_id <= 0 ) {
+						$result['errors'][] = sprintf(
+							/* translators: %s: PO msgid */
+							__( 'Could not create source row for: %s', 'perflocale' ),
+							mb_substr( $singular, 0, 60 )
+						);
+						++$result['skipped'];
+						continue;
+					}
+
+					// The link is written BEFORE the value, and the string's group
+					// is healed first when it cannot legally own one. Same order
+					// and same contract as
+					// BulkStringTranslateJob::save_translation(): a value with no
+					// link is never served AND never retried (the skip-existing
+					// branches key off the value), whereas a link with no value
+					// serves nothing in the meantime and is simply re-written by
+					// the next import.
+					//
+					// `strings.group_id` is an unenforced FK and three shapes fail
+					// it — 0 (never grouped), an id whose group row is gone, and an
+					// id that collides with a live post/term group. The last is why
+					// this can never be the bare `> 0` test it used to be:
+					// upsert_link()'s ON DUPLICATE KEY UPDATE would match that post
+					// group's own row through the group_lang unique key and rewrite
+					// its object_id to a string id, pointing a real post
+					// translation at nothing.
+					$link_error = self::link_string_translation(
+						$group_repo,
+						$string_id,
+						$string_group_id,
+						(int) $lang->id,
+						$group_verified
+					);
+
+					if ( $link_error !== '' ) {
+						++$result['skipped'];
+						$result['errors'][] = $link_error;
+						continue;
+					}
+
+					// Upsert the translation.
+					//
+					// MySQL's INSERT…ON DUPLICATE KEY UPDATE returns affected_rows:
+					// 0 — duplicate matched, the UPDATE clause's columns ended
+					// up with their existing values (no actual write)
+					// 1 — fresh insert
+					// 2 — duplicate matched and values changed (real update)
+					//
+					// IMPORTANT: we deliberately do NOT include `updated_at` in
+					// the UPDATE clause. The schema declares
+					// `updated_at … ON UPDATE CURRENT_TIMESTAMP`, which fires
+					// only when at least one OTHER column actually changes. If
+					// we wrote `updated_at = VALUES(updated_at)` here, MySQL
+					// would always count the row as updated (because the
+					// timestamp differs every call), and we couldn't distinguish
+					// "really updated" from "no-op upsert" — every re-import of
+					// the same PO would report "N updated" instead of "N already
+					// up to date".
+					// Plural forms 2..N (Polish/Russian/Arabic) ride on this row as
+					// JSON extra_forms; NULL for every other row. ONLY a genuine
+					// msgid_plural entry is authoritative about those forms —
+					// entry_to_forms tags its plural row with the 'extra_forms' key
+					// (even as []), and NEVER sets it on a flat/singular entry. So a
+					// plural entry may write (form present) OR clear (empty ->
+					// NULL) the column; a flat entry must leave it untouched. That
+					// distinction is load-bearing: our own PO export flattens each
+					// plural row to a singular msgctxt="plural" entry, which on
+					// re-import hash-matches the existing plural row. If a flat
+					// entry were allowed to write extra_forms it would NULL every
+					// 3+ form language's stored forms on the export -> edit ->
+					// re-import round-trip (silent data loss).
+					$authoritative = array_key_exists( 'extra_forms', $form );
+					$extra_json    = ( $authoritative && is_array( $form['extra_forms'] ) && $form['extra_forms'] !== [] )
+						? wp_json_encode( array_map( 'strval', $form['extra_forms'] ) )
+						: null;
+
+					// IF(%d, VALUES(extra_forms), extra_forms): when authoritative,
+					// take the incoming value (possibly NULL to clear); otherwise
+					// keep whatever is already stored. NULLIF(%s, '') restores the
+					// SQL NULL that wpdb::prepare() flattens away — a null php
+					// value binds as '' under %s, which would store a junk
+					// empty-string on every non-plural row (and on authoritative
+					// clears) instead of the column's real "no extra forms" state.
+					// A genuine $extra_json is a non-empty JSON array literal, so
+					// the '' → NULL mapping can never hit a real value.
+					$now = current_time( 'mysql', true );
+					// `string_translations` has exactly ONE unique key — PRIMARY
+					// (string_id, language_id) — so this upsert can only ever
+					// collide on the pair it is addressing, and affected_rows is a
+					// trustworthy inserted/updated/no-op signal. (The polymorphic
+					// `translation_links` table, written above, carries two, which
+					// is why its write goes through link_string_translation()
+					// rather than a bare upsert.)
+					$upsert = $wpdb->query(
+						$wpdb->prepare(
+							"INSERT INTO %i (string_id, language_id, translation, extra_forms, updated_at)
+						 VALUES (%d, %d, %s, NULLIF(%s, ''), %s)
+						 ON DUPLICATE KEY UPDATE
+							extra_forms = IF(%d, VALUES(extra_forms), extra_forms),
+							translation = VALUES(translation)",
+							$st_table,
+							$string_id,
+							(int) $lang->id,
+							$msgstr,
+							$extra_json,
+							$now,
+							$authoritative ? 1 : 0
+						)
+					);
+					// phpcs:enable
+
+					if ( $upsert !== false ) {
+						++$result['imported'];
+
+						switch ( (int) $upsert ) {
+							case 1:
+								++$result['inserted'];
+								break;
+							case 2:
+								++$result['updated'];
+								break;
+							case 0:
+							default:
+								++$result['unchanged'];
+								break;
+						}
+					} else {
+						++$result['skipped'];
+						$result['errors'][] = sprintf(
+							/* translators: 1: msgid, 2: DB error */
+							__( '%1$s: %2$s', 'perflocale' ),
+							mb_substr( $singular, 0, 60 ),
+							(string) $wpdb->last_error
 						);
 
-						if ( false !== $inserted && (int) $wpdb->insert_id > 0 ) {
-							$string_id       = (int) $wpdb->insert_id;
-							$string_group_id = $group_id;
-							$group_verified  = true;
-						} else {
-							// Lost the UNIQUE-hash race: drop the orphan group and
-							// recover the existing row by its canonical hash.
-							$wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
-							$string_row      = $wpdb->get_row(
-								$wpdb->prepare(
-									'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
-									$strings_table,
-									StringRepository::compute_hash( $domain, $context, $singular )
-								)
-							);
-							$string_id       = $string_row ? (int) $string_row->id : 0;
-							$string_group_id = $string_row ? (int) $string_row->group_id : 0;
+						// In replace mode the old value for this string is already
+						// deleted, so a refused upsert is not a skip - it is the
+						// string's translation, gone. Committing the rest would
+						// hand back 19 of 20 replacements plus a link still marked
+						// "translated" pointing at nothing. Roll the whole import
+						// back and give the operator their pre-import data.
+						//
+						// Returned, not thrown, so every caller keeps the
+						// documented array contract and reports the failure the
+						// same way it reports a malformed file.
+						if ( $replace ) {
+							// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
+							$wpdb->query( 'ROLLBACK' );
+
+							$result['errors'][]  = __( 'Replace import rolled back: the database refused a translation, so nothing was changed.', 'perflocale' );
+							$result['imported']  = 0;
+							$result['inserted']  = 0;
+							$result['updated']   = 0;
+							$result['unchanged'] = 0;
+
+							// Flush before returning. The aborted pass deleted
+							// and re-read rows, so caches populated during it
+							// describe a state the database has just discarded.
+							self::flush_language_caches( $lang );
+
+							return $result;
 						}
 					}
 				}
-
-				if ( $string_id <= 0 ) {
-					$result['errors'][] = sprintf(
-						/* translators: %s: PO msgid */
-						__( 'Could not create source row for: %s', 'perflocale' ),
-						mb_substr( $singular, 0, 60 )
-					);
-					++$result['skipped'];
-					continue;
-				}
-
-				// The link is written BEFORE the value, and the string's group
-				// is healed first when it cannot legally own one. Same order
-				// and same contract as
-				// BulkStringTranslateJob::save_translation(): a value with no
-				// link is never served AND never retried (the skip-existing
-				// branches key off the value), whereas a link with no value
-				// serves nothing in the meantime and is simply re-written by
-				// the next import.
-				//
-				// `strings.group_id` is an unenforced FK and three shapes fail
-				// it — 0 (never grouped), an id whose group row is gone, and an
-				// id that collides with a live post/term group. The last is why
-				// this can never be the bare `> 0` test it used to be:
-				// upsert_link()'s ON DUPLICATE KEY UPDATE would match that post
-				// group's own row through the group_lang unique key and rewrite
-				// its object_id to a string id, pointing a real post
-				// translation at nothing.
-				$link_error = self::link_string_translation(
-					$group_repo,
-					$string_id,
-					$string_group_id,
-					(int) $lang->id,
-					$group_verified
-				);
-
-				if ( $link_error !== '' ) {
-					++$result['skipped'];
-					$result['errors'][] = $link_error;
-					continue;
-				}
-
-				// Upsert the translation.
-				//
-				// MySQL's INSERT…ON DUPLICATE KEY UPDATE returns affected_rows:
-				// 0 — duplicate matched, the UPDATE clause's columns ended
-				// up with their existing values (no actual write)
-				// 1 — fresh insert
-				// 2 — duplicate matched and values changed (real update)
-				//
-				// IMPORTANT: we deliberately do NOT include `updated_at` in
-				// the UPDATE clause. The schema declares
-				// `updated_at … ON UPDATE CURRENT_TIMESTAMP`, which fires
-				// only when at least one OTHER column actually changes. If
-				// we wrote `updated_at = VALUES(updated_at)` here, MySQL
-				// would always count the row as updated (because the
-				// timestamp differs every call), and we couldn't distinguish
-				// "really updated" from "no-op upsert" — every re-import of
-				// the same PO would report "N updated" instead of "N already
-				// up to date".
-				// Plural forms 2..N (Polish/Russian/Arabic) ride on this row as
-				// JSON extra_forms; NULL for every other row. ONLY a genuine
-				// msgid_plural entry is authoritative about those forms —
-				// entry_to_forms tags its plural row with the 'extra_forms' key
-				// (even as []), and NEVER sets it on a flat/singular entry. So a
-				// plural entry may write (form present) OR clear (empty ->
-				// NULL) the column; a flat entry must leave it untouched. That
-				// distinction is load-bearing: our own PO export flattens each
-				// plural row to a singular msgctxt="plural" entry, which on
-				// re-import hash-matches the existing plural row. If a flat
-				// entry were allowed to write extra_forms it would NULL every
-				// 3+ form language's stored forms on the export -> edit ->
-				// re-import round-trip (silent data loss).
-				$authoritative = array_key_exists( 'extra_forms', $form );
-				$extra_json    = ( $authoritative && is_array( $form['extra_forms'] ) && $form['extra_forms'] !== [] )
-					? wp_json_encode( array_map( 'strval', $form['extra_forms'] ) )
-					: null;
-
-				// IF(%d, VALUES(extra_forms), extra_forms): when authoritative,
-				// take the incoming value (possibly NULL to clear); otherwise
-				// keep whatever is already stored. NULLIF(%s, '') restores the
-				// SQL NULL that wpdb::prepare() flattens away — a null php
-				// value binds as '' under %s, which would store a junk
-				// empty-string on every non-plural row (and on authoritative
-				// clears) instead of the column's real "no extra forms" state.
-				// A genuine $extra_json is a non-empty JSON array literal, so
-				// the '' → NULL mapping can never hit a real value.
-				$now = current_time( 'mysql', true );
-				// `string_translations` has exactly ONE unique key — PRIMARY
-				// (string_id, language_id) — so this upsert can only ever
-				// collide on the pair it is addressing, and affected_rows is a
-				// trustworthy inserted/updated/no-op signal. (The polymorphic
-				// `translation_links` table, written above, carries two, which
-				// is why its write goes through link_string_translation()
-				// rather than a bare upsert.)
-				$upsert = $wpdb->query(
-					$wpdb->prepare(
-						"INSERT INTO %i (string_id, language_id, translation, extra_forms, updated_at)
-					 VALUES (%d, %d, %s, NULLIF(%s, ''), %s)
-					 ON DUPLICATE KEY UPDATE
-						extra_forms = IF(%d, VALUES(extra_forms), extra_forms),
-						translation = VALUES(translation)",
-						$st_table,
-						$string_id,
-						(int) $lang->id,
-						$msgstr,
-						$extra_json,
-						$now,
-						$authoritative ? 1 : 0
-					)
-				);
-				// phpcs:enable
-
-				if ( $upsert !== false ) {
-					++$result['imported'];
-
-					switch ( (int) $upsert ) {
-						case 1:
-							++$result['inserted'];
-							break;
-						case 2:
-							++$result['updated'];
-							break;
-						case 0:
-						default:
-							++$result['unchanged'];
-							break;
-					}
-				} else {
-					++$result['skipped'];
-					$result['errors'][] = sprintf(
-						/* translators: 1: msgid, 2: DB error */
-						__( '%1$s: %2$s', 'perflocale' ),
-						mb_substr( $singular, 0, 60 ),
-						(string) $wpdb->last_error
-					);
-				}
 			}
+		} catch ( \Throwable $e ) {
+			if ( $replace ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
+				$wpdb->query( 'ROLLBACK' );
+			}
+
+			throw $e;
 		}
 
 		if ( $replace ) {
@@ -697,18 +777,7 @@ final class PoSync {
 		// Without this, an import only takes effect after an unrelated
 		// admin save or the caches' natural TTL.
 		if ( $result['imported'] > 0 || $replace ) {
-			$plugin = \PerfLocale\Plugin::get_instance();
-			$cache  = $plugin->get( 'cache' );
-
-			if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
-				$cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
-				$cache->invalidate_group( 'perflocale_strings' );
-				$cache->invalidate_group( 'perflocale_trans' );
-
-				if ( $plugin->get( 'settings' )->get( 'string_translation_mode' ) === 'files' ) {
-					( new \PerfLocale\Strings\TranslationFileGenerator( $cache ) )->generate_all( [ (int) $lang->id ] );
-				}
-			}
+			self::flush_language_caches( $lang );
 		}
 
 		/**

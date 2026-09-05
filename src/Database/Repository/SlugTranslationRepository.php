@@ -455,6 +455,51 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	private const SLUG_INDEX_PREFIX = 191;
 
 	/**
+	 * Trim a slug to at most $length characters WITHOUT cutting a percent-escape
+	 * in half.
+	 *
+	 * WordPress percent-encodes every non-ASCII character in a slug, so on the
+	 * sites this plugin exists for a slug is mostly escapes: one CJK character
+	 * costs nine characters (`%e6%96%b0`), one Cyrillic character six. An
+	 * ordinary 26-character Japanese title becomes a 198-character slug, which
+	 * is past the 191-character index prefix, so the collision path below trims
+	 * it — and a plain mb_substr() lands mid-escape roughly two times in three,
+	 * leaving a tail like `…%e3%81%8`.
+	 *
+	 * That is not a cosmetic defect. The trimmed slug goes straight into a URL
+	 * path (UrlConverter builds the translated permalink from it, unencoded,
+	 * because it is already encoded), and Apache and nginx both reject a
+	 * malformed escape in a path with **HTTP 400** before WordPress is reached.
+	 * The result is a translated permalink — in hreflang, in the switcher, in
+	 * the sitemap — that cannot be fetched at all. The stored value is also not
+	 * sanitize_title()-stable, so re-deriving it yields a different string.
+	 *
+	 * Mirrors core's `_truncate_post_slug()`: decode, and if the slug really was
+	 * encoded, re-encode with a length budget so the cut can only fall on a
+	 * character boundary. `utf8_uri_encode()` never returns more than $length
+	 * characters and never ends mid-escape. Trailing hyphens are trimmed for the
+	 * same reason core trims them — a slug ending in `-` then `-2` reads as `--2`.
+	 *
+	 * @param string $slug   Slug to trim (already sanitize_title()'d).
+	 * @param int    $length Maximum length in characters.
+	 * @return string
+	 */
+	private static function truncate_to_prefix( string $slug, int $length ): string {
+		if ( mb_strlen( $slug ) <= $length ) {
+			return $slug;
+		}
+
+		$decoded = urldecode( $slug );
+
+		// No escapes to straddle: a character cut is already safe.
+		if ( $decoded === $slug ) {
+			return rtrim( mb_substr( $slug, 0, $length ), '-' );
+		}
+
+		return rtrim( utf8_uri_encode( $decoded, $length ), '-' );
+	}
+
+	/**
 	 * Resolve a collision-free slug within a single (language, object_type,
 	 * object_subtype) namespace.
 	 *
@@ -536,9 +581,11 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			// The suffix has to land INSIDE the indexed prefix or the next
 			// candidate collides identically — appending past character 191
 			// leaves the compared prefix unchanged. Trimming the base to make
-			// room is what core's _truncate_post_slug() does.
+			// room is what core's _truncate_post_slug() does, and — as that
+			// function knows and a bare mb_substr() does not — the cut has to
+			// respect percent-escapes. See truncate_to_prefix().
 			$suffix    = '-' . $i;
-			$base      = mb_substr( $slug, 0, max( 1, self::SLUG_INDEX_PREFIX - mb_strlen( $suffix ) ) );
+			$base      = self::truncate_to_prefix( $slug, max( 1, self::SLUG_INDEX_PREFIX - mb_strlen( $suffix ) ) );
 			$candidate = $base . $suffix;
 		}
 

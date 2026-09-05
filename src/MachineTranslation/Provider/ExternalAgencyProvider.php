@@ -197,6 +197,10 @@ final class ExternalAgencyProvider extends AbstractProvider {
 			1
 		);
 
+		// This probe only cares that the endpoint answered 2xx - it never
+		// parses the body, so it has to settle the armed success itself.
+		$this->accept_response();
+
 		return true;
 	}
 

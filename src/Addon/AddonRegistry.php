@@ -745,9 +745,25 @@ final class AddonRegistry {
 				$this->booted[ $id ] = true;
 
 				// Clear any historical failure on a successful boot.
+				//
+				// The counter and the operator-visible record are the same
+				// fact, so retire both. A boot failure is very often
+				// TRANSIENT: WordPress replaces plugin files in place during
+				// an update, and a request landing mid-write sees a truncated
+				// file and a parse error. Recording that forever means the
+				// site owner carries a red notice about a problem that fixed
+				// itself on the next request, and the only way out is a WP-CLI
+				// command they may not have. Scoped to the `boot` stage — a
+				// failed migration or uninstall is a different fact that a
+				// successful boot does not invalidate.
+				//
+				// Cost: this branch only runs when a failure was previously
+				// recorded, which is rare, so the happy path pays nothing.
 				if ( isset( $failures[ $id ] ) ) {
 					unset( $failures[ $id ] );
 					$failure_changed = true;
+
+					AddonMigrationErrors::clear_stage( $id, 'boot' );
 				}
 
 				// Auto-seed declared defaults on the addon's first
@@ -776,7 +792,7 @@ final class AddonRegistry {
 					$id,
 					'boot',
 					(int) $failures[ $id ],
-					$e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine()
+					\PerfLocale\Util\PathRedactor::redact( $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() )
 				);
 
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
@@ -896,6 +912,13 @@ final class AddonRegistry {
 		$failures = (array) get_option( self::FAILURE_OPTION, [] );
 		unset( $failures[ $id ] );
 		update_option( self::FAILURE_OPTION, $failures, true );
+
+		// Drop the boot records too. This is the operator saying "I have dealt
+		// with it, try again"; leaving the red notice standing after that is
+		// just a stale claim, and it is the notice — not the counter — that
+		// they can actually see. Other stages are left alone: a failed
+		// migration is not retried by un-quarantining.
+		AddonMigrationErrors::clear_stage( $id, 'boot' );
 	}
 
 	/**

@@ -169,6 +169,12 @@ final class XliffController extends RestController {
 			$result = $importer->import( $xliff_content );
 
 			return $this->success( $result );
+		} catch ( \PerfLocale\Xliff\XliffFormatException $e ) {
+			// The client sent something that can never parse - empty body,
+			// broken XML, declared entities, an unknown trgLang. That is a
+			// 400: retrying the identical request cannot succeed, and a 500
+			// tells an integrator (and every uptime monitor) the opposite.
+			return $this->error( 'invalid_xliff', $e->getMessage(), 400 );
 		} catch ( \Throwable $e ) {
 			return $this->error( 'import_failed', $e->getMessage(), 500 );
 		}

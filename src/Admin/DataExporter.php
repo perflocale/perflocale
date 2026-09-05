@@ -169,6 +169,48 @@ final class DataExporter {
 	];
 
 	/**
+	 * Maximum nesting depth {@see self::redact_credentials()} walks before it
+	 * drops a subtree wholesale.
+	 *
+	 * A settings blob arrives from `get_option()` via `maybe_unserialize()`,
+	 * and a serialized payload can carry an `R:` back-reference that makes the
+	 * array cyclic — an unbounded walk would then recurse until the stack
+	 * dies. Real config is one to three levels deep, so 8 is generous. Past
+	 * the cap the value is DROPPED rather than passed through: an un-walked
+	 * subtree is exactly the leak the recursion exists to close, so the cap
+	 * fails closed.
+	 */
+	private const REDACT_MAX_DEPTH = 8;
+
+	/**
+	 * Temp files a `write_to_file()` call has created but not yet published,
+	 * keyed by absolute path.
+	 *
+	 * Every ordinary exit path — success, validation failure, exception —
+	 * removes its own entry, so this is empty except while a write is in
+	 * flight. {@see self::sweep_pending_temp_files()} is the net for the
+	 * EXTRAordinary exits (a memory_limit fatal or a killed worker mid-export)
+	 * which would otherwise leave a partial export sitting in a web-served
+	 * uploads directory until the 7-day Helper::gc_stale_upload_files() sweep.
+	 *
+	 * Paths are absolute, so this static carries no per-blog state.
+	 *
+	 * @var array<string, bool>
+	 */
+	private static array $pending_temp_files = [];
+
+	/**
+	 * Whether the shutdown sweep has been registered for this request.
+	 *
+	 * Registered once, not once per call: `wp perflocale export-network` runs
+	 * one write_to_file() per site in a single process, and PHP has no way to
+	 * unregister a shutdown function.
+	 *
+	 * @var bool
+	 */
+	private static bool $shutdown_registered = false;
+
+	/**
 	 * Export selected sections and send as an HTTP JSON download.
 	 *
 	 * Thin wrapper around {@see self::write_to()} that writes to php://output
@@ -178,6 +220,9 @@ final class DataExporter {
 	 *
 	 * @param array<int, string> $sections Section keys to export. Empty = all.
 	 * @return void Dies after sending the file.
+	 * @throws \Throwable Re-raised for any non-RuntimeException failure, so a
+	 *                    bug in our code or in a hooked third party is not
+	 *                    disguised as an aborted-export envelope.
 	 */
 	public function download( array $sections = [] ): void {
 		$sections = $this->normalize_sections( $sections );
@@ -194,8 +239,45 @@ final class DataExporter {
 			wp_die( esc_html__( 'Failed to create export stream.', 'perflocale' ) );
 		}
 
-		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Streaming to php://output requires direct PHP file functions.
-		$this->write_to( $out, $sections );
+		try {
+			$this->write_to( $out, $sections );
+		} catch ( \Throwable $e ) {
+			// A table read failed mid-stream (see export_table()). Headers
+			// and part of the body are already sent, so there is no clean
+			// HTTP error to return — but the envelope is UNTERMINATED, which
+			// means what the browser saved is not parseable JSON and
+			// DataImporter will refuse it. That is the point: a partial dump
+			// must never look like a complete backup. Name the reason in the
+			// body so the operator does not have to guess, log it for the
+			// host, and stop without the closing brace.
+			//
+			// Catching here rather than letting it propagate is deliberate:
+			// download() is invoked from AdminController's admin_init
+			// handler, where an uncaught RuntimeException would be a fatal
+			// and a white screen. This route is cap-gated
+			// (perflocale_import_export, Administrator-only), so naming the
+			// DB error in the body discloses nothing new.
+			// Same narrowing as write_to_file(): only export_table()'s
+			// RuntimeException is an expected mid-stream failure. Anything else
+			// is a bug in our code or in a third party hooked into the export,
+			// and must not be disguised as an aborted-export envelope. Re-raise
+			// BEFORE writing the abort marker, so the body is not half-written
+			// on a path that is about to fatal anyway.
+			if ( ! $e instanceof \RuntimeException ) {
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Streaming to php://output requires direct PHP file functions.
+				fclose( $out );
+				throw $e;
+			}
+
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming to php://output requires direct PHP file functions.
+			fwrite( $out, "\n" . '"__perflocale_export_aborted": ' . wp_json_encode( $e->getMessage() ) );
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Streaming to php://output requires direct PHP file functions.
+			fclose( $out );
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'PerfLocale DataExporter: streamed export aborted - ' . $e->getMessage() );
+			exit;
+		}
+
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Streaming to php://output requires direct PHP file functions.
 		fclose( $out );
 		exit;
@@ -208,21 +290,83 @@ final class DataExporter {
 	 * caller that needs a file without the HTTP download dance. Preserves
 	 * the streaming memory profile of {@see self::download()}.
 	 *
+	 * Publication is ATOMIC: the stream goes into a sibling temp file, the
+	 * existing flush / size / trailing-brace validation runs on THAT, and only
+	 * a file that passed all three is rename()d onto $path. Nothing exists at
+	 * $path until this method is about to return the byte count, so a
+	 * concurrent reader — the download endpoint, a backup agent, an anonymous
+	 * GET on a host that ignores .htaccess — sees either no file or the
+	 * previous complete one, never a half-written export.
+	 *
+	 * Converts the ONE expected failure to `false`: {@see self::export_table()}
+	 * raises a RuntimeException on a failed read, and this method turns that
+	 * into the same `false` every other write failure returns. It is not
+	 * exception-proof — random_bytes() below runs before the try and throws if
+	 * the CSPRNG is unavailable, and any non-RuntimeException from a hooked
+	 * third party is deliberately re-raised rather than swallowed. Callers
+	 * ({@see \PerfLocale\Background\Jobs\DataExportJob}, the CLI `export` and
+	 * `export-network` commands) key on that return value.
+	 *
 	 * @param string             $path Destination file path.
 	 * @param array<int, string> $sections Section keys to export. Empty = all.
 	 * @return int|false Bytes written, or false on failure.
+	 * @throws \Throwable Re-raised for any non-RuntimeException failure; also
+	 *                    random_bytes() if the CSPRNG is unavailable.
 	 */
 	public function write_to_file( string $path, array $sections = [] ) {
 		$sections = $this->normalize_sections( $sections );
 
+		// Sibling temp, same directory, so rename() below is a same-filesystem
+		// move and never a cross-device copy. Same shape as
+		// TranslationFileGenerator::write_l10n_file(); the divergence is that
+		// THAT function moves through $wp_filesystem because it wrote through
+		// $wp_filesystem, whereas this one streams natively (WP_Filesystem has
+		// no streaming API), so both halves here stay native and share a UID.
+		//
+		// 'xb' is O_CREAT|O_EXCL: it refuses to open ANY pre-existing node,
+		// which is what closes the symlink hole — the writer can no longer be
+		// steered through a planted final-component symlink the way
+		// fopen( $path, 'w' ) could, because $path is never opened at all now.
+		// rename() REPLACES a symlink sitting at $path rather than following
+		// it. The random component also means the temp name is at least as
+		// unguessable as the export name it is derived from.
+		$tmp = $path . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Streaming to disk; WP_Filesystem has no streaming API.
-		$out = fopen( $path, 'w' );
+		$out = fopen( $tmp, 'xb' );
 
 		if ( ! $out ) {
 			return false;
 		}
 
-		$this->write_to( $out, $sections );
+		self::track_temp_file( $tmp );
+
+		try {
+			$this->write_to( $out, $sections );
+		} catch ( \Throwable $e ) {
+			// export_table() throws on a failed read rather than closing a
+			// half-read table cleanly. Nothing was published, so the only
+			// cleanup is the temp; the caller gets the same `false` it gets
+			// for any other write failure, and DataExportJob turns that into
+			// a failed job with a visible error. The DB message goes to the
+			// log because the job's own message only carries the path.
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Streaming to disk requires direct PHP file functions.
+			fclose( $out );
+			self::discard_temp_file( $tmp );
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'PerfLocale DataExporter: export aborted before publication - ' . $e->getMessage() );
+
+			// Only export_table()'s RuntimeException is an expected failure and
+			// becomes `false`. A TypeError or any other Throwable raised by a
+			// third party hooked into the export must stay loud — swallowing it
+			// would report a clean "export failed" for a bug that is not ours
+			// and is not a failed read.
+			if ( ! $e instanceof \RuntimeException ) {
+				throw $e;
+			}
+
+			return false;
+		}
 
 		// Force any buffered bytes to disk and capture the success flag
 		// BEFORE fclose - a disk-full condition only surfaces at flush
@@ -238,7 +382,7 @@ final class DataExporter {
 		if ( $flushed === false || $closed === false ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log( 'PerfLocale DataExporter: flush/close failed on ' . $path . ' - disk full or quota exhausted?' );
-			wp_delete_file( $path );
+			self::discard_temp_file( $tmp );
 			return false;
 		}
 
@@ -250,12 +394,12 @@ final class DataExporter {
 		// corrupted archive the user will try to import later.
 		$size = isset( $stat['size'] ) ? (int) $stat['size'] : 0;
 		if ( $size < 2 ) {
-			wp_delete_file( $path );
+			self::discard_temp_file( $tmp );
 			return false;
 		}
 
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Streaming validation needs fopen; @ suppresses the open-failure warning that the truthiness check on the next line handles.
-		$fh = @fopen( $path, 'r' );
+		$fh = @fopen( $tmp, 'r' );
 		if ( $fh ) {
 			// Read the last 16 bytes so we can tolerate trailing
 			// whitespace (write_to() ends with "}\n"). Anything past
@@ -271,13 +415,86 @@ final class DataExporter {
 			$trimmed = is_string( $tail ) ? rtrim( $tail ) : '';
 
 			if ( $trimmed === '' || substr( $trimmed, -1 ) !== '}' ) {
-				error_log( 'PerfLocale DataExporter: produced truncated JSON (tail: ' . var_export( $tail, true ) . ') - dropping ' . $path ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log, WordPress.PHP.DevelopmentFunctions.error_log_var_export
-				wp_delete_file( $path );
+				error_log( 'PerfLocale DataExporter: produced truncated JSON (tail: ' . var_export( $tail, true ) . ') - dropping the temp for ' . $path ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log, WordPress.PHP.DevelopmentFunctions.error_log_var_export
+				self::discard_temp_file( $tmp );
 				return false;
 			}
 		}
 
+		// Every gate passed — publish. This is the first and only moment the
+		// export becomes visible at $path, and rename() is atomic within a
+		// filesystem, so no reader can ever observe a partial one.
+		// Atomicity IS the point: rename(2) is atomic within a filesystem, so a
+		// concurrent reader sees either the previous complete export or the new
+		// one, never a partial file. WP_Filesystem::move() gives no such
+		// guarantee and can degrade to copy-then-delete, reintroducing the very
+		// window this closes — and it would run as a different UID than the
+		// fopen() that wrote the temp (see TranslationFileGenerator::write_l10n_file()'s
+		// docblock), so both halves of this write must stay native. Sibling
+		// path, so never cross-device.
+		//
+		// The ignore sits directly on the call because phpcs:ignore covers only
+		// the line that follows it.
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.rename_rename -- See above.
+		if ( ! rename( $tmp, $path ) ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'PerfLocale DataExporter: could not publish the export to ' . $path . ' - leaving it unwritten.' );
+			self::discard_temp_file( $tmp );
+			return false;
+		}
+
+		unset( self::$pending_temp_files[ $tmp ] );
+
 		return $size;
+	}
+
+	/**
+	 * Remember an in-flight temp file and arm the shutdown sweep once.
+	 *
+	 * @param string $tmp Absolute path to the temp file just created.
+	 * @return void
+	 */
+	private static function track_temp_file( string $tmp ): void {
+		self::$pending_temp_files[ $tmp ] = true;
+
+		if ( self::$shutdown_registered ) {
+			return;
+		}
+
+		self::$shutdown_registered = true;
+		register_shutdown_function( [ self::class, 'sweep_pending_temp_files' ] );
+	}
+
+	/**
+	 * Delete an unpublished temp file and forget it.
+	 *
+	 * @param string $tmp Absolute path to the temp file.
+	 * @return void
+	 */
+	private static function discard_temp_file( string $tmp ): void {
+		unset( self::$pending_temp_files[ $tmp ] );
+		wp_delete_file( $tmp );
+	}
+
+	/**
+	 * Shutdown sweep for temp files no ordinary exit path reached.
+	 *
+	 * Public only because `register_shutdown_function()` needs a callable. It
+	 * is a no-op unless a write died mid-stream — a memory_limit fatal on a
+	 * very large export is the realistic case — and it can never touch a
+	 * PUBLISHED export: write_to_file() drops the entry the instant rename()
+	 * succeeds, and the published name is not the temp name.
+	 *
+	 * @return void
+	 */
+	public static function sweep_pending_temp_files(): void {
+		foreach ( array_keys( self::$pending_temp_files ) as $tmp ) {
+			unset( self::$pending_temp_files[ $tmp ] );
+
+			if ( file_exists( $tmp ) ) {
+				wp_delete_file( $tmp );
+			}
+		}
 	}
 
 	/**
@@ -297,17 +514,90 @@ final class DataExporter {
 	 * via suffix match so future additions are redacted by default. Exports
 	 * are commonly shared as backups - credentials must never travel.
 	 *
+	 * Two things this does that the flat version did not:
+	 *
+	 * 1. It RECURSES. The old walk read `array_keys()` at the top level only,
+	 *    so `addon_settings[x]['nested']['access_token']` travelled verbatim
+	 *    while `addon_settings[x]['access_token']` was stripped — whether a
+	 *    secret survived depended on how deep its addon happened to nest it.
+	 * 2. It looks at VALUES, not only keys, for `scheme://user:pass@host`
+	 *    userinfo. `mt_libre_url` / `mt_agency_url` are ordinary URL settings
+	 *    matching no credential suffix, and `esc_url_raw()` keeps both the
+	 *    `:` and the `@`, so a self-hosted endpoint configured with inline
+	 *    HTTP auth used to export its password in plain sight.
+	 *
+	 * Both cases OMIT the key rather than rewriting the value, and that is
+	 * deliberate. `Settings::update()` merges (`array_merge( $current,
+	 * $sanitized )`), so an omitted key leaves the target's live value alone
+	 * on import, whereas a rewritten one would OVERWRITE a working endpoint
+	 * with a credential-less copy and break the provider silently on every
+	 * restore. Omission is also what the importer already expects of this
+	 * function: `DataImporter` restores a credential key the export omitted.
+	 *
 	 * @param array<string, mixed> $settings Raw settings array.
+	 * @param int                  $depth    Recursion depth; callers pass
+	 *                                       nothing. See REDACT_MAX_DEPTH for
+	 *                                       why the walk is bounded and why
+	 *                                       the cap DROPS rather than passes
+	 *                                       an un-walked subtree through.
 	 * @return array<string, mixed>
 	 */
-	public static function redact_credentials( array $settings ): array {
-		foreach ( array_keys( $settings ) as $key ) {
+	public static function redact_credentials( array $settings, int $depth = 0 ): array {
+		foreach ( $settings as $key => $value ) {
 			if ( preg_match( self::CREDENTIAL_KEY_PATTERN, (string) $key ) ) {
+				unset( $settings[ $key ] );
+				continue;
+			}
+
+			if ( is_array( $value ) ) {
+				if ( $depth >= self::REDACT_MAX_DEPTH ) {
+					unset( $settings[ $key ] );
+					continue;
+				}
+
+				// phpcs:ignore Generic.Commenting.DocComment.MissingShort -- Inline type hint for static analysis; a short description would be noise.
+				/** @var array<string, mixed> $value */
+				$settings[ $key ] = self::redact_credentials( $value, $depth + 1 );
+				continue;
+			}
+
+			if ( is_string( $value ) && self::has_url_userinfo( $value ) ) {
 				unset( $settings[ $key ] );
 			}
 		}
 
 		return $settings;
+	}
+
+	/**
+	 * Does this value parse as a URL carrying inline credentials?
+	 *
+	 * Deliberately strict: the WHOLE trimmed value must parse as a URL with a
+	 * user or pass component. A credential-shaped substring inside a longer
+	 * prose value does not qualify — dropping a whole setting because it
+	 * happens to mention a URL would be silent data loss in the export, which
+	 * is the failure mode this file works hardest to avoid. The two cheap
+	 * string tests short-circuit before wp_parse_url() for the ~120 settings
+	 * that are not URLs at all.
+	 *
+	 * @param string $value Raw setting value.
+	 * @return bool
+	 */
+	private static function has_url_userinfo( string $value ): bool {
+		$value = trim( $value );
+
+		if ( $value === '' || ! str_contains( $value, '@' ) || ! str_contains( $value, '://' ) ) {
+			return false;
+		}
+
+		$parts = wp_parse_url( $value );
+
+		if ( ! is_array( $parts ) ) {
+			return false;
+		}
+
+		return ( isset( $parts['user'] ) && $parts['user'] !== '' )
+			|| ( isset( $parts['pass'] ) && $parts['pass'] !== '' );
 	}
 
 	/**
@@ -318,6 +608,15 @@ final class DataExporter {
 	 * an addon's `*_api_key` / `*_token` / etc. never ride along on a
 	 * staging → prod export. Per-addon credentials stay on the exporting
 	 * site; operators re-enter them on import.
+	 *
+	 * That inner walk is RECURSIVE (see redact_credentials()), so a secret an
+	 * addon nested inside its own sub-array is stripped too. Mind the
+	 * asymmetry this creates with the importer: `DataImporter` restores a
+	 * credential key the export omitted only at the TOP level of an addon
+	 * entry, so a NESTED credential is not carried across a restore and has
+	 * to be re-entered. Losing it is the intended trade — the alternative is
+	 * shipping it in every backup. The addon-id level itself is deliberately
+	 * NOT key-matched here: only the entries are walked, exactly as before.
 	 *
 	 * @param array<string, mixed> $addon_settings
 	 * @return array<string, mixed>
@@ -385,22 +684,76 @@ final class DataExporter {
 	}
 
 	/**
+	 * Write one chunk to the export stream, or abort the export.
+	 *
+	 * `fwrite()` reports a short or refused write in its RETURN VALUE and
+	 * nowhere else. Discarding it meant a quota or device error partway
+	 * through a dump left a hole in the middle of the file while the final
+	 * writes still succeeded - so the flush check passed, the tail check saw
+	 * a well-formed `}`, and rename() published unparseable JSON over the
+	 * operator's previous, valid backup. The failure surfaced only when they
+	 * tried to restore it.
+	 *
+	 * Throwing keeps the streaming design intact (nothing is buffered to
+	 * compare afterwards) and lands in {@see write_to_file()}'s existing
+	 * RuntimeException handler, which discards the temp and publishes
+	 * nothing; on the download path it emits the abort marker instead.
+	 *
+	 * @param resource     $out   Open write stream.
+	 * @param string|false $chunk Bytes to write, or false from a failed encode.
+	 * @return void
+	 *
+	 * @throws \RuntimeException When the chunk could not be encoded, or could
+	 *                           not be written in full.
+	 */
+	private static function write_chunk( $out, $chunk ): void {
+		if ( ! is_string( $chunk ) ) {
+			throw new \RuntimeException( 'Export aborted: a section could not be encoded as JSON.' );
+		}
+
+		$length = strlen( $chunk );
+
+		if ( 0 === $length ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming write; WP_Filesystem has no streaming API.
+		$written = fwrite( $out, $chunk );
+
+		if ( false === $written || $written < $length ) {
+			throw new \RuntimeException(
+				esc_html(
+					sprintf(
+						'Export aborted: wrote %1$d of %2$d bytes (disk full, quota exhausted, or the stream refused the write).',
+						(int) $written,
+						$length
+					)
+				)
+			);
+		}
+	}
+
+	/**
 	 * Shared streaming logic used by download() and write_to_file().
 	 *
 	 * @param resource           $out Output stream.
 	 * @param array<int, string> $sections Normalized section keys (non-empty).
 	 * @return void
+	 * @throws \RuntimeException Propagated from {@see self::export_table()} when a
+	 *                           batch read fails, and from {@see self::write_chunk()}
+	 *                           when a stream write is refused or short. Both
+	 *                           callers catch it.
 	 */
 	private function write_to( $out, array $sections ): void {
 		// phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming to a JSON output stream; WP_Filesystem has no streaming API and download() targets php://output.
 
-		fwrite( $out, "{\n" );
-		fwrite( $out, '"perflocale_export": true,' . "\n" );
-		fwrite( $out, '"version": "' . PERFLOCALE_VERSION . '",' . "\n" );
-		fwrite( $out, '"format_version": ' . (int) self::FORMAT_VERSION . ',' . "\n" );
-		fwrite( $out, '"exported_at": "' . gmdate( 'c' ) . '",' . "\n" );
-		fwrite( $out, '"site_url": ' . wp_json_encode( home_url() ) . ',' . "\n" );
-		fwrite( $out, '"sections": ' . wp_json_encode( $sections ) . ',' . "\n" );
+		self::write_chunk( $out, "{\n" );
+		self::write_chunk( $out, '"perflocale_export": true,' . "\n" );
+		self::write_chunk( $out, '"version": "' . PERFLOCALE_VERSION . '",' . "\n" );
+		self::write_chunk( $out, '"format_version": ' . (int) self::FORMAT_VERSION . ',' . "\n" );
+		self::write_chunk( $out, '"exported_at": "' . gmdate( 'c' ) . '",' . "\n" );
+		self::write_chunk( $out, '"site_url": ' . wp_json_encode( home_url() ) . ',' . "\n" );
+		self::write_chunk( $out, '"sections": ' . wp_json_encode( $sections ) . ',' . "\n" );
 
 		if ( in_array( 'settings', $sections, true ) ) {
 			$settings = get_option( 'perflocale_settings', [] );
@@ -409,7 +762,7 @@ final class DataExporter {
 				$settings = self::redact_credentials( $settings );
 			}
 
-			fwrite( $out, '"settings": ' . wp_json_encode( $settings ) . ',' . "\n" );
+			self::write_chunk( $out, '"settings": ' . wp_json_encode( $settings ) . ',' . "\n" );
 
 			// Per-addon settings (perflocale_addon_settings, keyed by addon
 			// id). Travels with the 'settings' section because it's
@@ -425,7 +778,7 @@ final class DataExporter {
 				$addon_settings = self::redact_addon_credentials( $addon_settings );
 			}
 
-			fwrite( $out, '"addon_settings": ' . wp_json_encode( $addon_settings ) . ',' . "\n" );
+			self::write_chunk( $out, '"addon_settings": ' . wp_json_encode( $addon_settings ) . ',' . "\n" );
 
 			// Operator's enable/disable choices per addon. Without this,
 			// a staging → prod clone would carry an addon's settings but
@@ -434,11 +787,11 @@ final class DataExporter {
 			// the source means "nothing disabled" and must be preserved
 			// literally — that's a meaningful operator intent.
 			$disabled_addons = (array) get_option( 'perflocale_disabled_addons', [] );
-			fwrite( $out, '"disabled_addons": ' . wp_json_encode( array_values( array_filter( array_map( 'strval', $disabled_addons ) ) ) ) . ',' . "\n" );
+			self::write_chunk( $out, '"disabled_addons": ' . wp_json_encode( array_values( array_filter( array_map( 'strval', $disabled_addons ) ) ) ) . ',' . "\n" );
 		}
 
 		if ( in_array( 'roles', $sections, true ) ) {
-			fwrite( $out, '"roles": ' . wp_json_encode( self::snapshot_roles() ) . ',' . "\n" );
+			self::write_chunk( $out, '"roles": ' . wp_json_encode( self::snapshot_roles() ) . ',' . "\n" );
 		}
 
 		$tables = [];
@@ -466,7 +819,7 @@ final class DataExporter {
 
 		$tables = array_unique( $tables );
 
-		fwrite( $out, '"data": {' . "\n" );
+		self::write_chunk( $out, '"data": {' . "\n" );
 
 		$table_count = count( $tables );
 		$i           = 0;
@@ -477,7 +830,7 @@ final class DataExporter {
 			++$i;
 		}
 
-		fwrite( $out, '}' );
+		self::write_chunk( $out, '}' );
 
 		/**
 		 * Filter the extra top-level sections an addon wants to add to the
@@ -537,14 +890,14 @@ final class DataExporter {
 				continue;
 			}
 
-			fwrite( $out, ',' . "\n" );
+			self::write_chunk( $out, ',' . "\n" );
 			// Encode the KEY too so a name with a quote/backslash can never
 			// produce invalid JSON (the charset guard already rejects those;
 			// this keeps the envelope well-formed by construction anyway).
-			fwrite( $out, wp_json_encode( (string) $name ) . ': ' . $encoded );
+			self::write_chunk( $out, wp_json_encode( (string) $name ) . ': ' . $encoded );
 		}
 
-		fwrite( $out, "\n}\n" );
+		self::write_chunk( $out, "\n}\n" );
 		// phpcs:enable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite
 	}
 
@@ -558,6 +911,12 @@ final class DataExporter {
 	 *                                column holds this value (see SECTIONS);
 	 *                                null emits the whole table.
 	 * @return void
+	 * @throws \RuntimeException When a batch SELECT fails. A partial table must
+	 *                          never be emitted as a complete one — see the
+	 *                          comment on the guard for what a partial export
+	 *                          does to a replace-mode restore. Callers:
+	 *                          write_to_file() converts this to `false`,
+	 *                          download() aborts the stream.
 	 */
 	private function export_table( $out, string $table_name, bool $is_last, ?string $type_scope = null ): void {
 		// phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming to php://output requires direct PHP file functions.
@@ -565,7 +924,7 @@ final class DataExporter {
 
 		$full_table = Schema::table( $table_name );
 
-		fwrite( $out, '"' . $table_name . '": [' . "\n" );
+		self::write_chunk( $out, '"' . $table_name . '": [' . "\n" );
 
 		// Keyset pagination cursors. Every export table has an `id` PK except
 		// string_translations, which is keyed on the (string_id, language_id)
@@ -640,16 +999,51 @@ final class DataExporter {
 			}
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-			if ( ! is_array( $rows ) ) {
-				break;
+			// A FAILED read is not an empty table, and the two used to be
+			// indistinguishable here. wpdb::get_results( …, ARRAY_A ) builds
+			// `$new_array = array()` and only fills it `if ( $this->last_result )`,
+			// so a lost connection, a killed query, a max_allowed_packet
+			// overrun or a crashed table hands back `[]` — which sails past
+			// the is_array() guard, writes no rows, leaves the keyset cursor
+			// where it was and exits this do/while as an ordinary
+			// end-of-table. The envelope then closes cleanly, the size and
+			// trailing-brace gates in write_to_file() pass, and the job
+			// reports success over a backup that is silently missing rows.
+			//
+			// Restore that in replace mode and it DESTROYS the table with no
+			// error: DataImporter wipes first, its `if ( empty( $rows ) )
+			// continue;` then skips the refill, and its zero-insert abort
+			// needs `count( $rows ) > 0` to fire, so nothing catches it.
+			// Failing loudly here is the only place this is catchable.
+			//
+			// wpdb::query() calls flush() before every query — which resets
+			// last_error to '' — and assigns it from mysqli_error()
+			// afterwards, so a non-empty value here belongs to the SELECT
+			// above and to nothing before it. Costs no extra query. The
+			// instanceof is PHPStan narrowing, not a runtime guard (the
+			// $wpdb global reads as `mixed` in this file — see the existing
+			// "Cannot call method get_results() on mixed" baseline entry);
+			// the get_results() call above would already have fataled.
+			$db_error = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
+
+			if ( $db_error !== '' || ! is_array( $rows ) ) {
+				throw new \RuntimeException(
+					esc_html(
+						sprintf(
+							'PerfLocale export: reading table "%1$s" failed (%2$s) - refusing to emit a partial export.',
+							$table_name,
+							$db_error !== '' ? $db_error : 'no result set'
+						)
+					)
+				);
 			}
 
 			foreach ( $rows as $row ) {
 				if ( ! $first_row ) {
-					fwrite( $out, ',' . "\n" );
+					self::write_chunk( $out, ',' . "\n" );
 				}
 
-				fwrite( $out, wp_json_encode( $row ) );
+				self::write_chunk( $out, wp_json_encode( $row ) );
 				$first_row = false;
 			}
 
@@ -668,7 +1062,7 @@ final class DataExporter {
 			$got_full_batch = ( count( $rows ) === $batch_size );
 		} while ( $got_full_batch );
 
-		fwrite( $out, "\n" . ']' . ( $is_last ? '' : ',' ) . "\n" );
+		self::write_chunk( $out, "\n" . ']' . ( $is_last ? '' : ',' ) . "\n" );
 		// phpcs:enable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite
 	}
 }

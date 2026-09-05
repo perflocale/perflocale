@@ -146,11 +146,19 @@ final class WpAiClientProvider extends AbstractProvider {
 			);
 		}
 
-		// Successful call resets the failure counter so a transient blip
-		// doesn't accumulate toward the trip threshold across requests.
-		\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
+		// A returned-without-throwing call is not yet a success: the AI
+		// client can hand back a shape this provider cannot read at all.
+		// Clearing the counter before extraction made that failure invisible
+		// to the breaker - every call reset the streak, so a model that had
+		// stopped answering usefully kept being paid for. Extract first.
+		try {
+			$translated = $this->extract_translation_from_response( $result, $text );
+		} catch ( \Throwable $e ) {
+			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'malformed' );
+			throw $e;
+		}
 
-		$translated = $this->extract_translation_from_response( $result, $text );
+		\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
 
 		$this->track_usage( $text );
 
@@ -499,15 +507,27 @@ final class WpAiClientProvider extends AbstractProvider {
 					$builder->usingSystemInstruction( $args['system_instruction'] );
 				}
 
-				// `generateText()` on the WP 7.0 builder routes through __call.
+				// Call the SNAKE_CASE method. Core's WP_AI_Client_Prompt_Builder
+				// applies wp_supports_ai() and the site-wide
+				// `wp_ai_client_prevent_prompt` policy filter ONLY inside its
+				// __call() proxy, i.e. only for snake_case names. The camelCase
+				// generateText() is the underlying SDK method and reaches the
+				// provider with no policy check at all — so a site that had
+				// blocked AI prompts globally was still being prompted by this
+				// plugin (found by tools/regression-tests/cov-machine-translation.php
+				// I15f). A builder without __call (a non-core SDK object) has no
+				// policy layer to bypass, so it keeps the direct call.
+				//
 				// When no AI provider is configured / available / the prompt is
-				// blocked by core, __call returns `$this->error` (a WP_Error) or
-				// the builder itself instead of throwing — so we have to detect
-				// the failure shape and convert it to a RuntimeException for
-				// the outer try / breaker. Without this, the strict `: string`
-				// return type triggers a TypeError that the breaker classifier
-				// reads as 'unknown' rather than the real cause.
-				$result = $builder->generateText();
+				// blocked, __call returns `$this->error` (a WP_Error) or the
+				// builder itself instead of throwing — so we detect the failure
+				// shape and convert it to a RuntimeException for the outer
+				// try / breaker. Without this, the strict `: string` return type
+				// triggers a TypeError that the breaker classifier reads as
+				// 'unknown' rather than the real cause.
+				$result = method_exists( $builder, '__call' )
+					? $builder->generate_text()
+					: $builder->generateText();
 
 				if ( is_string( $result ) ) {
 					return $result;

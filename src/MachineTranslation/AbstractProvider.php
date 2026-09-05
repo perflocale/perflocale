@@ -58,6 +58,14 @@ abstract class AbstractProvider implements ProviderInterface {
 	protected int $session_usage = 0;
 
 	/**
+	 * Breaker key of a 2xx response whose body has not been proven usable
+	 * yet. Empty when there is nothing outstanding.
+	 *
+	 * @var string
+	 */
+	private string $pending_success_key = '';
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings $settings Plugin settings.
@@ -159,6 +167,11 @@ abstract class AbstractProvider implements ProviderInterface {
 		// path in WpAiClientProvider feeds into.
 		$breaker_key = 'mt_' . $this->get_id();
 
+		// A previous call on this instance may have armed a success that its
+		// caller never confirmed (a raw consumer that reads the body itself).
+		// Drop it rather than let it settle against this call's result.
+		$this->pending_success_key = '';
+
 		if ( \PerfLocale\Concurrency\Breaker::is_open( $breaker_key ) ) {
 			$status = \PerfLocale\Concurrency\Breaker::status( $breaker_key );
 			// $breaker_key is built from a sanitize_key()-passed provider
@@ -199,6 +212,39 @@ abstract class AbstractProvider implements ProviderInterface {
 			$args['redirection'] = 0;
 		}
 
+		// Bound the response body. Nothing above limits how much a provider — or
+		// a proxy, or a captive portal answering for one — may send back, and
+		// wp_remote_request() buffers the WHOLE body in memory before this method
+		// sees a byte, so a runaway reply is a PHP fatal in the middle of a bulk
+		// run. Size the cap FROM THE REQUEST rather than pinning a constant: a
+		// fixed ceiling either truncates a legitimate long translation or is too
+		// loose to bound anything. 8x the submitted payload plus 16 KB covers the
+		// worst realistic expansion (ASCII source into a 3-4 byte-per-character
+		// script, plus the JSON envelope and any entity escaping in html mode),
+		// with a 64 KB floor for the tiny probe requests (test_connection,
+		// DeepL /usage).
+		//
+		// Two consequences to know about. (1) A body over the cap is TRUNCATED
+		// SILENTLY — WpOrg\Requests\Transport\Curl::stream_body() stops storing
+		// bytes but still reports the full length, so there is no transport-level
+		// error. The truncated body then fails JSON decoding, which is how an
+		// oversized response surfaces: as a parse error, not as an OOM. That is
+		// the intended trade. (2) The cap bounds MEMORY, not transfer time — a
+		// slow trickle is still the `timeout` argument's job. Set if-absent, so the
+		// request_args filter below can raise or remove it for an odd endpoint.
+		if ( ! isset( $args['limit_response_size'] ) ) {
+			$payload = $args['body'] ?? '';
+
+			if ( is_array( $payload ) ) {
+				$encoded = wp_json_encode( $payload );
+				$payload = is_string( $encoded ) ? $encoded : '';
+			}
+
+			$payload_bytes = is_string( $payload ) ? strlen( $payload ) : 0;
+
+			$args['limit_response_size'] = max( 65536, ( 8 * $payload_bytes ) + 16384 );
+		}
+
 		/**
 		 * Filter the wp_remote_request() arguments before they are sent to a
 		 * machine-translation provider. Integrators behind corporate proxies,
@@ -223,7 +269,14 @@ abstract class AbstractProvider implements ProviderInterface {
 			$response = wp_remote_request( $url, $args );
 
 			if ( is_wp_error( $response ) ) {
-				$last_error     = $response->get_error_message();
+				// A WP_Error from the transport layer is not automatically
+				// safe text: a site-local `pre_http_request` / `http_api_curl`
+				// filter, a custom transport or a proxy integration composes
+				// that message and can fold the outgoing request - headers,
+				// credential and all - into it. It then reaches a thrown
+				// exception that a background job persists on the job row and
+				// the Jobs page renders. Mask it exactly like a response body.
+				$last_error     = self::mask_credentials( $response->get_error_message() );
 				$failure_reason = 'transient';
 
 				if ( $attempt < $retries ) {
@@ -262,9 +315,15 @@ abstract class AbstractProvider implements ProviderInterface {
 			}
 
 			if ( $code >= 200 && $code < 300 ) {
-				// Success — clear any accumulated breaker counter so a
-				// short hiccup doesn't take us halfway to OPEN forever.
-				\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
+				// HTTP 200 is not yet success. A provider (or a proxy, or a
+				// captive portal) that answers every call with an unparseable
+				// body is failing in the only way that matters, and clearing
+				// the counter here made that failure INVISIBLE to the breaker:
+				// each call reset the streak before the parse could fail, so
+				// the count could never reach the threshold and a permanently
+				// broken endpoint got billed and retried forever. Arm the
+				// success instead and let parse_json_response() decide.
+				$this->pending_success_key = $breaker_key;
 
 				$body = wp_remote_retrieve_body( $response );
 
@@ -353,6 +412,8 @@ abstract class AbstractProvider implements ProviderInterface {
 		$data = json_decode( $body, true );
 
 		if ( json_last_error() !== JSON_ERROR_NONE ) {
+			$this->reject_response( 'malformed' );
+
 			throw new \RuntimeException(
 				esc_html(
 					sprintf(
@@ -365,12 +426,51 @@ abstract class AbstractProvider implements ProviderInterface {
 		}
 
 		if ( ! is_array( $data ) ) {
+			$this->reject_response( 'malformed' );
+
 			throw new \RuntimeException(
 				esc_html( sprintf( 'Unexpected response format from %s.', $this->get_name() ) )
 			);
 		}
 
+		$this->accept_response();
+
 		return $data;
+	}
+
+	/**
+	 * Confirm that the last 2xx body was usable, closing out the success the
+	 * transport armed. Call this from any provider that consumes a
+	 * {@see make_request()} body WITHOUT going through
+	 * {@see parse_json_response()}; otherwise the breaker never learns the
+	 * call worked and an old failure streak lingers until it expires.
+	 *
+	 * @return void
+	 */
+	protected function accept_response(): void {
+		if ( $this->pending_success_key === '' ) {
+			return;
+		}
+
+		$key                       = $this->pending_success_key;
+		$this->pending_success_key = '';
+
+		\PerfLocale\Concurrency\Breaker::record_success( $key );
+	}
+
+	/**
+	 * Report a 2xx response whose body could not be used. Counts toward the
+	 * breaker exactly like a transport failure, because for the caller it is
+	 * one: the call was paid for and produced nothing.
+	 *
+	 * @param string $reason Short failure tag stored for Site Health.
+	 * @return void
+	 */
+	protected function reject_response( string $reason = 'malformed' ): void {
+		$key                       = $this->pending_success_key !== '' ? $this->pending_success_key : 'mt_' . $this->get_id();
+		$this->pending_success_key = '';
+
+		\PerfLocale\Concurrency\Breaker::record_failure( $key, $reason );
 	}
 
 	/**
@@ -543,6 +643,78 @@ abstract class AbstractProvider implements ProviderInterface {
 		if ( str_starts_with( $ip, '127.' ) ) {
 			throw new \RuntimeException( 'Provider URL resolves to a loopback address.' );
 		}
+
+		// AAAA blind spot. Everything above this line is IPv4-only:
+		// gethostbyname() has no IPv6 form, and PHP's reserved-range flags were
+		// only ever applied to the A record. A hostname that publishes
+		// A=<public> alongside AAAA=::1 therefore passes every gate here, and on
+		// a dual-stack box glibc's RFC 6724 destination sorting hands libcurl the
+		// IPv6 answer. No timing, no rebinding — just an address family nothing
+		// checked.
+		//
+		// Re-run THIS method against each AAAA literal rather than restating the
+		// rules: the bracketed form goes through the hard-coded loopback list,
+		// the IPv4-mapped unwrap above (load-bearing on BOTH sides of the PHP 8.4
+		// reserved-range change) and the fc00::/fe80:: byte checks exactly as a
+		// literal URL would, so the two spellings of one address can never drift
+		// apart. An IP literal returns before the DNS branch, so the recursion is
+		// exactly one level deep. A host on perflocale/mt/trusted_hosts returned
+		// long before this point — that documented full exemption is still the
+		// way to reach an internal endpoint.
+		foreach ( self::resolve_aaaa( $host ) as $ipv6 ) {
+			try {
+				$this->validate_url( 'https://[' . $ipv6 . ']/' );
+			} catch ( \RuntimeException ) {
+				throw new \RuntimeException( 'Provider URL resolves to a private or reserved IPv6 address.' );
+			}
+		}
+	}
+
+	/**
+	 * Resolve a hostname's AAAA records, cached like the A-record lookup.
+	 *
+	 * Deliberately FAILS OPEN when the resolver cannot answer. `dns_get_record`
+	 * is disabled outright on some managed hosts, and refusing every provider
+	 * URL there would take machine translation offline on those sites to close
+	 * a hole the A-record gate already covers in the ordinary case. The result
+	 * is cached for the same 5 minutes as the A record, so a slow or broken
+	 * resolver is paid once per host per window rather than once per request —
+	 * and hosts on the trusted list, and every IP literal, return before this
+	 * is ever called.
+	 *
+	 * Mirrored in {@see \PerfLocale\Api\WebhookController}; keep them in sync.
+	 *
+	 * @param string $host Hostname (never an IP literal — the caller returns first).
+	 * @return array<int, string> IPv6 literals; empty when there are none or the
+	 *   lookup is unavailable.
+	 */
+	private static function resolve_aaaa( string $host ): array {
+		if ( ! function_exists( 'dns_get_record' ) ) {
+			return [];
+		}
+
+		$cache_key = 'perflocale_dns6_' . md5( $host );
+		$cached    = get_transient( $cache_key );
+
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- dns_get_record() warns on a temporary resolver failure; the is_array() test below handles it and this lookup fails open by design.
+		$records   = @dns_get_record( $host, DNS_AAAA );
+		$addresses = [];
+
+		foreach ( ( is_array( $records ) ? $records : [] ) as $record ) {
+			$ipv6 = is_array( $record ) ? (string) ( $record['ipv6'] ?? '' ) : '';
+
+			if ( $ipv6 !== '' ) {
+				$addresses[] = $ipv6;
+			}
+		}
+
+		set_transient( $cache_key, $addresses, 5 * MINUTE_IN_SECONDS );
+
+		return $addresses;
 	}
 
 	/**
@@ -564,17 +736,14 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * which is invoked through a PHP callback — have to apply the same
 	 * masking to the upstream message themselves.
 	 *
+	 * The rule itself lives in {@see \PerfLocale\Util\SecretMasker} so the
+	 * webhook failure log applies exactly the same one.
+	 *
 	 * @param string $body Truncated error body or upstream error message.
 	 * @return string
 	 */
 	protected static function mask_credentials( string $body ): string {
-		if ( $body === '' ) {
-			return $body;
-		}
-
-		$masked = preg_replace( '/[A-Za-z0-9_\-]{24,}/', '[REDACTED]', $body );
-
-		return is_string( $masked ) ? $masked : $body;
+		return \PerfLocale\Util\SecretMasker::mask( $body );
 	}
 
 	/**

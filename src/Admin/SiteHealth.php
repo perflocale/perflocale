@@ -198,6 +198,10 @@ final class SiteHealth {
 	 */
 	public function register_tests( array $tests ): array {
 		$direct = [
+			'perflocale_exports_exposed'   => [
+				'label' => __( 'PerfLocale export files are not web-readable', 'perflocale' ),
+				'test'  => [ $this, 'test_exports_not_public' ],
+			],
 			'perflocale_tables'            => [
 				'label' => __( 'PerfLocale database tables', 'perflocale' ),
 				'test'  => [ $this, 'test_tables_exist' ],
@@ -397,8 +401,13 @@ final class SiteHealth {
 		$rules = get_option( 'rewrite_rules' );
 
 		if ( is_array( $rules ) ) {
+			// RewriteManager writes the filtered query-variable name, so the
+			// needle has to be built the same way or a renamed site reports
+			// "rewrite rules missing" while they are present and correct.
+			$lang_needle = \PerfLocale\Router\UrlConverter::query_var() . '=$matches[1]';
+
 			foreach ( $rules as $rewrite ) {
-				if ( is_string( $rewrite ) && str_contains( $rewrite, 'lang=$matches[1]' ) ) {
+				if ( is_string( $rewrite ) && str_contains( $rewrite, $lang_needle ) ) {
 					return $this->pass(
 						'perflocale_rewrite_rules',
 						__( 'Language-prefixed rewrite rules are active', 'perflocale' ),
@@ -1220,12 +1229,17 @@ final class SiteHealth {
 	 * per-request memory/CPU cost.
 	 *
 	 * Database mode loads a language's ENTIRE string-translation map as one
-	 * serialized blob on the first gettext call of every request (~200
-	 * bytes/entry → 4-10 MB at 20k-50k rows), plus one per fallback
-	 * language. Files mode avoids this — it serves opcache-compiled,
-	 * per-domain .l10n.php files. We RECOMMEND switching (never auto-switch:
-	 * files mode needs a writable uploads dir, and DB mode is a legitimate
-	 * choice on read-only filesystems).
+	 * serialized blob: StringTranslation::activate() preloads it eagerly once
+	 * language detection completes on a request whose detected language is
+	 * not the default (default-language requests skip the preload and the
+	 * gettext filters), the gettext path reloads it lazily if the memo was
+	 * reset (switch_blog), and each fallback in the current language's
+	 * chain adds one more map. At an estimated ~200 bytes/entry serialized
+	 * that is 4-10 MB at 20k-50k rows, and the unserialized in-request
+	 * footprint is several times larger. Files mode avoids this — it serves
+	 * opcache-compiled, per-domain .l10n.php files. We RECOMMEND switching
+	 * (never auto-switch: files mode needs a writable uploads dir, and DB
+	 * mode is a legitimate choice on read-only filesystems).
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2699,7 +2713,10 @@ final class SiteHealth {
 		// 'too_large' sentinel there). The old `_eager_link_map_` names never
 		// existed, so this Site Health size check silently never fired.
 		// The option holds EITHER the link-map array, the 'too_large' string
-		// sentinel, an empty array, or is absent — never a plain string. Casting
+		// sentinel, the 'empty' string sentinel (written when a build proved the
+		// map genuinely empty, so a real emptiness is never confused with a
+		// failed read), or is absent. The is_array() guard below is what makes
+		// the string forms safe — do not remove it. Casting
 		// the array form to string would throw an "Array to string conversion"
 		// warning on every Status load AND collapse the byte count to strlen(
 		// "Array") = 5, which permanently dead-ends the size-envelope branch
@@ -2769,6 +2786,12 @@ final class SiteHealth {
 			'perflocale_jobs_watchdog' => __( 'background-jobs watchdog', 'perflocale' ),
 			'perflocale_jobs_gc'       => __( 'background-jobs garbage collector', 'perflocale' ),
 			'perflocale_lock_cleanup'  => __( 'expired-lock reaper', 'perflocale' ),
+			// The fourth unconditionally-scheduled recurring hook. It was
+			// missing here, so a refused or lost machine-translation usage GC
+			// was the one recurring event nothing reported. Safe to list
+			// unconditionally: ensure_recurring_schedules() creates it on every
+			// site, with no feature gate.
+			'perflocale_mt_usage_gc'   => __( 'machine-translation usage cleanup', 'perflocale' ),
 		];
 
 		$missing = [];
@@ -3064,6 +3087,192 @@ final class SiteHealth {
 	/**
 	 * @return array<string, mixed>
 	 */
+	/**
+	 * Is the export directory actually protected, on THIS server?
+	 *
+	 * WHY THIS ASKS INSTEAD OF ASSUMING
+	 *   A data export is a full dump of the site's translation data. It is
+	 *   written under wp-content/uploads, which is web-served, and the only
+	 *   thing standing between it and the internet is the `Deny from all`
+	 *   .htaccess that Helper::harden_directory() writes. Apache and LiteSpeed
+	 *   honour that file. **nginx and Caddy ignore it completely.** On those
+	 *   servers the export is fetchable by anyone who knows its URL, and the
+	 *   plugin cannot tell from PHP which server it is behind or what that
+	 *   server's configuration says.
+	 *
+	 *   So it stops guessing and measures: write a short-lived random canary
+	 *   into the export directory, ask for it over HTTP the way a stranger
+	 *   would, and see whether the bytes come back. That turns an invisible,
+	 *   host-dependent exposure into a concrete result with the exact snippet
+	 *   needed to close it.
+	 *
+	 *   The canary is random, carries no site data, and is deleted immediately
+	 *   whatever the outcome. The result is cached for an hour so opening Site
+	 *   Health does not repeat the write and the request.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_exports_not_public(): array {
+		$id = 'perflocale_exports_exposed';
+
+		$fix = sprintf(
+			/* translators: 1: nginx configuration snippet, 2: Caddy configuration snippet */
+			__( 'Add a rule to your server configuration that denies access to the directory. For nginx: %1$s For Caddy: %2$s After adding it, reload the server and re-run this check.', 'perflocale' ),
+			'<br><code>location ~* /wp-content/uploads/perflocale/exports/ { deny all; return 404; }</code><br>',
+			'<br><code>@perflocale_exports path /wp-content/uploads/perflocale/exports/*</code><br><code>respond @perflocale_exports 404</code><br>'
+		);
+
+		/**
+		 * Run the ACTIVE probe, or only give the advice?
+		 *
+		 * The probe writes a temporary file and makes one loopback request. Both
+		 * are cheap and the verdict is cached, but there is a host shape where
+		 * that stops being true: loopback blocked AND transients not persisting.
+		 * Then every visit to Site Health pays the timeout again and never
+		 * learns anything. An administrator on such a host cannot fix either
+		 * condition, so give them a way to stop paying for it.
+		 *
+		 * Returning false disables only the MEASUREMENT. The check still
+		 * appears, and still tells you to add the server rule — a filter must
+		 * not be able to turn a real exposure green, only to stop testing for
+		 * it. Verify the rule yourself if you turn this off.
+		 *
+		 * @hook perflocale/site_health/probe_export_exposure Set false to skip the active export-exposure probe.
+		 * @param bool $probe Whether to write the canary and make the request. Default true.
+		 */
+		if ( ! (bool) apply_filters( 'perflocale/site_health/probe_export_exposure', true ) ) {
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export exposure check is disabled', 'perflocale' ),
+				esc_html__( 'The active check has been switched off on this site, so PerfLocale has not verified whether export files are reachable over the web. If this site runs on nginx or Caddy, add the export deny rule from the installation notes and confirm it yourself — .htaccess alone does not protect that directory on those servers.', 'perflocale' )
+			);
+		}
+
+		$cached = get_transient( 'perflocale_exports_exposed' );
+
+		if ( 'open' === $cached ) {
+			return $this->critical(
+				$id,
+				__( 'PerfLocale export files are readable over the web', 'perflocale' ),
+				esc_html__( 'A test file placed in the export directory was served over HTTP, so anyone who learns or guesses an export URL can download that export without logging in. Export filenames carry 32 characters of randomness, so they cannot realistically be guessed, but they can leak through server logs, browser history, referrers or backups.', 'perflocale' ),
+				$fix
+			);
+		}
+
+		if ( 'closed' === $cached ) {
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export files are not web-readable', 'perflocale' ),
+				esc_html__( 'A test file placed in the export directory was refused over HTTP, so exports are only reachable through the authenticated download in the admin.', 'perflocale' )
+			);
+		}
+
+		// An inconclusive run is cached too, and that is the point. Plenty of
+		// hosts block or stall loopback requests; without this the probe would
+		// pay its full timeout on EVERY Site Health page load on exactly those
+		// hosts. A shorter TTL than a definite answer, so a temporary network
+		// problem is re-checked sooner than a settled verdict.
+		if ( 'unknown' === $cached ) {
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export exposure could not be checked', 'perflocale' ),
+				esc_html__( 'This site could not make a request to itself, so the check was skipped. That is common on hosts that block loopback requests and does not by itself indicate a problem. If your server is nginx or Caddy, add the export deny rule from the installation notes anyway.', 'perflocale' )
+			);
+		}
+
+		$dir = \PerfLocale\Helper::uploads_exports_dir();
+
+		if ( '' === $dir || ! is_dir( $dir ) ) {
+			// Not cached: the directory appearing is exactly the event that
+			// should make this check run for real.
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export directory does not exist yet', 'perflocale' ),
+				esc_html__( 'No export has been created on this site, so there is nothing to expose. This check runs again once the directory exists.', 'perflocale' )
+			);
+		}
+
+		// Random name AND random body: the body is what proves the file was
+		// served rather than a 404 page that happens to return 200.
+		$token  = wp_generate_password( 24, false, false );
+		$name   = 'perflocale-healthcheck-' . $token . '.txt';
+		$path   = trailingslashit( $dir ) . $name;
+		$body   = 'perflocale-canary-' . $token;
+		$upload = wp_upload_dir();
+
+		if ( ! is_array( $upload ) || empty( $upload['baseurl'] ) ) {
+			set_transient( 'perflocale_exports_exposed', 'unknown', 15 * MINUTE_IN_SECONDS );
+
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export exposure could not be checked', 'perflocale' ),
+				esc_html__( 'The uploads directory URL is unavailable, so this check was skipped. It does not indicate a problem.', 'perflocale' )
+			);
+		}
+
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents, WordPress.PHP.NoSilencedErrors.Discouraged -- A canary write that must not raise on a read-only directory; failure is handled immediately below.
+		$written = @file_put_contents( $path, $body );
+
+		if ( false === $written ) {
+			set_transient( 'perflocale_exports_exposed', 'unknown', 15 * MINUTE_IN_SECONDS );
+
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export exposure could not be checked', 'perflocale' ),
+				esc_html__( 'The export directory is not writable from PHP, so this check was skipped. A directory that cannot be written also cannot receive new exports.', 'perflocale' )
+			);
+		}
+
+		$url = trailingslashit( $upload['baseurl'] ) . 'perflocale/exports/' . $name;
+
+		$response = wp_remote_get(
+			$url,
+			[
+				// Short: this is a static file on the very server running the
+				// request. Anything slower than this is a host that does not
+				// want loopback, which the WP_Error branch handles and caches.
+				'timeout'     => 3,
+				'redirection' => 0,
+				// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core WordPress filter name (defined in WP_Http::request).
+				'sslverify'   => apply_filters( 'https_local_ssl_verify', false ),
+				'headers'     => [ 'X-PerfLocale-Health-Check' => '1' ],
+			]
+		);
+
+		// Always remove the canary, whatever happened.
+		wp_delete_file( $path );
+
+		if ( is_wp_error( $response ) ) {
+			set_transient( 'perflocale_exports_exposed', 'unknown', 15 * MINUTE_IN_SECONDS );
+
+			return $this->pass(
+				$id,
+				__( 'PerfLocale export exposure could not be checked', 'perflocale' ),
+				esc_html__( 'The site could not make a request to itself, so this check was skipped. That is common on hosts that block loopback requests and does not by itself indicate a problem.', 'perflocale' )
+			);
+		}
+
+		$served = 200 === (int) wp_remote_retrieve_response_code( $response )
+			&& str_contains( (string) wp_remote_retrieve_body( $response ), $body );
+
+		set_transient( 'perflocale_exports_exposed', $served ? 'open' : 'closed', HOUR_IN_SECONDS );
+
+		if ( $served ) {
+			return $this->critical(
+				$id,
+				__( 'PerfLocale export files are readable over the web', 'perflocale' ),
+				esc_html__( 'A test file placed in the export directory was served over HTTP, so anyone who learns or guesses an export URL can download that export without logging in. Export filenames carry 32 characters of randomness, so they cannot realistically be guessed, but they can leak through server logs, browser history, referrers or backups.', 'perflocale' ),
+				$fix
+			);
+		}
+
+		return $this->pass(
+			$id,
+			__( 'PerfLocale export files are not web-readable', 'perflocale' ),
+			esc_html__( 'A test file placed in the export directory was refused over HTTP, so exports are only reachable through the authenticated download in the admin.', 'perflocale' )
+		);
+	}
+
 	private function pass( string $id, string $label, string $desc, string $actions = '' ): array {
 		return $this->build( $id, 'good', $label, $desc, $actions );
 	}

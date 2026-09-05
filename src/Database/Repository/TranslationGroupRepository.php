@@ -159,6 +159,21 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	private const EAGER_LINK_MAP_BYTE_CAP = 750 * 1024;
 
 	/**
+	 * Sentinel stored (and memoised) when a SUCCESSFUL count proved this blog
+	 * has zero links of the type.
+	 *
+	 * Distinct from a stored `[]` on purpose. A `[]` is what a FAILED cold
+	 * build used to persist — `wpdb::get_var()` answers NULL on error and
+	 * `(int) null === 0`, which took the "no rows" branch — so the two states
+	 * are indistinguishable in the pre-1.0.1 shape, and the memo handed the
+	 * empty array to every consumer after the first as an authoritative
+	 * "this object has no translations". With this sentinel, `[]` means only
+	 * "legacy or unproven" and is rebuilt once; the sentinel means "proven
+	 * empty" and is cached like any other answer.
+	 */
+	private const EAGER_MAP_EMPTY = 'empty';
+
+	/**
 	 * Tracks whether a transaction is already active.
 	 *
 	 * Uses a static flag instead of querying @@in_transaction which is
@@ -995,7 +1010,14 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		if ( array_key_exists( $memo_key, self::$eager_link_map_memo ) ) {
 			$cached = self::$eager_link_map_memo[ $memo_key ];
-			return is_array( $cached ) ? $cached : null;
+			// `!== []` keeps the memo and the option path answering the same
+			// thing. Before, a memoised `[]` came back as an authoritative empty
+			// ARRAY while the option path returned null for the same state, so
+			// the second consumer in a request cached "no translations" where the
+			// first had correctly fallen back to SQL. Post-fix nothing memoises
+			// `[]` any more (proven-empty uses EAGER_MAP_EMPTY); this makes the
+			// invariant explicit rather than relying on it.
+			return is_array( $cached ) && $cached !== [] ? $cached : null;
 		}
 
 		$stored = get_option( $option_key, false );
@@ -1005,10 +1027,26 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return null;
 		}
 
-		if ( is_array( $stored ) ) {
-			self::$eager_link_map_memo[ $memo_key ] = $stored;
-			return $stored === [] ? null : $stored;
+		if ( $stored === self::EAGER_MAP_EMPTY ) {
+			// Proven empty by a COUNT that actually returned zero. Callers still
+			// get null (unchanged contract: "no usable map, use the JOIN path"),
+			// but the sentinel is memoised so this request does not re-run the
+			// cold build for every consumer.
+			self::$eager_link_map_memo[ $memo_key ] = self::EAGER_MAP_EMPTY;
+			return null;
 		}
+
+		if ( is_array( $stored ) && $stored !== [] ) {
+			self::$eager_link_map_memo[ $memo_key ] = $stored;
+			return $stored;
+		}
+
+		// A stored `[]` is the pre-1.0.1 empty shape, which a FAILED cold build
+		// could also write. It is therefore NOT trusted: fall through and
+		// rebuild once. The rebuild re-persists either the real map or
+		// EAGER_MAP_EMPTY, so an install poisoned by the old bug repairs itself
+		// on the next read instead of waiting for a write or a Clear Cache —
+		// one COUNT per blog/type after the update, not one per request.
 
 		// Caps are filterable so sites with extra RAM (or smaller envelope)
 		// can tune autoload bloat vs prime_translations DB cost. Default
@@ -1020,7 +1058,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// Cold build. Cheap size check first so we don't pull 100k+
 		// rows on a site that will never fit in alloptions anyway.
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders -- Replacements arrive via array_merge(), which WPCS cannot count.
-		$count = (int) $this->wpdb->get_var(
+		$count_raw = $this->wpdb->get_var(
 			$this->wpdb->prepare(
 				'SELECT COUNT(*) FROM %i l
 				 INNER JOIN %i g ON l.group_id = g.id
@@ -1031,9 +1069,22 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			)
 		);
 
+		// get_var() answers NULL when the query FAILED, and `(int) null` is 0 —
+		// which used to take the "this type has no links" branch below and
+		// persist an AUTHORITATIVE empty map built from a deadlock or a "server
+		// has gone away". Every consumer then cached "no translations" until the
+		// next write. wpdb resets last_error at the start of every query, so it
+		// reflects this one; same discipline as LanguageRepository::get_bootstrap().
+		// Persist and memoise NOTHING on failure: the next healthy call rebuilds.
+		if ( $count_raw === null || $this->wpdb->last_error !== '' ) {
+			return null;
+		}
+
+		$count = (int) $count_raw;
+
 		if ( $count === 0 ) {
-			self::persist_eager_map( $option_key, [] );
-			self::$eager_link_map_memo[ $memo_key ] = [];
+			self::persist_eager_map( $option_key, self::EAGER_MAP_EMPTY );
+			self::$eager_link_map_memo[ $memo_key ] = self::EAGER_MAP_EMPTY;
 			return null;
 		}
 
@@ -1060,9 +1111,18 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		);
 		// phpcs:enable
 
-		if ( ! is_array( $rows ) || $rows === [] ) {
-			self::persist_eager_map( $option_key, [] );
-			self::$eager_link_map_memo[ $memo_key ] = [];
+		// A FAILED SELECT also yields `[]` here — wpdb::query() flushes
+		// last_result before it returns false — so `$rows === []` on its own
+		// cannot be read as "no rows". Check the error channel first and, on
+		// failure, persist and memoise nothing so a later healthy request
+		// rebuilds instead of the site serving an authoritative empty map.
+		if ( ! is_array( $rows ) || $this->wpdb->last_error !== '' ) {
+			return null;
+		}
+
+		if ( $rows === [] ) {
+			self::persist_eager_map( $option_key, self::EAGER_MAP_EMPTY );
+			self::$eager_link_map_memo[ $memo_key ] = self::EAGER_MAP_EMPTY;
 			return null;
 		}
 
@@ -1100,6 +1160,17 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return null;
 		}
 
+		if ( $map === [] ) {
+			// Rows existed but none carried a usable object_id, so the map is
+			// genuinely empty. Store the sentinel, never a bare `[]`: the reader
+			// no longer trusts `[]`, so persisting it here would re-run this
+			// cold build (COUNT + three-table JOIN) on every request forever.
+			self::persist_eager_map( $option_key, self::EAGER_MAP_EMPTY );
+			self::$eager_link_map_memo[ $memo_key ] = self::EAGER_MAP_EMPTY;
+
+			return null;
+		}
+
 		self::persist_eager_map( $option_key, $map );
 		self::$eager_link_map_memo[ $memo_key ] = $map;
 
@@ -1125,7 +1196,9 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * blob from a single sub-millisecond lookup.
 	 *
 	 * @param string       $option_key Autoloaded option name.
-	 * @param array|string $value      Map, `[]`, or the `'too_large'` sentinel.
+	 * @param array|string $value      Map, the {@see EAGER_MAP_EMPTY} sentinel,
+	 *                                 or the `'too_large'` sentinel. A bare `[]`
+	 *                                 is no longer written — see EAGER_MAP_EMPTY.
 	 * @return void
 	 */
 	private static function persist_eager_map( string $option_key, array|string $value ): void {

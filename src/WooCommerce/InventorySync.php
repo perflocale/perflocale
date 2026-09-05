@@ -110,6 +110,321 @@ final class InventorySync {
 	}
 
 	/**
+	 * Relative stock deltas captured from WooCommerce's own stock statement,
+	 * keyed by the product / variation id it is about to change.
+	 *
+	 * WooCommerce decrements stock with an ATOMIC RELATIVE statement
+	 * (`SET meta_value = meta_value -1`) precisely so two concurrent shoppers
+	 * cannot lose an update. The sibling mirror used to read
+	 * get_stock_quantity() - an ABSOLUTE snapshot - and blind-write it onto
+	 * every language sibling. Siblings each own their own `_stock` row, so
+	 * that is a read-modify-write and cannot represent two concurrent
+	 * decrements: two sales from a stock of 10 left BOTH siblings at 9
+	 * instead of 8. Capturing the delta lets the mirror replay the same
+	 * relative operation instead of a lossy snapshot.
+	 *
+	 * @var array<int, float>
+	 */
+	private array $pending_stock_ops = [];
+
+	/**
+	 * Record the relative stock operation WooCommerce is about to run.
+	 *
+	 * Registered on `woocommerce_update_product_stock_query` at priority 1 so
+	 * it reads WooCommerce's own statement before another plugin can rewrite
+	 * it. The query is returned untouched - this callback only observes.
+	 *
+	 * @param mixed $sql        Statement WooCommerce is about to execute.
+	 * @param mixed $product_id Product / variation id being changed.
+	 * @param mixed $new_stock  Resulting stock level. Unused: only the RELATIVE
+	 *                          delta is replayed, never an absolute snapshot.
+	 * @param mixed $operation  'set', 'increase' or 'decrease'.
+	 * @return mixed The unmodified statement.
+	 */
+	public function capture_stock_operation( $sql, $product_id = 0, $new_stock = null, $operation = 'set' ) {
+		$product_id = (int) $product_id;
+
+		// Always clear first: a later absolute 'set' on the same product must
+		// never be mirrored with a stale delta left over from an 'increase'.
+		unset( $this->pending_stock_ops[ $product_id ] );
+
+		if ( $product_id > 0 && is_string( $sql ) && ( 'increase' === $operation || 'decrease' === $operation ) ) {
+			$delta = $this->extract_stock_delta( $sql, $product_id );
+
+			if ( null !== $delta ) {
+				$this->pending_stock_ops[ $product_id ] = $delta;
+			}
+		}
+
+		return $sql;
+	}
+
+	/**
+	 * Consume the delta captured for a product, if any.
+	 *
+	 * Consumed (not merely read) so a handler that bails early - master switch
+	 * off, product opted out, no siblings, lock contention - cannot leave a
+	 * stale delta behind for a later call in the same request.
+	 *
+	 * @param int $product_id Product / variation id.
+	 * @return float|null Signed delta, or null when the change was absolute.
+	 */
+	private function take_stock_delta( int $product_id ): ?float {
+		$op = $this->pending_stock_ops[ $product_id ] ?? null;
+
+		unset( $this->pending_stock_ops[ $product_id ] );
+
+		return is_float( $op ) ? $op : null;
+	}
+
+	/**
+	 * Signed delta from WooCommerce's relative stock statement.
+	 *
+	 * WC_Product_Data_Store_CPT::update_product_stock() builds exactly
+	 * "SET meta_value = meta_value %+f WHERE post_id = %d AND meta_key='_stock'"
+	 * for increase/decrease, and wpdb::prepare renders %+f locale-unaware, so
+	 * the sign and magnitude are readable without guessing. Anything else - a
+	 * WooCommerce rewrite, or another plugin that filtered the statement first
+	 * - returns null and the caller keeps the absolute mirror it has always
+	 * used. Losing the optimisation is a correctness no-op; guessing a delta
+	 * would not be.
+	 *
+	 * @param string $sql        Statement WooCommerce built.
+	 * @param int    $product_id Product id the statement must target.
+	 * @return float|null Signed delta, or null when the shape is unrecognised.
+	 */
+	private function extract_stock_delta( string $sql, int $product_id ): ?float {
+		$matched = preg_match(
+			"/SET\s+meta_value\s*=\s*meta_value\s*([+-])\s*([0-9]+(?:\.[0-9]+)?)\s+WHERE\s+post_id\s*=\s*([0-9]+)\s+AND\s+meta_key\s*=\s*'_stock'/i",
+			$sql,
+			$matches
+		);
+
+		if ( 1 !== $matched || (int) $matches[3] !== $product_id ) {
+			return null;
+		}
+
+		$delta = (float) $matches[2];
+
+		if ( ! is_finite( $delta ) || $delta <= 0.0 ) {
+			return null;
+		}
+
+		return '-' === $matches[1] ? -$delta : $delta;
+	}
+
+	/**
+	 * Apply the source's relative stock change to ONE sibling, atomically.
+	 *
+	 * The same statement shape WooCommerce runs on the product being bought,
+	 * so two concurrent sales of two language siblings both land instead of
+	 * one overwriting the other with a snapshot. Returns false - and the
+	 * caller falls back to the absolute mirror - for any sibling this cannot
+	 * safely apply to.
+	 *
+	 * @param int   $sibling_id Sibling product / variation id.
+	 * @param float $delta      Signed delta to apply.
+	 * @return bool True when the relative write happened. False only when the
+	 *              sibling has no numeric `_stock` row, where the caller's
+	 *              absolute mirror is the right fallback.
+	 */
+	private function apply_relative_stock( int $sibling_id, float $delta ): bool {
+		global $wpdb;
+
+		if ( $sibling_id <= 0 || 0.0 === $delta ) {
+			return false;
+		}
+
+		// A sibling with no NUMERIC `_stock` of its own has nothing to
+		// decrement - a product that never tracked stock would be driven
+		// negative from an empty value. Fall back to the absolute mirror.
+		if ( ! is_numeric( get_post_meta( $sibling_id, '_stock', true ) ) ) {
+			return false;
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Deliberate atomic read-modify-write; no WP meta API can express one, which is exactly why WooCommerce writes its own here too.
+		// `meta_value + (%f)` with a PLAIN %f, not `meta_value %+f`. The sign
+		// already rides in prepare()'s %F output, and `%+f` is a "complex
+		// placeholder" that trips WordPress.DB.PreparedSQLPlaceholders — which
+		// Plugin Check pulls in at full severity, so it would move the tracked
+		// dist score off 0.
+		//
+		// UNCONDITIONAL. There is deliberately NO `AND meta_value = <expected>`
+		// identity predicate here, and adding one back reintroduces a
+		// lost-update bug worse than the drift it was meant to solve.
+		//
+		// That predicate compared the sibling against the SOURCE's pre-change
+		// value. With three simultaneous orders against three language copies,
+		// all three of WooCommerce's own atomic decrements commit before any
+		// PerfLocale sync runs, so by sync time no sibling still holds the
+		// pre-change value. The predicate matched zero rows, the caller fell
+		// through to the absolute mirror, and that copied one worker's stale
+		// snapshot. Measured on three sites: three sales of a stock-10 product
+		// ended at (9,9,9) where the serial control ended at (7,7,7) — two of
+		// three decrements lost, and the loss grows with concurrency.
+		//
+		// A delta is valid whatever the sibling currently holds: "sold one" is
+		// -1 regardless of the base. Applying it inside a single UPDATE is
+		// atomic in the engine, so N concurrent orders produce N decrements.
+		//
+		// The trade is that a sibling which has ALREADY drifted stays drifted —
+		// its value moves by the right amount from the wrong base. That is the
+		// correct direction to fail: an absolute 'set' (admin stock edit,
+		// quick/bulk edit, REST or CLI write) still runs the absolute mirror
+		// below and re-converges the whole group, whereas a lost purchase is
+		// permanent.
+		$affected = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE %i SET meta_value = meta_value + (%f) WHERE post_id = %d AND meta_key = '_stock'",
+				$wpdb->postmeta,
+				$delta,
+				$sibling_id
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		// A relative delta always changes the value, so 0 affected rows means
+		// there was no `_stock` row to update (and false means a DB error).
+		if ( ! is_int( $affected ) || $affected < 1 ) {
+			return false;
+		}
+
+		// The row moved underneath the object cache - same call WooCommerce
+		// makes after its own stock statement.
+		wp_cache_delete( $sibling_id, 'post_meta' );
+
+		return true;
+	}
+
+	/**
+	 * Re-derive one product's `_stock_status` from ITS OWN resulting quantity.
+	 *
+	 * After a relative write the sibling's quantity is its own, so copying the
+	 * source's status would be a second lossy snapshot. This reproduces
+	 * WC_Product::validate_props() - above the no-stock threshold is in stock,
+	 * otherwise on backorder when backorders are allowed, otherwise out of
+	 * stock - against the sibling's own meta.
+	 *
+	 * @param int $product_id Sibling product / variation id.
+	 * @return void
+	 */
+	private function refresh_derived_stock_status( int $product_id ): void {
+		global $wpdb;
+
+		// Mirror WC_Product::validate_props(): a product that does NOT manage
+		// its own stock has an operator-chosen `_stock_status`, and deriving one
+		// from a leftover `_stock` value would silently overwrite it — flipping
+		// an always-in-stock product to outofstock because an old quantity row
+		// happened to be 0.
+		if ( 'yes' !== (string) get_post_meta( $product_id, '_manage_stock', true ) ) {
+			return;
+		}
+
+		$threshold  = absint( get_option( 'woocommerce_notify_no_stock_amount', 0 ) );
+		$backorders = (string) get_post_meta( $product_id, '_backorders', true );
+
+		// Below-threshold resolves to onbackorder or outofstock. Neither input
+		// is raced by a stock change, so both are decided here and bound.
+		$below = ( '' !== $backorders && 'no' !== $backorders ) ? 'onbackorder' : 'outofstock';
+
+		// ONE statement, deriving from `_stock` as committed AT WRITE TIME
+		// rather than from a value read moments earlier. That is what lets the
+		// callers run this unlocked: with a PHP-side read-derive-write, two
+		// concurrent orders could each read a quantity, and the one that wrote
+		// second could publish a status derived from the EARLIER quantity.
+		// Reading the quantity inside the UPDATE removes the window entirely.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Deliberately atomic; a read-modify-write here can publish a stale stock status under concurrency.
+		$affected = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE %i st JOIN %i q ON q.post_id = st.post_id AND q.meta_key = '_stock'
+				 SET st.meta_value = CASE WHEN CAST( q.meta_value AS DECIMAL(20,6) ) > %d THEN 'instock' ELSE %s END
+				 WHERE st.post_id = %d AND st.meta_key = '_stock_status'",
+				$wpdb->postmeta,
+				$wpdb->postmeta,
+				$threshold,
+				$below,
+				$product_id
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		if ( is_int( $affected ) && $affected > 0 ) {
+			wp_cache_delete( $product_id, 'post_meta' );
+
+			return;
+		}
+
+		// 0 affected rows is USUALLY the status already being correct, which is
+		// the common case and needs nothing. The other possibility is that the
+		// product has no `_stock_status` row at all, and an UPDATE cannot create
+		// one. Distinguish with a primed-cache read rather than another query.
+		if ( '' !== (string) get_post_meta( $product_id, '_stock_status', true ) ) {
+			return;
+		}
+
+		$quantity = (int) get_post_meta( $product_id, '_stock', true );
+
+		update_post_meta( $product_id, '_stock_status', $quantity > $threshold ? 'instock' : $below );
+	}
+
+	/**
+	 * Refresh ONLY the stock columns of a sibling's wc_product_meta_lookup row.
+	 *
+	 * Note that refresh_product_lookup() must NOT be used after a relative write: its
+	 * WC < 10.8 fallback re-sets stock ABSOLUTELY via
+	 * wc_update_product_stock(..., 'set') from a value it read a moment
+	 * earlier, which is harmless for the absolute mirror but would clobber a
+	 * concurrent decrement and undo exactly what the relative path exists for.
+	 * Update the two derived columns on the EXISTING row instead (0 affected
+	 * rows when WooCommerce has not created one yet, matching its own lazy
+	 * behaviour); a missing table or column on very old WooCommerce leaves the
+	 * derived row stale, which is the pre-fix behaviour.
+	 *
+	 * @param int $product_id Sibling product / variation id.
+	 * @return void
+	 */
+	private function refresh_stock_lookup_columns( int $product_id ): void {
+		global $wpdb;
+
+		try {
+			// ONE statement that COPIES from postmeta instead of two cached
+			// reads plus a write. wc_product_meta_lookup is what shop queries
+			// read, so a stale figure here is visible to shoppers and can
+			// oversell. Reading the source columns inside the UPDATE means the
+			// row always lands on the committed quantity whatever order two
+			// concurrent orders finished in — which is what makes this safe to
+			// call unlocked. It is also cheaper than the version it replaces.
+			//
+			// An inner JOIN on `_stock`: callers only reach here after
+			// apply_relative_stock() has confirmed a numeric `_stock` row, and a
+			// product without one should keep whatever WooCommerce put in the
+			// lookup rather than be forced to 0.
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Targeted refresh of WooCommerce's derived lookup row; no WC API rebuilds it without also rewriting stock.
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE %i l
+					 JOIN %i q ON q.post_id = l.product_id AND q.meta_key = '_stock'
+					 LEFT JOIN %i s ON s.post_id = l.product_id AND s.meta_key = '_stock_status'
+					 SET l.stock_quantity = CAST( q.meta_value AS DECIMAL(20,6) ),
+					     l.stock_status   = COALESCE( s.meta_value, l.stock_status )
+					 WHERE l.product_id = %d",
+					$wpdb->prefix . 'wc_product_meta_lookup',
+					$wpdb->postmeta,
+					$wpdb->postmeta,
+					$product_id
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		} catch ( \Throwable $e ) {
+			unset( $e );
+		}
+
+		if ( function_exists( 'wc_delete_product_transients' ) ) {
+			wc_delete_product_transients( $product_id );
+		}
+	}
+
+	/**
 	 * Rebuild a product's wc_product_meta_lookup row from its current meta.
 	 *
 	 * The sibling sync writes meta with update_post_meta() (deliberately — it
@@ -178,6 +493,13 @@ final class InventorySync {
 	 * @return void
 	 */
 	public function register_hooks(): void {
+		// Observe WooCommerce's own stock statement so the sibling mirror can
+		// replay a RELATIVE change instead of an absolute snapshot - two
+		// concurrent sales of two language siblings used to lose a decrement.
+		// Priority 1: read WooCommerce's statement before another plugin can
+		// rewrite it. The callback returns the query untouched.
+		add_filter( 'woocommerce_update_product_stock_query', [ $this, 'capture_stock_operation' ], 1, 4 );
+
 		// Sync after WooCommerce saves all product meta.
 		add_action( 'woocommerce_process_product_meta', [ $this, 'sync_product_fields' ], 100, 1 );
 
@@ -459,74 +781,121 @@ final class InventorySync {
 		}
 
 		$product_id = $product->get_id();
+		// Consume the delta WooCommerce just applied to the SOURCE (see
+		// capture_stock_operation). Taken BEFORE any early return so a
+		// disabled or opted-out product cannot leave a stale delta behind.
+		$delta = $this->take_stock_delta( $product_id );
 
 		if ( ! $this->sync_enabled() || $this->is_sync_opted_out( $product_id ) ) {
 			return;
 		}
 
-		if ( ! Lock::acquire( $this->lock_name( $product_id ), self::LOCK_TTL_OUTER ) ) {
+		$repo         = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
+		$translations = $repo->get_translations( $product_id, ObjectType::Post );
+
+		if ( count( $translations ) <= 1 ) {
 			return;
 		}
 
-		try {
-			$repo         = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
-			$translations = $repo->get_translations( $product_id, ObjectType::Post );
+		$synced_ids = [];
+		$absolute   = [];
 
-			if ( count( $translations ) <= 1 ) {
-				return;
+		// PASS 1 — RELATIVE, DELIBERATELY LOCK-FREE.
+		//
+		// Lock::acquire() is a NON-BLOCKING mutex: on contention it returns
+		// false immediately, it never waits. This loop used to sit inside two
+		// of them, and each one silently DROPPED a real customer purchase:
+		//
+		// The OUTER lock, on the source product: two simultaneous orders for
+		// the SAME product meant the loser returned early, so its decrement
+		// never reached any sibling language at all.
+		//
+		// The INNER lock, on each sibling: three simultaneous orders for three
+		// language copies all want the same two sibling locks, so whoever lost
+		// `continue`d and that language kept the old figure.
+		//
+		// A lock cannot help here even in principle. apply_relative_stock()
+		// issues `SET meta_value = meta_value + (delta)`, which InnoDB already
+		// serialises on the row; the lock added nothing but a way to lose the
+		// write. Locks are for the read-modify-write in pass 2, and only there.
+		//
+		// A sibling the relative path cannot handle (no numeric `_stock` of its
+		// own) is deferred to pass 2 rather than skipped.
+		foreach ( $translations as $link ) {
+			$sibling_id = (int) $link->object_id;
+
+			if ( $sibling_id === $product_id || $this->is_sync_opted_out( $sibling_id ) ) {
+				continue;
 			}
 
-			$stock_quantity = $product->get_stock_quantity();
-			$stock_status   = $product->get_stock_status();
-			$synced_ids     = [];
+			if ( null !== $delta && $this->apply_relative_stock( $sibling_id, $delta ) ) {
+				// The sibling's quantity is now ITS OWN, so derive its status
+				// from that rather than copying the source's. Both refreshes
+				// re-read the quantity inside a single statement, so they are
+				// safe to run unlocked and cannot publish a stale figure.
+				$this->refresh_derived_stock_status( $sibling_id );
+				$this->refresh_stock_lookup_columns( $sibling_id );
 
-			foreach ( $translations as $link ) {
-				$sibling_id = (int) $link->object_id;
+				$synced_ids[] = $sibling_id;
+				continue;
+			}
 
-				if ( $sibling_id === $product_id || $this->is_sync_opted_out( $sibling_id ) ) {
-					continue;
-				}
+			$absolute[] = $sibling_id;
+		}
 
-				if ( ! Lock::acquire( $this->lock_name( $sibling_id ), self::LOCK_TTL_INNER ) ) {
-					continue;
-				}
+		// PASS 2 — ABSOLUTE mirror, for siblings pass 1 could not apply to and
+		// for every non-order change ('set': admin edit, quick/bulk edit, REST,
+		// CLI, resync). This one really is a read-modify-write, so it takes the
+		// locks. Dropping a 'set' on contention is safe in a way dropping a
+		// delta is not: the winner writes the same absolute value this call
+		// would have written.
+		if ( ! empty( $absolute ) && Lock::acquire( $this->lock_name( $product_id ), self::LOCK_TTL_OUTER ) ) {
+			try {
+				$stock_quantity = $product->get_stock_quantity();
+				$stock_status   = $product->get_stock_status();
 
-				try {
-					// See the price-sync loop above: update_post_meta() returns
-					// false for value-unchanged too, so only treat a write that
-					// CHANGED something as a candidate failure — an in-sync
-					// sibling is normal, not an error to log.
-					$stock_same  = ( (string) get_post_meta( $sibling_id, '_stock', true ) === (string) $stock_quantity );
-					$status_same = ( (string) get_post_meta( $sibling_id, '_stock_status', true ) === (string) $stock_status );
-					$stock_ok    = $stock_same ? true : update_post_meta( $sibling_id, '_stock', $stock_quantity );
-					$status_ok   = $status_same ? true : update_post_meta( $sibling_id, '_stock_status', $stock_status );
-
-					if ( ( $stock_ok === false || $status_ok === false ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-						error_log( sprintf( 'PerfLocale InventorySync: stock update failed for sibling %d', $sibling_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				foreach ( $absolute as $sibling_id ) {
+					if ( ! Lock::acquire( $this->lock_name( $sibling_id ), self::LOCK_TTL_INNER ) ) {
+						continue;
 					}
 
-					// Rebuild the sibling's wc_product_meta_lookup row (stock /
-					// stock_status). Raw update_post_meta above bypasses WC's
-					// change-tracking, so without this every order/refund would
-					// leave the translated product showing stale stock in shop
-					// queries. Re-entrancy is safe: the sibling lock is held.
-					$this->refresh_product_lookup( $sibling_id );
+					try {
+						// See the price-sync loop above: update_post_meta()
+						// returns false for value-unchanged too, so only treat a
+						// write that CHANGED something as a candidate failure —
+						// an in-sync sibling is normal, not an error to log.
+						$stock_same  = ( (string) get_post_meta( $sibling_id, '_stock', true ) === (string) $stock_quantity );
+						$status_same = ( (string) get_post_meta( $sibling_id, '_stock_status', true ) === (string) $stock_status );
+						$stock_ok    = $stock_same ? true : update_post_meta( $sibling_id, '_stock', $stock_quantity );
+						$status_ok   = $status_same ? true : update_post_meta( $sibling_id, '_stock_status', $stock_status );
 
-					$synced_ids[] = $sibling_id;
-				} finally {
-					Lock::release( $this->lock_name( $sibling_id ) );
+						if ( ( $stock_ok === false || $status_ok === false ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+							error_log( sprintf( 'PerfLocale InventorySync: stock update failed for sibling %d', $sibling_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+						}
+
+						// Rebuild the sibling's wc_product_meta_lookup row
+						// (stock / stock_status). Raw update_post_meta above
+						// bypasses WC's change-tracking, so without this every
+						// order/refund would leave the translated product showing
+						// stale stock in shop queries. Re-entrancy is safe: the
+						// sibling lock is held.
+						$this->refresh_product_lookup( $sibling_id );
+
+						$synced_ids[] = $sibling_id;
+					} finally {
+						Lock::release( $this->lock_name( $sibling_id ) );
+					}
 				}
+			} finally {
+				Lock::release( $this->lock_name( $product_id ) );
 			}
+		}
 
-			if ( ! empty( $synced_ids ) ) {
-				/** @hook perflocale/woocommerce/inventory_synced Fires after inventory sync completes. */
-				do_action( 'perflocale/woocommerce/inventory_synced', $product_id, $synced_ids, [ '_stock', '_stock_status' ] );
-			}
-		} finally {
-			Lock::release( $this->lock_name( $product_id ) );
+		if ( ! empty( $synced_ids ) ) {
+			/** @hook perflocale/woocommerce/inventory_synced Fires after inventory sync completes. */
+			do_action( 'perflocale/woocommerce/inventory_synced', $product_id, $synced_ids, [ '_stock', '_stock_status' ] );
 		}
 	}
-
 	/**
 	 * Propagate a variation's stock to the equivalent variation on each
 	 * translation-sibling of its PARENT (variations aren't group-linked, so we
@@ -536,8 +905,9 @@ final class InventorySync {
 	 * clone step copies attributes verbatim and PerfLocale deliberately keeps
 	 * the original attribute terms on translated variations, so the maps are
 	 * string-for-string equal. When a translator has manually diverged a
-	 * sibling's attributes we skip it (never guess). Same locked, change-only
-	 * write path as the parent flow; raw update_post_meta does NOT re-fire
+	 * sibling's attributes we skip it (never guess). Same two-pass write path as
+	 * the parent flow — a lock-free atomic relative replay, then a locked
+	 * absolute mirror; raw update_post_meta does NOT re-fire
 	 * woocommerce_variation_set_stock, so there is no re-entrancy loop.
 	 *
 	 * @param \WC_Product_Variation $variation Variation whose stock changed.
@@ -546,6 +916,12 @@ final class InventorySync {
 	private function sync_variation_stock( \WC_Product_Variation $variation ): void {
 		$variation_id = $variation->get_id();
 		$parent_id    = $variation->get_parent_id();
+		// Consume the delta WooCommerce just applied to the SOURCE variation,
+		// before any early return (see capture_stock_operation). A variation
+		// whose stock is PARENT-managed never reaches here: WooCommerce fires
+		// woocommerce_product_set_stock for the parent instead, and the parent
+		// path above carries the parent's own delta.
+		$delta = $this->take_stock_delta( $variation_id );
 
 		if ( $parent_id <= 0 ) {
 			return;
@@ -555,76 +931,94 @@ final class InventorySync {
 			return;
 		}
 
-		// Outer lock on the VARIATION being changed.
-		if ( ! Lock::acquire( $this->lock_name( $variation_id ), self::LOCK_TTL_OUTER ) ) {
+		$repo        = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
+		$parent_sibs = $repo->get_translations( $parent_id, ObjectType::Post );
+
+		if ( count( $parent_sibs ) <= 1 ) {
 			return;
 		}
 
-		try {
-			$repo        = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
-			$parent_sibs = $repo->get_translations( $parent_id, ObjectType::Post );
+		$src_attrs  = $this->normalise_variation_attrs( $variation->get_attributes() );
+		$synced_ids = [];
+		$absolute   = [];
 
-			if ( count( $parent_sibs ) <= 1 ) {
-				return;
+		// PASS 1 — RELATIVE, LOCK-FREE. See sync_on_stock_change() for the full
+		// reasoning: Lock::acquire() never waits, so a lock around an already
+		// atomic `meta_value + delta` could only ever DROP a customer's
+		// purchase. Two shoppers buying the same variation in two languages hit
+		// exactly that.
+		foreach ( $parent_sibs as $link ) {
+			$sib_parent_id = (int) $link->object_id;
+
+			if ( $sib_parent_id === $parent_id || $this->is_sync_opted_out( $sib_parent_id ) ) {
+				continue;
 			}
 
-			$stock_quantity = $variation->get_stock_quantity();
-			$stock_status   = $variation->get_stock_status();
-			$src_attrs      = $this->normalise_variation_attrs( $variation->get_attributes() );
-			$synced_ids     = [];
+			$sib_variation_id = $this->match_sibling_variation( $sib_parent_id, $src_attrs );
 
-			foreach ( $parent_sibs as $link ) {
-				$sib_parent_id = (int) $link->object_id;
+			// A variation-level opt-out must block INCOMING writes too, not
+			// only outgoing ones — the source-side gate reads the same flag,
+			// so checking just the parent here would leave the key
+			// protecting a variation in one direction only. Placed after
+			// the match so the cheaper parent-level skip short-circuits
+			// first and this meta read only happens on real candidates.
+			if ( $sib_variation_id <= 0 || $sib_variation_id === $variation_id || $this->is_sync_opted_out( $sib_variation_id ) ) {
+				continue;
+			}
 
-				if ( $sib_parent_id === $parent_id || $this->is_sync_opted_out( $sib_parent_id ) ) {
-					continue;
-				}
+			if ( null !== $delta && $this->apply_relative_stock( $sib_variation_id, $delta ) ) {
+				$this->refresh_derived_stock_status( $sib_variation_id );
+				$this->refresh_stock_lookup_columns( $sib_variation_id );
 
-				$sib_variation_id = $this->match_sibling_variation( $sib_parent_id, $src_attrs );
+				$synced_ids[] = $sib_variation_id;
+				continue;
+			}
 
-				// A variation-level opt-out must block INCOMING writes too, not
-				// only outgoing ones — the source-side gate reads the same flag,
-				// so checking just the parent here would leave the key
-				// protecting a variation in one direction only. Placed after
-				// the match so the cheaper parent-level skip short-circuits
-				// first and this meta read only happens on real candidates.
-				if ( $sib_variation_id <= 0 || $sib_variation_id === $variation_id || $this->is_sync_opted_out( $sib_variation_id ) ) {
-					continue;
-				}
+			$absolute[] = $sib_variation_id;
+		}
 
-				if ( ! Lock::acquire( $this->lock_name( $sib_variation_id ), self::LOCK_TTL_INNER ) ) {
-					continue;
-				}
+		// PASS 2 — ABSOLUTE mirror (read-modify-write), so it takes the locks.
+		if ( ! empty( $absolute ) && Lock::acquire( $this->lock_name( $variation_id ), self::LOCK_TTL_OUTER ) ) {
+			try {
+				$stock_quantity = $variation->get_stock_quantity();
+				$stock_status   = $variation->get_stock_status();
 
-				try {
-					// Change-only writes: update_post_meta returns false for an
-					// unchanged value too, so only a real change is a candidate
-					// failure (mirrors the parent flow).
-					$stock_same  = ( (string) get_post_meta( $sib_variation_id, '_stock', true ) === (string) $stock_quantity );
-					$status_same = ( (string) get_post_meta( $sib_variation_id, '_stock_status', true ) === (string) $stock_status );
-					$stock_ok    = $stock_same ? true : update_post_meta( $sib_variation_id, '_stock', $stock_quantity );
-					$status_ok   = $status_same ? true : update_post_meta( $sib_variation_id, '_stock_status', $stock_status );
-
-					if ( ( $stock_ok === false || $status_ok === false ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-						error_log( sprintf( 'PerfLocale InventorySync: variation stock update failed for sibling %d', $sib_variation_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				foreach ( $absolute as $sib_variation_id ) {
+					if ( ! Lock::acquire( $this->lock_name( $sib_variation_id ), self::LOCK_TTL_INNER ) ) {
+						continue;
 					}
 
-					// Rebuild the sibling variation's wc_product_meta_lookup row
-					// so shop/stock queries reflect the new stock immediately.
-					$this->refresh_product_lookup( $sib_variation_id );
+					try {
+						// Change-only writes: update_post_meta returns false for
+						// an unchanged value too, so only a real change is a
+						// candidate failure (mirrors the parent flow).
+						$stock_same  = ( (string) get_post_meta( $sib_variation_id, '_stock', true ) === (string) $stock_quantity );
+						$status_same = ( (string) get_post_meta( $sib_variation_id, '_stock_status', true ) === (string) $stock_status );
+						$stock_ok    = $stock_same ? true : update_post_meta( $sib_variation_id, '_stock', $stock_quantity );
+						$status_ok   = $status_same ? true : update_post_meta( $sib_variation_id, '_stock_status', $stock_status );
 
-					$synced_ids[] = $sib_variation_id;
-				} finally {
-					Lock::release( $this->lock_name( $sib_variation_id ) );
+						if ( ( $stock_ok === false || $status_ok === false ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+							error_log( sprintf( 'PerfLocale InventorySync: variation stock update failed for sibling %d', $sib_variation_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+						}
+
+						// Rebuild the sibling variation's wc_product_meta_lookup
+						// row so shop/stock queries reflect the new stock
+						// immediately.
+						$this->refresh_product_lookup( $sib_variation_id );
+
+						$synced_ids[] = $sib_variation_id;
+					} finally {
+						Lock::release( $this->lock_name( $sib_variation_id ) );
+					}
 				}
+			} finally {
+				Lock::release( $this->lock_name( $variation_id ) );
 			}
+		}
 
-			if ( ! empty( $synced_ids ) ) {
-				/** @hook perflocale/woocommerce/inventory_synced Fires after inventory sync completes. */
-				do_action( 'perflocale/woocommerce/inventory_synced', $variation_id, $synced_ids, [ '_stock', '_stock_status' ] );
-			}
-		} finally {
-			Lock::release( $this->lock_name( $variation_id ) );
+		if ( ! empty( $synced_ids ) ) {
+			/** @hook perflocale/woocommerce/inventory_synced Fires after inventory sync completes. */
+			do_action( 'perflocale/woocommerce/inventory_synced', $variation_id, $synced_ids, [ '_stock', '_stock_status' ] );
 		}
 	}
 
@@ -673,6 +1067,13 @@ final class InventorySync {
 	 * @return void
 	 */
 	public function sync_on_quick_or_bulk_edit( \WC_Product $product ): void {
+		// WooCommerce's bulk-edit path is the only core caller that passes
+		// $updating = true, so it fires the stock statement in this same
+		// request WITHOUT a matching sync_on_stock_change(). Discard the
+		// captured delta here or it strands and would later be applied
+		// against an unrelated change.
+		$this->take_stock_delta( $product->get_id() );
+
 		$this->sync_product_fields( $product->get_id() );
 	}
 
@@ -906,6 +1307,22 @@ final class InventorySync {
 	/**
 	 * Normalise a variation attribute map for order-independent comparison.
 	 *
+	 * Taxonomy values are resolved to the TRANSLATION-GROUP identity of the
+	 * term they name, not to the raw slug. The WooCommerce add-on deliberately
+	 * rewrites a cloned variation's attribute slugs into the target language
+	 * (PerfLocaleWooCommerce::translate_variation_attributes(); without it the
+	 * variation dropdown renders empty and the translated product is
+	 * unpurchasable), so English `pa_color=red` and German `pa_color=rot` are
+	 * the SAME variation with different raw signatures — and stock, price and
+	 * field sync silently skipped every one of them. Canonicalising both sides
+	 * makes the two agree.
+	 *
+	 * The mapping is a pure function of (taxonomy, slug) within one blog, so
+	 * it can only ADD matches: two signatures equal before this change are
+	 * still equal after it. Custom (non-taxonomy) attributes, "any value"
+	 * (empty) entries and terms with no translation group keep their raw
+	 * literal value.
+	 *
 	 * @param array<string, string> $attrs Raw WC variation attributes.
 	 * @return array<string, string>
 	 */
@@ -913,12 +1330,68 @@ final class InventorySync {
 		$out = [];
 
 		foreach ( $attrs as $key => $value ) {
-			$out[ (string) $key ] = (string) $value;
+			$out[ (string) $key ] = $this->canonical_attr_value( (string) $key, (string) $value );
 		}
 
 		ksort( $out );
 
 		return $out;
+	}
+
+	/**
+	 * Translation-group identity for one variation attribute value.
+	 *
+	 * Memoised per request and per blog: a bulk stock pass compares the same
+	 * handful of distinct attribute values hundreds of times, and both lookups
+	 * underneath are already per-request cached (WP's term cache and
+	 * TranslationGroupRepository::find_for_object()'s blog-keyed static). The
+	 * bucket is reset at a small bound so a mega-bulk run stays memory-flat,
+	 * exactly as sibling_variation_map() does.
+	 *
+	 * @param string $taxonomy Attribute key (a taxonomy name for `pa_*`).
+	 * @param string $value    Stored value: a term slug for taxonomy
+	 *                         attributes, a literal for custom ones.
+	 * @return string Canonical token, or the raw value when there is no group.
+	 */
+	private function canonical_attr_value( string $taxonomy, string $value ): string {
+		static $memo = [];
+
+		// Custom (non-taxonomy) attributes carry literal strings and "any
+		// <attribute>" is stored empty — neither names a term, so neither can
+		// be canonicalised. Both keep their raw value, unchanged.
+		if ( $taxonomy === '' || $value === '' || ! taxonomy_exists( $taxonomy ) ) {
+			return $value;
+		}
+
+		$blog = get_current_blog_id();
+		$key  = $taxonomy . '|' . $value;
+
+		if ( isset( $memo[ $blog ][ $key ] ) ) {
+			return $memo[ $blog ][ $key ];
+		}
+
+		$canonical = $value;
+		$term      = get_term_by( 'slug', $value, $taxonomy );
+
+		if ( $term instanceof \WP_Term ) {
+			$group = \PerfLocale\Plugin::get_instance()
+				->get( 'group_repo' )
+				->find_for_object( (int) $term->term_id, ObjectType::Term );
+
+			if ( $group && isset( $group->id ) && (int) $group->id > 0 ) {
+				// A colon can never appear in a term slug (sanitize_title
+				// strips it), so this token cannot collide with a real value.
+				$canonical = 'pfl-termgroup:' . (int) $group->id;
+			}
+		}
+
+		if ( count( $memo[ $blog ] ?? [] ) >= 512 ) {
+			unset( $memo[ $blog ] );
+		}
+
+		$memo[ $blog ][ $key ] = $canonical;
+
+		return $canonical;
 	}
 
 	/**

@@ -402,7 +402,47 @@ final class WorkerRegistry {
 				$switched_locale = (bool) switch_to_user_locale( $created_by );
 			}
 
-			JobState::mark_running( $job_id );
+			// Claim the row BEFORE doing any work. The transition is the
+			// durable record that this worker owns the job; if it does not
+			// land there is no such record, and everything below - provider
+			// spend, created posts, the completion hook - would happen
+			// against a row that still says `queued` and is still eligible
+			// to be picked up and replayed by the next sweep.
+			if ( ! JobState::mark_running( $job_id ) ) {
+				// The claim did not transition anything. Read the row FRESH
+				// (the gate at the top of this method reads a cached one) and
+				// decide from what is actually stored.
+				$fresh  = JobState::get_fresh( $job_id );
+				$status = $fresh ? (string) $fresh['status'] : '';
+
+				if ( 'running' !== $status ) {
+					if ( '' === $status || JobState::is_terminal( $status ) ) {
+						// Cancelled, completed or failed between the cached
+						// gate and this write - or the row is gone. Nothing
+						// to report; stand down.
+						return;
+					}
+
+					// Still `queued`: the claim WRITE failed, so nothing
+					// durable says this worker owns the job. Fail loudly
+					// rather than run untracked work - a retry from the Jobs
+					// page is safe precisely because nothing ran.
+					JobState::mark_failed(
+						$job_id,
+						__( 'Could not record the job as running (the database refused the status update); refusing to execute it untracked.', 'perflocale' )
+					);
+
+					return;
+				}
+
+				// Already `running` AND this worker holds the per-job lock
+				// (acquired above; a live peer would have sent us down the
+				// busy-retry path instead). So the row is ours, resuming:
+				// the cooperative pause bail deliberately leaves it running,
+				// and mark_running() is a documented no-op there so the
+				// attempts counter is not charged twice for one run.
+				unset( $fresh );
+			}
 
 			// Tick-throttle: refresh the lock on a wall-clock cadence so the
 			// progress callback can't accidentally hammer the DB by refreshing
@@ -811,44 +851,13 @@ final class WorkerRegistry {
 	 * ending in a recognised file extension, to avoid mangling unrelated
 	 * text. Multi-line safe.
 	 *
+	 * The rule itself lives in {@see \PerfLocale\Util\PathRedactor} so the addon
+	 * boot-failure log applies exactly the same one.
+	 *
 	 * @param string $message Raw exception/error message.
 	 * @return string Redacted message, never longer than the input.
 	 */
 	private static function redact_paths( string $message ): string {
-		if ( $message === '' ) {
-			return $message;
-		}
-
-		// Walk known-prefix substitutions first — these are the most common
-		// path leak sources in WP code. Sort by descending length so the
-		// more-specific WP_CONTENT_DIR replacement wins on standard layouts
-		// where ABSPATH is a strict prefix of WP_CONTENT_DIR (otherwise the
-		// shorter prefix would consume part of the longer prefix's path
-		// before the longer match runs).
-		$prefixes = [
-			rtrim( (string) WP_CONTENT_DIR, '/\\' ) . '/' => '<content>/',
-			rtrim( (string) ABSPATH, '/\\' ) . '/'        => '<wp>/',
-		];
-		uksort( $prefixes, static fn( string $a, string $b ): int => strlen( $b ) - strlen( $a ) );
-
-		foreach ( $prefixes as $prefix => $placeholder ) {
-			$message = str_replace( $prefix, $placeholder, $message );
-		}
-
-		// Then catch any remaining absolute paths that escaped the prefix
-		// substitution (e.g. references to /tmp, /var/log, etc.). Keep the
-		// basename so the message stays useful — `<path>/import.csv` is
-		// actionable, `<path>` alone is not. Bounded the regex to avoid
-		// pathological backtracking. Anchored on a leading word boundary
-		// (start of string OR whitespace/quote/colon/comma/parenthesis) so
-		// we don't re-mangle paths that already passed through the prefix
-		// substitution above (e.g. `<content>/uploads/x.csv`).
-		$message = preg_replace_callback(
-			'#(^|[\s\'",;:()\[\]])/(?:[a-zA-Z0-9._-]+/){1,30}([a-zA-Z0-9._-]+\.[a-zA-Z0-9]{1,8})#',
-			static fn( array $m ): string => $m[1] . '<path>/' . $m[2],
-			$message
-		);
-
-		return is_string( $message ) ? $message : '';
+		return \PerfLocale\Util\PathRedactor::redact( $message );
 	}
 }

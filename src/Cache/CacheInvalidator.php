@@ -65,6 +65,13 @@ final class CacheInvalidator {
 		add_action( 'delete_post', [ $this, 'on_delete_post' ] );
 		add_action( 'delete_term', [ $this, 'on_delete_term' ], 10, 4 );
 
+		// Full-page-cache invalidation on a visibility change. Registered in
+		// every context: the handler is a cheap early-return unless public
+		// readability actually changed, and a transition can arrive from a
+		// front-end GET (scheduled-post publication on a visitor's request)
+		// that the write-context gate below deliberately excludes.
+		add_action( 'transition_post_status', [ $this, 'on_visibility_transition' ], 20, 3 );
+
 		if ( $is_write_context ) {
 			// Pure cache-flush hooks — these fire only on writes that don't
 			// occur during a read-only GET, so they can stay gated.
@@ -508,5 +515,154 @@ final class CacheInvalidator {
 		// touching them is pointless AND would fatal on a fresh subsite whose
 		// tables don't exist yet (switch_blog fires before our activator runs).
 		$this->cache->reset_static();
+	}
+
+	/**
+	 * Purge full-page caches for a post whose PUBLIC visibility changed.
+	 *
+	 * WHY THIS EXISTS
+	 *   A translated page is a separate post with its own language-prefixed
+	 *   URL. When such a page was public, was fetched anonymously (warming a
+	 *   full-page cache), and was then made private, the cached copy stayed
+	 *   anonymously readable. Reproduced on both multisites, root and child
+	 *   blogs, with Redis hot and with Redis disabled; the same transition
+	 *   invalidated correctly when the full-page cache was bypassed, so the
+	 *   stale copy lives in the page-cache layer, not the object cache.
+	 *
+	 *   Two things combine. A page cache purges what it believes the post's URL
+	 *   to be, and it computes that during an admin/CLI request — where this
+	 *   plugin deliberately does NOT add the language prefix, so the URL it
+	 *   purges is not the URL it stored. And the whole translation GROUP is
+	 *   affected: hiding one language changes sibling pages that link to it.
+	 *
+	 *   So this resolves the real front-end URLs itself and hands them to the
+	 *   page cache, rather than assuming the cache can work them out.
+	 *
+	 * DELIBERATELY NARROW. Only a transition that changes whether the post is
+	 * publicly readable does anything, and only that post and its translation
+	 * siblings are purged. There is no global page-cache flush, no object-cache
+	 * flush and no database flush — a visibility change on one post must not
+	 * cost the whole site its cache. Nothing here runs on a front-end request.
+	 *
+	 * @param string    $new_status New post status.
+	 * @param string    $old_status Previous post status.
+	 * @param \WP_Post|null $post   The post.
+	 * @return void
+	 */
+	public function on_visibility_transition( $new_status, $old_status, $post = null ): void {
+		if ( ! $post instanceof \WP_Post || $new_status === $old_status ) {
+			return;
+		}
+
+		$was_public = $this->status_is_public( (string) $old_status );
+		$is_public  = $this->status_is_public( (string) $new_status );
+
+		// Only a change in public readability can strand a cached page.
+		if ( $was_public === $is_public ) {
+			return;
+		}
+
+		$urls = $this->public_translation_urls( (int) $post->ID );
+
+		if ( $urls === [] ) {
+			return;
+		}
+
+		/**
+		 * Fires with every public URL affected by a visibility change.
+		 *
+		 * @hook perflocale/cache/purge_urls Purge these exact URLs from a full-page cache.
+		 * @param array<int, string> $urls    Absolute front-end URLs, language prefixes included.
+		 * @param int                $post_id The post whose visibility changed.
+		 */
+		do_action( 'perflocale/cache/purge_urls', $urls, (int) $post->ID );
+
+		// DELIBERATELY NO DIRECT CALLS INTO PAGE-CACHE PLUGINS.
+		//
+		// The obvious implementation — calling each cache's per-post purge
+		// (Breeze's `purge_post_cache`, `w3tc_flush_post`, `rocket_clean_post`,
+		// `wpsc_delete_post_cache`) — was written, tested and removed. Those
+		// entry points do more than clear a local file: Breeze's, for one, goes
+		// on to purge CloudFlare and Varnish over the network, so every
+		// publish/private toggle would have made PerfLocale the origin of
+		// outbound HTTP inside the request that saved the post. The
+		// cov-never-loaded suite caught exactly that (90 blocked requests
+		// carrying a PerfLocale frame), and it is right to: a translation plugin
+		// should not silently add network calls to someone else's save.
+		//
+		// So this publishes the facts only the translation layer knows — the
+		// exact public URLs — and leaves the purge to the site. One filter wires
+		// it to any cache:
+		//
+		//     add_action( 'perflocale/cache/purge_urls', function ( $urls ) {
+		//         foreach ( $urls as $url ) { my_cache_purge( $url ); }
+		//     } );
+		//
+		// With no listener this costs nothing and reaches nothing.
+	}
+
+	/**
+	 * Is a post with this status readable by an anonymous visitor?
+	 *
+	 * @param string $status Post status.
+	 * @return bool
+	 */
+	private function status_is_public( string $status ): bool {
+		$object = get_post_status_object( $status );
+
+		return is_object( $object ) && ! empty( $object->public );
+	}
+
+	/**
+	 * Every post id in this post's translation group, including itself.
+	 *
+	 * @param int $post_id Post id.
+	 * @return array<int, int>
+	 */
+	private function translation_group_post_ids( int $post_id ): array {
+		$ids = [ $post_id ];
+
+		try {
+			$repo  = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
+			$links = $repo->get_translations( $post_id, \PerfLocale\Enum\ObjectType::Post );
+
+			foreach ( $links as $link ) {
+				$sibling = (int) $link->object_id;
+
+				if ( $sibling > 0 ) {
+					$ids[] = $sibling;
+				}
+			}
+		} catch ( \Throwable $e ) {
+			// A missing container or table must never block a status change.
+			unset( $e );
+		}
+
+		return array_values( array_unique( $ids ) );
+	}
+
+	/**
+	 * Front-end URLs for every post in this post's translation group.
+	 *
+	 * get_permalink() is used deliberately: this runs during a status change,
+	 * which is an admin/CLI/REST request, and the URL that matters is the one a
+	 * visitor would have requested. Anything that cannot be resolved is skipped
+	 * rather than guessed.
+	 *
+	 * @param int $post_id Post id.
+	 * @return array<int, string>
+	 */
+	private function public_translation_urls( int $post_id ): array {
+		$urls = [];
+
+		foreach ( $this->translation_group_post_ids( $post_id ) as $id ) {
+			$permalink = get_permalink( $id );
+
+			if ( is_string( $permalink ) && $permalink !== '' ) {
+				$urls[] = $permalink;
+			}
+		}
+
+		return array_values( array_unique( $urls ) );
 	}
 }

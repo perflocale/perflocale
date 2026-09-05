@@ -522,10 +522,31 @@ final class TranslationService {
 
 		$provider = $this->get_provider( $provider_id );
 
-		// Get source language slug.
-		$lang_repo   = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
-		$default     = $lang_repo->get_default();
-		$source_lang = $default ? $default->slug : 'en';
+		// Declare the SOURCE object's OWN language, not the site default.
+		// A post that is itself a translation, or an original authored in a
+		// non-default language — routine after a WPML / Polylang /
+		// TranslatePress import, where pre-existing posts are linked into
+		// groups — was being announced to the provider as the site default, so
+		// DeepL and Google were told "this is English" about text that is not.
+		// The value travels on from here into MetaTranslator and into the
+		// perflocale/machine_translation/after hook, so it has to be right.
+		//
+		// detect_post_language() is the same lookup PostTranslationManager uses
+		// when it creates the group (PostTranslationManager.php:767-770), it is
+		// memoised per request and blog-keyed, and it returns null for a post
+		// with no language row — which is the ONLY case that should fall back
+		// to the configured default. In a bulk run the read is an L1 hit:
+		// BulkTranslateJob primes every source id before the loop.
+		$source_language = ( new PostTranslationManager( $this->cache, $this->settings ) )
+			->detect_post_language( $post_id );
+
+		if ( $source_language && ! empty( $source_language->slug ) ) {
+			$source_lang = (string) $source_language->slug;
+		} else {
+			$lang_repo   = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
+			$default     = $lang_repo->get_default();
+			$source_lang = $default ? (string) $default->slug : 'en';
+		}
 
 		/** @hook perflocale/machine_translation/before Fires before machine translation. */
 		do_action( 'perflocale/machine_translation/before', $post_id, $provider->get_id() );

@@ -325,6 +325,24 @@ final class CacheManager {
 			$this->static_cache[ $this->make_static_key( $group, $key ) ] = $value;
 		}
 
+		// Re-assert the bound AFTER the batch. The pre-emptive slice above frees
+		// a FIXED 25% (1,250 slots) and is then never re-checked, so any batch
+		// bigger than that — or a warm cache plus a mid-sized batch — lands over
+		// MAX_STATIC_ENTRIES and stays there: measured 6,000 retained from one
+		// 6,000-entry batch and 10,750 after a second disjoint one, against a
+		// documented 5,000 hard bound, and 5,151 from a real cold prime. One
+		// array_slice, O(N), at most once per call — not per entry, no sort.
+		// Drops the OLDEST keys so the entries this call just wrote (the current
+		// render's working set) survive, matching ensure_static_capacity()'s
+		// direction on the single-entry path. L1 is request-local and every
+		// entry still goes to L2/L3 below, so an evicted key is a miss that
+		// re-reads, never a wrong answer.
+		$overflow = count( $this->static_cache ) - self::MAX_STATIC_ENTRIES;
+
+		if ( $overflow > 0 ) {
+			$this->static_cache = array_slice( $this->static_cache, $overflow, null, true );
+		}
+
 		// L2 — wp_cache_set per entry. There's no batched wp_cache API in WP
 		// core (wp_cache_set_multiple exists only on WP 6.0+ AND only when
 		// the active object cache backend implements it), so a tight foreach

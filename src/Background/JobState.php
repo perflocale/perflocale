@@ -219,14 +219,69 @@ final class JobState {
 	}
 
 	/**
+	 * Find an identical job that is still queued or running on this blog.
+	 *
+	 * "Identical" means the same type and byte-identical stored args - the
+	 * same logical operation, not merely the same type, so unrelated work of
+	 * the same kind still runs in parallel and a chunked chain (whose cursor
+	 * advances every link) is never mistaken for a repeat of itself.
+	 *
+	 * Reads the `type_status` index, and the queued/running set is a handful
+	 * of rows on any real install.
+	 *
+	 * @param string              $type Job type slug.
+	 * @param array<mixed, mixed> $args Worker args as passed to {@see create()}.
+	 * @return string|null UUID of the in-flight twin, or null.
+	 */
+	public static function find_active_duplicate( string $type, array $args ): ?string {
+		global $wpdb;
+
+		$encoded = wp_json_encode( $args );
+
+		if ( ! is_string( $encoded ) ) {
+			return null;
+		}
+
+		$table = Schema::table( 'jobs' );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$uuid = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT uuid FROM %i
+			 WHERE type = %s
+			   AND status IN ('queued', 'running')
+			   AND blog_id = %d
+			   AND args = %s
+			 ORDER BY id ASC
+			 LIMIT 1",
+				$table,
+				$type,
+				function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0,
+				$encoded
+			)
+		);
+
+		return is_string( $uuid ) && $uuid !== '' ? $uuid : null;
+	}
+
+	/**
 	 * Move a queued job to `running`. Sets started_at + attempts++.
 	 *
+	 * Returns whether THIS caller performed the transition. False means the
+	 * claim did not land: the write failed, or the row was no longer
+	 * `queued` - cancelled, already claimed by another worker, or gone. The
+	 * caller must not execute the job in that case. It used to return void,
+	 * so a failed claim was invisible and the handler ran anyway: provider
+	 * calls were made and billed, translations and descendants were created,
+	 * and the completion hook fired, all while the row still said `queued`
+	 * and stayed eligible for a later replay.
+	 *
 	 * @param string $job_id UUID.
-	 * @return void
+	 * @return bool True when the row moved queued -> running.
 	 */
-	public static function mark_running( string $job_id ): void {
+	public static function mark_running( string $job_id ): bool {
 		if ( ! self::is_safe_id( $job_id ) ) {
-			return;
+			return false;
 		}
 
 		global $wpdb;
@@ -237,7 +292,7 @@ final class JobState {
 		// are NOT bumped (preserves the attempts counter set by the
 		// worker that actually owns the lock).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
-		$wpdb->query(
+		$affected = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE %i
 			 SET status = 'running',
@@ -252,6 +307,10 @@ final class JobState {
 				$job_id
 			)
 		);
+
+		// `false` is a query error; 0 is "no row was queued". Both mean the
+		// caller does not own this job.
+		return 1 === (int) $affected;
 	}
 
 	/**
@@ -431,15 +490,26 @@ final class JobState {
 		$table = Schema::table( 'jobs' );
 		$now   = current_time( 'mysql', true );
 
-		// Automatic callers (worker auto-retry, the deactivation Resumer) must
-		// never resurrect a job an operator explicitly canceled, so they keep
-		// 'canceled' in the exclusion set. Operator-initiated retries (CLI /
-		// REST) pass $allow_canceled = true so re-running a canceled job
-		// actually resets it instead of silently no-opping while the command
-		// still reports success. 'complete' is always excluded.
-		$excluded_statuses = $allow_canceled ? "'complete'" : "'complete', 'canceled'";
+		// ALLOW-list, not a deny-list. The old exclusion (NOT IN
+		// ('complete','canceled')) left 'queued' reachable, so two concurrent
+		// retries of the same failed job BOTH matched a row, both returned true
+		// and both enqueued the same UUID: the first flipped failed → queued and
+		// 'queued' still satisfied the predicate for the second. Naming the
+		// retryable SOURCE statuses makes the transition single-winner — the
+		// loser gets 0 affected rows and its caller's existing "state changed
+		// concurrently" 409 / CLI error, which both entry points already have.
+		//
+		// 'running' is required: Resumer flips a killed worker's row back to
+		// queued after a deactivation. 'failed' is required: WorkerRegistry's
+		// auto-retry resets immediately after mark_failed(). 'canceled' is
+		// operator-only — automatic callers must never resurrect a job an
+		// operator explicitly canceled. 'complete' is never retryable. 'queued'
+		// is now correctly refused: it is never a legitimate SOURCE status,
+		// because JobsController::retry_job and the CLI both gate on
+		// status IN ('failed','canceled') before calling this.
+		$allowed_statuses = $allow_canceled ? "'failed', 'running', 'canceled'" : "'failed', 'running'";
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'); $excluded_statuses is a hardcoded literal list, never user input.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'); $allowed_statuses is a hardcoded literal list, never user input.
 		$affected = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE %i
@@ -453,7 +523,7 @@ final class JobState {
 			     result = '[]',
 			     updated_at = %s,
 			     version = version + 1
-			 WHERE uuid = %s AND status NOT IN ({$excluded_statuses})",
+			 WHERE uuid = %s AND status IN ({$allowed_statuses})",
 				$table,
 				$now,
 				$job_id
@@ -552,6 +622,58 @@ final class JobState {
 				$job_id
 			)
 		);
+	}
+
+	/**
+	 * Is one of OUR long-running jobs currently in flight?
+	 *
+	 * Used to scope the `action_scheduler_failure_period` filter. That filter is
+	 * store-wide — Action Scheduler passes the callback no action context — so
+	 * raising the failure window unconditionally would delay reclamation of
+	 * EVERY plugin's stuck actions, not just ours. Answering "no" here hands the
+	 * incoming value straight back, leaving other plugins on AS's own cadence.
+	 *
+	 * NOT MEMOISED, deliberately. This used to cache the answer in a
+	 * function-local static, on the reasoning that it "cannot meaningfully
+	 * change inside one PHP process". That reasoning was wrong in two separate
+	 * ways, and a long-lived process (a WP-CLI run, a queue worker) hits both:
+	 *
+	 * It changes over TIME. The same process that starts, finishes or reclaims a
+	 * job then asks this question again and gets its first answer back — false
+	 * after a job began, or true long after the last one ended, pinning the
+	 * failure window at 300s or at 21,600s regardless of the truth.
+	 *
+	 * It changes across BLOGS. `Schema::table()` resolves against the CURRENT
+	 * blog, so on multisite the cached answer belonged to whichever blog asked
+	 * first. After switch_to_blog() a site with no jobs at all inherited its
+	 * neighbour's `true` and quietly extended Action Scheduler's failure period
+	 * — for every OTHER plugin's actions on that site too, since the filter is
+	 * store-wide. That is the one direction where being wrong reaches beyond
+	 * this plugin.
+	 *
+	 * Keying the static by blog would fix half of it and leave the time half, so
+	 * the memo is simply gone. Measured cost of not having it: 0.0435 ms per
+	 * call (2,000 calls, `type=ref` on the `status_updated` covering index,
+	 * `Using index`, no row reads). The only caller is the
+	 * `action_scheduler_failure_period` filter, which runs during Action
+	 * Scheduler queue processing and never on a front-end page request. There is
+	 * nothing here worth caching.
+	 *
+	 * @return bool True when at least one job row on the CURRENT blog is `running`.
+	 */
+	public static function has_long_job_in_flight(): bool {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Job state is not cacheable: a cached answer is exactly the bug this replaced.
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT 1 FROM %i WHERE status = %s LIMIT 1',
+				Schema::table( 'jobs' ),
+				'running'
+			)
+		);
+
+		return null !== $found;
 	}
 
 	/**
@@ -712,6 +834,58 @@ final class JobState {
 			return;
 		}
 
+		// Remove the artifact BEFORE the row, because the row is the only
+		// record of what the artifact was. A completed data_export writes its
+		// file into wp-content/uploads, which is web-served; deleting the job
+		// used to leave that file behind with nothing left to identify or own
+		// it, and the only thing that eventually removed it was the 7-day
+		// age sweep. Ordering matters: if the unlink fails we still delete the
+		// row (the file is then swept by age, exactly as before), but if the
+		// row went first we would have lost the path entirely.
+		//
+		// The row still goes even when the unlink fails — a directory the web
+		// server cannot write to, or an artifact the cleanup refuses because it
+		// is no longer the file the job created. Making admin deletion fail
+		// instead would leave the operator unable to remove a job at all, and
+		// the artifact is web-served, so a stuck row is not a safer state than a
+		// swept file. What was missing was any RECORD of the orphan: the file
+		// survived with nothing owning it and nothing said so. Log it, so the
+		// gap between "job deleted" and "file gone" is visible before the
+		// 7-day sweep closes it.
+		if ( ! self::delete_owned_artifact( $job_id ) ) {
+			$orphan_state  = self::get( $job_id );
+			$orphan_result = is_array( $orphan_state ) ? (array) ( $orphan_state['result'] ?? [] ) : [];
+			$orphan_path   = (string) ( $orphan_result['path'] ?? '' );
+
+			// Only when there really was an artifact to remove. Every other job
+			// type has no file, and logging those would bury the real cases.
+			if ( '' !== $orphan_path && file_exists( $orphan_path ) ) {
+				// NEVER log the path, the basename or the token.
+				//
+				// An export filename is `perflocale-export-<date>-<32 CSPRN>.json`
+				// and that suffix IS the access control: the file lands in
+				// wp-content/uploads, which Apache guards with the .htaccess
+				// harden_directory() writes but which nginx and Caddy ignore
+				// entirely, so on those servers anyone holding the exact URL can
+				// fetch the export. Writing the full path here put that token
+				// into the PHP error log — a file support tooling, hosting
+				// dashboards and log shippers routinely read — which handed away
+				// the very secret the 32-character suffix exists to protect.
+				//
+				// The job UUID is enough to find the row and its recorded path
+				// through the admin UI or WP-CLI, and a truncated SHA-256 of the
+				// path lets two log lines be correlated without being reversible.
+				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				error_log(
+					sprintf(
+						'PerfLocale JobState: job %s deleted but its export artifact was NOT removed (path digest %s). It is now unowned and will be swept by age. Check directory permissions, or whether the file at that path was replaced.',
+						$job_id,
+						substr( hash( 'sha256', $orphan_path ), 0, 12 )
+					)
+				);
+			}
+		}
+
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
 
@@ -719,6 +893,121 @@ final class JobState {
 		$wpdb->delete( $table, [ 'uuid' => $job_id ], [ '%s' ] );
 	}
 
+	/**
+	 * Delete the export file a finished job owns, if it still exists.
+	 *
+	 * Deliberately narrow. It removes ONLY a path this job recorded as its own
+	 * result, only when that path resolves inside the plugin's own exports
+	 * directory, and never one of the directory's hardening files. Anything it
+	 * cannot prove it owns is left alone for the age sweep — losing a file is
+	 * worse than keeping one a few days longer.
+	 *
+	 * @param string $job_id Job UUID.
+	 * @return bool True when a file was removed.
+	 */
+	private static function delete_owned_artifact( string $job_id ): bool {
+		$state = self::get( $job_id );
+
+		if ( ! is_array( $state ) ) {
+			return false;
+		}
+
+		$result = (array) ( $state['result'] ?? [] );
+		$path   = (string) ( $result['path'] ?? '' );
+
+		if ( '' === $path || str_contains( $path, "\0" ) ) {
+			return false;
+		}
+
+		$exports = \PerfLocale\Helper::uploads_exports_dir();
+
+		if ( '' === $exports ) {
+			return false;
+		}
+
+		$real_dir = realpath( $exports );
+
+		if ( false === $real_dir ) {
+			return false;
+		}
+
+		// RESOLVE THE PARENT DIRECTORY, NEVER THE FILE.
+		//
+		// This used to call realpath() on the recorded path itself and unlink
+		// whatever came back. realpath() FOLLOWS SYMLINKS, so a symlink left at
+		// job A's recorded path pointing at job B's export resolved to B's real
+		// file — which is genuinely inside the exports directory, so every
+		// containment check passed. Deleting job A then destroyed job B's data,
+		// left A's dangling symlink in place, and removed A's row while B's row
+		// survived pointing at a file that no longer existed.
+		//
+		// Resolving only the DIRECTORY gives the traversal protection that was
+		// wanted (`..` segments and a symlinked exports dir are still handled)
+		// without ever redirecting the unlink to a different file.
+		$real_parent = realpath( dirname( $path ) );
+		$base        = basename( $path );
+
+		if ( false === $real_parent || $real_parent !== $real_dir || '' === $base ) {
+			return false;
+		}
+
+		// Belt and braces: the exporter never writes these names, and unlinking
+		// one would strip the directory's own access controls.
+		if ( in_array( $base, [ '.htaccess', 'index.php', 'web.config' ], true ) ) {
+			return false;
+		}
+
+		$target = $real_parent . DIRECTORY_SEPARATOR . $base;
+
+		// NON-FOLLOWING metadata for the type check. is_file() follows links and
+		// so reports a symlink-to-a-regular-file as a regular file; lstat()
+		// describes the entry itself. Refuse anything that is not a plain file:
+		// a symlink, a FIFO, a socket, a device, a directory.
+		$st = @lstat( $target ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- A missing artifact is the normal already-cleaned case, not an error.
+
+		if ( ! is_array( $st ) || ! isset( $st['mode'] ) ) {
+			return false;
+		}
+
+		// S_IFMT / S_IFREG. PHP exposes no portable constants for these.
+		if ( 0100000 !== ( ( (int) $st['mode'] ) & 0170000 ) ) {
+			return false;
+		}
+
+		// IDENTITY BINDING. When the job recorded the inode and device of the
+		// file it created, require the entry at this path to still BE that
+		// file. This is what makes pathname reuse safe: the old file being
+		// unlinked while a handle stayed open, and an unrelated new file
+		// appearing at the same name, used to end with the cleanup deleting the
+		// newcomer. Absent on rows written before this was recorded, in which
+		// case the checks above stand alone and the age sweep is the backstop.
+		$want_ino = (string) ( $result['ino'] ?? '' );
+		$want_dev = (string) ( $result['dev'] ?? '' );
+
+		// A row with no recorded identity cannot prove it owns the file that is
+		// there NOW. Rows written before 1.0.1 carry only `path` and `bytes`, and
+		// treating the pathname as ownership is exactly the mistake the identity
+		// binding exists to prevent: if the original artifact is gone and any
+		// other regular file has since taken that pathname, deleting the job
+		// would delete the newcomer. Reproduced on four roots and both multisite
+		// child blogs.
+		//
+		// So a legacy row REFUSES to unlink and leaves the artifact to the bounded
+		// age sweep, which is the same backstop that already covers an unlink
+		// failure. The cost is that a pre-1.0.1 export lingers until the sweep;
+		// the alternative is deleting a file this row cannot show it owns.
+		if ( '' === $want_ino || '' === $want_dev ) {
+			return false;
+		}
+
+		if ( (string) ( $st['ino'] ?? '' ) !== $want_ino || (string) ( $st['dev'] ?? '' ) !== $want_dev ) {
+			return false;
+		}
+
+		wp_delete_file( $target );
+
+		return ! file_exists( $target );
+	}
 	/**
 	 * Zero the `created_by` field on every job dispatched by the given
 	 * user — GDPR Right-to-Erasure + admin user-delete hook entry point.
@@ -1127,11 +1416,24 @@ final class JobState {
 
 			$placeholders = implode( ',', array_fill( 0, count( $names ), '%s' ) );
 
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- $placeholders is a dynamic %s list for IN()
+			// Re-assert at DELETE time the exact predicate that qualified these
+			// names for collection, against the SAME captured $now. Between the
+			// SELECT above and this statement a worker can refresh its lease or
+			// CAS-reclaim an expired one; deleting by NAME alone then removes a
+			// LIVE lock and lets a second worker enter a job — or a whole job
+			// type — that is actively running. A renewed row now has
+			// expiry >= $now and is skipped, so $pruned also becomes an honest
+			// count of what was really deleted. Still one statement, no CAS list.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- $placeholders is a dynamic %s list for IN(); replacements arrive as one array, which WPCS cannot count.
 			$deleted = $wpdb->query(
 				$wpdb->prepare(
-					"DELETE FROM {$wpdb->options} WHERE option_name IN ({$placeholders})",
-					$names
+					"DELETE FROM {$wpdb->options}
+					 WHERE option_name IN ({$placeholders})
+					 AND NOT (
+						option_value REGEXP '^[0-9]+\\\\|'
+						AND CAST(SUBSTRING_INDEX(option_value, '|', 1) AS UNSIGNED) >= %d
+					 )",
+					array_merge( $names, [ $now ] )
 				)
 			);
 

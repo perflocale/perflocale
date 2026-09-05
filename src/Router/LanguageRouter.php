@@ -257,7 +257,7 @@ final class LanguageRouter {
 		// The locale filter is registered exactly once by Bootstrap::init()
 		// before detect_locale_early(). No conditional re-registration here.
 
-		// Add 'lang' as a recognized query variable.
+		// Register the language query variable (filterable, see UrlConverter::query_var()).
 		add_filter( 'query_vars', [ $this, 'add_query_vars' ] );
 
 		// Flush rewrite rules if the flag is set (after activation or settings change).
@@ -1340,7 +1340,32 @@ final class LanguageRouter {
 		// visitor's validated language cookie is the right signal here —
 		// Store API responses are per-cart and uncacheable, so cookie
 		// variance is safe.
-		if ( $slug === null && isset( $_COOKIE['perflocale_lang'] ) ) {
+		//
+		// NOT on a path-prefixed blog in subdirectory mode. This branch assumes
+		// the Store API base sits at the site root (`/wp-json/wc/store/...`).
+		// On a SUBDIRECTORY multisite child the site root already carries a path
+		// segment (`/sub/wp-json/wc/store/...`), and resolving a non-default
+		// language from the cookie there left the request inconsistent with
+		// subdirectory-mode path expectations: every Store API call returned an
+		// HTML 404 instead of JSON. Verified on mutest-subdir blog 2 — no cookie
+		// and an `en` (default) cookie both returned 200, `de`/`es`/`fr` all
+		// returned 404, the same route with the language IN the path returned
+		// 200, and a non-Store REST route with the same cookie returned 200.
+		//
+		// Skipping the branch there means such a shopper gets Store API strings
+		// in the DEFAULT language rather than a broken endpoint. That is a
+		// deliberate trade: an English error message is a nuisance, a 404 cart
+		// is a broken checkout. Single-site, subdomain and per-domain shapes, and
+		// the network's own root blog, are untouched and keep the localisation.
+		$blog_path = '/';
+
+		if ( is_multisite() && isset( $GLOBALS['current_blog']->path ) ) {
+			$blog_path = (string) $GLOBALS['current_blog']->path;
+		}
+
+		$store_api_prefix_safe = ( $url_mode !== 'subdirectory' || '/' === $blog_path );
+
+		if ( $slug === null && $store_api_prefix_safe && isset( $_COOKIE['perflocale_lang'] ) ) {
 			$request_path = (string) wp_parse_url(
 				esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '' ) ) ),
 				PHP_URL_PATH
@@ -1458,32 +1483,93 @@ final class LanguageRouter {
 	}
 
 	/**
+	 * Build the URL-prefix → language-slug lookup used by every URL mode.
+	 *
+	 * A language is addressable by TWO forms: its own slug (`en`) and the
+	 * locale form of its locale (`en-us` for `en_US`). Which one the plugin
+	 * WRITES depends on the URL Prefix Format setting; which ones it READS is
+	 * deliberately both, so flipping that setting — or an old bookmark, or a
+	 * link someone already published — never 404s or silently serves the
+	 * wrong language.
+	 *
+	 * TWO passes, and the order matters. Every language's own slug is claimed
+	 * first; locale-form aliases only fill keys still free afterwards.
+	 *
+	 * A single pass let a LATER language's alias overwrite an EARLIER
+	 * language's real slug: give one language the slug `de-de` and another
+	 * the locale `de_DE`, and `/de-de/` silently served the second one — the
+	 * first became unreachable by its own slug, and reversing the row order
+	 * hid the problem. A slug is a real, UNIQUE-constrained identifier; an
+	 * alias is a convenience. The identifier must always win.
+	 *
+	 * Built once per request behind a static that reset() drops on
+	 * switch_blog, so the cost is O(languages) once, not per URL.
+	 *
+	 * @param array<string, object> $slug_map Active language slug map.
+	 * @return array<string, string> Prefix (slug or locale form) → language slug.
+	 */
+	private function prefix_map( array $slug_map ): array {
+		if ( self::$path_prefix_map !== null ) {
+			return self::$path_prefix_map;
+		}
+
+		self::$path_prefix_map = [];
+
+		foreach ( $slug_map as $slug => $lang ) {
+			self::$path_prefix_map[ $slug ] = $slug;
+		}
+
+		foreach ( $slug_map as $slug => $lang ) {
+			$locale_prefix = strtolower( str_replace( '_', '-', $lang->locale ) );
+
+			if ( $locale_prefix !== $slug && ! isset( self::$path_prefix_map[ $locale_prefix ] ) ) {
+				self::$path_prefix_map[ $locale_prefix ] = $slug;
+			}
+		}
+
+		return self::$path_prefix_map;
+	}
+
+	/**
 	 * Detect language from the `lang` query parameter (query URL mode).
 	 *
-	 * The raw value is only ever matched against the active-language slug
+	 * The raw value is only ever matched against the active-language prefix
 	 * map — an unknown or malformed value means "no language in the URL"
 	 * and the default-language fallback applies. The user-supplied string
 	 * never propagates further: every URL the plugin builds afterwards
 	 * uses the slug stored in the languages table.
 	 *
+	 * The parameter name comes from UrlConverter::query_var(), the same
+	 * source the writer uses, so reader and writer cannot drift apart.
+	 *
 	 * @param array<string, object> $slug_map Language slug map.
 	 * @return string|null Detected language slug or null.
 	 */
 	private function detect_from_query_param( array $slug_map ): ?string {
+		$query_var = UrlConverter::query_var();
+
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only language routing; no state change.
-		if ( ! isset( $_GET['lang'] ) || ! is_string( $_GET['lang'] ) ) {
+		if ( ! isset( $_GET[ $query_var ] ) || ! is_string( $_GET[ $query_var ] ) ) {
 			return null;
 		}
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only language routing; no state change.
-		$slug = sanitize_key( wp_unslash( $_GET['lang'] ) );
+		$slug = sanitize_key( wp_unslash( $_GET[ $query_var ] ) );
 
 		if ( $slug === '' ) {
 			return null;
 		}
 
-		if ( isset( $slug_map[ $slug ] ) ) {
-			return $slug;
+		// Accept the slug AND the locale form, exactly like path mode does.
+		// The URL Prefix Format setting decides which one gets WRITTEN; both
+		// are always read. So `?lang=en` keeps resolving on a site later
+		// switched to full-locale prefixes, and `?lang=en-us` resolves on a
+		// slug-prefix site — no bookmark, backlink or indexed URL ever dies
+		// because someone changed a setting.
+		$prefix_map = $this->prefix_map( $slug_map );
+
+		if ( isset( $prefix_map[ $slug ] ) ) {
+			return $prefix_map[ $slug ];
 		}
 
 		// A renamed slug (e.g. `en` after the admin renamed it to `en-us`):
@@ -1504,17 +1590,27 @@ final class LanguageRouter {
 	}
 
 	/**
-	 * 301 query-mode URLs whose ?lang= carries a RENAMED slug to the new one.
+	 * 301 query-mode URLs whose language parameter is not in canonical form.
 	 *
-	 * Detection already resolves old slugs (so the content is correct even
-	 * without this), but leaving the old parameter in place would keep two
-	 * URL variants alive per renamed language. GET/HEAD only.
+	 * Covers both non-canonical cases:
+	 * - a RENAMED slug (`?lang=en` after the admin renamed `en` to `en-us`)
+	 * - the wrong PREFIX FORM for the current URL Prefix Format setting
+	 *   (`?lang=en` on a site set to full locale, and the reverse)
+	 *
+	 * Detection resolves all of these on its own, so content is already
+	 * correct without this handler. The redirect exists so each language
+	 * keeps exactly ONE indexable query URL instead of several 200s.
+	 *
+	 * GET/HEAD only, frontend only, and only registered in query URL mode.
+	 * The default language is untouched: it carries no parameter at all.
 	 *
 	 * @return void
 	 */
 	public function maybe_redirect_renamed_query_slug(): void {
+		$query_var = UrlConverter::query_var();
+
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only canonicalization.
-		if ( is_admin() || ! isset( $_GET['lang'] ) || ! is_string( $_GET['lang'] ) ) {
+		if ( is_admin() || ! isset( $_GET[ $query_var ] ) || ! is_string( $_GET[ $query_var ] ) ) {
 			return;
 		}
 
@@ -1525,27 +1621,56 @@ final class LanguageRouter {
 		}
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only canonicalization.
-		$slug = sanitize_key( wp_unslash( $_GET['lang'] ) );
+		$prefix = sanitize_key( wp_unslash( $_GET[ $query_var ] ) );
 
-		if ( $slug === '' ) {
+		if ( $prefix === '' ) {
 			return;
 		}
 
 		$slug_map = $this->get_language_slug_map();
 
-		if ( isset( $slug_map[ $slug ] ) ) {
-			return; // Active slug — nothing to canonicalize.
+		if ( empty( $slug_map ) ) {
+			return;
 		}
 
-		$redirects = \PerfLocale\Database\Repository\LanguageRepository::get_slug_redirects();
-		$resolved  = (string) ( $redirects[ $slug ] ?? '' );
+		// Resolve whatever form the visitor arrived with: own slug, locale
+		// form, or a slug the admin has since renamed.
+		$prefix_map = $this->prefix_map( $slug_map );
+		$resolved   = $prefix_map[ $prefix ] ?? '';
 
-		if ( $resolved === '' || ! isset( $slug_map[ $resolved ] ) ) {
+		if ( $resolved === '' ) {
+			$redirects = \PerfLocale\Database\Repository\LanguageRepository::get_slug_redirects();
+			$resolved  = (string) ( $redirects[ $prefix ] ?? '' );
+
+			if ( $resolved === '' || ! isset( $slug_map[ $resolved ] ) ) {
+				return; // Unknown value — leave the URL alone.
+			}
+		}
+
+		// Canonical form under the CURRENT URL Prefix Format setting. This is
+		// the same value UrlConverter writes, so one language keeps exactly
+		// one indexable query URL: reading both forms would otherwise leave
+		// `?lang=en` and `?lang=en-us` both answering 200 — duplicate content,
+		// which is the thing this plugin exists to prevent. Mirrors what
+		// maybe_canonicalise_prefix_form() does for subdirectory mode.
+		$canonical = $this->settings->get_url_prefix( $slug_map[ $resolved ] );
+
+		if ( $canonical === $prefix ) {
+			return; // Already canonical — no redirect.
+		}
+
+		// Never 301 to a prefix that resolves to a DIFFERENT language. Two
+		// languages can want the same canonical form when one's slug equals
+		// the other's locale form (slug `de-de` alongside locale `de_DE`).
+		// Sending a visitor there would serve the wrong language under a
+		// permanent, cacheable redirect. Leaving the URL alone always serves
+		// the right content, so that is the safe direction to fail.
+		if ( ( $prefix_map[ $canonical ] ?? '' ) !== $resolved ) {
 			return;
 		}
 
 		$request_uri = esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
-		$target      = add_query_arg( 'lang', rawurlencode( $resolved ), remove_query_arg( 'lang', $request_uri ) );
+		$target      = add_query_arg( $query_var, rawurlencode( $canonical ), remove_query_arg( $query_var, $request_uri ) );
 
 		wp_safe_redirect( $target, 301 );
 		exit;
@@ -1568,27 +1693,13 @@ final class LanguageRouter {
 			return null;
 		}
 
-		// Build a prefix → slug lookup (cached per-request).
-		// Stored on the class so reset() (switch_blog) can drop it cleanly.
-		if ( self::$path_prefix_map === null ) {
-			self::$path_prefix_map = [];
-
-			foreach ( $slug_map as $slug => $lang ) {
-				self::$path_prefix_map[ $slug ] = $slug;
-
-				$locale_prefix = strtolower( str_replace( '_', '-', $lang->locale ) );
-
-				if ( $locale_prefix !== $slug ) {
-					self::$path_prefix_map[ $locale_prefix ] = $slug;
-				}
-			}
-		}
+		$prefix_map = $this->prefix_map( $slug_map );
 
 		$slash_pos = strpos( $request, '/' );
 		$first_seg = $slash_pos !== false ? substr( $request, 0, $slash_pos ) : $request;
 
-		if ( isset( self::$path_prefix_map[ $first_seg ] ) ) {
-			$detected_slug = self::$path_prefix_map[ $first_seg ];
+		if ( isset( $prefix_map[ $first_seg ] ) ) {
+			$detected_slug = $prefix_map[ $first_seg ];
 
 			$wp->request = $slash_pos !== false ? substr( $request, $slash_pos + 1 ) : '';
 
@@ -2055,7 +2166,7 @@ final class LanguageRouter {
 	}
 
 	/**
-	 * Add 'lang' to recognized query variables.
+	 * Add the language query variable to WordPress's recognized query vars.
 	 *
 	 * `lang` is deliberately unprefixed: it is the shared multilingual URL
 	 * convention and is user-facing in query URL mode (`?lang=de`), where a
@@ -2073,7 +2184,7 @@ final class LanguageRouter {
 	 * @return array<int, string>
 	 */
 	public function add_query_vars( array $vars ): array {
-		$vars[] = 'lang';
+		$vars[] = UrlConverter::query_var();
 		return $vars;
 	}
 

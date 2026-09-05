@@ -68,6 +68,11 @@ final class UrlConverter {
 	private const MAX_CACHE_ENTRIES = 500;
 
 	/**
+	 * Default language query variable for query-parameter URL mode.
+	 */
+	public const DEFAULT_QUERY_VAR = 'lang';
+
+	/**
 	 * Per-request memoized read of `permalink_structure`.
 	 *
 	 * The option lives in WP's autoload cache so the underlying read is
@@ -118,6 +123,64 @@ final class UrlConverter {
 		self::$front_page_translation_memo   = [];
 		self::$front_page_translation_primed = false;
 		self::$primed_nav_refs               = [];
+		self::$query_var_memo                = null;
+	}
+
+	/**
+	 * Language query variable name used by query-parameter URL mode.
+	 *
+	 * Filterable so a site already using `lang` for something else (Polylang
+	 * leftovers, a theme, a page builder) can move PerfLocale out of the way
+	 * without touching rewrite rules. The result is passed through
+	 * sanitize_key() and falls back to the default when a filter returns
+	 * something unusable, so the value is always a safe query-arg name.
+	 *
+	 * The writer (UrlConverter), the reader (LanguageRouter), the rewrite
+	 * rules (RewriteManager), the fallback redirect walker (PostQueryFilter)
+	 * and the Site Health rewrite probe all call this, so they cannot disagree
+	 * about which variable to use. Bootstrap primes it during load so admin
+	 * and front-end requests freeze the same value at the same moment.
+	 *
+	 * @since 1.0.1
+	 *
+	 * @return string Sanitised query variable name. Never empty.
+	 */
+	public static function query_var(): string {
+		if ( self::$query_var_memo !== null ) {
+			return self::$query_var_memo;
+		}
+
+		/**
+		 * Filters the query variable used for query-parameter URL mode.
+		 *
+		 * Fires once per request per blog. The returned value is passed
+		 * through sanitize_key(); an empty or non-string result falls back
+		 * to the default.
+		 *
+		 * REGISTER THIS FROM AN MU-PLUGIN. The name is resolved during
+		 * PerfLocale's own load (Bootstrap primes it next to
+		 * detect_locale_early), because query-mode language detection has to
+		 * read the request before `plugins_loaded` fires. A filter added from
+		 * an ordinary plugin or a theme's functions.php runs too late and is
+		 * ignored — silently, because there is nothing to warn about at that
+		 * point. mu-plugins load first, so that is the supported home for it.
+		 *
+		 * Renaming this on a live site changes stored rewrite rules in
+		 * subdirectory mode, so flush permalinks (Settings > Permalinks)
+		 * after adding or changing the filter. Existing URLs carrying the
+		 * old name stop resolving, so treat a rename as a URL change.
+		 *
+		 * @since 1.0.1
+		 *
+		 * @param string $query_var Query variable name. Default 'lang'.
+		 */
+		$query_var = apply_filters( 'perflocale/url/query_var', self::DEFAULT_QUERY_VAR );
+
+		$query_var = is_string( $query_var ) ? sanitize_key( $query_var ) : '';
+
+		self::$query_var_memo = '' !== $query_var ? $query_var : self::DEFAULT_QUERY_VAR;
+
+		return self::$query_var_memo;
 	}
 
 	/**
@@ -282,6 +345,18 @@ final class UrlConverter {
 	 * @var array<string, object>|null
 	 */
 	private static ?array $lang_map = null;
+
+	/**
+	 * Memoised name of the language query variable.
+	 *
+	 * The perflocale/url/query_var filter fires ONCE per request (per blog,
+	 * since reset_static_caches() clears this on switch_blog) no matter how
+	 * many URLs get built, so a render that converts 200 URLs pays for one
+	 * apply_filters call, not 200. Every later read is a property hit.
+	 *
+	 * @var string|null
+	 */
+	private static ?string $query_var_memo = null;
 
 	/**
 	 * Per-request memo of the home-URL PATH (strip_language_prefix_from_path)
@@ -1294,7 +1369,13 @@ final class UrlConverter {
 				return $url;
 			}
 
-			return add_query_arg( 'lang', $current->slug, remove_query_arg( 'lang', $url ) );
+			// get_url_prefix() honours the URL Prefix Format setting, so query
+			// mode now emits `?lang=en-us` when the site is set to full locale,
+			// matching what path and subdomain modes put in the URL. It is
+			// memoised per language id, so this is a hash hit, not a query.
+			// Old `?lang=en` URLs keep resolving: the reader accepts the slug
+			// and the locale form (see LanguageRouter::prefix_map()).
+			return add_query_arg( self::query_var(), $this->settings->get_url_prefix( $current ), remove_query_arg( self::query_var(), $url ) );
 		}
 
 		// Subdirectory: skip prefix for default language if configured to hide it.
@@ -1342,11 +1423,13 @@ final class UrlConverter {
 
 		$current = $this->router->get_current_language();
 
-		if ( $current === null || stripos( $form, 'name="lang"' ) !== false ) {
+		$query_var = self::query_var();
+
+		if ( $current === null || stripos( $form, 'name="' . $query_var . '"' ) !== false ) {
 			return $form;
 		}
 
-		$field = '<input type="hidden" name="lang" value="' . esc_attr( (string) $current->slug ) . '" />';
+		$field = '<input type="hidden" name="' . esc_attr( $query_var ) . '" value="' . esc_attr( $this->settings->get_url_prefix( $current ) ) . '" />';
 		$pos   = stripos( $form, '</form>' );
 
 		return $pos === false ? $form . $field : substr_replace( $form, $field, $pos, 0 );
@@ -1369,11 +1452,13 @@ final class UrlConverter {
 
 		$current = $this->router->get_current_language();
 
-		if ( $current === null || strpos( $endpoint, 'lang=' ) !== false ) {
+		$query_var = self::query_var();
+
+		if ( $current === null || strpos( $endpoint, $query_var . '=' ) !== false ) {
 			return $endpoint;
 		}
 
-		return $endpoint . ( strpos( $endpoint, '?' ) !== false ? '&' : '?' ) . 'lang=' . rawurlencode( (string) $current->slug );
+		return $endpoint . ( strpos( $endpoint, '?' ) !== false ? '&' : '?' ) . $query_var . '=' . rawurlencode( $this->settings->get_url_prefix( $current ) );
 	}
 
 	/**
@@ -1392,13 +1477,17 @@ final class UrlConverter {
 	public function repair_query_lang_url( $url ): string {
 		$url = (string) $url;
 
-		if ( $this->settings->get_url_mode() !== 'query' || strpos( $url, '?lang=' ) === false ) {
+		$query_var = self::query_var();
+
+		if ( $this->settings->get_url_mode() !== 'query' || strpos( $url, '?' . $query_var . '=' ) === false ) {
 			return $url;
 		}
 
+		$quoted = preg_quote( $query_var, '#' );
+
 		$url = (string) preg_replace(
-			'#\?lang=([A-Za-z0-9_-]+)(/[^?\#]*)#',
-			'$2?lang=$1',
+			'#\?' . $quoted . '=([A-Za-z0-9_-]+)(/[^?\#]*)#',
+			'$2?' . $query_var . '=$1',
 			$url
 		);
 
@@ -1418,7 +1507,7 @@ final class UrlConverter {
 	public function repair_query_lang_url_html( $html ): string {
 		$html = (string) $html;
 
-		if ( $this->settings->get_url_mode() !== 'query' || strpos( $html, 'lang=' ) === false ) {
+		if ( $this->settings->get_url_mode() !== 'query' || strpos( $html, self::query_var() . '=' ) === false ) {
 			return $html;
 		}
 
@@ -1581,7 +1670,7 @@ final class UrlConverter {
 
 		if ( $query_routed && $query_string !== '' ) {
 			parse_str( $query_string, $query_args );
-			unset( $query_args['lang'] );
+			unset( $query_args[ self::query_var() ] );
 			$query_string = $query_args === [] ? '' : http_build_query( $query_args );
 		}
 
@@ -1592,7 +1681,9 @@ final class UrlConverter {
 		// Query mode: append the target language parameter (default language
 		// stays clean — exactly one canonical variant per language).
 		if ( $query_routed && ! ( $default !== null && $target_slug === $default->slug ) ) {
-			$new_url = add_query_arg( 'lang', $target_slug, $new_url );
+			// Emit the configured prefix form (slug or full locale), not the raw
+			// slug — see the note at the is_default branch above.
+			$new_url = add_query_arg( self::query_var(), $this->settings->get_url_prefix( $target_lang_obj ), $new_url );
 		}
 
 		// Re-add fragment if present.
@@ -2097,10 +2188,10 @@ final class UrlConverter {
 			// Query mode: the object's language rides in ?lang=. The default
 			// language always stays clean (no parameter) so the canonical URL
 			// set has exactly one variant per language.
-			$url = remove_query_arg( 'lang', $url );
+			$url = remove_query_arg( self::query_var(), $url );
 
 			if ( ! ( $default !== null && $language->slug === $default->slug ) ) {
-				$url = add_query_arg( 'lang', $language->slug, $url );
+				$url = add_query_arg( self::query_var(), $this->settings->get_url_prefix( $language ), $url );
 			}
 		} else {
 			// Subdirectory mode - skip prefix for hidden default.
@@ -2690,10 +2781,12 @@ final class UrlConverter {
 		// Terms get the same multi-language slug prime posts have: without
 		// it, every unique rendered term link on a translate-slugs site pays
 		// its own per-(term,language) L3 transient read inside
-		// SlugManager::get_slug. Gated exactly like the post-side prime —
-		// admin screens suppress filter_term_link so priming there is waste,
-		// and both gate reads are memoized (url_config + the repo's
-		// has_any_slugs verdict).
+		// SlugManager::get_slug. Gated like SlugManager::preload_slugs, which
+		// also bails on is_admin(): is_admin() requests still run
+		// filter_term_link, so their term links resolve one (term, language)
+		// at a time through SlugManager::get_slug (in-memory memo, then the
+		// repository's cached read). Both gate reads are memoized (url_config
+		// + the repo's has_any_slugs verdict).
 		if ( ! is_admin()
 			&& $this->url_config()['translate_slugs']
 			&& $this->slug_manager->has_any_slugs() ) {

@@ -29,7 +29,10 @@ final class XliffImporter {
 	 * @param string $xliff_content XLIFF XML string.
 	 * @return array{imported: int, skipped: int, errors: array<string>}
 	 *
-	 * @throws \RuntimeException If XML parsing fails.
+	 * @throws XliffFormatException If the payload is empty, does not parse as XML,
+	 *                             declares XML entities, or carries a `trgLang`
+	 *                             that matches no active language. Callers that
+	 *                             catch `\RuntimeException` still catch it.
 	 */
 	public function import( string $xliff_content ): array {
 		// Empty input: DOMDocument::loadXML() throws a raw ValueError on an
@@ -37,7 +40,7 @@ final class XliffImporter {
 		// below. Reject it up front with the same RuntimeException contract as
 		// every other malformed input so direct callers get a consistent error.
 		if ( trim( $xliff_content ) === '' ) {
-			throw new \RuntimeException(
+			throw new XliffFormatException(
 				esc_html__( 'XLIFF content is empty.', 'perflocale' )
 			);
 		}
@@ -59,7 +62,7 @@ final class XliffImporter {
 
 			$messages = array_map( fn( $e ) => trim( $e->message ), $errors );
 
-			throw new \RuntimeException(
+			throw new XliffFormatException(
 				sprintf(
 					/* translators: %s: Error messages */
 					esc_html__( 'Invalid XLIFF XML: %s', 'perflocale' ),
@@ -76,7 +79,7 @@ final class XliffImporter {
 		// entities. We don't use entities in PerfLocale XLIFF files, so any
 		// presence of them here is a strong signal the upload is hostile.
 		if ( $dom->doctype && $dom->doctype->entities && $dom->doctype->entities->length > 0 ) {
-			throw new \RuntimeException(
+			throw new XliffFormatException(
 				esc_html__( 'XLIFF document declares XML entities and was rejected as unsafe.', 'perflocale' )
 			);
 		}
@@ -94,7 +97,7 @@ final class XliffImporter {
 		$target_slug = $root instanceof \DOMElement ? $this->resolve_language_slug( $root->getAttribute( 'trgLang' ) ) : '';
 
 		if ( $target_slug === '' ) {
-			throw new \RuntimeException(
+			throw new XliffFormatException(
 				esc_html__( 'XLIFF trgLang attribute is missing or does not match any active language; refusing to import (it would otherwise overwrite source content).', 'perflocale' )
 			);
 		}
@@ -104,11 +107,35 @@ final class XliffImporter {
 
 		$units = $dom->getElementsByTagName( 'unit' );
 
+		// XLIFF 2.0 requires a unit id to be unique within its file, but
+		// nothing stops a generator (or a hostile upload) from repeating one.
+		// Applying every repeat means N full wp_update_post() calls - N
+		// revisions, N cache invalidations, N sets of save_post hooks - that
+		// all write the SAME field, and only the last one survives. Resolve
+		// the winner up front and let the loop skip the superseded copies:
+		// the committed result is identical, the cost is one write.
+		$last_occurrence = [];
+		$index           = -1;
+
+		foreach ( $units as $pre_unit ) {
+			++$index;
+			$last_occurrence[ $pre_unit->getAttribute( 'id' ) ] = $index;
+		}
+
+		$index = -1;
+
 		foreach ( $units as $unit ) {
 			/** @var \DOMElement $unit */
+			++$index;
 			$unit_id = $unit->getAttribute( 'id' );
 
 			if ( ! preg_match( '/^post-(\d+)-(title|content|excerpt)$/', $unit_id, $matches ) ) {
+				++$skipped;
+				continue;
+			}
+
+			// A superseded duplicate: counted, never written.
+			if ( ( $last_occurrence[ $unit_id ] ?? $index ) !== $index ) {
 				++$skipped;
 				continue;
 			}

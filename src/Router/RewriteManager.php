@@ -185,9 +185,12 @@ final class RewriteManager {
 			return;
 		}
 
-		// Check if any rewrite value contains our lang query var.
+		// Check if any rewrite value contains our language query var. The
+		// name is filterable (UrlConverter::query_var()), so the scan must
+		// look for whatever filter_rewrite_rules() actually writes.
+		$lang_needle = UrlConverter::query_var() . '=$matches[1]';
 		foreach ( $rules as $pattern => $rewrite ) {
-			if ( str_contains( $rewrite, 'lang=$matches[1]' ) ) {
+			if ( str_contains( $rewrite, $lang_needle ) ) {
 				$this->mark_verified();
 				return; // Rules exist, no flush needed.
 			}
@@ -238,8 +241,10 @@ final class RewriteManager {
 			return;
 		}
 
+		$lang_needle = UrlConverter::query_var() . '=$matches[1]';
+
 		foreach ( $rules as $pattern => $rewrite ) {
-			if ( str_contains( $rewrite, 'lang=$matches[1]' ) ) {
+			if ( str_contains( $rewrite, $lang_needle ) ) {
 				// Rules are present - set a flag so we don't check again.
 				$this->mark_verified();
 				return;
@@ -302,12 +307,17 @@ final class RewriteManager {
 
 		$new_rules = [];
 
+		// Filterable query-var name, so renaming it keeps rewrite rules,
+		// add_query_vars() and the URL writer in agreement. Renaming on a
+		// live site needs a permalink flush, as the rules are stored.
+		$lang_qv = UrlConverter::query_var() . '=$matches[1]';
+
 		// Add root language page rule.
-		$new_rules[ $lang_regex . '/?$' ] = 'index.php?lang=$matches[1]';
+		$new_rules[ $lang_regex . '/?$' ] = 'index.php?' . $lang_qv;
 
 		// Add feed rule for language root.
 		$new_rules[ $lang_regex . '/feed/(feed|rdf|rss|rss2|atom)/?$' ] =
-			'index.php?lang=$matches[1]&feed=$matches[2]';
+			'index.php?' . $lang_qv . '&feed=$matches[2]';
 
 		// Prefix each existing rule with the language segment.
 		foreach ( $rules as $pattern => $rewrite ) {
@@ -330,8 +340,8 @@ final class RewriteManager {
 				continue;
 			}
 
-			// Add lang= parameter.
-			$new_rewrite = str_replace( 'index.php?', 'index.php?lang=$matches[1]&', $new_rewrite );
+			// Add the language parameter.
+			$new_rewrite = str_replace( 'index.php?', 'index.php?' . $lang_qv . '&', $new_rewrite );
 
 			// Some third-party rules (WooCommerce wc-auth/wc-api among them)
 			// anchor their pattern with a leading ^. Prepending the language

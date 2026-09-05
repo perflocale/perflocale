@@ -456,6 +456,91 @@ final class ExchangeRateSync {
 	}
 
 	/**
+	 * Preserve previously-synced rates the current reply did not cover.
+	 *
+	 * RATES_OPTION is written wholesale, so before this a provider reply that
+	 * omitted a currency deleted that currency's rate: MultiCurrency reads it
+	 * with `isset()`, so the language silently fell back to an unconverted 1.0
+	 * price. Partial replies are ordinary — a free-tier plan, a per-symbol quota,
+	 * a currency temporarily unquoted — so the omission has to mean "unchanged",
+	 * not "gone".
+	 *
+	 * A carried rate is only kept when it is still provably meaningful:
+	 *
+	 *   - the store's BASE currency has not changed since that rate was fetched
+	 *     (every stored rate is relative to the base, so a base change makes the
+	 *     whole set meaningless at once);
+	 *   - the language is still configured for a non-base currency;
+	 *   - it is still configured for the SAME currency the rate was fetched for,
+	 *     proven against the `codes` map written beside the rates;
+	 *   - the stored value is a usable positive number.
+	 *
+	 * Fails safe: before the first sync that writes `codes` the map is absent, so
+	 * nothing is carried and behaviour is exactly what it was.
+	 *
+	 * Cost is one `get_option()` on each of two autoload=false rows, on the sync
+	 * tick only. Nothing here runs on a page request, and the shape written to
+	 * RATES_OPTION is unchanged, so the front-end read path is untouched.
+	 *
+	 * @param array<string, float> $fresh          Rates resolved from this reply.
+	 * @param array<string, mixed> $currencies     Per-language currency config.
+	 * @param string               $base_currency  Store base currency.
+	 * @return array<string, float> Fresh rates, plus any still-valid carried ones.
+	 */
+	private function carry_forward_rates( array $fresh, array $currencies, string $base_currency ): array {
+		$last = (array) get_option( self::LAST_SYNC_OPTION, [] );
+
+		// Base changed (or was never recorded) — discard the lot rather than
+		// mixing two bases in one map, which would misprice silently.
+		if ( (string) ( $last['base'] ?? '' ) !== $base_currency ) {
+			return $fresh;
+		}
+
+		$previous = (array) get_option( self::RATES_OPTION, [] );
+
+		if ( $previous === [] ) {
+			return $fresh;
+		}
+
+		$previous_codes = (array) ( $last['codes'] ?? [] );
+		$carried        = [];
+
+		foreach ( $previous as $slug => $rate ) {
+			$slug = (string) $slug;
+
+			// This reply covered it; the fresh value wins.
+			if ( isset( $fresh[ $slug ] ) ) {
+				continue;
+			}
+
+			$code = (string) ( $currencies[ $slug ]['currency_code'] ?? '' );
+
+			// Language removed, or now priced in the base currency: sync skips
+			// base-currency codes entirely, so a rate here would be stale.
+			if ( $code === '' || $code === $base_currency ) {
+				continue;
+			}
+
+			// Repointed at a different currency since that rate was fetched —
+			// carrying it would price the language with another currency's rate.
+			if ( ! isset( $previous_codes[ $slug ] ) || (string) $previous_codes[ $slug ] !== $code ) {
+				continue;
+			}
+
+			if ( ! is_numeric( $rate ) || (float) $rate <= 0 ) {
+				continue;
+			}
+
+			$carried[ $slug ] = (float) $rate;
+		}
+
+		// Union, NOT array_merge(): array_merge renumbers integer-like keys, and
+		// a language slug can be integer-like, which would hand one language's
+		// rate to another. `+` keeps keys and lets the left side (fresh) win.
+		return $fresh + $carried;
+	}
+
+	/**
 	 * Body of sync_rates(), executed under the `exchange_rate_sync`
 	 * lock so two concurrent ticks can't double-hit the provider.
 	 *
@@ -607,9 +692,12 @@ final class ExchangeRateSync {
 			return [];
 		}
 
-		// Successful fetch — reset any accumulated failure counter so a
-		// past hiccup doesn't take us halfway to OPEN forever.
-		\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
+		// NOTE: the breaker is NOT reset here. A non-empty $rates only means the
+		// transport worked; the payload can still be entirely unusable, and the
+		// validation loop below is what decides that. Recording success here
+		// zeroed the failure streak on every reply, so a provider returning
+		// well-formed garbage forever kept the breaker one step from OPEN and it
+		// never tripped. record_success() now runs after validation.
 
 		// Build the overrides map directly from the language configuration
 		// and the freshly fetched rates. No mutation of $currencies - that
@@ -681,12 +769,37 @@ final class ExchangeRateSync {
 			return [];
 		}
 
+		// Validation is past: either usable rates came back, or there was
+		// genuinely nothing to validate (no non-base target currencies). Only
+		// now does the run count as a success and reset the failure streak.
+		\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
+
 		if ( ! empty( $rate_overrides ) ) {
+			// A provider reply that omits some currencies used to WIPE them:
+			// this option was overwritten wholesale, so a language whose code
+			// was missing from one response silently lost its rate and fell
+			// back to 1.0 — every price in that language shown unconverted.
+			// Carry the untouched ones forward instead.
+			$rate_overrides = $this->carry_forward_rates( $rate_overrides, $currencies, $base_currency );
+
 			// Persist machine-fetched rates to a dedicated option (autoload
 			// off - only loaded when WooCommerce needs currency conversion).
 			// This isolates cron/manual-sync writes from concurrent writes to
 			// the shared settings blob, eliminating the prior race condition.
 			update_option( self::RATES_OPTION, $rate_overrides, false );
+
+			// Which currency each slug's rate was fetched FOR. carry_forward_rates()
+			// refuses to carry a rate whose language has since been repointed at a
+			// different currency, and without this map it could not tell.
+			$synced_codes = [];
+
+			foreach ( $currencies as $code_slug => $code_config ) {
+				$code_for_slug = (string) ( $code_config['currency_code'] ?? '' );
+
+				if ( $code_for_slug !== '' ) {
+					$synced_codes[ (string) $code_slug ] = $code_for_slug;
+				}
+			}
 
 			// Store last sync metadata.
 			update_option(
@@ -696,6 +809,7 @@ final class ExchangeRateSync {
 					'provider'  => $provider_id,
 					'rates'     => $rates,
 					'base'      => $base_currency,
+					'codes'     => $synced_codes,
 				],
 				false
 			);

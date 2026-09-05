@@ -34,8 +34,11 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * @internal Implementation detail of the WC settings UI. Not part of
  *           the @api surface — content of the map may shift as the
- *           ISO currency assignments do (e.g. Croatia adopted EUR in
- *           2023; Latvia 2014; Estonia 2011).
+ *           ISO currency assignments do (e.g. Bulgaria adopted EUR on
+ *           2026-01-01; Croatia 2023; Latvia 2014; Estonia 2011). Only
+ *           the SUGGESTION for a language with no saved currency moves:
+ *           a merchant's stored wc_currencies row always wins, so a
+ *           store still trading in BGN is never rewritten.
  */
 final class LocaleCurrency {
 
@@ -43,7 +46,7 @@ final class LocaleCurrency {
 	 * ISO 3166-1 alpha-2 country code → ISO 4217 alpha-3 currency code.
 	 *
 	 * Coverage prioritises:
-	 *   • All 20 EUR-using EU member states + non-EU EUR users
+	 *   • All 21 EUR-using EU member states + non-EU EUR users
 	 *     (Andorra, Monaco, San Marino, Vatican, Montenegro, Kosovo)
 	 *   • All G20 economies
 	 *   • Top 50 countries by population
@@ -61,6 +64,7 @@ final class LocaleCurrency {
 		'AD' => 'EUR',
 		'AT' => 'EUR',
 		'BE' => 'EUR',
+		'BG' => 'EUR',
 		'CY' => 'EUR',
 		'DE' => 'EUR',
 		'EE' => 'EUR',
@@ -88,7 +92,6 @@ final class LocaleCurrency {
 		// Non-Eurozone Europe.
 		'AL' => 'ALL',
 		'BA' => 'BAM',
-		'BG' => 'BGN',
 		'BY' => 'BYN',
 		'CH' => 'CHF',
 		'CZ' => 'CZK',

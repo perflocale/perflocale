@@ -93,6 +93,26 @@ final class JobLock {
 	private static array $owned = [];
 
 	/**
+	 * Keys whose lease this process HELD and provably LOST — a conditional
+	 * refresh matched zero rows and the re-read showed a different value.
+	 *
+	 * {@see $owned} answers "do I hold it?". This answers "did I hold it and
+	 * lose it?", which is the distinction {@see refresh()} and {@see release()}
+	 * need. Without it, clearing $owned on a lost refresh made a stale worker
+	 * look identical to one that never acquired in this request, so its next
+	 * heartbeat took the ownerless best-effort-overwrite path and stamped a NEW
+	 * token over the takeover winner's lease, and its `finally` release took the
+	 * forced-delete path and removed that lease outright — either way two
+	 * workers could then run the same job, or the same job type.
+	 *
+	 * Cleared by {@see cas_acquire()} on a successful (re)acquire and by
+	 * {@see release()}. Same blog-namespaced keys as {@see $owned}.
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $lost = [];
+
+	/**
 	 * Build the per-blog static key for the {@see $owned} map.
 	 *
 	 * @param string $key Lock option name (already prefixed).
@@ -156,6 +176,16 @@ final class JobLock {
 		$key         = self::PREFIX . $job_id;
 		$owned_key   = self::owned_key( $key );
 		$owned_value = self::$owned[ $owned_key ] ?? null;
+
+		if ( $owned_value === null && isset( self::$lost[ $owned_key ] ) ) {
+			// We DID hold this lease and provably lost it: an earlier refresh
+			// found another worker's value in the row. The ownerless best-effort
+			// overwrite below is only ever correct for "never acquired in THIS
+			// request"; here it would stamp a fresh token over the CURRENT
+			// owner's lease and hand exclusivity to two workers at once. Stay
+			// out and let the new owner keep its lock.
+			return;
+		}
 
 		if ( $owned_value === null ) {
 			// Refresh called without a prior acquire in THIS request — most
@@ -227,6 +257,11 @@ final class JobLock {
 		JobState::append_log( $job_id, __( 'Lock refresh lost — another worker took over after the lock TTL expired.', 'perflocale' ) );
 
 		unset( self::$owned[ $owned_key ] );
+		// Record that ownership was LOST, not merely absent. Clearing $owned
+		// alone made this state look like "never acquired here", which is what
+		// let the next refresh() overwrite and the finally-release() delete the
+		// new owner's lease. Cleared again by cas_acquire() / release().
+		self::$lost[ $owned_key ] = true;
 	}
 
 	/**
@@ -274,7 +309,20 @@ final class JobLock {
 		$key         = self::PREFIX . $job_id;
 		$owned_key   = self::owned_key( $key );
 		$owned_value = self::$owned[ $owned_key ] ?? null;
-		unset( self::$owned[ $owned_key ] );
+		$was_lost    = isset( self::$lost[ $owned_key ] );
+		unset( self::$owned[ $owned_key ], self::$lost[ $owned_key ] );
+
+		if ( $owned_value === null && $was_lost ) {
+			// This worker held the lease, lost it to a takeover, and is now
+			// unwinding through WorkerRegistry's `finally`. The forced delete
+			// below is safe for a caller that NEVER owned the lock — the key is
+			// namespaced to this job id, so nothing else can be holding it — but
+			// here the ROW is somebody else's LIVE lease, and deleting it lets a
+			// third worker enter a job that is actively running. Operator cancel
+			// from REST/CLI is unaffected: it never refreshed, so it never
+			// recorded a loss and still takes the forced path.
+			return;
+		}
 
 		// Cross-request release (REST/CLI cancel) legitimately has no
 		// $owned_value — the lock was stamped by the worker's request, whose
@@ -393,6 +441,9 @@ final class JobLock {
 			wp_cache_delete( $key, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
 			self::$owned[ self::owned_key( $key ) ] = $value;
+			// A fresh acquire re-establishes ownership, so any recorded
+			// lost-ownership state for this key is obsolete.
+			unset( self::$lost[ self::owned_key( $key ) ] );
 			return true;
 		}
 
@@ -425,6 +476,9 @@ final class JobLock {
 		wp_cache_delete( 'notoptions', 'options' );
 
 		self::$owned[ self::owned_key( $key ) ] = $value;
+		// A successful CAS reclaim re-establishes ownership, so any recorded
+		// lost-ownership state for this key is obsolete.
+		unset( self::$lost[ self::owned_key( $key ) ] );
 		return true;
 	}
 
@@ -450,6 +504,14 @@ final class JobLock {
 		$key         = self::TYPE_PREFIX . $type;
 		$owned_key   = self::owned_key( $key );
 		$owned_value = self::$owned[ $owned_key ] ?? null;
+
+		if ( $owned_value === null && isset( self::$lost[ $owned_key ] ) ) {
+			// Provably lost the TYPE lock (same reasoning as refresh()): the
+			// ownerless overwrite below would stamp our token over the worker
+			// that now holds it and break the max_concurrent=1 guarantee for
+			// this whole job type.
+			return;
+		}
 
 		if ( $owned_value === null ) {
 			// No prior acquire in this request (static reset between AS
@@ -498,8 +560,10 @@ final class JobLock {
 		}
 
 		// Lost ownership of the type lock — drop our stale record so we don't
-		// keep trying to refresh a lock a different worker now owns.
+		// keep trying to refresh a lock a different worker now owns, and mark it
+		// LOST so the ownerless overwrite above stays disabled for this key.
 		unset( self::$owned[ $owned_key ] );
+		self::$lost[ $owned_key ] = true;
 	}
 
 	/**

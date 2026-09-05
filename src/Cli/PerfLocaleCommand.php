@@ -388,8 +388,8 @@ final class PerfLocaleCommand {
 	 * : Estimate characters/cost for the selection; nothing is translated.
 	 *
 	 * [--async]
-	 * : With --all: dispatch the chunked background chain instead of looping
-	 * : in-process. Track under PerfLocale → Jobs.
+	 * : With --all, dispatch the chunked background chain instead of looping
+	 * in-process. Track it under PerfLocale → Jobs.
 	 *
 	 * [--include-meta]
 	 * : Also machine-translate registered meta fields (SEO titles etc.).
@@ -1110,6 +1110,21 @@ final class PerfLocaleCommand {
 			foreach ( $result['errors'] as $error ) {
 				\WP_CLI::warning( $error );
 			}
+
+			// Exit non-zero. `errors` only ever carries REAL failures - a
+			// rejected file, a data-quality refusal, or a row the database
+			// returned an error for; ordinary duplicate-key merge skips
+			// never land here. A restore script that reads only the exit
+			// code must not read "Success:" after an import that changed
+			// nothing, or it will tick the restore off as done.
+			\WP_CLI::error(
+				sprintf(
+					'Import finished with %d error(s). Imported: %d, Skipped: %d.',
+					count( $result['errors'] ),
+					$result['imported'],
+					$result['skipped']
+				)
+			);
 		}
 
 		\WP_CLI::success(
@@ -1460,6 +1475,14 @@ final class PerfLocaleCommand {
 			}
 		}
 
+		if ( $total_errors > 0 ) {
+			// Per-site slices that were deliberately skipped (missing blog,
+			// absent `export` key) are logged as warnings and are NOT counted
+			// in $total_errors - only real per-row import failures are, so a
+			// non-zero count always means data did not land.
+			\WP_CLI::error( "Network import finished with {$total_errors} error(s). Imported across sites: {$total_imported}." );
+		}
+
 		\WP_CLI::success( "Network import done. Imported across sites: {$total_imported}; total errors: {$total_errors}." );
 	}
 
@@ -1560,6 +1583,19 @@ final class PerfLocaleCommand {
 
 		foreach ( $result['errors'] as $err ) {
 			\WP_CLI::warning( $err );
+		}
+
+		// Same automation contract as `wp perflocale import`: a malformed or
+		// unreadable PO that changed nothing must not exit 0.
+		if ( ! empty( $result['errors'] ) ) {
+			\WP_CLI::error(
+				sprintf(
+					'PO import finished with %d error(s). Imported: %d, Skipped: %d.',
+					count( $result['errors'] ),
+					$result['imported'],
+					$result['skipped']
+				)
+			);
 		}
 
 		\WP_CLI::success(
@@ -1970,7 +2006,13 @@ final class PerfLocaleCommand {
 		\WP_CLI::log( '' );
 
 		if ( $issues === 0 ) {
-			\WP_CLI::success( 'All checks passed. Database is healthy.' );
+			// Name what was checked rather than certifying the database. These
+			// are six specific orphan/duplicate invariants; other semantic
+			// relationships (a link whose stored type disagrees with its
+			// group's, say) are enforced by the repositories on write and are
+			// not re-verified here, so "the database is healthy" claims more
+			// than the command actually established.
+			\WP_CLI::success( 'All six orphan and duplicate checks passed.' );
 		} elseif ( $fix ) {
 			// The repair steps above issue direct $wpdb DELETEs that bypass the
 			// repository's invalidation, so without an explicit flush the

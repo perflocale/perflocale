@@ -547,7 +547,20 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 			if ( $translated_id && $translated_id !== (int) $link['id'] ) {
 				$translated_post = get_post( $translated_id );
 
-				if ( $translated_post instanceof \WP_Post ) {
+				// Only a publicly viewable sibling may be swapped in. The
+				// wpseo_breadcrumb_links registration in boot() is not gated on
+				// the visible-breadcrumb setting, so Yoast emits the
+				// BreadcrumbList JSON-LD either way: a draft, pending, private
+				// or trashed translation would put its title in front of
+				// anonymous visitors and link to a URL they cannot open. And
+				// PerfLocale creates every translation as a DRAFT, so that is
+				// the normal state of half-finished work, not an edge case -
+				// the same rule the ACF, Meta Box, Pods and WooCommerce addons
+				// already apply to reference fields. Leaving the crumb
+				// untouched keeps Yoast's own source crumb, exactly as when no
+				// sibling exists at all. get_post() above has already primed
+				// the cache, so the check costs no query.
+				if ( $translated_post instanceof \WP_Post && $this->is_publicly_viewable_translation( $translated_id ) ) {
 					$link['text'] = $translated_post->post_title;
 					$link['url']  = get_permalink( $translated_id );
 					$link['id']   = $translated_id;
@@ -558,6 +571,34 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 		unset( $link );
 
 		return $links;
+	}
+
+	/**
+	 * Whether a translated post may be shown to the current visitor.
+	 *
+	 * Breadcrumbs resolve on the front end and Yoast emits the BreadcrumbList
+	 * JSON-LD whether or not the visible trail is rendered, so swapping in a
+	 * draft, pending or private sibling would publish unfinished content and
+	 * point at a URL the visitor cannot open. Same rule and same shape as
+	 * PerfLocaleAcf::is_publicly_viewable_translation() and the Meta Box / Pods
+	 * equivalents: core's own visibility rule (WP 5.7+) with a status fallback
+	 * for older cores.
+	 *
+	 * @param int $post_id Translated post ID.
+	 * @return bool
+	 */
+	private function is_publicly_viewable_translation( int $post_id ): bool {
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		if ( function_exists( 'is_post_publicly_viewable' ) ) {
+			return (bool) is_post_publicly_viewable( $post_id );
+		}
+
+		$status = get_post_status( $post_id );
+
+		return is_string( $status ) && in_array( $status, get_post_stati( [ 'public' => true ] ), true );
 	}
 
 	/**
