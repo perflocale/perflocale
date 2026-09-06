@@ -553,7 +553,13 @@ final class JobState {
 
 		$entry = [
 			't' => time(),
-			'm' => substr( $message, 0, 500 ),
+			// mb_substr, matching the 500-character contract in the docblock and
+			// truncate_error()'s own convention. A byte cut split the last
+			// multibyte character, and wp_json_encode() then either replaced it
+			// with U+FFFD after losing two thirds of the documented length or,
+			// on a host without ext-mbstring, fell through to iconv() which
+			// returns false on PHP 8 and dropped the message entirely.
+			'm' => mb_substr( $message, 0, 500 ),
 		];
 
 		for ( $attempt = 0; $attempt < self::CAS_MAX_RETRIES; $attempt++ ) {

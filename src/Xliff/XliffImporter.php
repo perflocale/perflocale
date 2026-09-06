@@ -33,6 +33,10 @@ final class XliffImporter {
 	 *                             declares XML entities, or carries a `trgLang`
 	 *                             that matches no active language. Callers that
 	 *                             catch `\RuntimeException` still catch it.
+	 * @throws \RuntimeException   If PHP was built without ext-dom or ext-libxml.
+	 *                             Distinct from the above on purpose: that one is
+	 *                             the client's fault (4xx), this one is the
+	 *                             server's (5xx).
 	 */
 	public function import( string $xliff_content ): array {
 		// Empty input: DOMDocument::loadXML() throws a raw ValueError on an
@@ -42,6 +46,20 @@ final class XliffImporter {
 		if ( trim( $xliff_content ) === '' ) {
 			throw new XliffFormatException(
 				esc_html__( 'XLIFF content is empty.', 'perflocale' )
+			);
+		}
+
+		// ext-dom (and the ext-libxml functions it rides on) can be absent on a
+		// stripped PHP build. Both are used unconditionally two lines down, so
+		// without this guard the very next call raises an Error naming an
+		// internal PHP class - which the REST controller reports as a 500 whose
+		// message is "Class \"DOMDocument\" not found". Fail here instead with a
+		// sentence that names the real remedy. \RuntimeException, not
+		// XliffFormatException: the upload is fine, the server is missing a
+		// part, so this must stay a 5xx rather than blaming the client.
+		if ( ! class_exists( '\DOMDocument' ) || ! function_exists( 'libxml_use_internal_errors' ) ) {
+			throw new \RuntimeException(
+				esc_html__( 'XLIFF import needs the PHP dom and libxml extensions, which are not installed on this server. Ask your host to enable the php-xml package.', 'perflocale' )
 			);
 		}
 
@@ -123,6 +141,66 @@ final class XliffImporter {
 		}
 
 		$index = -1;
+
+		// Per-target write buffer. One target post's validated, sanitised,
+		// UNSLASHED fields are held here until the loop reaches a different
+		// target (or ends), then written with ONE wp_update_post(). A post's
+		// title, content and excerpt used to cost a full save cycle each — one
+		// revision, one save_post chain, one sibling fan-out per FIELD — for a
+		// row that ends up identical either way.
+		//
+		// Locals and a closure, never properties: this is per-import state, and
+		// a property would survive a switch_to_blog() between imports.
+		/** @var int|null $pending_id Target post the buffer is holding, if any. */
+		$pending_id = null;
+		/** @var array{post_title?: string, post_content?: string, post_excerpt?: string} $pending_fields Unslashed, sanitised field values. */
+		$pending_fields = [];
+		/** @var array<int, string> $pending_units Unit ids held for that post. */
+		$pending_units = [];
+
+		/**
+		 * Write the held target post, if any, and account for every unit in it.
+		 *
+		 * Exactly one wp_slash() over the merged array, immediately before
+		 * exactly one wp_update_post(): DOM textContent is unslashed, and
+		 * wp_update_post() unslashes internally. A second slash doubles every
+		 * backslash; a missing one eats it.
+		 */
+		$flush = function () use ( &$pending_id, &$pending_fields, &$pending_units, &$imported, &$errors ): void {
+			if ( $pending_id === null ) {
+				return;
+			}
+
+			$held_id     = $pending_id;
+			$held_fields = $pending_fields;
+			$held_units  = $pending_units;
+
+			// Cleared BEFORE the write, so a throw out of a save hook cannot
+			// leave a stale buffer for a later flush to write twice.
+			$pending_id     = null;
+			$pending_fields = [];
+			$pending_units  = [];
+
+			$postarr       = $held_fields;
+			$postarr['ID'] = $held_id;
+
+			$result = wp_update_post( wp_slash( $postarr ), true );
+
+			if ( is_wp_error( $result ) ) {
+				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+					error_log( sprintf( 'PerfLocale XLIFF import: failed to update post %d (%s): %s', $held_id, implode( ', ', $held_units ), $result->get_error_message() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				}
+
+				// One entry per held unit: a batched write must not collapse
+				// several unit failures into a single reported error.
+				foreach ( $held_units as $ignored_unit_id ) {
+					unset( $ignored_unit_id );
+					$errors[] = __( 'Failed to import a translation unit.', 'perflocale' );
+				}
+			} else {
+				$imported += count( $held_units );
+			}
+		};
 
 		foreach ( $units as $unit ) {
 			/** @var \DOMElement $unit */
@@ -219,6 +297,12 @@ final class XliffImporter {
 			$target_id = $manager->get_translation_id( $post_id, $target_slug );
 
 			if ( ! $target_id ) {
+				// create_translation() copies the SOURCE row. On an import whose
+				// target language IS the site default, that source can be a post
+				// this loop is still holding unwritten fields for, so commit
+				// before it reads.
+				$flush();
+
 				$created = $manager->create_translation( $post_id, $target_slug, true );
 
 				if ( $created === false ) {
@@ -227,6 +311,11 @@ final class XliffImporter {
 				}
 
 				$target_id = (int) $created;
+			}
+
+			// A different target ends the previous one's batch.
+			if ( $pending_id !== null && $pending_id !== (int) $target_id ) {
+				$flush();
 			}
 
 			// Permission is checked on the TARGET post being written.
@@ -260,22 +349,17 @@ final class XliffImporter {
 					break;
 			}
 
-			// $wp_error=true: without this, wp_update_post returns integer 0
-			// on failure (never WP_Error), so the is_wp_error branch below was
-			// unreachable and every failed update silently counted as success.
-			// wp_slash: DOM textContent is unslashed; wp_update_post() unslashes
-			// internally, so backslash-bearing translations would be corrupted.
-			$result = wp_update_post( wp_slash( $update_data ), true );
-
-			if ( is_wp_error( $result ) ) {
-				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					error_log( sprintf( 'PerfLocale XLIFF import: failed to update post %d (%s): %s', $post_id, $field, $result->get_error_message() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				}
-				$errors[] = __( 'Failed to import a translation unit.', 'perflocale' );
-			} else {
-				++$imported;
-			}
+			// Buffered, not written: a later unit for the same target merges into
+			// the same array so the whole post lands in one wp_update_post().
+			// A repeated field for one target overwrites, which matches the
+			// last-wins rule the pre-pass above already applies to unit ids.
+			$pending_id      = (int) $target_id;
+			$pending_fields  = array_merge( $pending_fields, $update_data );
+			$pending_units[] = $unit_id;
 		}
+
+		// Commit the final target.
+		$flush();
 
 		return [
 			'imported' => $imported,

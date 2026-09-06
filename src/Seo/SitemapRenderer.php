@@ -42,6 +42,14 @@ final class SitemapRenderer extends \WP_Sitemaps_Renderer {
 	 * @return string XML body.
 	 */
 	public function get_sitemap_xml( $url_list ): string {
+		// No class_exists( 'SimpleXMLElement' ) guard here, deliberately.
+		// This method is only ever reached through the inherited
+		// WP_Sitemaps_Renderer::render_sitemap(), which calls its private
+		// check_for_simple_xml_availability() first and wp_die()s with an XML
+		// error document when the extension is absent. We do not override
+		// render_sitemap(), so on a SimpleXML-less host the request stops in
+		// core before it can dispatch here. Adding a second guard would be
+		// dead code that can never run.
 		$urlset = new \SimpleXMLElement(
 			sprintf(
 				'%1$s%2$s%3$s',

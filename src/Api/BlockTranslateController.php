@@ -294,10 +294,17 @@ final class BlockTranslateController extends RestController {
 				);
 			}
 
+			// mb_strlen, not strlen: every message below says "characters", and
+			// every other cap in the plugin (TranslationService, MetaTranslator,
+			// all four providers) is character-based. Counting bytes made the
+			// real limit 16,666 characters for Japanese, Chinese, Korean and
+			// Thai and 25,000 for Arabic, Hebrew and Russian, while telling the
+			// operator it was 50,000. Core polyfills mb_strlen at every
+			// supported version, so this needs no extension.
 			$total_chars = 0;
 
 			foreach ( $texts as $i => $t ) {
-				if ( strlen( $t ) > self::MAX_INPUT_LENGTH ) {
+				if ( mb_strlen( $t ) > self::MAX_INPUT_LENGTH ) {
 					return $this->error(
 						'text_too_long',
 						sprintf(
@@ -309,7 +316,7 @@ final class BlockTranslateController extends RestController {
 						413
 					);
 				}
-				$total_chars += strlen( $t );
+				$total_chars += mb_strlen( $t );
 			}
 
 			// Batch sum cap = 4× single cap. Conservative enough that one
@@ -335,7 +342,7 @@ final class BlockTranslateController extends RestController {
 				return $this->error( 'empty_text', __( 'Text to translate is empty.', 'perflocale' ) );
 			}
 
-			if ( strlen( $text ) > self::MAX_INPUT_LENGTH ) {
+			if ( mb_strlen( $text ) > self::MAX_INPUT_LENGTH ) {
 				return $this->error(
 					'text_too_long',
 					sprintf(
@@ -711,7 +718,7 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'empty_source_text', __( 'The corresponding source block has no text to translate.', 'perflocale' ), 422 );
 		}
 
-		if ( strlen( $source_text ) > self::MAX_INPUT_LENGTH ) {
+		if ( mb_strlen( $source_text ) > self::MAX_INPUT_LENGTH ) {
 			return $this->error(
 				'text_too_long',
 				sprintf(

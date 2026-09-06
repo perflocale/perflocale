@@ -157,6 +157,11 @@ final class SettingsPage {
 				<div class="notice notice-success is-dismissible">
 					<p><?php echo esc_html__( 'Settings saved successfully.', 'perflocale' ); ?></p>
 				</div>
+			<?php elseif ( $message === 'false' ) : ?>
+				<?php // A save that wpdb refused. It reported success before this existed. ?>
+				<div class="notice notice-error is-dismissible">
+					<p><?php echo esc_html__( 'Settings could not be saved. The database refused the write, which usually means one value is too long for its column or contains characters it cannot store. Your previous settings are unchanged.', 'perflocale' ); ?></p>
+				</div>
 			<?php endif; ?>
 
 			<?php
@@ -544,7 +549,13 @@ final class SettingsPage {
 					// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized, WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- keys sanitize_key'd and each value sanitized + host-normalized inside the closure above.
 					} )( (array) $_POST['language_domains'] )
 					: [],
-				'redirect_edge_hint_enabled' => isset( $_POST['redirect_edge_hint_enabled'] ),
+				// Rendered only inside `if ( edge_integration_enabled() )`, so on a
+				// save with the edge worker off the checkbox was never printed and
+				// isset() reads false — clearing a setting the operator could not
+				// see. Mirror the renderer's gate and keep the stored value.
+				'redirect_edge_hint_enabled' => $this->settings->edge_integration_enabled()
+					? isset( $_POST['redirect_edge_hint_enabled'] )
+					: (bool) $this->settings->get( 'redirect_edge_hint_enabled' ),
 				// Redirect-priority chip order. Sanitisation also lives in
 				// Settings::get_redirect_priority_order() (drops unknowns,
 				// dedupes, backfills missing methods) so this can stay simple.
@@ -561,7 +572,17 @@ final class SettingsPage {
 				'translate_slugs'            => isset( $_POST['translate_slugs'] ),
 				'sync_term_hierarchy'        => isset( $_POST['sync_term_hierarchy'] ),
 			],
-			'machine-translation' => $values = [
+			// The renderer returns early when machine translation is OFF
+			// (render_machine_translation_tab), so the enabling save posts
+			// ONLY mt_enabled — every other control below was never printed.
+			// Extracting them anyway turned "not rendered" into "operator
+			// cleared it": mt_auto_translate_languages in particular became
+			// the explicit no-language scope, so auto-translate silently did
+			// nothing after being switched on. Mirror the renderer's own gate
+			// and read the flag as it is STORED, before Settings::update()
+			// runs (AdminController::on_admin_init extracts at :242 and
+			// updates at :245).
+			'machine-translation' => $values = $this->settings->mt_enabled() ? [
 				'mt_enabled'                   => isset( $_POST['mt_enabled'] ),
 				'mt_provider'                  => isset( $_POST['mt_provider'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_provider'] ) ) : '',
 				'mt_deepl_api_key'             => isset( $_POST['mt_deepl_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_deepl_api_key'] ) ) : '',
@@ -608,6 +629,9 @@ final class SettingsPage {
 				'mt_auto_translate_on_create'  => isset( $_POST['mt_auto_translate_on_create'] ),
 				'mt_monthly_char_limit'        => isset( $_POST['mt_monthly_char_limit'] ) ? absint( $_POST['mt_monthly_char_limit'] ) : 500000,
 				'mt_bulk_strings_enabled'      => isset( $_POST['mt_bulk_strings_enabled'] ),
+				'mt_meta_custom_fields'        => isset( $_POST['mt_meta_custom_fields'] ),
+			] : [
+				'mt_enabled' => isset( $_POST['mt_enabled'] ),
 			],
 			'seo' => $values                 = [
 				'seo_hreflang_enabled'           => isset( $_POST['seo_hreflang_enabled'] ),
@@ -664,9 +688,14 @@ final class SettingsPage {
 				'background_processing'   => isset( $_POST['background_processing'] ) && in_array( $_POST['background_processing'], [ 'auto', 'always', 'never' ], true )
 					? sanitize_key( wp_unslash( $_POST['background_processing'] ) )
 					: 'auto',
-				'background_engine'       => isset( $_POST['background_engine'] ) && in_array( $_POST['background_engine'], [ 'auto', 'force_wp_cron' ], true )
-					? sanitize_key( wp_unslash( $_POST['background_engine'] ) )
-					: 'auto',
+				// The radio renders only when Action Scheduler is loaded, so a
+				// Performance save on a site without it never posts the field and
+				// the fallback below would silently reset the operator's choice.
+				'background_engine'       => ! \PerfLocale\Background\JobRunnerFactory::action_scheduler_available()
+					? (string) $this->settings->get( 'background_engine', 'auto' )
+					: ( isset( $_POST['background_engine'] ) && in_array( $_POST['background_engine'], [ 'auto', 'force_wp_cron' ], true )
+						? sanitize_key( wp_unslash( $_POST['background_engine'] ) )
+						: 'auto' ),
 				// Per-job threshold overrides. Whitelist keys against the
 				// registered job types (self::background_job_types()) so an
 				// attacker can't POST arbitrary keys that would persist via
@@ -722,13 +751,14 @@ final class SettingsPage {
 	private function get_addon_subtabs(): array {
 		$subtabs = [];
 
-		// Built-in feature subtabs — only listed when the underlying
-		// feature flag is on. The Addons listing page's per-card
-		// Enable/Disable button writes to these same flags, so this
-		// keeps the Settings nav in sync with the listing-page status.
-		if ( (bool) $this->settings->get( 'mt_enabled', false ) ) {
-			$subtabs['machine-translation'] = __( 'Machine Translation', 'perflocale' );
-		}
+		// Machine Translation is ALWAYS listed, on or off. Its own
+		// enable checkbox lives inside this subtab, so gating the subtab
+		// on mt_enabled made the feature unreachable: the tab was hidden
+		// until the flag was set, and the only control that sets the flag
+		// was inside the hidden tab. The nav still shows the on/off state
+		// beside the label (see $statuses below), which is what the
+		// listing-page sync was actually for.
+		$subtabs['machine-translation'] = __( 'Machine Translation', 'perflocale' );
 
 		// WooCommerce subtab — needs the WC plugin active AND the
 		// WooCommerce addon not in the operator-controlled disabled
@@ -836,10 +866,11 @@ final class SettingsPage {
 			$subtab = array_key_first( $subtabs );
 		}
 
-		// Nothing to configure. This is the DEFAULT state of a fresh install —
-		// Machine Translation is off until enabled, WooCommerce may not be
-		// installed, and no third-party addon has registered editable fields —
-		// so it is the first thing many people see when they click "Addons".
+		// Nothing to configure. This is NO LONGER the default state: since
+		// Machine Translation is listed unconditionally, get_addon_subtabs()
+		// always returns at least one entry, so this branch is now reachable
+		// only when a filter empties the list. It stays because that filter is
+		// public, and because admin-render.php drives exactly this path.
 		// It used to fall through to the form below with $subtab = null, which
 		// rendered an empty nav, an empty table and a lone "Save Changes"
 		// button that saved nothing: a blank screen with no explanation.
@@ -2074,7 +2105,7 @@ final class SettingsPage {
 				<p class="description" style="margin-top:6px;">
 					<a href="https://perflocale.com/docs/machine-translation/#providers" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare providers', 'perflocale' ); ?></a>
 					<span style="color:#c3c4c7;"> · </span>
-					<a href="https://perflocale.com/docs/api-key-constants/" target="_blank" rel="noopener"><?php echo esc_html__( 'Set API keys via wp-config constants', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+					<a href="https://perflocale.com/docs/api-key-constants/" target="_blank" rel="noopener"><?php echo esc_html__( 'Keep API keys out of the database instead', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
 		</tr>
@@ -2134,6 +2165,19 @@ final class SettingsPage {
 				</label>
 				<p class="description">
 					<?php echo esc_html__( 'Lets translators MT-translate selected, filtered, or every string in a single dispatch (up to 5,000 string × target pairs per run). Disable to keep MT available for per-row edits only — useful when controlling provider costs.', 'perflocale' ); ?>
+				</p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Custom Fields', 'perflocale' ); ?></th>
+			<td>
+				<?php $mt_meta_custom_fields = (bool) $this->settings->get( 'mt_meta_custom_fields', false ); ?>
+				<label>
+					<input type="checkbox" name="mt_meta_custom_fields" value="1" <?php checked( $mt_meta_custom_fields ); ?>>
+					<?php echo esc_html__( 'Machine-translate custom field values from ACF, Meta Box and Pods.', 'perflocale' ); ?>
+				</label>
+				<p class="description">
+					<?php echo esc_html__( 'Off by default: field values are often names, SKUs, URLs or numbers that must not be translated. Turn it on only when your custom fields hold prose. Fields the addons exclude are still skipped.', 'perflocale' ); ?>
 				</p>
 			</td>
 		</tr>
@@ -2947,7 +2991,7 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Publish /perflocale/v1/config endpoint and honour X-PerfLocale-Lang hints', 'perflocale' ); ?>
 				</label>
 				<p class="description" style="margin-top:6px;">
-					<?php echo esc_html__( 'Exposes a cache-friendly public REST endpoint that a Cloudflare Worker, Vercel Edge function, or Netlify Edge function can read to pre-route visitors to the correct language before the request reaches PHP. Also adds an `edge_hint` detection method you can add to your detection order.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Exposes a cache-friendly public REST endpoint that a Cloudflare Worker, Vercel Edge function, or Netlify Edge function can read to pre-route visitors to the correct language before the request reaches PHP. Also adds an Edge Hint Redirect method, which you switch on under URL &amp; Routing; with two or more redirect methods enabled you can set the order they run in.', 'perflocale' ); ?>
 					<a href="https://perflocale.com/docs/edge-integration/#restricting-access" target="_blank" rel="noopener"><?php echo esc_html__( 'Restricting access to the endpoint', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 				<?php if ( $edge_enabled ) : ?>

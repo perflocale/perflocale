@@ -11,6 +11,7 @@ namespace PerfLocale\Api;
 
 use PerfLocale\Background\BackgroundEvents;
 use PerfLocale\Concurrency\Lock;
+use PerfLocale\Helper;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -257,7 +258,12 @@ final class WebhookController extends RestController {
 							'required'          => true,
 							'type'              => 'string',
 							'validate_callback' => static function ( $value ): bool {
-								return filter_var( $value, FILTER_VALIDATE_URL ) !== false;
+								// is_string first: REST parameters are untrusted and
+								// arrive as whatever the client sent. Helper::is_valid_url
+								// declares `string $url` under strict_types, so an array
+								// or null argument raised an uncaught TypeError out of
+								// the validator and returned HTTP 500 instead of 400.
+								return is_string( $value ) && Helper::is_valid_url( $value );
 							},
 							'sanitize_callback' => 'esc_url_raw',
 						],
@@ -372,7 +378,7 @@ final class WebhookController extends RestController {
 		// both spellings of one address: a mapped PUBLIC IPv4 still passes just
 		// as the bare form does. Gated on FILTER_FLAG_IPV6 first so inet_pton()
 		// only ever sees a literal it can parse.
-		if ( filter_var( $host_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 ) !== false ) {
+		if ( Helper::is_ipv6( $host_ip ) ) {
 			$host_bin = inet_pton( $host_ip );
 
 			if ( false !== $host_bin && 16 === strlen( $host_bin ) && "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" === substr( $host_bin, 0, 12 ) ) {
@@ -385,18 +391,18 @@ final class WebhookController extends RestController {
 		}
 
 		// IP literal - reject loopback, link-local, and RFC1918 ranges.
-		$is_ip_literal = ( filter_var( $host_ip, FILTER_VALIDATE_IP ) !== false );
+		$is_ip_literal = Helper::is_ip( $host_ip );
 
 		if ( $is_ip_literal ) {
 			// FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE only cover IPv4.
-			if ( filter_var( $host_ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
 				$safe = false;
 			}
 
 			// IPv6 equivalents: unique-local (fc00::/7) and link-local
 			// (fe80::/10). Both are "private" in the SSRF sense but pass
 			// PHP's IPv4-only private-range flag.
-			if ( filter_var( $host_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 ) !== false ) {
+			if ( Helper::is_ipv6( $host_ip ) ) {
 				// $host_ip was just validated as a well-formed IPv6 literal,
 				// so inet_pton() can't emit a warning here - no @-suppression
 				// needed. The is_string() guard is defensive in case PHP
@@ -431,14 +437,14 @@ final class WebhookController extends RestController {
 		if ( $safe && ! $is_ip_literal ) {
 			$resolved = gethostbyname( $host );
 
-			if ( $resolved === $host || ! filter_var( $resolved, FILTER_VALIDATE_IP ) ) {
+			if ( $resolved === $host || ! Helper::is_ip( $resolved ) ) {
 				// gethostbyname() returns the input string unchanged on
 				// resolution failure. Fail closed: if we can't resolve the
 				// host now, refuse the URL rather than fail-open - a hostile
 				// DNS server could otherwise return a public IP at
 				// validation time and a private IP at delivery time.
 				$safe = false;
-			} elseif ( filter_var( $resolved, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+			} elseif ( ! Helper::is_public_ipv4( $resolved ) ) {
 				// Resolved to a private (RFC1918) or reserved IPv4 range.
 				$safe = false;
 			} elseif ( str_starts_with( $resolved, '127.' ) ) {

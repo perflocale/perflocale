@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\MachineTranslation;
 
+use PerfLocale\Helper;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -40,7 +41,6 @@ abstract class AbstractProvider implements ProviderInterface {
 		'api.deepl.com',
 		'api-free.deepl.com',
 		'api.cognitive.microsofttranslator.com',
-		'libretranslate.com',
 	];
 
 	/**
@@ -564,7 +564,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// Gated on FILTER_FLAG_IPV6 first so inet_pton() only ever sees a
 		// literal it can parse — same shape as the fc00::/fe80:: byte check
 		// further down.
-		if ( filter_var( $host_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 ) !== false ) {
+		if ( Helper::is_ipv6( $host_ip ) ) {
 			$host_bin = inet_pton( $host_ip );
 
 			if ( false !== $host_bin && 16 === strlen( $host_bin ) && "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" === substr( $host_bin, 0, 12 ) ) {
@@ -578,9 +578,9 @@ abstract class AbstractProvider implements ProviderInterface {
 
 		// If the host is already an IP literal, skip DNS entirely - this is
 		// both faster and avoids a potential hang on misconfigured resolvers.
-		if ( filter_var( $host_ip, FILTER_VALIDATE_IP ) !== false ) {
+		if ( Helper::is_ip( $host_ip ) ) {
 			// FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE only cover IPv4.
-			if ( filter_var( $host_ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
 				throw new \RuntimeException( 'Provider URL targets a private or reserved IP address.' );
 			}
 
@@ -588,7 +588,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			// (fe80::/10). Both are "private" in the SSRF sense but pass
 			// PHP's IPv4-only private-range flag. Mirrors the byte check
 			// in WebhookController::is_url_safe().
-			if ( filter_var( $host_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 ) !== false ) {
+			if ( Helper::is_ipv6( $host_ip ) ) {
 				$bin = inet_pton( $host_ip );
 
 				if ( $bin !== false && strlen( $bin ) === 16 ) {
@@ -630,11 +630,11 @@ abstract class AbstractProvider implements ProviderInterface {
 		// encoded address. The old `if ( $ip !== $host )` gate treated those as
 		// "fine" and let obfuscated internal IPs slip past the private-range
 		// check — require a real resolution to a verifiable public IP instead.
-		if ( $ip === $host || filter_var( $ip, FILTER_VALIDATE_IP ) === false ) {
+		if ( $ip === $host || ! Helper::is_ip( $ip ) ) {
 			throw new \RuntimeException( 'Provider URL could not be resolved to a verifiable public IP.' );
 		}
 
-		if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+		if ( ! Helper::is_public_ipv4( $ip ) ) {
 			throw new \RuntimeException( 'Provider URL resolves to a private or reserved IP address.' );
 		}
 
@@ -891,7 +891,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		$trimmed = trim( $header );
 
 		// Delta-seconds form — pure integer string.
-		if ( ctype_digit( $trimmed ) ) {
+		if ( Helper::is_ascii_digits( $trimmed ) ) {
 			return (int) $trimmed;
 		}
 

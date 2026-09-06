@@ -11,6 +11,7 @@ namespace PerfLocale\Translation;
 
 use PerfLocale\Database\Schema;
 use PerfLocale\Enum\ObjectType;
+use PerfLocale\Helper;
 use PerfLocale\Router\LanguageRouter;
 use PerfLocale\Settings;
 
@@ -730,7 +731,7 @@ final class PostQueryFilter {
 
 		// Check if the current query is targeting any translation of the posts page.
 		$queried_page_id  = (int) $query->get( 'page_id' );
-		$queried_pagename = $query->get( 'pagename' );
+		$queried_pagename = Helper::normalize_slug_for_query( (string) $query->get( 'pagename' ) );
 
 		$is_posts_page = false;
 
@@ -746,7 +747,15 @@ final class PostQueryFilter {
 			_prime_post_caches( $posts_page_ids, false, false );
 
 			foreach ( $posts_page_ids as $pid ) {
-				if ( get_post_field( 'post_name', $pid ) === $queried_pagename ) {
+				// get_page_uri(), not post_name: `pagename` carries the FULL
+				// path, so a posts page nested under a parent never matched its
+				// own leaf slug and the archive rendered as a singular page
+				// instead. Comparing full URIs also stops a same-named page
+				// under a different parent from being mistaken for it, which a
+				// basename comparison would have allowed. Both sides are the
+				// stored percent-encoded form: get_page_uri() concatenates raw
+				// post_name values, and $queried_pagename was normalised above.
+				if ( get_page_uri( $pid ) === $queried_pagename ) {
 					$is_posts_page = true;
 					break;
 				}
@@ -797,7 +806,12 @@ final class PostQueryFilter {
 		}
 
 		// Handle pagename queries (pages/hierarchical CPTs).
-		$pagename = $query->get( 'pagename' );
+		//
+		// Normalised to the stored form first: post_name is percent-encoded for
+		// every non-Latin script, the query var is not, and every resolver and
+		// get_page_uri() comparison below matches against post_name. No-op on
+		// ASCII, so Latin-script sites are unaffected.
+		$pagename = Helper::normalize_slug_for_query( (string) $query->get( 'pagename' ) );
 
 		if ( ! empty( $pagename ) ) {
 			// For a nested page core sets `pagename` to the FULL path
@@ -887,8 +901,9 @@ final class PostQueryFilter {
 			}
 		}
 
-		// Handle name queries (regular posts).
-		$name = $query->get( 'name' );
+		// Handle name queries (regular posts). Same normalisation as the
+		// pagename branch above, for the same reason.
+		$name = Helper::normalize_slug_for_query( (string) $query->get( 'name' ) );
 
 		if ( ! empty( $name ) ) {
 			$post_type = $query->get( 'post_type' );
@@ -2536,7 +2551,27 @@ final class PostQueryFilter {
 		// previews, etc.) so marketing attribution survives the fallback
 		// redirect. The `perflocale_fb` sentinel is added on top; if the
 		// original had conflicting values they are overwritten by ours.
-		$request_qs = ( isset( $_SERVER['QUERY_STRING'] ) ? sanitize_text_field( wp_unslash( (string) $_SERVER['QUERY_STRING'] ) ) : '' );
+		// esc_url_raw, not sanitize_text_field. _sanitize_text_fields() loops
+		// `preg_replace('/%[a-f0-9]{2}/i', '', …)` until no escape remains, so it
+		// DELETES every percent-escape in the string: a Japanese site search
+		// `?s=%E3%83%8B...` arrives at the redirect target as a bare `?s`, and
+		// `utm_campaign=Fr%C3%BChling` becomes `Frhling`. The sibling
+		// is_current_url() already uses esc_url_raw for exactly this reason, and
+		// so does every REQUEST_URI read in this codebase.
+		//
+		// The '/?' prefix is load-bearing, and its absence was a bug: esc_url()
+		// prepends a scheme to anything that does not look like a path, so a BARE
+		// query string came back as `http://utm_source=nl&…` and parse_str() then
+		// read the first parameter's name as `http://utm_source`. REQUEST_URI
+		// escapes this because it always starts with '/'. Prefixing gives
+		// esc_url_raw a path to recognise; the prefix is stripped straight back
+		// off, and the result is byte-identical to the input for every query
+		// string tested.
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Sanitised on the very next line by esc_url_raw(); it cannot be applied here because esc_url() prepends a scheme to a value that does not look like a path, which is the bug this replaced.
+		$raw_qs     = isset( $_SERVER['QUERY_STRING'] ) ? wp_unslash( (string) $_SERVER['QUERY_STRING'] ) : '';
+		$safe_qs    = $raw_qs === '' ? '' : esc_url_raw( '/?' . $raw_qs );
+		$qs_mark    = strpos( $safe_qs, '?' );
+		$request_qs = ( $safe_qs !== '' && $qs_mark !== false ) ? substr( $safe_qs, $qs_mark + 1 ) : '';
 
 		if ( $request_qs !== '' ) {
 			$passthrough = [];

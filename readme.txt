@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.1
+Stable tag: 1.0.2
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -196,6 +196,32 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 == Changelog ==
 
+= 1.0.2 =
+
+Fixes translated content served in the wrong language on sites whose slugs are not Latin script, permanently corrupted slugs for long non-Latin names, fatal errors on servers built without an optional PHP extension, a PO import that could delete a language's translations, and a group of settings that could not be reached or were silently cleared. Full detail at https://perflocale.com/changelog/
+
+**Non-Latin slugs.** WordPress stores a slug percent-encoded for every non-Latin script, and PerfLocale compared its lookups against that stored form. Two request shapes deliver the slug decoded and matched nothing: a query-string request such as `?category_name=ニュース`, which is what a plain-permalink site issues for every archive and page, and a URL carrying raw UTF-8 in the path. On those the visitor got the source language. Japanese, Chinese, Korean, Arabic, Hebrew, Russian, Greek, Thai and Hindi were affected, and so was any accented Latin slug such as the German "Über uns". Pretty-permalink sites were unaffected on the normal path. A pure-ASCII slug is returned unchanged, so nothing about an English or French site changes. Present since 1.0.0.
+
+**Corrupted slugs for long non-Latin names.** Shortening a translated term slug cut by byte position and landed inside a percent-escape, so the slug became different characters rather than fewer, permanently. Japanese, Chinese and Korean names from about 24 characters, and Arabic, Hebrew and Russian from about 45, were affected every time, and the damaged slug is what hreflang, the sitemap and the switcher emitted.
+
+**Fatal errors on servers missing an optional PHP extension.** Building the language tag for the `Content-Language` header and the hreflang tags called a function WordPress ships no replacement for, on every request, so a server compiled without the ctype extension returned a fatal error instead of a page. XLIFF export and import reached for the XML extensions without checking. All now work without those extensions, or stop with a message naming the package to install. Site Health previously reported a critical failure for extensions nothing needed; it now lists only extensions that gate a real feature.
+
+**Machine Translation could not be switched on.** Its settings tab was listed only once the feature was already enabled, and the checkbox that enables it lives inside that tab. On a default install there was no route to turn it on. Present since 1.0.0.
+
+**Three settings were silently cleared by unrelated saves.** A tab only submits the controls it draws, but every key was read whether drawn or not, so a hidden control read as one the operator had unticked.
+
+**A PO import could delete a language's translations and put nothing back.** Gettext parsing drops entries it cannot decode without raising an error, so a file saved as ISO-8859-1 read as valid but empty; in Replace mode that deleted everything and imported nothing. Non-UTF-8 files are now refused before anything is deleted. Exports were affected too: a carriage return made the whole file unparseable.
+
+**Excluded paths never matched a non-Latin path**, and the two places that checked them disagreed, so an excluded `/api` also excluded `/apifoo` in one of them.
+
+**A refused settings save reported success.** The database declines a value it cannot store rather than shortening it, so nothing changed and the screen still said it saved.
+
+**Language prefixes outside plain ASCII could not be read back.** A locale such as `sr_RS@latin`, or one written in Cyrillic, was written into the URL correctly and then stripped by the reader.
+
+**WPForms confirmation messages are now translated**, and **XLIFF imports write once per post instead of once per field** — an import of 40 posts went from 120 post writes to 40, byte-for-byte identical.
+
+**Behaviour changes worth knowing.** An XLIFF import now creates one revision per post rather than one per field, and the save hooks fire once per post. If a plugin vetoes the write for a post, none of that post's fields are stored. `libretranslate.com` no longer skips the outbound-URL safety check. Machine-translation length caps now count characters rather than bytes, so the real limit matches the stated one for CJK, Arabic, Hebrew and Russian.
+
 = 1.0.1 =
 
 Security and reliability release. Updating is recommended for every site, and required for any site that uses the Translator role or Contact Form 7.
@@ -299,6 +325,9 @@ Initial public release.
 Full release notes: https://perflocale.com/changelog/
 
 == Upgrade Notice ==
+
+= 1.0.2 =
+Machine Translation could not be switched on from the admin at all, and three settings were silently cleared by unrelated saves. Also fixes a fatal on servers without mbstring, translates WPForms confirmations, and makes XLIFF imports about three times cheaper.
 
 = 1.0.1 =
 Security release. Fixes capability bypasses that let the Translator role publish, trash or destroy content, closes a machine-translation quota bypass, stops translated Contact Form 7 forms exposing mail settings, and fixes a WooCommerce race that lost stock when several languages sold at once.

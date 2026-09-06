@@ -2973,7 +2973,17 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				continue;
 			}
 
-			$code = strtoupper( substr( sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) ), 0, 3 ) );
+			// Validated, not byte-truncated. substr( …, 0, 3 ) on a four-byte
+			// character leaves three bytes of a half-finished UTF-8 sequence, and
+			// the consequence is not local: the invalid value goes into the
+			// settings array, update_option() hands it to wpdb, strip_invalid_text()
+			// drops the bad bytes while the serialize() length header still claims
+			// them, and the whole blob stops unserialising. get_option() then
+			// returns false, load() falls back to defaults, and EVERY setting in
+			// the plugin is silently lost. ISO 4217 codes are three ASCII letters
+			// by definition, so anything else is simply not a currency code.
+			$raw_code = sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) );
+			$code     = preg_match( '/^[A-Za-z]{3}$/', $raw_code ) === 1 ? strtoupper( $raw_code ) : '';
 
 			if ( $code === '' ) {
 				continue;

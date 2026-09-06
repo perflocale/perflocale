@@ -496,7 +496,7 @@ final class LanguagesPage {
 						$flag       = (string) ( $pl['flag'] ?? '' );
 						$flag_emoji = '';
 
-						if ( $flag !== '' && strlen( $flag ) === 2 && ctype_alpha( $flag ) ) {
+						if ( $flag !== '' && strlen( $flag ) === 2 && Helper::is_ascii_alpha( $flag ) ) {
 							// Regional-indicator codepoints U+1F1E6–U+1F1FF are a
 							// contiguous 4-byte UTF-8 block (leading bytes F0 9F 87);
 							// 'A' (0x41) maps to U+1F1E6, so 'us' becomes 🇺🇸. Encoded

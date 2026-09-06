@@ -9,6 +9,8 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Background;
 
+use PerfLocale\Helper;
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
@@ -697,7 +699,7 @@ final class JobLock {
 
 		$prefix = substr( $stored, 0, $delim_pos );
 
-		if ( $prefix === '' || ! ctype_digit( $prefix ) ) {
+		if ( $prefix === '' || ! Helper::is_ascii_digits( $prefix ) ) {
 			return 0;
 		}
 

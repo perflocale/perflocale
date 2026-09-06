@@ -13,6 +13,7 @@ use PerfLocale\Cache\CacheManager;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Enum\ObjectType;
+use PerfLocale\Helper;
 use PerfLocale\Enum\SourceType;
 use PerfLocale\Enum\TranslationStatus;
 
@@ -112,10 +113,14 @@ final class TermTranslationManager {
 	 * keeps force_insert_term()'s "-N" walk able to reach a slug it has not
 	 * already tried.
 	 *
-	 * substr() can leave half a percent-encoded octet behind ("%c3%a4" cut to
-	 * "%c3%a"), so the cut is re-sanitized: sanitize_title() drops the orphaned
-	 * "%" and trims any dash the cut exposed. On an already-sanitized slug it
-	 * can only shorten, never grow, so the result always fits.
+	 * The cut itself is delegated to {@see \PerfLocale\Helper::truncate_slug()},
+	 * which never lands inside a percent-escape. An earlier version cut with
+	 * byte substr() and relied on sanitize_title() to "drop the orphaned %".
+	 * It does drop the %, but it KEEPS the hex digits that followed, so the
+	 * slug silently became different bytes rather than shorter ones: every
+	 * Japanese, Chinese or Korean term name of 24 characters and up, and every
+	 * Russian or Arabic one of 45 and up, was stored as mojibake that no later
+	 * sanitising repaired.
 	 *
 	 * @param string $base    Sanitized slug base.
 	 * @param int    $reserve Characters to keep free for the suffix.
@@ -125,11 +130,11 @@ final class TermTranslationManager {
 	private function reserve_slug_room( string $base, int $reserve ): string {
 		$max = self::SLUG_MAX_LENGTH - $reserve;
 
-		if ( $max < 1 || strlen( $base ) <= $max ) {
+		if ( $max < 1 ) {
 			return $base;
 		}
 
-		return sanitize_title( substr( $base, 0, $max ) );
+		return Helper::truncate_slug( $base, $max );
 	}
 
 	/**

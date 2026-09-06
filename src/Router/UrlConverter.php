@@ -14,6 +14,7 @@ use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Database\Repository\SlugTranslationRepository;
 use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Enum\ObjectType;
+use PerfLocale\Helper;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -950,7 +951,11 @@ final class UrlConverter {
 				continue;
 			}
 
-			$slug = $wp->query_vars[ $qv ];
+			// Core delivers this urldecoded (parse_str in class-wp.php), while
+			// slug_translations.slug holds the sanitize_title() form. Without
+			// this the lookup below missed on every non-ASCII term slug and the
+			// visitor silently got the source-language archive. No-op on ASCII.
+			$slug = Helper::normalize_slug_for_query( $wp->query_vars[ $qv ] );
 
 			// Reduce a nested path ('parent/child') to the term's own segment.
 			// WP_Query::parse_tax_query() applies exactly this reduction — the
@@ -1227,17 +1232,13 @@ final class UrlConverter {
 			self::$excluded_paths_cached = $needles;
 		}
 
-		// Normalize before matching: core passes both '/wp-json/' and the
-		// slash-less 'wp-json' (get_rest_url), which a raw prefix comparison
-		// against the configured '/wp-json/' entries never matches.
-		$normalized_path = '/' . ltrim( $path, '/' );
-
-		foreach ( self::$excluded_paths_cached as $needle ) {
-			if ( $normalized_path === $needle || str_starts_with( $normalized_path, $needle . '/' ) || str_starts_with( $normalized_path, $needle . '.' ) || str_starts_with( $normalized_path, $needle . '?' ) ) {
-				self::cap_cache( self::$home_url_memo );
-				self::$home_url_memo[ $memo_key ] = $url;
-				return self::$home_url_memo[ $memo_key ];
-			}
+		// Shared with LanguageRouter so the two cannot drift apart again, and
+		// decoding on both sides so a non-Latin excluded path actually matches
+		// the encoded form a browser sends. See Helper::path_matches_excluded().
+		if ( Helper::path_matches_excluded( $path, self::$excluded_paths_cached ) ) {
+			self::cap_cache( self::$home_url_memo );
+			self::$home_url_memo[ $memo_key ] = $url;
+			return self::$home_url_memo[ $memo_key ];
 		}
 
 		self::cap_cache( self::$home_url_memo );
@@ -2736,7 +2737,7 @@ final class UrlConverter {
 
 			if ( $t instanceof \WP_Term ) {
 				$tid = (int) $t->term_id;
-			} elseif ( is_int( $t ) || ( is_string( $t ) && ctype_digit( $t ) ) ) {
+			} elseif ( is_int( $t ) || ( is_string( $t ) && Helper::is_ascii_digits( $t ) ) ) {
 				$tid = (int) $t;
 			} else {
 				return $terms; // slugs/names/count shapes — nothing to prime.

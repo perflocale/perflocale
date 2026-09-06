@@ -32,7 +32,7 @@ final class AddonsPage {
 				'description'  => __( 'Translate content using DeepL, Google Translate, Microsoft Translator, or LibreTranslate. Includes auto-translate on publish/create, bulk translation and monthly usage limits. Disabled by default.', 'perflocale' ),
 				'category'     => 'feature',
 				'icon'         => 'dashicons-translation',
-				'requires'     => __( 'Enable here, then configure in Settings > Addons > Machine Translation', 'perflocale' ),
+				'requires'     => __( 'Enable and configure in Settings > Addons > Machine Translation', 'perflocale' ),
 				'settings_tab' => 'machine-translation',
 				'check'        => fn() => (bool) \PerfLocale\Plugin::get_instance()->get( 'settings' )->mt_enabled(),
 			],
@@ -725,7 +725,15 @@ final class AddonsPage {
 								</div>
 							<?php endif; ?>
 						</div>
-						<?php if ( $addon_instance !== null && current_user_can( 'perflocale_manage_addons' ) ) : ?>
+						<?php
+						// Built-in features (Machine Translation) have no registry
+						// instance, but they DO have a toggle: AdminController's
+						// BUILTIN_FEATURE_TOGGLES maps the card to its Settings flag.
+						// Gating this form on $addon_instance alone meant the MT card
+						// rendered "Enable here" with no Enable button on it.
+						$perflocale_card_toggleable = ( $addon_instance !== null || in_array( $addon_id, $builtin_feature_ids, true ) );
+						?>
+						<?php if ( $perflocale_card_toggleable && current_user_can( 'perflocale_manage_addons' ) ) : ?>
 							<div class="perflocale-addon-card__toggle" style="padding:6px 12px;border-top:1px solid #f0f0f1;">
 								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display:flex;align-items:center;gap:8px;margin:0;">
 									<input type="hidden" name="action" value="perflocale_toggle_addon">
@@ -735,7 +743,7 @@ final class AddonsPage {
 									<button type="submit" class="button button-small">
 										<?php echo $is_disabled ? esc_html__( 'Enable', 'perflocale' ) : esc_html__( 'Disable', 'perflocale' ); ?>
 									</button>
-									<?php if ( $is_disabled ) : ?>
+									<?php if ( $is_disabled && $addon_instance !== null ) : ?>
 										<span class="description" style="font-size:11px;color:var(--perflocale-gray-text);">
 											<?php echo esc_html__( 'Skipped at boot until re-enabled.', 'perflocale' ); ?>
 										</span>
@@ -774,7 +782,14 @@ final class AddonsPage {
 									<?php echo esc_html( $addon['requires'] ); ?>
 								</a>
 								<span class="perflocale-addon-card__auto" style="color: var(--perflocale-gray-text);">
-									<?php echo esc_html__( 'Not installed', 'perflocale' ); ?>
+									<?php
+									// Reuse the status already resolved above. Hard-coding
+									// "Not installed" made a built-in feature that is merely
+									// switched off — Machine Translation on a default install —
+									// read "Disabled" in its header and "Not installed" in its
+									// footer at the same time.
+									echo esc_html( $status_label );
+									?>
 								</span>
 							<?php else : ?>
 								<span class="perflocale-addon-card__requires">

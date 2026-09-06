@@ -242,7 +242,14 @@ final class AdminController {
 		$page   = new Pages\SettingsPage( $this->settings );
 		$values = $page->extract_tab_values( $tab );
 
-		$this->settings->update( $values );
+		// The boolean matters. wpdb refuses a write whose value is too long for
+		// its column or carries invalid UTF-8 — it does not truncate or repair —
+		// so update() can fail with nothing stored while the redirect below
+		// reports success. Carry the real result through to the notice.
+		// update() returns false for a refused write AND for a save that changed
+		// nothing, so the no-op signal is consulted alongside it. Without that,
+		// re-saving a tab unchanged — the common case — would show an error.
+		$settings_saved = $this->settings->update( $values ) || \PerfLocale\Settings::last_update_was_noop();
 
 		// When performance tab is saved, handle string translation mode changes.
 		if ( $tab === 'performance' ) {
@@ -273,7 +280,7 @@ final class AdminController {
 
 		$redirect_args = [
 			'page'             => 'perflocale-settings',
-			'settings-updated' => 'true',
+			'settings-updated' => $settings_saved ? 'true' : 'false',
 		];
 
 		if ( in_array( $tab, $addon_subtabs, true ) ) {
@@ -1114,6 +1121,29 @@ final class AdminController {
 		$action_type = sanitize_text_field( wp_unslash( $_POST['perflocale_language_action'] ) );
 
 		if ( $action_type === 'add' ) {
+			// Pre-flight: the slug survived sanitisation. sanitize_key() carries
+			// no /u modifier, so it deletes every byte of a non-ASCII slug and
+			// hands back ''. That row inserts once (the UNIQUE key allows a
+			// single empty slug), the screen says "Language added", and the
+			// language can never match a rewrite rule. The repository refuses it
+			// now; this turns that refusal into a message that names the value
+			// the operator actually typed, rather than a silently re-rendered
+			// form. Reuses the invalid_slug notice the edit branch already has.
+			if ( $data['slug'] === '' ) {
+				wp_safe_redirect(
+					add_query_arg(
+						[
+							'page'    => 'perflocale-languages',
+							'action'  => 'add',
+							'message' => 'invalid_slug',
+							'dup'     => rawurlencode( isset( $_POST['slug'] ) ? sanitize_text_field( wp_unslash( $_POST['slug'] ) ) : '' ),
+						],
+						admin_url( 'admin.php' )
+					)
+				);
+				exit;
+			}
+
 			// Pre-flight: friendly duplicate check. Both `slug` and
 			// `locale` columns carry UNIQUE indexes. Without this, the
 			// admin sees a raw `Duplicate entry 'de' for key

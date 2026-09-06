@@ -198,11 +198,18 @@ final class PoSync {
 			foreach ( $rows as $row ) {
 				$cursor = (int) $row->id;
 
+				// Carriage returns are normalised out first. Core's PO::poify
+				// escapes backslash, double quote and tab but NOT \r, so a raw
+				// 0x0D inside a quoted PO string is emitted verbatim and makes
+				// the ENTIRE exported file unparseable — a re-import returns
+				// zero entries, not one bad entry. Measured: one CR anywhere in
+				// one string costs the whole export. Windows line endings in a
+				// translation are the ordinary way to acquire one.
 				$entry = new \Translation_Entry(
 					[
-						'singular'           => (string) $row->original,
+						'singular'           => self::normalise_newlines( (string) $row->original ),
 						'context'            => self::compose_context( (string) $row->domain, (string) $row->context ),
-						'translations'       => [ (string) $row->translation ],
+						'translations'       => [ self::normalise_newlines( (string) $row->translation ) ],
 						'extracted_comments' => self::DOMAIN_PREFIX . (string) $row->domain,
 					]
 				);
@@ -298,6 +305,33 @@ final class PoSync {
 	 *                     back, so an unexpected failure can never leave the
 	 *                     wipe committed without its re-import.
 	 */
+	/**
+	 * True when `$bytes` is well-formed UTF-8.
+	 *
+	 * preg_match with the /u modifier and an empty pattern is the standard test
+	 * and needs no extension: PCRE refuses to run a /u pattern against a subject
+	 * that is not valid UTF-8, so a false return IS the answer.
+	 * mb_check_encoding() would be the obvious choice and is not usable here —
+	 * WordPress core does not polyfill it, so it would fatal on a host built
+	 * without ext-mbstring.
+	 *
+	 * @param string $bytes Candidate.
+	 */
+	/**
+	 * Convert CRLF and bare CR to LF.
+	 *
+	 * @see the export loop for why: core's PO serialiser does not escape \r.
+	 *
+	 * @param string $text Text to normalise.
+	 */
+	private static function normalise_newlines( string $text ): string {
+		return str_replace( [ "\r\n", "\r" ], "\n", $text );
+	}
+
+	private static function is_valid_utf8( string $bytes ): bool {
+		return $bytes === '' || preg_match( '//u', $bytes ) === 1;
+	}
+
 	public static function import_from_file( string $path, string $lang_slug, bool $replace = false ): array {
 		$result = [
 			'imported'       => 0,
@@ -333,6 +367,51 @@ final class PoSync {
 
 		if ( ! $po->import_from_file( $path ) ) {
 			$result['errors'][] = __( 'Failed to parse PO file.', 'perflocale' );
+			return $result;
+		}
+
+		// import_from_file() returns TRUE for a file it could not read a single
+		// usable entry out of, and in replace mode the code below then deletes
+		// every string translation and every translated link for the target
+		// language, commits, and imports nothing: total data loss from a file the
+		// operator was told was fine.
+		//
+		// Three distinct triggers, and an earlier version of this guard caught
+		// only the first:
+		//
+		//  1. A file that parses to zero entries. A header-only PO — what Poedit
+		//     writes before anything is translated — does this.
+		//  2. A file that is not valid UTF-8. Core's PO::unpoify runs a /u regex,
+		//     so a Latin-1 or Windows-1252 save loses the entries that contain a
+		//     high byte while the method still reports success.
+		//  3. A file whose entries all carry an EMPTY translation, which is what
+		//     an ASCII msgid with a Latin-1 msgstr produces: one entry, nothing
+		//     in it. Counting entries was not enough.
+		//
+		// So: reject the payload outright unless it is valid UTF-8, and then
+		// require at least one entry that would actually write something.
+		if ( ! self::is_valid_utf8( (string) file_get_contents( $path ) ) ) {
+			$result['errors'][] = __( 'The PO file is not valid UTF-8. Re-save it as UTF-8 and try again — importing it as-is would discard the entries it cannot read.', 'perflocale' );
+			return $result;
+		}
+
+		$has_entries = false;
+
+		foreach ( (array) $po->entries as $po_entry ) {
+			if ( ! $po_entry instanceof \Translation_Entry || (string) $po_entry->singular === '' ) {
+				continue;
+			}
+
+			foreach ( (array) $po_entry->translations as $po_translation ) {
+				if ( (string) $po_translation !== '' ) {
+					$has_entries = true;
+					break 2;
+				}
+			}
+		}
+
+		if ( ! $has_entries ) {
+			$result['errors'][] = __( 'The PO file contains no translatable entries. If it was exported from another tool, check that it is saved as UTF-8.', 'perflocale' );
 			return $result;
 		}
 

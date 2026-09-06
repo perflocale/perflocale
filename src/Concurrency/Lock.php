@@ -9,6 +9,8 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Concurrency;
 
+use PerfLocale\Helper;
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
@@ -440,10 +442,12 @@ final class Lock {
 
 		$prefix = substr( $stored, 0, $delim_pos );
 
-		// `ctype_digit` rejects negative numbers, decimals, and the empty
+		// is_ascii_digits() rejects negative numbers, decimals, and the empty
 		// string — so an empty or garbage prefix returns 0 (treated as
 		// unknown / refuse takeover). Defensive against a corrupted row.
-		if ( $prefix === '' || ! ctype_digit( $prefix ) ) {
+		// It replaces ctype_digit() with the same contract; ext-ctype is
+		// absent on some builds and WordPress polyfills none of it.
+		if ( $prefix === '' || ! Helper::is_ascii_digits( $prefix ) ) {
 			return 0;
 		}
 

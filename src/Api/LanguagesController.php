@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Api;
 
 use PerfLocale\Database\Repository\LanguageRepository;
+use PerfLocale\Helper;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -281,7 +282,7 @@ final class LanguagesController extends RestController {
 
 		$locale = sanitize_text_field( $request->get_param( 'locale' ) ?? '' );
 
-		$wants_default = filter_var( $request->get_param( 'is_default' ), FILTER_VALIDATE_BOOLEAN );
+		$wants_default = Helper::to_bool( $request->get_param( 'is_default' ) );
 		$is_active     = absint( $request->get_param( 'is_active' ) ?? 1 );
 
 		// Refuse the impossible combination BEFORE the insert, not after.
@@ -337,7 +338,14 @@ final class LanguagesController extends RestController {
 				'locale'         => $locale,
 				'name'           => sanitize_text_field( $request->get_param( 'name' ) ?? '' ),
 				'native_name'    => sanitize_text_field( $request->get_param( 'native_name' ) ?? '' ),
-				'flag'           => sanitize_key( $request->get_param( 'flag' ) ?? '' ),
+				// NOT sanitize_key(): the arg already declares
+				// sanitize_text_field, and the repository sanitises again on
+				// write. A second pass through sanitize_key() destroyed emoji
+				// flags outright, so this route stored '' where the admin screen
+				// and the update route both keep the flag. Helper's
+				// region_code_from_flag_emoji() exists precisely because a flag
+				// may be stored as an emoji.
+				'flag'           => (string) ( $request->get_param( 'flag' ) ?? '' ),
 				'is_active'      => $is_active,
 				// Explicit ltr/rtl wins; otherwise derive a sensible default from
 				// the locale so RTL languages aren't silently created left-to-right.
@@ -416,7 +424,11 @@ final class LanguagesController extends RestController {
 					$data[ $key ] = sanitize_text_field( (string) $value );
 					break;
 				case 'flag':
-					$data[ $key ] = sanitize_key( (string) $value );
+					// sanitize_text_field, matching create_item(), the admin screen
+					// and the repository's own sanitise. sanitize_key() has no /u
+					// modifier and strips every byte of an emoji flag, so this route
+					// stored '' where the other two keep it.
+					$data[ $key ] = sanitize_text_field( (string) $value );
 					break;
 				case 'is_active':
 					$data[ $key ] = absint( $value );

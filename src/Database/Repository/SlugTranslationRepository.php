@@ -12,6 +12,7 @@ namespace PerfLocale\Database\Repository;
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Contract\RepositoryInterface;
 use PerfLocale\Database\Schema;
+use PerfLocale\Helper;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -328,7 +329,15 @@ final class SlugTranslationRepository implements RepositoryInterface {
 					$this->table(),
 					[
 						'object_type'    => sanitize_key( $object_type ),
-						'object_subtype' => sanitize_key( $object_subtype ),
+						// NOT sanitize_key(): every reader — the UPDATE branch above,
+						// find_unique_slug(), resolve_from_slug() and the router's own
+						// lookup — matches the RAW subtype, and sanitize_key() strips
+						// non-ASCII bytes. A WooCommerce attribute taxonomy such as
+						// `pa_色` was written as `pa_` and could never be read back,
+						// so its translated archive fell through to the source
+						// language. The value is a bound %s parameter, never an
+						// identifier, so the sanitiser bought nothing.
+						'object_subtype' => $object_subtype,
 						'object_id'      => $object_id,
 						'language_id'    => $language_id,
 						'slug'           => $candidate,
@@ -485,18 +494,11 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	 * @return string
 	 */
 	private static function truncate_to_prefix( string $slug, int $length ): string {
-		if ( mb_strlen( $slug ) <= $length ) {
-			return $slug;
-		}
-
-		$decoded = urldecode( $slug );
-
-		// No escapes to straddle: a character cut is already safe.
-		if ( $decoded === $slug ) {
-			return rtrim( mb_substr( $slug, 0, $length ), '-' );
-		}
-
-		return rtrim( utf8_uri_encode( $decoded, $length ), '-' );
+		// This implementation moved to Helper::truncate_slug() so the term
+		// manager could share it rather than keep a second, subtly broken copy.
+		// Two truncators for one problem is what let the term path corrupt every
+		// non-Latin slug while this one stayed correct.
+		return Helper::truncate_slug( $slug, $length );
 	}
 
 	/**
@@ -656,7 +658,8 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			$this->table(),
 			[
 				'object_type'    => sanitize_key( $data['object_type'] ?? '' ),
-				'object_subtype' => sanitize_key( $data['object_subtype'] ?? '' ),
+				// See set_slug(): readers use the raw subtype, so writers must too.
+				'object_subtype' => (string) ( $data['object_subtype'] ?? '' ),
 				'object_id'      => absint( $data['object_id'] ?? 0 ),
 				'language_id'    => absint( $data['language_id'] ?? 0 ),
 				'slug'           => sanitize_title( $data['slug'] ?? '' ),

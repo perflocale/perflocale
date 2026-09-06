@@ -27,8 +27,25 @@ final class XliffExporter {
 	 * @param string     $source_lang Source language code.
 	 * @param string     $target_lang Target language code.
 	 * @return string XLIFF XML content.
+	 *
+	 * @throws \RuntimeException If PHP was built without ext-xmlwriter.
 	 */
 	public function export( array $post_ids, string $source_lang, string $target_lang ): string {
+		// ext-xmlwriter is bundled by default but is a separate compile-time
+		// unit (Debian/RHEL ship it inside php-xml), so a stripped build can
+		// lack it. Without this guard `new \XMLWriter()` raises an Error that
+		// nothing upstream catches, turning a missing optional extension into
+		// a white screen. Throw the documented \RuntimeException instead so
+		// the REST layer answers with a readable 500 and CLI callers see a
+		// sentence rather than a stack trace. Deliberately NOT an
+		// XliffFormatException: that type means "the client sent bad XLIFF"
+		// and maps to 4xx, while a missing extension is a server fault.
+		if ( ! class_exists( '\XMLWriter' ) ) {
+			throw new \RuntimeException(
+				esc_html__( 'XLIFF export needs the PHP xmlwriter extension, which is not installed on this server. Ask your host to enable the php-xml package.', 'perflocale' )
+			);
+		}
+
 		// Stream-build via XMLWriter into memory so very large exports don't
 		// hold the entire DOM tree + its duplicate serialization simultaneously.
 		$writer = new \XMLWriter();
@@ -166,11 +183,33 @@ final class XliffExporter {
 		// stayed well-formed, which is exactly why a well-formedness check
 		// never caught it. U+FFFE / U+FFFF remain excluded, as XML requires.
 		//
-		// Deliberately NOT passing $strip = true here: on the declared 6.4
-		// floor that branch returns iconv()'s false on PHP 8, and this file
+		// Not wp_check_invalid_utf8(): without $strip it returns '' for the WHOLE
+		// string when any byte is invalid, so one bad byte anywhere in a title or
+		// body exported that entire field as an empty CDATA — silently, in a
+		// still-well-formed document, and a partial re-import could then write
+		// the emptiness back. Its $strip branch is not usable either: on the
+		// declared 6.4 floor it returns iconv()'s false on PHP 8, and this file
 		// declares strict_types=1, so the preg_replace() below would throw a
-		// TypeError out of the REST handler on any input with one bad byte.
-		$text = wp_check_invalid_utf8( $text );
+		// TypeError out of the REST handler.
+		//
+		// So drop only the offending bytes. One pass: the alternation captures a
+		// VALID sequence into group 1 and is replaced by itself, while any other
+		// single byte matches the trailing `.` with group 1 empty and is replaced
+		// by nothing. No /u modifier, which is the point — a /u pattern cannot run
+		// on invalid input at all. Every valid sequence survives, astral-plane
+		// characters included.
+		$text = (string) preg_replace(
+			'/([\x00-\x7F]'
+			. '|[\xC2-\xDF][\x80-\xBF]'
+			. '|\xE0[\xA0-\xBF][\x80-\xBF]'
+			. '|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}'
+			. '|\xED[\x80-\x9F][\x80-\xBF]'
+			. '|\xF0[\x90-\xBF][\x80-\xBF]{2}'
+			. '|[\xF1-\xF3][\x80-\xBF]{3}'
+			. '|\xF4[\x80-\x8F][\x80-\xBF]{2})|./s',
+			'$1',
+			$text
+		);
 		$text = (string) preg_replace( '/[^\x{09}\x{0A}\x{0D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u', '', $text );
 
 		$writer->writeRaw( '<![CDATA[' . str_replace( ']]>', ']]]]><![CDATA[>', $text ) . ']]>' );

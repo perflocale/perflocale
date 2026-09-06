@@ -3,7 +3,7 @@
  * Plugin Name: PerfLocale
  * Plugin URI: https://perflocale.com
  * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs without slowing your site down.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Requires at least: 6.4
  * Tested up to: 7.1
  * Requires PHP: 8.1
@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ---- Plugin constants ----
 
-define( 'PERFLOCALE_VERSION', '1.0.1' );
+define( 'PERFLOCALE_VERSION', '1.0.2' );
 define( 'PERFLOCALE_FILE', __FILE__ );
 define( 'PERFLOCALE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );

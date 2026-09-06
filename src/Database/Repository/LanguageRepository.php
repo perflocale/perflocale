@@ -516,6 +516,16 @@ final class LanguageRepository implements RepositoryInterface {
 	public function insert( array $data ): int|false {
 		$sanitized = $this->sanitize_data( $data );
 
+		// A language with no slug can never match a rewrite rule, so the row is
+		// dead on arrival. It was reachable: the Add Language screen sanitises
+		// with sanitize_key(), which has no /u modifier and therefore deletes
+		// every byte of a non-ASCII slug, and update() and rename_slug() both
+		// validate their slug while this did not. The column's UNIQUE key let
+		// exactly one such row exist, and the screen reported success.
+		if ( ! isset( $sanitized['slug'] ) || $sanitized['slug'] === '' ) {
+			return false;
+		}
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 		$result = $this->wpdb->insert( $this->table(), $sanitized );
 

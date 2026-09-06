@@ -774,7 +774,7 @@ final class StringsPage {
 												printf(
 													/* translators: %s: original (untranslated) string preview */
 													esc_html__( 'Select string: %s', 'perflocale' ),
-													esc_html( mb_strimwidth( $string->original, 0, 60, '...' ) )
+													esc_html( self::truncate( (string) $string->original, 60 ) )
 												);
 												?>
 											</label>
@@ -786,7 +786,7 @@ final class StringsPage {
 									<?php endif; ?>
 									<td class="column-primary">
 										<span class="perflocale-str-original<?php echo $has_placeholders ? ' perflocale-str-original--has-ph' : ''; ?>">
-											<?php echo esc_html( mb_strimwidth( $string->original, 0, 100, '...' ) ); ?>
+											<?php echo esc_html( self::truncate( (string) $string->original, 100 ) ); ?>
 										</span>
 										<?php if ( ! empty( $string->context ) ) : ?>
 											<span class="perflocale-str-context"><?php echo esc_html( $string->context ); ?></span>
@@ -1622,4 +1622,26 @@ final class StringsPage {
 
 		return $hints;
 	}
+
+	/**
+	 * Shorten a string for display, without depending on mb_strimwidth().
+	 *
+	 * WordPress polyfills mb_substr and mb_strlen (wp-includes/compat.php) but
+	 * ships no mb_strimwidth polyfill at any version, so calling it directly
+	 * is a fatal on a PHP build without ext-mbstring. Site Health reports the
+	 * missing extension rather than preventing it, so this page must not
+	 * assume it.
+	 *
+	 * @param string $text  Text to shorten.
+	 * @param int    $limit Maximum length before the ellipsis.
+	 * @return string
+	 */
+	private static function truncate( string $text, int $limit ): string {
+		if ( mb_strlen( $text ) <= $limit ) {
+			return $text;
+		}
+
+		return mb_substr( $text, 0, $limit ) . '...';
+	}
+
 }

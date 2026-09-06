@@ -616,6 +616,13 @@ final class Settings {
 	 * @param array<string, mixed> $values Key-value pairs to update.
 	 * @return bool True on success.
 	 */
+	/**
+	 * Set by {@see update()}; read by {@see last_update_was_noop()}.
+	 *
+	 * @var bool
+	 */
+	private static bool $last_update_was_noop = false;
+
 	public function update( array $values ): bool {
 		$sanitized = $this->sanitize( $values );
 
@@ -674,6 +681,7 @@ final class Settings {
 
 				return [
 					'ok'      => (bool) $saved,
+					'noop'    => $merged === $current,
 					'merged'  => $merged,
 					'current' => $current,
 				];
@@ -688,10 +696,30 @@ final class Settings {
 			return false;
 		}
 
+		self::$last_update_was_noop = (bool) ( $result['noop'] ?? false );
+
 		/** @hook perflocale/settings/updated Fires after settings are saved. */
 		do_action( 'perflocale/settings/updated', $result['merged'], $result['current'] );
 
 		return (bool) $result['ok'];
+	}
+
+	/**
+	 * Whether the most recent {@see update()} wrote nothing because the stored
+	 * value already matched.
+	 *
+	 * update_option() returns false for BOTH a refused write and a no-op, and a
+	 * caller cannot tell them apart from the outside. The distinction matters on
+	 * the settings screen: re-saving a tab without changing anything is the
+	 * common case, and reporting it as a failure would be wrong, while a write
+	 * wpdb actually refused must not be reported as success.
+	 *
+	 * The boolean update() returns is deliberately unchanged — the addon-toggle
+	 * path treats false as a failure and the gate pins that — so this is exposed
+	 * alongside it rather than folded into it.
+	 */
+	public static function last_update_was_noop(): bool {
+		return self::$last_update_was_noop;
 	}
 
 	/**
@@ -911,7 +939,17 @@ final class Settings {
 				continue;
 			}
 
-			$code = strtoupper( substr( sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) ), 0, 3 ) );
+			// Validated, not byte-truncated. substr( …, 0, 3 ) on a four-byte
+			// character leaves three bytes of a half-finished UTF-8 sequence, and
+			// the consequence is not local: the invalid value goes into the
+			// settings array, update_option() hands it to wpdb, strip_invalid_text()
+			// drops the bad bytes while the serialize() length header still claims
+			// them, and the whole blob stops unserialising. get_option() then
+			// returns false, load() falls back to defaults, and EVERY setting in
+			// the plugin is silently lost. ISO 4217 codes are three ASCII letters
+			// by definition, so anything else is simply not a currency code.
+			$raw_code = sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) );
+			$code     = preg_match( '/^[A-Za-z]{3}$/', $raw_code ) === 1 ? strtoupper( $raw_code ) : '';
 
 			if ( $code === '' ) {
 				continue;

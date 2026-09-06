@@ -130,14 +130,28 @@ final class SiteHealth {
 	];
 
 	/**
-	 * Required PHP extensions. Missing any of these means user-visible
-	 * features break silently: XLIFF import/export uses dom + libxml +
-	 * simplexml, every text path uses mbstring, and the REST layer +
-	 * provider calls need json.
+	 * PHP extensions that gate one optional PerfLocale feature each. Absent
+	 * ones cost that feature and nothing else - the rest of the plugin runs
+	 * unchanged - so this reports a recommendation, not a critical failure.
+	 *
+	 * Two extensions an earlier revision listed here are deliberately gone:
+	 *
+	 * - `mbstring`: the only multibyte calls left in the plugin are
+	 *   mb_strlen() and mb_substr(), and WordPress core polyfills both in
+	 *   wp-includes/compat.php at every version PerfLocale supports. Nothing
+	 *   degrades without the extension, so flagging it raised a critical
+	 *   failure that was never true. Core's own Site Health agrees: it marks
+	 *   mbstring `required => false`.
+	 * - `json`: cannot be disabled on PHP 8.0+, and this plugin's floor is
+	 *   8.1, so the branch was unreachable.
+	 *
+	 * `xmlwriter` is new here: XLIFF export builds its document with it, and
+	 * the old list omitted it while naming `simplexml`, which the plugin only
+	 * ever touches through core's already-guarded sitemap renderer.
 	 *
 	 * @var array<int, string>
 	 */
-	private const REQUIRED_PHP_EXTENSIONS = [ 'mbstring', 'dom', 'libxml', 'simplexml', 'json' ];
+	private const FEATURE_PHP_EXTENSIONS = [ 'dom', 'libxml', 'xmlwriter', 'simplexml', 'filter', 'intl' ];
 
 	/**
 	 * MT provider API hosts for DNS reachability checks. Keyed by the
@@ -1608,14 +1622,30 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Verify that every PHP extension PerfLocale depends on is loaded.
+	 * Report which optional PHP extensions are absent, and name the single
+	 * feature each one costs.
+	 *
+	 * Never critical. Every code path behind these extensions now checks for
+	 * them and raises a readable exception, so a missing one narrows what the
+	 * plugin can do without breaking what it already does.
 	 *
 	 * @return array<string, mixed>
 	 */
 	public function test_php_extensions(): array {
+		// Kept next to the constant rather than inside it so the feature names
+		// stay translatable - __() cannot run in a class constant.
+		$features = [
+			'dom'       => __( 'XLIFF import', 'perflocale' ),
+			'libxml'    => __( 'XLIFF import', 'perflocale' ),
+			'xmlwriter' => __( 'XLIFF export', 'perflocale' ),
+			'simplexml' => __( 'XML sitemaps (WordPress core needs this one too)', 'perflocale' ),
+			'filter'    => __( 'machine translation and webhooks (their address checks fail closed without it)', 'perflocale' ),
+			'intl'      => __( 'locale-aware number and currency formatting (WordPress formatting is used instead without it)', 'perflocale' ),
+		];
+
 		$missing = [];
 
-		foreach ( self::REQUIRED_PHP_EXTENSIONS as $ext ) {
+		foreach ( self::FEATURE_PHP_EXTENSIONS as $ext ) {
 			if ( ! extension_loaded( $ext ) ) {
 				$missing[] = $ext;
 			}
@@ -1624,11 +1654,11 @@ final class SiteHealth {
 		if ( $missing === [] ) {
 			return $this->pass(
 				'perflocale_php_extensions',
-				__( 'All required PHP extensions are loaded', 'perflocale' ),
+				__( 'Optional PHP extensions are all available', 'perflocale' ),
 				sprintf(
 					/* translators: %s: comma-separated extension list */
-					esc_html__( 'PerfLocale requires %s. All are present.', 'perflocale' ),
-					'<code>' . esc_html( implode( ', ', self::REQUIRED_PHP_EXTENSIONS ) ) . '</code>'
+					esc_html__( 'Every optional extension PerfLocale can use is installed: %s.', 'perflocale' ),
+					'<code>' . esc_html( implode( ', ', self::FEATURE_PHP_EXTENSIONS ) ) . '</code>'
 				)
 			);
 		}
@@ -1636,17 +1666,21 @@ final class SiteHealth {
 		$items = '';
 
 		foreach ( $missing as $ext ) {
-			$items .= '<li><code>' . esc_html( $ext ) . '</code></li>';
+			$items .= sprintf(
+				'<li><code>%1$s</code> - %2$s</li>',
+				esc_html( $ext ),
+				esc_html( $features[ $ext ] ?? '' )
+			);
 		}
 
-		return $this->critical(
+		return $this->recommended(
 			'perflocale_php_extensions',
-			__( 'Required PHP extensions are missing', 'perflocale' ),
+			__( 'Some optional PHP extensions are not installed', 'perflocale' ),
 			sprintf(
 				'<p>%1$s</p><ul>%2$s</ul><p>%3$s</p>',
-				esc_html__( 'PerfLocale relies on the following extensions. Ask your host to enable them or features like XLIFF import, string scanning, and REST requests will fail unpredictably:', 'perflocale' ),
+				esc_html__( 'PerfLocale runs without these. Each one you add enables the feature listed beside it; everything else works either way.', 'perflocale' ),
 				$items,
-				esc_html__( 'Most shared hosts enable these by default; they are usually provided by the php-xml, php-mbstring, and php-json packages.', 'perflocale' )
+				esc_html__( 'On most hosts all of them arrive together in the php-xml package.', 'perflocale' )
 			)
 		);
 	}

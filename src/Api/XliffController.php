@@ -140,7 +140,17 @@ final class XliffController extends RestController {
 		}
 
 		$exporter = new XliffExporter();
-		$xliff    = $exporter->export( $post_ids, $source_lang, $target_lang );
+
+		try {
+			$xliff = $exporter->export( $post_ids, $source_lang, $target_lang );
+		} catch ( \Throwable $e ) {
+			// The export builder needs ext-xmlwriter, which a stripped PHP
+			// build can lack. Nothing above this frame catches, so an
+			// uncaught Error here would end the request as a fatal instead
+			// of a REST envelope. 500 is right: the request was valid and
+			// the server is the part that is missing something.
+			return $this->error( 'export_failed', $e->getMessage(), 500 );
+		}
 
 		return $this->success(
 			[

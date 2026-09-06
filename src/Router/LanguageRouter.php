@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Router;
 
 use PerfLocale\Cache\CacheManager;
+use PerfLocale\Helper;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Settings;
 
@@ -634,16 +635,12 @@ final class LanguageRouter {
 		// Excluded paths (wp-admin, wp-json, wp-login.php, custom). These
 		// also already get skipped in the admin/REST guards above, but
 		// custom excluded paths (e.g., `/api/`, `/feed/`) need this check.
-		foreach ( $this->settings->get_excluded_paths() as $excluded ) {
-			$excluded = (string) $excluded;
-
-			if ( $excluded === '' ) {
-				continue;
-			}
-
-			if ( str_starts_with( $relative, $excluded ) ) {
-				return;
-			}
+		// Shared with UrlConverter. This used to be a bare str_starts_with, which
+		// meant an excluded `/api` also excluded `/apifoo`, and which compared an
+		// encoded request path against a decoded stored needle so no non-Latin
+		// excluded path ever matched.
+		if ( Helper::path_matches_excluded( $relative, (array) $this->settings->get_excluded_paths() ) ) {
+			return;
 		}
 
 		// Build the prefixed target. `get_url_prefix()` returns the slug or
@@ -1437,6 +1434,16 @@ final class LanguageRouter {
 		$first_seg = $slash_pos !== false ? substr( $path, 0, $slash_pos ) : $path;
 
 		// Direct slug match.
+		// REQUEST_URI is percent-encoded; the map keys are not. See
+		// detect_from_path() for why only the lookup is decoded.
+		if ( ! isset( $slug_map[ $first_seg ] ) && strpos( $first_seg, '%' ) !== false ) {
+			$decoded_first = rawurldecode( $first_seg );
+
+			if ( isset( $slug_map[ $decoded_first ] ) ) {
+				$first_seg = $decoded_first;
+			}
+		}
+
 		if ( isset( $slug_map[ $first_seg ] ) ) {
 			return $first_seg;
 		}
@@ -1445,7 +1452,7 @@ final class LanguageRouter {
 		foreach ( $slug_map as $slug => $lang ) {
 			$locale_prefix = strtolower( str_replace( '_', '-', $lang->locale ) );
 
-			if ( $first_seg === $locale_prefix ) {
+			if ( $first_seg === $locale_prefix || rawurldecode( $first_seg ) === $locale_prefix ) {
 				return $slug;
 			}
 		}
@@ -1545,6 +1552,41 @@ final class LanguageRouter {
 	 * @param array<string, object> $slug_map Language slug map.
 	 * @return string|null Detected language slug or null.
 	 */
+	/**
+	 * Read the language query parameter without destroying a legal prefix.
+	 *
+	 * sanitize_key() lowercases and strips everything outside `[a-z0-9_-]`,
+	 * which is fine for the ordinary `?lang=de` but silently mangles a prefix
+	 * the plugin itself wrote. Settings::get_url_prefix() is a byte operation,
+	 * so a locale carrying `@` or non-ASCII survives into the URL: `sr_RS@latin`
+	 * is written as `?lang=sr-rs@latin` and read back as `sr-rslatin`, which
+	 * matches nothing, so every non-default page on such a site served the
+	 * default language.
+	 *
+	 * Fixing the WRITER was the obvious move and is wrong: it would change every
+	 * live URL on sites that work today. So the reader accepts the raw value
+	 * when, and only when, it is a key the plugin itself minted, and otherwise
+	 * falls back to the sanitised form exactly as before. The raw string is used
+	 * solely as an array key for that lookup and never reaches SQL or output.
+	 *
+	 * @param string              $raw        Unslashed query value.
+	 * @param array<string, mixed> $prefix_map Known prefixes.
+	 * @return string Either the raw value or its sanitised form.
+	 */
+	private function resolve_prefix_candidate( string $raw, array $prefix_map ): string {
+		if ( $raw !== '' && isset( $prefix_map[ $raw ] ) ) {
+			return $raw;
+		}
+
+		$lowered = strtolower( $raw );
+
+		if ( $lowered !== '' && isset( $prefix_map[ $lowered ] ) ) {
+			return $lowered;
+		}
+
+		return sanitize_key( $raw );
+	}
+
 	private function detect_from_query_param( array $slug_map ): ?string {
 		$query_var = UrlConverter::query_var();
 
@@ -1553,8 +1595,10 @@ final class LanguageRouter {
 			return null;
 		}
 
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only language routing; no state change.
-		$slug = sanitize_key( wp_unslash( $_GET[ $query_var ] ) );
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Read-only language routing, no state change. Deliberately unsanitised: resolve_prefix_candidate() uses the raw string ONLY as an array key against the plugin's own prefix map and falls back to sanitize_key() for anything not found there, so nothing unsanitised reaches SQL, output or state. sanitize_key() here would strip the '@' and non-ASCII bytes out of a prefix the plugin itself wrote.
+		$raw_slug   = (string) wp_unslash( $_GET[ $query_var ] );
+		$prefix_map = $this->prefix_map( $slug_map );
+		$slug       = $this->resolve_prefix_candidate( $raw_slug, $prefix_map );
 
 		if ( $slug === '' ) {
 			return null;
@@ -1566,8 +1610,6 @@ final class LanguageRouter {
 		// switched to full-locale prefixes, and `?lang=en-us` resolves on a
 		// slug-prefix site — no bookmark, backlink or indexed URL ever dies
 		// because someone changed a setting.
-		$prefix_map = $this->prefix_map( $slug_map );
-
 		if ( isset( $prefix_map[ $slug ] ) ) {
 			return $prefix_map[ $slug ];
 		}
@@ -1620,12 +1662,8 @@ final class LanguageRouter {
 			return;
 		}
 
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only canonicalization.
-		$prefix = sanitize_key( wp_unslash( $_GET[ $query_var ] ) );
-
-		if ( $prefix === '' ) {
-			return;
-		}
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Read-only canonicalisation. Same contract as detect_from_query_param(): the raw string is only ever an array key into the plugin's own prefix map, with sanitize_key() as the fallback.
+		$raw_prefix = (string) wp_unslash( $_GET[ $query_var ] );
 
 		$slug_map = $this->get_language_slug_map();
 
@@ -1634,8 +1672,15 @@ final class LanguageRouter {
 		}
 
 		// Resolve whatever form the visitor arrived with: own slug, locale
-		// form, or a slug the admin has since renamed.
+		// form, or a slug the admin has since renamed. Same reader tolerance as
+		// detect_from_query_param(), or this canonicaliser would 301 a legal
+		// prefix it could not parse.
 		$prefix_map = $this->prefix_map( $slug_map );
+		$prefix     = $this->resolve_prefix_candidate( $raw_prefix, $prefix_map );
+
+		if ( $prefix === '' ) {
+			return;
+		}
 		$resolved   = $prefix_map[ $prefix ] ?? '';
 
 		if ( $resolved === '' ) {
@@ -1698,8 +1743,28 @@ final class LanguageRouter {
 		$slash_pos = strpos( $request, '/' );
 		$first_seg = $slash_pos !== false ? substr( $request, 0, $slash_pos ) : $request;
 
-		if ( isset( $prefix_map[ $first_seg ] ) ) {
-			$detected_slug = $prefix_map[ $first_seg ];
+		// $wp->request carries the PERCENT-ENCODED path, while prefix_map keys
+		// are decoded. For an ASCII prefix the two forms are identical, which is
+		// why this went unnoticed; for a locale prefix containing `@` or
+		// non-ASCII a browser sends `/%D1%80%D1%83%D1%81-ru/` and the lookup
+		// missed, so the plugin rendered the default language on a URL it had
+		// emitted itself. Core does not miss, because WP::parse_request() retries
+		// every rewrite rule against urldecode().
+		//
+		// Only the LOOKUP key is decoded. $first_seg stays raw because the string
+		// surgery below indexes into $request and $matched_query by its length.
+		$seg_key = $first_seg;
+
+		if ( ! isset( $prefix_map[ $seg_key ] ) && strpos( $first_seg, '%' ) !== false ) {
+			$decoded_seg = rawurldecode( $first_seg );
+
+			if ( isset( $prefix_map[ $decoded_seg ] ) ) {
+				$seg_key = $decoded_seg;
+			}
+		}
+
+		if ( isset( $prefix_map[ $seg_key ] ) ) {
+			$detected_slug = $prefix_map[ $seg_key ];
 
 			$wp->request = $slash_pos !== false ? substr( $request, $slash_pos + 1 ) : '';
 

@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Router;
 
 use PerfLocale\Cache\CacheManager;
+use PerfLocale\Helper;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -816,7 +817,7 @@ final class GeoRedirect {
 		if ( ! empty( $_SERVER['HTTP_CF_CONNECTING_IP'] ) && $this->is_cloudflare_ip( $remote_addr ) ) {
 			$cf_ip = trim( sanitize_text_field( wp_unslash( (string) $_SERVER['HTTP_CF_CONNECTING_IP'] ) ) );
 
-			if ( filter_var( $cf_ip, FILTER_VALIDATE_IP ) !== false ) {
+			if ( Helper::is_ip( $cf_ip ) ) {
 				return $cf_ip;
 			}
 		}
@@ -834,7 +835,7 @@ final class GeoRedirect {
 			for ( $i = count( $hops ) - 1; $i >= 0; $i-- ) {
 				$hop = trim( $hops[ $i ] );
 
-				if ( $hop === '' || filter_var( $hop, FILTER_VALIDATE_IP ) === false ) {
+				if ( $hop === '' || ! Helper::is_ip( $hop ) ) {
 					continue;
 				}
 
@@ -852,7 +853,7 @@ final class GeoRedirect {
 		if ( ! empty( $_SERVER['HTTP_X_REAL_IP'] ) ) {
 			$real_ip = trim( sanitize_text_field( wp_unslash( (string) $_SERVER['HTTP_X_REAL_IP'] ) ) );
 
-			if ( filter_var( $real_ip, FILTER_VALIDATE_IP ) !== false ) {
+			if ( Helper::is_ip( $real_ip ) ) {
 				return $real_ip;
 			}
 		}
@@ -976,11 +977,7 @@ final class GeoRedirect {
 	 * @return bool
 	 */
 	private function is_local_ip( string $ip ): bool {
-		return ! filter_var(
-			$ip,
-			FILTER_VALIDATE_IP,
-			FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-		);
+		return ! Helper::is_public_ipv4( $ip );
 	}
 
 	/**

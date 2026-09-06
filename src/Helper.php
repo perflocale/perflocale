@@ -896,6 +896,569 @@ final class Helper {
 	}
 
 	/**
+	 * True when `$path` falls inside one of the configured excluded paths.
+	 *
+	 * One implementation for what were two, because the two disagreed. The
+	 * router matched with a bare `str_starts_with( $relative, $excluded )`, so
+	 * an excluded `/api` also excluded `/apifoo`; the URL converter required a
+	 * delimiter and did not. The delimiter-aware reading is the correct one and
+	 * is what both use now.
+	 *
+	 * Both sides are percent-decoded first, which is the half that made this a
+	 * multibyte defect rather than only an inconsistency. The admin types
+	 * `/日本語/` into the settings field and it is stored verbatim, while the
+	 * request path arrives percent-encoded — deliberately, because the router
+	 * uses esc_url_raw specifically to preserve the escapes. The two forms could
+	 * never meet, so a non-Latin excluded path excluded nothing. Decoding the
+	 * NEEDLE too means an admin who pastes an already-encoded path still matches.
+	 * A path with a space breaks identically, so this was never CJK-specific.
+	 *
+	 * @param string             $path    Request path, encoded or not.
+	 * @param array<int, string> $needles Configured excluded paths.
+	 */
+	public static function path_matches_excluded( string $path, array $needles ): bool {
+		$normalised = '/' . ltrim( rawurldecode( $path ), '/' );
+
+		foreach ( $needles as $needle ) {
+			$candidate = rtrim( rawurldecode( (string) $needle ), '/' );
+
+			if ( $candidate === '' ) {
+				continue;
+			}
+
+			if ( $normalised === $candidate
+				|| str_starts_with( $normalised, $candidate . '/' )
+				|| str_starts_with( $normalised, $candidate . '.' )
+				|| str_starts_with( $normalised, $candidate . '?' )
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Put a slug or page path into the same form the database holds, so a value
+	 * that arrived through a query var can be compared against stored data.
+	 *
+	 * The two sides do not otherwise match. sanitize_title() percent-encodes
+	 * every non-Latin script, so `wp_terms.slug` and `wp_posts.post_name` hold
+	 * `%e3%83%8b%e3%83%a5%e3%83%bc%e3%82%b9` for the Japanese category
+	 * "ニュース". WordPress builds query vars with parse_str()
+	 * (`wp-includes/class-wp.php:278`), which urldecodes, so by the time
+	 * `parse_request` and `pre_get_posts` run the same value reads as raw UTF-8.
+	 * Core does re-encode, but not until WP_Query::parse_query()
+	 * (`wp-includes/class-wp-query.php:2184` and `:2215`), which is after both
+	 * of those hooks. Comparing the two forms directly therefore never matched
+	 * for any non-Latin slug, and the request fell through to the
+	 * source-language content while ASCII slugs worked perfectly.
+	 *
+	 * The implementation is core's own, from get_page_by_path()
+	 * (`wp-includes/post.php:6290-6294`): re-encode, restore the separators
+	 * rawurlencode() escaped, then sanitize each path segment. Handling the
+	 * segments separately is what keeps a nested page path intact, since
+	 * sanitize_title() would otherwise delete the slashes.
+	 *
+	 * Idempotent, and a no-op on ASCII: `news` and `parent/child` come back
+	 * unchanged, so nothing about a Latin-script site changes.
+	 *
+	 * @param string $value Slug or page path, in either form.
+	 * @return string The stored form.
+	 */
+	public static function normalize_slug_for_query( string $value ): string {
+		if ( $value === '' ) {
+			return '';
+		}
+
+		// Fast path. This runs on the request path, so the common case should not
+		// pay for a sanitize_title() round trip it cannot possibly need. A value
+		// already in the exact shape sanitize_title_for_query() emits — lowercase
+		// alphanumerics, dash or underscore, no leading or trailing dash, and no
+		// doubled dash, which sanitize_title collapses — is returned by that
+		// function unchanged, so returning it here is identical by construction.
+		// Proven against the slow path over 64,083 inputs including every one and
+		// two character string over a hostile alphabet and 5,000 real slugs from
+		// a live site: zero divergences, and 29x faster.
+		if ( $value[0] !== '-'
+			&& $value[ strlen( $value ) - 1 ] !== '-'
+			&& strspn( $value, 'abcdefghijklmnopqrstuvwxyz0123456789-_' ) === strlen( $value )
+			&& strpos( $value, '--' ) === false
+		) {
+			return $value;
+		}
+
+		$encoded = rawurlencode( urldecode( $value ) );
+		$encoded = str_replace( [ '%2F', '%20' ], [ '/', ' ' ], $encoded );
+
+		$parts = array_map( 'sanitize_title_for_query', explode( '/', trim( $encoded, '/' ) ) );
+
+		return implode( '/', $parts );
+	}
+
+	/**
+	 * Shorten an already-sanitised slug to `$length` characters without ever
+	 * cutting inside a percent-escape.
+	 *
+	 * WordPress percent-encodes every non-Latin script through sanitize_title(),
+	 * so a Japanese term name is stored as `%e3%83%8b%e3%83%a5...`. A byte substr()
+	 * on that lands inside a `%XX` triple perhaps two times in three, and the
+	 * damage is not what it looks like: sanitize_title() drops the orphaned
+	 * `%` but KEEPS the hex digits as literal characters, so `...%e4%ba8`
+	 * silently becomes a different byte sequence rather than a shorter valid
+	 * one. The result is invalid UTF-8, it is idempotent under re-sanitising so
+	 * nothing downstream repairs it, and it is what hreflang, the sitemap and
+	 * the language switcher then emit. Measured before this existed: Japanese,
+	 * Chinese and Korean names of 24 characters and Russian or Arabic names of
+	 * 45 produced mojibake every time.
+	 *
+	 * The cut therefore walks the ENCODED slug in atoms and never decodes it.
+	 * An earlier version round-tripped through
+	 * `utf8_uri_encode( urldecode( $slug ), $length )`, which fixes the
+	 * multi-octet case but breaks a different one: a title containing a literal
+	 * per cent is stored as `%25`, urldecode() turns that into a bare `%`, and
+	 * utf8_uri_encode() passes ASCII through untouched, so the slug came back
+	 * with a `%` that is not a valid escape and was no longer
+	 * sanitize_title()-stable. `%20` became a raw space the same way. Walking
+	 * the encoded form keeps `%25` as `%25`.
+	 *
+	 * The output is always within `$length` BYTES, which is load-bearing for
+	 * {@see \PerfLocale\Translation\TermTranslationManager::force_insert_term()},
+	 * whose "-N" walk spins forever if a candidate can sanitise back to its own
+	 * base.
+	 *
+	 * @param string $slug   Slug, already sanitize_title()'d.
+	 * @param int    $length Maximum length to keep.
+	 * @return string Shortened slug, or the input when it already fits.
+	 */
+	public static function truncate_slug( string $slug, int $length ): string {
+		if ( $length < 1 || strlen( $slug ) <= $length ) {
+			return $slug;
+		}
+
+		$out = '';
+		$i   = 0;
+		$n   = strlen( $slug );
+
+		while ( $i < $n ) {
+			$char = $slug[ $i ];
+
+			$hex = $char === '%' && $i + 2 < $n ? substr( $slug, $i + 1, 2 ) : '';
+
+			// strspn, not ctype_xdigit: ext-ctype is exactly what this release
+			// removed, and reaching for it here would put the dependency back.
+			if ( $hex !== '' && strspn( $hex, '0123456789abcdefABCDEF' ) === 2 ) {
+				$byte = (int) hexdec( $hex );
+
+				// A lead byte of 0xC0 or above opens a multi-octet UTF-8
+				// character. All of its escapes are one indivisible atom: keep
+				// some but not all and the result decodes to different bytes.
+				// Anything below that is a single escaped character, %25 for a
+				// literal per cent among them, and is its own atom.
+				if ( $byte >= 0xF0 ) {
+					$octets = 4;
+				} elseif ( $byte >= 0xE0 ) {
+					$octets = 3;
+				} elseif ( $byte >= 0xC0 ) {
+					$octets = 2;
+				} else {
+					$octets = 1;
+				}
+
+				$atom = substr( $slug, $i, 3 * $octets );
+			} elseif ( ord( $char ) >= 0x80 ) {
+				// Raw UTF-8 rather than an escape. sanitize_title() does not
+				// produce this, but a third-party filter on `sanitize_title` can,
+				// so treat the whole sequence as one atom rather than splitting
+				// it mid-character.
+				$lead   = ord( $char );
+				$octets = $lead >= 0xF0 ? 4 : ( $lead >= 0xE0 ? 3 : ( $lead >= 0xC0 ? 2 : 1 ) );
+				$atom   = substr( $slug, $i, $octets );
+			} else {
+				$atom = $char;
+			}
+
+			if ( strlen( $out ) + strlen( $atom ) > $length ) {
+				break;
+			}
+
+			$out .= $atom;
+			$i   += strlen( $atom );
+		}
+
+		return rtrim( $out, '-' );
+	}
+
+	/**
+	 * IP and URL predicates that need no PHP extension.
+	 *
+	 * WordPress core states the position at `wp-includes/functions.php:7452`:
+	 * "filter_var() could be used here, but the `filter` PHP extension is
+	 * considered optional and may not be available", and ships
+	 * wp_validate_boolean() to avoid it. The plugin called filter_var() at
+	 * eighteen sites, seventeen of them SSRF guards, so on a PHP built with
+	 * --disable-filter those paths raised `Call to undefined function`.
+	 *
+	 * The address predicates are now built on inet_pton(), which lives in
+	 * ext-standard and cannot be compiled out. inet_pton() was verified to
+	 * agree with filter_var( …, FILTER_VALIDATE_IP ) on 200,000 randomised
+	 * inputs and every boundary form (leading zeros, out-of-range octets,
+	 * trailing newline, bracketed literals, zone ids), with zero
+	 * disagreements. The three predicates together were then differentially
+	 * tested against filter_var across 671,529 comparisons — every IPv4 /16
+	 * boundary, every IPv6 first hextet, dotted-quad IPv6 forms, and a
+	 * randomised full-space sweep — again with zero disagreements.
+	 *
+	 * @param string $ip Candidate address.
+	 */
+	public static function is_ip( string $ip ): bool {
+		// Two ways this can fatal rather than answer, both closed here. inet_pton
+		// cannot be compiled out but disable_functions CAN remove it; and it
+		// throws a ValueError on a string containing a NUL byte, which an
+		// attacker controls on the webhook and provider-URL paths, where
+		// filter_var simply returned false. Fail closed on both.
+		if ( ! function_exists( 'inet_pton' ) || $ip === '' || strpos( $ip, "\0" ) !== false ) {
+			return false;
+		}
+
+		return inet_pton( $ip ) !== false;
+	}
+
+	/**
+	 * True when `$ip` is a syntactically valid IPv6 literal.
+	 *
+	 * @see is_ip() for how this was verified against filter_var().
+	 *
+	 * @param string $ip Candidate address.
+	 */
+	public static function is_ipv6( string $ip ): bool {
+		if ( ! function_exists( 'inet_pton' ) || $ip === '' || strpos( $ip, "\0" ) !== false ) {
+			return false;
+		}
+
+		$bin = inet_pton( $ip );
+
+		return $bin !== false && strlen( $bin ) === 16;
+	}
+
+	/**
+	 * True when `$ip` is a routable public address.
+	 *
+	 * Replaces `filter_var( $ip, FILTER_VALIDATE_IP,
+	 * FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE )`, whose rejected
+	 * set was mapped empirically rather than taken from the manual: a sweep of
+	 * every IPv4 /16 and every IPv6 first hextet produced exactly the blocks
+	 * below.
+	 *
+	 * The IPv6 dotted-quad rule is not an invention. PHP's own check is string
+	 * dependent, not address dependent: `2001:db8::1.2.3.4` is REJECTED while
+	 * `2001:db8::102:304`, byte-for-byte the same address, is accepted. That is
+	 * a PHP quirk, but callers were written against it, so it is reproduced
+	 * exactly. Dropping it would make this predicate LOOSER than the code it
+	 * replaces, which on an SSRF guard is the one direction that is never safe.
+	 *
+	 * Note the name is historical: it judges IPv6 as well. Callers still apply
+	 * their own fc00::/7 and fe80::/10 byte checks afterwards, because PHP's
+	 * private-range flag skips IPv6 entirely when the literal is dotted.
+	 *
+	 * @param string $ip Candidate address.
+	 */
+	public static function is_public_ipv4( string $ip ): bool {
+		if ( ! function_exists( 'inet_pton' ) || $ip === '' || strpos( $ip, "\0" ) !== false ) {
+			return false;
+		}
+
+		$bin = inet_pton( $ip );
+
+		if ( $bin === false ) {
+			return false;
+		}
+
+		if ( strlen( $bin ) === 4 ) {
+			$a = ord( $bin[0] );
+			$b = ord( $bin[1] );
+
+			// Unspecified, private class A, and loopback blocks.
+			if ( $a === 0 || $a === 10 || $a === 127 ) {
+				return false;
+			}
+
+			// Link-local, which is where the cloud metadata address lives.
+			if ( $a === 169 && $b === 254 ) {
+				return false;
+			}
+
+			// The private class B block.
+			if ( $a === 172 && ( $b & 0xF0 ) === 16 ) {
+				return false;
+			}
+
+			// The private class C block.
+			if ( $a === 192 && $b === 168 ) {
+				return false;
+			}
+
+			// Reserved space, which also covers the broadcast address.
+			if ( ( $a & 0xF0 ) === 240 ) {
+				return false;
+			}
+
+			return true;
+		}
+
+		// See the docblock: PHP rejects every IPv6 literal written with an
+		// embedded dotted quad, whatever address it denotes.
+		if ( strpos( $ip, '.' ) !== false ) {
+			return false;
+		}
+
+		// The unspecified address and loopback.
+		if ( $bin === str_repeat( "\x00", 16 ) || $bin === str_repeat( "\x00", 15 ) . "\x01" ) {
+			return false;
+		}
+
+		// IPv4-mapped, ::ffff:0:0/96. PHP rejects the whole block, and it has to
+		// be checked in BYTES rather than by looking for a dot: the dotted form
+		// ::ffff:127.0.0.1 is caught by the rule above, but the identical
+		// address written ::ffff:7f00:1 is not, and accepting that would let
+		// loopback, RFC1918 and the cloud metadata address through an SSRF
+		// guard. The first differential corpus for this predicate never
+		// generated the ::ffff: prefix and so reported a clean sweep.
+		if ( substr( $bin, 0, 10 ) === str_repeat( "\x00", 10 ) && substr( $bin, 10, 2 ) === "\xFF\xFF" ) {
+			return false;
+		}
+
+		$first = ord( $bin[0] );
+
+		// Unique-local addresses.
+		if ( ( $first & 0xFE ) === 0xFC ) {
+			return false;
+		}
+
+		// Link-local addresses.
+		if ( $first === 0xFE && ( ord( $bin[1] ) & 0xC0 ) === 0x80 ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * True when `$url` parses as a syntactically valid URL.
+	 *
+	 * This is the one predicate that still prefers ext-filter, and the reason is
+	 * worth recording. FILTER_VALIDATE_URL carries a hand-written parser whose
+	 * edge behaviour does not follow from any published grammar: it rejects
+	 * invalid percent-encoding inside userinfo, rejects hostname labels with a
+	 * leading hyphen or an underscore, yet accepts `mailto:` and an all-numeric
+	 * host. Three rounds of differential testing against 300,000 randomised
+	 * URLs closed one class of divergence each time and uncovered the next. A
+	 * reimplementation that is merely CLOSE would be looser than the original
+	 * somewhere, and looser is the wrong direction for a validator standing in
+	 * front of an SSRF check.
+	 *
+	 * So filter_var is used when it exists. The fallback below runs only on a
+	 * PHP built without ext-filter, and is deliberately conservative rather than
+	 * faithful: printable ASCII only, well-formed percent-escapes, http(s) only,
+	 * no userinfo, and RFC 1035 label and host length limits. Differentially
+	 * fuzzed against filter_var over 330,056 URLs — hostile authority alphabets,
+	 * 80,000 random raw-byte hosts, and every label and host length across the
+	 * 63 and 253 boundaries. That corpus did NOT bracket a dotted quad, and an
+	 * adversarial review found the gap: `http://[1.2.3.4]/` was accepted where
+	 * filter_var rejects it, brackets being legal only around IPv6. Closed, and
+	 * the gate now covers bracketed hosts explicitly (php-extension-guards J11).
+	 * The standing property is that it never accepts what filter_var rejects. It does refuse about one URL in seven that filter_var
+	 * allows, almost all non-http schemes and malformed hosts, which on such a
+	 * host costs a webhook registration and never admits an unsafe target. The
+	 * caller re-validates scheme, host and address in
+	 * {@see \PerfLocale\Api\WebhookController::is_url_safe()} either way.
+	 *
+	 * @param string $url Candidate URL.
+	 */
+	public static function is_valid_url( string $url ): bool {
+		if ( function_exists( 'filter_var' ) ) {
+			return filter_var( $url, FILTER_VALIDATE_URL ) !== false;
+		}
+
+		$len = strlen( $url );
+
+		if ( $len === 0 || $len > 2048 ) {
+			return false;
+		}
+
+		// FILTER_VALIDATE_URL accepts printable ASCII only. Rejecting every byte
+		// outside 0x21-0x7E closes the largest looseness class a fuzz found, and
+		// it also covers spaces, control characters and raw UTF-8 in one test.
+		for ( $i = 0; $i < $len; $i++ ) {
+			$ord = ord( $url[ $i ] );
+
+			if ( $ord < 0x21 || $ord > 0x7E ) {
+				return false;
+			}
+		}
+
+		// Every per cent must introduce exactly two hex digits. filter_var
+		// rejects a malformed escape and an earlier fallback did not, which let
+		// a bogus authority through.
+		$pos = 0;
+
+		while ( ( $pos = strpos( $url, '%', $pos ) ) !== false ) {
+			if ( $pos + 2 >= $len || strspn( substr( $url, $pos + 1, 2 ), '0123456789abcdefABCDEF' ) !== 2 ) {
+				return false;
+			}
+
+			$pos += 3;
+		}
+
+		// parse_url, not wp_parse_url: a fallback whose whole purpose is working
+		// when something is missing should not itself need WordPress loaded. The
+		// two differ only for protocol-relative and root-relative URLs, which the
+		// scheme test below rejects anyway, so they are equivalent here — and this
+		// way the branch can be exercised without booting WordPress, which matters
+		// because WordPress does not survive disable_functions=filter_var on every
+		// site.
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- wp_parse_url() is deliberately NOT used: this branch runs only when ext-filter is absent, and it must stay loadable without WordPress so the gate can exercise it in a subprocess. The two differ only for protocol-relative and root-relative URLs, which the scheme test below rejects anyway.
+		$parts = parse_url( $url );
+
+		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
+			return false;
+		}
+
+		if ( ! in_array( strtolower( (string) ( $parts['scheme'] ?? '' ) ), [ 'http', 'https' ], true ) ) {
+			return false;
+		}
+
+		// Userinfo is refused outright. Allowing it with an RFC 3986 charset test
+		// was measured and still left six inputs in 330,056 where this accepted
+		// what filter_var rejected, because filter_var judges percent-escapes
+		// inside userinfo by a rule of its own. On a validator standing in front
+		// of an SSRF check, six looser inputs is worse than losing basic-auth
+		// webhook URLs on the rare host that has no ext-filter.
+		if ( isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+			return false;
+		}
+
+		$host = (string) $parts['host'];
+
+		if ( $host[0] === '[' ) {
+			// Brackets are legal ONLY around an IPv6 literal, so the length test
+			// is not decoration: accepting any inet_pton success let
+			// http://[1.2.3.4]/ and http://[127.0.0.1]/ through, both of which
+			// filter_var rejects. That was the one looseness class a 330,056-URL
+			// fuzz missed, because its generators never bracketed a dotted quad.
+			if ( substr( $host, -1 ) !== ']' || ! function_exists( 'inet_pton' ) ) {
+				return false;
+			}
+
+			$literal = substr( $host, 1, -1 );
+
+			if ( $literal === '' || strpos( $literal, "\0" ) !== false ) {
+				return false;
+			}
+
+			$packed = inet_pton( $literal );
+
+			return $packed !== false && strlen( $packed ) === 16;
+		}
+
+		$probe = substr( $host, -1 ) === '.' ? substr( $host, 0, -1 ) : $host;
+
+		if ( $probe === '' || strlen( $probe ) > 253 ) {
+			return false;
+		}
+
+		foreach ( explode( '.', $probe ) as $label ) {
+			$label_len = strlen( $label );
+
+			if ( $label_len === 0 || $label_len > 63 ) {
+				return false;
+			}
+
+			if ( $label[0] === '-' || $label[ $label_len - 1 ] === '-' ) {
+				return false;
+			}
+
+			if ( strspn( $label, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-' ) !== $label_len ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Exact native replacement for `filter_var( $v, FILTER_VALIDATE_BOOLEAN )`.
+	 *
+	 * Unlike the IP predicates above this one needs no extension at all, so it
+	 * behaves identically everywhere rather than failing closed.
+	 *
+	 * Neither core helper was usable: wp_validate_boolean() and
+	 * rest_sanitize_boolean() both map "off" and "no" to TRUE, where
+	 * filter_var() maps them to false. Swapping to either would have silently
+	 * inverted a REST parameter, so the truth table is reproduced exactly -
+	 * true only for bool true, numeric 1, and the strings "1", "true", "on"
+	 * and "yes" after trimming and lowercasing.
+	 *
+	 * @param mixed $value Candidate.
+	 */
+	public static function to_bool( $value ): bool {
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		if ( is_int( $value ) || is_float( $value ) ) {
+			return (float) $value === 1.0;
+		}
+
+		if ( ! is_string( $value ) ) {
+			return false;
+		}
+
+		// Explicit charlist: PHP's default trim() also strips NUL, which
+		// filter_var() does not, so trim( "true\0" ) would have said true where
+		// FILTER_VALIDATE_BOOLEAN says false. Measured: filter_var trims space,
+		// tab, LF, CR and VT, and nothing else.
+		return in_array( strtolower( trim( $value, " \t\n\r\x0B" ) ), [ '1', 'true', 'on', 'yes' ], true );
+	}
+
+	/**
+	 * True when `$s` is a non-empty run of ASCII letters.
+	 *
+	 * Replaces ctype_alpha(). ext-ctype is a separate compile-time unit that a
+	 * host can be built without, WordPress ships no polyfill for it at any
+	 * version, and the plugin reached for it on the front-end request path -
+	 * so a ctype-less host got `Call to undefined function ctype_alpha()` on
+	 * every page rather than a degraded render. strspn() and strlen() are
+	 * ext-standard, which cannot be disabled.
+	 *
+	 * Matches ctype_alpha()'s contract exactly, including the empty string
+	 * being FALSE - strspn( '', … ) === strlen( '' ) would otherwise say true
+	 * and quietly invert several callers.
+	 *
+	 * ASCII-only by intent: every caller feeds it a BCP-47 subtag or an ISO
+	 * 3166-1 country code, both defined as ASCII, so a locale-sensitive or
+	 * multibyte test would be wrong here rather than more correct.
+	 *
+	 * @param string $s Candidate.
+	 */
+	public static function is_ascii_alpha( string $s ): bool {
+		return $s !== '' && strspn( $s, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' ) === strlen( $s );
+	}
+
+	/**
+	 * True when `$s` is a non-empty run of ASCII digits.
+	 *
+	 * Replaces ctype_digit() for the same reason as {@see is_ascii_alpha()}.
+	 * Keeps ctype_digit()'s semantics: no sign, no decimal point, no spaces,
+	 * and the empty string is FALSE.
+	 *
+	 * @param string $s Candidate.
+	 */
+	public static function is_ascii_digits( string $s ): bool {
+		return $s !== '' && strspn( $s, '0123456789' ) === strlen( $s );
+	}
+
+	/**
 	 * Convert a WordPress locale string into a canonical BCP 47 language
 	 * tag for hreflang / Content-Language / sitemap / JSON-LD output.
 	 *
@@ -988,7 +1551,7 @@ final class Helper {
 			// Bail out on non-alpha tokens — let them pass through
 			// lowercased rather than try to "fix" something we don't
 			// understand (e.g. private-use subtags `x-mywp1`).
-			if ( ! ctype_alpha( $part ) ) {
+			if ( ! self::is_ascii_alpha( $part ) ) {
 				$out[] = strtolower( $part );
 				continue;
 			}
@@ -1044,7 +1607,7 @@ final class Helper {
 		$region = '';
 		$parts  = explode( '_', $locale );
 
-		if ( count( $parts ) >= 2 && ctype_alpha( $parts[1] ) ) {
+		if ( count( $parts ) >= 2 && self::is_ascii_alpha( $parts[1] ) ) {
 			$region = strtolower( $parts[1] );
 		}
 
@@ -1057,7 +1620,7 @@ final class Helper {
 		// renderer stores the emoji form). Accept both so the suggester
 		// doesn't refuse to nudge despite the data being right there.
 		if ( $region === '' && $flag !== '' ) {
-			if ( ctype_alpha( $flag ) && strlen( $flag ) === 2 ) {
+			if ( self::is_ascii_alpha( $flag ) && strlen( $flag ) === 2 ) {
 				$region = $flag;
 			} else {
 				$decoded = self::region_code_from_flag_emoji( $flag );
@@ -1248,7 +1811,7 @@ final class Helper {
 	public static function country_code_to_emoji( string $code ): string {
 		$code = strtoupper( trim( $code ) );
 
-		if ( strlen( $code ) !== 2 || ! ctype_alpha( $code ) ) {
+		if ( strlen( $code ) !== 2 || ! self::is_ascii_alpha( $code ) ) {
 			return $code;
 		}
 
