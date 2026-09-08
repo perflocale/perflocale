@@ -699,6 +699,14 @@ final class LanguageSwitcherBlock {
 		$html  = '<nav ' . self::build_wrapper_attrs( $classes, $wrapper_style, $block ) . '>';
 		$html .= '<ul>';
 
+		/*
+		 * Counted rather than pre-computed on purpose. render_dropdown() below
+		 * pre-counts because it has to build a trigger before the loop; here the
+		 * loop is the only thing that knows, and a second copy of the skip rules
+		 * would be free to drift away from the ones actually applied.
+		 */
+		$items = 0;
+
 		foreach ( $languages as $lang ) {
 			$is_current = ( $lang->slug === $current_slug );
 
@@ -798,6 +806,21 @@ final class LanguageSwitcherBlock {
 			}
 
 			$html .= '</li>';
+			++$items;
+		}
+
+		/*
+		 * Every language was skipped -- an untranslated page with the current
+		 * language hidden and untranslated languages hidden skips all of them.
+		 * Return nothing rather than an empty `<nav><ul></ul></nav>`: that string
+		 * is non-empty, so a consumer testing the rendered HTML for emptiness
+		 * (the floating switcher's fixed-position panel, the widget's
+		 * before_widget/after_widget, a builder addon's own wrapper) would still
+		 * draw its chrome around nothing. The dropdown branch has always done
+		 * this; the inline and simple branches did not.
+		 */
+		if ( $items === 0 ) {
+			return '';
 		}
 
 		$html .= '</ul>';

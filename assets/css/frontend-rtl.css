@@ -314,3 +314,15 @@ a.perflocale-switcher-block__item:hover {
 	padding: 3px 8px;
 }
 
+/* Touch devices: the inline switcher's language links are 26px tall, which is
+   an easy mis-tap when three of them are stacked 8px apart in a corner. Keyed
+   on `pointer: coarse` rather than a viewport width on purpose — a narrow
+   desktop window keeps the compact spacing the surrounding theme was built
+   around, and only devices that are actually finger-driven pay the extra
+   height. `min-height` alone, so nothing reflows horizontally. */
+@media (pointer: coarse) {
+	.perflocale-switcher-block__item,
+	.perflocale-dd__option {
+		min-height: 32px;
+	}
+}

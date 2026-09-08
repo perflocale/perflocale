@@ -252,7 +252,7 @@ final class WebhookController extends RestController {
 				[
 					'methods'             => \WP_REST_Server::CREATABLE,
 					'callback'            => [ $this, 'register_webhook' ],
-					'permission_callback' => [ $this, 'admin_permissions_check' ],
+					'permission_callback' => [ $this, 'register_permissions_check' ],
 					'args'                => [
 						'url'    => [
 							'required'          => true,
@@ -313,6 +313,72 @@ final class WebhookController extends RestController {
 	}
 
 	/**
+	 * Who may CREATE a webhook.
+	 *
+	 * Registering a webhook tells this site to make an outbound HTTP request to
+	 * an address the caller chose. {@see is_url_safe()} refuses loopback and
+	 * private ranges, but that check resolves the host and then hands
+	 * `wp_remote_post()` the HOSTNAME, which libcurl resolves again on its own —
+	 * so it is validate-then-connect, and a short-TTL DNS answer can differ
+	 * between the two. Pinning the validated address is not a fix worth its
+	 * cost here (see the delivery notes below), so the boundary is drawn at who
+	 * may ask for the request at all.
+	 *
+	 * On SINGLE SITE that is not a boundary: `manage_options` already implies
+	 * `install_plugins` and `edit_plugins`, so the same user can execute
+	 * arbitrary PHP. Nothing is gained by tightening this, and requiring a
+	 * network capability that does not exist would break every single-site
+	 * install. `manage_options` is therefore kept there.
+	 *
+	 * On MULTISITE it is a real boundary: a subsite administrator has
+	 * `manage_options` but NOT `install_plugins`, so without this gate the one
+	 * configuration where an outbound-request primitive is a privilege
+	 * escalation is exactly the one that allowed it. Creating a webhook now
+	 * needs `manage_network_options`; reading and deleting stay at
+	 * `manage_options` so a subsite admin can still audit and remove what is
+	 * pointed at their site.
+	 *
+	 * BREAKING CHANGE on multisite networks that delegated webhook creation to
+	 * subsite administrators. Networks that need the old behaviour can restore
+	 * it with the filter below.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return bool|\WP_Error
+	 */
+	public function register_permissions_check( \WP_REST_Request $request ): bool|\WP_Error {
+		/**
+		 * Capability required to register an outbound webhook.
+		 *
+		 * @hook perflocale/webhooks/register_capability
+		 *
+		 * @param string           $capability Default `manage_network_options` on multisite, `manage_options` otherwise.
+		 * @param \WP_REST_Request $request    The REST request being authorised.
+		 */
+		$capability = (string) apply_filters(
+			'perflocale/webhooks/register_capability',
+			is_multisite() ? 'manage_network_options' : 'manage_options',
+			$request
+		);
+
+		// A filter that returns nothing usable must not open the route.
+		if ( '' === $capability ) {
+			$capability = is_multisite() ? 'manage_network_options' : 'manage_options';
+		}
+
+		if ( ! current_user_can( $capability ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				is_multisite()
+					? __( 'Registering a webhook requires network administrator permissions.', 'perflocale' )
+					: __( 'You do not have permission to perform this action.', 'perflocale' ),
+				[ 'status' => rest_authorization_required_code() ]
+			);
+		}
+
+		return true;
+	}
+
+	/**
 	 * Reject URLs that target loopback or link-local addresses.
 	 *
 	 * Webhooks are a classic SSRF surface - an admin (or a plugin that
@@ -328,10 +394,22 @@ final class WebhookController extends RestController {
 	 *   synthetic `https://[<ipv6>]/` URL nobody registered.
 	 * @return bool True if safe to deliver to.
 	 */
-	private function is_url_safe( string $url, bool $filterable = true ): bool {
-		$parts = wp_parse_url( $url );
+	private function is_url_safe( string $url, bool $filterable = true, ?string &$reason = null ): bool {
+		// Out-param rather than a richer return type: this method has two early
+		// `return false` exits and a filtered tail return, and widening the
+		// return of a ~250-line security-critical method is the narrow-type
+		// change that has already caused a fatal in this codebase once. Every
+		// existing caller passes two arguments or fewer and is unaffected.
+		//
+		// The distinction that matters to callers is POLICY (this URL must never
+		// be delivered to) versus UNDETERMINED (the resolver could not answer
+		// right now). The delivery path retries the second and not the first.
+		$reason = '';
+		$parts  = wp_parse_url( $url );
 
 		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
+			$reason = 'unparseable_url';
+
 			return false;
 		}
 
@@ -342,7 +420,73 @@ final class WebhookController extends RestController {
 		$scheme = strtolower( (string) ( $parts['scheme'] ?? '' ) );
 
 		if ( ! in_array( $scheme, [ 'http', 'https' ], true ) ) {
+			$reason = 'unsupported_scheme';
+
 			return false;
+		}
+
+		// Syntactic rules that WordPress's own transport will enforce at request
+		// time anyway (wp_http_validate_url, reached because delivery passes
+		// reject_unsafe_urls => true). Applying them HERE too closes a gap where
+		// registration returned 201 with a generated secret for a URL that could
+		// never be delivered: every attempt then died inside WP_Http with "A
+		// valid URL was not provided", burned the retry ladder, and landed in the
+		// failure log with a message naming nothing.
+		//
+		// NOT migration-free by construction, which an earlier version of this
+		// comment claimed. Core has ONE exemption these rules must copy: a URL
+		// whose host AND port match the site's own `home` is allowed even when
+		// the port is not in the allowlist (wp-includes/http.php:665). A site
+		// served on, say, https://example.com:8443 with a webhook pointing back at
+		// itself therefore delivers today — and without the same exemption below
+		// this check would refuse it, and the delivery path treats a policy
+		// refusal as terminal, so every future event for that webhook would be
+		// recorded once and destroyed with no retry.
+		//
+		// GATED ON $filterable, and that is load-bearing. The AAAA branch below
+		// re-enters this method as is_url_safe( 'https://[<ipv6>]/', false ) to
+		// reuse the address rules. A bracketed-host or port check placed ahead of
+		// that loop without this gate would refuse every dual-stack webhook on
+		// the site. $filterable is false only on that internal re-entry, so it is
+		// exactly the "this URL came from a caller" flag these checks need.
+		if ( $filterable ) {
+			// Credentials in the URL. Core rejects these outright, and they would
+			// otherwise be stored in an option and echoed back by the GET route.
+			if ( isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+				$reason = 'userinfo_in_url';
+
+				return false;
+			}
+
+			if ( isset( $parts['port'] ) ) {
+				$port = (int) $parts['port'];
+
+				/**
+				 * Core's own allowlist, read through core's own filter so a site
+				 * that widens it for WP_Http widens it here too and the two
+				 * cannot drift apart.
+				 *
+				 * @see wp_http_validate_url()
+				 */
+				// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core WordPress filter name; reading it is the point.
+				$allowed_ports = apply_filters( 'http_allowed_safe_ports', [ 80, 443, 8080 ], $parts['host'], $url );
+
+				if ( ! is_array( $allowed_ports ) || ! in_array( $port, $allowed_ports, true ) ) {
+					// Core's same-host exemption, copied exactly so the two cannot
+					// disagree: a URL on the site's OWN host and port is allowed
+					// whatever the port number.
+					$home      = wp_parse_url( (string) get_option( 'home' ) );
+					$same_host = is_array( $home )
+						&& isset( $home['host'] )
+						&& strtolower( (string) $home['host'] ) === strtolower( (string) $parts['host'] );
+
+					if ( ! ( $same_host && isset( $home['port'] ) && (int) $home['port'] === $port ) ) {
+						$reason = 'disallowed_port';
+
+						return false;
+					}
+				}
+			}
 		}
 
 		$host = strtolower( (string) $parts['host'] );
@@ -350,6 +494,12 @@ final class WebhookController extends RestController {
 
 		if ( in_array( $host, [ 'localhost', '127.0.0.1', '::1', '[::1]' ], true ) ) {
 			$safe = false;
+
+			// Name it here. Without this the literal-hostname case fell through
+			// to the generic 'rejected' set at the filter, so the REST error told
+			// the caller a site policy filter had refused their URL when in fact
+			// they had simply typed localhost.
+			$reason = 'loopback_address';
 		}
 
 		// wp_parse_url() returns IPv6 hosts wrapped in brackets per RFC 3986
@@ -396,7 +546,8 @@ final class WebhookController extends RestController {
 		if ( $is_ip_literal ) {
 			// FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE only cover IPv4.
 			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
-				$safe = false;
+				$safe   = false;
+				$reason = 'private_address';
 			}
 
 			// IPv6 equivalents: unique-local (fc00::/7) and link-local
@@ -415,12 +566,14 @@ final class WebhookController extends RestController {
 
 					// fc00::/7 - first 7 bits = 1111110 (0xFC or 0xFD).
 					if ( ( $first & 0xFE ) === 0xFC ) {
-						$safe = false;
+						$safe   = false;
+						$reason = 'private_address';
 					}
 
 					// fe80::/10 - first 10 bits = 1111111010.
 					if ( $first === 0xFE && ( $second & 0xC0 ) === 0x80 ) {
-						$safe = false;
+						$safe   = false;
+						$reason = 'private_address';
 					}
 				}
 			}
@@ -429,11 +582,25 @@ final class WebhookController extends RestController {
 		// Hostname — resolve via DNS and re-check the IP against the same
 		// private/reserved ranges. Catches the admin-mistake case (a domain
 		// resolving to 169.254.169.254 metadata / 127.0.0.1 / an internal
-		// service); full DNS-rebinding prevention (pinning the IP through the
-		// transport) is out of scope. Uses gethostbyname() to mirror WP core's
-		// wp_http_validate_url() and avoid warnings on failure — single-A-record
-		// only; the perflocale/webhooks/url_safe filter can bridge fuller
-		// coverage. Skipped for IP literals and once $safe is already false.
+		// service). Uses gethostbyname() to mirror WP core's
+		// wp_http_validate_url() and avoid warnings on failure. Skipped for IP
+		// literals and once $safe is already false.
+		//
+		// IPv4 only — but NOT "single-A-record only", as this comment used to
+		// say while sitting a few dozen lines above the AAAA loop that has
+		// covered the v6 side since 1.0.2.
+		//
+		// What remains out of scope, deliberately: DNS rebinding. This validates
+		// an address and then hands wp_remote_post() the HOSTNAME, which libcurl
+		// resolves again on its own, so a short-TTL answer can differ between the
+		// two. Closing that means pinning the validated address through the
+		// transport, and pinning is silently inert on the streams transport,
+		// behind a proxy, and whenever another plugin intervenes in
+		// pre_http_request — three ways to believe you are protected when you are
+		// not. The boundary is drawn at who may register a webhook instead: see
+		// register_permissions_check(), which requires manage_network_options on
+		// multisite. On single site the caller already has manage_options and can
+		// execute arbitrary PHP, so there is no boundary left to defend.
 		if ( $safe && ! $is_ip_literal ) {
 			$resolved = gethostbyname( $host );
 
@@ -443,13 +610,21 @@ final class WebhookController extends RestController {
 				// host now, refuse the URL rather than fail-open - a hostile
 				// DNS server could otherwise return a public IP at
 				// validation time and a private IP at delivery time.
-				$safe = false;
+				//
+				// This is the one rejection that is NOT a statement about the
+				// URL. A SERVFAIL or a timeout says nothing about where the
+				// host points, and it recovers on its own — so the delivery
+				// path treats it as retryable rather than destroying the event.
+				$reason = 'unresolvable';
+				$safe   = false;
 			} elseif ( ! Helper::is_public_ipv4( $resolved ) ) {
 				// Resolved to a private (RFC1918) or reserved IPv4 range.
-				$safe = false;
+				$reason = 'private_address';
+				$safe   = false;
 			} elseif ( str_starts_with( $resolved, '127.' ) ) {
 				// Loopback 127.0.0.0/8 - not covered by NO_RES_RANGE.
-				$safe = false;
+				$reason = 'loopback_address';
+				$safe   = false;
 			}
 
 			// AAAA blind spot. gethostbyname() is IPv4-only, so a hostname
@@ -462,8 +637,17 @@ final class WebhookController extends RestController {
 			// literal never reaches this branch, so the recursion is one level
 			// deep. Mirrors AbstractProvider::validate_url(); keep in sync.
 			foreach ( ( $safe ? self::resolve_aaaa( $host ) : [] ) as $ipv6 ) {
-				if ( ! $this->is_url_safe( 'https://[' . $ipv6 . ']/', false ) ) {
-					$safe = false;
+				// The inner call writes its reason into ITS OWN by-ref parameter,
+				// which is discarded here — so without this the outer $reason
+				// stayed empty and the tail below labelled it 'rejected', telling
+				// the caller a site policy filter had refused their webhook when
+				// the truth is that the host's IPv6 address is private. Carry the
+				// inner verdict out.
+				$ipv6_reason = '';
+
+				if ( ! $this->is_url_safe( 'https://[' . $ipv6 . ']/', false, $ipv6_reason ) ) {
+					$safe   = false;
+					$reason = '' !== $ipv6_reason ? $ipv6_reason : 'private_address';
 					break;
 				}
 			}
@@ -483,7 +667,20 @@ final class WebhookController extends RestController {
 		 * @param bool $safe Default safety decision.
 		 * @param string $url Raw URL being evaluated.
 		 */
-		return (bool) apply_filters( 'perflocale/webhooks/url_safe', $safe, $url );
+		$filtered = (bool) apply_filters( 'perflocale/webhooks/url_safe', $safe, $url );
+
+		if ( $filtered ) {
+			$reason = '';
+		} elseif ( $reason === '' ) {
+			// Only reachable when a site's own filter flipped the verdict — every
+			// check above now names its own reason, so an unset reason here means
+			// policy and nothing else. (It used to also catch the literal
+			// localhost branch, which reported "rejected by a site policy filter"
+			// to someone who had merely typed localhost.)
+			$reason = 'rejected';
+		}
+
+		return $filtered;
 	}
 
 	/**
@@ -574,8 +771,28 @@ final class WebhookController extends RestController {
 		$secret = (string) $request->get_param( 'secret' );
 		$secret = trim( $secret );
 
-		if ( ! $this->is_url_safe( $url ) ) {
-			return $this->error( 'unsafe_url', __( 'Webhook URL targets a loopback or private-range address.', 'perflocale' ) );
+		$safety_reason = '';
+
+		if ( ! $this->is_url_safe( $url, true, $safety_reason ) ) {
+			// Name the actual rule. This used to answer "targets a loopback or
+			// private-range address" for every refusal, which was simply untrue
+			// for a bad scheme, a disallowed port or credentials in the URL, and
+			// sent integrators looking at their firewall instead of their URL.
+			$messages = [
+				'unparseable_url'  => __( 'Webhook URL could not be parsed.', 'perflocale' ),
+				'unsupported_scheme' => __( 'Webhook URL must use http or https.', 'perflocale' ),
+				'userinfo_in_url'  => __( 'Webhook URL must not contain a username or password.', 'perflocale' ),
+				'disallowed_port'  => __( 'Webhook URL uses a port WordPress will not connect to. Allowed ports are 80, 443 and 8080.', 'perflocale' ),
+				'unresolvable'     => __( 'Webhook URL host could not be resolved.', 'perflocale' ),
+				'private_address'  => __( 'Webhook URL targets a private-range address.', 'perflocale' ),
+				'loopback_address' => __( 'Webhook URL targets a loopback address.', 'perflocale' ),
+				'rejected'         => __( 'Webhook URL was rejected by a site policy filter.', 'perflocale' ),
+			];
+
+			return $this->error(
+				'unsafe_url',
+				$messages[ $safety_reason ] ?? __( 'Webhook URL targets a loopback or private-range address.', 'perflocale' )
+			);
 		}
 
 		// Auto-generate a strong secret when one wasn't supplied - clients
@@ -1153,7 +1370,78 @@ final class WebhookController extends RestController {
 		$webhook = $webhooks[ $webhook_id ];
 
 		// Re-check URL safety at delivery time in case the filter changed.
-		if ( ! $this->is_url_safe( (string) ( $webhook['url'] ?? '' ) ) ) {
+		//
+		// This used to be a bare `return`: the event was destroyed with no
+		// retry, no failure-log row and no breaker signal — the third instance
+		// in this file of the silent-drop class the two branches below already
+		// fix. It needs no attacker to hurt: gethostbyname() fails closed on a
+		// SERVFAIL or a timeout (measured at 2.2-4.6s against a broken
+		// resolver), so one DNS hiccup silently ate a customer's event.
+		//
+		// A resolver that could not answer says nothing about where the host
+		// points and recovers on its own, so that case goes through the same
+		// retry ladder as an HTTP 5xx. A policy rejection — a private address,
+		// a scheme we cannot deliver, a site filter saying no — is a statement
+		// about the URL, will be just as true in thirty seconds, and is
+		// recorded once and dropped.
+		$safety_reason = '';
+
+		if ( ! $this->is_url_safe( (string) ( $webhook['url'] ?? '' ), true, $safety_reason ) ) {
+			if ( $safety_reason === 'unresolvable' && $attempt < self::MAX_ATTEMPTS ) {
+				\PerfLocale\Concurrency\Breaker::record_failure( 'webhook_' . $webhook_id, 'transient' );
+
+				$base_delay = self::RETRY_DELAYS[ $attempt - 1 ] ?? 30;
+
+				try {
+					$jitter = random_int( 0, max( 1, (int) ( $base_delay / 2 ) ) );
+				} catch ( \Throwable $e ) {
+					$jitter = (int) ( $base_delay / 4 );
+				}
+
+				// Deliberately no negative-result cache here. A 5-minute one
+				// (as the MT path keeps) would outlive the first retry delay of
+				// 30s, so every remaining attempt would re-read the cached
+				// failure without touching the resolver and the ladder would
+				// collapse to a single real try.
+				//
+				// This divergence from the MT twin is intentional and has now
+				// been proposed twice by separate reviews, from opposite
+				// directions ("sync it for consistency" and "add a transient for
+				// speed"). Both are wrong for the same two reasons: the ladder
+				// collapse above, and that a shared negative cache would widen
+				// the validate-then-connect window from per-delivery to 300
+				// seconds. Do not sync these two paths.
+				$requeued = BackgroundEvents::enqueue(
+					self::RETRY_HOOK,
+					[ $webhook_id, $event, $data, $timestamp, $attempt + 1, $delivery_id ],
+					max( 1, $base_delay + $jitter )
+				);
+
+				if ( $requeued ) {
+					return;
+				}
+
+				// Scheduler refused the retry, so this is the last chance to
+				// leave a durable record — same reasoning as the branches below.
+				$this->record_failure(
+					$webhook_id,
+					$event,
+					$timestamp,
+					'The webhook host could not be resolved, and a retry could not be scheduled; the delivery was dropped.'
+				);
+
+				return;
+			}
+
+			$this->record_failure(
+				$webhook_id,
+				$event,
+				$timestamp,
+				$safety_reason === 'unresolvable'
+					? 'The webhook host could not be resolved after the final attempt.'
+					: sprintf( 'The webhook URL was refused at delivery time (%s).', $safety_reason )
+			);
+
 			return;
 		}
 
@@ -1357,8 +1645,9 @@ final class WebhookController extends RestController {
 		// hits the log. Callers only ever pass `$response->get_error_message()`
 		// (WP_Error message — cURL/WordPress text) or `sprintf('HTTP %d', $code)`,
 		// neither of which contains secrets, response bodies, or the
-		// destination URL. But the log is read by every manage_options
-		// account on the site (via the Webhooks admin page), so future
+		// destination URL. The log is surfaced to every manage_options account
+		// on the site by the PerfLocale webhook-delivery card in Site Health
+		// (SiteHealth::test_webhook_failures), so future
 		// refactors that widen $error to include receiver response bodies
 		// — which can echo back partial HMAC signatures, request IDs that
 		// leak internal infrastructure, or credentials a misconfigured
@@ -1376,9 +1665,10 @@ final class WebhookController extends RestController {
 			// message is composed by whatever handles the request: a
 			// site-local `pre_http_request` filter, a custom transport or a
 			// proxy integration can fold the outgoing request - including the
-			// webhook signing secret - into it, and this log is rendered to
-			// every manage_options account. Mask credential-shaped runs so the
-			// assumption is enforced rather than merely documented.
+			// webhook signing secret - into it, and the most recent entry is
+			// rendered to every manage_options account by the Site Health card.
+			// Mask credential-shaped runs so the assumption is enforced rather
+			// than merely documented.
 			$error = \PerfLocale\Util\SecretMasker::mask( $error );
 		}
 

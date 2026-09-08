@@ -661,9 +661,9 @@ final class TranslatePressImporter {
 								[
 									'post_type'    => $post->post_type,
 									'post_status'  => $post->post_status,
-									'post_title'   => sanitize_text_field( $title ),
+									'post_title'   => \PerfLocale\Helper::sanitize_plain_text_field( $title ),
 									'post_content' => wp_kses_post( $content ),
-									'post_excerpt' => sanitize_textarea_field( $excerpt ),
+									'post_excerpt' => \PerfLocale\Helper::sanitize_plain_textarea_field( $excerpt ),
 									'post_parent'  => $post->post_parent,
 									'menu_order'   => $post->menu_order,
 								]

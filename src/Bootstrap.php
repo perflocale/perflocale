@@ -968,6 +968,33 @@ final class Bootstrap {
 			\PerfLocale\Addon\AddonMigrationErrors::register_hooks();
 		}
 
+		// WP Site Health integration — an info section plus status tests covering
+		// config, DB tables, rewrite rules, conflicts, MT usage, FX staleness,
+		// translation files and addon quarantine.
+		//
+		// Deliberately NOT inside the admin gate above. WordPress runs
+		// `wp_site_health_scheduled_check` weekly from cron, where `is_admin()`
+		// is false — so while this lived with the other admin services, that run
+		// never saw a single PerfLocale test. It is that run which writes the
+		// `health-check-site-status-result` transient behind the Tools-menu
+		// count bubble and the Dashboard "Site Health Status" widget, and it
+		// overwrites whatever a manual visit left there. The result was that a
+		// site with translation exports readable over HTTP, no default language
+		// or missing tables still showed a PerfLocale issue count of zero.
+		//
+		// Both registrations are filters; their callbacks only run when core
+		// asks, so this costs a single object on a cron request and nothing on
+		// the front end. The three tests that make a loopback request or a
+		// blocking DNS lookup opt out with `skip_cron` in register_tests(),
+		// which core honours at class-wp-site-health.php:3374.
+		if ( is_admin() || wp_doing_cron() ) {
+			$plugin->register(
+				'site_health',
+				fn() => new Admin\SiteHealth(),
+				true
+			);
+		}
+
 		// Admin AJAX handlers that need to work during wp_doing_ajax().
 		// AdminController and TermMetaBox are not loaded during AJAX (by
 		// design), so these lightweight handlers are registered directly.
@@ -2297,15 +2324,6 @@ final class Bootstrap {
 		$plugin->register(
 			'quarantine_notice',
 			fn() => new Admin\QuarantineNotice(),
-			true
-		);
-
-		// WP Site Health integration - adds an info section + status tests
-		// covering config, DB tables, rewrite rules, conflicts, MT usage,
-		// FX staleness, translation files, and addon quarantine.
-		$plugin->register(
-			'site_health',
-			fn() => new Admin\SiteHealth(),
 			true
 		);
 

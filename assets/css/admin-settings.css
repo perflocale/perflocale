@@ -225,6 +225,16 @@
 		}
 }
 
+/* Browsers give <fieldset> a default `min-inline-size: min-content`, so the
+   longest unbreakable option label -- the URL examples such as
+   "(example.com/en/page)" -- became a floor the surrounding auto-layout
+   form-table could not shrink below, pushing the whole admin page 17px wider
+   than a 390px phone. The fieldsets here are layout-neutral grouping wrappers
+   for radio lists; they have no reason to hold the page open. */
+.perflocale-settings .form-table fieldset {
+	min-width: 0;
+}
+
 /* Settings Page tab navigation — underline tab strip on desktop,
  * native <select> picker on mobile. */
 .perflocale-settings-tabs-mobile {

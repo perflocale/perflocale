@@ -632,20 +632,44 @@ final class Helper {
 	public function format_number( $value, ?string $lang_slug = null, ?int $decimals = null ): string {
 		$locale = $this->resolve_locale_for_format( $lang_slug );
 
+		// try/catch, not just class_exists: NumberFormatter's constructor throws
+		// ValueError on PHP 8.4 for a locale ICU does not recognise, and two such
+		// locales ship in this plugin's own data/languages.php - me_ME and nah.
+		// PHP 8.3 accepts both, so this is a version-dependent fatal that stayed
+		// invisible while no host had ext-intl loaded. The catch falls through to
+		// the same return the class_exists() === false branch already used.
 		if ( class_exists( '\\NumberFormatter' ) ) {
-			$fmt = new \NumberFormatter( $locale, \NumberFormatter::DECIMAL );
-			if ( $decimals !== null ) {
-				$fmt->setAttribute( \NumberFormatter::FRACTION_DIGITS, max( 0, $decimals ) );
-			}
-			$formatted = $fmt->format( (float) $value );
-			if ( is_string( $formatted ) && $formatted !== '' ) {
-				return $formatted;
+			try {
+				$fmt = new \NumberFormatter( $locale, \NumberFormatter::DECIMAL );
+				if ( $decimals !== null ) {
+					$fmt->setAttribute( \NumberFormatter::FRACTION_DIGITS, max( 0, $decimals ) );
+				}
+				$formatted = $fmt->format( (float) $value );
+				if ( is_string( $formatted ) && $formatted !== '' ) {
+					return $formatted;
+				}
+			} catch ( \Throwable $e ) {
+				unset( $e );
 			}
 		}
 
-		// Fallback: WP's built-in i18n number formatter respects the
-		// thousands and decimal separators of the active site locale.
-		return number_format_i18n( (float) $value, $decimals ?? 0 );
+		// Fallback: WP's built-in i18n number formatter respects the thousands
+		// and decimal separators of the active site locale.
+		//
+		// The decimal count is derived rather than defaulted to 0. `?? 0` meant
+		// that without intl the DEFAULT call threw the fraction away entirely -
+		// format_number( 1234.5 ) returned "1,235" where intl returns "1,234.5" -
+		// so the two paths disagreed about the value, not merely its punctuation.
+		// Three places matches NumberFormatter's DECIMAL default.
+		$float = (float) $value;
+
+		if ( $decimals === null ) {
+			$trimmed  = rtrim( rtrim( number_format( $float, 3, '.', '' ), '0' ), '.' );
+			$dot      = strpos( $trimmed, '.' );
+			$decimals = ( false === $dot ) ? 0 : strlen( $trimmed ) - $dot - 1;
+		}
+
+		return number_format_i18n( $float, max( 0, $decimals ) );
 	}
 
 	/**
@@ -675,11 +699,16 @@ final class Helper {
 			return (string) $value;
 		}
 
+		// See format_number(): the constructor throws on a locale ICU rejects.
 		if ( class_exists( '\\NumberFormatter' ) ) {
-			$fmt       = new \NumberFormatter( $locale, \NumberFormatter::CURRENCY );
-			$formatted = $fmt->formatCurrency( (float) $value, $code );
-			if ( is_string( $formatted ) && $formatted !== '' ) {
-				return $formatted;
+			try {
+				$fmt       = new \NumberFormatter( $locale, \NumberFormatter::CURRENCY );
+				$formatted = $fmt->formatCurrency( (float) $value, $code );
+				if ( is_string( $formatted ) && $formatted !== '' ) {
+					return $formatted;
+				}
+			} catch ( \Throwable $e ) {
+				unset( $e );
 			}
 		}
 
@@ -1090,6 +1119,111 @@ final class Helper {
 	}
 
 	/**
+	 * Sanitise plain text WITHOUT deleting percent-escapes.
+	 *
+	 * `sanitize_text_field()` ends with a loop that strips every
+	 * `/%[a-f0-9]{2}/i` from the string (`_sanitize_text_fields()` in
+	 * wp-includes/formatting.php). That is URL hygiene, and on a post title it
+	 * is silent data loss: "100%25 off" is stored as "100 off", "Save %2B more"
+	 * as "Save more", and a title that is only "%20" becomes empty. WordPress
+	 * itself writes a literal per cent as %25 (see {@see self::truncate_slug()}),
+	 * and a title typed into wp-admin keeps it, because core's only default
+	 * `title_save_pre` filter is `trim`. So the strip is not something the rest
+	 * of WordPress does to titles — it is specific to this sanitiser.
+	 *
+	 * Every other guarantee of `sanitize_text_field()` is kept, in core's order:
+	 * invalid UTF-8 removed, tags stripped, `<` handled the way core handles it,
+	 * and for a single-line field runs of whitespace collapsed to one space.
+	 *
+	 * The invalid-UTF-8 scrub is NOT dead code here even though the XLIFF caller
+	 * feeds it DOM output (always valid UTF-8): the REST, machine-translation and
+	 * TranslatePress-migration callers do not. It is load-bearing for those —
+	 * `wpdb::process_fields()` refuses a write whose value `strip_invalid_text()`
+	 * had to change, so an unscrubbed bad byte loses the whole post update rather
+	 * than mangling one field. Bytes are dropped individually rather than core's
+	 * all-or-nothing empty return, matching {@see \PerfLocale\Xliff\XliffExporter}.
+	 *
+	 * Takes `mixed` deliberately. This file is `strict_types=1`, and the REST
+	 * sanitize_callbacks below hand through whatever the client sent — a `string`
+	 * parameter would turn a malformed request into an uncaught TypeError.
+	 *
+	 * @param mixed $str           Raw value; anything not a string yields ''.
+	 * @param bool  $keep_newlines Keep line breaks (excerpt) or collapse them (title).
+	 * @return string Sanitised text.
+	 */
+	public static function sanitize_plain_text( $str, bool $keep_newlines = false ): string {
+		if ( ! is_scalar( $str ) ) {
+			return '';
+		}
+
+		$str = (string) $str;
+
+		if ( $str === '' ) {
+			return '';
+		}
+
+		// One PCRE pass proves validity; a valid subject never enters the scrub.
+		if ( preg_match( '//u', $str ) !== 1 ) {
+			// Same alternation as wpdb::strip_invalid_text(): a valid sequence is
+			// captured and replaced by itself, any other single byte matches the
+			// trailing `.` and is dropped. Astral characters survive; lone
+			// surrogates and overlong forms do not.
+			$str = (string) preg_replace(
+				'/([\x00-\x7F]'
+				. '|[\xC2-\xDF][\x80-\xBF]'
+				. '|\xE0[\xA0-\xBF][\x80-\xBF]'
+				. '|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}'
+				. '|\xED[\x80-\x9F][\x80-\xBF]'
+				. '|\xF0[\x90-\xBF][\x80-\xBF]{2}'
+				. '|[\xF1-\xF3][\x80-\xBF]{3}'
+				. '|\xF4[\x80-\x8F][\x80-\xBF]{2})|./s',
+				'$1',
+				$str
+			);
+		}
+
+		// Core's tag handling verbatim, so output matches sanitize_text_field()
+		// byte for byte on anything containing markup.
+		if ( str_contains( $str, '<' ) ) {
+			$str = wp_pre_kses_less_than( $str );
+			$str = wp_strip_all_tags( $str, false );
+			$str = str_replace( "<\n", '&lt;' . "\n", $str );
+		}
+
+		if ( ! $keep_newlines ) {
+			$str = (string) preg_replace( '/[\r\n\t ]+/', ' ', $str );
+		}
+
+		return trim( $str );
+	}
+
+	/**
+	 * Single-line variant, shaped for a REST `sanitize_callback`.
+	 *
+	 * WordPress calls a sanitize_callback with three arguments. Registering
+	 * {@see self::sanitize_plain_text()} directly would bind the WP_REST_Request
+	 * to its `$keep_newlines` parameter, so every value would be treated as an
+	 * excerpt. This wrapper takes one argument and ignores the rest.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return string
+	 */
+	public static function sanitize_plain_text_field( $value ): string {
+		return self::sanitize_plain_text( $value, false );
+	}
+
+	/**
+	 * Multi-line variant for excerpts. See {@see self::sanitize_plain_text_field()}
+	 * for why the wrapper exists.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return string
+	 */
+	public static function sanitize_plain_textarea_field( $value ): string {
+		return self::sanitize_plain_text( $value, true );
+	}
+
+	/**
 	 * IP and URL predicates that need no PHP extension.
 	 *
 	 * WordPress core states the position at `wp-includes/functions.php:7452`:
@@ -1160,6 +1294,19 @@ final class Helper {
 	 * Note the name is historical: it judges IPv6 as well. Callers still apply
 	 * their own fc00::/7 and fe80::/10 byte checks afterwards, because PHP's
 	 * private-range flag skips IPv6 entirely when the literal is dotted.
+	 *
+	 * ⚠ DO NOT widen this toward WordPress core's fuller block list — 100.64.0.0/10
+	 * (CGNAT), 198.18.0.0/15 (benchmarking), the TEST-NETs, multicast — however
+	 * reasonable that looks from the webhook/SSRF side. This predicate has a
+	 * SECOND caller that judges INBOUND visitor addresses:
+	 * {@see \PerfLocale\Router\GeoRedirect} (`! Helper::is_public_ipv4( $ip )` at
+	 * GeoRedirect.php:980) uses it to decide whether a visitor's IP is local and
+	 * therefore not worth geolocating. Adding CGNAT here would classify every
+	 * visitor behind a mobile carrier's CGNAT as local and silently switch off
+	 * geo-redirect for them — a large, invisible group.
+	 *
+	 * If a webhook-specific block list is ever wanted, add it as a separate
+	 * predicate at the webhook call sites, never here.
 	 *
 	 * @param string $ip Candidate address.
 	 */

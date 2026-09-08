@@ -706,6 +706,80 @@ final class DataExporter {
 	 * @throws \RuntimeException When the chunk could not be encoded, or could
 	 *                           not be written in full.
 	 */
+	/**
+	 * JSON-encode a value for the export stream, or abort the export.
+	 *
+	 * `JSON_THROW_ON_ERROR` is the whole point. Plain `wp_json_encode()` falls
+	 * back to `_wp_json_sanity_check()`, which pushes every string through
+	 * `mb_convert_encoding( $s, 'UTF-8', 'UTF-8' )` and replaces each byte it
+	 * cannot read with a question mark. In a BACKUP that is the worst outcome
+	 * available: the damaged value encodes cleanly, so the size gate, the
+	 * tail-brace gate and `rename()` all pass, and the corrupted file is
+	 * published over the operator's previous good one. The loss surfaces at
+	 * restore time, when the good copy is gone. With the flag the encoder throws
+	 * instead, and nothing is published. The flag is passed straight through to
+	 * `json_encode()` as wp_json_encode()'s first statement, so the lossy
+	 * fallback is unreachable; output for an encodable value is byte-identical.
+	 *
+	 * Throws rather than returning false because six call sites concatenate the
+	 * result into a larger string before handing it to write_chunk(); a `false`
+	 * there becomes '' and the concatenation is still a string, so
+	 * write_chunk()'s own `is_string()` guard could never fire.
+	 *
+	 * Scope, stated honestly: this catches bytes that are not valid UTF-8, which
+	 * is what a utf8 column read over a non-UTF-8 connection produces for the
+	 * connection charset's own repertoire. It CANNOT catch a character MySQL
+	 * already replaced with a literal "?" on the wire because the results
+	 * charset could not represent it at all — that arrives as valid ASCII and
+	 * encodes cleanly. Detecting the latter needs a charset check on the
+	 * connection, not on the value.
+	 *
+	 * JsonException is caught and re-thrown as RuntimeException on purpose:
+	 * JsonException extends Exception, and both callers re-raise anything that
+	 * is not a RuntimeException, which would turn an unencodable byte into an
+	 * uncaught fatal on the admin download route.
+	 *
+	 * @param mixed  $value   Value to encode.
+	 * @param string $context Human-readable name of what is being encoded.
+	 * @return string Encoded JSON.
+	 * @throws \RuntimeException When the value cannot be encoded losslessly.
+	 */
+	private static function encode_or_fail( $value, string $context ): string {
+		try {
+			$encoded = wp_json_encode( $value, JSON_THROW_ON_ERROR );
+		} catch ( \JsonException $e ) {
+			throw new \RuntimeException(
+				esc_html(
+					sprintf(
+						/* translators: 1: what was being encoded, 2: the JSON encoder's message. */
+						'PerfLocale export: %1$s could not be encoded as JSON (%2$s). Refusing to publish an export with unreadable bytes in it — the previous export file has been left untouched. This usually means the database connection charset does not match the column charset; compare DB_CHARSET in wp-config.php with the tables\' own charset before changing either.',
+						$context,
+						$e->getMessage()
+					)
+				),
+				0,
+				// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- FALSE POSITIVE. The sniff treats every argument of a thrown exception as output. This is the third constructor argument, $previous: a Throwable object that is never rendered. The MESSAGE argument above is wrapped in esc_html(), which is the one the rule exists to protect. Escaping $e here would be a type error.
+				$e
+			);
+		}
+
+		// wp_json_encode() can still return false for a depth overrun without
+		// raising, so the contract is completed here rather than assumed.
+		if ( ! is_string( $encoded ) ) {
+			throw new \RuntimeException(
+				esc_html(
+					sprintf(
+						/* translators: %s: what was being encoded. */
+						'PerfLocale export: %s could not be encoded as JSON. Refusing to publish a partial export.',
+						$context
+					)
+				)
+			);
+		}
+
+		return $encoded;
+	}
+
 	private static function write_chunk( $out, $chunk ): void {
 		if ( ! is_string( $chunk ) ) {
 			throw new \RuntimeException( 'Export aborted: a section could not be encoded as JSON.' );
@@ -752,8 +826,8 @@ final class DataExporter {
 		self::write_chunk( $out, '"version": "' . PERFLOCALE_VERSION . '",' . "\n" );
 		self::write_chunk( $out, '"format_version": ' . (int) self::FORMAT_VERSION . ',' . "\n" );
 		self::write_chunk( $out, '"exported_at": "' . gmdate( 'c' ) . '",' . "\n" );
-		self::write_chunk( $out, '"site_url": ' . wp_json_encode( home_url() ) . ',' . "\n" );
-		self::write_chunk( $out, '"sections": ' . wp_json_encode( $sections ) . ',' . "\n" );
+		self::write_chunk( $out, '"site_url": ' . self::encode_or_fail( home_url(), 'site_url' ) . ',' . "\n" );
+		self::write_chunk( $out, '"sections": ' . self::encode_or_fail( $sections, 'sections' ) . ',' . "\n" );
 
 		if ( in_array( 'settings', $sections, true ) ) {
 			$settings = get_option( 'perflocale_settings', [] );
@@ -762,7 +836,7 @@ final class DataExporter {
 				$settings = self::redact_credentials( $settings );
 			}
 
-			self::write_chunk( $out, '"settings": ' . wp_json_encode( $settings ) . ',' . "\n" );
+			self::write_chunk( $out, '"settings": ' . self::encode_or_fail( $settings, 'settings' ) . ',' . "\n" );
 
 			// Per-addon settings (perflocale_addon_settings, keyed by addon
 			// id). Travels with the 'settings' section because it's
@@ -778,7 +852,7 @@ final class DataExporter {
 				$addon_settings = self::redact_addon_credentials( $addon_settings );
 			}
 
-			self::write_chunk( $out, '"addon_settings": ' . wp_json_encode( $addon_settings ) . ',' . "\n" );
+			self::write_chunk( $out, '"addon_settings": ' . self::encode_or_fail( $addon_settings, 'addon_settings' ) . ',' . "\n" );
 
 			// Operator's enable/disable choices per addon. Without this,
 			// a staging → prod clone would carry an addon's settings but
@@ -787,11 +861,11 @@ final class DataExporter {
 			// the source means "nothing disabled" and must be preserved
 			// literally — that's a meaningful operator intent.
 			$disabled_addons = (array) get_option( 'perflocale_disabled_addons', [] );
-			self::write_chunk( $out, '"disabled_addons": ' . wp_json_encode( array_values( array_filter( array_map( 'strval', $disabled_addons ) ) ) ) . ',' . "\n" );
+			self::write_chunk( $out, '"disabled_addons": ' . self::encode_or_fail( array_values( array_filter( array_map( 'strval', $disabled_addons ) ) ), 'disabled_addons' ) . ',' . "\n" );
 		}
 
 		if ( in_array( 'roles', $sections, true ) ) {
-			self::write_chunk( $out, '"roles": ' . wp_json_encode( self::snapshot_roles() ) . ',' . "\n" );
+			self::write_chunk( $out, '"roles": ' . self::encode_or_fail( self::snapshot_roles(), 'roles' ) . ',' . "\n" );
 		}
 
 		$tables = [];
@@ -894,7 +968,7 @@ final class DataExporter {
 			// Encode the KEY too so a name with a quote/backslash can never
 			// produce invalid JSON (the charset guard already rejects those;
 			// this keeps the envelope well-formed by construction anyway).
-			self::write_chunk( $out, wp_json_encode( (string) $name ) . ': ' . $encoded );
+			self::write_chunk( $out, self::encode_or_fail( (string) $name, 'addon section name' ) . ': ' . $encoded );
 		}
 
 		self::write_chunk( $out, "\n}\n" );
@@ -1043,7 +1117,7 @@ final class DataExporter {
 					self::write_chunk( $out, ',' . "\n" );
 				}
 
-				self::write_chunk( $out, wp_json_encode( $row ) );
+				self::write_chunk( $out, self::encode_or_fail( $row, 'table row' ) );
 				$first_row = false;
 			}
 

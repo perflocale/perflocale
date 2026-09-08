@@ -1129,7 +1129,12 @@ final class AdminController {
 			// now; this turns that refusal into a message that names the value
 			// the operator actually typed, rather than a silently re-rendered
 			// form. Reuses the invalid_slug notice the edit branch already has.
-			if ( $data['slug'] === '' ) {
+			// Checked against the repository's own constant, and checked HERE —
+			// before the rename-checkbox loop further down commits rename_slug()
+			// calls and records 301s. A refused insert after those renames would
+			// leave every renamed language's prefix moved with nothing put in its
+			// place, and only a silently re-rendered form to show for it.
+			if ( $data['slug'] === '' || ! preg_match( \PerfLocale\Database\Repository\LanguageRepository::SLUG_PATTERN, $data['slug'] ) ) {
 				wp_safe_redirect(
 					add_query_arg(
 						[

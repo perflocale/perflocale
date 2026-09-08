@@ -2,14 +2,14 @@
 # This file is distributed under the GPL v2 or later.
 msgid ""
 msgstr ""
-"Project-Id-Version: PerfLocale 1.0.2\n"
+"Project-Id-Version: PerfLocale 1.0.3\n"
 "Report-Msgid-Bugs-To: https://wordpress.org/support/plugin/perflocale\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-09-06T05:22:38+00:00\n"
+"POT-Creation-Date: 2026-09-07T20:48:39+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: perflocale\n"
@@ -17,14 +17,14 @@ msgstr ""
 #. Plugin Name of the plugin
 #: perflocale.php
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:30
-#: src/Admin/AdminController.php:3247
-#: src/Admin/AdminController.php:3248
-#: src/Admin/AdminController.php:3402
-#: src/Admin/AdminController.php:3403
+#: src/Admin/AdminController.php:3252
+#: src/Admin/AdminController.php:3253
+#: src/Admin/AdminController.php:3407
+#: src/Admin/AdminController.php:3408
 #: src/Admin/DashboardWidget.php:73
 #: src/Admin/PrivacyIntegration.php:102
 #: src/Admin/PrivacyIntegration.php:117
-#: src/Admin/SiteHealth.php:2559
+#: src/Admin/SiteHealth.php:3057
 msgid "PerfLocale"
 msgstr ""
 
@@ -69,9 +69,9 @@ msgstr ""
 
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:56
 #: src/Admin/AdminController.php:130
-#: src/Admin/AdminController.php:3321
-#: src/Admin/AdminController.php:3322
-#: src/Admin/Pages/DashboardPage.php:435
+#: src/Admin/AdminController.php:3326
+#: src/Admin/AdminController.php:3327
+#: src/Admin/Pages/DashboardPage.php:448
 msgid "Settings"
 msgstr ""
 
@@ -90,7 +90,7 @@ msgstr ""
 #: addons/kadence/PerfLocaleKadence.php:248
 #: addons/neve/NeveSwitcherComponent.php:135
 #: src/Frontend/CustomizerIntegration.php:136
-#: src/Frontend/LanguageSwitcherWidget.php:139
+#: src/Frontend/LanguageSwitcherWidget.php:156
 msgid "Style"
 msgstr ""
 
@@ -103,7 +103,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:140
 #: src/Admin/Pages/SettingsPage.php:2543
 #: src/Frontend/CustomizerIntegration.php:140
-#: src/Frontend/LanguageSwitcherWidget.php:142
+#: src/Frontend/LanguageSwitcherWidget.php:159
 #: blocks/language-switcher/index.js:51
 msgid "Flags + Names"
 msgstr ""
@@ -117,7 +117,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:141
 #: src/Admin/Pages/SettingsPage.php:2544
 #: src/Frontend/CustomizerIntegration.php:142
-#: src/Frontend/LanguageSwitcherWidget.php:144
+#: src/Frontend/LanguageSwitcherWidget.php:161
 #: blocks/language-switcher/index.js:52
 msgid "Flags Only"
 msgstr ""
@@ -131,7 +131,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:142
 #: src/Admin/Pages/SettingsPage.php:2545
 #: src/Frontend/CustomizerIntegration.php:141
-#: src/Frontend/LanguageSwitcherWidget.php:143
+#: src/Frontend/LanguageSwitcherWidget.php:160
 #: blocks/language-switcher/index.js:53
 msgid "Names Only"
 msgstr ""
@@ -143,7 +143,7 @@ msgstr ""
 #: addons/elementor/widgets/class-language-switcher-widget.php:102
 #: src/Admin/Pages/SettingsPage.php:2557
 #: src/Frontend/CustomizerIntegration.php:164
-#: src/Frontend/LanguageSwitcherWidget.php:131
+#: src/Frontend/LanguageSwitcherWidget.php:148
 #: blocks/language-switcher/index.js:57
 msgid "Inline"
 msgstr ""
@@ -155,7 +155,7 @@ msgstr ""
 #: addons/elementor/widgets/class-language-switcher-widget.php:103
 #: src/Admin/Pages/SettingsPage.php:2558
 #: src/Frontend/CustomizerIntegration.php:165
-#: src/Frontend/LanguageSwitcherWidget.php:132
+#: src/Frontend/LanguageSwitcherWidget.php:149
 #: blocks/language-switcher/index.js:58
 msgid "Simple"
 msgstr ""
@@ -169,7 +169,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:67
 #: src/Admin/Pages/SettingsPage.php:2559
 #: src/Frontend/CustomizerIntegration.php:166
-#: src/Frontend/LanguageSwitcherWidget.php:133
+#: src/Frontend/LanguageSwitcherWidget.php:150
 #: blocks/language-switcher/index.js:59
 msgid "Dropdown"
 msgstr ""
@@ -183,7 +183,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:156
 #: src/Admin/Pages/SettingsPage.php:2597
 #: src/Frontend/CustomizerIntegration.php:240
-#: src/Frontend/LanguageSwitcherWidget.php:150
+#: src/Frontend/LanguageSwitcherWidget.php:167
 #: blocks/language-switcher/index.js:115
 msgid "Layout"
 msgstr ""
@@ -197,7 +197,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:161
 #: src/Admin/Pages/SettingsPage.php:2602
 #: src/Frontend/CustomizerIntegration.php:244
-#: src/Frontend/LanguageSwitcherWidget.php:153
+#: src/Frontend/LanguageSwitcherWidget.php:170
 #: blocks/language-switcher/index.js:63
 msgid "Horizontal"
 msgstr ""
@@ -211,7 +211,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:162
 #: src/Admin/Pages/SettingsPage.php:2603
 #: src/Frontend/CustomizerIntegration.php:245
-#: src/Frontend/LanguageSwitcherWidget.php:154
+#: src/Frontend/LanguageSwitcherWidget.php:171
 #: blocks/language-switcher/index.js:64
 msgid "Vertical"
 msgstr ""
@@ -225,7 +225,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:176
 #: src/Admin/Pages/SettingsPage.php:2609
 #: src/Frontend/CustomizerIntegration.php:263
-#: src/Frontend/LanguageSwitcherWidget.php:160
+#: src/Frontend/LanguageSwitcherWidget.php:177
 #: blocks/language-switcher/index.js:121
 msgid "Name Format"
 msgstr ""
@@ -286,7 +286,7 @@ msgstr ""
 #: addons/elementor/widgets/class-language-switcher-widget.php:148
 #: addons/kadence/PerfLocaleKadence.php:221
 #: addons/neve/NeveSwitcherComponent.php:117
-#: src/Frontend/LanguageSwitcherWidget.php:176
+#: src/Frontend/LanguageSwitcherWidget.php:193
 msgid "Match Name Format"
 msgstr ""
 
@@ -297,14 +297,14 @@ msgstr ""
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:120
 #: addons/bricks/elements/language-switcher.php:129
 #: addons/elementor/widgets/class-language-switcher-widget.php:168
-#: src/Frontend/LanguageSwitcherWidget.php:190
+#: src/Frontend/LanguageSwitcherWidget.php:207
 msgid "Single chevron"
 msgstr ""
 
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:121
 #: addons/bricks/elements/language-switcher.php:130
 #: addons/elementor/widgets/class-language-switcher-widget.php:169
-#: src/Frontend/LanguageSwitcherWidget.php:191
+#: src/Frontend/LanguageSwitcherWidget.php:208
 msgid "Double chevrons"
 msgstr ""
 
@@ -317,7 +317,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:94
 #: src/Admin/Pages/SettingsPage.php:2575
 #: src/Frontend/CustomizerIntegration.php:190
-#: src/Frontend/LanguageSwitcherWidget.php:192
+#: src/Frontend/LanguageSwitcherWidget.php:209
 #: blocks/language-switcher/index.js:95
 msgid "No arrow"
 msgstr ""
@@ -339,35 +339,35 @@ msgstr ""
 
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:135
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:144
-#: src/Admin/SiteHealth.php:2229
-#: src/Admin/SiteHealth.php:2247
-#: src/Admin/SiteHealth.php:2255
-#: src/Admin/SiteHealth.php:2259
-#: src/Admin/SiteHealth.php:2263
-#: src/Admin/SiteHealth.php:2271
-#: src/Admin/SiteHealth.php:2345
-#: src/Admin/SiteHealth.php:2454
-#: src/Admin/SiteHealth.php:2458
-#: src/Admin/SiteHealth.php:2492
-#: src/Admin/SiteHealth.php:2496
-#: src/Admin/SiteHealth.php:2502
+#: src/Admin/SiteHealth.php:2709
+#: src/Admin/SiteHealth.php:2727
+#: src/Admin/SiteHealth.php:2735
+#: src/Admin/SiteHealth.php:2739
+#: src/Admin/SiteHealth.php:2743
+#: src/Admin/SiteHealth.php:2751
+#: src/Admin/SiteHealth.php:2825
+#: src/Admin/SiteHealth.php:2934
+#: src/Admin/SiteHealth.php:2938
+#: src/Admin/SiteHealth.php:2972
+#: src/Admin/SiteHealth.php:2976
+#: src/Admin/SiteHealth.php:2982
 msgid "No"
 msgstr ""
 
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:136
 #: addons/beaver-builder/modules/language-switcher/language-switcher.php:145
-#: src/Admin/SiteHealth.php:2229
-#: src/Admin/SiteHealth.php:2233
-#: src/Admin/SiteHealth.php:2247
-#: src/Admin/SiteHealth.php:2255
-#: src/Admin/SiteHealth.php:2259
-#: src/Admin/SiteHealth.php:2263
-#: src/Admin/SiteHealth.php:2271
-#: src/Admin/SiteHealth.php:2345
-#: src/Admin/SiteHealth.php:2454
-#: src/Admin/SiteHealth.php:2458
-#: src/Admin/SiteHealth.php:2492
-#: src/Admin/SiteHealth.php:2496
+#: src/Admin/SiteHealth.php:2709
+#: src/Admin/SiteHealth.php:2713
+#: src/Admin/SiteHealth.php:2727
+#: src/Admin/SiteHealth.php:2735
+#: src/Admin/SiteHealth.php:2739
+#: src/Admin/SiteHealth.php:2743
+#: src/Admin/SiteHealth.php:2751
+#: src/Admin/SiteHealth.php:2825
+#: src/Admin/SiteHealth.php:2934
+#: src/Admin/SiteHealth.php:2938
+#: src/Admin/SiteHealth.php:2972
+#: src/Admin/SiteHealth.php:2976
 msgid "Yes"
 msgstr ""
 
@@ -418,7 +418,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:62
 #: src/Admin/Pages/SettingsPage.php:2552
 #: src/Frontend/CustomizerIntegration.php:160
-#: src/Frontend/LanguageSwitcherWidget.php:128
+#: src/Frontend/LanguageSwitcherWidget.php:145
 #: blocks/language-switcher/index.js:108
 msgid "Display Mode"
 msgstr ""
@@ -431,7 +431,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:85
 #: src/Admin/Pages/SettingsPage.php:2569
 #: src/Frontend/CustomizerIntegration.php:183
-#: src/Frontend/LanguageSwitcherWidget.php:186
+#: src/Frontend/LanguageSwitcherWidget.php:203
 msgid "Dropdown Arrow"
 msgstr ""
 
@@ -469,7 +469,7 @@ msgstr ""
 #: addons/neve/NeveSwitcherComponent.php:110
 #: src/Admin/Pages/SettingsPage.php:2582
 #: src/Frontend/CustomizerIntegration.php:210
-#: src/Frontend/LanguageSwitcherWidget.php:172
+#: src/Frontend/LanguageSwitcherWidget.php:189
 #: blocks/language-switcher/index.js:132
 msgid "Trigger Label Format"
 msgstr ""
@@ -568,29 +568,29 @@ msgid "Flag Size (px)"
 msgstr ""
 
 #: addons/bricks/elements/language-switcher.php:171
-#: src/Frontend/LanguageSwitcherWidget.php:203
+#: src/Frontend/LanguageSwitcherWidget.php:220
 #: blocks/language-switcher/index.js:196
 msgid "Gap (px)"
 msgstr ""
 
 #: addons/elementor/widgets/class-language-switcher-widget.php:149
 #: src/Frontend/CustomizerIntegration.php:267
-#: src/Frontend/LanguageSwitcherWidget.php:163
-#: src/Frontend/LanguageSwitcherWidget.php:177
+#: src/Frontend/LanguageSwitcherWidget.php:180
+#: src/Frontend/LanguageSwitcherWidget.php:194
 msgid "Native (Français)"
 msgstr ""
 
 #: addons/elementor/widgets/class-language-switcher-widget.php:150
 #: src/Frontend/CustomizerIntegration.php:268
-#: src/Frontend/LanguageSwitcherWidget.php:164
-#: src/Frontend/LanguageSwitcherWidget.php:178
+#: src/Frontend/LanguageSwitcherWidget.php:181
+#: src/Frontend/LanguageSwitcherWidget.php:195
 msgid "English (French)"
 msgstr ""
 
 #: addons/elementor/widgets/class-language-switcher-widget.php:152
 #: src/Frontend/CustomizerIntegration.php:270
-#: src/Frontend/LanguageSwitcherWidget.php:166
-#: src/Frontend/LanguageSwitcherWidget.php:180
+#: src/Frontend/LanguageSwitcherWidget.php:183
+#: src/Frontend/LanguageSwitcherWidget.php:197
 msgid "Code (FR)"
 msgstr ""
 
@@ -709,7 +709,7 @@ msgid "Creating pages..."
 msgstr ""
 
 #: addons/woocommerce/PerfLocaleWooCommerce.php:2558
-#: src/Admin/AdminController.php:3536
+#: src/Admin/AdminController.php:3541
 #: src/Admin/Pages/JobsPage.php:91
 #: src/Admin/Pages/JobsPage.php:546
 #: src/Admin/Pages/SettingsPage.php:1741
@@ -831,7 +831,7 @@ msgid "Set the currency code and exchange rate for each language. Prices are mul
 msgstr ""
 
 #: addons/woocommerce/PerfLocaleWooCommerce.php:2674
-#: src/Admin/Pages/DashboardPage.php:345
+#: src/Admin/Pages/DashboardPage.php:358
 #: src/Admin/Pages/SettingsPage.php:1241
 #: src/Admin/Pages/SettingsPage.php:1503
 #: src/Admin/Pages/StringsPage.php:216
@@ -965,13 +965,13 @@ msgid "Abilities for multilingual content translation, language detection, and U
 msgstr ""
 
 #: src/AbilitiesRegistrar.php:130
-#: src/Api/TranslationsController.php:371
+#: src/Api/TranslationsController.php:372
 msgid "You cannot access this term."
 msgstr ""
 
 #: src/AbilitiesRegistrar.php:141
-#: src/Api/TranslationsController.php:363
-#: src/Api/TranslationsController.php:426
+#: src/Api/TranslationsController.php:364
+#: src/Api/TranslationsController.php:427
 msgid "You cannot access this post."
 msgstr ""
 
@@ -1032,7 +1032,7 @@ msgstr ""
 #: src/Api/BlockTranslateController.php:655
 #: src/Api/MachineTranslateController.php:213
 #: src/Api/MachineTranslateController.php:528
-#: src/Api/TranslationsController.php:204
+#: src/Api/TranslationsController.php:205
 msgid "Machine translation is disabled."
 msgstr ""
 
@@ -1085,15 +1085,15 @@ msgstr ""
 #: src/AbilitiesRegistrar.php:824
 #: src/Api/BlockTranslateController.php:188
 #: src/Api/BlockTranslateController.php:649
-#: src/Api/TranslationsController.php:534
-#: src/Api/TranslationsController.php:588
+#: src/Api/TranslationsController.php:535
+#: src/Api/TranslationsController.php:589
 msgid "You cannot edit this post."
 msgstr ""
 
 #: src/AbilitiesRegistrar.php:836
-#: src/Admin/AdminController.php:2857
-#: src/Admin/AdminController.php:2864
-#: src/Api/TranslationsController.php:550
+#: src/Admin/AdminController.php:2862
+#: src/Admin/AdminController.php:2869
+#: src/Api/TranslationsController.php:551
 msgid "Failed to create translation."
 msgstr ""
 
@@ -1122,55 +1122,55 @@ msgid "Clear via WP CLI: wp perflocale addon errors --clear"
 msgstr ""
 
 #. translators: %s is the offending addon ID returned from AddonInterface::get_id().
-#: src/Addon/AddonRegistry.php:493
+#: src/Addon/AddonRegistry.php:509
 #, php-format
 msgid "AddonInterface::get_id() must return a 2-16 character slug matching [a-z0-9_-]. Got: \"%s\". Addon was not registered."
 msgstr ""
 
 #. translators: %s is the addon ID.
-#: src/Addon/AddonRegistry.php:514
+#: src/Addon/AddonRegistry.php:530
 #, php-format
 msgid "Addon \"%s\" was registered AFTER the perflocale/addons/register action fired — its boot() will never be called. Hook your registration on perflocale/addons/register (or earlier)."
 msgstr ""
 
 #. translators: %s is the addon ID.
-#: src/Addon/AddonRegistry.php:533
+#: src/Addon/AddonRegistry.php:549
 #, php-format
 msgid "Addon \"%s\" cannot override a bundled addon with the same ID. Choose a different ID."
 msgstr ""
 
 #. translators: %s is the addon ID.
-#: src/Addon/AddonRegistry.php:551
+#: src/Addon/AddonRegistry.php:567
 #, php-format
 msgid "Addon \"%s\" is already registered. Registering twice would overwrite the prior instance — second-call ignored."
 msgstr ""
 
 #. translators: %s is the addon ID.
-#: src/Addon/AddonRegistry.php:576
+#: src/Addon/AddonRegistry.php:592
 #, php-format
 msgid "Addon \"%s\" returned an empty AddonInterface::get_name() — admin UI rows + Site Health cards rely on it. Provide a human-readable name."
 msgstr ""
 
 #. translators: 1: addon ID, 2: offending version string.
-#: src/Addon/AddonRegistry.php:595
+#: src/Addon/AddonRegistry.php:611
 #, php-format
 msgid "Addon \"%1$s\" returned get_version()=\"%2$s\" — must be a dot-version string (e.g. 1.0.0 or 1.0.0-beta). Compatibility gates via version_compare() will silently treat it as invalid."
 msgstr ""
 
 #. translators: 1: addon ID, 2: offending return type.
-#: src/Addon/AddonRegistry.php:613
+#: src/Addon/AddonRegistry.php:629
 #, php-format
 msgid "Addon \"%1$s\" returned get_required_plugins() = %2$s — must be an array of plugin-file strings (or empty array)."
 msgstr ""
 
 #. translators: %s is the offending return type.
-#: src/Addon/AddonRegistry.php:658
+#: src/Addon/AddonRegistry.php:674
 #, php-format
 msgid "A hook on perflocale/addons/registered returned %s — must be an array<string, AddonInterface>. Falling back to the unfiltered registration map."
 msgstr ""
 
 #: src/Addon/AddonSettings.php:555
-#: src/Admin/Pages/LanguagesPage.php:770
+#: src/Admin/Pages/LanguagesPage.php:818
 msgid "Save Changes"
 msgstr ""
 
@@ -1217,8 +1217,8 @@ msgid "Current Language"
 msgstr ""
 
 #: src/Admin/AdminController.php:138
-#: src/Admin/AdminController.php:3269
-#: src/Admin/AdminController.php:3270
+#: src/Admin/AdminController.php:3274
+#: src/Admin/AdminController.php:3275
 #: src/Admin/DashboardWidget.php:103
 #: src/Admin/DashboardWidget.php:176
 #: src/Admin/Pages/DashboardPage.php:183
@@ -1228,12 +1228,12 @@ msgid "Languages"
 msgstr ""
 
 #: src/Admin/AdminController.php:161
-#: src/Admin/Pages/DashboardPage.php:444
+#: src/Admin/Pages/DashboardPage.php:457
 msgid "Documentation"
 msgstr ""
 
 #: src/Admin/AdminController.php:167
-#: src/Admin/Pages/DashboardPage.php:454
+#: src/Admin/Pages/DashboardPage.php:467
 msgid "Support"
 msgstr ""
 
@@ -1247,13 +1247,13 @@ msgstr ""
 #: src/Admin/AdminController.php:976
 #: src/Admin/AdminController.php:1054
 #: src/Admin/AdminController.php:1098
-#: src/Admin/AdminController.php:1629
-#: src/Admin/AdminController.php:2135
-#: src/Admin/AdminController.php:2448
-#: src/Admin/AdminController.php:2490
-#: src/Admin/AdminController.php:2633
-#: src/Admin/AdminController.php:2753
-#: src/Admin/AdminController.php:3638
+#: src/Admin/AdminController.php:1634
+#: src/Admin/AdminController.php:2140
+#: src/Admin/AdminController.php:2453
+#: src/Admin/AdminController.php:2495
+#: src/Admin/AdminController.php:2638
+#: src/Admin/AdminController.php:2758
+#: src/Admin/AdminController.php:3643
 #: src/Admin/QuarantineNotice.php:132
 #: src/WooCommerce/ExchangeRateSync.php:926
 msgid "Insufficient permissions."
@@ -1268,17 +1268,17 @@ msgstr ""
 #: src/Admin/AdminController.php:972
 #: src/Admin/AdminController.php:1050
 #: src/Admin/AdminController.php:1094
-#: src/Admin/AdminController.php:1625
-#: src/Admin/AdminController.php:2131
-#: src/Admin/AdminController.php:2444
-#: src/Admin/AdminController.php:2486
-#: src/Admin/AdminController.php:2624
-#: src/Admin/AdminController.php:2749
-#: src/Admin/AdminController.php:2812
-#: src/Admin/AdminController.php:2886
-#: src/Admin/AdminController.php:2942
-#: src/Admin/AdminController.php:2988
-#: src/Admin/AdminController.php:3110
+#: src/Admin/AdminController.php:1630
+#: src/Admin/AdminController.php:2136
+#: src/Admin/AdminController.php:2449
+#: src/Admin/AdminController.php:2491
+#: src/Admin/AdminController.php:2629
+#: src/Admin/AdminController.php:2754
+#: src/Admin/AdminController.php:2817
+#: src/Admin/AdminController.php:2891
+#: src/Admin/AdminController.php:2947
+#: src/Admin/AdminController.php:2993
+#: src/Admin/AdminController.php:3115
 msgid "Security check failed."
 msgstr ""
 
@@ -1316,14 +1316,11 @@ msgstr ""
 
 #: src/Admin/AdminController.php:535
 #: src/WooCommerce/ExchangeRateSync.php:253
-#: tools/regression-tests/upload-errors.php:940
 msgid "PerfLocale:"
 msgstr ""
 
 #. translators: 1: largest single file this server accepts, e.g. "2 MB". 2: largest whole submission this server accepts, e.g. "8 MB".
-#. translators: 1: largest single file this server accepts. 2: largest whole submission this server accepts.
 #: src/Admin/AdminController.php:539
-#: tools/regression-tests/upload-errors.php:944
 #, php-format
 msgid "That submission was too large for this server, so PHP discarded it before WordPress saw it — nothing was uploaded, imported or changed. This server accepts at most %1$s per file and %2$s per submission. Use a smaller file, or ask your host to raise the PHP upload_max_filesize and post_max_size settings."
 msgstr ""
@@ -1406,98 +1403,98 @@ msgstr ""
 msgid "TranslatePress import complete. %1$d posts, %2$d strings, %3$d slugs imported."
 msgstr ""
 
-#: src/Admin/AdminController.php:1408
+#: src/Admin/AdminController.php:1413
 msgid "Strings per page"
 msgstr ""
 
-#: src/Admin/AdminController.php:1412
+#: src/Admin/AdminController.php:1417
 msgid "Languages per page"
 msgstr ""
 
-#: src/Admin/AdminController.php:1416
+#: src/Admin/AdminController.php:1421
 msgid "Translations per page"
 msgstr ""
 
-#: src/Admin/AdminController.php:1481
-#: src/Admin/AdminController.php:1568
+#: src/Admin/AdminController.php:1486
+#: src/Admin/AdminController.php:1573
 msgid "Language Columns"
 msgstr ""
 
-#: src/Admin/AdminController.php:2097
+#: src/Admin/AdminController.php:2102
 msgid "Dispatch failed."
 msgstr ""
 
-#: src/Admin/AdminController.php:2641
+#: src/Admin/AdminController.php:2646
 msgid "Export not ready."
 msgstr ""
 
-#: src/Admin/AdminController.php:2648
-#: src/Admin/AdminController.php:2660
+#: src/Admin/AdminController.php:2653
+#: src/Admin/AdminController.php:2665
 msgid "Export file is no longer available."
 msgstr ""
 
-#: src/Admin/AdminController.php:2774
+#: src/Admin/AdminController.php:2779
 msgid "String scan queued. Track progress below."
 msgstr ""
 
-#: src/Admin/AdminController.php:2807
-#: src/Admin/AdminController.php:2882
+#: src/Admin/AdminController.php:2812
+#: src/Admin/AdminController.php:2887
 msgid "Invalid request."
 msgstr ""
 
-#: src/Admin/AdminController.php:2817
-#: src/Admin/AdminController.php:2890
+#: src/Admin/AdminController.php:2822
+#: src/Admin/AdminController.php:2895
 msgid "You do not have permission to do this."
 msgstr ""
 
-#: src/Admin/AdminController.php:2899
-#: src/Admin/AdminController.php:2905
+#: src/Admin/AdminController.php:2904
+#: src/Admin/AdminController.php:2910
 msgid "Failed to create term translation."
 msgstr ""
 
-#: src/Admin/AdminController.php:2934
+#: src/Admin/AdminController.php:2939
 msgid "Invalid breaker key."
 msgstr ""
 
-#: src/Admin/AdminController.php:2938
+#: src/Admin/AdminController.php:2943
 msgid "You do not have permission to reset circuit breakers."
 msgstr ""
 
-#: src/Admin/AdminController.php:2984
-#: src/Admin/AdminController.php:3106
+#: src/Admin/AdminController.php:2989
+#: src/Admin/AdminController.php:3111
 msgid "Invalid addon."
 msgstr ""
 
-#: src/Admin/AdminController.php:2992
+#: src/Admin/AdminController.php:2997
 msgid "You do not have permission to update addon settings."
 msgstr ""
 
-#: src/Admin/AdminController.php:2998
+#: src/Admin/AdminController.php:3003
 #: src/Admin/Pages/SettingsPage.php:1093
 msgid "Addon registry unavailable."
 msgstr ""
 
-#: src/Admin/AdminController.php:3005
+#: src/Admin/AdminController.php:3010
 #: src/Admin/Pages/SettingsPage.php:1101
 msgid "Unknown addon."
 msgstr ""
 
-#: src/Admin/AdminController.php:3114
+#: src/Admin/AdminController.php:3119
 msgid "You do not have permission to toggle addons."
 msgstr ""
 
-#: src/Admin/AdminController.php:3259
-#: src/Admin/AdminController.php:3260
+#: src/Admin/AdminController.php:3264
+#: src/Admin/AdminController.php:3265
 msgid "Dashboard"
 msgstr ""
 
-#: src/Admin/AdminController.php:3279
-#: src/Admin/AdminController.php:3280
+#: src/Admin/AdminController.php:3284
+#: src/Admin/AdminController.php:3285
 msgid "Strings"
 msgstr ""
 
-#: src/Admin/AdminController.php:3289
-#: src/Admin/AdminController.php:3290
+#: src/Admin/AdminController.php:3294
+#: src/Admin/AdminController.php:3295
 #: src/Admin/EditorSidebar.php:96
 #: src/Admin/MetaBox.php:220
 #: src/Admin/Pages/TranslationsPage.php:278
@@ -1507,32 +1504,32 @@ msgstr ""
 msgid "Translations"
 msgstr ""
 
-#: src/Admin/AdminController.php:3299
-#: src/Admin/AdminController.php:3300
-#: src/Admin/Pages/AddonsPage.php:408
+#: src/Admin/AdminController.php:3304
+#: src/Admin/AdminController.php:3305
+#: src/Admin/Pages/AddonsPage.php:438
 #: src/Admin/Pages/SettingsPage.php:56
 msgid "Addons"
 msgstr ""
 
-#: src/Admin/AdminController.php:3311
+#: src/Admin/AdminController.php:3316
 #: src/Admin/Pages/JobsPage.php:140
 msgid "Background Jobs"
 msgstr ""
 
-#: src/Admin/AdminController.php:3312
+#: src/Admin/AdminController.php:3317
 msgid "Jobs"
 msgstr ""
 
-#: src/Admin/AdminController.php:3429
+#: src/Admin/AdminController.php:3434
 msgid "You do not have permission to view this page."
 msgstr ""
 
-#: src/Admin/AdminController.php:3506
+#: src/Admin/AdminController.php:3511
 msgid "PerfLocale - Network Jobs Overview"
 msgstr ""
 
 #. translators: %d is the number of sites listed.
-#: src/Admin/AdminController.php:3511
+#: src/Admin/AdminController.php:3516
 #, php-format
 msgid "Showing job state across %d site on this network."
 msgid_plural "Showing job state across %d sites on this network."
@@ -1540,51 +1537,51 @@ msgstr[0] ""
 msgstr[1] ""
 
 #. translators: 1: number of sites listed (the cap), 2: total number of sites on this network.
-#: src/Admin/AdminController.php:3521
+#: src/Admin/AdminController.php:3526
 #, php-format
 msgid "Capped at the first %1$d of %2$d sites on this network. Use the per-site Jobs page for the rest."
 msgstr ""
 
-#: src/Admin/AdminController.php:3530
+#: src/Admin/AdminController.php:3535
 msgid "Per-site background-job engine and health status."
 msgstr ""
 
-#: src/Admin/AdminController.php:3533
+#: src/Admin/AdminController.php:3538
 #: src/Admin/Pages/JobsPage.php:74
 msgid "ID"
 msgstr ""
 
-#: src/Admin/AdminController.php:3534
+#: src/Admin/AdminController.php:3539
 msgid "Site"
 msgstr ""
 
-#: src/Admin/AdminController.php:3535
-#: src/Admin/Pages/AddonsPage.php:510
-#: src/Admin/Pages/AddonsPage.php:565
-#: src/Admin/Pages/AddonsPage.php:633
+#: src/Admin/AdminController.php:3540
+#: src/Admin/Pages/AddonsPage.php:540
+#: src/Admin/Pages/AddonsPage.php:595
+#: src/Admin/Pages/AddonsPage.php:669
 #: src/Admin/Pages/SettingsPage.php:952
 msgid "Active"
 msgstr ""
 
-#: src/Admin/AdminController.php:3537
+#: src/Admin/AdminController.php:3542
 #: src/Admin/Pages/JobsPage.php:76
 msgid "Engine"
 msgstr ""
 
-#: src/Admin/AdminController.php:3538
+#: src/Admin/AdminController.php:3543
 msgid "Lock cleanup"
 msgstr ""
 
-#: src/Admin/AdminController.php:3539
+#: src/Admin/AdminController.php:3544
 msgid "Jobs GC"
 msgstr ""
 
-#: src/Admin/AdminController.php:3546
+#: src/Admin/AdminController.php:3551
 msgid "No sites found."
 msgstr ""
 
-#: src/Admin/AdminController.php:3582
-#: src/Admin/AdminController.php:3589
+#: src/Admin/AdminController.php:3587
+#: src/Admin/AdminController.php:3594
 #: src/Admin/Pages/JobsPage.php:70
 #: src/WooCommerce/ExchangeRateSync.php:231
 msgid "ago"
@@ -1871,7 +1868,7 @@ msgstr ""
 #. translators: %s: post title
 #: src/Admin/EditorSidebar.php:98
 #: src/Admin/MetaBox.php:271
-#: src/Admin/Pages/LanguagesPage.php:268
+#: src/Admin/Pages/LanguagesPage.php:316
 #: src/Admin/Pages/TranslationsPage.php:606
 #: src/Admin/TermMetaBox.php:170
 #: assets/js/editor-sidebar.js:222
@@ -1889,7 +1886,7 @@ msgid "Current"
 msgstr ""
 
 #: src/Admin/EditorSidebar.php:101
-#: src/Admin/Pages/DashboardPage.php:347
+#: src/Admin/Pages/DashboardPage.php:360
 #: src/Enum/TranslationStatus.php:85
 msgid "Published"
 msgstr ""
@@ -1924,7 +1921,7 @@ msgid "This %s has no language yet. Pick the language it is written in:"
 msgstr ""
 
 #: src/Admin/MetaBox.php:274
-#: src/Api/TranslationsController.php:543
+#: src/Api/TranslationsController.php:544
 #: assets/js/editor-sidebar.js:140
 msgid "Save the post before creating translations."
 msgstr ""
@@ -2051,255 +2048,259 @@ msgstr ""
 msgid "Slim SEO plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:122
+#: src/Admin/Pages/AddonsPage.php:129
 msgid "Translate products, categories, attributes. Multi-currency and email translation."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:125
+#: src/Admin/Pages/AddonsPage.php:132
 msgid "WooCommerce plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:132
+#: src/Admin/Pages/AddonsPage.php:139
 msgid "Language switcher Elementor widget and translatable widget content."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:135
+#: src/Admin/Pages/AddonsPage.php:142
 msgid "Elementor plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:141
+#: src/Admin/Pages/AddonsPage.php:148
 msgid "Language switcher Beaver Builder module."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:144
+#: src/Admin/Pages/AddonsPage.php:151
 msgid "Beaver Builder plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:150
+#: src/Admin/Pages/AddonsPage.php:157
 msgid "Translate Oxygen Classic builder content, shortcodes, and page settings. Registers ct_template post type as translatable."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:153
+#: src/Admin/Pages/AddonsPage.php:160
 msgid "Oxygen Builder plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:159
+#: src/Admin/Pages/AddonsPage.php:166
 msgid "Translate Oxygen 6.0 (Breakdance in Oxygen mode) content tree and template settings with dynamic meta prefix support."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:162
+#: src/Admin/Pages/AddonsPage.php:169
 msgid "Oxygen 6.0 plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:168
+#: src/Admin/Pages/AddonsPage.php:175
 msgid "Translate Bricks Builder page content and settings. Includes a Language Switcher element."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:171
+#: src/Admin/Pages/AddonsPage.php:178
 msgid "Bricks Builder theme"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:177
+#: src/Admin/Pages/AddonsPage.php:184
 msgid "Translate ACF text, textarea, WYSIWYG, URL, and email fields."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:180
+#: src/Admin/Pages/AddonsPage.php:187
 msgid "ACF or ACF Pro"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:186
+#: src/Admin/Pages/AddonsPage.php:193
 msgid "Translate MetaBox text, textarea, WYSIWYG, URL, email fields. Supports groups, cloneables, and reference field translation."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:189
+#: src/Admin/Pages/AddonsPage.php:196
 msgid "MetaBox or MetaBox AIO plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:195
+#: src/Admin/Pages/AddonsPage.php:202
 msgid "Translate Pods text, paragraph, WYSIWYG, email, phone, URL fields. Translates pick field relationships on the frontend."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:198
+#: src/Admin/Pages/AddonsPage.php:205
 msgid "Pods plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:204
+#: src/Admin/Pages/AddonsPage.php:211
 msgid "Translate form labels, descriptions, choices, and confirmations."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:207
+#: src/Admin/Pages/AddonsPage.php:214
 msgid "Gravity Forms plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:213
+#: src/Admin/Pages/AddonsPage.php:220
 msgid "Serve translated form content and email templates per language."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:216
+#: src/Admin/Pages/AddonsPage.php:223
 msgid "Contact Form 7 plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:222
+#: src/Admin/Pages/AddonsPage.php:229
 msgid "Translate form fields, descriptions, placeholders, and submit buttons."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:225
+#: src/Admin/Pages/AddonsPage.php:232
 msgid "WPForms plugin"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:249
+#: src/Admin/Pages/AddonsPage.php:256
 msgid "All"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:250
+#: src/Admin/Pages/AddonsPage.php:257
 msgid "Features"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:251
+#: src/Admin/Pages/AddonsPage.php:258
 msgid "Themes"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:252
+#: src/Admin/Pages/AddonsPage.php:259
 #: src/Admin/Pages/SettingsPage.php:53
 msgid "SEO"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:253
+#: src/Admin/Pages/AddonsPage.php:260
 msgid "E-Commerce"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:254
+#: src/Admin/Pages/AddonsPage.php:261
 msgid "Page Builders"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:255
+#: src/Admin/Pages/AddonsPage.php:262
 #: src/Admin/Pages/SettingsPage.php:2172
 msgid "Custom Fields"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:256
+#: src/Admin/Pages/AddonsPage.php:263
 msgid "Forms"
 msgstr ""
 
 #. translators: %s: addon display name
-#: src/Admin/Pages/AddonsPage.php:425
+#: src/Admin/Pages/AddonsPage.php:455
 #: src/Admin/Pages/SettingsPage.php:240
 #, php-format
 msgid "Settings for %s saved."
 msgstr ""
 
 #. translators: %s: addon display name
-#: src/Admin/Pages/AddonsPage.php:429
+#: src/Admin/Pages/AddonsPage.php:459
 #: src/Admin/Pages/SettingsPage.php:251
 #, php-format
 msgid "Could not save settings for %s. The values may exceed the per-addon size limit, or another save was in progress. Check the PHP error log under WP_DEBUG for the exact reason."
 msgstr ""
 
 #. translators: %s: addon display name
-#: src/Admin/Pages/AddonsPage.php:434
+#: src/Admin/Pages/AddonsPage.php:464
 #, php-format
 msgid "%s disabled. Refresh the page to confirm the addon no longer boots."
 msgstr ""
 
 #. translators: %s: addon display name
-#: src/Admin/Pages/AddonsPage.php:439
+#: src/Admin/Pages/AddonsPage.php:469
 #, php-format
 msgid "%s re-enabled."
 msgstr ""
 
 #. translators: %s: addon display name
-#: src/Admin/Pages/AddonsPage.php:443
+#: src/Admin/Pages/AddonsPage.php:473
 #, php-format
 msgid "Could not toggle %s. The disabled-addons list may be at its size cap, or the addon id is malformed. Check the PHP error log under WP_DEBUG."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:457
+#: src/Admin/Pages/AddonsPage.php:487
 msgid "Some addons require a newer version of PerfLocale and were not booted:"
 msgstr ""
 
 #. translators: 1: addon name, 2: required PerfLocale version, 3: running PerfLocale version
-#: src/Admin/Pages/AddonsPage.php:468
+#: src/Admin/Pages/AddonsPage.php:498
 #, php-format
 msgid "%1$s requires PerfLocale %2$s (running %3$s)."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:483
-#: src/Admin/SiteHealth.php:2397
+#: src/Admin/Pages/AddonsPage.php:513
+#: src/Admin/SiteHealth.php:2877
 msgid "Quarantined addons"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:485
+#: src/Admin/Pages/AddonsPage.php:515
 msgid "these addons threw a fatal exception during boot 3 times in a row, so PerfLocale has stopped trying to load them. The rest of the plugin keeps working normally. After fixing the underlying issue (check the PHP error log under WP_DEBUG), clear the failure counter with:"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:506
+#: src/Admin/Pages/AddonsPage.php:536
 msgid "Available"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:514
-#: src/Admin/Pages/AddonsPage.php:586
-#: src/Admin/Pages/LanguagesPage.php:248
+#: src/Admin/Pages/AddonsPage.php:544
+#: src/Admin/Pages/AddonsPage.php:616
+#: src/Admin/Pages/LanguagesPage.php:296
 #: src/Admin/Pages/SettingsPage.php:954
 msgid "Inactive"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:519
+#: src/Admin/Pages/AddonsPage.php:549
 msgid "Addons activate automatically when their required plugin or theme is detected. No manual installation needed."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:630
-#: src/Admin/SiteHealth.php:2326
-#: src/Admin/SiteHealth.php:2353
-#: src/Admin/SiteHealth.php:2357
-#: src/Admin/SiteHealth.php:2361
-#: src/Admin/SiteHealth.php:2462
-#: src/Admin/SiteHealth.php:2466
+#: src/Admin/Pages/AddonsPage.php:663
+msgid "Not running"
+msgstr ""
+
+#: src/Admin/Pages/AddonsPage.php:666
+#: src/Admin/SiteHealth.php:2806
+#: src/Admin/SiteHealth.php:2833
+#: src/Admin/SiteHealth.php:2837
+#: src/Admin/SiteHealth.php:2841
+#: src/Admin/SiteHealth.php:2942
+#: src/Admin/SiteHealth.php:2946
 msgid "Disabled"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:636
+#: src/Admin/Pages/AddonsPage.php:672
 msgid "Not active"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:639
-#: src/Admin/Pages/AddonsPage.php:810
+#: src/Admin/Pages/AddonsPage.php:675
+#: src/Admin/Pages/AddonsPage.php:846
 msgid "Not installed"
 msgstr ""
 
 #. translators: 1: warning icon, 2: error stage (boot, migrate, etc.)
-#: src/Admin/Pages/AddonsPage.php:704
+#: src/Admin/Pages/AddonsPage.php:740
 #, php-format
 msgid "%1$s Last error (%2$s):"
 msgstr ""
 
 #. translators: 1: ISO 8601 datetime, 2: addon id
-#: src/Admin/Pages/AddonsPage.php:718
+#: src/Admin/Pages/AddonsPage.php:754
 #, php-format
 msgid "Recorded %1$s · full text: wp perflocale addon errors %2$s"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:744
+#: src/Admin/Pages/AddonsPage.php:780
 msgid "Enable"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:744
+#: src/Admin/Pages/AddonsPage.php:780
 msgid "Disable"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:748
+#: src/Admin/Pages/AddonsPage.php:784
 msgid "Skipped at boot until re-enabled."
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:774
+#: src/Admin/Pages/AddonsPage.php:810
 msgid "Manage"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:778
-#: src/Admin/Pages/AddonsPage.php:801
+#: src/Admin/Pages/AddonsPage.php:814
+#: src/Admin/Pages/AddonsPage.php:837
 msgid "Detected"
 msgstr ""
 
-#: src/Admin/Pages/AddonsPage.php:806
+#: src/Admin/Pages/AddonsPage.php:842
 msgid "Installed"
 msgstr ""
 
@@ -2322,7 +2323,7 @@ msgid "No active languages found. <a href=\"%s\">Add a language</a> to get start
 msgstr ""
 
 #: src/Admin/Pages/DashboardPage.php:201
-#: src/Admin/Pages/LanguagesPage.php:245
+#: src/Admin/Pages/LanguagesPage.php:293
 #: src/Admin/Pages/SettingsPage.php:2215
 #: src/Admin/Pages/SettingsPage.php:2927
 msgid "Default"
@@ -2373,85 +2374,89 @@ msgstr ""
 msgid "Translation Progress"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:309
+#: src/Admin/Pages/DashboardPage.php:313
+msgid "Only one language is set up, so there is nothing to compare progress against yet. Add a second language and per-language progress appears here."
+msgstr ""
+
+#: src/Admin/Pages/DashboardPage.php:322
 msgid "No published content to translate yet. Once you publish posts or pages in the default language, per-language progress appears here."
 msgstr ""
 
 #. translators: %s: number of items
-#: src/Admin/Pages/DashboardPage.php:335
+#: src/Admin/Pages/DashboardPage.php:348
 #, php-format
 msgid "%s item"
 msgid_plural "%s items"
 msgstr[0] ""
 msgstr[1] ""
 
-#: src/Admin/Pages/DashboardPage.php:346
+#: src/Admin/Pages/DashboardPage.php:359
 #: src/Admin/Pages/JobsPage.php:181
 msgid "Progress"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:348
+#: src/Admin/Pages/DashboardPage.php:361
 msgid "Drafts"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:349
+#: src/Admin/Pages/DashboardPage.php:362
 msgid "Pending"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:350
+#: src/Admin/Pages/DashboardPage.php:363
 msgid "Outdated"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:389
+#: src/Admin/Pages/DashboardPage.php:402
 msgid "Progress counts published translations against published default-language content. Drafts and pending translations are underway; outdated ones need review after their source changed."
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:403
+#: src/Admin/Pages/DashboardPage.php:416
 msgid "Cache"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:406
+#: src/Admin/Pages/DashboardPage.php:419
 msgid "Clear Cache"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:409
+#: src/Admin/Pages/DashboardPage.php:422
 msgid "Empties all PerfLocale caches. They are rebuilt automatically on the next page view."
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:413
+#: src/Admin/Pages/DashboardPage.php:426
 msgid "Permalinks"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:416
+#: src/Admin/Pages/DashboardPage.php:429
 msgid "Refresh Permalinks"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:419
+#: src/Admin/Pages/DashboardPage.php:432
 msgid "Rebuilds the rewrite rules. Use this if language URLs stop resolving after changing the URL mode."
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:423
+#: src/Admin/Pages/DashboardPage.php:436
 msgid "Shortcuts"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:427
+#: src/Admin/Pages/DashboardPage.php:440
 msgid "Manage Languages"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:431
+#: src/Admin/Pages/DashboardPage.php:444
 #: src/Admin/Pages/StringsPage.php:203
 msgid "String Translations"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:440
+#: src/Admin/Pages/DashboardPage.php:453
 msgid "Resources"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:449
+#: src/Admin/Pages/DashboardPage.php:462
 msgid "All Features"
 msgstr ""
 
-#: src/Admin/Pages/DashboardPage.php:467
+#: src/Admin/Pages/DashboardPage.php:480
 msgid "Rate PerfLocale"
 msgstr ""
 
@@ -2795,7 +2800,7 @@ msgstr ""
 
 #: src/Admin/Pages/JobsPage.php:640
 #: src/Admin/Pages/LanguagesPage.php:158
-#: src/Admin/Pages/LanguagesPage.php:772
+#: src/Admin/Pages/LanguagesPage.php:820
 #: src/Admin/Pages/StringsPage.php:914
 #: assets/js/block-toolbar.js:1070
 msgid "Cancel"
@@ -2811,7 +2816,7 @@ msgid "Download"
 msgstr ""
 
 #: src/Admin/Pages/JobsPage.php:665
-#: src/Admin/Pages/LanguagesPage.php:311
+#: src/Admin/Pages/LanguagesPage.php:359
 msgid "Delete"
 msgstr ""
 
@@ -2828,7 +2833,7 @@ msgid "String translations"
 msgstr ""
 
 #: src/Admin/Pages/LanguagesPage.php:90
-#: src/Admin/SiteHealth.php:2651
+#: src/Admin/SiteHealth.php:3149
 msgid "Slug translations"
 msgstr ""
 
@@ -2885,211 +2890,223 @@ msgstr ""
 msgid "Drag, or press arrow up/down, to reorder"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:282
+#. translators: %s: language name
+#: src/Admin/Pages/LanguagesPage.php:259
+#, php-format
+msgid "Move %s up"
+msgstr ""
+
+#. translators: %s: language name
+#: src/Admin/Pages/LanguagesPage.php:277
+#, php-format
+msgid "Move %s down"
+msgstr ""
+
+#: src/Admin/Pages/LanguagesPage.php:330
 msgid "Set this as the default language? All new content will default to this language."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:283
-#: src/Admin/Pages/LanguagesPage.php:297
+#: src/Admin/Pages/LanguagesPage.php:331
+#: src/Admin/Pages/LanguagesPage.php:345
 msgid "Set as Default"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:296
+#: src/Admin/Pages/LanguagesPage.php:344
 msgid "Activate this language before making it the default."
 msgstr ""
 
 #. translators: %s: Number of languages
-#: src/Admin/Pages/LanguagesPage.php:369
+#: src/Admin/Pages/LanguagesPage.php:417
 #, php-format
 msgid "%s language"
 msgid_plural "%s languages"
 msgstr[0] ""
 msgstr[1] ""
 
-#: src/Admin/Pages/LanguagesPage.php:386
+#: src/Admin/Pages/LanguagesPage.php:434
 msgid "Edit Language"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:386
-#: src/Admin/Pages/LanguagesPage.php:770
+#: src/Admin/Pages/LanguagesPage.php:434
+#: src/Admin/Pages/LanguagesPage.php:818
 msgid "Add Language"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:536
+#: src/Admin/Pages/LanguagesPage.php:584
 msgid "Quick select a language"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:542
+#: src/Admin/Pages/LanguagesPage.php:590
 msgid "Search by name, locale, or country code…"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:556
+#: src/Admin/Pages/LanguagesPage.php:604
 msgid "Popular"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:563
+#: src/Admin/Pages/LanguagesPage.php:611
 msgid "All languages (alphabetical)"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:574
+#: src/Admin/Pages/LanguagesPage.php:622
 msgid "Choose a language..."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:602
+#: src/Admin/Pages/LanguagesPage.php:650
 msgid "Slug"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:604
+#: src/Admin/Pages/LanguagesPage.php:652
 msgid "URL identifier (e.g. \"en\", \"fr\", \"de\")"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:608
+#: src/Admin/Pages/LanguagesPage.php:656
 msgid "Locale"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:610
+#: src/Admin/Pages/LanguagesPage.php:658
 msgid "WordPress locale (e.g. \"en_US\", \"fr_FR\")"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:614
+#: src/Admin/Pages/LanguagesPage.php:662
 msgid "English Name"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:619
+#: src/Admin/Pages/LanguagesPage.php:667
 msgid "Native Name"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:625
+#: src/Admin/Pages/LanguagesPage.php:673
 msgid "Flag Override"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:628
+#: src/Admin/Pages/LanguagesPage.php:676
 msgid "Auto from locale"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:629
+#: src/Admin/Pages/LanguagesPage.php:677
 msgid "Optional. Country code (e.g. \"us\"). Auto-detected from locale if empty."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:633
+#: src/Admin/Pages/LanguagesPage.php:681
 msgid "Text Direction"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:635
+#: src/Admin/Pages/LanguagesPage.php:683
 msgid "LTR (Left to Right)"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:636
+#: src/Admin/Pages/LanguagesPage.php:684
 msgid "RTL (Right to Left)"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:641
+#: src/Admin/Pages/LanguagesPage.php:689
 msgid "Date Format"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:643
+#: src/Admin/Pages/LanguagesPage.php:691
 msgid "Optional. PHP date format used when rendering dates in this language. Falls back to the site default."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:647
+#: src/Admin/Pages/LanguagesPage.php:695
 msgid "Time Format"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:649
+#: src/Admin/Pages/LanguagesPage.php:697
 msgid "Optional. PHP time format used when rendering times in this language. Falls back to the site default."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:656
+#: src/Admin/Pages/LanguagesPage.php:704
 msgid "Active - enable this language on the site"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:666
+#: src/Admin/Pages/LanguagesPage.php:714
 msgid "Default language - the primary language of the site"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:672
+#: src/Admin/Pages/LanguagesPage.php:720
 msgid "This is the current default language. To change the default, set another language as default."
 msgstr ""
 
 #. translators: 1: current bare slug, 2: suggested rename target
-#: src/Admin/Pages/LanguagesPage.php:714
+#: src/Admin/Pages/LanguagesPage.php:762
 #, php-format
 msgid "Rename %1$s to %2$s for visual symmetry. Existing %1$s URLs will 301-redirect to %2$s."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:723
+#: src/Admin/Pages/LanguagesPage.php:771
 msgid "Optional. Skip if your default language is intentionally region-unspecified."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:725
+#: src/Admin/Pages/LanguagesPage.php:773
 msgid "Optional. Skip if this language is intentionally region-unspecified."
 msgstr ""
 
 #. translators: %s: slug that already exists
-#: src/Admin/Pages/LanguagesPage.php:804
+#: src/Admin/Pages/LanguagesPage.php:852
 #, php-format
 msgid "A language with the slug %s already exists. Pick a different slug — each language must have a unique URL identifier."
 msgstr ""
 
 #. translators: %s: locale that already exists
-#: src/Admin/Pages/LanguagesPage.php:809
+#: src/Admin/Pages/LanguagesPage.php:857
 #, php-format
 msgid "A language with the locale %s already exists. Pick a different locale — each language must have a unique WordPress locale."
 msgstr ""
 
 #. translators: %1$s: the rejected language slug, %2$s and %3$s: example slugs
-#: src/Admin/Pages/LanguagesPage.php:830
+#: src/Admin/Pages/LanguagesPage.php:878
 #, php-format
-msgid "The slug %1$s cannot be used in URLs, so nothing was saved. Use two to five lowercase letters, optionally with one region suffix — for example %2$s or %3$s."
+msgid "The slug %1$s cannot be used in URLs, so nothing was saved. Use two or three lowercase letters, optionally followed by a hyphen and two or three more — for example %2$s or %3$s."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:845
+#: src/Admin/Pages/LanguagesPage.php:893
 msgid "The language was not deleted and nothing on the site was changed. The default language cannot be removed, and the language may already be gone — reload this list, and check the error log if it is still here."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:856
+#: src/Admin/Pages/LanguagesPage.php:904
 msgid "The default language was not changed. Only an active language can be the default — activate it first, then set it as default."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:864
+#: src/Admin/Pages/LanguagesPage.php:912
 msgid "Language added successfully."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:865
+#: src/Admin/Pages/LanguagesPage.php:913
 msgid "Language added. Default language slug was renamed for visual consistency; old URLs now 301 to the new slug."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:866
+#: src/Admin/Pages/LanguagesPage.php:914
 msgid "Language updated successfully."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:867
+#: src/Admin/Pages/LanguagesPage.php:915
 msgid "Language deleted successfully."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:868
+#: src/Admin/Pages/LanguagesPage.php:916
 msgid "Default language changed successfully."
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:902
+#: src/Admin/Pages/LanguagesPage.php:950
 msgid "Heads up:"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:903
+#: src/Admin/Pages/LanguagesPage.php:951
 msgid "Some active languages use bare slugs while others are region-qualified, which produces uneven badges and weaker hreflang. Consider renaming for visual symmetry:"
 msgstr ""
 
 #. translators: 1: current slug, 2: suggested slug
-#: src/Admin/Pages/LanguagesPage.php:916
+#: src/Admin/Pages/LanguagesPage.php:964
 #, php-format
 msgid "%1$s → %2$s"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:921
+#: src/Admin/Pages/LanguagesPage.php:969
 msgid "(default)"
 msgstr ""
 
-#: src/Admin/Pages/LanguagesPage.php:928
+#: src/Admin/Pages/LanguagesPage.php:976
 msgid "Renaming is offered when you next add a region-qualified language."
 msgstr ""
 
@@ -3099,7 +3116,7 @@ msgstr ""
 
 #: src/Admin/Pages/SettingsPage.php:52
 #: src/Admin/Pages/StringsPage.php:909
-#: src/Admin/SiteHealth.php:3112
+#: src/Admin/SiteHealth.php:3791
 msgid "Translation"
 msgstr ""
 
@@ -3167,7 +3184,7 @@ msgid "Add each hostname as a site in the network (and point its DNS or server a
 msgstr ""
 
 #: src/Admin/Pages/SettingsPage.php:212
-#: src/Admin/SiteHealth.php:536
+#: src/Admin/SiteHealth.php:606
 msgid "Add a site to the network"
 msgstr ""
 
@@ -5096,7 +5113,7 @@ msgid "Translation Status by Language"
 msgstr ""
 
 #: src/Admin/Pages/TranslationsPage.php:491
-#: src/Frontend/LanguageSwitcherWidget.php:124
+#: src/Frontend/LanguageSwitcherWidget.php:141
 msgid "Title"
 msgstr ""
 
@@ -5222,56 +5239,56 @@ msgstr ""
 msgid "in use"
 msgstr ""
 
-#: src/Admin/PoSync.php:349
+#: src/Admin/PoSync.php:420
 msgid "Cannot read PO file."
 msgstr ""
 
 #. translators: %s: language slug
-#: src/Admin/PoSync.php:360
+#: src/Admin/PoSync.php:431
 #, php-format
 msgid "Language \"%s\" is not active on this site."
 msgstr ""
 
-#: src/Admin/PoSync.php:369
+#: src/Admin/PoSync.php:440
 msgid "Failed to parse PO file."
 msgstr ""
 
-#: src/Admin/PoSync.php:394
+#: src/Admin/PoSync.php:465
 msgid "The PO file is not valid UTF-8. Re-save it as UTF-8 and try again — importing it as-is would discard the entries it cannot read."
 msgstr ""
 
-#: src/Admin/PoSync.php:414
+#: src/Admin/PoSync.php:485
 msgid "The PO file contains no translatable entries. If it was exported from another tool, check that it is saved as UTF-8."
 msgstr ""
 
-#: src/Admin/PoSync.php:431
+#: src/Admin/PoSync.php:502
 msgid "The PerfLocale cache service is not available, so imported translations could not be linked to a language. Nothing was imported."
 msgstr ""
 
 #. translators: %s: PO msgid
-#: src/Admin/PoSync.php:675
+#: src/Admin/PoSync.php:746
 #, php-format
 msgid "Could not create source row for: %s"
 msgstr ""
 
 #. translators: 1: msgid, 2: DB error
-#: src/Admin/PoSync.php:803
+#: src/Admin/PoSync.php:874
 #, php-format
 msgid "%1$s: %2$s"
 msgstr ""
 
-#: src/Admin/PoSync.php:822
+#: src/Admin/PoSync.php:893
 msgid "Replace import rolled back: the database refused a translation, so nothing was changed."
 msgstr ""
 
 #. translators: %d: id of the row in the plugin's strings table.
-#: src/Admin/PoSync.php:939
+#: src/Admin/PoSync.php:1010
 #, php-format
 msgid "Could not create a translation group for string #%d; its translation was not imported. Re-run the import to retry."
 msgstr ""
 
 #. translators: %d: id of the row in the plugin's strings table.
-#: src/Admin/PoSync.php:1006
+#: src/Admin/PoSync.php:1077
 #, php-format
 msgid "Could not link string #%d to the target language; its translation was not imported. Re-run the import to retry."
 msgstr ""
@@ -5351,7 +5368,7 @@ msgid "When this site is deployed behind an edge platform (Cloudflare, Vercel, N
 msgstr ""
 
 #: src/Admin/PrivacyIntegration.php:510
-#: src/Admin/SiteHealth.php:2325
+#: src/Admin/SiteHealth.php:2805
 #: src/Enum/SourceType.php:86
 msgid "Machine translation"
 msgstr ""
@@ -5386,429 +5403,479 @@ msgstr ""
 msgid "the addon(s) listed below threw errors three times in a row and have been auto-disabled to protect your site. Fix the underlying issue (deactivate the third-party plugin, update it, or check the debug log) then click Retry."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:216
-#: src/Admin/SiteHealth.php:3199
-#: src/Admin/SiteHealth.php:3305
+#: src/Admin/SiteHealth.php:237
+#: src/Admin/SiteHealth.php:3887
+#: src/Admin/SiteHealth.php:3993
 msgid "PerfLocale export files are not web-readable"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:220
+#: src/Admin/SiteHealth.php:245
 msgid "PerfLocale database tables"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:224
+#: src/Admin/SiteHealth.php:249
 msgid "PerfLocale database schema version"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:228
+#: src/Admin/SiteHealth.php:253
 msgid "PerfLocale PHP extensions"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:232
+#: src/Admin/SiteHealth.php:257
 msgid "PerfLocale default language"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:236
+#: src/Admin/SiteHealth.php:261
 msgid "PerfLocale string translation scale"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:240
+#: src/Admin/SiteHealth.php:265
 msgid "PerfLocale rewrite rules"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:244
+#: src/Admin/SiteHealth.php:269
 msgid "PerfLocale multisite language hosts"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:248
+#: src/Admin/SiteHealth.php:273
 msgid "PerfLocale plugin conflicts"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:252
+#: src/Admin/SiteHealth.php:277
 msgid "PerfLocale addon health"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:256
+#: src/Admin/SiteHealth.php:281
 msgid "PerfLocale addon schema"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:260
+#: src/Admin/SiteHealth.php:285
 msgid "PerfLocale MT usage"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:264
+#: src/Admin/SiteHealth.php:289
 msgid "PerfLocale MT provider reachability"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:268
+#: src/Admin/SiteHealth.php:295
 msgid "PerfLocale exchange-rate freshness"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:272
+#: src/Admin/SiteHealth.php:299
 msgid "PerfLocale translation files"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:276
+#: src/Admin/SiteHealth.php:303
 msgid "PerfLocale translation files directory"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:280
+#: src/Admin/SiteHealth.php:307
 msgid "PerfLocale object cache"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:284
+#: src/Admin/SiteHealth.php:311
 msgid "PerfLocale hreflang output"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:288
+#: src/Admin/SiteHealth.php:317
 msgid "PerfLocale background-jobs health"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:293
+#: src/Admin/SiteHealth.php:322
 msgid "PerfLocale circuit breakers"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:297
+#: src/Admin/SiteHealth.php:326
 msgid "PerfLocale eager-link-map state"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:301
+#: src/Admin/SiteHealth.php:330
 msgid "PerfLocale background cron schedule"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:305
+#: src/Admin/SiteHealth.php:334
 msgid "PerfLocale stuck translations"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:309
+#: src/Admin/SiteHealth.php:338
 msgid "PerfLocale orphan translation rows"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:334
+#: src/Admin/SiteHealth.php:342
+msgid "PerfLocale webhook delivery"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:380
 msgid "PerfLocale database tables are present"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:335
-msgid "All required PerfLocale database tables exist. Translation storage is healthy."
+#. translators: %d: number of database tables that were checked.
+#: src/Admin/SiteHealth.php:383
+#, php-format
+msgid "All %d PerfLocale database tables exist. Translation storage is healthy."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:341
-msgid "PerfLocale database tables are missing"
+#. translators: %d: number of missing database tables.
+#: src/Admin/SiteHealth.php:399
+#, php-format
+msgid "%d PerfLocale database table is missing"
+msgid_plural "%d PerfLocale database tables are missing"
+msgstr[0] ""
+msgstr[1] ""
+
+#. translators: 1: number of missing tables, 2: total number of tables.
+#: src/Admin/SiteHealth.php:406
+#, php-format
+msgid "%1$d of the %2$d tables PerfLocale needs are not in the database:"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:342
-msgid "One or more PerfLocale tables weren't created. This usually happens after restoring a backup from a time before the plugin was activated, or when the database user lacks CREATE TABLE privileges. Deactivate and reactivate the plugin to recreate them."
+#: src/Admin/SiteHealth.php:411
+msgid "This usually happens after restoring a backup from a time before the plugin was activated, when the database user lacks CREATE TABLE privileges, or when a migration was interrupted. Deactivate and reactivate the plugin to recreate them; existing data in the surviving tables is left alone."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:357
+#: src/Admin/SiteHealth.php:427
 msgid "Default language check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:358
+#: src/Admin/SiteHealth.php:428
 msgid "Service container not fully booted - check again after the page loads."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:368
+#: src/Admin/SiteHealth.php:438
 msgid "Default language is set"
 msgstr ""
 
 #. translators: %s: language slug
-#: src/Admin/SiteHealth.php:371
+#: src/Admin/SiteHealth.php:441
 #, php-format
 msgid "Default language: %s. Translation routing will fall back to this language when a visitor's preference isn't available."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:379
+#: src/Admin/SiteHealth.php:449
 msgid "No default language is set"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:380
+#: src/Admin/SiteHealth.php:450
 msgid "PerfLocale cannot resolve URLs without a default language. Add a language in PerfLocale → Languages and mark it as default."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:395
+#: src/Admin/SiteHealth.php:465
 msgid "Rewrite rule check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:396
-#: src/Admin/SiteHealth.php:914
-#: src/Admin/SiteHealth.php:1167
-#: src/Admin/SiteHealth.php:1265
-#: src/Admin/SiteHealth.php:1370
-#: src/Admin/SiteHealth.php:1785
-#: src/Admin/SiteHealth.php:1854
-#: src/Admin/SiteHealth.php:1932
+#: src/Admin/SiteHealth.php:466
+#: src/Admin/SiteHealth.php:1058
+#: src/Admin/SiteHealth.php:1332
+#: src/Admin/SiteHealth.php:1499
+#: src/Admin/SiteHealth.php:1604
+#: src/Admin/SiteHealth.php:2052
+#: src/Admin/SiteHealth.php:2175
+#: src/Admin/SiteHealth.php:2253
 msgid "Settings service not available."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:406
+#: src/Admin/SiteHealth.php:476
 msgid "URL mode doesn't require rewrite rules"
 msgstr ""
 
 #. translators: %s: URL mode label
-#: src/Admin/SiteHealth.php:409
+#: src/Admin/SiteHealth.php:479
 #, php-format
 msgid "Current URL mode: %s. Rewrite rules are only used in subdirectory mode."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:427
+#: src/Admin/SiteHealth.php:497
 msgid "Language-prefixed rewrite rules are active"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:428
+#: src/Admin/SiteHealth.php:498
 msgid "Rewrite rules contain PerfLocale language prefixes - translated URLs resolve correctly."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:449
+#: src/Admin/SiteHealth.php:519
 msgid "Plain permalinks on Apache may break language URLs"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:450
+#: src/Admin/SiteHealth.php:520
 msgid "Plain permalinks work, but pretty permalinks are recommended"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:452
+#: src/Admin/SiteHealth.php:522
 msgid "This site uses Plain permalinks on Apache without URL rewriting available. Language-prefixed URLs such as /de/ can return a server-level 404 before WordPress loads. Enable pretty permalinks (which sets up the routing automatically), or ensure the standard WordPress .htaccess rewrite block is present."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:453
+#: src/Admin/SiteHealth.php:523
 msgid "This site uses Plain permalinks. Language URLs work as long as the server routes all paths to WordPress (typical for nginx and Apache with the WordPress .htaccess block). Enabling pretty permalinks makes WordPress guarantee that routing itself."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:457
-#: src/Admin/SiteHealth.php:469
+#: src/Admin/SiteHealth.php:527
+#: src/Admin/SiteHealth.php:539
 msgid "Go to Permalinks"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:464
+#: src/Admin/SiteHealth.php:534
 msgid "Language-prefixed rewrite rules are missing"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:465
+#: src/Admin/SiteHealth.php:535
 msgid "Visit Settings → Permalinks and click Save to force WordPress to flush rewrite rules. Without this, translated URLs will return 404."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:526
+#: src/Admin/SiteHealth.php:596
 msgid "Language hostnames are not registered in this network"
 msgstr ""
 
 #. translators: 1: URL mode label, 2: comma-separated list of hostnames
-#: src/Admin/SiteHealth.php:529
+#: src/Admin/SiteHealth.php:599
 #, php-format
 msgid "PerfLocale is in %1$s URL mode and generates language hostnames this network cannot resolve: %2$s. On multisite, WordPress matches the requested hostname against the network's site list before any plugin loads, and none of these is registered there - a visitor following a translated link gets WordPress's \"site does not exist\" screen instead of a translation. Either add each hostname as a site in the network (and point its DNS or server alias at this install), or switch PerfLocale to subdirectory or query URL mode, which keep this site's hostname."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:538
+#: src/Admin/SiteHealth.php:608
 msgid "Change the URL mode"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:554
+#: src/Admin/SiteHealth.php:624
 msgid "Language hostnames resolve to sites in this network"
 msgstr ""
 
 #. translators: 1: URL mode label, 2: number of hostnames checked, 3: comma-separated list of hostnames
-#: src/Admin/SiteHealth.php:557
+#: src/Admin/SiteHealth.php:627
 #, php-format
 msgid "PerfLocale is in %1$s URL mode and all %2$d language hostname(s) it generates resolve to a site registered in this network: %3$s. Requests for translated URLs reach WordPress instead of the \"site does not exist\" screen."
 msgstr ""
 
 #. translators: 1: number of hostnames checked, 2: total number of hostnames generated
-#: src/Admin/SiteHealth.php:574
+#: src/Admin/SiteHealth.php:644
 #, php-format
 msgid "Checked %1$d of %2$d language hostnames"
 msgstr ""
 
 #. translators: 1: URL mode label, 2: number of hostnames checked, 3: total generated, 4: comma-separated list of hostnames
-#: src/Admin/SiteHealth.php:580
+#: src/Admin/SiteHealth.php:650
 #, php-format
 msgid "PerfLocale is in %1$s URL mode and generates %3$d language hostnames. This test resolves at most %2$d of them per run so it stays cheap enough for every scheduled health check, and the ones it checked all resolve to a site in this network: %4$s. The remaining hostnames were NOT checked - if a visitor gets WordPress's \"site does not exist\" screen on a translated link, verify by hand that every language hostname is registered as a site in the network."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:589
+#: src/Admin/SiteHealth.php:659
 msgid "Review the network's site list"
 msgstr ""
 
 #. translators: %d: number of language hostnames left unchecked
-#: src/Admin/SiteHealth.php:607
+#: src/Admin/SiteHealth.php:677
 #, php-format
 msgid "%d further language hostname(s) were not checked, so this test stays cheap enough to run on every scheduled health check."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:650
+#: src/Admin/SiteHealth.php:720
 msgid "Language hostname check does not apply"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:651
+#: src/Admin/SiteHealth.php:721
 msgid "This is a single-site install. WordPress serves whichever hostname reaches it, so PerfLocale's URL modes never depend on a network site list."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:659
+#: src/Admin/SiteHealth.php:729
 msgid "Language hostname check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:660
-#: src/Admin/SiteHealth.php:2055
+#: src/Admin/SiteHealth.php:730
+#: src/Admin/SiteHealth.php:2479
 msgid "Required services not available."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:672
-msgid "URL mode is safe on a multisite network"
-msgstr ""
-
-#. translators: %s: URL mode label
-#: src/Admin/SiteHealth.php:675
-#, php-format
-msgid "Current URL mode: %s. Translated URLs keep this site's hostname, so the network resolves them exactly as it resolves an untranslated one."
-msgstr ""
-
 #: src/Admin/SiteHealth.php:742
-msgid "No language-specific hostnames are generated"
+msgid "URL mode is safe on a multisite network"
 msgstr ""
 
 #. translators: %s: URL mode label
 #: src/Admin/SiteHealth.php:745
 #, php-format
+msgid "Current URL mode: %s. Translated URLs keep this site's hostname, so the network resolves them exactly as it resolves an untranslated one."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:812
+msgid "No language-specific hostnames are generated"
+msgstr ""
+
+#. translators: %s: URL mode label
+#: src/Admin/SiteHealth.php:815
+#, php-format
 msgid "PerfLocale is in %s URL mode but this site generates no language-specific hostname, so there is nothing for the network to resolve. In domain mode that also means every language shares one hostname - set a domain per language on the URL & Routing settings tab if that is not intended."
 msgstr ""
 
 #. translators: %s: conflicting plugin name
-#: src/Admin/SiteHealth.php:833
+#: src/Admin/SiteHealth.php:915
 #, php-format
 msgid "Conflicting multilingual plugin: %s"
 msgstr ""
 
 #. translators: %s: conflicting plugin name
-#: src/Admin/SiteHealth.php:838
+#: src/Admin/SiteHealth.php:920
 #, php-format
 msgid "PerfLocale cannot run while %s is active - they would fight over URL routing, query filtering, and post meta. Deactivate one of the two."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:847
+#: src/Admin/SiteHealth.php:929
 msgid "No conflicting multilingual plugins detected"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:848
+#: src/Admin/SiteHealth.php:930
 msgid "PerfLocale is the only multilingual plugin active. Routing and translation filtering run without contention."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:863
-#: src/Admin/SiteHealth.php:1701
+#: src/Admin/SiteHealth.php:945
+#: src/Admin/SiteHealth.php:1968
 msgid "Addon registry not loaded"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:864
+#: src/Admin/SiteHealth.php:946
 msgid "Addon health can't be checked right now - try again after the page fully loads."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:873
+#: src/Admin/SiteHealth.php:967
 msgid "PerfLocale addons are running normally"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:874
-msgid "No PerfLocale addons have been auto-disabled. All active integrations are booting without errors."
+#: src/Admin/SiteHealth.php:968
+msgid "No PerfLocale addons have been auto-disabled, and none was skipped as incompatible. All active integrations are booting without errors."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:887
+#: src/Admin/SiteHealth.php:979
+msgid "reported itself incompatible with this site"
+msgstr ""
+
+#. translators: %s: the PerfLocale version the addon requires.
+#: src/Admin/SiteHealth.php:989
+#, php-format
+msgid "needs PerfLocale %s or newer"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:997
+msgid "Some PerfLocale integrations are installed but not running"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1000
+msgid "These integrations were skipped at load, so the features they add are not active:"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1002
+msgid "This is not an error — it is how PerfLocale avoids running an integration against a version it does not support. Updating the plugin it integrates with, or PerfLocale itself, is usually what clears it."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1022
 msgid "One or more PerfLocale addons are disabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:890
-msgid "The following addons have been auto-disabled after three consecutive boot failures:"
-msgstr ""
+#. translators: %d: number of consecutive boot failures that trigger auto-disable.
+#: src/Admin/SiteHealth.php:1027
+#, php-format
+msgid "The following addons have been auto-disabled after %d consecutive boot failure:"
+msgid_plural "The following addons have been auto-disabled after %d consecutive boot failures:"
+msgstr[0] ""
+msgstr[1] ""
 
-#: src/Admin/SiteHealth.php:892
+#: src/Admin/SiteHealth.php:1036
 msgid "Check the error log for the root cause, then click \"Retry\" in the PerfLocale admin notice to restore them."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:897
+#: src/Admin/SiteHealth.php:1041
 msgid "Go to PerfLocale Addons"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:913
+#: src/Admin/SiteHealth.php:1057
 msgid "MT usage check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:923
-#: src/Admin/SiteHealth.php:1794
+#: src/Admin/SiteHealth.php:1067
+#: src/Admin/SiteHealth.php:2061
 msgid "Machine translation is disabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:924
+#: src/Admin/SiteHealth.php:1068
 msgid "No MT usage to track while machine translation is off."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:933
+#: src/Admin/SiteHealth.php:1077
 msgid "Machine translation is unlimited"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:934
+#: src/Admin/SiteHealth.php:1078
 msgid "The monthly character limit is set to 0 (unlimited) - no threshold warnings apply."
 msgstr ""
 
 #. translators: 1: used characters, 2: limit, 3: percentage
-#: src/Admin/SiteHealth.php:943
+#: src/Admin/SiteHealth.php:1087
 #, php-format
 msgid "%1$s / %2$s characters used this month (%3$s)."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:952
+#: src/Admin/SiteHealth.php:1101
+msgid "The monthly machine-translation limit has been reached"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1102
+msgid "Translation requests are now being refused and will keep failing until the limit is raised in Settings → Addons → Machine Translation, or until the monthly counter resets."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1109
 msgid "Machine-translation usage is near the monthly limit"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:953
-msgid "Further translation requests will fail until next month or until you raise the limit in Settings → Addons → Machine Translation."
+#: src/Admin/SiteHealth.php:1113
+msgid "Translation requests are still being sent. They stop once the limit is reached — raise it in Settings → Addons → Machine Translation, or wait for the monthly reset."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:960
+#: src/Admin/SiteHealth.php:1120
 msgid "Machine-translation usage is high"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:961
+#: src/Admin/SiteHealth.php:1121
 msgid "You're on track to hit the monthly limit. Review upcoming bulk translations or raise the limit."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:967
+#: src/Admin/SiteHealth.php:1127
 msgid "Machine-translation usage is within limits"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:999
+#: src/Admin/SiteHealth.php:1159
 msgid "Circuit breakers inactive"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1000
+#: src/Admin/SiteHealth.php:1160
 msgid "The PerfLocale circuit-breaker subsystem is not loaded."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1009
+#: src/Admin/SiteHealth.php:1169
 msgid "No active circuit breakers"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1010
+#: src/Admin/SiteHealth.php:1170
 msgid "Circuit breakers protect external calls (MT providers, webhook receivers, FX APIs, geo-IP services). None have tripped recently; the table is empty."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1031
+#: src/Admin/SiteHealth.php:1191
 msgid "One or more circuit breakers are OPEN — calls to the listed external services are being refused to prevent piling retries onto a failing dependency."
 msgstr ""
 
 #. translators: %s: reason category
-#: src/Admin/SiteHealth.php:1044
+#: src/Admin/SiteHealth.php:1204
 #, php-format
 msgid "reason: %s"
 msgstr ""
 
 #. translators: %d: seconds
-#: src/Admin/SiteHealth.php:1051
+#: src/Admin/SiteHealth.php:1211
 #, php-format
 msgid "retry in %ds"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1059
+#: src/Admin/SiteHealth.php:1219
 msgid "Reset now"
 msgstr ""
 
 #. translators: %d: count of open circuit breakers
-#: src/Admin/SiteHealth.php:1070
+#: src/Admin/SiteHealth.php:1230
 #, php-format
 msgid "%d circuit breaker is OPEN"
 msgid_plural "%d circuit breakers are OPEN"
@@ -5816,7 +5883,7 @@ msgstr[0] ""
 msgstr[1] ""
 
 #. translators: %d: count of probing circuit breakers
-#: src/Admin/SiteHealth.php:1089
+#: src/Admin/SiteHealth.php:1249
 #, php-format
 msgid "%d circuit breaker is probing recovery"
 msgid_plural "%d circuit breakers are probing recovery"
@@ -5824,985 +5891,1126 @@ msgstr[0] ""
 msgstr[1] ""
 
 #. translators: %s: comma-separated list of breaker keys
-#: src/Admin/SiteHealth.php:1099
+#: src/Admin/SiteHealth.php:1259
 #, php-format
 msgid "The following breakers cooled down and are now allowing the next call as a probe: %s. If the probe succeeds the breaker closes; if it fails it re-opens for another cooldown cycle."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1107
+#: src/Admin/SiteHealth.php:1267
 msgid "All circuit breakers closed"
 msgstr ""
 
 #. translators: %d: count of closed breakers
-#: src/Admin/SiteHealth.php:1110
+#: src/Admin/SiteHealth.php:1270
 #, php-format
 msgid "%d breaker is tracked and operating normally."
 msgid_plural "%d breakers are tracked and operating normally."
 msgstr[0] ""
 msgstr[1] ""
 
-#: src/Admin/SiteHealth.php:1156
+#: src/Admin/SiteHealth.php:1321
 msgid "Exchange-rate sync inactive"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1157
-msgid "WooCommerce is not active or the exchange-rate sync module is not loaded."
+#: src/Admin/SiteHealth.php:1322
+msgid "WooCommerce is not active, so there are no currencies to keep in sync."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1166
+#: src/Admin/SiteHealth.php:1331
 msgid "FX freshness check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1176
+#: src/Admin/SiteHealth.php:1341
 msgid "Automatic exchange-rate sync is disabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1177
+#: src/Admin/SiteHealth.php:1342
 msgid "Exchange rates are managed manually - no freshness warning applies."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1189
+#: src/Admin/SiteHealth.php:1354
 msgid "Exchange rates are up to date"
 msgstr ""
 
 #. translators: 1: human-readable time diff, 2: absolute timestamp in site locale + timezone
-#: src/Admin/SiteHealth.php:1193
+#: src/Admin/SiteHealth.php:1358
 #, php-format
 msgid "Last synced %1$s ago (%2$s)."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1197
+#: src/Admin/SiteHealth.php:1362
 msgid "Last sync timestamp unavailable but no staleness detected."
 msgstr ""
 
 #. translators: 1: human-readable time diff (e.g. "2 hours"), 2: absolute timestamp formatted in site's locale + timezone
-#: src/Admin/SiteHealth.php:1206
-#: src/Admin/SiteHealth.php:2477
+#: src/Admin/SiteHealth.php:1371
+#: src/Admin/SiteHealth.php:2957
 #, php-format
 msgid "%1$s ago (%2$s)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1210
-#: src/Admin/SiteHealth.php:2481
+#: src/Admin/SiteHealth.php:1375
+#: src/Admin/SiteHealth.php:2961
 #: src/WooCommerce/ExchangeRateSync.php:232
 msgid "never"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1218
+#: src/Admin/SiteHealth.php:1430
+msgid "Foreign-currency prices are being charged at the wrong rate"
+msgstr ""
+
+#. translators: 1: comma-separated currency codes, 2: the store's base currency, 3: time since last sync.
+#: src/Admin/SiteHealth.php:1435
+#, php-format
+msgid "Automatic exchange-rate sync is on but no rate source is configured, and %1$s are priced against a %2$s base with no manual rate set. Those prices are being charged at the base-currency figure — a %2$s amount taken as though it were the customer's currency (last sync: %3$s)."
+msgstr ""
+
+#. translators: 1: providers filter name, 2: rates filter name
+#: src/Admin/SiteHealth.php:1442
+#, php-format
+msgid "No rate provider ships with the plugin. Register one with the %1$s filter, supply rates directly with the %2$s filter, set a manual rate per language in the currency settings, or turn auto-sync off."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1452
 msgid "No exchange-rate source is configured"
 msgstr ""
 
 #. translators: 1: time since last sync, 2: providers filter name, 3: rates filter name
-#: src/Admin/SiteHealth.php:1221
+#: src/Admin/SiteHealth.php:1455
 #, php-format
-msgid "Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %1$s). No provider ships with the plugin: register one with the %2$s filter, supply rates directly with the %3$s filter, or turn auto-sync off in the currency settings."
+msgid "Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %1$s). Nothing is mispriced right now because no language is set to a currency other than the store base, but adding one would be. No provider ships with the plugin: register one with the %2$s filter, supply rates directly with the %3$s filter, or turn auto-sync off in the currency settings."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1231
+#: src/Admin/SiteHealth.php:1465
 msgid "Exchange rates are stale"
 msgstr ""
 
 #. translators: %s: time since last sync
-#: src/Admin/SiteHealth.php:1234
+#: src/Admin/SiteHealth.php:1468
 #, php-format
 msgid "Exchange rates have not been updated recently (last sync: %s). Check that WP-Cron is running, or sync manually from the currency settings."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1265
+#: src/Admin/SiteHealth.php:1499
 msgid "String-scale check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1273
+#: src/Admin/SiteHealth.php:1507
 msgid "String translations are served from compiled files"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1274
+#: src/Admin/SiteHealth.php:1508
 msgid "Files mode serves each language/domain from an opcache-compiled file, so the string count does not affect per-request memory."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1317
+#: src/Admin/SiteHealth.php:1551
 msgid "Database string mode is within a comfortable size"
 msgstr ""
 
 #. translators: 1: row count, 2: threshold
-#: src/Admin/SiteHealth.php:1320
+#: src/Admin/SiteHealth.php:1554
 #, php-format
 msgid "The largest language holds %1$s translated strings, under the %2$s recommended for database mode."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1330
+#: src/Admin/SiteHealth.php:1564
 msgid "Open PerfLocale performance settings"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1335
+#: src/Admin/SiteHealth.php:1569
 msgid "Database string mode is loading a large per-request blob"
 msgstr ""
 
 #. translators: 1: row count, 2: threshold
-#: src/Admin/SiteHealth.php:1338
+#: src/Admin/SiteHealth.php:1572
 #, php-format
 msgid "The largest language holds %1$s translated strings (over %2$s). In database mode, PerfLocale loads a language's entire string map on the first translated string of every page request. Switching the string-translation mode to \"Files\" serves each language and text domain from an opcache-compiled file instead, removing that per-request cost. Files mode requires a writable uploads directory."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1369
+#: src/Admin/SiteHealth.php:1603
 msgid "Translation-file check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1379
+#: src/Admin/SiteHealth.php:1613
 msgid "String translation mode is not file-based"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1380
+#: src/Admin/SiteHealth.php:1614
 msgid "Strings resolve directly from the database - no compiled files to keep in sync."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1492
+#: src/Admin/SiteHealth.php:1726
 msgid "Go to Performance settings"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1504
+#: src/Admin/SiteHealth.php:1738
 msgid "Some translations need to be re-linked"
 msgstr ""
 
 #. translators: %d: number of stranded translations
-#: src/Admin/SiteHealth.php:1507
+#: src/Admin/SiteHealth.php:1741
 #, php-format
 msgid "%d saved translation(s) are not connected to the file-generation pipeline, so the compiled files cannot be produced yet. Click \"Regenerate translation files\" - it will reconnect them and write the files in one step."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1515
+#: src/Admin/SiteHealth.php:1749
 msgid "No translation files needed yet"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1516
+#: src/Admin/SiteHealth.php:1750
 msgid "File-based mode is enabled but no string translations have been added yet, so there is nothing to compile. Files will generate automatically once you translate a string."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1524
+#: src/Admin/SiteHealth.php:1758
 msgid "Compiled translation files are missing"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1525
+#: src/Admin/SiteHealth.php:1759
 msgid "String translations exist in the database but no compiled `.l10n.php` files were found. Files normally regenerate automatically when a translation is saved - this may indicate a file-permission problem on the uploads directory."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1535
+#: src/Admin/SiteHealth.php:1769
 msgid "Translation files are stale"
 msgstr ""
 
 #. translators: 1: count, 2: newest translation absolute time, 3: oldest file absolute time
-#: src/Admin/SiteHealth.php:1538
+#: src/Admin/SiteHealth.php:1772
 #, php-format
 msgid "%1$d compiled file(s) on disk, but the newest translation row (%2$s) is newer than the oldest file (%3$s). Regenerate so the file cache reflects the current DB state."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1550
+#: src/Admin/SiteHealth.php:1784
 msgid "Translation files are present"
 msgstr ""
 
 #. translators: 1: file count, 2: filesystem path
-#: src/Admin/SiteHealth.php:1553
+#: src/Admin/SiteHealth.php:1787
 #, php-format
 msgid "%1$d compiled `.l10n.php` file(s) at %2$s."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1574
+#: src/Admin/SiteHealth.php:1814
 msgid "Database schema version check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1575
+#: src/Admin/SiteHealth.php:1815
 msgid "The plugin version constant is not defined yet - the page may have loaded before bootstrap finished."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1582
+#: src/Admin/SiteHealth.php:1822
 msgid "Database schema has never been installed"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1583
+#: src/Admin/SiteHealth.php:1823
 msgid "The `perflocale_db_version` option is missing. This usually means the activation hook did not run. Deactivate and reactivate the plugin to create the tables and stamp the version."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1590
+#: src/Admin/SiteHealth.php:1830
 msgid "A pending database migration was not applied"
 msgstr ""
 
 #. translators: 1: stored version, 2: expected version
-#: src/Admin/SiteHealth.php:1593
+#: src/Admin/SiteHealth.php:1833
 #, php-format
 msgid "Stored schema version %1$d is behind the expected version %2$d. Deactivate and reactivate the plugin, or run `wp perflocale db-migrate`, so the migration completes."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1603
+#: src/Admin/SiteHealth.php:1843
 msgid "Database schema is newer than the installed plugin"
 msgstr ""
 
 #. translators: 1: stored version, 2: expected version
-#: src/Admin/SiteHealth.php:1606
+#: src/Admin/SiteHealth.php:1846
 #, php-format
 msgid "The database reports schema version %1$d but the installed plugin expects %2$d. This usually indicates a plugin downgrade. Re-install the newer version or the schema may not match what the code expects."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1615
+#: src/Admin/SiteHealth.php:1855
 msgid "Database schema is up to date"
 msgstr ""
 
 #. translators: %d: schema version
-#: src/Admin/SiteHealth.php:1618
+#: src/Admin/SiteHealth.php:1858
 #, php-format
 msgid "Schema version %d matches the installed plugin."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1638
-#: src/Admin/SiteHealth.php:1639
+#: src/Admin/SiteHealth.php:1878
+#: src/Admin/SiteHealth.php:1879
 msgid "XLIFF import"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1640
+#: src/Admin/SiteHealth.php:1880
 msgid "XLIFF export"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1641
+#: src/Admin/SiteHealth.php:1881
 msgid "XML sitemaps (WordPress core needs this one too)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1642
-msgid "machine translation and webhooks (their address checks fail closed without it)"
+#: src/Admin/SiteHealth.php:1886
+msgid "stricter URL syntax validation when adding a webhook (a simpler built-in check is used without it)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1643
+#: src/Admin/SiteHealth.php:1887
 msgid "locale-aware number and currency formatting (WordPress formatting is used instead without it)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1657
+#: src/Admin/SiteHealth.php:1901
 msgid "Optional PHP extensions are all available"
 msgstr ""
 
 #. translators: %s: comma-separated extension list
-#: src/Admin/SiteHealth.php:1660
+#: src/Admin/SiteHealth.php:1904
 #, php-format
 msgid "Every optional extension PerfLocale can use is installed: %s."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1678
+#: src/Admin/SiteHealth.php:1928
+msgid "On most hosts all of these arrive together in the php-xml package."
+msgstr ""
+
+#. translators: %s: comma-separated list of PHP package names, e.g. "php-intl, php-curl".
+#: src/Admin/SiteHealth.php:1932
+#, php-format
+msgid "These are separate packages on most hosts: %s."
+msgstr ""
+
+#. translators: %s: comma-separated list of PHP package names, e.g. "php-intl".
+#: src/Admin/SiteHealth.php:1938
+#, php-format
+msgid "The XML extensions above arrive together in the php-xml package; the rest are separate packages: %s."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:1945
 msgid "Some optional PHP extensions are not installed"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1681
+#: src/Admin/SiteHealth.php:1948
 msgid "PerfLocale runs without these. Each one you add enables the feature listed beside it; everything else works either way."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1683
-msgid "On most hosts all of them arrive together in the php-xml package."
-msgstr ""
-
-#: src/Admin/SiteHealth.php:1702
+#: src/Admin/SiteHealth.php:1969
 msgid "Addon schema drift can't be checked right now - try again after the page fully loads."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1736
+#: src/Admin/SiteHealth.php:2003
 msgid "Addon schemas are up to date"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1737
+#: src/Admin/SiteHealth.php:2004
 msgid "Every active addon that manages its own tables is at the version declared in its code."
 msgstr ""
 
 #. translators: 1: stored version, 2: declared version
-#: src/Admin/SiteHealth.php:1750
+#: src/Admin/SiteHealth.php:2017
 #, php-format
 msgid "stored %1$d, declared %2$d"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1760
+#: src/Admin/SiteHealth.php:2027
 msgid "One or more PerfLocale addons have pending schema migrations"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1763
+#: src/Admin/SiteHealth.php:2030
 msgid "The following addons declare a newer schema version than what is stored. Their tables may be missing recent columns or indexes:"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1765
+#: src/Admin/SiteHealth.php:2032
 msgid "Deactivate and reactivate the affected addons, or run `wp perflocale addon migrate <id>` for each one, to bring their schemas current."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1784
+#: src/Admin/SiteHealth.php:2051
 msgid "MT reachability check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1795
+#: src/Admin/SiteHealth.php:2062
 msgid "No provider reachability test runs while MT is off."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1805
+#: src/Admin/SiteHealth.php:2083
+msgid "Machine translation is on but the provider cannot run"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2087
+msgid "Machine translation is enabled but no provider is selected, so every translation request fails before it is sent."
+msgstr ""
+
+#. translators: %s: the selected machine-translation provider slug.
+#: src/Admin/SiteHealth.php:2090
+#, php-format
+msgid "Machine translation is enabled and set to %s, but that provider has no API credential saved — so every translation request fails before it is sent."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2093
+msgid "Add the credential under PerfLocale → Settings → Addons → Machine Translation, or turn machine translation off so queued jobs stop retrying."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2110
 msgid "MT provider reachability check skipped"
 msgstr ""
 
 #. translators: %s: provider slug
-#: src/Admin/SiteHealth.php:1808
+#: src/Admin/SiteHealth.php:2113
 #, php-format
 msgid "No DNS endpoint is registered for provider \"%s\" - this test covers only hosted providers."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1819
+#: src/Admin/SiteHealth.php:2140
 msgid "The configured MT provider host does not resolve"
 msgstr ""
 
 #. translators: 1: host, 2: provider slug
-#: src/Admin/SiteHealth.php:1822
+#: src/Admin/SiteHealth.php:2143
 #, php-format
 msgid "DNS lookup for %1$s (provider: %2$s) returned no address. This usually means an outbound firewall or a container without DNS. Translations to this provider will fail."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1831
+#: src/Admin/SiteHealth.php:2152
 msgid "MT provider host resolves"
 msgstr ""
 
 #. translators: 1: host, 2: IP
-#: src/Admin/SiteHealth.php:1834
+#: src/Admin/SiteHealth.php:2155
 #, php-format
 msgid "%1$s resolved to %2$s. Auth and rate-limit errors, if any, will appear at request time."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1853
+#: src/Admin/SiteHealth.php:2174
 msgid "Uploads writable check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1863
+#: src/Admin/SiteHealth.php:2184
 msgid "Translation-files directory not required"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1864
+#: src/Admin/SiteHealth.php:2185
 msgid "String translation mode is not file-based, so no writable directory is needed."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1873
+#: src/Admin/SiteHealth.php:2194
 msgid "The WordPress uploads directory is not available"
 msgstr ""
 
 #. translators: %s: error reported by wp_upload_dir
-#: src/Admin/SiteHealth.php:1876
+#: src/Admin/SiteHealth.php:2197
 #, php-format
 msgid "WordPress reported: %s"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1893
+#: src/Admin/SiteHealth.php:2214
 msgid "Translation-files directory is not writable"
 msgstr ""
 
 #. translators: %s: filesystem path
-#: src/Admin/SiteHealth.php:1896
+#: src/Admin/SiteHealth.php:2217
 #, php-format
 msgid "PerfLocale cannot write compiled .l10n.php files into %s. Ask your host to make the uploads directory writable by PHP, or switch Settings → Performance → String translation mode to \"Database\"."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1904
+#: src/Admin/SiteHealth.php:2225
 msgid "Translation-files directory is writable"
 msgstr ""
 
 #. translators: %s: filesystem path
-#: src/Admin/SiteHealth.php:1907
+#: src/Admin/SiteHealth.php:2228
 #, php-format
 msgid "PerfLocale can write compiled .l10n.php translation files into %s."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1931
+#: src/Admin/SiteHealth.php:2252
 msgid "Object cache check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1952
+#: src/Admin/SiteHealth.php:2273
 msgid "PerfLocale is caching nothing between requests"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1953
+#: src/Admin/SiteHealth.php:2274
 msgid "This site has a persistent object cache (Redis, Memcached, or equivalent), but PerfLocale's \"Object Cache\" setting is unchecked. With a drop-in installed PerfLocale skips its database transient fallback entirely, so this setting is its only persistent layer - unchecking it leaves no persistent caching at all, and every language, translation and slug lookup is recomputed on each request. Re-enable it under Settings → Performance → Object Cache unless you are deliberately isolating PerfLocale from a misbehaving cache backend."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1959
+#: src/Admin/SiteHealth.php:2280
 msgid "PerfLocale object cache is disabled in settings"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1960
+#: src/Admin/SiteHealth.php:2281
 msgid "Object cache look-ups are skipped by configuration - no backend-compatibility warning applies. This site has no persistent object cache, so PerfLocale still caches to transients in the database."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1967
+#: src/Admin/SiteHealth.php:2288
 msgid "External object cache detected"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1968
+#: src/Admin/SiteHealth.php:2289
 msgid "PerfLocale's cached lookups are backed by a persistent object cache (Redis, Memcached, or equivalent)."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1974
+#: src/Admin/SiteHealth.php:2295
 msgid "Object cache is enabled in settings but no persistent backend is active"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:1975
+#: src/Admin/SiteHealth.php:2296
 msgid "PerfLocale is configured to use the object cache, but WordPress is running with the default per-request cache. Install Redis Object Cache or a comparable drop-in for the performance benefits - or disable the setting under Settings → Performance."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2008
+#. translators: 1: number of failed jobs, 2: total jobs run in the same period.
+#: src/Admin/SiteHealth.php:2387
+#, php-format
+msgid "%1$d of the %2$d background jobs run in the last 24 hours failed."
+msgid_plural "%1$d of the %2$d background jobs run in the last 24 hours failed."
+msgstr[0] ""
+msgstr[1] ""
+
+#. translators: %s: the most recent error recorded against a failed job.
+#. translators: %s: the most recent error message recorded for a webhook delivery.
+#: src/Admin/SiteHealth.php:2399
+#: src/Admin/SiteHealth.php:3299
+#, php-format
+msgid "Most recent error: %s"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2408
+msgid "Every background job is failing"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2409
+msgid "No job has completed in the last 24 hours. If machine translation is configured, check that its API credential is still valid — a revoked key fails every request while still looking present in the settings."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2415
+msgid "Some background jobs are failing"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2424
 msgid "Background-jobs garbage collection is not scheduled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2009
+#: src/Admin/SiteHealth.php:2425
 msgid "The daily perflocale_jobs_gc cron event is missing. Stuck jobs and stale lock rows will not be cleaned up. PerfLocale re-registers it automatically on any admin page load (checked at most once every 6 hours); saving a PerfLocale setting forces an immediate re-check."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2017
-msgid "WP-Cron is disabled and no Action Scheduler is loaded"
+#: src/Admin/SiteHealth.php:2433
+msgid "WP-Cron is disabled and jobs are queued in WP-Cron"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2018
+#: src/Admin/SiteHealth.php:2441
+msgid "Background jobs are queued in WP-Cron because the background engine is set to \"Force WP-Cron\", and DISABLE_WP_CRON is also set — so nothing will run them. Either point a system cron at wp-cron.php every minute, or change the background engine back to automatic in Settings → Performance so Action Scheduler can be used when it is available."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2442
 msgid "Background jobs are enqueued in WP-Cron but DISABLE_WP_CRON is set. Configure an external system cron to hit wp-cron.php every minute, install WooCommerce or the Action Scheduler plugin, or jobs will sit in the queue indefinitely."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2025
+#: src/Admin/SiteHealth.php:2449
 msgid "Background-jobs queue is paused"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2026
+#: src/Admin/SiteHealth.php:2450
 msgid "Workers are re-queueing jobs every 5 minutes instead of running them. Visit PerfLocale → Settings → Performance and uncheck \"Pause queue\" to resume processing."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2032
+#: src/Admin/SiteHealth.php:2456
 msgid "Background jobs are healthy"
 msgstr ""
 
 #. translators: 1: engine name (action_scheduler / wp_cron)
-#: src/Admin/SiteHealth.php:2035
+#: src/Admin/SiteHealth.php:2459
 #, php-format
 msgid "GC cron scheduled, engine: %1$s, queue not paused."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2054
+#: src/Admin/SiteHealth.php:2478
 msgid "Hreflang check skipped"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2064
+#: src/Admin/SiteHealth.php:2488
 msgid "Hreflang output is disabled in settings"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2065
+#: src/Admin/SiteHealth.php:2489
 msgid "No hreflang tags are expected, so this check is skipped."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2075
+#: src/Admin/SiteHealth.php:2499
 msgid "Hreflang check skipped (fewer than 2 active languages)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2076
+#: src/Admin/SiteHealth.php:2500
 msgid "Hreflang tags are only meaningful on sites with at least two active languages."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2100
+#: src/Admin/SiteHealth.php:2531
 msgid "Homepage could not be fetched for the hreflang sanity check"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2101
+#: src/Admin/SiteHealth.php:2532
 msgid "The Site Health probe could not reach the homepage over HTTP, so hreflang output could not be verified. This is usually a loopback-block or a self-signed-certificate issue."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2148
+#: src/Admin/SiteHealth.php:2606
 msgid "No hreflang alternate links detected on the homepage"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2149
-msgid "Hreflang output is enabled in settings but the homepage did not render any `<link rel=\"alternate\" hreflang>` tags. Check theme or cache rules that might strip head elements, and make sure the homepage is translatable."
-msgstr ""
-
-#: src/Admin/SiteHealth.php:2156
-msgid "Hreflang output is thinner than the active-language list"
-msgstr ""
-
-#. translators: 1: links found, 2: active languages
-#: src/Admin/SiteHealth.php:2159
+#. translators: %s: the HTML tag being looked for, already escaped.
+#: src/Admin/SiteHealth.php:2609
 #, php-format
-msgid "The homepage rendered %1$d hreflang link(s) but %2$d languages are active. Translations for missing languages may not be linked yet, or a caching layer is serving a pre-translation copy."
+msgid "Hreflang output is enabled in settings but the homepage did not render any %s tags. Check theme or cache rules that might strip head elements, and make sure the homepage is translatable."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2168
+#: src/Admin/SiteHealth.php:2619
+msgid "An x-default link is also present; it points at the default-language version and is not counted as a language."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2631
+msgid "Hreflang links are present for the translated languages"
+msgstr ""
+
+#. translators: 1: number of hreflang links found, 2: number of active languages.
+#: src/Admin/SiteHealth.php:2634
+#, php-format
+msgid "The homepage links %1$d of %2$d active languages. PerfLocale only emits a language once that page has a translation, so this is expected while a site is still being translated. If a language you have already translated is missing here, check for a caching layer serving a pre-translation copy."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:2643
 msgid "Hreflang output matches the active-language list"
 msgstr ""
 
-#. translators: %d: hreflang link count
-#: src/Admin/SiteHealth.php:2171
+#. translators: %d: number of hreflang alternate links found.
+#: src/Admin/SiteHealth.php:2646
 #, php-format
-msgid "Homepage rendered %d hreflang alternate link(s) - search engines can discover all active languages."
-msgstr ""
+msgid "The homepage rendered %d hreflang alternate link — search engines can discover the translated languages."
+msgid_plural "The homepage rendered %d hreflang alternate links — search engines can discover the translated languages."
+msgstr[0] ""
+msgstr[1] ""
 
-#: src/Admin/SiteHealth.php:2220
+#: src/Admin/SiteHealth.php:2700
 msgid "Version"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2221
+#: src/Admin/SiteHealth.php:2701
 msgid "unknown"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2224
+#: src/Admin/SiteHealth.php:2704
 msgid "Database schema version"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2228
+#: src/Admin/SiteHealth.php:2708
 msgid "Multisite"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2232
+#: src/Admin/SiteHealth.php:2712
 msgid "Tables present"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2233
+#: src/Admin/SiteHealth.php:2713
 msgid "No - needs repair"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2238
+#: src/Admin/SiteHealth.php:2718
 msgid "URL mode"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2242
+#: src/Admin/SiteHealth.php:2722
 msgid "URL prefix type"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2246
+#: src/Admin/SiteHealth.php:2726
 msgid "Hide prefix for default language"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2250
+#: src/Admin/SiteHealth.php:2730
 msgid "Language detection order"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2254
+#: src/Admin/SiteHealth.php:2734
 msgid "Redirect by browser language"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2258
+#: src/Admin/SiteHealth.php:2738
 msgid "Redirect by GeoIP"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2262
+#: src/Admin/SiteHealth.php:2742
 msgid "Redirect by edge hint"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2266
+#: src/Admin/SiteHealth.php:2746
 msgid "Redirect priority"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2270
+#: src/Admin/SiteHealth.php:2750
 msgid "Edge integration enabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2288
+#: src/Admin/SiteHealth.php:2768
 msgid "Default language"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2289
+#: src/Admin/SiteHealth.php:2769
 msgid "not set"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2292
+#: src/Admin/SiteHealth.php:2772
 msgid "Active languages"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2293
-#: src/Admin/SiteHealth.php:2300
-#: src/Admin/SiteHealth.php:2304
-#: src/Admin/SiteHealth.php:2330
-#: src/Admin/SiteHealth.php:2392
-#: src/Admin/SiteHealth.php:2693
-#: src/Admin/SiteHealth.php:2716
+#: src/Admin/SiteHealth.php:2773
+#: src/Admin/SiteHealth.php:2780
+#: src/Admin/SiteHealth.php:2784
+#: src/Admin/SiteHealth.php:2810
+#: src/Admin/SiteHealth.php:2872
+#: src/Admin/SiteHealth.php:3191
+#: src/Admin/SiteHealth.php:3345
 msgid "none"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2299
+#: src/Admin/SiteHealth.php:2779
 msgid "Translatable post types"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2303
+#: src/Admin/SiteHealth.php:2783
 msgid "Translatable taxonomies"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2309
+#: src/Admin/SiteHealth.php:2789
 msgid "Translatable meta keys (post-filter)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2326
-#: src/Admin/SiteHealth.php:2353
-#: src/Admin/SiteHealth.php:2357
-#: src/Admin/SiteHealth.php:2361
-#: src/Admin/SiteHealth.php:2462
-#: src/Admin/SiteHealth.php:2466
+#: src/Admin/SiteHealth.php:2806
+#: src/Admin/SiteHealth.php:2833
+#: src/Admin/SiteHealth.php:2837
+#: src/Admin/SiteHealth.php:2841
+#: src/Admin/SiteHealth.php:2942
+#: src/Admin/SiteHealth.php:2946
 msgid "Enabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2329
+#: src/Admin/SiteHealth.php:2809
 msgid "MT provider"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2336
+#: src/Admin/SiteHealth.php:2816
 msgid "unlimited"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2339
+#: src/Admin/SiteHealth.php:2819
 msgid "MT usage this month"
 msgstr ""
 
 #. translators: 1: used characters, 2: limit
-#: src/Admin/SiteHealth.php:2341
+#: src/Admin/SiteHealth.php:2821
 #, php-format
 msgid "%1$s / %2$s characters"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2344
+#: src/Admin/SiteHealth.php:2824
 msgid "Auto-translate on publish"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2352
+#: src/Admin/SiteHealth.php:2832
 msgid "Hreflang output"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2356
+#: src/Admin/SiteHealth.php:2836
 msgid "x-default hreflang"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2360
+#: src/Admin/SiteHealth.php:2840
 msgid "Sitemap integration"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2364
+#: src/Admin/SiteHealth.php:2844
 msgid "SEO plugin preference"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2370
+#: src/Admin/SiteHealth.php:2850
 msgid "SEO plugin detected"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2374
+#: src/Admin/SiteHealth.php:2854
 msgid "Builder detected"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2378
+#: src/Admin/SiteHealth.php:2858
 msgid "Theme detected"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2391
+#: src/Admin/SiteHealth.php:2871
 msgid "Active addons"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2404
+#: src/Admin/SiteHealth.php:2884
 msgid "Addons disabled by operator"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2411
+#: src/Admin/SiteHealth.php:2891
 msgid "Addons needing newer PerfLocale"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2426
+#: src/Admin/SiteHealth.php:2906
 msgid "Addon settings option size"
 msgstr ""
 
 #. translators: 1: total serialised bytes, 2: per-addon byte cap
-#: src/Admin/SiteHealth.php:2429
+#: src/Admin/SiteHealth.php:2909
 #, php-format
 msgid "%1$s bytes total (per-addon cap %2$s bytes)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2436
+#: src/Admin/SiteHealth.php:2916
 msgid "Disabled-addons option size"
 msgstr ""
 
 #. translators: 1: serialised bytes, 2: option byte cap
-#: src/Admin/SiteHealth.php:2439
+#: src/Admin/SiteHealth.php:2919
 #, php-format
 msgid "%1$s of %2$s bytes used"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2449
+#: src/Admin/SiteHealth.php:2929
 msgid "WooCommerce base currency"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2453
+#: src/Admin/SiteHealth.php:2933
 msgid "Stock sync across translations"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2457
+#: src/Admin/SiteHealth.php:2937
 msgid "Price sync across translations"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2461
+#: src/Admin/SiteHealth.php:2941
 msgid "Per-language currencies"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2465
+#: src/Admin/SiteHealth.php:2945
 msgid "Automatic FX sync"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2473
+#: src/Admin/SiteHealth.php:2953
 msgid "FX (foreign-exchange rates) last synced"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2487
+#: src/Admin/SiteHealth.php:2967
 msgid "String translation mode"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2491
+#: src/Admin/SiteHealth.php:2971
 msgid "Object cache enabled in settings"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2495
+#: src/Admin/SiteHealth.php:2975
 msgid "Preload translated slugs"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2499
+#: src/Admin/SiteHealth.php:2979
 msgid "WP-Cron disabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2501
+#: src/Admin/SiteHealth.php:2981
 msgid "Yes (affects scheduled FX sync, webhook delivery, and background jobs when Action Scheduler is not loaded — make sure an external cron hits wp-cron.php)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2517
+#: src/Admin/SiteHealth.php:2997
 msgid "Background jobs: engine"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2518
+#: src/Admin/SiteHealth.php:2998
 msgid " (Action Scheduler not loaded)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2521
+#: src/Admin/SiteHealth.php:3001
 msgid "Background jobs: processing mode"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2522
+#: src/Admin/SiteHealth.php:3002
 msgid " (queue PAUSED)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2525
+#: src/Admin/SiteHealth.php:3005
 msgid "Background jobs: active queue depth"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2526
+#: src/Admin/SiteHealth.php:3006
 msgid " (bounded to 50)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2538
+#: src/Admin/SiteHealth.php:3023
+msgid "Optional PHP extensions"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:3036
 msgid "Migration importer batch sizes"
 msgstr ""
 
 #. translators: 1: WPML batch, 2: Polylang batch, 3: TranslatePress batch
-#: src/Admin/SiteHealth.php:2541
+#: src/Admin/SiteHealth.php:3039
 #, php-format
 msgid "WPML=%1$d, Polylang=%2$d, TranslatePress=%3$d"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2554
+#: src/Admin/SiteHealth.php:3052
 msgid "not configured"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2554
+#: src/Admin/SiteHealth.php:3052
 msgid "configured"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2560
+#: src/Admin/SiteHealth.php:3058
 msgid "Translation, routing, and integration state for the PerfLocale multilingual plugin. Paste this section when asking for support."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2648
+#: src/Admin/SiteHealth.php:3146
 msgid "Translation groups"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2649
+#: src/Admin/SiteHealth.php:3147
 msgid "Translation links"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2650
+#: src/Admin/SiteHealth.php:3148
 msgid "Source strings"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2777
+#: src/Admin/SiteHealth.php:3222
+msgid "No webhook delivery failures recorded"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:3223
+msgid "PerfLocale has not given up on any webhook delivery. This card stays green when no webhooks are configured."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:3252
+msgid "No recent webhook delivery failures"
+msgstr ""
+
+#. translators: %d: number of older failure entries still in the log.
+#: src/Admin/SiteHealth.php:3255
+#, php-format
+msgid "There is %d older delivery failure in the log, but none in the last 24 hours."
+msgid_plural "There are %d older delivery failures in the log, but none in the last 24 hours."
+msgstr[0] ""
+msgstr[1] ""
+
+#. translators: %d: number of failed deliveries for one webhook.
+#: src/Admin/SiteHealth.php:3275
+#, php-format
+msgid "%d failed delivery"
+msgid_plural "%d failed deliveries"
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/Admin/SiteHealth.php:3283
+msgid "Webhook deliveries are failing"
+msgstr ""
+
+#. translators: %d: number of failed deliveries in the last 24 hours.
+#: src/Admin/SiteHealth.php:3288
+#, php-format
+msgid "%d webhook delivery was abandoned in the last 24 hours after its retries were exhausted or its address was refused."
+msgid_plural "%d webhook deliveries were abandoned in the last 24 hours after their retries were exhausted or their addresses were refused."
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/Admin/SiteHealth.php:3406
 msgid "PerfLocale eager-link-map is over the size sentinel"
 msgstr ""
 
 #. translators: %s is a comma-separated list of object types (post, term).
-#: src/Admin/SiteHealth.php:2780
+#: src/Admin/SiteHealth.php:3409
 #, php-format
 msgid "The eager-link-map autoloaded option for %s tripped its size sentinel and is currently disabled. Lookups fall back to per-row DB queries, which is correct but slower. This typically means the site has more translation groups than the per-blog cap. Consider archiving stale translation groups, or override the cap via the perflocale/cache/eager_map_byte_cap filter if your hosting can absorb the alloptions cost."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2789
+#: src/Admin/SiteHealth.php:3418
 msgid "PerfLocale eager-link-map is large"
 msgstr ""
 
 #. translators: 1: total autoloaded bytes (formatted), 2: KB threshold.
-#: src/Admin/SiteHealth.php:2792
+#: src/Admin/SiteHealth.php:3421
 #, php-format
 msgid "PerfLocale's eager-link-map autoloaded options total %1$s, above the recommended %2$s threshold. The blob is loaded on every page via alloptions, so growth above this point starts to eat into the optimization's benefit. Consider archiving old translation groups; the loader self-disables (via its size sentinel) before runtime cost becomes meaningful."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2801
+#: src/Admin/SiteHealth.php:3430
 msgid "PerfLocale eager-link-map is healthy"
 msgstr ""
 
 #. translators: %s is the formatted byte size.
-#: src/Admin/SiteHealth.php:2804
+#: src/Admin/SiteHealth.php:3433
 #, php-format
 msgid "The eager-link-map is populated and well within the recommended size envelope (%s). Frontend translation-lookup hot path is on the fast (autoload + sub-µs lookup) branch."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2820
+#: src/Admin/SiteHealth.php:3449
 msgid "background-jobs watchdog"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2821
+#: src/Admin/SiteHealth.php:3450
 msgid "background-jobs garbage collector"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2822
+#: src/Admin/SiteHealth.php:3451
 msgid "expired-lock reaper"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2828
+#: src/Admin/SiteHealth.php:3457
 msgid "machine-translation usage cleanup"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2847
-msgid "PerfLocale background jobs cannot run"
+#: src/Admin/SiteHealth.php:3502
+msgid "PerfLocale background jobs are not running"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2848
-msgid "DISABLE_WP_CRON is set to true AND Action Scheduler is not available — neither of PerfLocale's job runners can execute. Background translations, watchdog sweeps, and lock cleanup will all stall. Either install/enable Action Scheduler, set up a real OS-level cron pointing at wp-cron.php, or set DISABLE_WP_CRON back to false."
+#. translators: 1: comma-separated list of overdue event names, 2: how long they are overdue, e.g. "3 hours".
+#: src/Admin/SiteHealth.php:3507
+#, php-format
+msgid "These recurring events are more than %2$s past their scheduled time and have not run: %1$s."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2860
+#: src/Admin/SiteHealth.php:3511
+msgid "DISABLE_WP_CRON is set and Action Scheduler is not available, so WordPress will not run these by itself. If you use a system cron, check that it still reaches wp-cron.php. Otherwise install Action Scheduler (WooCommerce ships it) or set DISABLE_WP_CRON back to false."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:3522
+#: src/Admin/SiteHealth.php:3547
+msgid "PerfLocale cron schedules are healthy"
+msgstr ""
+
+#: src/Admin/SiteHealth.php:3523
+msgid "DISABLE_WP_CRON is set and Action Scheduler is not available, but every PerfLocale recurring event is scheduled and none is overdue — so an external cron is reaching wp-cron.php as intended. This is the recommended production setup."
+msgstr ""
+
+#: src/Admin/SiteHealth.php:3536
 msgid "PerfLocale cron schedules are missing"
 msgstr ""
 
 #. translators: %s is a comma-separated list of human-readable cron-event names.
-#: src/Admin/SiteHealth.php:2863
+#: src/Admin/SiteHealth.php:3539
 #, php-format
 msgid "These PerfLocale recurring events are not scheduled and won't run: %s. PerfLocale re-registers them automatically on any admin page load (checked at most once every 6 hours), so loading wp-admin again is usually enough. If they stay missing, saving any PerfLocale setting forces an immediate re-check, and deactivating then reactivating the plugin rebuilds them from scratch."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2871
-msgid "PerfLocale cron schedules are healthy"
+#: src/Admin/SiteHealth.php:3551
+msgid "All PerfLocale recurring events (watchdog, garbage collector, lock reaper, machine-translation usage cleanup) are scheduled and will run on their normal cadence."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2872
-msgid "All PerfLocale recurring events (watchdog, garbage collector, lock reaper) are scheduled and will run on their normal cadence."
-msgstr ""
-
-#: src/Admin/SiteHealth.php:2897
+#: src/Admin/SiteHealth.php:3576
 msgid "PerfLocale stuck-translations check unavailable"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2898
-#: src/Admin/SiteHealth.php:2986
+#: src/Admin/SiteHealth.php:3577
+#: src/Admin/SiteHealth.php:3665
 msgid "Translation tables are not present yet; the check will start running once the plugin's tables are created."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2936
+#: src/Admin/SiteHealth.php:3615
 msgid "No translations are stuck"
 msgstr ""
 
 #. translators: 1: STUCK_AGE_DAYS, 2: how long ago the check ran (human-readable).
-#: src/Admin/SiteHealth.php:2939
+#: src/Admin/SiteHealth.php:3618
 #, php-format
 msgid "No translations have been in the in_progress or pending state for more than %1$d days. (Checked %2$s ago.)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:2948
+#: src/Admin/SiteHealth.php:3627
 msgid "Some translations have been stuck for over a week"
 msgstr ""
 
 #. translators: 1: row count, 2: STUCK_AGE_DAYS, 3: how long ago the check ran (human-readable).
-#: src/Admin/SiteHealth.php:2951
+#: src/Admin/SiteHealth.php:3630
 #, php-format
 msgid "%1$d translation row has been in in_progress or pending status for more than %2$d days. This usually means a background job crashed mid-run, an MT provider stopped responding, or a worker was assigned the row but never returned. Check the PerfLocale Jobs admin page for failed/retried entries, then either re-dispatch or manually mark the row. (Checked %3$s ago; the count refreshes hourly.)"
 msgid_plural "%1$d translation rows have been in in_progress or pending status for more than %2$d days. This usually means background jobs crashed mid-run, an MT provider stopped responding, or workers were assigned the rows but never returned. Check the PerfLocale Jobs admin page for failed/retried entries, then either re-dispatch or manually mark them. (Checked %3$s ago; the count refreshes hourly.)"
 msgstr[0] ""
 msgstr[1] ""
 
-#: src/Admin/SiteHealth.php:2985
+#: src/Admin/SiteHealth.php:3664
 msgid "PerfLocale orphan-rows check unavailable"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3037
+#: src/Admin/SiteHealth.php:3716
 msgid "No orphan translation rows"
 msgstr ""
 
 #. translators: %s is how long ago the check ran (human-readable).
-#: src/Admin/SiteHealth.php:3040
+#: src/Admin/SiteHealth.php:3719
 #, php-format
 msgid "Every translation row points at a real post/term. (Checked %s ago.)"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3048
+#: src/Admin/SiteHealth.php:3727
 msgid "PerfLocale has orphan translation rows"
 msgstr ""
 
 #. translators: 1: post-orphan count, 2: term-orphan count, 3: how long ago the check ran.
-#: src/Admin/SiteHealth.php:3051
+#: src/Admin/SiteHealth.php:3730
 #, php-format
 msgid "Found %1$d post-translation rows and %2$d term-translation rows pointing at posts/terms that no longer exist. This usually happens after a direct DB import, a destructive bulk-delete that bypassed wp_delete_post()/wp_delete_term(), or a partial restore. Run `wp perflocale health-check` to review, then `wp perflocale health-check --fix` to clean up. The fix deletes the dangling link rows (and any other stale database references it finds); your posts, terms and their translations are not touched. (Checked %3$s ago; the count refreshes hourly.)"
 msgstr ""
 
 #. translators: 1: nginx configuration snippet, 2: Caddy configuration snippet
-#: src/Admin/SiteHealth.php:3154
+#: src/Admin/SiteHealth.php:3833
 #, php-format
 msgid "Add a rule to your server configuration that denies access to the directory. For nginx: %1$s For Caddy: %2$s After adding it, reload the server and re-run this check."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3180
+#: src/Admin/SiteHealth.php:3868
 msgid "PerfLocale export exposure check is disabled"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3181
+#: src/Admin/SiteHealth.php:3869
 msgid "The active check has been switched off on this site, so PerfLocale has not verified whether export files are reachable over the web. If this site runs on nginx or Caddy, add the export deny rule from the installation notes and confirm it yourself — .htaccess alone does not protect that directory on those servers."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3190
-#: src/Admin/SiteHealth.php:3297
+#: src/Admin/SiteHealth.php:3878
+#: src/Admin/SiteHealth.php:3985
 msgid "PerfLocale export files are readable over the web"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3191
-#: src/Admin/SiteHealth.php:3298
+#: src/Admin/SiteHealth.php:3879
+#: src/Admin/SiteHealth.php:3986
 msgid "A test file placed in the export directory was served over HTTP, so anyone who learns or guesses an export URL can download that export without logging in. Export filenames carry 32 characters of randomness, so they cannot realistically be guessed, but they can leak through server logs, browser history, referrers or backups."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3200
-#: src/Admin/SiteHealth.php:3306
+#: src/Admin/SiteHealth.php:3888
+#: src/Admin/SiteHealth.php:3994
 msgid "A test file placed in the export directory was refused over HTTP, so exports are only reachable through the authenticated download in the admin."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3212
-#: src/Admin/SiteHealth.php:3242
-#: src/Admin/SiteHealth.php:3255
-#: src/Admin/SiteHealth.php:3284
+#: src/Admin/SiteHealth.php:3900
+#: src/Admin/SiteHealth.php:3930
+#: src/Admin/SiteHealth.php:3943
+#: src/Admin/SiteHealth.php:3972
 msgid "PerfLocale export exposure could not be checked"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3213
+#: src/Admin/SiteHealth.php:3901
 msgid "This site could not make a request to itself, so the check was skipped. That is common on hosts that block loopback requests and does not by itself indicate a problem. If your server is nginx or Caddy, add the export deny rule from the installation notes anyway."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3224
+#: src/Admin/SiteHealth.php:3912
 msgid "PerfLocale export directory does not exist yet"
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3225
+#: src/Admin/SiteHealth.php:3913
 msgid "No export has been created on this site, so there is nothing to expose. This check runs again once the directory exists."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3243
-msgid "The uploads directory URL is unavailable, so this check was skipped. It does not indicate a problem."
+#: src/Admin/SiteHealth.php:3931
+msgid "The uploads directory URL is unavailable, so PerfLocale could not verify whether exports are reachable over the web. This is not itself evidence of a problem, but it is not evidence of safety either. If this site runs on nginx or Caddy, add the export deny rule from the installation notes."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3256
-msgid "The export directory is not writable from PHP, so this check was skipped. A directory that cannot be written also cannot receive new exports."
+#: src/Admin/SiteHealth.php:3944
+msgid "The export directory is not writable from PHP, so PerfLocale could not place its test file. A directory that cannot be written cannot receive new exports, but any export already in it is still served by the web server. If this site runs on nginx or Caddy, add the export deny rule from the installation notes."
 msgstr ""
 
-#: src/Admin/SiteHealth.php:3285
-msgid "The site could not make a request to itself, so this check was skipped. That is common on hosts that block loopback requests and does not by itself indicate a problem."
+#: src/Admin/SiteHealth.php:3973
+msgid "The site could not make a request to itself, so PerfLocale could not verify whether exports are reachable over the web. That is common on hosts that block loopback requests and is not itself evidence of a problem — but it is not evidence of safety either, and .htaccess does not protect this directory on nginx or Caddy. Add the export deny rule from the installation notes."
 msgstr ""
 
 #: src/Admin/TermListColumns.php:330
@@ -6884,7 +7092,7 @@ msgid "Target post IS the source post; use /block-translate to translate in plac
 msgstr ""
 
 #: src/Api/BlockTranslateController.php:685
-#: src/Bootstrap.php:3255
+#: src/Bootstrap.php:3273
 msgid "No default language configured."
 msgstr ""
 
@@ -7071,7 +7279,7 @@ msgid "String row IDs (kind=strings)."
 msgstr ""
 
 #: src/Api/MachineTranslateController.php:98
-#: src/Api/TranslationsController.php:155
+#: src/Api/TranslationsController.php:156
 msgid "Target language IDs."
 msgstr ""
 
@@ -7122,7 +7330,7 @@ msgid "Failed to create the term translation."
 msgstr ""
 
 #: src/Api/MachineTranslateController.php:434
-#: src/Api/TranslationsController.php:265
+#: src/Api/TranslationsController.php:266
 msgid "You cannot access one of the requested posts."
 msgstr ""
 
@@ -7135,7 +7343,8 @@ msgstr ""
 #: src/Api/RestController.php:77
 #: src/Api/RestController.php:95
 #: src/Api/RestController.php:113
-#: src/Api/TranslationsController.php:185
+#: src/Api/TranslationsController.php:186
+#: src/Api/WebhookController.php:373
 msgid "You do not have permission to perform this action."
 msgstr ""
 
@@ -7203,150 +7412,186 @@ msgstr ""
 msgid "Translated post title."
 msgstr ""
 
-#: src/Api/TranslationsController.php:93
+#: src/Api/TranslationsController.php:94
 msgid "Translated post content (HTML allowed; sanitised with wp_kses_post by the handler)."
 msgstr ""
 
-#: src/Api/TranslationsController.php:97
+#: src/Api/TranslationsController.php:98
 msgid "Translated post excerpt."
 msgstr ""
 
-#: src/Api/TranslationsController.php:102
+#: src/Api/TranslationsController.php:103
 msgid "Post status to set (e.g. draft, publish)."
 msgstr ""
 
-#: src/Api/TranslationsController.php:130
+#: src/Api/TranslationsController.php:131
 msgid "Language slug to assign to the (currently unassigned) post."
 msgstr ""
 
-#: src/Api/TranslationsController.php:152
+#: src/Api/TranslationsController.php:153
 msgid "Source post IDs to translate."
 msgstr ""
 
-#: src/Api/TranslationsController.php:158
+#: src/Api/TranslationsController.php:159
 msgid "Also machine-translate registered meta fields."
 msgstr ""
 
-#: src/Api/TranslationsController.php:161
+#: src/Api/TranslationsController.php:162
 msgid "Return the character/cost estimate without dispatching."
 msgstr ""
 
-#: src/Api/TranslationsController.php:164
+#: src/Api/TranslationsController.php:165
 msgid "Translate ALL published posts of the given post types (chunked background chain) instead of an explicit ID list."
 msgstr ""
 
-#: src/Api/TranslationsController.php:167
+#: src/Api/TranslationsController.php:168
 msgid "Post types for site_wide mode (default: post, page)."
 msgstr ""
 
-#: src/Api/TranslationsController.php:213
+#: src/Api/TranslationsController.php:214
 msgid "target_lang_ids is required."
 msgstr ""
 
-#: src/Api/TranslationsController.php:217
+#: src/Api/TranslationsController.php:218
 msgid "post_ids is required unless site_wide is set."
 msgstr ""
 
-#: src/Api/TranslationsController.php:237
-#: src/Api/TranslationsController.php:282
+#: src/Api/TranslationsController.php:238
+#: src/Api/TranslationsController.php:283
 msgid "No valid post types supplied."
 msgstr ""
 
-#: src/Api/TranslationsController.php:355
-#: src/Api/TranslationsController.php:398
+#: src/Api/TranslationsController.php:356
+#: src/Api/TranslationsController.php:399
 msgid "Invalid object type."
 msgstr ""
 
-#: src/Api/TranslationsController.php:415
+#: src/Api/TranslationsController.php:416
 msgid "Only post translations can be listed here."
 msgstr ""
 
-#: src/Api/TranslationsController.php:538
+#: src/Api/TranslationsController.php:539
 msgid "Target language is required."
 msgstr ""
 
-#: src/Api/TranslationsController.php:584
+#: src/Api/TranslationsController.php:585
 msgid "Only posts support direct language assignment."
 msgstr ""
 
-#: src/Api/TranslationsController.php:592
+#: src/Api/TranslationsController.php:593
 msgid "Language slug is required."
 msgstr ""
 
-#: src/Api/TranslationsController.php:600
+#: src/Api/TranslationsController.php:601
 msgid "Unknown or inactive language."
 msgstr ""
 
-#: src/Api/TranslationsController.php:622
+#: src/Api/TranslationsController.php:623
 msgid "This post already has a language assigned."
 msgstr ""
 
-#: src/Api/TranslationsController.php:626
+#: src/Api/TranslationsController.php:627
 msgid "Failed to assign language."
 msgstr ""
 
-#: src/Api/TranslationsController.php:641
+#: src/Api/TranslationsController.php:642
 msgid "Another language assignment for this post is in progress. Please retry."
 msgstr ""
 
-#: src/Api/TranslationsController.php:665
-#: src/Api/TranslationsController.php:859
+#: src/Api/TranslationsController.php:666
+#: src/Api/TranslationsController.php:860
 msgid "Translation not found."
 msgstr ""
 
-#: src/Api/TranslationsController.php:670
+#: src/Api/TranslationsController.php:671
 msgid "You cannot edit this translation."
 msgstr ""
 
-#: src/Api/TranslationsController.php:727
+#: src/Api/TranslationsController.php:728
 msgid "Unknown post type for this translation."
 msgstr ""
 
-#: src/Api/TranslationsController.php:737
+#: src/Api/TranslationsController.php:738
 msgid "You cannot trash this translation."
 msgstr ""
 
-#: src/Api/TranslationsController.php:776
+#: src/Api/TranslationsController.php:777
 msgid "That status cannot be set through this endpoint."
 msgstr ""
 
-#: src/Api/TranslationsController.php:792
+#: src/Api/TranslationsController.php:793
 msgid "You are not allowed to publish this translation."
 msgstr ""
 
 #. translators: 1: requested post status, 2: reason reported by WordPress
-#: src/Api/TranslationsController.php:823
+#: src/Api/TranslationsController.php:824
 #, php-format
 msgid "WordPress refused the status \"%1$s\" for this post: %2$s"
 msgstr ""
 
-#: src/Api/TranslationsController.php:864
+#: src/Api/TranslationsController.php:865
 msgid "You cannot delete this translation."
 msgstr ""
 
-#: src/Api/WebhookController.php:578
+#: src/Api/WebhookController.php:372
+msgid "Registering a webhook requires network administrator permissions."
+msgstr ""
+
+#: src/Api/WebhookController.php:782
+msgid "Webhook URL could not be parsed."
+msgstr ""
+
+#: src/Api/WebhookController.php:783
+msgid "Webhook URL must use http or https."
+msgstr ""
+
+#: src/Api/WebhookController.php:784
+msgid "Webhook URL must not contain a username or password."
+msgstr ""
+
+#: src/Api/WebhookController.php:785
+msgid "Webhook URL uses a port WordPress will not connect to. Allowed ports are 80, 443 and 8080."
+msgstr ""
+
+#: src/Api/WebhookController.php:786
+msgid "Webhook URL host could not be resolved."
+msgstr ""
+
+#: src/Api/WebhookController.php:787
+msgid "Webhook URL targets a private-range address."
+msgstr ""
+
+#: src/Api/WebhookController.php:788
+msgid "Webhook URL targets a loopback address."
+msgstr ""
+
+#: src/Api/WebhookController.php:789
+msgid "Webhook URL was rejected by a site policy filter."
+msgstr ""
+
+#: src/Api/WebhookController.php:794
 msgid "Webhook URL targets a loopback or private-range address."
 msgstr ""
 
 #. translators: %d: Minimum secret length.
-#: src/Api/WebhookController.php:593
+#: src/Api/WebhookController.php:810
 #, php-format
 msgid "Webhook secret must be at least %d characters."
 msgstr ""
 
-#: src/Api/WebhookController.php:634
+#: src/Api/WebhookController.php:851
 msgid "Another webhook registration is in progress; please retry."
 msgstr ""
 
-#: src/Api/WebhookController.php:640
+#: src/Api/WebhookController.php:857
 msgid "The secret is only returned once during registration. Store it securely - subsequent GET requests will NOT include it."
 msgstr ""
 
-#: src/Api/WebhookController.php:700
+#: src/Api/WebhookController.php:917
 msgid "Another webhook write is in progress; please retry."
 msgstr ""
 
-#: src/Api/WebhookController.php:704
+#: src/Api/WebhookController.php:921
 msgid "Webhook not found."
 msgstr ""
 
@@ -7595,62 +7840,62 @@ msgid "Set up machine translation…"
 msgstr ""
 
 #. translators: %s is an optional AS-supplied error message starting with ": ".
-#: src/Bootstrap.php:1580
+#: src/Bootstrap.php:1607
 #, php-format
 msgid "[AS marked failed] Worker terminated before completion%s"
 msgstr ""
 
 #. translators: 1: estimated characters, 2: remaining monthly characters, 3: monthly limit.
-#: src/Bootstrap.php:1905
+#: src/Bootstrap.php:1932
 #, php-format
 msgid "This translation needs about %1$s characters but only %2$s of the monthly limit (%3$s) remain. Raise the limit under Settings → Addons → Machine Translation, or narrow the selection."
 msgstr ""
 
-#: src/Bootstrap.php:2582
-#: src/Bootstrap.php:2812
-#: src/Bootstrap.php:3220
+#: src/Bootstrap.php:2600
+#: src/Bootstrap.php:2830
+#: src/Bootstrap.php:3238
 msgid "Permission denied."
 msgstr ""
 
-#: src/Bootstrap.php:2586
+#: src/Bootstrap.php:2604
 msgid "WooCommerce is not active."
 msgstr ""
 
-#: src/Bootstrap.php:2597
-#: src/Bootstrap.php:2850
+#: src/Bootstrap.php:2615
+#: src/Bootstrap.php:2868
 msgid "At least two active languages are required."
 msgstr ""
 
-#: src/Bootstrap.php:2613
+#: src/Bootstrap.php:2631
 msgid "No WooCommerce pages found."
 msgstr ""
 
 #. translators: %1$d: number of pages created, %2$d: number already existing
-#: src/Bootstrap.php:2777
+#: src/Bootstrap.php:2795
 #, php-format
 msgid "Done - %1$d page(s) created, %2$d already existed."
 msgstr ""
 
-#: src/Bootstrap.php:2783
+#: src/Bootstrap.php:2801
 msgid "Titles were machine-translated."
 msgstr ""
 
 #. translators: %1$d: number of translations created, %2$d: number already existing
-#: src/Bootstrap.php:3172
+#: src/Bootstrap.php:3190
 #, php-format
 msgid "Done - %1$d translation(s) created, %2$d already existed."
 msgstr ""
 
-#: src/Bootstrap.php:3178
+#: src/Bootstrap.php:3196
 msgid "Term names were machine-translated."
 msgstr ""
 
-#: src/Bootstrap.php:3261
+#: src/Bootstrap.php:3279
 msgid "No translatable post types configured."
 msgstr ""
 
 #. translators: 1: number of posts assigned, 2: default language slug
-#: src/Bootstrap.php:3319
+#: src/Bootstrap.php:3337
 #, php-format
 msgid "Done - %1$d post(s) assigned to %2$s."
 msgstr ""
@@ -7753,7 +7998,7 @@ msgid "Label format on the dropdown trigger button, independent of the options l
 msgstr ""
 
 #: src/Frontend/CustomizerIntegration.php:288
-#: src/Frontend/LanguageSwitcherWidget.php:198
+#: src/Frontend/LanguageSwitcherWidget.php:215
 #: blocks/language-switcher/index.js:147
 msgid "Hide current language"
 msgstr ""
@@ -7791,7 +8036,7 @@ msgid "No languages configured."
 msgstr ""
 
 #. translators: %s: name of the currently-selected language
-#: src/Frontend/LanguageSwitcherBlock.php:904
+#: src/Frontend/LanguageSwitcherBlock.php:927
 #, php-format
 msgid "Choose language, currently %s"
 msgstr ""
@@ -7800,36 +8045,36 @@ msgstr ""
 msgid "Display a language switcher with flags, names, or dropdown."
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:165
-#: src/Frontend/LanguageSwitcherWidget.php:179
+#: src/Frontend/LanguageSwitcherWidget.php:182
+#: src/Frontend/LanguageSwitcherWidget.php:196
 msgid "Both - English (Native)"
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:175
-#: src/Frontend/LanguageSwitcherWidget.php:189
+#: src/Frontend/LanguageSwitcherWidget.php:192
+#: src/Frontend/LanguageSwitcherWidget.php:206
 msgid "Use site default (Settings → Switcher)"
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:196
+#: src/Frontend/LanguageSwitcherWidget.php:213
 #: blocks/language-switcher/index.js:172
 msgid "Show flags"
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:197
+#: src/Frontend/LanguageSwitcherWidget.php:214
 #: blocks/language-switcher/index.js:177
 msgid "Show names"
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:199
+#: src/Frontend/LanguageSwitcherWidget.php:216
 msgid "Show untranslated"
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:201
+#: src/Frontend/LanguageSwitcherWidget.php:218
 #: blocks/language-switcher/index.js:182
 msgid "Font size (px)"
 msgstr ""
 
-#: src/Frontend/LanguageSwitcherWidget.php:202
+#: src/Frontend/LanguageSwitcherWidget.php:219
 #: blocks/language-switcher/index.js:189
 msgid "Flag size (px)"
 msgstr ""
@@ -7839,7 +8084,7 @@ msgid "PerfLocale\\Helper::switcher() must be called after the plugins_loaded ac
 msgstr ""
 
 #. translators: %s is the addon textdomain.
-#: src/Helper.php:2403
+#: src/Helper.php:2551
 #, php-format
 msgid "Helper::load_addon_textdomain( \"%s\", ... ) was called before the init action fired. Wrap your call in add_action( \"init\", ..., 99 ) so WP 6.7+ does not strip the textdomain."
 msgstr ""

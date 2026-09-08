@@ -329,7 +329,9 @@ final class XliffImporter {
 
 			switch ( $field ) {
 				case 'title':
-					$update_data['post_title'] = sanitize_text_field( $translated_text );
+					// Not sanitize_text_field(): it deletes every %XX sequence, so a
+					// title exported as "100%25 off" comes back as "100 off".
+					$update_data['post_title'] = \PerfLocale\Helper::sanitize_plain_text_field( $translated_text );
 					break;
 
 				case 'content':
@@ -345,7 +347,15 @@ final class XliffImporter {
 					break;
 
 				case 'excerpt':
-					$update_data['post_excerpt'] = sanitize_textarea_field( $translated_text );
+					// Same trust model as `content` above, for the same reason: an
+					// excerpt legitimately carries markup — a WooCommerce product's
+					// short description is stored as `<p>…</p>` — and
+					// sanitize_textarea_field() stripped every tag AND every %XX on
+					// the way back in, so an export/import round trip silently
+					// flattened it. kses keeps both.
+					$update_data['post_excerpt'] = current_user_can( 'unfiltered_html' )
+						? $translated_text
+						: \PerfLocale\MachineTranslation\TranslationService::sanitize_mt_html( $translated_text );
 					break;
 			}
 

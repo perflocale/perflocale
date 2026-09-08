@@ -1524,10 +1524,36 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( "Directory is not writable: {$dir}" );
 		}
 
-		$bytes = \PerfLocale\Admin\PoSync::export_to_file( $file, $lang, $domain );
+		$report = [];
+		$bytes  = \PerfLocale\Admin\PoSync::export_to_file( $file, $lang, $domain, $report );
 
 		if ( $bytes === false ) {
 			\WP_CLI::error( "PO export failed (unknown lang slug or write error): {$file}" );
+		}
+
+		// Both conditions leave the .po itself valid, so they are warnings, not
+		// errors — but they are invisible without this: the damage only appears
+		// when someone imports the file back and their work lands on the wrong
+		// row (or on a row nothing reads).
+		if ( ! empty( $report['dup_groups'] ) ) {
+			\WP_CLI::warning(
+				sprintf(
+					'%1$d duplicate msgctxt/msgid pair(s) covering %2$d strings: a PO file cannot hold two entries with the same key, so re-importing this file will merge them and one string becomes unreachable through PO.',
+					(int) $report['dup_groups'],
+					(int) $report['dup_rows']
+				)
+			);
+		}
+
+		if ( ! empty( $report['unhashable'] ) ) {
+			\WP_CLI::warning(
+				sprintf(
+					'%1$d of %2$d strings will not round-trip: their stored hash was not computed from the text now in the row, so re-importing creates a new row instead of updating theirs. Serving is unaffected. First ids: %3$s',
+					(int) $report['unhashable'],
+					(int) $report['emitted'],
+					implode( ', ', array_map( 'intval', (array) $report['unhashable_ids'] ) )
+				)
+			);
 		}
 
 		$kb = round( ( (int) $bytes ) / 1024, 1 );

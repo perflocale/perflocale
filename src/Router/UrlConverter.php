@@ -911,37 +911,37 @@ final class UrlConverter {
 			return;
 		}
 
-		// Build a map of taxonomy query_var → taxonomy slug (cached per request),
-		// alongside the list of query vars whose rewrite is hierarchical — the
-		// exact flag WP_Query::parse_tax_query() tests before it basenames the
-		// value. Collecting it here keeps get_taxonomy() out of the loop below.
-		static $tax_query_vars = null;
-
-		/**
-		 * Query vars of the translatable taxonomies whose rewrite is hierarchical.
+		/*
+		 * Build a map of taxonomy query_var → taxonomy slug, alongside the list
+		 * of query vars whose rewrite is hierarchical — the exact flag
+		 * WP_Query::parse_tax_query() tests before it basenames the value.
+		 * Collecting it here keeps get_taxonomy() out of the loop below.
 		 *
-		 * @var string[] $hier_query_vars
+		 * Deliberately NOT memoised in a function-local static. This method is
+		 * hooked to `parse_request`, so it runs once per request and the memo
+		 * could only ever save the cost of one rebuild — measured at 0.4µs. In
+		 * exchange a static would hold two kinds of stale data no invalidation
+		 * in this plugin can reach: the registered taxonomies differ per blog on
+		 * a network (a static survives switch_to_blog()), and the translatable
+		 * list is a setting, so it also survived Settings::reset_cache(), which
+		 * is what a settings save and switch_blog both fire. Half a microsecond
+		 * is not worth two staleness axes.
 		 */
-		static $hier_query_vars = [];
+		$tax_query_vars  = [];
+		$hier_query_vars = [];
 
-		if ( $tax_query_vars === null ) {
-			$tax_query_vars  = [];
-			$hier_query_vars = [];
-			$translatable    = $this->settings->get_translatable_taxonomies();
+		foreach ( $this->settings->get_translatable_taxonomies() as $taxonomy ) {
+			$tax_obj = get_taxonomy( $taxonomy );
 
-			foreach ( $translatable as $taxonomy ) {
-				$tax_obj = get_taxonomy( $taxonomy );
+			if ( $tax_obj && $tax_obj->query_var ) {
+				$tax_query_vars[ $tax_obj->query_var ] = $taxonomy;
 
-				if ( $tax_obj && $tax_obj->query_var ) {
-					$tax_query_vars[ $tax_obj->query_var ] = $taxonomy;
-
-					// `rewrite` is false when a taxonomy opts out of rewrites;
-					// reading the offset through empty() is deliberate, and is
-					// what core does, so that case evaluates false rather than
-					// warning.
-					if ( ! empty( $tax_obj->rewrite['hierarchical'] ) ) {
-						$hier_query_vars[] = (string) $tax_obj->query_var;
-					}
+				// `rewrite` is false when a taxonomy opts out of rewrites;
+				// reading the offset through empty() is deliberate, and is
+				// what core does, so that case evaluates false rather than
+				// warning.
+				if ( ! empty( $tax_obj->rewrite['hierarchical'] ) ) {
+					$hier_query_vars[] = (string) $tax_obj->query_var;
 				}
 			}
 		}

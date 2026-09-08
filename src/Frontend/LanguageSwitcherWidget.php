@@ -78,12 +78,6 @@ class LanguageSwitcherWidget extends \WP_Widget {
 			]
 		);
 
-		echo wp_kses_post( $args['before_widget'] );
-
-		if ( ! empty( $instance['title'] ) ) {
-			echo wp_kses_post( $args['before_title'] ) . esc_html( $instance['title'] ) . wp_kses_post( $args['after_title'] );
-		}
-
 		$render_args = [
 			'display'          => sanitize_key( $instance['display'] ?? 'dropdown' ),
 			'style'            => sanitize_key( $instance['style'] ),
@@ -107,7 +101,30 @@ class LanguageSwitcherWidget extends \WP_Widget {
 		}
 
 		$block = new LanguageSwitcherBlock();
-		echo LanguageSwitcherBlock::kses_switcher( $block->render( $render_args ) ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
+		$html  = LanguageSwitcherBlock::kses_switcher( $block->render( $render_args ) );
+
+		/*
+		 * Render before emitting any chrome. The block returns '' whenever it
+		 * has nothing to offer (an untranslated page with the current language
+		 * hidden and untranslated languages hidden skips every option), and the
+		 * theme's `before_widget`/`after_widget` is a real box — often a
+		 * bordered <section> carrying the title. Emitting it around nothing put
+		 * an empty "Languages" widget in the sidebar or footer.
+		 */
+		if ( trim( $html ) === '' ) {
+			return;
+		}
+
+		echo wp_kses_post( $args['before_widget'] );
+
+		if ( ! empty( $instance['title'] ) ) {
+			echo wp_kses_post( $args['before_title'] ) . esc_html( $instance['title'] ) . wp_kses_post( $args['after_title'] );
+		}
+
+		// Re-wrapped at the sink deliberately -- see the note in
+		// CustomizerIntegration::output_custom_placement(). The scanner does not read
+		// phpcs:ignore, and kses_switcher() memoises, so this costs nothing.
+		echo LanguageSwitcherBlock::kses_switcher( $html ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
 
 		echo wp_kses_post( $args['after_widget'] );
 	}

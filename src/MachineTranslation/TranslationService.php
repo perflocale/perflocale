@@ -673,9 +673,9 @@ final class TranslationService {
 			// legitimate literal '&amp;' a user typed as content would come
 			// back as '&amp;' and be collapsed to '&'.
 			$result = [
-				'title'   => sanitize_text_field( $translated[0] ?? '' ),
+				'title'   => \PerfLocale\Helper::sanitize_plain_text_field( $translated[0] ?? '' ),
 				'content' => self::sanitize_mt_html( $translated[1] ?? '' ),
-				'excerpt' => sanitize_textarea_field( $translated[2] ?? '' ),
+				'excerpt' => \PerfLocale\Helper::sanitize_plain_textarea_field( $translated[2] ?? '' ),
 			];
 
 			// Create or update the translation post.

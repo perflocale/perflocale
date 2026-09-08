@@ -44,7 +44,7 @@ final class LanguageRepository implements RepositoryInterface {
 	 * All 194 entries in `data/languages.php` match, so nothing the plugin
 	 * itself offers is excluded.
 	 */
-	private const SLUG_PATTERN = '/^[a-z]{2,3}(?:-[a-z]{2,3})?$/';
+	public const SLUG_PATTERN = '/^[a-z]{2,3}(?:-[a-z]{2,3})?$/';
 
 	/**
 	 * @var \wpdb
@@ -522,7 +522,13 @@ final class LanguageRepository implements RepositoryInterface {
 		// every byte of a non-ASCII slug, and update() and rename_slug() both
 		// validate their slug while this did not. The column's UNIQUE key let
 		// exactly one such row exist, and the screen reported success.
-		if ( ! isset( $sanitized['slug'] ) || $sanitized['slug'] === '' ) {
+		// 1.0.3 widened this from "not empty" to the full shape. update() (which
+		// rejects on SLUG_PATTERN) and rename_slug() have always enforced it, and
+		// the constant's own docblock calls the shape a system-wide contract, so
+		// a slug this accepted but update() would reject produced a language that
+		// could be created and then never edited again. '' still fails, so the
+		// empty-slug behaviour above is preserved exactly.
+		if ( ! isset( $sanitized['slug'] ) || ! is_string( $sanitized['slug'] ) || ! preg_match( self::SLUG_PATTERN, $sanitized['slug'] ) ) {
 			return false;
 		}
 
@@ -804,6 +810,9 @@ final class LanguageRepository implements RepositoryInterface {
 	 *     - `_perflocale_language` term meta — nav-menu language tag
 	 *     - `_perflocale_language` post meta — WC order language tag
 	 *       (see WooCommerce\EmailTranslation::ORDER_LANG_META)
+	 *     - `_perflocale_language` in `{prefix}wc_orders_meta` — the same tag
+	 *       where WooCommerce actually stores it under High Performance Order
+	 *       Storage, which is the default for new stores
 	 *
 	 *   Option / settings array migrations (KEY and/or VALUE inside arrays):
 	 *     - perflocale_settings.geo_country_map      — slug as VALUE
@@ -952,7 +961,90 @@ final class LanguageRepository implements RepositoryInterface {
 				}
 			}
 		}
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key
+
+		// 2d. The SAME tag, in WooCommerce's own order tables. With High
+		// Performance Order Storage an order's meta lives in
+		// `{prefix}wc_orders_meta`, not in postmeta — so 2c above, and the
+		// docblock's claim to cover the WC order language tag, missed every
+		// order on an HPOS store. Measured on a development store: 11 rows in
+		// wc_orders_meta against 1 in postmeta. The consequence of missing them
+		// is silent: the rename succeeds, the tag still holds the OLD slug,
+		// detect_order_language() stops matching, and every later status email
+		// for those orders goes out in the site default language.
+		//
+		// Runs whenever the table exists rather than gating on the HPOS toggle,
+		// because in compatibility mode both tables hold the value and both have
+		// to move together.
+		$orders_meta = $wpdb->prefix . 'wc_orders_meta';
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value
+		$has_orders_meta = (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $orders_meta ) ) ) === $orders_meta;
+
+		if ( $has_orders_meta ) {
+			$affected_order_ids = $wpdb->get_col(
+				$wpdb->prepare(
+					'SELECT order_id FROM %i WHERE meta_key = %s AND meta_value = %s',
+					$orders_meta,
+					'_perflocale_language',
+					$old_slug
+				)
+			);
+
+			if ( ! empty( $affected_order_ids ) ) {
+				$wpdb->update(
+					$orders_meta,
+					[ 'meta_value' => $new_slug ],
+					[
+						'meta_key'   => '_perflocale_language',
+						'meta_value' => $old_slug,
+					],
+					[ '%s' ],
+					[ '%s', '%s' ]
+				);
+
+				// Mirror WooCommerce's own invalidation for a direct meta write
+				// (OrdersTableDataStore::update_order_meta_data), plus the cached
+				// order object itself — a direct UPDATE fires none of the hooks
+				// that would otherwise clear either.
+				//
+				// The order OBJECT is not cached under its bare id. WooCommerce's
+				// ObjectCache namespaces the key (wc_cache_<prefix>_<id>), so
+				// wp_cache_delete( $oid, 'orders' ) deletes a key nothing ever
+				// wrote. On a store with a persistent object cache and HPOS —
+				// where order caching is on by default — WC_Order_Factory::get_order()
+				// then keeps returning an order whose meta still carries the OLD
+				// slug for up to an hour, and every status email for those orders
+				// goes out in the site default language: exactly the failure this
+				// rename exists to prevent, arriving via the cache instead of the
+				// table. Go through WooCommerce's own OrderCache so the key is
+				// built the same way it was written. Resolved once, outside the
+				// loop — the container lookup is the cost, not remove().
+				$order_cache = null;
+
+				if ( function_exists( 'wc_get_container' ) && class_exists( \Automattic\WooCommerce\Caches\OrderCache::class ) ) {
+					try {
+						$order_cache = wc_get_container()->get( \Automattic\WooCommerce\Caches\OrderCache::class );
+					} catch ( \Throwable $e ) {
+						$order_cache = null;   // container not booted, or the class is not registered
+					}
+				}
+
+				foreach ( array_map( 'intval', (array) $affected_order_ids ) as $oid ) {
+					if ( class_exists( '\WC_Order' ) && method_exists( '\WC_Order', 'generate_meta_cache_key' ) ) {
+						wp_cache_delete( \WC_Order::generate_meta_cache_key( $oid, 'orders' ), 'orders' );
+					}
+
+					if ( null !== $order_cache ) {
+						$order_cache->remove( $oid );
+					}
+
+					// Kept as the documented fallback for a WooCommerce old enough
+					// to lack OrderCache, and harmless otherwise.
+					wp_cache_delete( $oid, 'orders' );
+				}
+			}
+		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 
 		// 3. Plugin settings — operate on the in-memory option array, then
 		// persist once. Avoids three separate update_option calls and

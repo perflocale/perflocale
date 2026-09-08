@@ -102,8 +102,18 @@ final class PoSync {
 	 * @param string $domain    Optional domain filter; empty = all domains.
 	 * @return int|false Bytes written, or false on failure.
 	 */
-	public static function export_to_file( string $path, string $lang_slug, string $domain = '' ) {
+	public static function export_to_file( string $path, string $lang_slug, string $domain = '', array &$report = [] ) {
 		self::load_pomo();
+
+		// Assigned on EVERY exit path, including the two failures below, so a
+		// caller can read it without checking the return value first.
+		$report = [
+			'emitted'        => 0,
+			'unhashable'     => 0,
+			'unhashable_ids' => [],
+			'dup_groups'     => 0,
+			'dup_rows'       => 0,
+		];
 
 		global $wpdb;
 		$lang = self::resolve_language( $lang_slug );
@@ -184,7 +194,7 @@ final class PoSync {
 			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$rows = (array) $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT s.id, s.original, s.context, s.domain, COALESCE(t.translation, '') AS translation
+					"SELECT s.id, s.original, s.original_hash, s.context, s.domain, COALESCE(t.translation, '') AS translation
 				 FROM %i s
 				 LEFT JOIN %i t ON t.string_id = s.id AND t.language_id = %d
 				 WHERE {$where} AND s.id > %d
@@ -223,8 +233,76 @@ final class PoSync {
 				// Mirror core PO::export(): headers and entries joined by
 				// exactly one blank line.
 				$out .= "\n\n" . $serialized;
+				++$report['emitted'];
+
+				/*
+				 * Round-trip integrity, checked per row and retaining nothing.
+				 *
+				 * The importer finds an existing string by hashing the msgid it
+				 * reads back. If a row's stored original_hash was not computed
+				 * from the text now in its `original` column, that probe misses
+				 * and the re-import creates a PHANTOM row instead of updating
+				 * this one -- so a translator's work lands somewhere the site
+				 * never reads. Observed on a real corpus: rows whose `original`
+				 * had been HTML-entity-encoded after the hash was taken, e.g.
+				 * `Review sites &amp; upgrade` hashed as `Review sites & upgrade`.
+				 * Serving is unaffected (the runtime hashes the live source
+				 * string, which still matches), which is exactly why this stays
+				 * invisible until someone re-imports.
+				 *
+				 * Hash the RAW original, not the newline-normalised copy above:
+				 * the stored hash was taken before normalisation.
+				 */
+				if ( StringRepository::compute_hash( (string) $row->domain, (string) $row->context, (string) $row->original ) !== (string) $row->original_hash ) {
+					++$report['unhashable'];
+
+					if ( count( $report['unhashable_ids'] ) < 20 ) {
+						$report['unhashable_ids'][] = (int) $row->id;
+					}
+				}
 			}
 		} while ( count( $rows ) === $batch_size );
+
+		/*
+		 * A PO file is keyed by (msgctxt, msgid), so two rows that compose to the
+		 * same pair collapse into one entry in every consumer and one of them
+		 * becomes unreachable through PO forever. Counted in SQL rather than with
+		 * a seen-set in PHP: this method is keyset-paginated precisely so the
+		 * corpus is never materialised (the comment above records an OOM around
+		 * 100k strings), and an O(corpus) array here would undo that. One
+		 * aggregate over the same WHERE the loop used, so the report always
+		 * describes exactly the set that was exported.
+		 */
+		// ReplacementsWrongNumber is a FALSE POSITIVE here and must stay suppressed:
+		// the query carries six placeholders (%i, then %s for the context separator,
+		// then four %s for the nested REPLACE) and exactly six values are bound —
+		// but they arrive through `...array_merge( ... )`, and the sniff counts the
+		// spread as a single argument. It reports "found 1, expected 6" for correct
+		// code. Verified by binding: $args holds only the language id on this path,
+		// so array_slice( $args, 1 ) is empty and the count is 1 + 0 + 5 = 6.
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+		$dupes = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT COUNT(*) AS grps, COALESCE(SUM(c), 0) AS rows_in_grps FROM (
+					SELECT COUNT(*) AS c
+					FROM %i s
+					WHERE {$where} AND s.original <> ''
+					GROUP BY BINARY ( CASE WHEN s.domain <> '' AND s.domain <> 'default' THEN CONCAT( s.domain, %s, s.context ) ELSE s.context END ),
+						BINARY REPLACE( REPLACE( s.original, %s, %s ), %s, %s )
+					HAVING COUNT(*) > 1
+				) d",
+				// $args[0] is the language id, bound to the LEFT JOIN in the row
+				// query above; this aggregate has no such join, so only the optional
+				// domain filter that $where may carry is bound here.
+				...array_merge( [ $strings ], array_slice( $args, 1 ), [ self::CTX_DOMAIN_SEP, "\r\n", "\n", "\r", "\n" ] )
+			)
+		);
+		// phpcs:enable
+
+		if ( $dupes ) {
+			$report['dup_groups'] = (int) $dupes->grps;
+			$report['dup_rows']   = (int) $dupes->rows_in_grps;
+		}
 
 		$wp_filesystem = \PerfLocale\Helper::filesystem();
 

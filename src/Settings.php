@@ -940,14 +940,18 @@ final class Settings {
 			}
 
 			// Validated, not byte-truncated. substr( …, 0, 3 ) on a four-byte
-			// character leaves three bytes of a half-finished UTF-8 sequence, and
-			// the consequence is not local: the invalid value goes into the
-			// settings array, update_option() hands it to wpdb, strip_invalid_text()
-			// drops the bad bytes while the serialize() length header still claims
-			// them, and the whole blob stops unserialising. get_option() then
-			// returns false, load() falls back to defaults, and EVERY setting in
-			// the plugin is silently lost. ISO 4217 codes are three ASCII letters
-			// by definition, so anything else is simply not a currency code.
+			// character leaves three bytes of a half-finished UTF-8 sequence.
+			// What actually follows was re-checked against core in 1.0.3, because
+			// the comment here used to claim a data-destruction chain WordPress
+			// does not perform: the invalid value goes into the settings array,
+			// update_option() hands it to wpdb, and wpdb::process_fields() REFUSES
+			// the whole write — strip_invalid_text() changes the value,
+			// process_fields() sees it changed and returns false, and update()
+			// never issues the UPDATE. So the stored blob survives intact; what is
+			// lost is the operator's save, silently (see last_update_was_noop()).
+			// Bad enough to keep guarding against, and now described accurately.
+			// ISO 4217 codes are three ASCII letters by definition, so anything
+			// else is simply not a currency code.
 			$raw_code = sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) );
 			$code     = preg_match( '/^[A-Za-z]{3}$/', $raw_code ) === 1 ? strtoupper( $raw_code ) : '';
 

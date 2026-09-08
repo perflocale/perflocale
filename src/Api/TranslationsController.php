@@ -86,7 +86,8 @@ final class TranslationsController extends RestController {
 						'title'   => [
 							'type'              => 'string',
 							'description'       => __( 'Translated post title.', 'perflocale' ),
-							'sanitize_callback' => 'sanitize_text_field',
+							// Percent-preserving; plain sanitize_text_field() deletes %XX.
+							'sanitize_callback' => [ \PerfLocale\Helper::class, 'sanitize_plain_text_field' ],
 						],
 						'content' => [
 							'type'        => 'string',
@@ -95,7 +96,7 @@ final class TranslationsController extends RestController {
 						'excerpt' => [
 							'type'              => 'string',
 							'description'       => __( 'Translated post excerpt.', 'perflocale' ),
-							'sanitize_callback' => 'sanitize_textarea_field',
+							'sanitize_callback' => [ \PerfLocale\Helper::class, 'sanitize_plain_textarea_field' ],
 						],
 						'status'  => [
 							'type'              => 'string',
@@ -673,7 +674,7 @@ final class TranslationsController extends RestController {
 		$update_data = [];
 
 		if ( $request->has_param( 'title' ) ) {
-			$update_data['post_title'] = sanitize_text_field( $request->get_param( 'title' ) );
+			$update_data['post_title'] = \PerfLocale\Helper::sanitize_plain_text_field( $request->get_param( 'title' ) );
 		}
 
 		if ( $request->has_param( 'content' ) ) {
@@ -681,7 +682,7 @@ final class TranslationsController extends RestController {
 		}
 
 		if ( $request->has_param( 'excerpt' ) ) {
-			$update_data['post_excerpt'] = sanitize_textarea_field( $request->get_param( 'excerpt' ) );
+			$update_data['post_excerpt'] = \PerfLocale\Helper::sanitize_plain_textarea_field( $request->get_param( 'excerpt' ) );
 		}
 
 		if ( $request->has_param( 'status' ) ) {

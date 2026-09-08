@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.2
+Stable tag: 1.0.3
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -190,11 +190,37 @@ When you configure an external agency URL in PerfLocale → Settings → Addons 
 
 When you register webhooks via the PerfLocale REST API, the plugin sends event notifications to your configured webhook URLs when translations are created, updated, or content changes:
 
-* **User-configured webhook URLs** - registered via REST API (loopback and private-network destinations are rejected). Endpoints you register via the PerfLocale REST API to receive translation-lifecycle notifications (use HTTPS URLs); the destinations are entirely under your control and the plugin calls no hard-coded URL. The plugin POSTs the event type, translation data (post IDs, language codes, status), and a timestamp whenever a translation is created, updated, or otherwise changes, and signs each payload with HMAC-SHA256 when a shared secret is configured. Terms of service and privacy policy are governed by whatever destination you register; review the operator's public policies before registering the URL.
+(loopback, private-network and credential-bearing destinations, and ports outside WordPress's own allowlist of 80, 443 and 8080, are rejected at validation time, and the refusal names the rule that was broken; on multisite, registering one requires network-administrator permissions) Endpoints you register via the PerfLocale REST API to receive translation-lifecycle notifications (use HTTPS URLs); the destinations are entirely under your control and the plugin calls no hard-coded URL. The plugin POSTs the event type, translation data (post IDs, language codes, status), and a timestamp whenever a translation is created, updated, or otherwise changes, and signs each payload with HMAC-SHA256 when a shared secret is configured. Terms of service and privacy policy are governed by whatever destination you register; review the operator's public policies before registering the URL.
 
 PerfLocale can also publish a read-only public REST endpoint for edge runtimes (`/wp-json/perflocale/v1/config`). It is served by your own site, makes no outbound third-party request and sends no data anywhere - see the "Does PerfLocale expose anything to edge workers?" FAQ for the full description.
 
 == Changelog ==
+
+= 1.0.3 =
+
+Fixes WooCommerce order emails going out in the wrong language, percent signs deleted from translated titles, exports publishing unreadable bytes, Site Health checks that never reached the dashboard, and the admin on phones and tablets. Full detail at https://perflocale.com/changelog/
+
+**WooCommerce order emails.** Four faults. WordPress declines to switch language - recording nothing - when the target has no language pack or is already active; PerfLocale restored anyway, leaving the request in a language nobody chose. The restore also ran when the body finished, before WooCommerce builds the headers, attachments and plain-text half, so those came out wrong. The three notifications that go to the SHOP - new order, cancelled, failed - were rendered in the customer's language; they now follow the shop language. Renaming a language now also moves the order's language tag in the table High Performance Order Storage keeps it in.
+
+**Percent signs are no longer deleted from translated titles.** WordPress's plain-text sanitiser strips every %XX sequence - right for a URL, wrong for a title: "100%25 off" was stored as "100 off". It applied wherever a translated title or excerpt was written: XLIFF import, the translation editor, machine translation and the TranslatePress migration, and it also stripped every HTML tag from imported excerpts.
+
+**Exports refuse to publish unreadable bytes.** The JSON encoder replaced any byte it could not read as UTF-8 with a question mark - the worst option in a backup, because the damaged file encodes cleanly, passes every check and replaces the previous good one. It now stops and leaves the existing file alone. PO exports additionally report which strings will not survive a round trip.
+
+**Site Health checks never reached the dashboard.** All 25 were registered for admin screens only, so WordPress's weekly site-health run - which happens on cron, where no admin screen exists - never saw one, and it overwrote the counts a manual visit had left. A site with missing tables, no default language, or exports readable over the web showed an issue count of zero. They now run in that pass; the three making a network request opt out, and none runs on the front end.
+
+Several also reported the wrong thing. The export-exposure check filed "could not be checked" as a passed test, worst on the hosts where exposure is most likely. The tables check looked at one table of nine, so a partial restore still read "healthy". Machine translation with no API key produced three green cards while every translation failed. The cron check called the recommended production setup a critical failure.
+
+**Webhooks.** A delivery whose host could not be resolved was dropped with no retry and no trace; it is now retried like a failed request. The failure log had never been read by anything in the plugin - a new Site Health card reports deliveries abandoned in the last 24 hours. Registration now refuses URLs WordPress itself refuses at send time, and names the actual reason. **On multisite, registering a webhook now requires network-administrator permissions**, because a site administrator has manage_options without being able to install plugins. Listing and deleting are unchanged. If your network delegates registration to site administrators this is a breaking change; the perflocale/webhooks/register_capability filter restores the old rule.
+
+**Domain matching and number formatting.** A Host header cased differently from the stored domain fell through to the default language, and a domain with non-ASCII characters never matched at all; both are now canonicalised using the encoder WordPress itself ships rather than an optional PHP extension. Separately, two languages the plugin ships are not recognised by the number formatter PHP 8.4 uses and the error was not caught - it now falls back, and the fallback stopped discarding decimals.
+
+**An empty switcher no longer draws an empty box.** With "hide current language" on and untranslated languages hidden, an untranslated page has nothing to show - but the floating switcher still drew a blank panel over the page corner. Present since 1.0.0.
+
+**The admin was not usable on a touchscreen.** Languages could only be reordered by drag-and-drop, which does not exist on touch; below 782px each row now has up and down buttons. The Translations list broke into unlabelled fragments on a phone; rows are rows again, with the checkbox and title pinned while the language columns scroll.
+
+**An integration could silently stop loading.** PerfLocale remembered which integrations to load for twelve hours at a time. If that list was built while one of the plugins it integrates with had not finished loading, that integration stayed off until the note expired - and the Addons screen still called it active, because it only checks whether the other plugin is installed. The list is now worked out fresh each time.
+
+**Also:** creating a language now validates its slug, as editing did.
 
 = 1.0.2 =
 
@@ -325,6 +351,9 @@ Initial public release.
 Full release notes: https://perflocale.com/changelog/
 
 == Upgrade Notice ==
+
+= 1.0.3 =
+Multisite: registering a webhook now needs network-administrator permissions - a breaking change, with a filter to restore the old rule. Also fixes WooCommerce order emails in the wrong language, percent signs deleted from titles, and the admin on phones and tablets.
 
 = 1.0.2 =
 Machine Translation could not be switched on from the admin at all, and three settings were silently cleared by unrelated saves. Also fixes a fatal on servers without mbstring, translates WPForms confirmations, and makes XLIFF imports about three times cheaper.

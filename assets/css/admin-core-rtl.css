@@ -213,6 +213,47 @@ a.perflocale-badge:focus {
 	outline-offset: 2px;
 }
 
+/* Up/down reorder buttons. Hidden by default: on a pointer device the drag
+   handle above is the affordance, and showing both would be noise. CSS is the
+   right switch here rather than PHP — wp_is_mobile() reads the user agent,
+   which says nothing about the width the page is actually being rendered at. */
+.perflocale-lang-item__move {
+	display: none;
+	flex-direction: column;
+	gap: 2px;
+	flex-shrink: 0;
+}
+
+.perflocale-lang-item__move-btn {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 38px;
+	height: 30px;
+	padding: 0;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	color: #50575e;
+	cursor: pointer;
+}
+
+.perflocale-lang-item__move-btn:hover:not(:disabled) {
+	border-color: var(--wp-admin-theme-color, #2271b1);
+	color: var(--wp-admin-theme-color, #2271b1);
+	background: #f0f6fc;
+}
+
+.perflocale-lang-item__move-btn:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: 1px;
+}
+
+.perflocale-lang-item__move-btn:disabled {
+	opacity: 0.35;
+	cursor: default;
+}
+
 /* Dragging state: lift the row, fade slightly, hint at "in transit". */
 .perflocale-lang-item.is-dragging {
 	opacity: 0.4;
@@ -248,6 +289,19 @@ a.perflocale-badge:focus {
 
 .perflocale-lang-list__status.is-error {
 	color: #b32d2e;
+}
+
+@media screen and (max-width: 782px) {
+	/* Below this width the drag handle is dead weight: HTML5 drag-and-drop
+	 * does not fire on touch, and `opacity: 0` until :hover means a phone
+	 * user cannot even see it. Swap it for the buttons. */
+	.perflocale-lang-item__handle {
+			display: none;
+		}
+
+	.perflocale-lang-item__move {
+			display: flex;
+		}
 }
 
 @media screen and (max-width: 600px) {
@@ -436,6 +490,14 @@ a.perflocale-mb__status:hover {
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
+
+	/* The mobile block below stacks this row at 782px, but between there and
+	   roughly 900px the filters and the pagination still do not fit side by
+	   side, and a non-wrapping flex row has nowhere to put the overflow: the
+	   pagination hung past the page edge. `row-gap` only applies once a wrap
+	   actually happens, so the single-line desktop layout is unchanged. */
+	flex-wrap: wrap;
+	row-gap: 8px;
 }
 
 /* Base font-size on PerfLocale list pages. WP admin's 13px felt cramped
@@ -1408,6 +1470,15 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 	margin: 16px 0 24px;
 }
 
+/* The strip is a flex row (inline style on the <nav>), and a flex row does not
+ * wrap by default -- so between 783px, where the mobile <select> above stops
+ * standing in for it, and roughly 1000px, the eight sections simply ran off the
+ * page: 226px of horizontal scroll on an 820px tablet. Wrapping to a second row
+ * is what the shared .perflocale-nav-tabs strip already does at these widths. */
+.perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__items {
+	flex-wrap: wrap;
+}
+
 .perflocale-settings .nav-tab-wrapper .nav-tab {
 	margin: 0;
 	padding: 10px 18px;
@@ -1455,6 +1526,18 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
  * `style="display:none;"` that Screen Options emits for user-hidden
  * columns. */
 @media screen and (max-width: 782px) {
+	/* Restore the ROWS first. WordPress sets `.wp-list-table tr { display: flex }`
+	 * at this width, and a flex container blockifies its children — so the
+	 * `table-cell` below could never take effect while the row stayed flex, and
+	 * every cell rendered as a full-width block. That is what turned these
+	 * tables into a vertical stack of unlabelled fragments on a phone: the
+	 * horizontal-scroll design above was in place and simply outvoted. */
+	.perflocale-table-responsive .wp-list-table > thead > tr,
+		.perflocale-table-responsive .wp-list-table > tbody > tr,
+		.perflocale-table-responsive .wp-list-table > tfoot > tr {
+			display: table-row !important;
+		}
+
 	.perflocale-table-responsive .wp-list-table > thead > tr > th:not([style*="display:none"]),
 		.perflocale-table-responsive .wp-list-table > tbody > tr > td:not([style*="display:none"]),
 		.perflocale-table-responsive .wp-list-table > tfoot > tr > th:not([style*="display:none"]) {
@@ -1473,7 +1556,10 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 			display: none !important;
 		}
 
-	.perflocale-table-responsive .wp-list-table tr:not(.inline-edit-row):not(.no-items) > td:not(.check-column) {
+	.perflocale-table-responsive .wp-list-table tr:not(.inline-edit-row):not(.no-items) > td:not(.check-column):not(.perflocale-col-title):not(.perflocale-str-col-original) {
+			/* .perflocale-col-title is excluded: it is pinned sticky below, and this
+			 * reset would otherwise win on specificity (:not() args count) and
+			 * silently unpin it. */
 			position: static !important;
 		}
 
@@ -1516,6 +1602,144 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 			padding: 3px 9px;
 			font-size: 11px;
 			white-space: nowrap;
+		}
+
+	/* Touch targets. The checkboxes here are 25px because that is what
+	 * WordPress core sizes admin checkboxes to below 782px, and matching the
+	 * host admin is worth more than the few pixels an override would buy.
+	 * These two are ours, though, and they were the smallest things on the
+	 * page a phone user actually has to hit: 28px for a row action, 24px for
+	 * a badge that is also the link to that translation. */
+	.perflocale-table-responsive .perflocale-translations-table a.perflocale-status-badge {
+			min-height: 32px;
+		}
+
+	.perflocale-table-responsive .wp-list-table .row-actions a {
+			display: inline-block;
+			padding: 6px 0;
+		}
+
+	/* Keep the row's identity on screen while the language matrix scrolls.
+	 * These tables are deliberately wider than a phone and scroll sideways, but
+	 * with the title scrolled away a column of status badges belongs to nothing.
+	 * Pinning the checkbox and the title keeps selection and identity together.
+	 *
+	 * Size the columns through the `col` elements, never the cells: the table is
+	 * `table-layout: fixed`, so a width or max-width on a cell fights the column
+	 * definition and collapses the title to one character per line. Fixed layout
+	 * honours an explicit `col` width exactly and spreads the rest over the
+	 * columns left auto, which is what the language columns want. Left auto, the
+	 * title takes ~397px of a 368px viewport -- pinned, it would cover the whole
+	 * matrix it exists to label. */
+	.perflocale-table-responsive > .perflocale-translations-table {
+			/* Release the 820px desktop floor: on a phone the column widths
+			 * below (plus the language columns' own floor) should decide how
+			 * far the table scrolls, so the distance tracks the number of
+			 * languages instead of a flat guess. */
+			min-width: 0;
+		}
+
+	.perflocale-translations-table > colgroup > col.check-column {
+			width: 32px;
+		}
+
+	.perflocale-translations-table > colgroup > col.perflocale-col-title {
+			width: 168px;
+		}
+
+	.perflocale-translations-table > colgroup > col.perflocale-col-type {
+			width: 84px;
+		}
+
+	/* Sticky cells inherit this: without an opaque row background the
+	 * language columns would scroll visibly underneath them. Only the base
+	 * is set -- WordPress's own `.striped > tbody > :nth-child(odd)` is the
+	 * more specific selector, so the stripes survive untouched. */
+	.perflocale-translations-table > tbody > tr,
+		.perflocale-translations-table > thead > tr {
+			background-color: #fff;
+		}
+
+	.perflocale-table-responsive .perflocale-translations-table > thead > tr > th.check-column,
+		.perflocale-table-responsive .perflocale-translations-table > tbody > tr > th.check-column {
+			position: sticky !important;
+			right: 0;
+			z-index: 3;
+			background-color: inherit;
+		}
+
+	.perflocale-table-responsive .perflocale-translations-table > thead > tr > th.perflocale-col-title,
+		.perflocale-table-responsive .perflocale-translations-table > tbody > tr > td.perflocale-col-title {
+			/* !important because WordPress's own mobile rule for
+			 * `td.column-primary` resets position, and the title cell carries
+			 * that class. Without it the `left` applied and the position did
+			 * not, so the cell scrolled away and left a gap. */
+			position: sticky !important;
+			right: 32px;
+			z-index: 2;
+			background-color: inherit;
+			box-shadow: -1px 0 0 rgba(0, 0, 0, .08);
+		}
+
+
+	/* Strings table, same reasoning: a row of translation inputs means nothing
+	 * without the source string beside it. The checkbox column is rendered only
+	 * when the MT toolbar is on, so the original pins behind it when it exists
+	 * and at the edge when it does not -- hence the `:first-child` variant. */
+	.perflocale-table-responsive > .perflocale-str-edit-table {
+			min-width: 0;
+		}
+
+	.perflocale-str-edit-table .perflocale-str-col-original {
+			width: 168px;
+		}
+
+	.perflocale-str-edit-table .perflocale-str-col-domain {
+			width: 88px;
+		}
+
+	.perflocale-str-edit-table > tbody > tr,
+		.perflocale-str-edit-table > thead > tr {
+			background-color: #fff;
+		}
+
+	.perflocale-table-responsive .perflocale-str-edit-table > thead > tr > .check-column,
+		.perflocale-table-responsive .perflocale-str-edit-table > tbody > tr > .check-column {
+			position: sticky !important;
+			right: 0;
+			z-index: 3;
+			background-color: inherit;
+		}
+
+	.perflocale-table-responsive .perflocale-str-edit-table > thead > tr > .perflocale-str-col-original,
+		.perflocale-table-responsive .perflocale-str-edit-table > tbody > tr > .perflocale-str-col-original {
+			position: sticky !important;
+			right: 32px;
+			z-index: 2;
+			background-color: inherit;
+			box-shadow: -1px 0 0 rgba(0, 0, 0, .08);
+		}
+
+	.perflocale-table-responsive .perflocale-str-edit-table > thead > tr > .perflocale-str-col-original:first-child,
+		.perflocale-table-responsive .perflocale-str-edit-table > tbody > tr > .perflocale-str-col-original:first-child {
+			right: 0;
+		}
+
+	/* The pinned columns cover the start edge of the scrollport, and the
+	   browser parks a newly focused control exactly there when it scrolls it
+	   into view — so tabbing back into a status badge or a translation input
+	   that is off to the left lands it completely underneath the pinned band,
+	   focused but invisible. WCAG 2.2 SC 2.4.11. 208px clears the widest band
+	   (32 checkbox + 168 identity) with a little air; scroll-margin sits on the
+	   target rather than scroll-padding on the wrapper because that wrapper is
+	   shared with the jobs and dashboard tables, which pin nothing or pin less. */
+	.perflocale-table-responsive .perflocale-translations-table a.perflocale-status-badge {
+			scroll-margin-right: 208px;
+		}
+
+	.perflocale-table-responsive .perflocale-str-edit-table .perflocale-str-input,
+		.perflocale-table-responsive .perflocale-str-edit-table .perflocale-str-expand-btn {
+			scroll-margin-right: 208px;
 		}
 
 	.perflocale-table-responsive .perflocale-jobs-table th,

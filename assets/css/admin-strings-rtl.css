@@ -105,6 +105,17 @@
 			align-items: stretch;
 		}
 
+	.perflocale-str-mt-toolbar__status {
+			/* The row is a column here, so the status paragraph's
+			   `flex: 1 1 200px` basis stops being a width and becomes a
+			   200px HEIGHT -- an empty grey void between the language chips
+			   and the Translate buttons whenever there is no message to
+			   show. Let it size to its own content instead; min-height
+			   still reserves the one line that keeps the buttons from
+			   jumping when a message arrives. */
+			flex: 0 0 auto;
+		}
+
 	.perflocale-str-mt-toolbar__group--actions {
 			width: 100%;
 		}

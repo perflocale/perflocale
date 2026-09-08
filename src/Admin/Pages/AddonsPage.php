@@ -115,7 +115,14 @@ final class AddonsPage {
 				'icon'        => 'dashicons-chart-area',
 				'requires'    => __( 'Slim SEO plugin', 'perflocale' ),
 				'plugin_file' => 'slim-seo/slim-seo.php',
-				'check'       => fn() => class_exists( 'SlimSEO\\Plugin' ),
+				// Must match AddonRegistry::bundled_manifest()['slimseo']['compat']
+				// and PerfLocaleSlimSeo::is_compatible() exactly. Slim SEO 4.x
+				// renamed SlimSEO\Plugin → SlimSEO\Core (verified against 4.9.11);
+				// the registry was updated and this page was not, so the addon
+				// booted while the page badged it "Not active" on every site
+				// running Slim SEO 4. A display check that disagrees with the boot
+				// check is the bug, not the class name — keep the three in sync.
+				'check'       => fn() => class_exists( 'SlimSEO\\Core' ) || class_exists( 'SlimSEO\\Plugin' ),
 			],
 			'woocommerce'         => [
 				'name'         => 'WooCommerce',
@@ -304,6 +311,11 @@ final class AddonsPage {
 		$version_mismatches = $registry !== null ? $registry->get_version_mismatches() : [];
 		$disabled_ids       = \PerfLocale\Addon\AddonRegistry::get_disabled();
 		$quarantined_ids    = $registry !== null ? $registry->get_quarantined_ids() : [];
+		// Addons whose own is_compatible() returned false. method_exists keeps this
+		// safe if an older registry is somehow in play.
+		$incompatible_ids   = ( $registry !== null && method_exists( $registry, 'get_incompatible_ids' ) )
+			? $registry->get_incompatible_ids()
+			: [];
 
 		// phpcs:disable WordPress.Security.NonceVerification.Recommended
 		$active_cat    = isset( $_GET['category'] ) ? sanitize_key( $_GET['category'] ) : 'all';
@@ -362,6 +374,24 @@ final class AddonsPage {
 
 			$check     = $addon['check'] ?? null;
 			$is_active = is_callable( $check ) ? (bool) $check() : false;
+
+			// An addon the registry refused to boot must never badge "Active".
+			// `check()` answers "is the host plugin present?", which stays true
+			// while the addon is quarantined after repeated boot failures, or
+			// skipped because it needs a newer PerfLocale, or because its own
+			// is_compatible() said no. The card said Active, the quarantine
+			// banner on the same screen said otherwise, and the operator had no
+			// way to tell which was true. Counted as installed-not-active, which
+			// is what it is.
+			if (
+				in_array( $addon_id, (array) $quarantined_ids, true )
+				|| isset( $version_mismatches[ $addon_id ] )
+				|| isset( $incompatible_ids[ $addon_id ] )
+			) {
+				$addon_statuses[ $addon_id ] = 'blocked';
+				++$installed_count;
+				continue;
+			}
 
 			if ( $is_active ) {
 				$addon_statuses[ $addon_id ] = 'active';
@@ -625,7 +655,13 @@ final class AddonsPage {
 					$is_disabled  = ( $addon_status === 'disabled' );
 					$is_installed = ( $addon_status === 'installed' );
 
-					if ( $is_disabled ) {
+					if ( $addon_status === 'blocked' ) {
+						// Installed, host plugin present, but the registry did not
+						// boot it — quarantined, version-gated, or self-declared
+						// incompatible. "Not running" rather than "Active".
+						$status_class = 'perflocale-addon-card__status--inactive';
+						$status_label = __( 'Not running', 'perflocale' );
+					} elseif ( $is_disabled ) {
 						$status_class = 'perflocale-addon-card__status--inactive';
 						$status_label = __( 'Disabled', 'perflocale' );
 					} elseif ( $is_active ) {

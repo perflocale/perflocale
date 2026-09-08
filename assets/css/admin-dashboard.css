@@ -287,6 +287,28 @@ a.perflocale-dash-langs__row:focus-visible {
 			min-width: 140px;
 		}
 
+	/* This table scrolls sideways on a phone (the four count columns do not
+	   fit), and Published / Drafts / Pending / Outdated are four columns of
+	   bare numbers that look identical -- with the language scrolled away
+	   they belong to nothing. Pin it, exactly as the Translations and Strings
+	   tables do. Unlike those two this is not a `.wp-list-table`, so core's
+	   mobile `tr { display: flex }` never applies and no row-display override
+	   is needed here. The row background is what the sticky cell inherits;
+	   only the base is set, so WordPress's own striping still wins. */
+	.perflocale-dash-table > thead > tr,
+		.perflocale-dash-table > tbody > tr {
+			background-color: #fff;
+		}
+
+	.perflocale-table-responsive .perflocale-dash-table > thead > tr > .perflocale-dash-table__lang-col,
+		.perflocale-table-responsive .perflocale-dash-table > tbody > tr > .perflocale-dash-table__lang-col {
+			position: sticky;
+			left: 0;
+			z-index: 2;
+			background-color: inherit;
+			box-shadow: 1px 0 0 rgba(0, 0, 0, .08);
+		}
+
 	/* WP-admin enlarges .dashicons on mobile; keep the compact 16px icons
 		 * inside the rail link rows. */
 	.perflocale-dash-links a .dashicons {

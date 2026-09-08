@@ -288,7 +288,7 @@ final class SettingsPage {
 			<?php endif; ?>
 
 			<nav class="nav-tab-wrapper" style="position: sticky; top: 32px; background: #f0f0f1; z-index: 10; display: flex; align-items: flex-end;">
-				<div style="flex: 1 1 auto; display: flex; align-items: flex-end;">
+				<div class="perflocale-settings-tabs__items" style="flex: 1 1 auto; display: flex; align-items: flex-end;">
 					<?php foreach ( $this->tabs as $tab_key => $tab_label ) : ?>
 						<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=' . $tab_key ) ); ?>"
 							class="nav-tab <?php echo esc_attr( $active_tab === $tab_key ? 'nav-tab-active' : '' ); ?>">

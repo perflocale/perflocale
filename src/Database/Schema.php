@@ -508,13 +508,34 @@ final class Schema {
 	public static function missing_tables(): array {
 		global $wpdb;
 
+		// One catalog scan, not nine. This is called from the activation and
+		// migration post-conditions and from the Site Health tables card; the
+		// per-table loop it replaces cost ~0.5 ms each on a server with a large
+		// table catalog, which is exactly the kind of server that has one.
+		// A single LIKE over the shared prefix returns every candidate, and the
+		// comparison happens in PHP.
+		$prefix = $wpdb->prefix . 'perflocale_';
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Schema post-condition; must ask the server, and a cached answer would defeat the purpose.
+		$found = $wpdb->get_col(
+			$wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' )
+		);
+
+		// Case-insensitive compare: lower_case_table_names=1 (the Windows and
+		// some macOS default) reports names folded to lower case, and the
+		// prefix can legitimately contain capitals.
+		$have = [];
+
+		foreach ( (array) $found as $name ) {
+			$have[ strtolower( (string) $name ) ] = true;
+		}
+
 		$missing = [];
 
 		foreach ( self::REQUIRED_TABLES as $table_name ) {
 			$full_name = self::table( $table_name );
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			if ( ! $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $full_name ) ) ) {
+			if ( ! isset( $have[ strtolower( $full_name ) ] ) ) {
 				$missing[] = $full_name;
 			}
 		}

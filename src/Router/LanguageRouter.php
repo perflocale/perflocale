@@ -1817,6 +1817,85 @@ final class LanguageRouter {
 	}
 
 	/**
+	 * Canonicalise a host for comparison: port-stripped, lowercase, A-label.
+	 *
+	 * Two defects made this necessary, both proven by calling the detectors
+	 * directly. The comparison was case-sensitive while the settings writer
+	 * lowercases what it stores, so `Host: EXAMPLE.COM` against a stored
+	 * `example.com` resolved to the default language. And an internationalised
+	 * domain was unreachable: the stored value is the U-label an admin typed
+	 * (`bücher.example`) while a browser always sends the punycode A-label
+	 * (`xn--bcher-kva.example`), so the two never matched.
+	 *
+	 * Uses WordPress core's own pure-PHP punycode encoder rather than
+	 * ext-intl's idn_to_ascii(). Three reasons, in order of weight:
+	 *
+	 *  1. No extension dependency. `WpOrg\Requests\IdnaEncoder` is autoloaded
+	 *     unconditionally by wp-settings.php and has shipped since WP 6.2,
+	 *     below this plugin's 6.4 floor.
+	 *  2. It is deterministic across hosts. The two encoders DISAGREE — for
+	 *     `faß.de`, idn_to_ascii() with UTS-46 gives `fass.de` while the core
+	 *     encoder gives `xn--fa-hia.de`. An intl-if-available design would make
+	 *     which language a visitor gets depend on which extension the host
+	 *     happens to have installed, which is intolerable for routing.
+	 *  3. ext-intl's idn_to_ascii() throws a ValueError on an empty string, and
+	 *     HTTP_HOST is legitimately empty under CLI.
+	 *
+	 * Order matters. The ASCII fast path comes first so that the overwhelmingly
+	 * common case is a strtolower() and never reaches the encoder — that is what
+	 * keeps existing sites byte-identical and keeps a crafted Host away from
+	 * punycode entirely. The length cap comes before the encoder because an
+	 * 8KB non-ASCII Host costs about 1.4ms of CPU to encode; 253 is the maximum
+	 * legal hostname. The encoder is wrapped because it throws on a label longer
+	 * than 64 characters, which a request header can trivially carry.
+	 *
+	 * @param string $host Raw host, possibly with a port.
+	 * @return string Canonical host for comparison.
+	 */
+	/**
+	 * Public so Site Health can ask the SAME question the router asks.
+	 *
+	 * SiteHealth::normalize_authority() used to lowercase a configured language
+	 * domain and stop there. This method also punycode-encodes it. The two
+	 * therefore judged different strings, so the multisite host card could call a
+	 * hostname healthy that the router would never match, or blame one it would.
+	 * A second copy of this logic would drift again; there is one copy.
+	 */
+	public static function normalize_host( string $host ): string {
+		$host = (string) preg_replace( '/:\d+$/', '', $host );
+
+		if ( $host === '' ) {
+			return '';
+		}
+
+		// Fast path: an all-ASCII host only needs case folding. strtolower(),
+		// not mb_strtolower() — the extension-guard suite forbids mbstring here
+		// and a hostname's ASCII range is all that can matter for the fold.
+		if ( ! preg_match( '/[\x80-\xFF]/', $host ) ) {
+			return strtolower( $host );
+		}
+
+		if ( strlen( $host ) > 253 ) {
+			return strtolower( $host );
+		}
+
+		if ( ! class_exists( '\WpOrg\Requests\IdnaEncoder' ) ) {
+			return strtolower( $host );
+		}
+
+		try {
+			return strtolower( \WpOrg\Requests\IdnaEncoder::encode( $host ) );
+		} catch ( \Throwable $e ) {
+			// Over-long label, or anything else the encoder refuses. A host we
+			// cannot canonicalise simply will not match a configured domain,
+			// which is the correct outcome — never a fatal on a front-end request.
+			unset( $e );
+
+			return strtolower( $host );
+		}
+	}
+
+	/**
 	 * Detect language from subdomain (e.g., en.example.com → 'en').
 	 *
 	 * @param array<string, object> $slug_map Language slug map.
@@ -1826,8 +1905,8 @@ final class LanguageRouter {
 		// Strip any :port — HTTP_HOST carries it on non-80/443 setups (dev,
 		// staging, ported production) but wp_parse_url(home_url()) never does,
 		// so an unstripped host would match neither branch and force default.
-		$host      = (string) preg_replace( '/:\d+$/', '', sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) ) );
-		$base_host = wp_parse_url( home_url(), PHP_URL_HOST ) ?? '';
+		$host      = self::normalize_host( sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) ) );
+		$base_host = self::normalize_host( (string) ( wp_parse_url( home_url(), PHP_URL_HOST ) ?? '' ) );
 
 		// Extract the subdomain prefix: 'en.example.com' → 'en'.
 		if ( str_ends_with( $host, '.' . $base_host ) ) {
@@ -1855,7 +1934,7 @@ final class LanguageRouter {
 	private function detect_from_domain( array $slug_map ): ?string {
 		// Strip any :port so a ported HTTP_HOST still matches the (typically
 		// portless) configured domain values — see detect_from_subdomain().
-		$host    = (string) preg_replace( '/:\d+$/', '', sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) ) );
+		$host    = self::normalize_host( sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) ) );
 		$domains = $this->settings->get_language_domains();
 
 		// Build a reverse map: domain → slug, port-stripped on both sides so an
@@ -1863,7 +1942,7 @@ final class LanguageRouter {
 		$domain_map = [];
 
 		foreach ( $domains as $slug => $domain ) {
-			$domain = (string) preg_replace( '/:\d+$/', '', (string) $domain );
+			$domain = self::normalize_host( (string) $domain );
 
 			if ( $domain !== '' ) {
 				$domain_map[ $domain ] = $slug;
@@ -1875,7 +1954,7 @@ final class LanguageRouter {
 		}
 
 		// Fallback: if host matches home_url, use default language.
-		$base_host = wp_parse_url( home_url(), PHP_URL_HOST ) ?? '';
+		$base_host = self::normalize_host( (string) ( wp_parse_url( home_url(), PHP_URL_HOST ) ?? '' ) );
 
 		if ( $host === $base_host && self::$default_language !== null ) {
 			return self::$default_language->slug;

@@ -29,3 +29,14 @@
 .pl-prio-editor{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 12px;background:#f6f7f7;border:1px solid #e5e5e7;border-radius:6px;max-width:600px;min-height:44px;}
 .pl-prio-chip{cursor:grab;}
 .pl-prio-chip:active{cursor:grabbing;}
+
+/* Phone: the row is label + picker on one non-wrapping line, and the label is
+   `flex: 0 0 160px` while the picker floors at 170px -- together a ~396px
+   min-content that the surrounding form-table cannot shrink below, which was
+   pushing the whole Settings page 17px wider than a 390px screen. Stack the
+   label over the body and let the picker shrink to the space it is given. */
+@media screen and (max-width:782px){
+.pl-fb-row{flex-wrap:wrap;gap:8px;}
+.pl-fb-row__label{flex:1 1 100%;}
+.pl-fb-row__picker{min-width:0;max-width:100%;}
+}

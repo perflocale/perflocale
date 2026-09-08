@@ -237,6 +237,54 @@ final class LanguagesPage {
 									<circle cx="8" cy="13" r="1.2" fill="currentColor"/>
 								</svg>
 							</button>
+							<?php
+							/*
+							 * Touch has no equivalent of the drag handle above: HTML5
+							 * drag-and-drop never fires on a touchscreen, and the handle
+							 * is `opacity: 0` until row hover -- which a phone also does
+							 * not have. So on small screens the handle is swapped for
+							 * these two buttons, which drive the same move-one-slot-and-
+							 * save path the handle's arrow keys already used.
+							 */
+							?>
+							<div class="perflocale-lang-item__move">
+								<button type="button"
+									class="perflocale-lang-item__move-btn"
+									data-perflocale-move="up"
+									aria-label="
+									<?php
+									echo esc_attr(
+										sprintf(
+											/* translators: %s: language name */
+											__( 'Move %s up', 'perflocale' ),
+											$language->name
+										)
+									);
+									?>
+									">
+									<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+										<path d="M2.5 7.5L6 4L9.5 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+									</svg>
+								</button>
+								<button type="button"
+									class="perflocale-lang-item__move-btn"
+									data-perflocale-move="down"
+									aria-label="
+									<?php
+									echo esc_attr(
+										sprintf(
+											/* translators: %s: language name */
+											__( 'Move %s down', 'perflocale' ),
+											$language->name
+										)
+									);
+									?>
+									">
+									<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+										<path d="M2.5 4.5L6 8L9.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+									</svg>
+								</button>
+							</div>
 							<div class="perflocale-lang-item__flag"><?php echo esc_html( $flag ); ?></div>
 							<div class="perflocale-lang-item__info">
 								<div class="perflocale-lang-item__title">
@@ -827,7 +875,7 @@ final class LanguagesPage {
 			echo '<div class="notice notice-error is-dismissible"><p>' . wp_kses(
 				sprintf(
 					/* translators: %1$s: the rejected language slug, %2$s and %3$s: example slugs */
-					__( 'The slug %1$s cannot be used in URLs, so nothing was saved. Use two to five lowercase letters, optionally with one region suffix — for example %2$s or %3$s.', 'perflocale' ),
+					__( 'The slug %1$s cannot be used in URLs, so nothing was saved. Use two or three lowercase letters, optionally followed by a hyphen and two or three more — for example %2$s or %3$s.', 'perflocale' ),
 					'<code>' . esc_html( $bad ) . '</code>',
 					'<code>de</code>',
 					'<code>pt-br</code>'

@@ -130,6 +130,28 @@ a.perflocale-status-badge--linked:focus .perflocale-status-badge__icon {
 		}
 }
 
+/* Phone — the table scrolls sideways with the checkbox and title pinned (see
+   admin-core.css). Two overrides are needed for that to work at all:
+
+   - the 240px min-width above is a desktop comfort floor, but under
+     `table-layout: fixed` a cell min-width overrides the colgroup, so it held
+     the title at ~314px inside a 368px viewport: pinned, it covered the whole
+     matrix it exists to label.
+   - the language columns must go back to auto so they absorb the leftover
+     width; with every column sized, fixed layout spreads the surplus over all
+     of them and re-inflates the title. The min-width is their floor, which is
+     what actually sets the table's scroll width once the surplus is gone. */
+@media screen and (max-width: 782px) {
+	.perflocale-translations-table .perflocale-col-title {
+			min-width: 0;
+		}
+
+	.perflocale-translations-table .perflocale-col-lang {
+			width: auto;
+			min-width: 92px;
+		}
+}
+
 /* ---- "Translate the entire site" panel ---- */
 .perflocale-site-translate {
 	margin: 24px 0 8px;

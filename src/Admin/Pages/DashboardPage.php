@@ -303,7 +303,20 @@ final class DashboardPage {
 		<h2 class="perflocale-dash-section-title"><?php echo esc_html__( 'Translation Progress', 'perflocale' ); ?></h2>
 		<?php
 
-		if ( ! $has_translatable_content || $non_default_langs === [] ) {
+		// Two different reasons land here and they need different advice. The
+		// message used to say "no published content" in both cases — so a site
+		// with plenty of posts but only one language was told to go and publish
+		// something, which would not have helped and was not true.
+		if ( $non_default_langs === [] ) {
+			?>
+			<p class="perflocale-dash-empty">
+				<?php echo esc_html__( 'Only one language is set up, so there is nothing to compare progress against yet. Add a second language and per-language progress appears here.', 'perflocale' ); ?>
+			</p>
+			<?php
+			return;
+		}
+
+		if ( ! $has_translatable_content ) {
 			?>
 			<p class="perflocale-dash-empty">
 				<?php echo esc_html__( 'No published content to translate yet. Once you publish posts or pages in the default language, per-language progress appears here.', 'perflocale' ); ?>

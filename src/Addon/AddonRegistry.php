@@ -65,6 +65,22 @@ final class AddonRegistry {
 	private array $version_mismatches = [];
 
 	/**
+	 * Addons whose own is_compatible() said no (or a site filter said no for
+	 * them). Keyed by addon ID; the value is always true — the addon decides
+	 * WHY and this registry does not second-guess it.
+	 *
+	 * Distinct from $version_mismatches, which is specifically "needs a newer
+	 * PerfLocale". Both mean the same thing to an operator: the integration is
+	 * installed and is not running.
+	 *
+	 * Populated in every context, including cron and WP-CLI: Site Health reads
+	 * it from the weekly scheduled check, where is_admin() is false.
+	 *
+	 * @var array<string, bool>
+	 */
+	private array $incompatible = [];
+
+	/**
 	 * Bundled addon manifest - keyed by directory name.
 	 *
 	 * Each entry carries:
@@ -340,29 +356,36 @@ final class AddonRegistry {
 	 * @return string[]
 	 */
 	private static function resolve_bootable_ids( array $manifest ): array {
-		// The transient trades one persistent read for ~21 sub-microsecond
-		// compat closures (defined()/class_exists()-style checks). That trade
-		// only wins when the read is an object-cache hit: WITHOUT a
-		// persistent object cache a TTL'd transient is an autoload=off
-		// options row, so the "cache" COSTS one options-table SELECT per
-		// request (plus a site-option generation read on multisite) to save
-		// microseconds. Plain sites therefore skip the transient machinery
-		// entirely and recompute — byte-identical output, and staleness
-		// cannot exist because nothing is cached on that branch.
-		$use_cache  = (bool) wp_using_ext_object_cache();
-		$generation = $use_cache ? self::bootable_generation() : 0;
-
-		if ( $use_cache ) {
-			$cached = get_transient( self::BOOTABLE_TRANSIENT );
-
-			if ( is_array( $cached )
-				&& isset( $cached['ids'] ) && is_array( $cached['ids'] )
-				&& (int) ( $cached['gen'] ?? -1 ) === $generation
-			) {
-				return $cached['ids'];
-			}
-		}
-
+		// This list is ALWAYS computed. It used to be memoised in a 12-hour
+		// transient on sites with a persistent object cache, and that cache was
+		// removed deliberately — it could not win enough to justify what it
+		// risked.
+		//
+		// WHAT IT COST. A cache hit returned the stored id list and never called
+		// the compat closures at all. So if the list was ever computed in a
+		// context where an active plugin's symbols were not visible, the wrong
+		// list was stored and every later request reused it for up to twelve
+		// hours: the integration for that plugin silently did not load, the
+		// Addons page still said "Active" (its check asks only whether the host
+		// plugin is present), and nothing anywhere reported a problem. Nothing
+		// downstream could recover it either — boot_pending() only boots addons
+		// already registered, and on a real request it never runs at all, since
+		// Bootstrap hooks the whole boot on `init:0` (Bootstrap.php ~1982) and
+		// discovery has already set $final_boot_done by then.
+		//
+		// WHAT IT BOUGHT. Measured on a multisite fixture with Redis over a unix
+		// socket, 300 iterations with the runtime memo dropped each time so the
+		// reads are genuinely cold:
+		//     cold cache path (site-option generation + transient) : 23.2 us
+		//     computing all 21 compat closures                     : 26.7 us
+		// About three microseconds per request. And the comparison only gets
+		// worse for the cache as Redis gets slower, because the cache path is
+		// TWO network round trips while computing is pure PHP with no I/O at
+		// all — a site whose object cache is not on a local socket pays more to
+		// read the answer than to work it out.
+		//
+		// Three microseconds is not worth a twelve-hour window in which an
+		// integration is silently off.
 		$bootable = [];
 
 		foreach ( $manifest as $id => $entry ) {
@@ -380,17 +403,6 @@ final class AddonRegistry {
 			}
 
 			$bootable[] = $id;
-		}
-
-		if ( $use_cache ) {
-			set_transient(
-				self::BOOTABLE_TRANSIENT,
-				[
-					'gen' => $generation,
-					'ids' => $bootable,
-				],
-				self::BOOTABLE_TTL
-			);
 		}
 
 		return $bootable;
@@ -710,17 +722,22 @@ final class AddonRegistry {
 			//
 			// The SKIP must happen in every context (the addon's hooks
 			// shouldn't fire on frontend either), but the RECORD-into-the-
-			// list step is only consumed by the AddonsPage admin notice —
-			// so we skip the array write on frontend / AJAX / REST / cron
-			// to save a few microseconds and a few bytes of resident
-			// memory on every non-admin request.
+			// list step used to be skipped outside admin requests, to save a few
+			// bytes. That was wrong once anything other than the Addons page read
+			// it: Site Health now runs in WordPress's weekly cron check, where
+			// is_admin() is false, so the addon card saw an empty list and wrote a
+			// GREEN result over the amber one an admin visit had produced — the
+			// very "issue count of zero on a site with a problem" symptom that
+			// running on cron was meant to fix. `wp perflocale addon` has the same
+			// problem: WP-CLI is not an admin request either, so its
+			// version-mismatch column always read zero. Two string entries in an
+			// array are not worth a wrong answer in two readers.
 			if ( $addon instanceof HasVersionRequirement && defined( 'PERFLOCALE_VERSION' ) ) {
 				$required = (string) $addon->get_min_perflocale_version();
 
 				if ( $required !== '' && version_compare( (string) PERFLOCALE_VERSION, $required, '<' ) ) {
-					if ( is_admin() && ! wp_doing_ajax() ) {
-						$this->version_mismatches[ $id ] = $required;
-					}
+					$this->version_mismatches[ $id ] = $required;
+
 					continue;
 				}
 			}
@@ -738,6 +755,20 @@ final class AddonRegistry {
 				$compatible = apply_filters( 'perflocale/addon/is_compatible', $addon->is_compatible(), $id );
 
 				if ( ! $compatible ) {
+					// Record it. This used to be a bare `continue`, so an addon
+					// that declared itself incompatible — a host plugin below the
+					// version it needs, a missing dependency, a site filter saying
+					// no — vanished with no trace anywhere: the Addons page still
+					// badged it Active because that badge asks "is the host plugin
+					// present?", and the Site Health addon card reported every
+					// addon booting fine because it only counts quarantined ones.
+					// The operator's integration was simply not running.
+					//
+					// Recorded in EVERY context, deliberately — see the note on
+					// version_mismatches above. Site Health reads this from the
+					// weekly cron run, where is_admin() is false.
+					$this->incompatible[ $id ] = true;
+
 					continue;
 				}
 
@@ -817,11 +848,12 @@ final class AddonRegistry {
 	/**
 	 * Transient name for the cached "which addons should boot" decision.
 	 *
-	 * Stores an array of addon IDs whose compat check has already passed.
-	 * Lets us skip ~21 closure invocations per request once the cache is
-	 * warm (the closures themselves are cheap but they add up on a site
-	 * with many integrations active). Invalidated automatically when
-	 * plugins/themes change, with a 12-hour ceiling as a safety net.
+	 * LEGACY. Nothing writes or reads this any more — resolve_bootable_ids()
+	 * always computes the list (see the note there for the measurements and the
+	 * twelve-hour silent-failure window that removing it closed). The constant
+	 * and the delete in flush_bootable_cache() are kept so that a site upgrading
+	 * from a version that DID cache has its stale payload cleared rather than
+	 * left to sit in Redis until its TTL expires.
 	 */
 	private const BOOTABLE_TRANSIENT = 'perflocale_bootable_addons';
 
@@ -831,15 +863,6 @@ final class AddonRegistry {
 	 * {@see self::bootable_generation()} / {@see self::flush_bootable_cache()}).
 	 */
 	private const BOOTABLE_GEN_OPTION = 'perflocale_bootable_gen';
-
-	/**
-	 * Cache TTL ceiling. Hooks below (`activated_plugin`, `deactivated_plugin`,
-	 * `switch_theme`, `upgrader_process_complete`) invalidate eagerly on
-	 * any change that could flip a compat result. The TTL is the
-	 * defence-in-depth backstop: even if every invalidation hook misses,
-	 * the cache rebuilds within 12 hours.
-	 */
-	private const BOOTABLE_TTL = 12 * HOUR_IN_SECONDS;
 
 	/**
 	 * Default number of consecutive boot failures before an addon is
@@ -963,6 +986,15 @@ final class AddonRegistry {
 	 *
 	 * @return array<string, string>
 	 */
+	/**
+	 * Addons that reported themselves incompatible and were skipped.
+	 *
+	 * @return array<string, bool>
+	 */
+	public function get_incompatible_ids(): array {
+		return $this->incompatible;
+	}
+
 	public function get_version_mismatches(): array {
 		return $this->version_mismatches;
 	}

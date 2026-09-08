@@ -433,6 +433,22 @@ final class CustomizerIntegration {
 			]
 		);
 
+		$safe_html = LanguageSwitcherBlock::kses_switcher( $html );
+
+		/*
+		 * The block suppresses itself whenever it has nothing to offer — on an
+		 * untranslated page with "hide current language" on and untranslated
+		 * languages hidden, every option is skipped and render() returns ''.
+		 * The wrapper below is `position: fixed; z-index: 9999` with a border,
+		 * padding and a shadow, so echoing it around an empty string left a
+		 * small blank pill pinned over the page on every such view, covering
+		 * whatever sat in that corner. Checked after kses, not before, because
+		 * the sanitiser is what decides what actually reaches the page.
+		 */
+		if ( trim( $safe_html ) === '' ) {
+			return;
+		}
+
 		$position_class = in_array( $position, [ 'bottom-left', 'top-right', 'top-left', 'bottom-right' ], true )
 			? 'perflocale-floating-switcher--' . $position
 			: 'perflocale-floating-switcher--bottom-right';
@@ -444,7 +460,12 @@ final class CustomizerIntegration {
 		}
 
 		echo '<div class="' . esc_attr( $classes ) . '">';
-		echo LanguageSwitcherBlock::kses_switcher( $html ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
+		// Re-wrapped at the sink deliberately, even though $safe_html already went
+		// through kses above: the wordpress.org scanner is annotation-blind, so an
+		// `echo` of a bare variable reads as unescaped output no matter what the
+		// phpcs:ignore says. kses_switcher() memoises by hash, so the second pass is
+		// free. Do not hoist this back out.
+		echo LanguageSwitcherBlock::kses_switcher( $safe_html ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
 		echo '</div>';
 	}
 

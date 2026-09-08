@@ -729,8 +729,8 @@ final class StringsPage {
 										<input id="perflocale-str-cb-select-all" type="checkbox" data-perflocale-mt-select-all>
 									</td>
 								<?php endif; ?>
-								<th scope="col" class="manage-column"><?php echo esc_html__( 'Original Text', 'perflocale' ); ?></th>
-								<th scope="col" class="manage-column"><?php echo esc_html__( 'Domain', 'perflocale' ); ?></th>
+								<th scope="col" class="manage-column perflocale-str-col-original"><?php echo esc_html__( 'Original Text', 'perflocale' ); ?></th>
+								<th scope="col" class="manage-column perflocale-str-col-domain"><?php echo esc_html__( 'Domain', 'perflocale' ); ?></th>
 								<?php
 								foreach ( $languages as $lang ) :
 									$is_hidden  = in_array( $lang->slug, $hidden_langs, true );
@@ -784,7 +784,7 @@ final class StringsPage {
 												data-perflocale-string-id="<?php echo absint( $string->id ); ?>">
 										</th>
 									<?php endif; ?>
-									<td class="column-primary">
+									<td class="column-primary perflocale-str-col-original">
 										<span class="perflocale-str-original<?php echo $has_placeholders ? ' perflocale-str-original--has-ph' : ''; ?>">
 											<?php echo esc_html( self::truncate( (string) $string->original, 100 ) ); ?>
 										</span>
@@ -797,7 +797,7 @@ final class StringsPage {
 										</div>
 										<?php endif; ?>
 									</td>
-									<td>
+									<td class="perflocale-str-col-domain">
 										<code class="perflocale-str-domain"><?php echo esc_html( $string->domain ); ?></code>
 									</td>
 									<?php
