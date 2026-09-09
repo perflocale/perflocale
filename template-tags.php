@@ -293,9 +293,20 @@ function perflocale_string_translation_service(): ?object {
  * @param string $context Optional context.
  * @return string Translated string (or original if no translation found).
  */
-function perflocale_t( string $key, string $context = '' ): string {
+function perflocale_t( string $key, string $context = '', $language = '' ): string {
 	if ( perflocale_doing_it_wrong_too_early( __FUNCTION__ ) ) {
 		return $key;
+	}
+
+	// A named language takes the targeted-lookup path instead of the loaded map.
+	// The map holds exactly ONE language per request, so answering for another
+	// one from it is impossible - and switching the request's language to read a
+	// single string would rebuild the whole map. Helper::translate() reads just
+	// that value.
+	if ( $language !== '' && $language !== null ) {
+		return function_exists( 'perflocale' )
+			? perflocale()->translate( $key, $language, [ 'context' => $context ] )
+			: $key;
 	}
 
 	$service = perflocale_string_translation_service();

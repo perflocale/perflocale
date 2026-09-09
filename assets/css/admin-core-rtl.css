@@ -1834,6 +1834,21 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 	margin: 16px 0 24px;
 }
 
+/* An OPEN popover must clear the sticky strip above.
+   The strip is z-index 10 and the Export/Import panels were z-index 10 too, so
+   the winner was decided by DOM order — and the strip is rendered AFTER the page
+   header holding the buttons, so it painted over the open panel and hid those
+   controls behind the tabs.
+   Lifting the <details> rather than the panel keeps the summary and its panel in
+   one stacking context, so the whole control clears the strip together. The value
+   stays well below WordPress's own chrome (admin menu ~9990, admin bar 99999).
+   position:relative is repeated here so the z-index still applies if a popover's
+   inline positioning is ever removed. */
+details[data-perflocale-popover][open] {
+	position: relative;
+	z-index: 100;
+}
+
 .perflocale-nav-tabs__items {
 	flex: 1 1 auto;
 	display: flex;

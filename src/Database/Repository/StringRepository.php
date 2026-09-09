@@ -13,6 +13,7 @@ use PerfLocale\Cache\CacheManager;
 use PerfLocale\Concurrency\Lock;
 use PerfLocale\Contract\RepositoryInterface;
 use PerfLocale\Database\Schema;
+use PerfLocale\Enum\ObjectType;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -802,9 +803,30 @@ final class StringRepository implements RepositoryInterface {
 			return false;
 		}
 
-		// Cascade: drop the string's translations, then its now-empty group.
+		// Cascade: drop the string's translations, then its links, then its
+		// now-empty group.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->delete( Schema::table( 'string_translations' ), [ 'string_id' => $id ], [ '%d' ] );
+
+		// ⚠️ And the links. Without this, deleting a string through the repository
+		// leaves `translation_links` rows pointing at an id that no longer exists
+		// — the orphan state the health checks and the `string-mode-db` suite
+		// exist to catch, produced by the plugin's own supported delete path.
+		// gc_stale_strings() already cascades to links; a single delete must
+		// agree with it.
+		//
+		// Scoped by BOTH type and object_id: translation_links is polymorphic, so
+		// an unqualified object_id delete would take out a post or term
+		// translation that merely shares the number.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$this->wpdb->delete(
+			Schema::table( 'translation_links' ),
+			[
+				'object_id' => $id,
+				'type'      => ObjectType::String->value,
+			],
+			[ '%d', '%s' ]
+		);
 
 		if ( $group_id > 0 ) {
 			$groups_table = Schema::table( 'translation_groups' );

@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.3
+Stable tag: 1.0.4
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -16,9 +16,9 @@ PerfLocale is a **performance-first multilingual plugin** for WordPress. A 3-lay
 
 = What you get =
 
-* **Content translation** - posts, pages, any custom post type, taxonomies, and URL slugs, with translation-status tracking
+* **Content translation** - posts, pages, any custom post type, taxonomies, and URL slugs, with translation-status tracking. Synced patterns and block-theme navigation menus are translatable too (opt-in)
 * **URL routing** - subdirectory (`/en/`), subdomain (`en.example.com`), per-domain, or query-parameter (`?lang=en`) modes; auto-detect from URL, cookie, browser, or an edge/CDN hint
-* **String translation** - gettext strings from any plugin or theme, file-based (`.l10n.php`) or database-mode, with full CLDR plural rules (Arabic 6 forms, Russian 3) and context support
+* **String translation** - gettext strings from any plugin or theme, file-based (`.l10n.php`) or database-mode, with full CLDR plural rules (Arabic 6 forms, Russian 3) and context support. The site title and tagline appear there too
 * **Language switcher** - block, shortcode, widget, menu, admin-bar, and template tags with full ARIA listbox accessibility
 * **SEO** - hreflang (HTML + HTTP) and sitemap alternates; integrates with Yoast, Rank Math, AIOSEO, SEOPress, The SEO Framework, and Slim SEO
 * **Machine translation** - DeepL, Google, Microsoft, LibreTranslate, a custom agency endpoint, and the WordPress 7.0 AI Client, with monthly usage caps
@@ -32,7 +32,7 @@ Translation-aware features generic SEO plugins can't provide: Content-Language H
 
 = For developers =
 
-200+ action/filter hooks, a full REST API, WP-CLI commands, and a documented addon system. Every internal primitive is `@api` and semver-stable across 1.x. Multisite-ready. Full docs at **https://perflocale.com/docs/**.
+200+ action/filter hooks, a full REST API, WP-CLI commands, and a documented addon system. A PHP helper API lets you translate a string or render a block of markup in any language from your own code. Every internal primitive is `@api` and semver-stable across 1.x. Multisite-ready. Full docs at **https://perflocale.com/docs/**.
 
 **Try it without installing anything.** Open a throwaway WordPress site in your browser with PerfLocale already active: https://playground.wordpress.net/?blueprint-url=https://perflocale.com/blueprint.json
 
@@ -93,6 +93,22 @@ Yes. PerfLocale includes a deep WooCommerce integration: translate products, var
 = Does it work with page builders? =
 
 Yes. PerfLocale integrates with Elementor, Beaver Builder, Bricks Builder, Oxygen Classic, and Oxygen 6.0. Each builder's content is registered as translatable meta, and dedicated Language Switcher widgets/elements are provided for Elementor, Beaver Builder, and Bricks — in Oxygen (Classic or 6.0) use the `[perflocale_switcher]` shortcode in a Code Block or Shortcode element.
+
+= How do I translate patterns and block-theme menus? =
+
+It depends on which kind of pattern you used, and the two look identical in the editor.
+
+A pattern you insert from the inserter is **copied into the page**, so its text is simply part of that page — translate the page under PerfLocale → Translations and the text comes with it. (This is also why the theme's pattern strings on the Strings screen don't apply to it: those are used when the theme renders the pattern file itself, while the copy in your page is plain HTML.)
+
+A **synced** pattern is stored once and the page only holds a reference to it, so there is nothing in the page to translate. Enable "Patterns" under *Advanced content types* at PerfLocale → Settings → Translation, then translate each pattern like any other post; PerfLocale serves the right one per language, including patterns nested inside a Group.
+
+Block-theme menus work the same way. Menu link addresses are already translated without any setting; enable "Navigation Menus" in the same place to translate the visible labels too. In both cases, if a translation is missing or still a draft the original renders — never a blank space.
+
+= How do I translate the site title and tagline? =
+
+Go to PerfLocale → Strings and translate them like any other string — they are listed there as "Site Title" and "Tagline". There is nothing to switch on, and no scan to run: they are registered automatically when the plugin is updated or activated.
+
+Your original title and tagline are never overwritten. PerfLocale serves the translated text on the front end only, and refuses any attempt to write a translated value back over the original.
 
 = Can I migrate from WPML, Polylang, or TranslatePress? =
 
@@ -195,6 +211,28 @@ When you register webhooks via the PerfLocale REST API, the plugin sends event n
 PerfLocale can also publish a read-only public REST endpoint for edge runtimes (`/wp-json/perflocale/v1/config`). It is served by your own site, makes no outbound third-party request and sends no data anywhere - see the "Does PerfLocale expose anything to edge workers?" FAQ for the full description.
 
 == Changelog ==
+
+= 1.0.4 =
+
+Adds translation for the site title and tagline, synced patterns and block-theme navigation menus, and a PHP API for translating from your own code. Fixes a case where a translated site title could overwrite the original, a multisite call returning the wrong blog's name, and scheduled rendering windows resolving the wrong language. Full detail at https://perflocale.com/changelog/
+
+**Site title and tagline.** Both are now translatable, and appear on the Strings screen as "Site Title" and "Tagline" rather than as raw option names. Nothing to switch on and no scan to run - they are registered when the plugin is activated or updated. Your stored title is never modified: the translation is served on the front end only, and a write-side guard refuses any attempt to save a translated value back over the original.
+
+**Synced patterns and block-theme menus.** A synced pattern is stored once and referenced by every page that uses it, so translating the page could never reach its text. Enable "Patterns" under Advanced content types at Settings > Translation and each pattern becomes translatable, including patterns nested inside a Group. Block-theme navigation menus work the same way: link addresses were already translated, and enabling "Navigation Menus" translates the visible labels too. If a translation is missing or still a draft the original renders - WordPress renders nothing at all for a reference it will not accept, and a blank space is worse than untranslated text.
+
+**A translated site title could overwrite the original.** WordPress sanitises an option value before the filter that guards the write, so a title containing an apostrophe or ampersand arrived in a different form than the one the guard compared against - "Alex's Bakery" as "Alex&#039;s Bakery" - and the guard let the round trip through. The comparison now happens at WordPress's own sanitisation boundary.
+
+**The site-title strings were not registered when updating from wp-admin.** The class was only loaded on front-end requests, so an operator whose first request after updating was a wp-admin page - the normal case - never got the strings registered at all, on that request or any later one. It now loads in every context.
+
+**Multisite: another blog's name.** On a translated request, get_site() and get_blog_details() could return the calling blog's title for a different blog. The site-details filter now checks which blog it was handed.
+
+**Imposed rendering windows.** Order emails and other internal rendering windows impose a language for part of a request. String translations, the site title and the helper's own accessors kept answering with the language the request arrived in, so an email could carry the wrong site title and a right-to-left order could render left-to-right. All of them now follow the imposed language.
+
+**Also fixed.** Deleting a string through the plugin's own delete path left its translation links behind. A site installed below a directory named test, build or dist was skipped entirely by the string scanner, which reported nothing found - exclusions are now measured from the directory being scanned. Exchange-rate sync errors are recorded once per condition instead of on every scheduled run. An open Export/Import panel on the Strings screen no longer sits behind the navigation tabs.
+
+**For developers.** perflocale()->with_language( $lang, $callback ) runs a callback with another language imposed and restores it afterwards, even if the callback throws - the general primitive for rendering part of a request in another language. perflocale()->translate( $text, $lang, $args ) translates one registered string without touching request state. perflocale_t() takes an optional third $language argument. New filters: perflocale/settings/non_public_post_types and perflocale/strings/context_label.
+
+Translation of block template and template part content (full site editing) is not included in this release.
 
 = 1.0.3 =
 
@@ -351,6 +389,9 @@ Initial public release.
 Full release notes: https://perflocale.com/changelog/
 
 == Upgrade Notice ==
+
+= 1.0.4 =
+Translates the site title, tagline, synced patterns and block-theme menus. Fixes a translated site title overwriting the original, a multisite call returning the wrong blog's name, and order emails resolving the wrong language.
 
 = 1.0.3 =
 Multisite: registering a webhook now needs network-administrator permissions - a breaking change, with a filter to restore the old rule. Also fixes WooCommerce order emails in the wrong language, percent signs deleted from titles, and the admin on phones and tablets.

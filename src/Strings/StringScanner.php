@@ -103,6 +103,22 @@ final class StringScanner {
 		$inserted        = 0;
 		$batch           = [];
 
+		// ⚠️ Exclusions are relative to the REQUESTED ROOT, never the absolute
+		// path. The regex is a segment match like `/(?:vendor|tests|test|build)/`,
+		// and matching it against the full realpath means an installation that
+		// merely LIVES below a directory of that name — `/var/www/test/`,
+		// `/srv/build/`, a checkout under `dist/` — has every one of its files
+		// excluded and scans silently return "found 0". An audit reproduced
+		// exactly that: a readable file yielded a string through scan_file() while
+		// scan() on its own directory found nothing.
+		//
+		// Anchoring to the scan root keeps every intentional exclusion working —
+		// a `vendor/` or `tests/` directory INSIDE the tree being scanned is still
+		// skipped — while removing a rule nobody meant: that the name of a parent
+		// directory you did not ask to scan can disable scanning entirely.
+		$scan_root = realpath( $directory );
+		$scan_root = false === $scan_root ? '' : rtrim( $scan_root, '/' );
+
 		/**
 		 * Maximum size of a single PHP file the scanner will read.
 		 * Default 2 MB. Files bigger than this are skipped to keep peak
@@ -153,9 +169,20 @@ final class StringScanner {
 					continue;
 				}
 
-				// Skip excluded paths (single regex check instead of loop).
-				if ( $exclusion_regex !== '' && preg_match( $exclusion_regex, $filepath ) ) {
-					continue;
+				// Skip excluded paths (single regex check instead of loop),
+				// measured from the scan root — see $scan_root above.
+				if ( '' !== $exclusion_regex ) {
+					$relative = $filepath;
+
+					if ( '' !== $scan_root && str_starts_with( $filepath, $scan_root ) ) {
+						$relative = substr( $filepath, strlen( $scan_root ) );
+					}
+
+					// Leading slash so the segment regex can match the first
+					// directory below the root as well as a nested one.
+					if ( preg_match( $exclusion_regex, '/' . ltrim( $relative, '/' ) ) ) {
+						continue;
+					}
 				}
 
 				// Skip files over size limit to prevent memory exhaustion.

@@ -2356,6 +2356,24 @@ final class UrlConverter {
 		$blocks = isset( $parsed_block['innerBlocks'] ) && is_array( $parsed_block['innerBlocks'] ) ? $parsed_block['innerBlocks'] : [];
 
 		if ( $ref > 0 ) {
+			// ⚠️ Prime the menu that will actually RENDER, not the one the block
+			// was saved with. BlockRefTranslator swaps a translated
+			// `wp_navigation` in on `render_block_data`, which fires AFTER this
+			// `pre_render_block` pass — so priming $ref here would warm the
+			// source menu's items and then watch the translated menu render,
+			// turning one batched query into one lookup per menu item on exactly
+			// the pages that use the feature. The translator memoises, so asking
+			// twice costs nothing.
+			$plugin = \PerfLocale\Plugin::get_instance();
+
+			if ( $plugin->has( 'block_ref_translator' ) ) {
+				$translated_ref = $plugin->get( 'block_ref_translator' )->translated_ref( $ref, 'wp_navigation' );
+
+				if ( $translated_ref > 0 ) {
+					$ref = $translated_ref;
+				}
+			}
+
 			if ( isset( self::$primed_nav_refs[ $ref ] ) ) {
 				return $pre_render;
 			}

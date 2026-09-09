@@ -340,6 +340,70 @@ final class TranslationsPage {
 				<div class="notice notice-warning is-dismissible"><p><?php echo esc_html__( 'No score row matched the request — it may have already been cleared.', 'perflocale' ); ?></p></div>
 			<?php endif; ?>
 
+			<?php
+			/*
+			 * Discoverability hint for the non-public content types.
+			 *
+			 * These ship OFF, and the support thread that produced the feature was
+			 * someone who could not find HOW to translate a synced pattern. A hint is
+			 * the cheap half of that problem: tell the people who actually have such
+			 * content, and nobody else.
+			 *
+			 * ⚠️ COST. This runs ONLY while rendering this screen — never on the front
+			 * end, never on another admin page, never on cron. It asks nothing at all
+			 * when both types are already enabled, and otherwise uses
+			 * wp_count_posts(), whose per-status counts core keeps in the object
+			 * cache and invalidates on save — so on a warm cache it costs no query,
+			 * and on a cold one far less than this screen's own listing query.
+			 */
+			$hint_candidates = [];
+
+			foreach ( [ 'wp_block' => __( 'Patterns', 'perflocale' ), 'wp_navigation' => __( 'Navigation Menus', 'perflocale' ) ] as $hint_type => $hint_label ) {
+				if ( ! in_array( $hint_type, $post_types, true ) && post_type_exists( $hint_type ) ) {
+					$hint_candidates[ $hint_type ] = $hint_label;
+				}
+			}
+
+			if ( $hint_candidates ) {
+				$hint_counts = [];
+
+				foreach ( $hint_candidates as $hint_type => $hint_label ) {
+					// wp_count_posts() rather than a hand-written COUNT: core caches
+					// the per-status counts in the object cache and invalidates them
+					// on save, so on a warm cache this costs no query at all.
+					$hint_counts_obj = wp_count_posts( $hint_type );
+					$hint_found      = (int) ( $hint_counts_obj->publish ?? 0 );
+
+					if ( $hint_found > 0 ) {
+						$hint_counts[] = sprintf(
+							/* translators: 1: number of items, 2: the content type label shown on the settings screen, e.g. "Patterns". */
+							_n( '%1$d %2$s', '%1$d %2$s', $hint_found, 'perflocale' ),
+							$hint_found,
+							$hint_label
+						);
+					}
+				}
+
+				if ( $hint_counts ) :
+					?>
+					<div class="notice notice-info is-dismissible">
+						<p>
+							<?php
+							printf(
+								/* translators: %s: a list such as "4 Patterns and 1 Navigation Menus". */
+								esc_html__( 'This site has %s that are not translatable yet.', 'perflocale' ),
+								esc_html( implode( __( ' and ', 'perflocale' ), $hint_counts ) )
+							);
+							?>
+							<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=translation' ) ); ?>">
+								<?php echo esc_html__( 'Switch them on under Advanced content types', 'perflocale' ); ?></a>.
+						</p>
+					</div>
+					<?php
+				endif;
+			}
+			?>
+
 			<!-- Toolbar: search + count (matches Strings page style) -->
 			<div class="perflocale-str-toolbar">
 				<div class="perflocale-str-toolbar__left">

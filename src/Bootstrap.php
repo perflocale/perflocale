@@ -1175,6 +1175,74 @@ final class Bootstrap {
 		add_action( 'wp_enqueue_scripts', [ Helper::class, 'register_rtl_styles' ], 999 );
 		add_action( 'admin_enqueue_scripts', [ Helper::class, 'register_rtl_styles' ], 999 );
 
+		// ⚠️ An imposed rendering language must reach the STRING layer too.
+		//
+		// `override_current_language()` exists so an order email rendered outside
+		// the customer's request resolves "term names, attribute labels, string
+		// translations" in the ORDER's language (LanguageRouter.php:2360-2372).
+		// But both string services load their whole per-language map ONCE, on
+		// `perflocale/language/detected`, and never reload — so inside an override
+		// window every `__()` kept serving the language the REQUEST arrived in.
+		// `get_locale()` follows the override correctly, which is what made this
+		// hard to see: the locale said Polish while the loader still held German.
+		//
+		// The reset the blog-switch registry already uses is exactly the right
+		// one, so it is reused rather than duplicated. Unlike that registry this
+		// is NOT gated on is_multisite() — the override window is a single-site
+		// feature too. It costs nothing until an override actually changes the
+		// language: the action only fires on a real change
+		// (LanguageRouter.php:2382), and the reload is lazy, so a request that
+		// never overrides pays one no-op hook registration.
+		add_action(
+			'perflocale/language/overridden',
+			static function (): void {
+				$plugin = Plugin::get_instance();
+
+				foreach ( [ 'string_translation', 'translation_file_loader' ] as $service ) {
+					if ( ! $plugin->has( $service ) ) {
+						continue;
+					}
+
+					$instance = $plugin->get( $service );
+
+					if ( method_exists( $instance, 'reset_for_blog_switch' ) ) {
+						$instance->reset_for_blog_switch();
+					}
+				}
+			},
+			5
+		);
+
+		// Per-language site title and tagline.
+		//
+		// ⚠️ Registered HERE, outside the frontend/admin split below, and the
+		// distinction is load-bearing. register_frontend_services() only runs
+		// when `! is_admin() || wp_doing_ajax()`, so while this lived there the
+		// class did not exist on an ordinary wp-admin request. Three consequences,
+		// all confirmed by audit:
+		//
+		//   1. The Strings screen showed `blogname` instead of "Site Title",
+		//      because the context-label filter was never added.
+		//   2. Renaming the title in Settings > General did not register the new
+		//      source string — `update_option_blogname` had no listener.
+		//   3. Worst: `Migrator::maybe_update()` also runs on `admin_init`, and
+		//      stamps the new version IMMEDIATELY after firing
+		//      `perflocale/updated`. An operator whose first request after
+		//      updating is a wp-admin page — which is the normal case, since that
+		//      is where you click update — fired that action into the void and
+		//      the option strings were then NEVER registered, on any later
+		//      request either.
+		//
+		// Registering everywhere is safe and cheap: register_hooks() attaches the
+		// write-side veto and the registration hooks, then returns before the
+		// read filters in admin, CLI, XML-RPC and cron. The front end is
+		// unaffected — same object, same hooks, same cost.
+		$plugin->register(
+			'option_strings',
+			fn( Plugin $p ) => new Frontend\OptionStrings( $p->get( 'router' ) ),
+			true
+		);
+
 		if ( ! is_admin() || wp_doing_ajax() ) {
 			self::register_frontend_services( $plugin );
 		} else {
@@ -1455,6 +1523,16 @@ final class Bootstrap {
 		add_action( 'perflocale/language/updated', $reset_helper );
 		add_action( 'perflocale/language/slug_renamed', $reset_helper );
 		add_action( 'perflocale/language/deleted', $reset_helper );
+
+		// ⚠️ And when a rendering window IMPOSES a language. Without this the
+		// memo keeps answering with the language the REQUEST arrived in, so
+		// inside a WooCommerce order-email window — the live consumer of
+		// override_current_language() — perflocale()->slug(), ->locale() and
+		// ->is_rtl() all describe the wrong language, and an RTL order can be
+		// rendered left-to-right. Helper::with_language() depends on this being
+		// wired: it is the difference between the public API telling the truth
+		// inside a window and quietly lying.
+		add_action( 'perflocale/language/overridden', $reset_helper );
 		add_action( 'perflocale/language/deleted', $reset_slug_repo );
 
 		// Glossary entries reference (source_language_id, target_language_id).
@@ -2411,6 +2489,23 @@ final class Bootstrap {
 		$plugin->register(
 			'slug_redirector',
 			fn() => new Frontend\SlugRedirector(),
+			true
+		);
+
+		// Per-language synced patterns (`core/block`) and block-theme navigation
+		// menus (`core/navigation`). Both hold only a `ref` to another post, so
+		// translating the page that uses them cannot reach their text.
+		//
+		// Front-end only, and the class says so itself: a `ref` rewritten in the
+		// editor is written back into the source page on the next save, so
+		// Frontend\BlockRefTranslator::register_hooks() refuses to attach anything
+		// under is_admin() and detaches before REST dispatch. Registered
+		// unconditionally because the cost on a page with none of these blocks is
+		// one array lookup per block, and zero on the default language (the filter
+		// is never attached at all).
+		$plugin->register(
+			'block_ref_translator',
+			fn( Plugin $p ) => new Frontend\BlockRefTranslator( $p->get( 'router' ), $p->get( 'settings' ) ),
 			true
 		);
 

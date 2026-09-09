@@ -133,6 +133,11 @@ final class Activator {
 		// as the upgrade / self-heal path; install_caps() is idempotent.
 		TranslatorRole::install_caps();
 
+		// Put the site title and tagline on the Strings screen straight away.
+		// maybe_update() cannot do it for a FRESH install because activation
+		// stamps perflocale_version, so its version gate never opens.
+		\PerfLocale\Frontend\OptionStrings::register_source_strings();
+
 		// Initialize default settings and hot-path options. The
 		// `perflocale_flush_rules` flag is initialized in this same block via
 		// add_option() + set_autoload(), so no separate update_option() call

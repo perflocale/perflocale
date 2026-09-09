@@ -897,6 +897,37 @@ final class ExchangeRateSync {
 
 		// Store last error for display in the admin UI. Not autoloaded — it's
 		// read only on the admin settings screen, never on the front end.
+		//
+		// ⚠️ WRITE ONLY WHEN THE MESSAGE IS NEW OR HAS CHANGED.
+		//
+		// The plugin ships NO exchange-rate providers — `self::PROVIDERS` is empty
+		// by design, because rates come from the
+		// `perflocale/woocommerce/exchange_rate_providers` or
+		// `..._exchange_rates_fetched` filters. A site that has wired neither
+		// cannot resolve that from the UI, so its scheduled sync fails on every
+		// run and this option was being rewritten each time: a recurring write
+		// recording a condition that never changes. It also broke any
+		// "this request wrote nothing" assertion whenever cron happened to fire
+		// during the measured window — child HTTP requests do not inherit
+		// DISABLE_WP_CRON.
+		//
+		// Scheduling is deliberately NOT touched. Cron is only re-armed by
+		// maybe_reschedule() on `perflocale/settings/updated` — a SETTINGS save —
+		// but wiring a rate source is a CODE change that fires no settings update.
+		// Unscheduling on "no source configured" would therefore leave a developer
+		// who correctly registers the filter with a silently dead sync, which is a
+		// worse and far harder failure to diagnose than a single log entry.
+		//
+		// `timestamp` consequently means "when this condition was first recorded"
+		// rather than "the last time we noticed", which is the more useful of the
+		// two. That is safe: the only reader (ajax_sync_rates) deletes this option
+		// before triggering a sync and reads `message` alone.
+		$existing = get_option( 'perflocale_exchange_rate_last_error', [] );
+
+		if ( is_array( $existing ) && isset( $existing['message'] ) && $existing['message'] === $message ) {
+			return;
+		}
+
 		update_option(
 			'perflocale_exchange_rate_last_error',
 			[

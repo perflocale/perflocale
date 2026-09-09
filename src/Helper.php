@@ -202,6 +202,237 @@ final class Helper {
 	}
 
 	/**
+	 * Run a callback with a different language imposed, then restore.
+	 *
+	 * The general primitive for rendering part of a request in another language
+	 * from PHP: a custom template, an Oxygen/Bricks code block, a REST handler
+	 * building a preview, a notification assembled outside its recipient's
+	 * request. It composes with everything rather than needing a render_pattern(),
+	 * a render_template() and a render_block() of its own:
+	 *
+	 *     echo perflocale()->with_language( 'de', fn() => do_blocks( $markup ) );
+	 *     echo perflocale()->with_language( 'de', fn() => do_shortcode( '[thing]' ) );
+	 *     $title = perflocale()->with_language( 'de', fn() => get_bloginfo( 'name' ) );
+	 *
+	 * WHAT FOLLOWS THE WINDOW, AND WHAT DOES NOT
+	 * Imposing a language fires `perflocale/language/overridden`, and these
+	 * rebuild on it: the string services (so `__()` resolves in the imposed
+	 * language), the site title and tagline, synced-pattern and navigation
+	 * references, UrlConverter's per-language memos, and this class's own
+	 * language memo.
+	 *
+	 * ⚠️ Two things deliberately do NOT change, and callers should not expect
+	 * them to:
+	 *   - The block editor and other admin contexts never rewrite pattern or
+	 *     navigation references, at any language. That guard exists because a
+	 *     rewritten reference saved from an editor merges the two languages
+	 *     permanently; a preview being untranslated is the cheaper failure.
+	 *   - Block-template CONTENT (`wp_template` / `wp_template_part`) is not
+	 *     translated by this plugin at all, so a window cannot conjure it.
+	 *
+	 * ⚠️ COST. Each actual language CHANGE rebuilds the per-language string map.
+	 * That is a few hundred microseconds, not free: fine around a template or a
+	 * handful of blocks, wrong inside a loop over posts or a filter that fires
+	 * hundreds of times per request. To translate a single string, prefer
+	 * {@see self::translate()}, which looks the one value up without touching
+	 * request state.
+	 *
+	 * Nesting is safe (each call restores its own predecessor), and the language
+	 * is restored even if the callback throws.
+	 *
+	 * @api  Stable API surface - semver-bound.
+	 *
+	 * @param string|int|\WP_Post|object|null $language Slug, locale, a post whose
+	 *                                                  language should be used, a
+	 *                                                  language row, or null/'' for
+	 *                                                  no change.
+	 * @param callable                        $callback Callback to run.
+	 * @return mixed Whatever the callback returns.
+	 */
+	public function with_language( $language, callable $callback ) {
+		$router = $this->safe_router();
+		$target = $this->resolve_language( $language );
+
+		// No router, or a language we cannot resolve: run the callback rather
+		// than throwing. A template helper that fatals on a typo'd slug is worse
+		// than one that renders the current language - but say so, or the typo
+		// is invisible.
+		if ( $router === null || $target === null ) {
+			if ( $router !== null && $language !== null && $language !== '' ) {
+				_doing_it_wrong(
+					__METHOD__,
+					esc_html(
+						sprintf(
+							/* translators: %s: the language identifier that could not be resolved. */
+							__( 'Unknown language %s - the callback ran in the current language instead.', 'perflocale' ),
+							is_scalar( $language ) ? (string) $language : get_debug_type( $language )
+						)
+					),
+					'1.0.4'
+				);
+			}
+
+			return $callback();
+		}
+
+		$previous = $router->override_current_language( $target );
+
+		try {
+			return $callback();
+		} finally {
+			// finally, not a trailing call: an exception inside the callback must
+			// not leave the whole rest of the request in the imposed language.
+			$router->override_current_language( $previous );
+		}
+	}
+
+	/**
+	 * Translate one registered string, optionally into a named language.
+	 *
+	 *     perflocale()->translate( 'Read more' );                       // current language
+	 *     perflocale()->translate( 'Read more', 'de' );                 // by slug
+	 *     perflocale()->translate( 'Read more', 'de_DE' );              // by locale
+	 *     perflocale()->translate( 'Read more', $post );                // that post's language
+	 *     perflocale()->translate( 'Read more', 'de', [ 'domain' => 'my-theme' ] );
+	 *
+	 * ⚠️ THIS ONLY TRANSLATES STRINGS PERFLOCALE ALREADY KNOWS ABOUT. A string is
+	 * identified by the triple `domain|context|text`, and it must already exist on
+	 * the Strings screen - put there by a scan, or registered by code. An
+	 * unregistered string returns unchanged, for ever, with no error: that is the
+	 * single most likely reason this function will appear "not to work". Register
+	 * first, then translate.
+	 *
+	 * ⚠️ The `$domain` matters as much as the text. The default is the plugin's own
+	 * `perflocale` domain, matching {@see perflocale_t()}. A theme string scanned
+	 * under `my-theme` will NOT be found under the default - pass its domain.
+	 *
+	 * Unlike {@see self::with_language()} this does NOT change request state: it is
+	 * two indexed lookups, so it is safe in a loop and safe to call for several
+	 * languages in a row.
+	 *
+	 * @api  Stable API surface - semver-bound.
+	 *
+	 * @param string                          $text     Source text, exactly as registered.
+	 * @param string|int|\WP_Post|object|null $language Slug, locale, a post, a language
+	 *                                                  row, or ''/null for the current one.
+	 * @param array<string, mixed>            $args     Optional: `domain` (default
+	 *                                                  'perflocale'), `context` (default
+	 *                                                  ''), `default` (returned when there
+	 *                                                  is no translation; defaults to $text).
+	 * @return string The translation, or the fallback.
+	 */
+	public function translate( string $text, $language = '', array $args = [] ): string {
+		$domain   = isset( $args['domain'] ) ? (string) $args['domain'] : 'perflocale';
+		$context  = isset( $args['context'] ) ? (string) $args['context'] : '';
+		$fallback = array_key_exists( 'default', $args ) ? (string) $args['default'] : $text;
+
+		if ( $text === '' ) {
+			return $fallback;
+		}
+
+		try {
+			$language_row = $this->resolve_language( $language );
+
+			// No language, or the default language: the source text IS the answer.
+			// Checked before any query - the default language is the common case
+			// and must not pay for a lookup.
+			if ( $language_row === null ) {
+				$language_row = $this->current_language();
+			}
+
+			$default_language = $this->default_language();
+
+			if (
+				$language_row === null
+				|| ( $default_language !== null && ( $language_row->slug ?? null ) === ( $default_language->slug ?? null ) )
+			) {
+				return $fallback;
+			}
+
+			$plugin = Plugin::get_instance();
+
+			if ( ! $plugin->has( 'cache' ) ) {
+				return $fallback;
+			}
+
+			$strings = new \PerfLocale\Database\Repository\StringRepository( $plugin->get( 'cache' ) );
+			$string  = $strings->find_by_hash( $domain, $context, $text );
+
+			if ( $string === null || empty( $string->id ) ) {
+				return $fallback;
+			}
+
+			$values      = new \PerfLocale\Database\Repository\StringTranslationRepository( $plugin->get( 'cache' ) );
+			$translation = $values->get( (int) $string->id, (int) $language_row->id );
+
+			// '' means "no translation stored", not "translated to empty" - a
+			// template must never render nothing where text was expected.
+			return $translation === '' ? $fallback : $translation;
+		} catch ( \Throwable $e ) {
+			// Same contract as the rest of this class: a helper called from a
+			// template returns something renderable rather than fatalling a page.
+			return $fallback;
+		}
+	}
+
+	/**
+	 * Resolve whatever a caller passed into a language row.
+	 *
+	 * Overloaded by TYPE rather than by inspecting the contents of a string.
+	 * Sniffing would have to guess whether 'de_DE' is a slug or a locale, and
+	 * slugs are operator-chosen - a site really can have a language whose slug is
+	 * `de_DE` or `fr-ca`. A string is therefore always a language identifier
+	 * (slug first, then locale), and a post is always a post.
+	 *
+	 * @param string|int|\WP_Post|object|null $language Language identifier.
+	 * @return object|null Language row, or null when it cannot be resolved.
+	 */
+	private function resolve_language( $language ): ?object {
+		if ( $language === null || $language === '' ) {
+			return null;
+		}
+
+		// Already a language row.
+		if ( is_object( $language ) && ! ( $language instanceof \WP_Post ) && isset( $language->slug, $language->id ) ) {
+			return $language;
+		}
+
+		try {
+			$plugin = Plugin::get_instance();
+
+			// A post, or a post id: use whatever language that post is in.
+			if ( $language instanceof \WP_Post || is_int( $language ) ) {
+				$post_id = $language instanceof \WP_Post ? (int) $language->ID : (int) $language;
+
+				if ( $post_id <= 0 || ! $plugin->has( 'cache' ) || ! $plugin->has( 'settings' ) ) {
+					return null;
+				}
+
+				$manager = new \PerfLocale\Translation\PostTranslationManager(
+					$plugin->get( 'cache' ),
+					$plugin->get( 'settings' )
+				);
+
+				return $manager->detect_post_language( $post_id );
+			}
+
+			if ( ! is_string( $language ) || ! $plugin->has( 'lang_repo' ) ) {
+				return null;
+			}
+
+			$repo = $plugin->get( 'lang_repo' );
+
+			// Slug first: it is what the operator sees and types everywhere else
+			// in this API, so it wins any collision with a locale.
+			$row = $repo->find_by_slug( $language );
+
+			return $row ?? $repo->find_by_locale( $language );
+		} catch ( \Throwable $e ) {
+			return null;
+		}
+	}
+
+	/**
 	 * Get the current locale (e.g. "fr_FR").
 	 *
 	 * @return string

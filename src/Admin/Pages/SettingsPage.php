@@ -1715,6 +1715,57 @@ final class SettingsPage {
 		$all_post_types = get_post_types( [ 'public' => true ], 'objects' );
 		$all_taxonomies = get_taxonomies( [ 'public' => true ], 'objects' );
 
+		// Non-public post types PerfLocale can actually translate.
+		//
+		// ⚠️ This is a curated allowlist, NOT get_post_types( [ 'public' => false ] ).
+		// That call returns `revision`, `nav_menu_item`, `wp_global_styles`,
+		// `oembed_cache` and friends — checkboxes that would either do nothing or
+		// do harm. It also returns `wp_template` and `wp_template_part`, which
+		// have no resolver yet: offering them would let an operator switch on
+		// something that silently never renders translated, which is worse than
+		// not offering it at all.
+		//
+		// A type earns its place here only once something rewrites or serves its
+		// translation on the front end. `wp_block` and `wp_navigation` qualify
+		// because {@see \PerfLocale\Frontend\BlockRefTranslator} rewrites the
+		// `ref` of `core/block` and `core/navigation` at render time;
+		//
+		// ⚠️ `wp_template` and `wp_template_part` are NOT offered, and the reason
+		// is measured rather than assumed. A working content swap was built on
+		// `get_block_templates` and proved on a real request — and then, with the
+		// type actually marked translatable, `/de/` fell back to the THEME file
+		// template (`wp_id=0`) and the operator's customised template vanished on
+		// every non-default language. `PostQueryFilter` hides the source (it is
+		// tagged in the default language and has a translation) while the
+		// translation itself carries no `wp_theme` term, so core returns neither.
+		// Making templates opt out of language query filtering touches
+		// `get_translatable_post_types()` in five places inside PostQueryFilter
+		// and needs its own round. Until then a checkbox here would be worse than
+		// no feature: it would BREAK a template that works today.
+		/**
+		 * Non-public post types offered on the settings screen.
+		 *
+		 * @hook perflocale/settings/non_public_post_types
+		 * @param string[] $types Post type names. Default [ 'wp_block', 'wp_navigation' ].
+		 */
+		$non_public_names = (array) apply_filters(
+			'perflocale/settings/non_public_post_types',
+			[ 'wp_block', 'wp_navigation' ]
+		);
+
+		$non_public_types = [];
+
+		foreach ( $non_public_names as $non_public_name ) {
+			$non_public_object = get_post_type_object( (string) $non_public_name );
+
+			// Skip anything not registered on this site, and anything that is
+			// actually public — it is already in the list above and must not
+			// appear twice with two checkboxes writing the same key.
+			if ( $non_public_object && empty( $non_public_object->public ) ) {
+				$non_public_types[ $non_public_object->name ] = $non_public_object;
+			}
+		}
+
 		$available_sync_fields = [
 			'featured_image' => __( 'Featured Image', 'perflocale' ),
 			'menu_order'     => __( 'Menu Order', 'perflocale' ),
@@ -1902,6 +1953,40 @@ final class SettingsPage {
 						</label><br>
 					<?php endforeach; ?>
 				</fieldset>
+				<?php if ( $non_public_types ) : ?>
+					<?php
+					// Kept in a SEPARATE collapsed group rather than mixed into the
+					// list above: "Patterns" and "Posts" are not comparable choices,
+					// and a flat list invites an operator to tick something whose
+					// consequences they cannot see. Collapsed by default so the
+					// common case — the operator only wants posts and pages — is
+					// unchanged.
+					?>
+					<details class="perflocale-settings__advanced-types">
+						<summary><?php echo esc_html__( 'Advanced content types', 'perflocale' ); ?></summary>
+						<p class="description">
+							<?php echo esc_html__( 'Content types that are not part of your site\'s public pages, but can still hold text your visitors read.', 'perflocale' ); ?>
+						</p>
+						<fieldset>
+							<?php foreach ( $non_public_types as $npt ) : ?>
+								<label>
+									<input type="checkbox" name="translatable_post_types[]" value="<?php echo esc_attr( $npt->name ); ?>" <?php checked( in_array( $npt->name, $translatable_pts, true ) ); ?>>
+									<?php echo esc_html( $npt->labels->name ); ?> <code>(<?php echo esc_html( $npt->name ); ?>)</code>
+								</label>
+								<?php if ( 'wp_block' === $npt->name ) : ?>
+									<span class="description">
+										&mdash; <?php echo esc_html__( 'synced patterns; each language gets its own copy, and pages using the pattern show the right one automatically.', 'perflocale' ); ?>
+									</span>
+								<?php elseif ( 'wp_navigation' === $npt->name ) : ?>
+									<span class="description">
+										&mdash; <?php echo esc_html__( 'menus in block themes. Link addresses are already translated without this; switch it on to translate the menu labels too.', 'perflocale' ); ?>
+									</span>
+								<?php endif; ?>
+								<br>
+							<?php endforeach; ?>
+						</fieldset>
+					</details>
+				<?php endif; ?>
 			</td>
 		</tr>
 		<tr>

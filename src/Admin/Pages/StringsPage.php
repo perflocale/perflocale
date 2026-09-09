@@ -789,7 +789,28 @@ final class StringsPage {
 											<?php echo esc_html( self::truncate( (string) $string->original, 100 ) ); ?>
 										</span>
 										<?php if ( ! empty( $string->context ) ) : ?>
-											<span class="perflocale-str-context"><?php echo esc_html( $string->context ); ?></span>
+											<?php
+											/**
+											 * Friendly label for a string's context.
+											 *
+											 * A context is an identifier meant for code — `blogname`,
+											 * `attribute_label_size`. It is shown to an operator who is
+											 * looking for their site title, so a domain that knows a
+											 * human name for its contexts can supply one here.
+											 *
+											 * @hook perflocale/strings/context_label
+											 * @param string $label   Context, unchanged by default.
+											 * @param string $domain  The string's text domain.
+											 * @param object $string  The string row.
+											 */
+											$context_label = (string) apply_filters(
+												'perflocale/strings/context_label',
+												(string) $string->context,
+												(string) ( $string->domain ?? '' ),
+												$string
+											);
+											?>
+											<span class="perflocale-str-context"><?php echo esc_html( '' !== $context_label ? $context_label : (string) $string->context ); ?></span>
 										<?php endif; ?>
 										<?php if ( $string->file_path !== '' ) : ?>
 										<div class="perflocale-str-meta" title="<?php echo esc_attr( $this->full_path( $string->file_path ) . ':' . $string->line_number ); ?>">
