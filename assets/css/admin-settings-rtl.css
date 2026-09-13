@@ -358,3 +358,183 @@
 			grid-template-columns: 1fr;
 		}
 }
+
+
+/* ---- Background-threshold table on a phone ----
+   ⚠️ WordPress's own `@media (max-width: 782px) { .form-table td { display:
+   block } }` is a DESCENDANT selector, and this table lives inside a form-table
+   cell — so core stacks these three columns whether we want it or not, leaving
+   the "Operation / Default / Override" header as three loose words above a pile
+   of unlabelled values. That is the reported bug.
+
+   Fighting core here would be a losing game (its rule is as specific as ours and
+   ships on every install), so the stack is embraced instead: each row becomes a
+   card, the operation name is its heading, and the two values sit on one line
+   underneath, each naming itself from its `data-label`. A CSS `content:` string
+   cannot be translated, which is why the label travels in the attribute. */
+@media screen and (max-width: 782px) {
+	.perflocale-bgthresh {
+		border-collapse: separate;
+		border-spacing: 0;
+	}
+
+	/* The header row has nothing left to align to once the cells stack; the
+	   per-cell labels replace it. Kept in the DOM for screen readers, which
+	   still associate it through the scope="col" relationship. */
+	.perflocale-bgthresh thead {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip: rect(1px, 1px, 1px, 1px);
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+
+	/* ⚠️ FLEX, NOT BLOCK + INLINE-BLOCK CELLS. The first attempt made the row a
+	   block and the two value cells `inline-block` at 34%/66% — which measured
+	   105px and 205px correctly and STILL wrapped, because the whitespace text
+	   node between two `<td>`s in the source is a real inline box and 34 + 66 +
+	   whitespace > 100%. Flex has no such text node to place, so the split just
+	   works, and `flex-wrap` keeps the operation name on its own line above. */
+	.perflocale-bgthresh tbody tr {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		margin: 0 0 10px;
+		padding: 10px 12px;
+		border: 1px solid #dcdcde;
+		border-radius: 6px;
+		background: #fff;
+	}
+
+	.perflocale-bgthresh tbody tr:last-child {
+		margin-bottom: 0;
+	}
+
+	.perflocale-bgthresh td {
+		padding: 0;
+		border: 0;
+	}
+
+	.perflocale-bgthresh__op {
+		padding-right: 0 !important;
+		margin-bottom: 8px;
+		font-weight: 600;
+		color: #1d2327;
+	}
+
+	.perflocale-bgthresh__op label {
+		display: block;
+		cursor: pointer;
+	}
+
+	/* Default and Override share one line: the default is a short read-only
+	   number, the override is the control the operator came for.
+	   ⚠️ SCOPED `table td.class`, NOT the bare class. WordPress's own
+	   `.form-table td { display: block }` is (0,1,1) and a lone class is
+	   (0,1,0), so the bare selector lost and the two cells stacked full-width —
+	   measured 310px each instead of sharing a 34/66 split. Two classes plus
+	   the element take it to (0,2,1) and it holds. */
+	.perflocale-bgthresh td.perflocale-bgthresh__default,
+	.perflocale-bgthresh td.perflocale-bgthresh__override {
+		display: inline-block;
+		vertical-align: bottom;
+	}
+
+	.perflocale-bgthresh td.perflocale-bgthresh__op {
+		flex: 0 0 100%;
+	}
+
+	.perflocale-bgthresh td.perflocale-bgthresh__default {
+		flex: 0 0 34%;
+		width: 34%;
+		padding-left: 10px !important;
+		box-sizing: border-box;
+	}
+
+	/* ⚠️ basis 0 + `min-width: 0`, not `flex: 1 1 auto`. With an auto basis the
+	   cell is sized from its content first, and a number input's intrinsic width
+	   exceeded the 205px left on the line — so it wrapped to a row of its own
+	   and the 34/66 split never appeared. A zero basis takes the remaining
+	   space whatever the input wants, and min-width releases the flex item's
+	   automatic min-content floor so it can actually shrink to it. */
+	.perflocale-bgthresh td.perflocale-bgthresh__override {
+		flex: 1 1 0;
+		min-width: 0;
+		width: auto;
+		box-sizing: border-box;
+	}
+
+	.perflocale-bgthresh__default::before,
+	.perflocale-bgthresh__override::before {
+		content: attr(data-label);
+		display: block;
+		margin-bottom: 3px;
+		font-size: 11px;
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.4px;
+		color: #646970;
+	}
+
+	/* 16px stops iOS Safari zooming the viewport when the field is focused. */
+	.perflocale-bgthresh__override input[type="number"] {
+		font-size: 16px;
+		min-height: 36px;
+	}
+}
+
+
+/* ---- Touch reordering for the chip editors ----
+   ⚠️ Both chip editors (language fallbacks, redirect priority) shipped with
+   exactly two ways to reorder: HTML5 drag-and-drop and ArrowLeft/ArrowRight. A
+   phone has NEITHER, so the chain could be built on mobile and then never
+   reordered — reported from a real device. The grip glyph made it look
+   draggable, which is worse than offering nothing.
+
+   The buttons are always in the DOM (so assistive tech and keyboard users can
+   reach them too) and hidden only where a precise pointer makes dragging the
+   better interaction. Scoped with `(pointer: coarse)` rather than a width, per
+   the rule that touch affordances follow the input device and not the viewport
+   — a 1280px tablet needs them and a 500px desktop window does not. */
+.pl-fb-chip__move {
+	display: none;
+}
+
+@media (pointer: coarse) {
+	.pl-fb-chip__move {
+		display: inline-flex;
+		flex-direction: column;
+		gap: 2px;
+		margin-inline-end: 4px;
+	}
+
+	.pl-fb-chip__move button {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 30px;
+		height: 26px;
+		padding: 0;
+		font-size: 11px;
+		line-height: 1;
+		color: #50575e;
+		background: #f6f7f7;
+		border: 1px solid #c3c4c7;
+		border-radius: 4px;
+		cursor: pointer;
+	}
+
+	.pl-fb-chip__move button:hover,
+	.pl-fb-chip__move button:focus {
+		background: #e8e8ea;
+		color: #1d2327;
+	}
+
+	/* The grip is a drag affordance and drag is exactly what does not work
+	   here, so stop advertising it once the buttons are the real control. */
+	.pl-fb-chip__grip {
+		display: none;
+	}
+}

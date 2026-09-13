@@ -145,5 +145,46 @@
 		}
 	} );
 
+	/**
+	 * Explicit reordering for pointers that cannot drag.
+	 *
+	 * ⚠️ This editor shipped drag-and-drop plus ArrowLeft/ArrowRight, and a
+	 * phone has neither — so the priority order was readable but not editable
+	 * on touch. Same DOM move as the keyboard handler above, so the two input
+	 * methods cannot disagree about the resulting order. Focus stays on the
+	 * pressed button so a chip can be walked several places with repeated taps.
+	 */
+	editor.addEventListener( 'click', function ( e ) {
+		var btn = e.target.closest( '.pl-fb-chip__up, .pl-fb-chip__down' );
+
+		if ( ! btn ) {
+			return;
+		}
+
+		var chip = btn.closest( '.pl-prio-chip' );
+
+		if ( ! chip ) {
+			return;
+		}
+
+		e.preventDefault();
+
+		var up      = btn.classList.contains( 'pl-fb-chip__up' );
+		var sibling = up ? chip.previousElementSibling : chip.nextElementSibling;
+
+		if ( ! sibling || ! sibling.classList.contains( 'pl-prio-chip' ) ) {
+			return;
+		}
+
+		if ( up ) {
+			editor.insertBefore( chip, sibling );
+		} else {
+			editor.insertBefore( sibling, chip );
+		}
+
+		renumber();
+		btn.focus();
+	} );
+
 	renumber();
 }() );

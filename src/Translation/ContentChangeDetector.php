@@ -12,6 +12,7 @@ namespace PerfLocale\Translation;
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Database\Schema;
 use PerfLocale\Enum\ObjectType;
+use PerfLocale\Enum\TranslationStatus;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -125,6 +126,10 @@ final class ContentChangeDetector {
 		// Only flag when the SOURCE (default language) post changes.
 		// Editing a translation should not mark the source or other translations.
 		if ( ! $this->is_default_language_object( $post_id, 'post' ) ) {
+			// ...but it IS the signal that a flagged translation was brought
+			// back up to date. See clear_needs_update().
+			$this->clear_needs_update( $post_id, ObjectType::Post );
+
 			return;
 		}
 
@@ -166,6 +171,10 @@ final class ContentChangeDetector {
 		$this->store_hash( $term_id, 'term', $new_hash );
 
 		if ( ! $this->is_default_language_object( $term_id, 'term' ) ) {
+			// Same as the post path: the operator just edited a translation,
+			// which is the only signal we get that it is up to date again.
+			$this->clear_needs_update( $term_id, ObjectType::Term );
+
 			return;
 		}
 
@@ -386,6 +395,108 @@ final class ContentChangeDetector {
 	 * @param ObjectType $type Object type.
 	 * @return void
 	 */
+	/**
+	 * Clear a stale "Needs update" flag on a translation that was just edited.
+	 *
+	 * `flag_translations()` stamps `needs_update` on every sibling whenever the
+	 * SOURCE changes, and until now nothing in the plugin ever cleared it
+	 * again. `TranslationGroupRepository::update_link_status()` — the only
+	 * status-write entry point — shipped with no production caller at all, and
+	 * no `transition_post_status` handler writes link status either. The result
+	 * was a one-way door: once a translation was flagged, the red badge on the
+	 * Translations screen was permanent, even after the translation had been
+	 * fully retranslated and republished. The Translations screen's own
+	 * reconciliation (TranslationsPage.php around :218-229) only repairs the
+	 * `empty` status, never `needs_update`, so it did not paper over this one.
+	 *
+	 * The signal acted on here is the strongest one available without inventing
+	 * new UI: this object is NOT the source, and its own content hash just
+	 * moved — somebody edited the translation. That is exactly the action the
+	 * badge was asking for.
+	 *
+	 * Deliberately narrow:
+	 *   - only a row currently reading `needs_update` is touched, so `empty`
+	 *     bookkeeping and any status another subsystem owns are left alone.
+	 *     ⚠️ The SELECT below does not achieve that on its own, and the first
+	 *     version of this method wrongly claimed it did. A read here and an
+	 *     unconditional UPDATE there is a two-statement race, and it lost both
+	 *     ways when measured on the frozen candidate: a source re-edit that
+	 *     re-flagged `needs_update` between the two was overwritten with
+	 *     `published`, and so was an unrelated subsystem's `pending`. The
+	 *     precondition passed to update_link_status() is what actually makes
+	 *     the claim true — the SELECT is now only a fast path that skips the
+	 *     UPDATE on the overwhelming majority of saves, where the row reads
+	 *     `empty` or `published` and there is no badge to retire;
+	 *   - the caller has already established `post_status === 'publish'` (and
+	 *     terms have no status), so `published` is the correct landing state;
+	 *   - a no-op when the object carries no link row (language id 0), which is
+	 *     the unmanaged/source-by-convention case.
+	 *
+	 * @param int        $object_id Post or term ID, per $type.
+	 * @param ObjectType $type      Which id-space $object_id belongs to.
+	 * @return void
+	 */
+	private function clear_needs_update( int $object_id, ObjectType $type ): void {
+		$object_type = $type === ObjectType::Term ? 'term' : 'post';
+		$language_id = $this->get_object_language_id( $object_id, $object_type );
+
+		if ( $language_id === 0 ) {
+			return;
+		}
+
+		// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter
+		global $wpdb;
+
+		$links_table = Schema::table( 'translation_links' );
+
+		// Fast path only. The correctness of "touch nothing but a flagged row"
+		// rests on the precondition handed to update_link_status() below, not
+		// on this read — see the ⚠️ note in the docblock. What this buys is
+		// skipping the UPDATE entirely on the ordinary save, where the row
+		// reads `empty` or `published` and there is no badge to retire.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$current = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT status FROM %i WHERE object_id = %d AND language_id = %d AND type = %s LIMIT 1",
+				$links_table,
+				$object_id,
+				$language_id,
+				$type->value
+			)
+		);
+		// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( $current !== TranslationStatus::NeedsUpdate->value ) {
+			return;
+		}
+
+		// Routed through the repository rather than a direct UPDATE so the
+		// per-object cache AND the eager link map are both invalidated and
+		// `perflocale/translation/status_changed` fires — a bare UPDATE here
+		// would leave the switcher and hreflang reading a stale status.
+		//
+		// Constructed from the injected CacheManager rather than fetched from
+		// the container (as flag_translations() does): the container's get()
+		// returns an untyped object, which costs a `method.notFound` that the
+		// gate's static-analysis step counts as fatal-class. Same repository,
+		// same cache, same invalidation — just a type PHPStan can see.
+		$repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $this->cache );
+
+		// The status read above is the PRECONDITION, not just a guard: passing
+		// it back means the UPDATE matches only while the row still reads
+		// `needs_update`, so a write that landed in between wins instead of
+		// being silently overwritten. A false return here is the expected,
+		// correct outcome in that case — the newer status stands.
+		$repo->update_link_status(
+			$object_id,
+			$language_id,
+			TranslationStatus::Published->value,
+			'',
+			$type,
+			TranslationStatus::NeedsUpdate->value
+		);
+	}
+
 	private function flag_translations( int $object_id, ObjectType $type ): void {
 		// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter
 		global $wpdb;

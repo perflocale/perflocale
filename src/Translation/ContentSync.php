@@ -188,6 +188,14 @@ final class ContentSync {
 			return;
 		}
 
+		// ⚠️ Templates are not content. sync_fields (post_parent, menu_order,
+		// featured image) are meaningless for them, and this fires on EVERY
+		// Site Editor save — acquiring two locks and walking the group — which
+		// is pure overhead on the hottest editing path in a block theme.
+		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post->post_type ) ) {
+			return;
+		}
+
 		// Check if post type is translatable.
 		$translatable = $this->settings->get_translatable_post_types();
 
@@ -243,10 +251,22 @@ final class ContentSync {
 			/**
 			 * Meta keys that keep FULL MIRROR semantics: every source save
 			 * overwrites the sibling's rows, and a delete on the source clears
-			 * the siblings. Defaults to the user-configured `sync_fields` list;
-			 * BUILDER addons (Elementor/Bricks/Oxygen/Beaver) add their layout
-			 * keys here because a layout must stay structurally identical
-			 * across siblings (text inside is translated at render).
+			 * the siblings. Defaults to the user-configured `sync_fields` list.
+			 *
+			 * ⚠️ NOTHING THAT CARRIES TRANSLATABLE TEXT BELONGS ON THIS LIST.
+			 * The mirror below is BIDIRECTIONAL — any group member's save
+			 * propagates to the rest — so a key holding words is destroyed in
+			 * both directions: the translator saves and overwrites the source,
+			 * then the next source save overwrites the translation.
+			 *
+			 * Until 1.0.5 the builder addons added their layout documents here,
+			 * justified by a claim that "a layout must stay structurally
+			 * identical across siblings (text inside is translated at render)".
+			 * Nothing translated it at render, and a German Elementor save was
+			 * observed replacing the English page with visitors then served the
+			 * wrong language. Those documents are seed-only now; only text-free
+			 * keys (Beaver's `_fl_builder_enabled`, Oxygen's `ct_page_settings`)
+			 * still mirror. Pinned by builder-layout-ownership.php.
 			 *
 			 * Every other addon-contributed "translatable" key (SEO titles/
 			 * descriptions, ACF/Meta Box/Pods field values, WooCommerce

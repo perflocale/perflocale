@@ -13,6 +13,7 @@ use PerfLocale\Cache\CacheManager;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Database\Repository\TranslationLinkRepository;
 use PerfLocale\Database\Schema;
+use PerfLocale\Enum\SourceType;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
 use PerfLocale\Strings\StringScanner;
@@ -776,7 +777,7 @@ final class PerfLocaleCommand {
 					\WP_CLI::error( 'Target language required: --to=<lang>' );
 				}
 
-				$new_id = $manager->create_translation( $post_id, $to, true );
+				$new_id = $manager->create_translation( $post_id, $to, true, SourceType::Cli );
 
 				if ( $new_id === false ) {
 					\WP_CLI::error( 'Failed to create translation.' );
@@ -1800,6 +1801,9 @@ final class PerfLocaleCommand {
 		$lang_table    = Schema::table( 'languages' );
 		$strings_table = Schema::table( 'strings' );
 		$issues        = 0;
+		// Counted separately: --fix must not claim to have repaired what it
+		// has just said it cannot repair.
+		$unfixable     = 0;
 
 		\WP_CLI::log( 'Running PerfLocale health checks...' );
 		\WP_CLI::log( '' );
@@ -2031,14 +2035,88 @@ final class PerfLocaleCommand {
 
 		\WP_CLI::log( '' );
 
+		// 7. Strings whose `original` column disagrees with `original_hash`.
+		//
+		// ⚠️ THIS IS RESIDUE FROM A FIXED BUG, not an ongoing fault. An earlier
+		// build ran `wp_kses_post()` over `original` on insert (see the comment
+		// at Database/Repository/StringRepository.php, "Store the original
+		// VERBATIM"). That entity-encoded &/</> AND stripped tags, while
+		// `original_hash` had already been computed from the raw text. The
+		// encoding was removed, but rows written while it ran keep the damaged
+		// value.
+		//
+		// Serving is NOT affected: the runtime hashes the live source string,
+		// which still matches the stored hash. What breaks is EXPORT — the PO
+		// msgid is written from `original`, so a re-import hashes the damaged
+		// text, misses, and creates a PHANTOM row that the site never reads. A
+		// translator's work lands somewhere invisible.
+		//
+		// Two populations, and only one is repairable:
+		//   - entity-encoded only: decoding restores a value whose hash matches
+		//     the stored hash, which PROVES the reconstruction is correct.
+		//   - tags/characters stripped: the text is GONE. It cannot be
+		//     reconstructed from what remains, and guessing would fabricate a
+		//     msgid. These are reported, never rewritten; the next string scan
+		//     re-adds the correct row from source.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$string_rows = $wpdb->get_results(
+			$wpdb->prepare( 'SELECT id, domain, context, original, original_hash FROM %i', $strings_table )
+		);
+
+		$repairable = [];
+		$damaged    = 0;
+
+		foreach ( (array) $string_rows as $row ) {
+			$stored = (string) $row->original_hash;
+
+			if ( \PerfLocale\Database\Repository\StringRepository::compute_hash( (string) $row->domain, (string) $row->context, (string) $row->original ) === $stored ) {
+				continue;
+			}
+
+			$decoded = html_entity_decode( (string) $row->original, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+
+			if ( \PerfLocale\Database\Repository\StringRepository::compute_hash( (string) $row->domain, (string) $row->context, $decoded ) === $stored ) {
+				$repairable[ (int) $row->id ] = $decoded;
+			} else {
+				++$damaged;
+			}
+		}
+
+		unset( $string_rows );
+
+		if ( $repairable !== [] || $damaged > 0 ) {
+			\WP_CLI::warning( sprintf( ' Strings whose text disagrees with its hash: %d (%d repairable)', count( $repairable ) + $damaged, count( $repairable ) ) );
+			$issues    += count( $repairable ) + $damaged;
+			$unfixable += $damaged;
+
+			if ( $damaged > 0 ) {
+				\WP_CLI::log( sprintf( '   %d cannot be repaired (text was stripped, not encoded) - the next string scan re-adds them from source.', $damaged ) );
+			}
+
+			if ( $fix && $repairable !== [] ) {
+				foreach ( $repairable as $id => $decoded ) {
+					// Only `original` is rewritten. The hash is already correct:
+					// it matches the live source string, which is why serving
+					// still works. Recomputing it from the damaged text would
+					// make the row consistent AND wrong.
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->update( $strings_table, [ 'original' => $decoded ], [ 'id' => $id ], [ '%s' ], [ '%d' ] );
+				}
+
+				\WP_CLI::log( sprintf( '   Repaired %d string(s).', count( $repairable ) ) );
+			}
+		} else {
+			\WP_CLI::log( ' Strings matching their hash: all ✓' );
+		}
+
 		if ( $issues === 0 ) {
 			// Name what was checked rather than certifying the database. These
-			// are six specific orphan/duplicate invariants; other semantic
+			// are seven specific orphan/duplicate/integrity invariants; other semantic
 			// relationships (a link whose stored type disagrees with its
 			// group's, say) are enforced by the repositories on write and are
 			// not re-verified here, so "the database is healthy" claims more
 			// than the command actually established.
-			\WP_CLI::success( 'All six orphan and duplicate checks passed.' );
+			\WP_CLI::success( 'All seven orphan, duplicate and string-integrity checks passed.' );
 		} elseif ( $fix ) {
 			// The repair steps above issue direct $wpdb DELETEs that bypass the
 			// repository's invalidation, so without an explicit flush the
@@ -2051,9 +2129,19 @@ final class PerfLocaleCommand {
 				$cache->flush_all();
 			}
 
-			\WP_CLI::success( "Fixed {$issues} issues." );
+			$fixed = $issues - $unfixable;
+
+			if ( $unfixable > 0 ) {
+				\WP_CLI::success( "Fixed {$fixed} issue(s); {$unfixable} could not be repaired automatically (see above)." );
+			} else {
+				\WP_CLI::success( "Fixed {$issues} issues." );
+			}
 		} else {
-			\WP_CLI::warning( "Found {$issues} issues. Run with --fix to repair." );
+			if ( $unfixable === $issues && $issues > 0 ) {
+				\WP_CLI::warning( "Found {$issues} issue(s), none of which --fix can repair (see above)." );
+			} else {
+				\WP_CLI::warning( "Found {$issues} issues. Run with --fix to repair." );
+			}
 		}
 		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 	}

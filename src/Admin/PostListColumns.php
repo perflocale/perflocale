@@ -74,21 +74,26 @@ final class PostListColumns {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		$post_types = $this->settings->get_translatable_post_types();
-
-		foreach ( $post_types as $post_type ) {
-			add_filter( "manage_{$post_type}_posts_columns", [ $this, 'add_column' ] );
-			add_action( "manage_{$post_type}_posts_custom_column", [ $this, 'render_column' ], 10, 2 );
-		}
+		// ⚠️ Do NOT read get_translatable_post_types() here, and do not move the
+		// per-post-type loop back into this method. This service boots from
+		// Plugin::boot() on `init:0`, several eager services before `addon_registry` (derive the position from the
+		// code, never restate it as a number — the old comment said TEN and drifted)
+		// — so at this point no addon has run boot() and none of their
+		// `perflocale/translatable_post_types` contributions exist yet. Reading
+		// the list here did two kinds of damage: the per-type hooks below were
+		// bound only for core types, AND — because Settings memoises the result
+		// once `plugins_loaded` has fired — the truncated list was frozen for the
+		// whole request, so every later consumer saw it too. On a site with
+		// Contact Form 7 the Translations screen offered no "Contact Forms" entry
+		// in its post-type filter at all, and WooCommerce products vanished from
+		// it unless they had also been ticked in Settings. Deferring to
+		// `admin_init` is what TermListColumns already does for the identical
+		// taxonomy hazard — keep the two symmetrical.
+		add_action( 'admin_init', [ $this, 'register_post_type_column_hooks' ] );
 
 		// Language filter dropdown on post list screens.
 		add_action( 'restrict_manage_posts', [ $this, 'render_language_filter' ] );
 		add_action( 'pre_get_posts', [ $this, 'apply_language_filter' ] );
-
-		// Preserve language filter in status links (All | Published | Draft | ...).
-		foreach ( $post_types as $post_type ) {
-			add_filter( "views_edit-{$post_type}", [ $this, 'append_lang_to_views' ] );
-		}
 
 		// Batch-preload translations for all posts on the page to avoid N+1 queries.
 		add_action( 'pre_get_posts', [ $this, 'schedule_preload' ] );
@@ -102,6 +107,31 @@ final class PostListColumns {
 		// the `perflocale-admin` script payload, so wp_add_inline_script()
 		// calls at that point are silently dropped).
 		add_action( 'admin_enqueue_scripts', [ $this, 'quick_edit_js' ] );
+	}
+
+	/**
+	 * Bind the per-post-type column and status-link hooks.
+	 *
+	 * Public and separately callable so a direct-instantiation caller (the
+	 * `cov-never-loaded` suite runs through `wp eval-file`, where `admin_init`
+	 * never fires) can bind synchronously. Mirrors
+	 * {@see TermListColumns::register_taxonomy_column_hooks()}.
+	 *
+	 * @return void
+	 */
+	public function register_post_type_column_hooks(): void {
+		$post_types = $this->settings->get_translatable_post_types();
+
+		foreach ( $post_types as $post_type ) {
+			add_filter( "manage_{$post_type}_posts_columns", [ $this, 'add_column' ] );
+			add_action( "manage_{$post_type}_posts_custom_column", [ $this, 'render_column' ], 10, 2 );
+
+			// Preserve the language filter in the status links
+			// (All | Published | Draft | ...). `views_edit-{$post_type}` has no
+			// un-suffixed variant — WP_List_Table::views() fires
+			// `views_{$screen->id}` — so this genuinely needs the resolved list.
+			add_filter( "views_edit-{$post_type}", [ $this, 'append_lang_to_views' ] );
+		}
 	}
 
 	/**
@@ -439,13 +469,23 @@ final class PostListColumns {
 			}
 
 			if ( $translated_id ) {
-				$edit_url = get_edit_post_link( $translated_id );
+				$edit_url = \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id );
 
-				if ( $edit_url ) {
+				if ( $edit_url !== '' ) {
 					/* translators: %s: language name */
 					echo '<a href="' . esc_url( $edit_url ) . '" class="perflocale-badge perflocale-badge--green" title="' . esc_attr( sprintf( __( 'Edit %s translation', 'perflocale' ), $lang->name ) ) . '">';
 					echo esc_html( $slug_upper );
 					echo '</a>';
+				} else {
+					// ⚠️ The translation EXISTS — it just has no editor we can
+					// link to (a non-public post type, or a user without
+					// edit_post on it). Previously nothing was echoed at all,
+					// so a translated row was indistinguishable from an
+					// untranslated one. Show the badge without the link.
+					/* translators: %s: language name */
+					echo '<span class="perflocale-badge perflocale-badge--green" title="' . esc_attr( sprintf( __( '%s: translated', 'perflocale' ), $lang->name ) ) . '">';
+					echo esc_html( $slug_upper );
+					echo '</span>';
 				}
 			} else {
 				/* translators: %s: Language name */

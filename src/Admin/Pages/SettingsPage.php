@@ -101,6 +101,11 @@ final class SettingsPage {
 					'dragHint'     => __( 'Draggable fallback', 'perflocale' ),
 					/* translators: 1: ordinal position, 2: language name or redirect method name */
 					'positionTpl'  => __( 'Position %1$d: %2$s', 'perflocale' ),
+					// ⚠️ Touch has neither drag-and-drop nor arrow keys, so on a
+					// phone the chain could be built but never REORDERED. These
+					// label the explicit move buttons that close that gap.
+					'moveUp'       => __( 'Move earlier', 'perflocale' ),
+					'moveDown'     => __( 'Move later', 'perflocale' ),
 				],
 			]
 		);
@@ -564,7 +569,7 @@ final class SettingsPage {
 					: [],
 			],
 			'translation' => $values         = [
-				'translatable_post_types'    => isset( $_POST['translatable_post_types'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_post_types'] ) : [],
+				'translatable_post_types'    => self::pair_block_template_types( isset( $_POST['translatable_post_types'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_post_types'] ) : [] ),
 				'translatable_taxonomies'    => isset( $_POST['translatable_taxonomies'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_taxonomies'] ) : [],
 				'default_translation_status' => isset( $_POST['default_translation_status'] ) ? sanitize_text_field( wp_unslash( $_POST['default_translation_status'] ) ) : 'empty',
 				'auto_create_stubs'          => isset( $_POST['auto_create_stubs'] ),
@@ -710,6 +715,8 @@ final class SettingsPage {
 				'cdn_cache_tags_enabled'   => isset( $_POST['cdn_cache_tags_enabled'] ),
 				'delete_data_on_uninstall' => isset( $_POST['delete_data_on_uninstall'] ),
 				'dashboard_widget_enabled' => isset( $_POST['dashboard_widget_enabled'] ),
+				'abilities_enabled'        => isset( $_POST['abilities_enabled'] ),
+				'abilities_write_enabled'  => isset( $_POST['abilities_write_enabled'] ),
 			],
 			'woocommerce' => $values   = [
 				'wc_email_translation'      => isset( $_POST['wc_email_translation'] ),
@@ -1393,6 +1400,7 @@ final class SettingsPage {
 							aria-roledescription="<?php echo esc_attr__( 'Draggable priority item', 'perflocale' ); ?>"
 							aria-label="<?php echo esc_attr( sprintf( /* translators: 1: ordinal position, 2: language name or redirect method name */ __( 'Position %1$d: %2$s', 'perflocale' ), $idx + 1, $method['label'] ) ); ?>">
 							<span class="pl-fb-chip__grip" aria-hidden="true">⋮⋮</span>
+							<span class="pl-fb-chip__move" aria-hidden="false"><button type="button" class="pl-fb-chip__up" aria-label="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>">&#9650;</button><button type="button" class="pl-fb-chip__down" aria-label="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>">&#9660;</button></span>
 							<span class="pl-fb-chip__pos"><?php echo esc_html( (string) ( $idx + 1 ) ); ?></span>
 							<span class="pl-fb-chip__name"><?php echo esc_html( $method['icon'] . ' ' . $method['label'] ); ?></span>
 							<input type="hidden" name="redirect_priority_order[]" value="<?php echo esc_attr( $method_key ); ?>">
@@ -1607,6 +1615,7 @@ final class SettingsPage {
 										aria-roledescription="<?php echo esc_attr__( 'Draggable fallback', 'perflocale' ); ?>"
 										aria-label="<?php echo esc_attr( sprintf( /* translators: 1: ordinal position, 2: language name or redirect method name */ __( 'Position %1$d: %2$s', 'perflocale' ), $idx + 1, $fb_name ) ); ?>">
 										<span class="pl-fb-chip__grip" aria-hidden="true">⋮⋮</span>
+										<span class="pl-fb-chip__move" aria-hidden="false"><button type="button" class="pl-fb-chip__up" aria-label="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>">&#9650;</button><button type="button" class="pl-fb-chip__down" aria-label="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>">&#9660;</button></span>
 										<span class="pl-fb-chip__pos"><?php echo esc_html( (string) ( $idx + 1 ) ); ?></span>
 										<span class="pl-fb-chip__name"><?php echo esc_html( $fb_flag . ' ' . $fb_name ); ?></span>
 										<button type="button" class="pl-fb-chip__remove" aria-label="<?php echo esc_attr( sprintf( /* translators: %s: language name */ __( 'Remove %s fallback', 'perflocale' ), $fb_name ) ); ?>" title="<?php echo esc_attr__( 'Remove fallback', 'perflocale' ); ?>">&times;</button>
@@ -1700,6 +1709,38 @@ final class SettingsPage {
 	}
 
 	/**
+	 * Keep `wp_template` and `wp_template_part` switched on together.
+	 *
+	 * ⭐ WHY ONE CHECKBOX, NOT TWO. They are two storage types behind ONE
+	 * feature. A block theme's page layout is a `wp_template` and its header is
+	 * a `wp_template_part`, so enabling either alone produces a HALF-translated
+	 * page — the body in German above an English header — which reads as a bug
+	 * rather than as a setting the operator chose. Offering "Templates" and
+	 * "Template Parts" as separate checkboxes also names WordPress's storage
+	 * rather than the thing the operator is looking for, which is full site
+	 * editing.
+	 *
+	 * The setting itself still stores the two type names, so nothing downstream
+	 * changes and `perflocale/translatable_post_types` can still enable exactly
+	 * one for a developer who genuinely wants that.
+	 *
+	 * @param array<int, string> $types Submitted post types.
+	 * @return array<int, string>
+	 */
+	private static function pair_block_template_types( array $types ): array {
+		$has_any = array_intersect( [ 'wp_template', 'wp_template_part' ], $types ) !== [];
+
+		$types = array_values( array_diff( $types, [ 'wp_template', 'wp_template_part' ] ) );
+
+		if ( $has_any ) {
+			$types[] = 'wp_template';
+			$types[] = 'wp_template_part';
+		}
+
+		return array_values( array_unique( $types ) );
+	}
+
+	/**
 	 * Render the Translation tab fields.
 	 *
 	 * @return void
@@ -1713,6 +1754,18 @@ final class SettingsPage {
 		$translate_slugs   = $this->settings->translate_slugs_enabled();
 
 		$all_post_types = get_post_types( [ 'public' => true ], 'objects' );
+
+		// ⚠️ `attachment` is public, so it lands in that list — but PerfLocale
+		// does not translate media by DUPLICATING attachment posts. Media is
+		// translated in place by {@see \PerfLocale\Translation\MediaTranslationManager},
+		// which stores per-language alt text, captions and descriptions as
+		// language-suffixed meta on the SAME attachment. The plugin already
+		// refuses the type everywhere it matters — `get_site_translate_post_types()`
+		// skips it explicitly (Settings.php:1237) — so offering the checkbox
+		// only let an operator turn on something no code implements, while
+		// language-scoping every front-end attachment query as a side effect.
+		// Removing it takes no feature away: media translation is unaffected.
+		unset( $all_post_types['attachment'] );
 		$all_taxonomies = get_taxonomies( [ 'public' => true ], 'objects' );
 
 		// Non-public post types PerfLocale can actually translate.
@@ -1720,37 +1773,36 @@ final class SettingsPage {
 		// ⚠️ This is a curated allowlist, NOT get_post_types( [ 'public' => false ] ).
 		// That call returns `revision`, `nav_menu_item`, `wp_global_styles`,
 		// `oembed_cache` and friends — checkboxes that would either do nothing or
-		// do harm. It also returns `wp_template` and `wp_template_part`, which
-		// have no resolver yet: offering them would let an operator switch on
-		// something that silently never renders translated, which is worse than
-		// not offering it at all.
+		// do harm.
 		//
 		// A type earns its place here only once something rewrites or serves its
 		// translation on the front end. `wp_block` and `wp_navigation` qualify
 		// because {@see \PerfLocale\Frontend\BlockRefTranslator} rewrites the
-		// `ref` of `core/block` and `core/navigation` at render time;
+		// `ref` of `core/block` and `core/navigation` at render time.
 		//
-		// ⚠️ `wp_template` and `wp_template_part` are NOT offered, and the reason
-		// is measured rather than assumed. A working content swap was built on
-		// `get_block_templates` and proved on a real request — and then, with the
-		// type actually marked translatable, `/de/` fell back to the THEME file
-		// template (`wp_id=0`) and the operator's customised template vanished on
-		// every non-default language. `PostQueryFilter` hides the source (it is
-		// tagged in the default language and has a translation) while the
-		// translation itself carries no `wp_theme` term, so core returns neither.
-		// Making templates opt out of language query filtering touches
-		// `get_translatable_post_types()` in five places inside PostQueryFilter
-		// and needs its own round. Until then a checkbox here would be worse than
-		// no feature: it would BREAK a template that works today.
+		// `wp_template` and `wp_template_part` now qualify too, through
+		// {@see \PerfLocale\Frontend\BlockTemplateTranslator}: a content swap on
+		// `get_block_templates` for templates, and an `attrs['slug']` rewrite on
+		// `render_block_data` for parts.
+		//
+		// ⚠️ THE HISTORY MATTERS, because a previous attempt shipped a checkbox
+		// that BROKE working templates. Marking the type translatable made
+		// `PostQueryFilter` hide the customised template on every non-default
+		// language — it was dropped for being LINKED, not for being TRANSLATED,
+		// so it happened even with no translation present, and core silently
+		// fell back to the theme FILE. That is closed by
+		// `PostQueryFilter::never_scoped_post_types()`, proven with a control
+		// that reproduces the original failure. Do not offer these types on a
+		// build where that deny-list is absent.
 		/**
 		 * Non-public post types offered on the settings screen.
 		 *
 		 * @hook perflocale/settings/non_public_post_types
-		 * @param string[] $types Post type names. Default [ 'wp_block', 'wp_navigation' ].
+		 * @param string[] $types Post type names.
 		 */
 		$non_public_names = (array) apply_filters(
 			'perflocale/settings/non_public_post_types',
-			[ 'wp_block', 'wp_navigation' ]
+			[ 'wp_block', 'wp_navigation', 'wp_template', 'wp_template_part' ]
 		);
 
 		$non_public_types = [];
@@ -1787,6 +1839,7 @@ final class SettingsPage {
 				[
 					'taxNonce'         => wp_create_nonce( 'perflocale_create_taxonomy_translations' ),
 					'postLangNonce'    => wp_create_nonce( 'perflocale_assign_post_languages' ),
+					'genTrNonce'       => wp_create_nonce( 'perflocale_generate_missing_translations' ),
 					'i18nCreating'     => __( 'Creating taxonomy translations...', 'perflocale' ),
 					'i18nAssigning'    => __( 'Assigning default language to unlinked posts...', 'perflocale' ),
 					'i18nFailed'       => __( 'Failed', 'perflocale' ),
@@ -1828,9 +1881,13 @@ final class SettingsPage {
 						'if ( bar ) bar.style.width = pct + \'%\';' .
 						'if ( percent ) percent.textContent = Math.round(pct) + \'%\';' .
 					'}, 400);' .
+					'var cursorTax = 0, cursorOffset = 0;' .
+					'var run = function() {' .
 					'var data = new FormData();' .
 					'data.append(\'action\', \'perflocale_create_taxonomy_translations\');' .
 					'data.append(\'_nonce\', d.taxNonce);' .
+					'data.append(\'tax_index\', cursorTax);' .
+					'data.append(\'term_offset\', cursorOffset);' .
 					'fetch(ajaxurl, { method: \'POST\', body: data, credentials: \'same-origin\' })' .
 						'.then(function(r) { return r.json(); })' .
 						'.then(function(resp) {' .
@@ -1842,6 +1899,16 @@ final class SettingsPage {
 								'if ( bar ) bar.style.background = \'#d63638\';' .
 								'if ( status ) status.textContent = d.i18nFailed;' .
 								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + (resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
+								'return;' .
+							'}' .
+							'if ( resp.data && resp.data.more ) {' .
+								'cursorTax = resp.data.tax_index; cursorOffset = resp.data.term_offset;' .
+								'if ( status ) status.textContent = resp.data.message || d.i18nCreating;' .
+								'pct = 0;' .
+								'pInterval = setInterval(function() { pct = Math.min(pct + Math.random() * 10, 90);' .
+									'if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
+								'btn.disabled = true;' .
+								'run();' .
 								'return;' .
 							'}' .
 							'if ( bar ) bar.style.background = \'#00a32a\';' .
@@ -1868,6 +1935,8 @@ final class SettingsPage {
 							'if ( percent ) percent.textContent = \'\';' .
 							'btn.disabled = false;' .
 						'});' .
+					'};' .
+					'run();' .
 				'});' .
 			'})();'
 		);
@@ -1899,6 +1968,7 @@ final class SettingsPage {
 						'if ( bar ) bar.style.width = pct + \'%\';' .
 						'if ( percent ) percent.textContent = Math.round(pct) + \'%\';' .
 					'}, 400);' .
+					'var run = function() {' .
 					'var data = new FormData();' .
 					'data.append(\'action\', \'perflocale_assign_post_languages\');' .
 					'data.append(\'_nonce\', d.postLangNonce);' .
@@ -1915,6 +1985,15 @@ final class SettingsPage {
 								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + (resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
 								'return;' .
 							'}' .
+								'if ( resp.data && resp.data.remaining > 0 ) {' .
+									'if ( status ) status.textContent = resp.data.message || d.i18nAssigning;' .
+									'pct = 0;' .
+									'pInterval = setInterval(function() { pct = Math.min(pct + Math.random() * 10, 90);' .
+										'if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
+									'btn.disabled = true;' .
+									'run();' .
+									'return;' .
+								'}' .
 							'if ( bar ) bar.style.background = \'#00a32a\';' .
 							'if ( status ) status.textContent = resp.data.message || d.i18nDone;' .
 							'var details = resp.data.post_type_details;' .
@@ -1937,6 +2016,59 @@ final class SettingsPage {
 							'if ( percent ) percent.textContent = \'\';' .
 							'btn.disabled = false;' .
 						'});' .
+					'};' .
+					'run();' .
+				'});' .
+			'})();'
+		);
+
+		wp_add_inline_script(
+			'perflocale-admin',
+			'(function(){' .
+				'var btn = document.getElementById(\'perflocale-generate-translations\');' .
+				'if ( ! btn ) return;' .
+				'var d = perflocaleTranslationData;' .
+				'var wrap = document.getElementById(\'perflocale-gentr-progress\');' .
+				'var bar = document.getElementById(\'perflocale-gentr-bar\');' .
+				'var status = document.getElementById(\'perflocale-gentr-status\');' .
+				'var percent = document.getElementById(\'perflocale-gentr-percent\');' .
+				'var result = document.getElementById(\'perflocale-gentr-result\');' .
+				'btn.addEventListener(\'click\', function() {' .
+					'var cursorType = 0, cursorOffset = 0, pInterval = null, pct = 0;' .
+					'var post = function( extra ) {' .
+						'var data = new FormData();' .
+						'data.append(\'action\', \'perflocale_generate_missing_translations\');' .
+						'data.append(\'_nonce\', d.genTrNonce);' .
+						'Object.keys(extra).forEach(function(k){ data.append(k, extra[k]); });' .
+						'return fetch(ajaxurl, { method: \'POST\', body: data, credentials: \'same-origin\' }).then(function(r){ return r.json(); });' .
+					'};' .
+					// ⭐ COUNT FIRST. This creates posts; the operator sees the
+					// scale and agrees to it before anything is written.
+					'btn.disabled = true;' .
+					'if ( result ) result.innerHTML = \'\';' .
+					'post({ mode: \'count\' }).then(function(resp){' .
+						'btn.disabled = false;' .
+						'if ( ! resp.success ) { if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + ((resp.data && resp.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
+						'if ( ! resp.data.max ) { if ( result ) result.innerHTML = \'<p style="margin:0;">\' + resp.data.message + \'</p>\'; return; }' .
+						'if ( ! window.confirm( resp.data.message ) ) { return; }' .
+						'btn.disabled = true;' .
+						'if ( wrap ) wrap.style.display = \'block\';' .
+						'if ( bar ) { bar.style.width = \'0\'; bar.style.background = \'#2271b1\'; }' .
+						'if ( status ) status.textContent = d.i18nCreating;' .
+						'pInterval = setInterval(function(){ pct = Math.min(pct + Math.random() * 10, 90); if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
+						'var run = function() {' .
+							'post({ type_index: cursorType, post_offset: cursorOffset }).then(function(r2){' .
+								'if ( ! r2.success ) { clearInterval(pInterval); btn.disabled = false; if ( bar ) bar.style.background = \'#d63638\'; if ( status ) status.textContent = d.i18nFailed; if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + ((r2.data && r2.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
+								'if ( r2.data.more ) { cursorType = r2.data.type_index; cursorOffset = r2.data.post_offset; if ( status ) status.textContent = r2.data.message; run(); return; }' .
+								'clearInterval(pInterval);' .
+								'if ( bar ) { bar.style.width = \'100%\'; bar.style.background = \'#00a32a\'; }' .
+								'if ( percent ) percent.textContent = \'100%\';' .
+								'btn.disabled = false;' .
+								'if ( status ) status.textContent = r2.data.message || d.i18nDone;' .
+							'}).catch(function(){ clearInterval(pInterval); btn.disabled = false; if ( bar ) bar.style.background = \'#d63638\'; if ( status ) status.textContent = d.i18nNetworkError; });' .
+						'};' .
+						'run();' .
+					'}).catch(function(){ btn.disabled = false; if ( status ) status.textContent = d.i18nNetworkError; });' .
 				'});' .
 			'})();'
 		);
@@ -1968,7 +2100,14 @@ final class SettingsPage {
 							<?php echo esc_html__( 'Content types that are not part of your site\'s public pages, but can still hold text your visitors read.', 'perflocale' ); ?>
 						</p>
 						<fieldset>
-							<?php foreach ( $non_public_types as $npt ) : ?>
+							<?php
+							foreach ( $non_public_types as $npt ) :
+								// The two block-template types share ONE control below —
+								// see pair_block_template_types().
+								if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $npt->name ) ) {
+									continue;
+								}
+								?>
 								<label>
 									<input type="checkbox" name="translatable_post_types[]" value="<?php echo esc_attr( $npt->name ); ?>" <?php checked( in_array( $npt->name, $translatable_pts, true ) ); ?>>
 									<?php echo esc_html( $npt->labels->name ); ?> <code>(<?php echo esc_html( $npt->name ); ?>)</code>
@@ -1989,6 +2128,41 @@ final class SettingsPage {
 				<?php endif; ?>
 			</td>
 		</tr>
+		<?php
+		// ⭐ ITS OWN ROW, NOT BURIED UNDER "Advanced content types".
+		//
+		// Full site editing is not an obscure storage type an expert goes
+		// looking for — on a block theme it is where the header, footer and
+		// page layouts live, so it is the FIRST thing many operators will want
+		// after posts and pages. Hiding it behind a collapsed <details> meant
+		// the feature was effectively undiscoverable, which is most of the
+		// distance between "shipped" and "used".
+		$fse_types   = array_filter(
+			$non_public_types,
+			static fn( $t ) => \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $t->name )
+		);
+		$fse_enabled = array_intersect( [ 'wp_template', 'wp_template_part' ], $translatable_pts ) !== [];
+
+		if ( $fse_types ) :
+			?>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Full Site Editing', 'perflocale' ); ?></th>
+			<td>
+				<fieldset>
+					<label>
+						<input type="checkbox" name="translatable_post_types[]" value="wp_template" <?php checked( $fse_enabled ); ?>>
+						<?php echo esc_html__( 'Translate block theme templates and template parts', 'perflocale' ); ?>
+					</label>
+					<p class="description">
+						<?php echo esc_html__( 'Text you typed directly into a block theme\'s templates and template parts — a header, footer, or 404 page. Both are switched on together: translating a page layout without its header leaves a half-translated page.', 'perflocale' ); ?>
+					</p>
+					<p class="description">
+						<?php echo esc_html__( 'Templates you have not customised are unaffected — their text already follows the theme\'s own translations. The Site Editor always shows and saves the original.', 'perflocale' ); ?>
+					</p>
+				</fieldset>
+			</td>
+		</tr>
+		<?php endif; ?>
 		<tr>
 			<th scope="row"><?php echo esc_html__( 'Translatable Taxonomies', 'perflocale' ); ?></th>
 			<td>
@@ -2096,7 +2270,11 @@ final class SettingsPage {
 			<th scope="row"><?php echo esc_html__( 'Assign Default Language', 'perflocale' ); ?></th>
 			<td>
 				<p class="description" style="margin:0 0 8px;">
-					<?php echo esc_html__( 'Link every translatable post/page/product that currently has no language assigned to the site\'s default language. Posts that already have a language assigned will not be touched. Use this once after installing PerfLocale on a pre-existing site so language-aware filters (nav-menu pickers, category checklists) stop showing unmanaged content in every language.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Give every item that has no language yet the site\'s default language. This covers everything ticked above - posts, pages, products, and the types your addons add, such as forms and patterns. Anything that already has a language is left alone. Run it once after installing PerfLocale on an existing site, so language-aware pickers (nav menus, category checklists) stop offering unmanaged content in every language. Large sites are processed in batches and the button keeps going until it is finished.', 'perflocale' ); ?>
+				</p>
+				<p class="description" style="margin:0 0 8px;">
+					<strong><?php echo esc_html__( 'This is step 1 of 2.', 'perflocale' ); ?></strong>
+					<?php echo esc_html__( 'Assigning a language is what makes "Generate Missing Translations" below able to see your existing content. Run this one first, then that one.', 'perflocale' ); ?>
 				</p>
 				<div style="display:flex;align-items:center;gap:8px;">
 					<button type="button" class="button" id="perflocale-assign-post-langs">
@@ -2113,6 +2291,36 @@ final class SettingsPage {
 					</div>
 				</div>
 				<div id="perflocale-postlang-result" style="margin-top:8px;"></div>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Generate Missing Translations', 'perflocale' ); ?></th>
+			<td>
+				<p class="description" style="margin:0 0 8px;">
+					<?php echo esc_html__( 'Create the missing translation drafts for content you already have, in every active language. Use this when you enable a new language, or turn on a content type whose existing items have no translations yet - forms and patterns are the usual cases, because nothing creates those in bulk otherwise.', 'perflocale' ); ?>
+				</p>
+				<p class="description" style="margin:0 0 8px;">
+					<strong><?php echo esc_html__( 'Run "Assign Default Language" first.', 'perflocale' ); ?></strong>
+					<?php echo esc_html__( 'This button only finds items that already have a language, so on a site that had content before PerfLocale it reports nothing to do until the button above has run.', 'perflocale' ); ?>
+				</p>
+				<p class="description" style="margin:0 0 8px;">
+					<?php echo esc_html__( 'Drafts only, with no content copied and no machine translation - nothing becomes visible to visitors, and nothing is sent to a provider. Existing translations are never touched, so running it twice creates nothing the second time. It tells you how many it will create before it starts.', 'perflocale' ); ?>
+				</p>
+				<div style="display:flex;align-items:center;gap:8px;">
+					<button type="button" class="button" id="perflocale-generate-translations">
+						<?php echo esc_html__( 'Generate Missing Translations', 'perflocale' ); ?>
+					</button>
+				</div>
+				<div id="perflocale-gentr-progress" style="display:none;margin-top:10px;max-width:420px;">
+					<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+						<span id="perflocale-gentr-status" style="font-size:13px;color:#50575e;"></span>
+						<span id="perflocale-gentr-percent" style="font-size:12px;color:#50575e;font-weight:500;"></span>
+					</div>
+					<div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;">
+						<div id="perflocale-gentr-bar" style="width:0;height:100%;background:#2271b1;border-radius:4px;transition:width 0.3s ease;"></div>
+					</div>
+				</div>
+				<div id="perflocale-gentr-result" style="margin-top:8px;"></div>
 			</td>
 		</tr>
 		<?php
@@ -3004,13 +3212,26 @@ final class SettingsPage {
 				<p class="description" style="margin: 0 0 10px;">
 					<?php esc_html_e( 'In Auto mode, operations below their threshold run inline; above, they queue. Leave a row blank to use the default. Filter perflocale/jobs/threshold/<type> is the programmatic equivalent.', 'perflocale' ); ?>
 				</p>
-				<table class="widefat striped" style="max-width:560px;">
+				<?php
+				// ⚠️ The per-cell `data-label`s are what make the phone layout
+				// work: below 782px WordPress's own `.form-table td { display:
+				// block }` matches THIS table's cells too (it is a descendant
+				// selector, and this table sits inside a form-table cell), so
+				// the three columns stack and the header row is stranded above
+				// them as three loose words. Rather than fight that, the CSS
+				// leans into it and turns each row into a card — but a stacked
+				// cell needs to say what it is, and a CSS `content:` string
+				// cannot be translated. Hence the attribute.
+				$bg_label_default  = __( 'Default', 'perflocale' );
+				$bg_label_override = __( 'Override', 'perflocale' );
+				?>
+				<table class="widefat striped perflocale-bgthresh" style="max-width:560px;">
 					<caption class="screen-reader-text"><?php esc_html_e( 'Background job thresholds, with each job\'s default and the operator\'s override.', 'perflocale' ); ?></caption>
 					<thead>
 						<tr>
 							<th scope="col" style="padding-left:14px;"><?php esc_html_e( 'Operation', 'perflocale' ); ?></th>
-							<th scope="col" style="width:120px;"><?php esc_html_e( 'Default', 'perflocale' ); ?></th>
-							<th scope="col" style="width:160px;"><?php esc_html_e( 'Override', 'perflocale' ); ?></th>
+							<th scope="col" style="width:120px;"><?php echo esc_html( $bg_label_default ); ?></th>
+							<th scope="col" style="width:160px;"><?php echo esc_html( $bg_label_override ); ?></th>
 						</tr>
 					</thead>
 					<tbody>
@@ -3018,15 +3239,19 @@ final class SettingsPage {
 						foreach ( self::background_job_types() as $type => $label ) :
 							$default  = (int) $factories[ $type ]()->get_default_threshold();
 							$override = isset( $thresholds[ $type ] ) ? (int) $thresholds[ $type ] : 0;
+							$field_id = 'perflocale-bgthresh-' . $type;
 							?>
 							<tr>
-								<td style="padding-left:14px;"><?php echo esc_html( $label ); ?></td>
-								<td><code><?php echo esc_html( (string) $default ); ?></code></td>
-								<td>
+								<td class="perflocale-bgthresh__op" style="padding-left:14px;">
+									<label for="<?php echo esc_attr( $field_id ); ?>"><?php echo esc_html( $label ); ?></label>
+								</td>
+								<td class="perflocale-bgthresh__default" data-label="<?php echo esc_attr( $bg_label_default ); ?>"><code><?php echo esc_html( (string) $default ); ?></code></td>
+								<td class="perflocale-bgthresh__override" data-label="<?php echo esc_attr( $bg_label_override ); ?>">
 									<input
 										type="number"
 										min="1"
 										step="1"
+										id="<?php echo esc_attr( $field_id ); ?>"
 										name="background_thresholds[<?php echo esc_attr( $type ); ?>]"
 										value="<?php echo $override > 0 ? esc_attr( (string) $override ) : ''; ?>"
 										placeholder="<?php echo esc_attr( (string) $default ); ?>"
@@ -3055,7 +3280,34 @@ final class SettingsPage {
 		$edge_enabled  = (bool) $this->settings->get( 'edge_integration_enabled' );
 		$cache_tags_on = (bool) $this->settings->get( 'cdn_cache_tags_enabled' );
 		$config_url    = rest_url( 'perflocale/v1/config' );
+		$abilities_on  = (bool) $this->settings->get( 'abilities_enabled', true );
+		$ability_write = (bool) $this->settings->get( 'abilities_write_enabled', false );
+		$abilities_api = function_exists( 'wp_register_ability' );
 		?>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'AI Agent Abilities', 'perflocale' ); ?></th>
+			<td>
+				<?php if ( ! $abilities_api ) : ?>
+					<p class="description">
+						<?php echo esc_html__( 'Requires WordPress 6.9 or newer. This site is running an older version, so nothing is registered either way.', 'perflocale' ); ?>
+					</p>
+				<?php endif; ?>
+				<label>
+					<input type="checkbox" name="abilities_enabled" value="1" <?php checked( $abilities_on ); ?>>
+					<?php echo esc_html__( 'Let AI tools and agents look up translation information', 'perflocale' ); ?>
+				</label>
+				<p class="description" style="margin-top:6px;">
+					<?php echo esc_html__( 'Registers four read-only abilities through WordPress\'s Abilities API: list languages, get a post\'s translations, detect a post\'s language, and convert a URL to another language. They respect the calling user\'s permissions and cost nothing when no agent is installed.', 'perflocale' ); ?>
+				</p>
+				<label style="display:block;margin-top:10px;">
+					<input type="checkbox" name="abilities_write_enabled" value="1" <?php checked( $ability_write ); ?>>
+					<?php echo esc_html__( 'Also let them create and machine-translate content', 'perflocale' ); ?>
+				</label>
+				<p class="description" style="margin-top:6px;">
+					<?php echo esc_html__( 'Adds two abilities that WRITE: create a translation, and machine-translate a post. Machine translation spends your provider quota, so an agent could use it without you seeing the request. Off by default for that reason — turn it on if you are deliberately automating translation through an agent.', 'perflocale' ); ?>
+				</p>
+			</td>
+		</tr>
 		<tr>
 			<th scope="row"><?php echo esc_html__( 'Dashboard Widget', 'perflocale' ); ?></th>
 			<td>
@@ -3309,7 +3561,7 @@ final class SettingsPage {
 						<p style="margin:8px 0 0;font-size:11px;color:#646970;">
 							<?php
 							printf(
-								/* translators: %s: largest import file this site accepts, e.g. "2 MB". */
+								/* translators: %s: largest file this site accepts for upload, e.g. "2 MB". */
 								esc_html__( 'Maximum file size: %s.', 'perflocale' ),
 								esc_html( $import_ceiling )
 							);

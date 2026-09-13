@@ -65,6 +65,16 @@ final class Settings {
 		'translatable_meta_keys'         => [],
 		'default_translation_status'     => 'empty',
 		'auto_create_stubs'              => false,
+
+		// Abilities API (WP 6.9+). Read abilities are on by default: they are
+		// discovery/lookup operations, capability-gated, and a site owner
+		// comparing agent surfaces otherwise sees zero from PerfLocale while
+		// other plugins register theirs. The two WRITE abilities are separate
+		// and OFF by default — `perflocale/translate-post` SPENDS machine-
+		// translation budget, and "an agent quietly used my provider quota" is
+		// a materially different surprise from "an agent read my language list".
+		'abilities_enabled'              => true,
+		'abilities_write_enabled'        => false,
 		'sync_fields'                    => [ 'featured_image', 'menu_order' ],
 		'sync_term_hierarchy'            => true,
 		'translate_slugs'                => true,
@@ -1174,11 +1184,103 @@ final class Settings {
 		/** @hook perflocale/translatable_post_types Filter the translatable post types. */
 		$result = (array) apply_filters( 'perflocale/translatable_post_types', (array) $this->get( 'translatable_post_types' ) );
 
+		// `attachment` is never translatable, whatever is stored or filtered in.
+		// PerfLocale translates media IN PLACE (per-language alt/caption/
+		// description meta on the same attachment, via MediaTranslationManager)
+		// and has no code that duplicates an attachment post. The settings
+		// screen no longer offers the checkbox, but a site that ticked it
+		// before would otherwise stay stuck with every front-end attachment
+		// query language-scoped and no way to turn it off. Dropping it here
+		// makes any stored value inert instead.
+		$result = array_values(
+			array_filter(
+				$result,
+				static fn( $type ): bool => (string) $type !== 'attachment'
+			)
+		);
+
 		if ( did_action( 'plugins_loaded' ) ) {
 			$this->translatable_post_types_cache = $result;
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Post types the "translate the entire site" surfaces may offer and accept.
+	 *
+	 * ⭐ WHY THIS EXISTS — four places used to compute this list independently as
+	 * `get_post_types( [ 'public' => true, 'show_ui' => true ] )` and never
+	 * consulted the translatable list at all:
+	 *   Admin\Pages\TranslationsPage::render_site_translate_panel()
+	 *   Admin\AdminController::process_site_translate()
+	 *   Api\TranslationsController — the estimate branch AND the dispatch branch
+	 *
+	 * That whitelist is wrong in BOTH directions, and both were user-visible:
+	 *
+	 *   - It EXCLUDES everything an addon registers with `show_ui => false`.
+	 *     `wpcf7_contact_form`, `wpforms` and `product_variation` are exactly
+	 *     that, as are the plugin's own `wp_block` and `wp_navigation`. They are
+	 *     listed on the Translations page and then silently discarded by the
+	 *     `array_intersect` on the site-translate path — tick only those and the
+	 *     run redirects to a bare "nothing to do".
+	 *   - It INCLUDES public types the operator never marked translatable
+	 *     (`movie`, `elementor_library`, `oxy_user_library`), offering work the
+	 *     plugin will not do.
+	 *
+	 * The correct set is "what this site is configured to translate", narrowed
+	 * to types that are actually registered right now.
+	 *
+	 * ⚠️ `post_type_exists()` matters: a type can persist in the saved setting
+	 * after the plugin that registered it is deactivated. Passing an
+	 * unregistered name to the job produces a keyset page that matches nothing,
+	 * which reads as a silent no-op — see
+	 * {@see self::get_unregistered_translatable_post_types()} for reporting it.
+	 *
+	 * `attachment` stays excluded: attachments are `post_status = inherit`, so
+	 * the job's publish-only keyset page would select none of them however the
+	 * operator has configured the type.
+	 *
+	 * @return array<int, string>
+	 */
+	public function get_site_translate_post_types(): array {
+		$types = [];
+
+		foreach ( $this->get_translatable_post_types() as $type ) {
+			$type = (string) $type;
+
+			if ( $type === '' || $type === 'attachment' || ! post_type_exists( $type ) ) {
+				continue;
+			}
+
+			$types[] = $type;
+		}
+
+		return array_values( array_unique( $types ) );
+	}
+
+	/**
+	 * Translatable post types that are NOT currently registered.
+	 *
+	 * The difference between the saved setting and what a request can actually
+	 * act on — i.e. the types {@see self::get_site_translate_post_types()}
+	 * dropped. Surfaced so a dropped selection can say WHY instead of looking
+	 * like a run that found nothing.
+	 *
+	 * @return array<int, string>
+	 */
+	public function get_unregistered_translatable_post_types(): array {
+		$missing = [];
+
+		foreach ( $this->get_translatable_post_types() as $type ) {
+			$type = (string) $type;
+
+			if ( $type !== '' && $type !== 'attachment' && ! post_type_exists( $type ) ) {
+				$missing[] = $type;
+			}
+		}
+
+		return array_values( array_unique( $missing ) );
 	}
 
 	/**
@@ -1345,15 +1447,48 @@ final class Settings {
 	 *
 	 * @return array<string, array<int, string>>
 	 */
-	public function get_language_fallbacks(): array {
-		static $cache     = null;
-		static $cache_key = null;
+	public function get_language_fallbacks( string $context = '' ): array {
+		static $cache = [];
 
 		$raw = (array) $this->get( 'language_fallbacks' );
-		$key = md5( (string) wp_json_encode( $raw ) );
 
-		if ( $cache !== null && $cache_key === $key ) {
-			return $cache;
+		/**
+		 * Filter the whole per-language fallback map before it is normalised.
+		 *
+		 * Shape: `[ 'en-us' => [ 'en-gb', 'de-de' ], ... ]`. Region-qualified
+		 * slugs are ordinary keys here, so a variation (`en-gb`) gets its own
+		 * chain exactly like a base language does.
+		 *
+		 * ⚠️ `$context` says WHO is asking, because the right answer differs:
+		 * a missing STRING can reasonably borrow from a sibling locale, while a
+		 * missing POST usually should not silently resolve to another language's
+		 * content. Returning a different map per context is supported and the
+		 * per-context result is cached separately.
+		 *
+		 * ⚠️ Whatever this returns is still normalised afterwards — slugs are
+		 * sanitised, self-references and duplicates dropped, and each chain
+		 * clipped to MAX_FALLBACK_DEPTH. A filter therefore cannot introduce a
+		 * cycle or an unbounded chain, which is why the filter runs BEFORE the
+		 * guardrails rather than after them.
+		 *
+		 * @hook perflocale/language/fallbacks
+		 *
+		 * @param array<string, array<int, string>> $raw     Stored map.
+		 * @param string                            $context Consumer: 'strings',
+		 *                                                   'post_query', 'admin',
+		 *                                                   or '' when unstated.
+		 */
+		$raw = (array) apply_filters( 'perflocale/language/fallbacks', $raw, $context );
+
+		// ⚠️ The cache key carries the CONTEXT as well as the data. Keyed on the
+		// raw option alone — as it was — the first caller's answer would have
+		// been served to every later caller, so a context-aware filter would
+		// have appeared to work and then silently leaked one consumer's chain
+		// into another's for the rest of the request.
+		$key = $context . '|' . md5( (string) wp_json_encode( $raw ) );
+
+		if ( isset( $cache[ $key ] ) ) {
+			return $cache[ $key ];
 		}
 
 		$normalised = [];
@@ -1394,10 +1529,64 @@ final class Settings {
 			}
 		}
 
-		$cache     = $normalised;
-		$cache_key = $key;
+		$cache[ $key ] = $normalised;
 
 		return $normalised;
+	}
+
+	/**
+	 * The fallback chain for ONE language, already normalised.
+	 *
+	 * The per-language filter most callers actually want: it hands you the
+	 * language being resolved instead of making you index a map, and it fires
+	 * AFTER the guardrails, so a chain returned here is re-normalised before it
+	 * is used — a filter cannot reintroduce a self-reference or an over-long
+	 * chain through this door either.
+	 *
+	 * @param string $slug    Language slug whose chain is wanted (a variation
+	 *                        such as `en-gb` is just another slug).
+	 * @param string $context Consumer: 'strings', 'post_query', 'admin', or ''.
+	 * @return array<int, string> Ordered fallback slugs, nearest first.
+	 */
+	public function get_fallback_chain( string $slug, string $context = '' ): array {
+		$slug = sanitize_key( $slug );
+
+		if ( $slug === '' ) {
+			return [];
+		}
+
+		$chain = (array) ( $this->get_language_fallbacks( $context )[ $slug ] ?? [] );
+
+		/**
+		 * Filter one language's fallback chain.
+		 *
+		 * @hook perflocale/language/fallback_chain
+		 *
+		 * @param array<int, string> $chain   Ordered fallback slugs, nearest first.
+		 * @param string             $slug    The language being resolved.
+		 * @param string             $context Consumer: 'strings', 'post_query',
+		 *                                    'admin', or '' when unstated.
+		 */
+		$chain = (array) apply_filters( 'perflocale/language/fallback_chain', $chain, $slug, $context );
+
+		// Re-apply the same guardrails to whatever the filter returned.
+		$clean = [];
+
+		foreach ( $chain as $entry ) {
+			$entry = sanitize_key( (string) $entry );
+
+			if ( $entry === '' || $entry === $slug || in_array( $entry, $clean, true ) ) {
+				continue;
+			}
+
+			$clean[] = $entry;
+
+			if ( count( $clean ) >= self::MAX_FALLBACK_DEPTH ) {
+				break;
+			}
+		}
+
+		return $clean;
 	}
 
 	/**

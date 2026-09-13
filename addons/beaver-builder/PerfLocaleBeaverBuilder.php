@@ -60,12 +60,11 @@ final class PerfLocaleBeaverBuilder implements \PerfLocale\Addon\AddonInterface 
 	public function boot( \PerfLocale\Plugin $plugin ): void {
 		// Add BB data as translatable meta.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		// Builder layout keys keep FULL MIRROR semantics: the layout must stay
-		// structurally identical across siblings (text inside is translated at
-		// render), so a source layout edit always propagates. Without this the
-		// key would fall into ContentSync's seed-only class and siblings would
-		// stop receiving layout updates.
-		add_filter( 'perflocale/sync/mirror_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
+		// ⚠️ Only the TEXT-FREE keys mirror — see add_mirror_keys() for what is on
+		// that list and why the builder document is not. A mirror is
+		// bidirectional, so mirroring a document that carries the user's words
+		// destroys translated text in both directions.
+		add_filter( 'perflocale/sync/mirror_meta_keys', [ $this, 'add_mirror_keys' ], 10, 2 );
 
 		// A raw meta mirror of the layout leaves the sibling's GENERATED
 		// asset cache (uploads/bb-plugin/cache/{id}-layout*.css/js) built
@@ -94,6 +93,46 @@ final class PerfLocaleBeaverBuilder implements \PerfLocale\Addon\AddonInterface 
 	 */
 	public function get_settings_fields(): array {
 		return [];
+	}
+
+	/**
+	 * Layout keys that keep FULL MIRROR semantics.
+	 *
+	 * ⚠️ The document that holds the user's TEXT is deliberately absent from this
+	 * list. It is seeded into a new translation by
+	 * {@see self::add_meta_keys()} and is owned by that translation from then on.
+	 *
+	 * A continuous mirror is bidirectional in ContentSync ("any group member's
+	 * save propagates group-wide"), so mirroring a builder document that carries
+	 * headings, paragraphs and button labels destroys translated text in BOTH
+	 * directions — a translator's save overwrites the source, and the next source
+	 * save overwrites the translation. That was reproduced end to end for
+	 * Elementor on 4.2.1 and 4.1.3, and observed for Beaver Builder on a replica;
+	 * every builder here stores text the same way, so all of them were moved.
+	 *
+	 * What stays below is the part that carries no user-visible text and genuinely
+	 * should track the source.
+	 *
+	 * The accepted cost: a structural edit to the source no longer propagates.
+	 * Propagating layout without destroying translated text needs a
+	 * builder-aware merge that can tell a layout node from a localisable value; a
+	 * raw whole-document mirror cannot give you both.
+	 *
+	 * @param array<int, string> $keys      Meta keys.
+	 * @param string             $post_type Post type.
+	 * @return array<int, string>
+	 */
+	public function add_mirror_keys( array $keys, string $post_type ): array {
+		// NOT `_fl_builder_data` — that is the published layout, and every module's
+		// heading, text editor content and button label lives inside it.
+		$keys[] = '_fl_builder_data_settings';
+		// The enabled flag decides whether BB renders the layout at all
+		// (FLBuilderModel::is_builder_enabled). It must keep mirroring, or a
+		// sibling seeded before the source was converted to BB (or after a
+		// revert-to-editor) renders the wrong content type. It holds no text.
+		$keys[] = '_fl_builder_enabled';
+
+		return $keys;
 	}
 
 	/**

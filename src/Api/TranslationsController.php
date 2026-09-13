@@ -226,9 +226,12 @@ final class TranslationsController extends RestController {
 				// keyset pages so the estimate never materialises a giant array.
 				global $wpdb;
 				$post_types = array_values( array_filter( array_map( 'sanitize_key', (array) ( $request->get_param( 'post_types' ) ?: [ 'post', 'page' ] ) ) ) );
-				// Same public + show_ui whitelist (minus attachment) the admin
-				// site-translate panel enforces — parity + defense in depth.
-				$allowed_types = array_diff( array_keys( get_post_types( [ 'public' => true, 'show_ui' => true ], 'names' ) ), [ 'attachment' ] );
+// ⭐ Parity: the ONE definition of what site-translate may act on lives in
+				// Settings::get_site_translate_post_types() — the translatable list
+				// narrowed to registered types. The old `public + show_ui` whitelist
+				// excluded every addon type (CF7, WPForms, product_variation) and
+				// included public types nobody marked translatable.
+				$allowed_types = \PerfLocale\Plugin::get_instance()->get( 'settings' )->get_site_translate_post_types();
 				$post_types    = array_values( array_intersect( $post_types, $allowed_types ) );
 
 					// All requested types filtered out: an empty IN () list is a
@@ -272,9 +275,12 @@ final class TranslationsController extends RestController {
 
 		if ( $site_wide ) {
 			$post_types = array_values( array_filter( array_map( 'sanitize_key', (array) ( $request->get_param( 'post_types' ) ?: [ 'post', 'page' ] ) ) ) );
-				// Same public + show_ui whitelist (minus attachment) the admin
-				// site-translate panel enforces — parity + defense in depth.
-				$allowed_types = array_diff( array_keys( get_post_types( [ 'public' => true, 'show_ui' => true ], 'names' ) ), [ 'attachment' ] );
+// ⭐ Parity: the ONE definition of what site-translate may act on lives in
+				// Settings::get_site_translate_post_types() — the translatable list
+				// narrowed to registered types. The old `public + show_ui` whitelist
+				// excluded every addon type (CF7, WPForms, product_variation) and
+				// included public types nobody marked translatable.
+				$allowed_types = \PerfLocale\Plugin::get_instance()->get( 'settings' )->get_site_translate_post_types();
 				$post_types    = array_values( array_intersect( $post_types, $allowed_types ) );
 
 			// Reject at the REST layer instead of dispatching a no-op job the
@@ -358,7 +364,7 @@ final class TranslationsController extends RestController {
 			);
 		}
 
-		if ( $type === 'post' && ! current_user_can( 'edit_post', $id ) ) {
+		if ( $type === 'post' && ! \PerfLocale\Helper::user_can_edit_object( $id ) ) {
 			return new \WP_Error(
 				'rest_forbidden',
 				__( 'You cannot access this post.', 'perflocale' ),
@@ -420,7 +426,7 @@ final class TranslationsController extends RestController {
 		}
 
 		// Verify the user can access this specific object.
-		if ( ! current_user_can( 'edit_post', $id ) ) {
+		if ( ! \PerfLocale\Helper::user_can_edit_object( $id ) ) {
 			return new \WP_REST_Response(
 				[
 					'code'    => 'rest_forbidden',
@@ -501,7 +507,15 @@ final class TranslationsController extends RestController {
 				'post_id'         => $translated_id,
 				'status'          => $status_obj ? $status_obj->value : null,
 				'status_label'    => $status_obj ? $status_obj->label() : null,
-				'edit_url'        => $translated_post ? get_edit_post_link( $translated_id, 'raw' ) : null,
+				// The POST's real status, not the link's. The link status is
+				// written once when the translation is created and is not
+				// maintained afterwards, so a live translation can still read
+				// `empty`. Consumers that need to tell the operator whether a
+				// translation is actually IN USE — the Site Editor panel most of
+				// all, where a draft template is silently ignored and the source
+				// renders instead — need the post's own status.
+				'post_status'     => $translated_post ? $translated_post->post_status : null,
+				'edit_url'        => $translated_post ? ( \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id ) ?: null ) : null,
 			];
 		}
 
@@ -531,7 +545,7 @@ final class TranslationsController extends RestController {
 		$copy        = (bool) $request->get_param( 'copy_content' );
 
 		// Verify the user can edit the source post.
-		if ( ! current_user_can( 'edit_post', $id ) ) {
+		if ( ! \PerfLocale\Helper::user_can_edit_object( $id ) ) {
 			return $this->error( 'rest_forbidden', __( 'You cannot edit this post.', 'perflocale' ), 403 );
 		}
 
@@ -554,7 +568,7 @@ final class TranslationsController extends RestController {
 		return $this->success(
 			[
 				'post_id'  => $new_id,
-				'edit_url' => get_edit_post_link( $new_id, 'raw' ),
+				'edit_url' => \PerfLocale\Admin\ObjectLinks::edit_url( (int) $new_id ) ?: null,
 			],
 			201
 		);
@@ -585,7 +599,7 @@ final class TranslationsController extends RestController {
 			return $this->error( 'invalid_type', __( 'Only posts support direct language assignment.', 'perflocale' ) );
 		}
 
-		if ( ! current_user_can( 'edit_post', $id ) ) {
+		if ( ! \PerfLocale\Helper::user_can_edit_object( $id ) ) {
 			return $this->error( 'rest_forbidden', __( 'You cannot edit this post.', 'perflocale' ), 403 );
 		}
 
@@ -667,7 +681,7 @@ final class TranslationsController extends RestController {
 		}
 
 		// Verify the user can edit this specific translation post.
-		if ( ! current_user_can( 'edit_post', $translated_id ) ) {
+		if ( ! \PerfLocale\Helper::user_can_edit_object( (int) $translated_id ) ) {
 			return $this->error( 'rest_forbidden', __( 'You cannot edit this translation.', 'perflocale' ), 403 );
 		}
 
@@ -732,7 +746,7 @@ final class TranslationsController extends RestController {
 
 				// Trash is a deletion. Use the same gate delete_translation() uses,
 				// so the two routes cannot disagree about who may remove content.
-				if ( 'trash' === $requested_status && ! current_user_can( 'delete_post', $translated_id ) ) {
+				if ( 'trash' === $requested_status && ! \PerfLocale\Helper::user_can_delete_object( (int) $translated_id ) ) {
 					return $this->error(
 						'rest_forbidden',
 						__( 'You cannot trash this translation.', 'perflocale' ),
@@ -861,7 +875,7 @@ final class TranslationsController extends RestController {
 		}
 
 		// Verify the user can delete this specific translation post.
-		if ( ! current_user_can( 'delete_post', $translated_id ) ) {
+		if ( ! \PerfLocale\Helper::user_can_delete_object( (int) $translated_id ) ) {
 			return $this->error( 'rest_forbidden', __( 'You cannot delete this translation.', 'perflocale' ), 403 );
 		}
 

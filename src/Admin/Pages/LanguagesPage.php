@@ -384,7 +384,12 @@ final class LanguagesPage {
 		$option = $screen ? $screen->get_option( 'per_page', 'option' ) : '';
 		$val    = $option ? (int) get_user_meta( $user, $option, true ) : 0;
 
-		return $val > 0 ? $val : 20;
+		// ⚠️ Clamp on READ. The save-time ceiling cannot touch values stored
+		// BEFORE it existed: measured with max_input_vars=64 (ceiling 25), a
+		// stored 777 still drove posts_per_page=777 and rendered every row.
+		// The protection has to sit where the value is USED. The stored
+		// preference is deliberately not rewritten - only the effective value.
+		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
 	}
 
 	/**

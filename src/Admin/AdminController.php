@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin;
 
+use PerfLocale\Admin\ObjectLinks;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -2049,7 +2050,7 @@ final class AdminController {
 	 */
 	private function process_site_translate(): void {
 		if ( ! self::bulk_mt_translate_available() ) {
-			wp_safe_redirect( add_query_arg( 'perflocale_bulk', 'bulk_mt_unavailable', admin_url( 'admin.php?page=perflocale-translations' ) ) );
+			wp_safe_redirect( add_query_arg( 'message', 'bulk_mt_unavailable', admin_url( 'admin.php?page=perflocale-translations' ) ) );
 			exit;
 		}
 
@@ -2065,26 +2066,47 @@ final class AdminController {
 		$include_meta = ! empty( $_POST['include_meta'] );
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
 
-		// Only public, UI-visible post types may be targeted — anything else
-		// in the POST is dropped (defends against crafted type names).
-		$allowed_types   = array_keys(
-			get_post_types(
-				[
-					'public'  => true,
-					'show_ui' => true,
-				],
-				'names'
-			)
-		);
-		// Attachments are additionally excluded to mirror the panel: they are
-		// post_status=inherit so the job would select nothing anyway, but the
-		// whitelist should match what the UI offers.
-		$allowed_types = array_diff( $allowed_types, [ 'attachment' ] );
-
-		$site_post_types = array_values( array_intersect( $site_post_types, $allowed_types ) );
+		// ⭐ Only types this site is configured to translate may be targeted —
+		// anything else in the POST is dropped (crafted type names included).
+		// This used to be `public + show_ui`, which silently discarded every
+		// addon-registered type (CF7, WPForms, product_variation) the
+		// Translations page had just listed as translatable.
+		$settings_for_types = \PerfLocale\Plugin::get_instance()->get( 'settings' );
+		$allowed_types      = $settings_for_types->get_site_translate_post_types();
+		$requested_types    = $site_post_types;
+		$requested_count    = count( $site_post_types );
+		$site_post_types    = array_values( array_intersect( $site_post_types, $allowed_types ) );
 
 		if ( $site_lang_ids === [] || $site_post_types === [] ) {
-			wp_safe_redirect( add_query_arg( 'perflocale_bulk', 'site_translate_empty', admin_url( 'admin.php?page=perflocale-translations' ) ) );
+			// Say WHY the selection was empty rather than redirecting to a bare
+			// "nothing to do". A type that is translatable in the settings but
+			// whose plugin is deactivated looks identical to a run that found no
+			// content, and the operator has no way to tell them apart.
+			$message = 'site_translate_empty';
+
+			// ⚠️ Only the types THIS REQUEST asked for. Listing every
+			// unregistered configured type told an operator who selected
+			// "Posts" that their run failed because of `elementor_library` —
+			// a diagnostic that points at the wrong thing is worse than none.
+			$dropped = $requested_count > 0
+				? array_values( array_intersect( $requested_types, $settings_for_types->get_unregistered_translatable_post_types() ) )
+				: [];
+
+			if ( $site_lang_ids !== [] && $dropped !== [] ) {
+				$message = 'site_translate_unregistered';
+			}
+
+			wp_safe_redirect(
+				add_query_arg(
+					array_filter(
+						[
+							'message' => $message,
+							'types'           => $message === 'site_translate_unregistered' ? implode( ',', $dropped ) : false,
+						]
+					),
+					admin_url( 'admin.php?page=perflocale-translations' )
+				)
+			);
 			exit;
 		}
 
@@ -2100,7 +2122,7 @@ final class AdminController {
 
 		if ( ( $outcome['mode'] ?? '' ) === 'denied' || ( $outcome['mode'] ?? '' ) === 'error' ) {
 			set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), (string) ( $outcome['error'] ?? __( 'Dispatch failed.', 'perflocale' ) ), 5 * MINUTE_IN_SECONDS );
-			wp_safe_redirect( add_query_arg( 'perflocale_bulk', 'site_translate_denied', admin_url( 'admin.php?page=perflocale-translations' ) ) );
+			wp_safe_redirect( add_query_arg( 'message', 'site_translate_denied', admin_url( 'admin.php?page=perflocale-translations' ) ) );
 			exit;
 		}
 
@@ -2138,6 +2160,47 @@ final class AdminController {
 
 		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+		}
+
+		// ⚠️ COMPLETENESS BEFORE BRANCHING. This used to sit inside the subset
+		// branch only, so `site_translate` returned above it and was never
+		// checked at all — a truncated site-wide POST dispatched a job for a
+		// SUBSET of the requested languages with no warning.
+		//
+		// And it used to infer truncation from `count( $_POST, COUNT_RECURSIVE )`,
+		// which ALSO counts array containers: an intact 63-field submission was
+		// refused as truncated at a limit of 64. A recursive element count can
+		// neither prove a request arrived intact nor prove it did not.
+		//
+		// The form now ends with `perflocale_form_end`. PHP discards input past
+		// `max_input_vars` in order, so if that field arrived, everything before
+		// it did too.
+		//
+		// A MISSING marker is not proof of truncation either — it may simply be
+		// a programmatic or pre-upgrade caller that never sent one. Refuse only
+		// when the marker is absent AND the request reached the server's
+		// ceiling, which is the one combination that really does indicate loss.
+		$max_input_vars = (int) ini_get( 'max_input_vars' );
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+		$form_complete  = isset( $_POST['perflocale_form_end'] );
+
+		if ( ! $form_complete && $max_input_vars > 0 ) {
+			// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+			$posted_vars = count( $_POST, COUNT_RECURSIVE );
+
+			if ( $posted_vars >= $max_input_vars ) {
+				wp_safe_redirect(
+					add_query_arg(
+						[
+							'page'    => 'perflocale-translations',
+							'message' => 'bulk_truncated',
+							'limit'   => $max_input_vars,
+						],
+						admin_url( 'admin.php' )
+					)
+				);
+				exit;
+			}
 		}
 
 		// Site-wide MT: the "Translate the entire site" panel posts the same
@@ -2863,10 +2926,26 @@ final class AdminController {
 		}
 
 		// Redirect to the new post's edit screen.
-		$edit_url = get_edit_post_link( $new_id, 'raw' );
+		//
+		// ⚠️ The translation is ALREADY WRITTEN at this point. A post type with
+		// no editor of its own (every addon-contributed type is non-public)
+		// yields no edit URL, and the previous code called wp_die( 'Failed to
+		// create translation.' ) — reporting a failure for work that succeeded,
+		// and stranding the user on a dead page. With Classic Editor active it
+		// was worse: the relative '?classic-editor' passed the truthiness check
+		// and wp_validate_redirect() returned it verbatim, so the browser
+		// resolved it against admin-post.php and rendered blank.
+		// Fall back to the Translations screen instead: the row is there.
+		$edit_url = ObjectLinks::edit_url( (int) $new_id );
 
-		if ( ! $edit_url ) {
-			wp_die( esc_html__( 'Failed to create translation.', 'perflocale' ) );
+		if ( $edit_url === '' ) {
+			$edit_url = add_query_arg(
+				[
+					'page'                => 'perflocale-translations',
+					'perflocale_created'  => (int) $new_id,
+				],
+				admin_url( 'admin.php' )
+			);
 		}
 
 		wp_safe_redirect( $edit_url );
@@ -3175,7 +3254,20 @@ final class AdminController {
 		if ( $front_page_id > 0 ) {
 			$translated = $manager->get_translation_id( $front_page_id, $new_lang->slug );
 
-			if ( $translated && $translated !== $front_page_id ) {
+			// ⚠️ ONLY A PUBLISHED TRANSLATION MAY BECOME THE FRONT PAGE.
+			//
+			// "A translation exists" is not "a translation is reachable".
+			// Generate Missing Translations creates every translation as a
+			// DRAFT, so on a site where that has been run — which the Settings
+			// screen tells operators to do — the new default language's
+			// homepage was very likely a draft, and this pointed
+			// `page_on_front` straight at it. A draft cannot be served, so the
+			// site's front page would break for everyone.
+			//
+			// Leaving the option on the old page is the safe failure: the front
+			// page keeps working, and the operator can point it at the
+			// translation once they publish it.
+			if ( $translated && $translated !== $front_page_id && get_post_status( $translated ) === 'publish' ) {
 				update_option( 'page_on_front', $translated );
 			}
 		}
@@ -3186,7 +3278,9 @@ final class AdminController {
 		if ( $blog_page_id > 0 ) {
 			$translated = $manager->get_translation_id( $blog_page_id, $new_lang->slug );
 
-			if ( $translated && $translated !== $blog_page_id ) {
+			// Same rule as the front page above: a draft posts page is not a
+			// posts page.
+			if ( $translated && $translated !== $blog_page_id && get_post_status( $translated ) === 'publish' ) {
 				update_option( 'page_for_posts', $translated );
 			}
 		}

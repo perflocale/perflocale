@@ -608,13 +608,26 @@ final class GeoRedirect {
 	/**
 	 * Validate a wp_remote_get response and decode its JSON body.
 	 *
-	 * All GeoIP providers share the same response shape: a JSON object
-	 * with a country-code field. They MUST also share the same failure
-	 * handling - a 429 (rate-limit) or 5xx response typically returns
-	 * an HTML error page, which `json_decode` happily parses as null,
-	 * returning empty country and silently breaking language detection
-	 * for the visitor's entire session. Centralising the response
-	 * validation here closes that gap across every provider.
+	 * ⚠️ CURRENTLY UNREFERENCED — and the docblock this replaces claimed
+	 * otherwise. It said "centralising the response validation here closes that
+	 * gap across every provider", which closes nothing: the method has no
+	 * caller, and the only `json_decode()` in this file is the one inside it.
+	 * A reader could reasonably have assumed the protection below was in force.
+	 *
+	 * What it guarded was real: a 429 or 5xx from a GeoIP endpoint typically
+	 * returns an HTML error page, which `json_decode` parses as null, yielding
+	 * an empty country and silently breaking language detection for the
+	 * visitor's whole session. But the bundled providers that shared that
+	 * response shape were deleted in the 2026-07-31 simplification (hosts
+	 * 16 -> 4, features kept behind filter seams). The one surviving path,
+	 * `fetch_custom_provider()`, delegates entirely to a third-party
+	 * `fetch_callback` that performs its own request and returns a country-code
+	 * STRING — it never hands back a response for this to decode.
+	 *
+	 * Retained rather than deleted only to keep a release-time diff small;
+	 * recorded as verified-dead in `dev/OPEN-ITEMS-AFTER-1.0.3.md` (DC-03) for
+	 * removal in a housekeeping pass. If a bundled provider is ever reinstated,
+	 * wire this in rather than re-deriving it.
 	 *
 	 * @param mixed $response wp_remote_get return value.
 	 * @return array<string, mixed>|null Decoded body or null on any failure.

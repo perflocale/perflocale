@@ -198,8 +198,25 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		$lang_ph = implode( ',', array_fill( 0, count( $lang_ids ), '%d' ) );
 		$pt_ph   = implode( ',', array_fill( 0, count( $pt_safe ), '%s' ) );
 
+		// The stored status is written when the link is created and is not
+		// maintained afterwards, so it is reconciled against the post's REAL
+		// status here. Both directions matter:
+		//
+		//   upward   — a link still reading 'empty' whose post is live really
+		//              is published (nothing writes the status on publish);
+		//   downward — a link reading 'published' whose post was TRASHED (or
+		//              left as an auto-draft) is not a translation any more.
+		//              Without this arm the dashboard counted trashed
+		//              translations toward "translated" and reported progress
+		//              the site does not have. Measured on a real site: 8
+		//              trashed + 3 auto-draft rows inflating the count.
+		//
+		// 'empty' is the correct landing bucket for the downward arm: the
+		// source post still needs a translation, which is exactly what 'empty'
+		// means everywhere else in the UI.
 		$sql = "SELECT l.language_id AS lid, p.post_type AS pt,
 				CASE
+					WHEN p.post_status IN ( 'trash', 'auto-draft' ) THEN 'empty'
 					WHEN l.status = 'empty' AND p.post_status = 'publish' THEN 'published'
 					WHEN l.status = 'empty' AND p.post_status = 'draft' THEN 'draft'
 					ELSE l.status

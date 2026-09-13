@@ -146,10 +146,19 @@ a.perflocale-status-badge--linked:focus .perflocale-status-badge__icon {
 			min-width: 0;
 		}
 
+	/* ⚠️ EXPLICIT width, not auto+min-width: under `table-layout: fixed` a
+	   cell min-width is ignored, so `auto` rendered these 18px wide at 360px
+	   and the status badges spilled out of them. Mirrors the LTR sheet. */
 	.perflocale-translations-table .perflocale-col-lang {
-			width: auto;
-			min-width: 92px;
+			/* Sized from the LONGEST status badge, not the most common one:
+			   "Needs Update" measures 106px and needs 118px once the 6px
+			   padding on each side is counted. "Published" fitted in 108px,
+			   which is how the first attempt still clipped one badge by 8px. */
+			width: 118px;
+			padding-left: 6px;
+			padding-right: 6px;
 		}
+
 }
 
 /* ---- "Translate the entire site" panel ---- */

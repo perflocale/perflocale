@@ -2411,18 +2411,25 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * post 42's German translation also rewrote the status of term 42's
 	 * German link.
 	 *
-	 * No caller ships in the plugin today (the publish-sync path writes
-	 * through link_object()); it stays as the repository's status-write entry
-	 * point for addons and is kept type-correct for whoever picks it up.
+	 * The publish-sync path writes through link_object(); this is the
+	 * repository's status-write entry point for everything else, and the one
+	 * ContentChangeDetector::clear_needs_update() uses to retire a stale
+	 * "Needs update" badge.
 	 *
-	 * @param int        $object_id Object ID (post id, term id, or string id per $type).
-	 * @param int        $language_id Language ID.
-	 * @param string     $status New status.
-	 * @param string     $source New source (optional).
-	 * @param ObjectType $type Object type the id belongs to. Defaults to post.
-	 * @return bool True when the UPDATE ran (a matching row is not guaranteed).
+	 * @param int         $object_id Object ID (post id, term id, or string id per $type).
+	 * @param int         $language_id Language ID.
+	 * @param string      $status New status.
+	 * @param string      $source New source (optional).
+	 * @param ObjectType  $type Object type the id belongs to. Defaults to post.
+	 * @param string|null $expect_status Write ONLY while the row still reads this status
+	 *                                   (compare-and-set). Required of any caller that
+	 *                                   chose $status by reading the current one, since
+	 *                                   the read and this write are separate statements.
+	 *                                   Null writes unconditionally.
+	 * @return bool True when the row was written. With $expect_status set, false also
+	 *              means the precondition no longer held and nothing was changed.
 	 */
-	public function update_link_status( int $object_id, int $language_id, string $status, string $source = '', ObjectType $type = ObjectType::Post ): bool {
+	public function update_link_status( int $object_id, int $language_id, string $status, string $source = '', ObjectType $type = ObjectType::Post, ?string $expect_status = null ): bool {
 		$data   = [
 			'status'     => sanitize_key( $status ),
 			'updated_at' => current_time( 'mysql' ),
@@ -2434,18 +2441,45 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			$format[]       = '%s';
 		}
 
+		$where        = [
+			'object_id'   => $object_id,
+			'language_id' => $language_id,
+			'type'        => $type->value,
+		];
+		$where_format = [ '%d', '%d', '%s' ];
+
+		// COMPARE-AND-SET. A caller that decided to write based on the status
+		// it just READ must put that status in the WHERE clause, or the two
+		// statements are a race with anything that writes between them. Callers
+		// which legitimately set a status unconditionally (a publish, a bulk
+		// reconcile) pass nothing and keep the original behaviour.
+		if ( $expect_status !== null ) {
+			$where['status'] = sanitize_key( $expect_status );
+			$where_format[]  = '%s';
+		}
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$result = $this->wpdb->update(
 			$this->links_table(),
 			$data,
-			[
-				'object_id'   => $object_id,
-				'language_id' => $language_id,
-				'type'        => $type->value,
-			],
+			$where,
 			$format,
-			[ '%d', '%d', '%s' ]
+			$where_format
 		);
+
+		// Under a precondition, zero affected rows means the row no longer
+		// reads $expect_status, so the write was correctly refused. It cannot
+		// mean "matched but unchanged": `updated_at` is always set to NOW(), so
+		// a matched row always reports as affected.
+		//
+		// This has to return early rather than fall through. Flushing the
+		// object cache and firing `status_changed` for a write that did not
+		// happen would tell the switcher, hreflang and any CDN integration to
+		// re-read a status that never changed — and would report success to a
+		// caller whose whole reason for passing a precondition was to find out.
+		if ( $expect_status !== null && ( $result === false || (int) $result === 0 ) ) {
+			return false;
+		}
 
 		if ( $result !== false ) {
 			// Invalidate the type that was actually written. Flushing a type

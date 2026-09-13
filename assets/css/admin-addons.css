@@ -42,18 +42,93 @@
 /* ==========================================================================
  Addons Page
  ========================================================================== */
+/* ⭐ THE UNDERLINED TAB STRIP.
+   The active tab's 2px underline merges into the strip's own baseline via
+   `margin-bottom: -2px` — that join is the design.
+
+   It only survives on ONE row. The strip used to be `flex-wrap: wrap`, and with
+   ten filters it wrapped (two rows at 1280px, four on a phone), stranding the
+   underline above the baseline it should meet. So the strip does not wrap: it
+   scrolls sideways, keeping every tab full size and the join intact at any
+   width.
+
+   THREE ELEMENTS, EACH WITH ONE JOB:
+     -wrap    positioning context; owns the vertical rhythm.
+     -scroll  the scroller. Its native scrollbar is HIDDEN — see -bar.
+     -tabs    the strip; owns the 2px baseline the underline merges into.
+   The scroller and the strip cannot be the same element: a visible scrollbar is
+   laid out INSIDE a scroll container and would come between the tabs and their
+   own baseline. */
+.perflocale-addons-tabs-wrap {
+	position: relative;
+	margin: 16px 0;
+}
+
+.perflocale-addons-tabs-scroll {
+	overflow-x: auto;
+	overflow-y: hidden;
+	-webkit-overflow-scrolling: touch;
+	overscroll-behavior-x: contain;
+	/* The native bar is suppressed because it cannot do this job. iOS and
+	   Android draw scrollbars as transient overlays that vanish at rest, and
+	   iOS ignores ::-webkit-scrollbar altogether — so on exactly the devices
+	   that need the hint, the native bar is invisible. -bar below is drawn by
+	   us instead, and is the same on every platform. */
+	scrollbar-width: none;
+	-ms-overflow-style: none;
+}
+
+.perflocale-addons-tabs-scroll::-webkit-scrollbar {
+	display: none;
+}
+
 .perflocale-addons-tabs {
 	display: flex;
-	flex-wrap: wrap;
+	flex-wrap: nowrap;
 	gap: 0;
 	border-bottom: 2px solid #e0e0e0;
-	margin: 16px 0;
+	/* As wide as its tabs, so the baseline runs the full scrollable width
+	   rather than stopping at the viewport edge. */
+	min-width: max-content;
+}
+
+/* The scroll indicator. Hidden until the script measures a real overflow, so a
+   site with few enough filters — or with JS off — never shows a bar that would
+   suggest content that is not there. */
+.perflocale-addons-tabs-bar {
+	display: none;
+	position: relative;
+	height: 4px;
+	margin-top: 8px;
+	border-radius: 2px;
+	background: #f0f0f1;
+}
+
+.perflocale-addons-tabs-bar.is-visible {
+	display: block;
+}
+
+.perflocale-addons-tabs-bar > span {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	/* Anchored with a physical side, not inset-inline-start: that logical
+	   property only landed in Chrome 87, and on anything older it is dropped
+	   silently — the thumb renders but never moves. The RTL sheet anchors to
+	   `right` instead, and the script signs its translateX by the computed
+	   direction. */
+	left: 0;
+	width: 30%;
+	border-radius: 2px;
+	background: #c3c4c7;
 }
 
 .perflocale-addons-tab {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
+	flex: 0 0 auto;
+	white-space: nowrap;
 	padding: 10px 16px;
 	font-size: 13px;
 	font-weight: 500;
@@ -64,8 +139,10 @@
 	transition: color 0.15s, border-color 0.15s;
 }
 
-.perflocale-addons-tab:hover {
+.perflocale-addons-tab:hover,
+.perflocale-addons-tab:focus {
 	color: #1d2327;
+	box-shadow: none;
 }
 
 .perflocale-addons-tab--active {
@@ -82,7 +159,7 @@
 	height: 18px;
 	padding: 0 5px;
 	border-radius: 9px;
-	background: #f0f0f0;
+	background: #f0f0f1;
 	font-size: 11px;
 	font-weight: 600;
 	color: #646970;
@@ -91,6 +168,70 @@
 .perflocale-addons-tab--active .perflocale-addons-tab__count {
 	background: #dbeafe;
 	color: #1e40af;
+}
+
+/* Below a wide desktop, buy back the few pixels that decide whether the strip
+   fits at all. Measured at a 1280px viewport the admin content area is 1078px
+   and the strip wanted 1102px — it overflowed by 24px, which would have put a
+   scroll bar under the row for the sake of nothing. Trimming 3px of horizontal
+   padding per tab returns 60px and the whole strip fits. Sizes only; the design
+   is untouched. */
+@media screen and (max-width: 1400px) {
+	.perflocale-addons-tab {
+		padding: 10px 13px;
+	}
+}
+
+/* Phones and small tablets. Here the strip genuinely cannot fit — it wants
+   ~1000px against a ~370px viewport — so it scrolls, and the indicator is the
+   affordance that says so. Tighten the rhythm to show more at rest and keep the
+   type at full size rather than shrinking it. */
+@media screen and (max-width: 782px) {
+	.perflocale-addons-tabs-wrap {
+		margin: 12px 0;
+	}
+
+	.perflocale-addons-tab {
+		padding: 10px 12px;
+	}
+}
+
+/* ⭐ DESKTOP: NO DRAWN INDICATOR.
+   The bar below the tabs is a TOUCH affordance — it exists because iOS and
+   Android hide their scrollbars at rest, so a phone user gets no hint that the
+   strip continues. A pointer user does not have that problem: the native
+   scrollbar appears on hover/scroll, shift+wheel works, and a permanent grey
+   bar under the tabs just reads as clutter on a wide screen.
+   So above tablet width the drawn indicator is hidden and the native scrollbar
+   is handed back its job — which means it still appears if the window really is
+   too narrow for the strip, and never appears when the strip fits. */
+@media screen and (min-width: 1025px) {
+	.perflocale-addons-tabs-bar,
+	.perflocale-addons-tabs-bar.is-visible {
+		display: none;
+	}
+
+	.perflocale-addons-tabs-scroll {
+		scrollbar-width: thin;
+		scrollbar-color: #c3c4c7 transparent;
+		-ms-overflow-style: auto;
+	}
+
+	/* The scroller is a separate element from the strip, so a native bar is laid
+	   out BELOW the baseline rather than between the tabs and their underline. */
+	.perflocale-addons-tabs-scroll::-webkit-scrollbar {
+		display: block;
+		height: 8px;
+	}
+
+	.perflocale-addons-tabs-scroll::-webkit-scrollbar-track { background: transparent; }
+
+	.perflocale-addons-tabs-scroll::-webkit-scrollbar-thumb {
+		background: #c3c4c7;
+		border-radius: 4px;
+	}
+
+	.perflocale-addons-tabs-scroll::-webkit-scrollbar-thumb:hover { background: #a7aaad; }
 }
 
 .perflocale-addons-grid {

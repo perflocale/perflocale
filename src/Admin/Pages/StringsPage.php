@@ -203,12 +203,12 @@ final class StringsPage {
 				<h1 class="wp-heading-inline" style="margin:0;padding:0;line-height:1;"><?php echo esc_html__( 'String Translations', 'perflocale' ); ?></h1>
 
 				<?php if ( ! empty( $non_default_langs ) ) : ?>
-					<details class="perflocale-page-action" data-perflocale-popover style="position:relative;margin:0;">
+					<details class="perflocale-page-action perflocale-popover" data-perflocale-popover>
 						<summary class="button perflocale-btn-icon perflocale-btn-icon--md" style="cursor:pointer;list-style:none;">
 							<span class="dashicons dashicons-download"></span>
 							<?php echo esc_html__( 'Export PO', 'perflocale' ); ?>
 						</summary>
-						<form method="post" action="<?php echo esc_url( $base_url ); ?>" style="position:absolute;left:0;top:calc(100% + 6px);background:#fff;border:1px solid #c3c4c7;border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.08);padding:14px;min-width:240px;z-index:10;">
+						<form method="post" action="<?php echo esc_url( $base_url ); ?>" class="perflocale-popover__panel">
 							<?php wp_nonce_field( 'perflocale_strings_po_export' ); ?>
 							<input type="hidden" name="perflocale_strings_action" value="po_export">
 							<p style="margin:0 0 6px;"><strong><?php echo esc_html__( 'Export translations as PO', 'perflocale' ); ?></strong></p>
@@ -224,12 +224,12 @@ final class StringsPage {
 						</form>
 					</details>
 
-					<details class="perflocale-page-action" data-perflocale-popover style="position:relative;margin:0;">
+					<details class="perflocale-page-action perflocale-popover" data-perflocale-popover>
 						<summary class="button perflocale-btn-icon perflocale-btn-icon--md" style="cursor:pointer;list-style:none;">
 							<span class="dashicons dashicons-upload"></span>
 							<?php echo esc_html__( 'Import PO', 'perflocale' ); ?>
 						</summary>
-						<form method="post" action="<?php echo esc_url( $base_url ); ?>" enctype="multipart/form-data" style="position:absolute;left:0;top:calc(100% + 6px);background:#fff;border:1px solid #c3c4c7;border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,.08);padding:14px;min-width:280px;z-index:10;">
+						<form method="post" action="<?php echo esc_url( $base_url ); ?>" enctype="multipart/form-data" class="perflocale-popover__panel perflocale-popover__panel--wide">
 							<?php wp_nonce_field( 'perflocale_strings_po_import' ); ?>
 							<input type="hidden" name="perflocale_strings_action" value="po_import">
 							<p style="margin:0 0 6px;"><strong><?php echo esc_html__( 'Import PO file', 'perflocale' ); ?></strong></p>
@@ -261,7 +261,7 @@ final class StringsPage {
 							<p style="margin:-2px 0 8px;font-size:11px;color:#646970;">
 								<?php
 								printf(
-									/* translators: %s: largest PO file this site accepts, e.g. "2 MB". */
+									/* translators: %s: largest file this site accepts for upload, e.g. "2 MB". */
 									esc_html__( 'Maximum file size: %s.', 'perflocale' ),
 									esc_html( $po_upload_ceiling )
 								);
@@ -1261,7 +1261,12 @@ final class StringsPage {
 		$option = $screen ? $screen->get_option( 'per_page', 'option' ) : '';
 		$val    = $option ? (int) get_user_meta( $user, $option, true ) : 0;
 
-		return $val > 0 ? $val : 20;
+		// ⚠️ Clamp on READ. The save-time ceiling cannot touch values stored
+		// BEFORE it existed: measured with max_input_vars=64 (ceiling 25), a
+		// stored 777 still drove posts_per_page=777 and rendered every row.
+		// The protection has to sit where the value is USED. The stored
+		// preference is deliberately not rewritten - only the effective value.
+		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
 	}
 
 	/**

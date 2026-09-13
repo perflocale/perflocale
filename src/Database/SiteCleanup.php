@@ -734,11 +734,25 @@ final class SiteCleanup {
 	private static function delete_options_like( string $like_pattern ): void {
 		global $wpdb;
 
+		// ⚠️ `_` IS A SINGLE-CHARACTER WILDCARD IN LIKE. Every pattern in
+		// OPTION_PATTERNS contains underscores — `perflocale_lock_%` also
+		// matches `perflocaleXlockY...`, so the DELETE reached further than the
+		// pattern says. Nothing is known to have been lost (no other plugin
+		// ships an option that close to ours), but a cleanup routine must
+		// delete exactly what it claims to.
+		//
+		// Escape the literal underscores while PRESERVING the intended `%`:
+		// split on `%`, escape each piece, rejoin. `esc_like()` on the whole
+		// string would escape the trailing `%` too and match nothing. No
+		// branch, and it matches the semantics the gate's orphan-data audit
+		// has always modelled.
+		$escaped = implode( '%', array_map( [ $wpdb, 'esc_like' ], explode( '%', $like_pattern ) ) );
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$names = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
-				$like_pattern
+				$escaped
 			)
 		);
 

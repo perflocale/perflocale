@@ -196,8 +196,28 @@ final class BulkTranslateJob extends AbstractJob {
 		// fresh map once.
 		\PerfLocale\Database\Repository\TranslationGroupRepository::suspend_eager_link_map();
 
+		// ⭐ SOURCE-BOUNDARY YIELD. SiteTranslateJob needs to stop on a wall
+		// clock while keeping a resumable, source-atomic cursor. It used to get
+		// that by calling execute() ONCE PER SOURCE — which re-ran everything
+		// above per source and measured 10.55x slower on an all-skip chunk
+		// (120ms/274 queries -> 1,267ms/1,809 queries for 50 sources), because
+		// each call rebuilt the service objects, re-primed, recomputed the
+		// progress threshold against a 10-pair total (so every row ticked), and
+		// ran its own suspend/resume/invalidate cycle: 300 eager-option SELECTs
+		// plus 50 INSERTs and 50 DELETEs.
+		//
+		// Yielding from INSIDE the loop keeps one context, one prime, one
+		// progress policy and one eager-map lifecycle, and still checkpoints
+		// only on a fully-processed source.
+		//
+		// ⚠️ Do NOT instead wrap an outer suspend_eager_link_map() around
+		// repeated calls: suspend/resume set a BOOLEAN, not a nesting counter,
+		// so the inner resume would end the outer scope early.
+		$yield  = $args['yield_after_source'] ?? null;
+		$cursor = 0;
+
 		try {
-			$this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error );
+			$this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error, is_callable( $yield ) ? $yield : null, $cursor );
 		} finally {
 			\PerfLocale\Database\Repository\TranslationGroupRepository::resume_eager_link_map();
 			\PerfLocale\Plugin::get_instance()->get( 'group_repo' )->invalidate_eager_link_map();
@@ -208,6 +228,8 @@ final class BulkTranslateJob extends AbstractJob {
 			'skipped'     => $skipped,
 			'failed'      => $failed,
 			'first_error' => $first_error,
+			'cursor'      => $cursor,
+			'processed'   => $processed,
 		];
 	}
 
@@ -229,9 +251,13 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param int                       $skipped     Running skipped count (by ref).
 	 * @param int                       $failed      Running failed count (by ref).
 	 * @param string                    $first_error First error message (by ref).
+	 * @param callable|null             $yield       Called with the just-completed
+	 *                                               source id; returning true stops
+	 *                                               the loop at that boundary.
+	 * @param int                       $cursor      Last FULLY processed source id (by ref).
 	 * @return void
 	 */
-	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, object $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error ): void {
+	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, object $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0 ): void {
 		// `perflocale_use_mt` is the capability that authorises SPENDING the
 		// provider; `perflocale_manage_translations` — the one WorkerRegistry
 		// re-validates at worker time — only authorises running the job. A queued
@@ -260,6 +286,15 @@ final class BulkTranslateJob extends AbstractJob {
 				$skipped   += count( $target_ids );
 				$processed += count( $target_ids );
 				$tick( $processed );
+
+				// A source skipped for permissions is still FULLY processed —
+				// the cursor must pass it or the chain re-reads it forever.
+				$cursor = (int) $source_id;
+
+				if ( $yield !== null && $yield( (int) $source_id, $processed ) ) {
+					return;
+				}
+
 				continue;
 			}
 
@@ -426,6 +461,14 @@ final class BulkTranslateJob extends AbstractJob {
 
 				++$processed;
 				$tick( $processed );
+			}
+
+			// Every target for this source has been attempted — only now is it
+			// safe to move the cursor past it.
+			$cursor = (int) $source_id;
+
+			if ( $yield !== null && $yield( (int) $source_id, $processed ) ) {
+				return;
 			}
 		}
 	}

@@ -2107,7 +2107,25 @@ final class UrlConverter {
 		}
 
 		// Only act on query-string URLs (?page_id=X or ?p=X).
-		if ( strpos( $url, 'page_id=' ) === false && strpos( $url, 'p=' ) === false ) {
+		//
+		// ⚠️ This MUST parse the query and test the actual keys. A substring
+		// test for 'p=' matches the tail of any parameter whose name ends in
+		// "p" — and WooCommerce variation links are built from attribute
+		// parameters, so `?attribute_pa_group=large` (…"grou p=") matched and
+		// every variation URL on the store was rewritten to a fabricated
+		// /product_variation/<slug>/ path that 404s. Same for top, grip, cup,
+		// strap, wrap, step, map. This runs from `filter_post_type_link`, so
+		// it reached shop loops, the cart, order emails, schema and sitemaps.
+		$query = (string) wp_parse_url( $url, PHP_URL_QUERY );
+
+		if ( $query === '' ) {
+			return $url;
+		}
+
+		$args = [];
+		wp_parse_str( $query, $args );
+
+		if ( ! isset( $args['p'] ) && ! isset( $args['page_id'] ) ) {
 			return $url;
 		}
 
@@ -2131,9 +2149,27 @@ final class UrlConverter {
 		}
 
 		// Posts / CPTs: use the permalink structure to build the URL.
-		$struct = $post->post_type === 'post'
-			? get_option( 'permalink_structure' )
-			: get_option( $post->post_type . '_permalink_structure', '/' . $post->post_type . '/%postname%/' );
+		//
+		// ⚠️ Do not invent a structure for a custom post type. The previous
+		// default of '/<post_type>/%postname%/' produced a path with no
+		// matching rewrite rule whenever the type was registered with
+		// `rewrite => false` or a custom slug — a clean-looking URL that 404s.
+		// Ask WP_Rewrite what the type actually registered, and when it has no
+		// permastruct leave the query-string URL alone: an ugly URL that works
+		// beats a pretty one that does not.
+		if ( $post->post_type === 'post' ) {
+			$struct = (string) get_option( 'permalink_structure' );
+		} else {
+			$struct = (string) get_option( $post->post_type . '_permalink_structure', '' );
+
+			if ( $struct === '' ) {
+				global $wp_rewrite;
+
+				$struct = ( $wp_rewrite instanceof \WP_Rewrite )
+					? (string) $wp_rewrite->get_extra_permastruct( $post->post_type )
+					: '';
+			}
+		}
 
 		if ( ! str_contains( $struct, '%postname%' ) ) {
 			return $url;

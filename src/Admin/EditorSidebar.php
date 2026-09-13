@@ -32,12 +32,103 @@ final class EditorSidebar {
 	}
 
 	/**
+	 * Enqueue the Site Editor translations panel.
+	 *
+	 * Templates and template parts cannot be opened in the post editor, so
+	 * before this they were the only translatable objects with no in-editor way
+	 * to see or reach their translations — which is exactly where the question
+	 * arises, since a template's translations are otherwise invisible until you
+	 * leave for the Translations screen.
+	 *
+	 * The panel resolves the edited entity CLIENT-SIDE. The Site Editor is a
+	 * single-page app: the operator moves between the 404 template, the header
+	 * part and back with no reload, so anything localised here would describe
+	 * whichever entity happened to be open first. Only the static configuration
+	 * is passed across; the script subscribes to `core/editor` for the rest.
+	 *
+	 * Reads through the existing `perflocale/v1/translations/post/<id>` route,
+	 * which already gates on `edit_post` for the specific object — so this adds
+	 * no new capability surface, and a user who cannot edit a template cannot
+	 * enumerate its translations either.
+	 *
+	 * @return void
+	 */
+	private function enqueue_site_editor_sidebar(): void {
+		$settings   = \PerfLocale\Plugin::get_instance()->get( 'settings' );
+		$post_types = $settings->get_translatable_post_types();
+
+		// Only the types the Site Editor can actually open. Ordinary types are
+		// served by the post-editor panel; listing them here would register a
+		// panel that never renders.
+		$site_editor_types = array_values(
+			array_intersect(
+				$post_types,
+				[ 'wp_template', 'wp_template_part', 'wp_block', 'wp_navigation' ]
+			)
+		);
+
+		// Nothing the Site Editor edits is translatable on this site — for
+		// example Full Site Editing is off — so ship no script at all.
+		if ( $site_editor_types === [] ) {
+			return;
+		}
+
+		wp_enqueue_script(
+			'perflocale-site-editor-sidebar',
+			PERFLOCALE_URL . 'assets/js/site-editor-sidebar.js',
+			[ 'wp-plugins', 'wp-editor', 'wp-element', 'wp-data', 'wp-api-fetch', 'wp-i18n' ],
+			PERFLOCALE_VERSION,
+			true
+		);
+
+		wp_set_script_translations( 'perflocale-site-editor-sidebar', 'perflocale' );
+
+		wp_localize_script(
+			'perflocale-site-editor-sidebar',
+			'perflocaleSiteEditor',
+			[
+				'postTypes' => $site_editor_types,
+				'i18n'      => [
+					'panelTitle'    => __( 'Translations', 'perflocale' ),
+					'current'       => __( 'Current', 'perflocale' ),
+					'published'     => __( 'Published', 'perflocale' ),
+					'draft'         => __( 'Draft', 'perflocale' ),
+					'trashed'       => __( 'Trashed', 'perflocale' ),
+					'none'          => __( 'None', 'perflocale' ),
+					'edit'          => __( 'Edit', 'perflocale' ),
+					'loading'       => __( 'Loading...', 'perflocale' ),
+					'loadError'     => __( 'Could not load translations.', 'perflocale' ),
+					'draftHint'     => __( 'Not used until published - the original renders instead.', 'perflocale' ),
+					'notCustomised' => __( 'This still comes from the theme. Save a change to customise it, then its translations appear here.', 'perflocale' ),
+				],
+			]
+		);
+
+		wp_enqueue_style(
+			'perflocale-editor-sidebar',
+			PERFLOCALE_URL . 'assets/css/editor-sidebar.css',
+			[],
+			PERFLOCALE_VERSION
+		);
+	}
+
+	/**
 	 * Enqueue the sidebar script for the block editor.
 	 *
 	 * @return void
 	 */
 	public function enqueue_sidebar(): void {
 		$screen = get_current_screen();
+
+		// The Site Editor is a different editor with a different screen base and
+		// a different lifecycle — the edited entity changes without a reload —
+		// so it gets its own, much smaller panel rather than being forced
+		// through this one.
+		if ( $screen && $screen->base === 'site-editor' ) {
+			$this->enqueue_site_editor_sidebar();
+
+			return;
+		}
 
 		if ( ! $screen || $screen->base !== 'post' ) {
 			return;

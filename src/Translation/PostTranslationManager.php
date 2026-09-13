@@ -234,6 +234,37 @@ final class PostTranslationManager {
 	 *                   acquisition, or false on failure.
 	 */
 	private function do_create_translation( int $source_id, string $target_slug, bool $copy_content, SourceType $source ): int|false {
+		// ⭐ A TEMPLATE TRANSLATION ALWAYS STARTS FROM THE SOURCE'S BLOCKS.
+		//
+		// For a post, starting empty is a defensible default: the translator
+		// writes fresh prose and an empty draft is simply unfinished. A
+		// template is not prose, it is STRUCTURE — the header part, the query
+		// loop, the 404 pattern — and the translatable part is the text sitting
+		// inside that structure. Handing the operator a blank canvas asks them
+		// to rebuild the whole layout by hand before they can translate a word.
+		//
+		// Worse, it fails DESTRUCTIVELY. The empty-content guard in
+		// BlockTemplateTranslator only rescues a translation that is still
+		// empty; the moment somebody types one paragraph into that blank
+		// template and publishes it, it becomes the layout for that language.
+		// Measured on a real site: a 404 template whose German translation had
+		// been created empty and then given a single line of text rendered
+		// 45,853 bytes with NO header and NO footer, against 108,929 bytes with
+		// both on the source language. The page did not look untranslated, it
+		// looked broken.
+		//
+		// So the flag is overridden rather than respected for these two types.
+		// Every caller benefits — the Generate Missing Translations button, the
+		// REST/abilities API, WP-CLI — and none of them has a reason to want an
+		// empty template.
+		if ( ! $copy_content ) {
+			$source_type = get_post_type( $source_id );
+
+			if ( is_string( $source_type ) && BlockTemplateSupport::is_template_type( $source_type ) ) {
+				$copy_content = true;
+			}
+		}
+
 		// Re-check existing INSIDE the lock. A sibling worker can have
 		// created the same translation between the public method's
 		// fast-path check and us reaching here; if so, return that

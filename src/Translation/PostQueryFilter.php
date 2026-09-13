@@ -38,6 +38,114 @@ final class PostQueryFilter {
 	private readonly Settings $settings;
 
 	/**
+	 * Post types that must NEVER be language-scoped by a query filter, even
+	 * when the operator has marked them translatable.
+	 *
+	 * ⭐ WHY. Block templates are INFRASTRUCTURE resolved by SLUG, not content
+	 * browsed by language. Core looks a template up by `post_name` + a
+	 * `wp_theme` term and expects exactly one answer; it has no notion of a
+	 * language variant. Language-scoping that lookup does not filter it, it
+	 * BREAKS it.
+	 *
+	 * ⚠️ The failure is worse than "the translation is not used". Measured on a
+	 * real request: with `wp_template_part` marked translatable, a customised
+	 * header VANISHED on every non-default language and core silently fell back
+	 * to the theme FILE — and it did so with NO TRANSLATION INVOLVED AT ALL.
+	 * The non-strict WHERE below admits a post when its link row matches the
+	 * current language OR when it has no link row; a customised part tagged in
+	 * the default language by `Bootstrap::auto_assign_default_language()`
+	 * satisfies neither on `/de/`. So it is dropped for being LINKED, not for
+	 * being TRANSLATED. This cost a complete, working implementation of
+	 * template translation, which was built, proved, and then backed out.
+	 *
+	 * ⭐ `wp_navigation` is here for the same reason, and its failure is the
+	 * worst of the set because core REACTS to the empty result by WRITING.
+	 * A `<!-- wp:navigation /-->` block with no `ref` — the stock header in
+	 * TT3/TT4 — falls through to
+	 * `WP_Navigation_Fallback::get_most_recently_published_navigation()`,
+	 * which is a plain `new WP_Query( [ 'post_type' => 'wp_navigation',
+	 * 'post_status' => 'publish' ] )` (wp-includes/class-wp-navigation-fallback.php
+	 * :110-123). Once the menu carries a default-language link row that query
+	 * returns ZERO on every other language — measured on a real site: menu #7
+	 * came back on `/`, and `[]` on both `/de/` and `/pl/`.
+	 *
+	 * `get_fallback()` (:70-100) then calls `create_classic_menu_fallback()` or
+	 * `create_default_fallback()`, both of which `wp_insert_post()` a PUBLISHED
+	 * `wp_navigation` — with no capability check and no `is_admin()` guard, on
+	 * an anonymous front-end GET. So the scoped lookup does not merely lose the
+	 * menu: it makes every uncached non-default-language pageview mint a junk
+	 * menu row, and because that new row is unlinked it is visible in EVERY
+	 * language and wins `ORDER BY date DESC` — displacing the real menu on the
+	 * default language too.
+	 *
+	 * Nothing is lost by exempting it: the `ref` path is `get_post( $ref )` and
+	 * was never scoped, and `BlockRefTranslator` (`core/navigation` =>
+	 * `wp_navigation`) already swaps that ref to the translation at render
+	 * time. Scoping the type added no translation and only broke the fallback.
+	 *
+	 * Memoised: `filter_by_language()` runs on essentially every WP_Query in
+	 * the request, so this must not re-run `apply_filters` each time.
+	 *
+	 * ⚠️ KEYED BY BLOG, and an earlier version of this docblock argued the
+	 * opposite — that "one instance per request inside the DI container" made
+	 * an instance memo blog-safe. That is backwards: surviving the whole
+	 * request is exactly WHY the instance is not blog-safe, because it also
+	 * survives switch_to_blog(). An instance memo is only blog-safe when the
+	 * memoised value is blog-independent, and this one is not: it is whatever
+	 * `perflocale/query/never_scoped_post_types` returns, and on multisite the
+	 * filter's callbacks differ per site for the most ordinary reason there is
+	 * — an addon active on one subsite and not another. CF7 active on blog 1
+	 * alone put `wpcf7_contact_form` in the list for blog 2 as well.
+	 *
+	 * Measured on the frozen candidate: a site-dependent filter exempting a
+	 * type on blog 1 only still exempted it on blog 2, which returned the
+	 * English source on a German request until the memo was reset.
+	 *
+	 * The default list IS blog-independent, so the leak needs a site-dependent
+	 * filter to show — but that filter is public API this release introduced.
+	 *
+	 * @var array<int, array<int, string>>
+	 */
+	private array $never_scoped_memo = [];
+
+	/**
+	 * @return array<int, string>
+	 */
+	private function never_scoped_post_types(): array {
+		// One global read plus an absint on the hottest query path in the
+		// plugin. Cheaper than the apply_filters() it avoids by orders of
+		// magnitude, and on single site it is always the same key.
+		$blog_id = get_current_blog_id();
+
+		if ( isset( $this->never_scoped_memo[ $blog_id ] ) ) {
+			return $this->never_scoped_memo[ $blog_id ];
+		}
+
+		/**
+		 * Filter the post types that are never language-scoped.
+		 *
+		 * @hook  perflocale/query/never_scoped_post_types
+		 * @since 1.0.5
+		 *
+		 * @param array<int, string> $types Post type slugs.
+		 * @return array<int, string>
+		 */
+		$this->never_scoped_memo[ $blog_id ] = array_values(
+			array_unique(
+				array_map(
+					'strval',
+					(array) apply_filters(
+						'perflocale/query/never_scoped_post_types',
+						[ 'wp_template', 'wp_template_part', 'wp_global_styles', 'wp_navigation' ]
+					)
+				)
+			)
+		);
+
+		return $this->never_scoped_memo[ $blog_id ];
+	}
+
+	/**
 	 * Whether a fallback post was loaded by resolve_duplicate_slug().
 	 *
 	 * Set when the current language has no translation and the default-language
@@ -1200,9 +1308,32 @@ final class PostQueryFilter {
 		// losing the visitor's language even when a sibling translation
 		// exists. Let the object load; the template_redirect handlers apply
 		// the configured language behavior (sibling redirect / fallback / 404).
+		// ⭐ `p` / `page_id` are exempt on ANY query, not just the main one.
+		// Naming an id is naming an id: such a query can only ever return the
+		// one object the caller already identified, so the language WHERE
+		// cannot filter it — it can only delete it. Nothing is leaked either,
+		// because the caller had to hold the id already, exactly as with the
+		// unfiltered `get_post( $id )`.
+		//
+		// This used to require is_main_query(), and that broke WooCommerce's
+		// block-theme single-product template. After the main query has loaded
+		// the product (including via PerfLocale's own default-language
+		// fallback), `ClassicTemplate::render_single_product()` re-queries it in
+		// a SECONDARY query —
+		//   new \WP_Query( [ 'post_type' => 'product', 'p' => get_the_ID() ] )
+		// (woocommerce/src/Blocks/BlockTypes/ClassicTemplate.php:260-265) — and
+		// loops `while ( have_posts() )` with NO else branch. Scoped, that
+		// query returned zero rows on every non-default language, so the header,
+		// breadcrumb and footer rendered while the entire product body — title,
+		// gallery, price, add-to-cart, tabs — silently disappeared.
+		//
+		// `is_attachment` stays main-query-only on purpose: it is a resolved
+		// query FLAG, not an id the caller named, so it does not carry the same
+		// "you already have this object" guarantee.
 		if (
-			$query->is_main_query()
-			&& ( (int) $query->get( 'p' ) > 0 || (int) $query->get( 'page_id' ) > 0 || $query->is_attachment )
+			(int) $query->get( 'p' ) > 0
+			|| (int) $query->get( 'page_id' ) > 0
+			|| ( $query->is_main_query() && $query->is_attachment )
 		) {
 			return;
 		}
@@ -1222,6 +1353,13 @@ final class PostQueryFilter {
 		// (e.g. product_variation). They must not be filtered independently.
 		$child_types = apply_filters( 'perflocale/query/child_post_types', [ 'product_variation' ] );
 		$post_type   = array_diff( (array) $post_type, $child_types );
+
+		// Infrastructure types are resolved by slug, never browsed by language.
+		// This is the site that hid a customised template part on every
+		// non-default language — see never_scoped_post_types(). Deliberately
+		// NOT folded into $child_types above: that seam means "inherits its
+		// language from a parent", and a template has no parent.
+		$post_type = array_diff( $post_type, $this->never_scoped_post_types() );
 
 		$translatable = $this->settings->get_translatable_post_types();
 
@@ -1578,7 +1716,14 @@ final class PostQueryFilter {
 		// same language-neutral URL in every context. Excluding them would
 		// drop, e.g., a non-translatable CPT from the block-editor link picker
 		// on a translated post even though linking to it is correct.
-		$translatable = $this->settings->get_translatable_post_types();
+		// Subtracting the never-scoped types here is what puts them INSIDE the
+		// strict-mode escape hatch below ("...OR post_type NOT IN (list)"), so a
+		// strict caller admits them unconditionally. Exempting site 1226 alone
+		// is NOT enough: a strict caller sets the language id itself, so this
+		// clause is reached without ever passing through filter_by_language().
+		$translatable = array_values(
+			array_diff( $this->settings->get_translatable_post_types(), $this->never_scoped_post_types() )
+		);
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $alias is a hardcoded string constant, not user input.
 		if ( $strict ) {
 			if ( $translatable !== [] ) {
@@ -2365,8 +2510,11 @@ final class PostQueryFilter {
 			}
 		}
 
-		$fallbacks = $this->settings->get_language_fallbacks();
-		$chain     = $fallbacks[ $current_slug ] ?? [];
+		// 'post_query' context — deliberately distinct from 'strings': serving
+		// another language's POST in place of a missing one is a much stronger
+		// claim than borrowing a UI string, and a site may well want one and
+		// not the other. The chain is memoised per context inside Settings.
+		$chain = $this->settings->get_fallback_chain( (string) $current_slug, 'post_query' );
 
 		if ( $chain !== [] ) {
 			// One translation-group lookup up front; the walk is pure

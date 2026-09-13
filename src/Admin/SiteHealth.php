@@ -2395,7 +2395,7 @@ final class SiteHealth {
 				) ),
 				'' !== $last_error
 					? '<p>' . sprintf(
-						/* translators: %s: the most recent error recorded against a failed job. */
+						/* translators: %s: the most recent error message recorded, e.g. for a failed job or a webhook delivery. */
 						esc_html__( 'Most recent error: %s', 'perflocale' ),
 						'<code>' . esc_html( mb_substr( $last_error, 0, 200 ) ) . '</code>'
 					) . '</p>'
@@ -3295,7 +3295,7 @@ final class SiteHealth {
 				) ),
 				$items,
 				sprintf(
-					/* translators: %s: the most recent error message recorded for a webhook delivery. */
+					/* translators: %s: the most recent error message recorded, e.g. for a failed job or a webhook delivery. */
 					esc_html__( 'Most recent error: %s', 'perflocale' ),
 					'<code>' . esc_html( (string) ( $last['error'] ?? '' ) ) . '</code>'
 				)

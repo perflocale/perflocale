@@ -169,3 +169,50 @@ a.perflocale-panel-status:hover {
 		transform: rotate(-360deg);
 	}
 }
+
+/* ---- Site Editor panel ----
+   Templates and template parts are edited in the Site Editor, which the
+   post-editor panel never reached. The rows reuse the classes above; these add
+   the status colours and the one line that matters most in this context — a
+   draft template is IGNORED and the original renders instead, which is invisible
+   from the canvas. */
+.perflocale-panel-status--published {
+	background: #edfaef;
+	color: #0a7227;
+}
+
+.perflocale-panel-status--draft {
+	background: #fcf3e3;
+	color: #8a5a00;
+}
+
+.perflocale-panel-status--none {
+	background: #f0f0f1;
+	color: #646970;
+}
+
+/* The row switches to a column so the hint sits under the language rather than
+   squeezing the badge off the edge of a narrow sidebar. */
+.perflocale-site-editor-panel .perflocale-panel-row__info {
+	flex-wrap: wrap;
+}
+
+.perflocale-panel-hint {
+	flex-basis: 100%;
+	margin-top: 2px;
+	font-size: 11px;
+	line-height: 1.4;
+	color: #646970;
+}
+
+/* With a hint under the language the row is two lines tall, and the shared
+   `align-items: center` floated the Edit link into the middle of the hint text.
+   Top-align it so it sits on the language/badge line where it belongs. */
+.perflocale-site-editor-panel .perflocale-panel-row {
+	align-items: flex-start;
+	gap: 8px;
+}
+
+.perflocale-site-editor-panel .perflocale-panel-row__action {
+	margin-top: 1px;
+}

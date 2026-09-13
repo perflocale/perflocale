@@ -3,7 +3,7 @@
  * Plugin Name: PerfLocale
  * Plugin URI: https://perflocale.com
  * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs without slowing your site down.
- * Version: 1.0.4
+ * Version: 1.0.5
  * Requires at least: 6.4
  * Tested up to: 7.1
  * Requires PHP: 8.1
@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ---- Plugin constants ----
 
-define( 'PERFLOCALE_VERSION', '1.0.4' );
+define( 'PERFLOCALE_VERSION', '1.0.5' );
 define( 'PERFLOCALE_FILE', __FILE__ );
 define( 'PERFLOCALE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );
@@ -313,8 +313,20 @@ add_action(
 // uses the same integer-coerce save logic. One closure reused across the
 // four hooks - no repeated callback allocation, single place to audit.
 $perflocale_per_page_save = static function ( $status, $option, $value ) {
-	return absint( $value );
+	// (int), not absint(): absint( -5 ) is 5, so a negative request used to
+	// be saved as a positive row count instead of being rejected.
+	$value = (int) $value;
+
+	if ( $value < 1 ) {
+		return $status;
+	}
+
+	// ONE ceiling, shared with every screen's READ path - see
+	// Helper::normalize_per_page(). Capping only on save left previously
+	// stored oversized values driving the query untouched.
+	return min( $value, \PerfLocale\Helper::per_page_ceiling( (string) $option ) );
 };
+
 
 add_filter( 'set_screen_option_perflocale_strings_per_page', $perflocale_per_page_save, 10, 3 );
 add_filter( 'set_screen_option_perflocale_languages_per_page', $perflocale_per_page_save, 10, 3 );

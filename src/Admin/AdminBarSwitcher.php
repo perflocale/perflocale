@@ -333,7 +333,7 @@ final class AdminBarSwitcher {
 						continue;
 					}
 
-					$url = get_edit_post_link( (int) $link->object_id, 'raw' );
+					$url = \PerfLocale\Admin\ObjectLinks::edit_url( (int) $link->object_id );
 				} else {
 					if ( ! current_user_can( 'edit_term', (int) $link->object_id ) ) {
 						continue;

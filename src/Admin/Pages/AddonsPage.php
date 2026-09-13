@@ -208,7 +208,18 @@ final class AddonsPage {
 			],
 			'gravity-forms'       => [
 				'name'        => 'Gravity Forms',
-				'description' => __( 'Translate form labels, descriptions, choices, and confirmations.', 'perflocale' ),
+				// ⚠️ Deliberately worded differently from the Contact Form 7 and
+				// WPForms cards. Those two create a translation POST you edit in
+				// the host's own builder. Gravity Forms keeps its forms in its
+				// own gf_form* tables — a GF form id is not a post id — so there
+				// is no translation record and no screen to edit one. The addon
+				// applies translations at render (gform_pre_render /
+				// _pre_validation / _pre_submission_filter), but the translations
+				// themselves have to be supplied by the operator through the
+				// `perflocale/gravity_forms/form_translations` filter or
+				// save_translations(). The old copy promised the same experience
+				// as the other two form addons and there was nothing behind it.
+				'description' => __( 'Apply translated labels, choices, and confirmations at render time. Supplied by filter or API - Gravity Forms keeps forms in its own tables, so there is no per-language form editor.', 'perflocale' ),
 				'category'    => 'forms',
 				'icon'        => 'dashicons-feedback',
 				'requires'    => __( 'Gravity Forms plugin', 'perflocale' ),
@@ -549,7 +560,20 @@ final class AddonsPage {
 				<?php echo esc_html__( 'Addons activate automatically when their required plugin or theme is detected. No manual installation needed.', 'perflocale' ); ?>
 			</p>
 
-			<!-- Category & Status Tabs -->
+			<!--
+				Category & Status Tabs.
+
+				Two elements, on purpose. The OUTER div is the horizontal
+				scroller; the INNER div is the tab strip and carries the 2px
+				baseline that the selected tab's underline merges into. Putting
+				both jobs on one element cannot work: a visible scrollbar is
+				laid out inside the scroll container, so it would sit between
+				the tabs and their own baseline and break the join the design is
+				built on. Split this way the order is tabs -> baseline ->
+				scrollbar, which is what a scrolling tab strip should look like.
+			-->
+			<div class="perflocale-addons-tabs-wrap">
+			<div class="perflocale-addons-tabs-scroll">
 			<div class="perflocale-addons-tabs">
 				<?php
 				// Category tabs - clicking a category clears the active filter.
@@ -616,6 +640,19 @@ final class AddonsPage {
 					<?php echo esc_html__( 'Inactive', 'perflocale' ); ?>
 					<span class="perflocale-addons-tab__count"><?php echo esc_html( (string) $inactive_count ); ?></span>
 				</a>
+			</div>
+			</div>
+				<?php
+				// Scroll indicator. Drawn by us rather than left to the native
+				// scrollbar: iOS and Android render scrollbars as transient
+				// overlays and iOS ignores ::-webkit-scrollbar entirely, so a
+				// native bar cannot be made to stay visible on the devices that
+				// actually need the hint. aria-hidden because it is decorative —
+				// the strip is already reachable by keyboard through the tabs
+				// themselves. It stays hidden until JS measures an overflow, so
+				// with JS off nothing misleading is drawn.
+				?>
+				<div class="perflocale-addons-tabs-bar" aria-hidden="true"><span></span></div>
 			</div>
 
 			<!-- Addon Cards -->

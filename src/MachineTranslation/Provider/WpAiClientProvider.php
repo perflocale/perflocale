@@ -424,8 +424,9 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * The returned callable normalises the WP 7.0 fluent-builder pattern
 	 * to a simple `(string $prompt, array $args): string` signature so the
 	 * rest of this class doesn't need to know about the builder. Args keys
-	 * recognised (each gated by method_exists so a stripped / future
-	 * builder build can't fatal):
+	 * recognised (each gated by is_callable so a stripped / future
+	 * builder build can't fatal — see the ⚠️ note at the call site for why
+	 * method_exists is the WRONG guard here):
 	 *
 	 *   - `temperature`        → `->usingTemperature( float )`
 	 *   - `max_tokens`         → `->usingMaxTokens( int )`
@@ -488,23 +489,48 @@ final class WpAiClientProvider extends AbstractProvider {
 
 				// Builder methods mutate `$this` in-place and return $this
 				// for chaining (see WP_AI_Client_Prompt_Builder::__call —
-				// `return $this`). Don't reassign — the return type from
-				// each method-via-__call is mixed, which would widen
-				// $builder back to mixed and break the subsequent
-				// method_exists() narrowing. Calling for side-effect is
-				// equivalent because the underlying state lives on the
-				// same builder instance.
-				if ( isset( $args['temperature'] ) && is_numeric( $args['temperature'] ) && method_exists( $builder, 'usingTemperature' ) ) {
-					$builder->usingTemperature( (float) $args['temperature'] );
+				// `return $this`), so each option is applied for side-effect
+				// and the builder is never reassigned.
+				//
+				// ⚠️ The guard MUST be is_callable(), not method_exists().
+				// Core's WP_AI_Client_Prompt_Builder declares usingTemperature
+				// / usingMaxTokens / usingProvider / usingSystemInstruction as
+				// @method docblock entries only and routes them through
+				// __call(), so method_exists() answers FALSE for every one of
+				// them on the only builder that ships in WordPress. Guarding
+				// with it therefore dropped EVERY option silently: translations
+				// ran at the provider's default temperature instead of 0.2, and
+				// the `provider` / `model` routing that the
+				// perflocale/mt/wp_ai_client_args docblock tells site owners to
+				// use did nothing at all. is_callable() answers true for a
+				// magic method and false for a genuinely absent one, which is
+				// the question being asked. Found by
+				// tools/regression-tests/wp-ai-client-roundtrip.php C.6, which
+				// is the first test to drive core's real builder — the stubbed
+				// resolver in cov-machine-translation.php never touched it.
+				$apply = static function ( object $target, string $method, $value ): void {
+					if ( ! is_callable( [ $target, $method ] ) ) {
+						return;
+					}
+
+					// Invoked as an array callable rather than
+					// `$target->$method()` so static analysis does not have to
+					// resolve a dynamic method on a bare object.
+					$call = [ $target, $method ];
+					$call( $value );
+				};
+
+				if ( isset( $args['temperature'] ) && is_numeric( $args['temperature'] ) ) {
+					$apply( $builder, 'usingTemperature', (float) $args['temperature'] );
 				}
-				if ( isset( $args['max_tokens'] ) && is_int( $args['max_tokens'] ) && method_exists( $builder, 'usingMaxTokens' ) ) {
-					$builder->usingMaxTokens( $args['max_tokens'] );
+				if ( isset( $args['max_tokens'] ) && is_int( $args['max_tokens'] ) ) {
+					$apply( $builder, 'usingMaxTokens', $args['max_tokens'] );
 				}
-				if ( isset( $args['provider'] ) && is_string( $args['provider'] ) && $args['provider'] !== '' && method_exists( $builder, 'usingProvider' ) ) {
-					$builder->usingProvider( $args['provider'] );
+				if ( isset( $args['provider'] ) && is_string( $args['provider'] ) && $args['provider'] !== '' ) {
+					$apply( $builder, 'usingProvider', $args['provider'] );
 				}
-				if ( isset( $args['system_instruction'] ) && is_string( $args['system_instruction'] ) && $args['system_instruction'] !== '' && method_exists( $builder, 'usingSystemInstruction' ) ) {
-					$builder->usingSystemInstruction( $args['system_instruction'] );
+				if ( isset( $args['system_instruction'] ) && is_string( $args['system_instruction'] ) && $args['system_instruction'] !== '' ) {
+					$apply( $builder, 'usingSystemInstruction', $args['system_instruction'] );
 				}
 
 				// Call the SNAKE_CASE method. Core's WP_AI_Client_Prompt_Builder

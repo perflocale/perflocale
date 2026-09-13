@@ -55,6 +55,12 @@ final class AbilitiesRegistrar {
 			return;
 		}
 
+		// Idempotent for the same reason the abilities are — see the guards in
+		// the register_*() methods below.
+		if ( true === self::call_optional( 'wp_has_ability_category', 'perflocale-translation' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability_category',
 			'perflocale-translation',
 			[
@@ -76,10 +82,24 @@ final class AbilitiesRegistrar {
 			return;
 		}
 
+		// Read abilities: discovery and lookup only.
 		$this->register_list_languages();
 		$this->register_get_translations();
 		$this->register_detect_language();
 		$this->register_convert_url();
+
+		// ⚠️ WRITE abilities, gated separately and OFF by default.
+		// `translate-post` spends the site's machine-translation budget and
+		// `create-translation` creates posts. Both are capability-checked, so
+		// this is not a privilege boundary — it is a SURPRISE boundary: an
+		// agent acting for an administrator could legitimately do either, and
+		// the owner would have no idea it happened until the provider bill or
+		// the post list showed it.
+		/** @hook perflocale/abilities/write_enabled Enable the ABILITIES THAT WRITE. Default: the `abilities_write_enabled` setting. */
+		if ( ! apply_filters( 'perflocale/abilities/write_enabled', (bool) $this->plugin->get( 'settings' )->get( 'abilities_write_enabled', false ) ) ) {
+			return;
+		}
+
 		$this->register_translate_post();
 		$this->register_create_translation();
 	}
@@ -147,6 +167,15 @@ final class AbilitiesRegistrar {
 	}
 
 	private function register_list_languages(): void {
+		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
+		// name is registered twice. Now that abilities register at BOOT by
+		// default, any path that re-enters registration in the same request
+		// would trip that — a test rig re-entering to add the write abilities
+		// is the live example.
+		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/list-languages' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability',
 			'perflocale/list-languages',
 			[
@@ -250,6 +279,15 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_get_translations(): void {
+		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
+		// name is registered twice. Now that abilities register at BOOT by
+		// default, any path that re-enters registration in the same request
+		// would trip that — a test rig re-entering to add the write abilities
+		// is the live example.
+		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/get-translations' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability',
 			'perflocale/get-translations',
 			[
@@ -337,6 +375,15 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_detect_language(): void {
+		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
+		// name is registered twice. Now that abilities register at BOOT by
+		// default, any path that re-enters registration in the same request
+		// would trip that — a test rig re-entering to add the write abilities
+		// is the live example.
+		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/detect-language' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability',
 			'perflocale/detect-language',
 			[
@@ -447,6 +494,15 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_convert_url(): void {
+		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
+		// name is registered twice. Now that abilities register at BOOT by
+		// default, any path that re-enters registration in the same request
+		// would trip that — a test rig re-entering to add the write abilities
+		// is the live example.
+		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/convert-url' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability',
 			'perflocale/convert-url',
 			[
@@ -619,6 +675,15 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_translate_post(): void {
+		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
+		// name is registered twice. Now that abilities register at BOOT by
+		// default, any path that re-enters registration in the same request
+		// would trip that — a test rig re-entering to add the write abilities
+		// is the live example.
+		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/translate-post' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability',
 			'perflocale/translate-post',
 			[
@@ -734,6 +799,15 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_create_translation(): void {
+		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
+		// name is registered twice. Now that abilities register at BOOT by
+		// default, any path that re-enters registration in the same request
+		// would trip that — a test rig re-entering to add the write abilities
+		// is the live example.
+		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/create-translation' ) ) {
+			return;
+		}
+
 		self::call_optional( 'wp_register_ability',
 			'perflocale/create-translation',
 			[
@@ -839,7 +913,7 @@ final class AbilitiesRegistrar {
 					return [
 						'translated_post_id' => $new_id,
 						'language'           => $slug,
-						'edit_url'           => get_edit_post_link( $new_id, 'raw' ) ?: '',
+						'edit_url'           => \PerfLocale\Admin\ObjectLinks::edit_url( (int) $new_id ),
 					];
 				},
 				'permission_callback' => function () {

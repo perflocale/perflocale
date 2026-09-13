@@ -81,6 +81,227 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 		// form the user edits in the native builder. The form definition lives in
 		// post_content (JSON), so there is no separate translatable meta key.
 		add_filter( 'perflocale/translatable_post_types', [ $this, 'add_post_types' ] );
+
+		// ...but never language-scope it. The visitor-facing paths are safe on
+		// their own — `[wpforms id="123"]` and the block both resolve through
+		// `WPFormsForm_Handler::get_single()`, which ends in
+		// `get_post( absint( $id ) )` (includes/class-form.php:294), a direct
+		// row read the query filter never sees. The LIST path is not:
+		// `get( '' )` falls to `get_multiple()` →
+		// `get_posts( [ 'post_type' => 'wpforms', 'suppress_filters' => false ] )`
+		// (:243/:347/:369), and that explicit `suppress_filters => false` means
+		// PerfLocale's WHERE is applied.
+		//
+		// That list runs on the FRONT END, not only in wp-admin: Beaver
+		// Builder renders `WP_Widget::form()` through its own front-end AJAX
+		// handler (`add_action( 'wp', … )`, chosen precisely because wp_ajax
+		// "only works in the admin"), so `includes/class-widget.php:140` runs
+		// with `is_admin() === false` on the edited page's own translated
+		// permalink. Every default-language-linked form is then dropped and the
+		// widget's form picker reads "No forms".
+		//
+		// Editor-facing rather than visitor-facing, so this is a low-severity
+		// member of the class — but the registration costs nothing and scoping
+		// this type protects nothing, since forms are resolved by id and the
+		// translation is swapped in at render time by translate_form_data()
+		// via a link-table lookup, never a WP_Query.
+		add_filter( 'perflocale/query/never_scoped_post_types', [ $this, 'never_scope_form_type' ] );
+
+		// The wpforms CPT is show_ui = false, so WordPress has no `_edit_link`
+		// and the Translations screen would render a dead link. Send it to the
+		// native builder the comment above already points users at.
+		add_filter( 'perflocale/admin/edit_post_link', [ $this, 'edit_link' ], 10, 3 );
+
+		// ⭐ ANSWER THE PERMISSION QUESTION CORE CANNOT.
+		//
+		// WPForms registers its type with `'capability_type' => 'wpforms_form'` and
+		// `'map_meta_cap' => false` (wpforms-lite/includes/class-form.php:102-103) and
+		// then adds no `map_meta_cap` filter anywhere — `src/Access/Capabilities.php`
+		// in Lite is a stub returning `manage_options`. Core therefore maps
+		// `current_user_can( 'edit_post', $form_id )` to the PRIMITIVE capability
+		// `edit_wpforms_form`, which no role holds, so the answer was `false` for
+		// EVERY user. Measured as user 1 (administrator, `is_super_admin()` true):
+		//
+		//     current_user_can( 'edit_post', 287348 )                === false
+		//     wpforms_current_user_can( 'edit_form_single', 287348 )  === true
+		//
+		// Every per-object translation route gates on that check, so translating a
+		// WPForms form was refused for everyone even though the plugin advertises the
+		// type as translatable. Contact Form 7 has the identical registration but DOES
+		// add the filter, which is why CF7 worked and this did not.
+		//
+		// The authority deferred to is the host's OWN access object, not a capability
+		// invented on WPForms' behalf, so a site running the Pro Access addon keeps its
+		// granular per-form rules. See answer_object_permission() for why the object is
+		// called directly rather than through `wpforms_current_user_can()`.
+		add_filter( 'perflocale/object/user_can', [ $this, 'answer_object_permission' ], 10, 4 );
+
+		// A Translations box in WPForms' own form builder — another screen none of the
+		// existing panels reach: the builder is a custom admin page, `wpforms` is
+		// registered `show_ui => false` so there is no post.php screen and no metabox,
+		// and `wp.plugins.registerPlugin` does not exist there.
+		if ( is_admin() ) {
+			// `wpforms_builder_after_panel_sidebar` fires inside `.wpforms-panel-sidebar`
+			// and receives ( WP_Post $form, string $panel_slug )
+			// (includes/admin/builder/panels/class-base.php:291).
+			//
+			// ⚠️ It fires for EVERY panel that has a sidebar — fields, settings,
+			// revisions, payments, providers — so an unguarded mount would render the
+			// box five times in one page. The resolver returns 0 for every panel but
+			// Settings, and the renderer draws nothing for an id <= 0. Settings is the
+			// right home: it is the form-level configuration panel, the analogue of the
+			// post editor's document sidebar.
+			$plugin->get( 'translations_panel' )->mount(
+				'wpforms_builder_after_panel_sidebar',
+				[
+					'accepted_args' => 2,
+					'context'       => 'wpforms',
+					'resolve'       => static function ( $form = null, $panel = '' ): int {
+						if ( $panel !== 'settings' || ! $form instanceof \WP_Post ) {
+							return 0;
+						}
+
+						return (int) $form->ID;
+					},
+				]
+			);
+
+			// ⚠️ WPForms DELETES the style registry on its builder screen, keeping only
+			// an allowlist: `wp_styles()->registered = array_intersect_key( ... )`
+			// (includes/admin/builder/class-builder.php:282). A stylesheet enqueued the
+			// ordinary way is silently dropped and the box renders unstyled, with no
+			// error. Adding the handle to the host's own documented allowlist filter is
+			// the supported way in — and is why the enqueue below can stay ordinary.
+			add_filter(
+				'wpforms_admin_builder_allowed_common_wp_admin_styles',
+				static function ( $handles ): array {
+					$handles   = is_array( $handles ) ? $handles : [];
+					$handles[] = 'perflocale-metabox';
+
+					return $handles;
+				}
+			);
+
+			add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_panel_styles' ] );
+		}
+	}
+
+	/**
+	 * Answer whether the current user may act on a WPForms form.
+	 *
+	 * Only ever consulted when core has already said NO, and only for this addon's own
+	 * post type — so it can widen access for `wpforms` and can never revoke access core
+	 * granted for anything else. The REST routes require the `perflocale_translate`
+	 * capability before reaching this, so it cannot hand translation rights to a user
+	 * who has none.
+	 *
+	 * ⚠️⚠️ DO NOT "SIMPLIFY" THIS TO `wpforms_current_user_can()`. THAT IS A PRIVILEGE
+	 * ESCALATION.
+	 *
+	 * That wrapper memoises in a function static keyed on `md5( $caps . $id )` —
+	 * **the user is not part of the key** (wpforms-lite/includes/functions/access.php:
+	 * 234-243). The first answer computed for a given capability and form id is
+	 * therefore returned to every subsequent caller in the same PHP process, whoever
+	 * they are. Harmless for WPForms itself, because an ordinary web request has one
+	 * user for its whole life. NOT harmless for anything that evaluates permissions for
+	 * more than one user in a process — WP-CLI, a background job, a test harness — and
+	 * it is exactly what a permission check must never do.
+	 *
+	 * Measured in one process against a real form, admin queried first:
+	 *
+	 *     administrator  wrapper=true   direct=true
+	 *     subscriber     wrapper=TRUE   direct=false     <-- the wrapper is wrong
+	 *
+	 * So this calls the host's access object directly, which is user-correct, and then
+	 * applies the host's own documented `wpforms_current_user_can` filter so a site that
+	 * customises WPForms permissions still has that honoured. That is precisely what the
+	 * wrapper does, minus the cache.
+	 *
+	 * Fails CLOSED: with no access object, core's original answer stands.
+	 *
+	 * @param bool   $can       Whether core's capability check passed.
+	 * @param string $action    Semantic action: 'edit' or 'delete'.
+	 * @param int    $post_id   Object being acted on.
+	 * @param string $post_type Its post type.
+	 * @return bool
+	 */
+	public function answer_object_permission( bool $can, string $action, int $post_id, string $post_type ): bool {
+		if ( $can || 'wpforms' !== $post_type ) {
+			return $can;
+		}
+
+		if ( ! function_exists( 'wpforms' ) ) {
+			return $can;
+		}
+
+		$wpforms = wpforms();
+
+		if ( ! is_object( $wpforms ) || ! is_callable( [ $wpforms, 'obj' ] ) ) {
+			return $can;
+		}
+
+		$access = $wpforms->obj( 'access' );
+
+		// is_callable(), not method_exists(): the latter is FALSE for a method routed
+		// through __call(), which would silently disable this on any version that uses
+		// magic dispatch.
+		if ( ! is_object( $access ) || ! is_callable( [ $access, 'current_user_can' ] ) ) {
+			return $can;
+		}
+
+		// WPForms' own capability names for a single form. 'delete' covers both the
+		// DELETE route and a `status=trash` update, which PerfLocale gates identically.
+		$cap = 'delete' === $action ? 'delete_form_single' : 'edit_form_single';
+
+		$user_can = (bool) $access->current_user_can( $cap, $post_id );
+
+		/**
+		 * This is the HOST's filter, re-applied here because this method deliberately
+		 * bypasses the host wrapper that would normally apply it. Documented by WPForms
+		 * with exactly this signature (access.php:253-261).
+		 */
+		return (bool) apply_filters( 'wpforms_current_user_can', $user_can, $cap, $post_id ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WPForms' own filter, re-applied because this method bypasses the host wrapper that normally applies it.
+	}
+
+	/**
+	 * Load the panel's stylesheet on the WPForms form builder.
+	 *
+	 * Reuses the classic metabox's sheet and handle, so the box matches every other
+	 * editor and Helper's late `perflocale*` pass supplies the RTL twin for free.
+	 *
+	 * @param string $hook_suffix Current admin page's hook suffix.
+	 * @return void
+	 */
+	public function enqueue_panel_styles( string $hook_suffix ): void {
+		// WPForms pins this string itself:
+		// `add_action( 'load-wpforms_page_wpforms-builder', ... )`
+		// (includes/admin/builder/class-builder.php:131).
+		if ( $hook_suffix !== 'wpforms_page_wpforms-builder' ) {
+			return;
+		}
+
+		wp_enqueue_style(
+			'perflocale-metabox',
+			PERFLOCALE_URL . 'assets/css/metabox.css',
+			[],
+			PERFLOCALE_VERSION
+		);
+	}
+
+	/**
+	 * Point the Translations screen at the native WPForms builder.
+	 *
+	 * @param string $url       URL resolved so far ('' when core could not).
+	 * @param int    $post_id   Object being linked.
+	 * @param string $post_type Its post type.
+	 * @return string
+	 */
+	public function edit_link( string $url, int $post_id, string $post_type ): string {
+		if ( 'wpforms' !== $post_type ) {
+			return $url;
+		}
+
+		return admin_url( 'admin.php?page=wpforms-builder&view=fields&form_id=' . $post_id );
 	}
 
 	/**
@@ -359,6 +580,21 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	public function add_post_types( array $post_types ): array {
+		$post_types[] = 'wpforms';
+
+		return array_unique( $post_types );
+	}
+
+	/**
+	 * Keep the WPForms CPT out of the language WHERE clause.
+	 *
+	 * Translatable (it gets translation records) but never scoped (forms are
+	 * resolved by id and translated at render). See the rationale in boot().
+	 *
+	 * @param array<int, string> $post_types Never-scoped post types.
+	 * @return array<int, string>
+	 */
+	public function never_scope_form_type( array $post_types ): array {
 		$post_types[] = 'wpforms';
 
 		return array_unique( $post_types );

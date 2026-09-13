@@ -106,6 +106,48 @@ final class Lock {
 	}
 
 	/**
+	 * Seconds until a held lock self-expires, or 0 when it is not held.
+	 *
+	 * ⭐ WHY A CALLER NEEDS THIS. `release()` deliberately only works in the
+	 * process that acquired the lock — it returns early unless `self::$owned`
+	 * has the token — so that one worker cannot steal another's lock. The
+	 * consequence is that a request which FATALS mid-run leaves its lock
+	 * standing until the TTL expires, and the next click gets "another run is
+	 * already in progress" with no hint that the previous one died or how long
+	 * the wait is.
+	 *
+	 * Reported after a real incident: a bulk handler hit PHP's memory limit,
+	 * and every retry for the next two minutes looked like contention with a
+	 * healthy run that was not there. Telling the operator the remaining
+	 * seconds turns a mystery into a wait.
+	 *
+	 * Reads the row directly rather than through `get_option()`: the lock is
+	 * written with `INSERT IGNORE` and is deliberately not autoloaded, so the
+	 * options cache may not have it.
+	 *
+	 * @param string $name Lock name (unprefixed, as passed to acquire()).
+	 * @return int Seconds remaining, 0 when free or already expired.
+	 */
+	public static function seconds_remaining( string $name ): int {
+		global $wpdb;
+
+		$key = self::PREFIX . $name;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$value = $wpdb->get_var(
+			$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $key )
+		);
+
+		if ( ! is_string( $value ) || $value === '' ) {
+			return 0;
+		}
+
+		$expires = (int) strtok( $value, '|' );
+
+		return max( 0, $expires - time() );
+	}
+
+	/**
 	 * Attempt to atomically acquire a named lock.
 	 *
 	 * @param string $name Lock name (will be prefixed to avoid collisions).

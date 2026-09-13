@@ -15,7 +15,9 @@
 		removePrefix: L.removePrefix || 'Remove',
 		removeSuffix: L.removeSuffix || 'fallback',
 		dragHint: L.dragHint || 'Draggable fallback',
-		positionTpl: L.positionTpl || 'Position %1$d: %2$s'
+		positionTpl: L.positionTpl || 'Position %1$d: %2$s',
+		moveUp: L.moveUp || 'Move earlier',
+		moveDown: L.moveDown || 'Move later'
 	};
 
 	function buildAriaLabel( position, langName ) {
@@ -50,6 +52,13 @@
 		var removeLabel = LABELS.removePrefix + ' ' + name + ' ' + LABELS.removeSuffix;
 		el.innerHTML =
 			'<span class="pl-fb-chip__grip" aria-hidden="true">⋮⋮</span>' +
+			// ⚠️ Touch devices have neither drag-and-drop nor arrow keys. Without
+			// these the chain can be built on a phone but never reordered — the
+			// reported bug. Hidden on fine-pointer devices by CSS.
+			'<span class="pl-fb-chip__move">' +
+				'<button type="button" class="pl-fb-chip__up">▲</button>' +
+				'<button type="button" class="pl-fb-chip__down">▼</button>' +
+			'</span>' +
 			'<span class="pl-fb-chip__pos"></span>' +
 			'<span class="pl-fb-chip__name"></span>' +
 			'<button type="button" class="pl-fb-chip__remove">×</button>' +
@@ -60,6 +69,12 @@
 		var removeBtn = el.querySelector( '.pl-fb-chip__remove' );
 		removeBtn.setAttribute( 'aria-label', removeLabel );
 		removeBtn.setAttribute( 'title', removeLabel );
+		var upBtn = el.querySelector( '.pl-fb-chip__up' );
+		var downBtn = el.querySelector( '.pl-fb-chip__down' );
+		upBtn.setAttribute( 'aria-label', LABELS.moveUp );
+		upBtn.setAttribute( 'title', LABELS.moveUp );
+		downBtn.setAttribute( 'aria-label', LABELS.moveDown );
+		downBtn.setAttribute( 'title', LABELS.moveDown );
 		el.querySelector( 'input[type="hidden"]' ).value = fbSlug;
 		return el;
 	}
@@ -207,6 +222,34 @@
 			e.preventDefault();
 			chip.querySelector( '.pl-fb-chip__remove' ).click();
 		}
+	} );
+
+	/**
+	 * Explicit reordering for pointers that cannot drag.
+	 *
+	 * Shares prevChip()/nextChip() and renumber() with the keyboard handler
+	 * above, so all three input methods (drag, arrow keys, buttons) move a chip
+	 * through exactly the same DOM operation and can never disagree about the
+	 * resulting order. Focus is returned to the button that was pressed so a
+	 * chip can be walked several places with repeated taps.
+	 */
+	editor.addEventListener( 'click', function ( e ) {
+		var btn = e.target.closest( '.pl-fb-chip__up, .pl-fb-chip__down' );
+		if ( ! btn ) { return; }
+		var chip = btn.closest( '.pl-fb-chip' );
+		if ( ! chip ) { return; }
+		e.preventDefault();
+		var row = chip.closest( '.pl-fb-row' );
+		var up = btn.classList.contains( 'pl-fb-chip__up' );
+		var sibling = up ? prevChip( chip ) : nextChip( chip );
+		if ( ! sibling ) { return; }
+		if ( up ) {
+			chip.parentNode.insertBefore( chip, sibling );
+		} else {
+			chip.parentNode.insertBefore( sibling, chip );
+		}
+		renumber( row );
+		btn.focus();
 	} );
 
 	editor.querySelectorAll( '.pl-fb-row' ).forEach( renumber );

@@ -178,6 +178,23 @@ final class Assets {
 			);
 		}
 
+		// Addons screen only: the filter tab strip is one non-wrapping row that
+		// scrolls sideways when narrow, and this draws its scroll indicator.
+		// The native scrollbar cannot do that job — iOS and Android render
+		// scrollbars as transient overlays and iOS ignores
+		// ::-webkit-scrollbar — so the CSS hides it and we draw our own.
+		// Footer-loaded and dependency-free: it only reads layout and writes
+		// two inline styles.
+		if ( 'perflocale_page_perflocale-addons' === $hook ) {
+			wp_enqueue_script(
+				'perflocale-addons-tabs-scroll',
+				PERFLOCALE_URL . 'assets/js/addons-tabs-scroll.js',
+				[],
+				PERFLOCALE_VERSION,
+				true
+			);
+		}
+
 		// `perflocale-admin` is a carrier-only handle (no script file). It
 		// holds the localized `perflocaleAdmin` payload, picks up inline
 		// scripts from page classes via wp_add_inline_script(), and serves

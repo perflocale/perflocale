@@ -1597,11 +1597,27 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 			font-size: 13px;
 		}
 
+	/* ⚠️ `normal`, NOT `nowrap`, and this is the rule that decides it — a
+	   lower-specificity attempt in admin-translations.css lost to this one and
+	   looked like it had no effect at all. Status labels are TRANSLATED: sized
+	   for English, "Needs Update" already clipped, and a German equivalent
+	   clips much harder. A two-line pill is better than a truncated one.
+	   The label needs BOTH releases below, because a flex item will not shrink
+	   under its min-content width and min-content for wrapped text is its
+	   longest word — measured, that word alone was wider than the cell. */
 	.perflocale-table-responsive .perflocale-translations-table .perflocale-status-badge {
 			min-width: 0;
+			max-width: 100%;
 			padding: 3px 9px;
 			font-size: 11px;
-			white-space: nowrap;
+			white-space: normal;
+			box-sizing: border-box;
+		}
+
+	.perflocale-table-responsive .perflocale-translations-table .perflocale-status-badge__label {
+			min-width: 0;
+			overflow-wrap: anywhere;
+			word-break: break-word;
 		}
 
 	/* Touch targets. The checkboxes here are 25px because that is what
@@ -1942,4 +1958,63 @@ details[data-perflocale-popover][open] {
 			 * the active underline to a sliver — keep tabs inside the box. */
 			margin-bottom: 0;
 		}
+}
+
+/* ---- Popovers (<details data-perflocale-popover>) ----
+   Export PO / Import PO on the Strings screen, and anything that opts in with
+   the same attribute. Dismissal (click-outside, ESC) is handled by the inline
+   script in Admin\Assets; this is purely placement and chrome.
+
+   ⚠️ THESE STYLES USED TO BE INLINE ON THE ELEMENTS, WHICH IS WHY THE PANEL
+   COULD NOT BE MADE RESPONSIVE: an inline `style` beats any stylesheet rule
+   short of !important, so no media query could move it. Measured before the
+   move, the 270px Export panel opened at x=202 on a 360px phone and ran
+   **112px off the right edge** (82px at 390px) — the panel in the bug report.
+   The Import panel escaped only by luck, being anchored further left. */
+.perflocale-popover {
+	position: relative;
+	margin: 0;
+}
+
+.perflocale-popover__panel {
+	position: absolute;
+	left: 0;
+	top: calc(100% + 6px);
+	z-index: 10;
+	min-width: 240px;
+	/* Never wider than the viewport allows, whatever the anchor's position. */
+	max-width: calc(100vw - 32px);
+	padding: 14px;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+	box-sizing: border-box;
+}
+
+.perflocale-popover__panel--wide {
+	min-width: 280px;
+}
+
+/* Phone — anchoring to the summary cannot work: the button sits wherever the
+   header flex line puts it, so any fixed panel width will overhang on one side
+   or the other. Pin the panel to the VIEWPORT instead and let it span the
+   available width. `position: fixed` needs no knowledge of the anchor, which is
+   exactly the property that makes it safe here; the panel still opens under the
+   header because the header is at the top of the page on a phone.
+
+   ⚠️ `left`/`right` with `width: auto` (rather than `width: 100%`) is what makes
+   both edges honoured — `100%` would resolve against the containing block and
+   reintroduce the overhang. */
+@media screen and (max-width: 600px) {
+	.perflocale-popover[open] > .perflocale-popover__panel,
+	.perflocale-popover[open] > .perflocale-popover__panel--wide {
+		position: fixed;
+		left: 12px;
+		right: 12px;
+		top: auto;
+		width: auto;
+		min-width: 0;
+		max-width: none;
+	}
 }

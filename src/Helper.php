@@ -85,6 +85,21 @@ final class Helper {
 	private static array $seo_excluded_memo = [];
 
 	/**
+	 * Per-request memo of a locale's number separators, used only by
+	 * {@see self::number_format_for_locale()} when intl is unavailable and the
+	 * caller asked for a language other than the one the request is running in.
+	 * Keyed by locale; `[ decimal_point, thousands_sep ]`, or null when the
+	 * locale has no WP_Locale data of its own.
+	 *
+	 * NOT blog-keyed on purpose: separators come from the translation files in
+	 * wp-content/languages, which a multisite network shares, so the value for
+	 * 'de_DE' is the same on every blog.
+	 *
+	 * @var array<string, array{0: string, 1: string}|null>
+	 */
+	private static array $number_separator_memo = [];
+
+	/**
 	 * Get the singleton instance.
 	 *
 	 * @return self
@@ -227,8 +242,12 @@ final class Helper {
 	 *     navigation references, at any language. That guard exists because a
 	 *     rewritten reference saved from an editor merges the two languages
 	 *     permanently; a preview being untranslated is the cheaper failure.
-	 *   - Block-template CONTENT (`wp_template` / `wp_template_part`) is not
-	 *     translated by this plugin at all, so a window cannot conjure it.
+	 *   - Block-template CONTENT (`wp_template` / `wp_template_part`) IS
+	 *     translated, by {@see \PerfLocale\Frontend\BlockTemplateTranslator},
+	 *     but only when an operator has marked those types translatable. A
+	 *     window does follow it: the resolver re-languages on
+	 *     `perflocale/language/overridden`. It is still front-end only — the
+	 *     Site Editor always sees and saves the SOURCE.
 	 *
 	 * ⚠️ COST. Each actual language CHANGE rebuilds the per-language string map.
 	 * That is a few hundred microseconds, not free: fine around a template or a
@@ -849,7 +868,13 @@ final class Helper {
 	 * Locale-aware number formatting. Uses PHP's intl NumberFormatter
 	 * when available so output matches the user's regional conventions
 	 * (1,234.56 in en-US, 1.234,56 in de-DE, 1 234,56 in fr-FR, etc.).
-	 * Falls back to {@see number_format_i18n()} when intl isn't loaded.
+	 *
+	 * Without intl it uses WordPress's own separators for the REQUESTED
+	 * language — see {@see self::number_format_for_locale()}, which exists
+	 * because plain {@see number_format_i18n()} punctuates for the locale the
+	 * request is running in and so ignored `$lang_slug` entirely. That path
+	 * needs the target locale's language pack installed; with no pack
+	 * WordPress has no separator data and the site default is used.
 	 *
 	 *   perflocale()->format_number( 1234.5 );             // current language
 	 *   perflocale()->format_number( 1234.5, 'de' );       // explicit
@@ -900,7 +925,84 @@ final class Helper {
 			$decimals = ( false === $dot ) ? 0 : strlen( $trimmed ) - $dot - 1;
 		}
 
-		return number_format_i18n( $float, max( 0, $decimals ) );
+		return $this->number_format_for_locale( $float, max( 0, $decimals ), $locale );
+	}
+
+	/**
+	 * Format a number using a SPECIFIC locale's separators, without intl.
+	 *
+	 * ⭐ WHY THIS EXISTS
+	 *   `number_format_i18n()` reads `$wp_locale`, which describes the locale
+	 *   the request is currently running in. On the intl-less path that made
+	 *   `format_number( 1234.5, 'de' )` return "1,234.5" on an English site —
+	 *   English punctuation on a number the caller explicitly asked for in
+	 *   German. The requested language was not formatted differently, it was
+	 *   IGNORED. Measured on WP 7.1 / PHP 8.4 with intl stripped via
+	 *   PHP_INI_SCAN_DIR: en/de/pl all returned "1,234.5", where intl returns
+	 *   "1,234.5" / "1.234,5" / "1 234,5".
+	 *
+	 * ⚡ WHY IT IS SHAPED LIKE THIS
+	 *   The common call — `format_number( $x )`, no language — asks for the
+	 *   locale the request is already in, so it takes the first branch and is
+	 *   byte-for-byte the old code path: one `number_format_i18n()`, no switch,
+	 *   no memo lookup cost worth measuring, and the `number_format_i18n`
+	 *   filter fires exactly as before.
+	 *
+	 *   Only an explicit, DIFFERENT language pays for a locale switch, and it
+	 *   pays once: `switch_to_locale()` loads a textdomain, so a template
+	 *   printing fifty prices in another language would otherwise switch fifty
+	 *   times. The separators are memoised per locale instead. They are a
+	 *   property of the locale's translation files, which are shared across a
+	 *   multisite network, so the memo is NOT blog-affine and needs no blog key.
+	 *
+	 * ⚠️ `switch_to_locale()` returns false both when the switch failed AND
+	 *   when the locale was already active — in neither case did it push onto
+	 *   the stack, so restoring on a false return would pop somebody else's
+	 *   locale.
+	 *
+	 * @param float  $value    Number.
+	 * @param int    $decimals Decimal places.
+	 * @param string $locale   Target locale, e.g. 'de_DE'.
+	 * @return string
+	 */
+	private function number_format_for_locale( float $value, int $decimals, string $locale ): string {
+		$current = function_exists( 'determine_locale' ) ? determine_locale() : get_locale();
+
+		if ( $locale === '' || $locale === $current || ! function_exists( 'switch_to_locale' ) ) {
+			return number_format_i18n( $value, $decimals );
+		}
+
+		if ( ! isset( self::$number_separator_memo[ $locale ] ) ) {
+			$switched = switch_to_locale( $locale );
+
+			global $wp_locale;
+
+			$separators = isset( $wp_locale->number_format['decimal_point'], $wp_locale->number_format['thousands_sep'] )
+				? [ (string) $wp_locale->number_format['decimal_point'], (string) $wp_locale->number_format['thousands_sep'] ]
+				: null;
+
+			if ( $switched ) {
+				restore_previous_locale();
+			}
+
+			// A locale with no installed translations gives back the same
+			// separators as the site default. Storing null would re-switch on
+			// every call for no gain, so store what was found either way.
+			self::$number_separator_memo[ $locale ] = $separators;
+		}
+
+		$separators = self::$number_separator_memo[ $locale ];
+
+		if ( $separators === null ) {
+			return number_format_i18n( $value, $decimals );
+		}
+
+		$formatted = number_format( $value, $decimals, $separators[0], $separators[1] );
+
+		// Fire core's filter so a site that customises number punctuation keeps
+		// doing so on this path too — this method stands in for
+		// number_format_i18n(), so it must honour the same contract.
+		return (string) apply_filters( 'number_format_i18n', $formatted, $value, $decimals ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress core 'number_format_i18n' filter; this method stands in for number_format_i18n() on the cross-locale path, so dropping it would make format_number( $x ) and format_number( $x, 'de' ) disagree on a site that customises number punctuation.
 	}
 
 	/**
@@ -944,8 +1046,11 @@ final class Helper {
 		}
 
 		// Conservative fallback when intl isn't loaded — code + amount,
-		// no symbol guessing (we'd be wrong as often as right).
-		return $code . ' ' . number_format_i18n( (float) $value, 2 );
+		// no symbol guessing (we'd be wrong as often as right). The AMOUNT is
+		// still punctuated for the requested locale; see
+		// number_format_for_locale() for why number_format_i18n() alone was
+		// wrong here.
+		return $code . ' ' . $this->number_format_for_locale( (float) $value, 2, $locale );
 	}
 
 	/**
@@ -1254,6 +1359,66 @@ final class Helper {
 		$parts = array_map( 'sanitize_title_for_query', explode( '/', trim( $encoded, '/' ) ) );
 
 		return implode( '/', $parts );
+	}
+
+	/**
+	 * Ceiling for a "Rows per page" screen option.
+	 *
+	 * ⚠️ THIS IS A RESOURCE BOUND, NOT COSMETIC. Every row on the Translations
+	 * screen contributes at least one `ids[]` checkbox to the bulk-action POST,
+	 * and PHP silently discards form fields past `max_input_vars` (default
+	 * 1000). A page size larger than the server can receive back produces a
+	 * bulk action that runs on an arbitrary PREFIX of the operator's selection
+	 * and reports success for it.
+	 *
+	 * 40% leaves room for the form's other fields (nonce, action, filters, the
+	 * per-row hidden inputs).
+	 *
+	 * @param string $option Screen-option name, for the filter.
+	 * @return int
+	 */
+	public static function per_page_ceiling( string $option = '' ): int {
+		$max_input_vars = (int) ini_get( 'max_input_vars' );
+		$ceiling        = $max_input_vars > 0 ? max( 10, (int) floor( $max_input_vars * 0.4 ) ) : 400;
+
+		/**
+		 * Filter the maximum rows-per-page any PerfLocale list screen will use.
+		 *
+		 * @hook  perflocale/admin/per_page_ceiling
+		 * @since 1.0.5
+		 *
+		 * @param int    $ceiling Computed ceiling.
+		 * @param string $option  Screen-option name.
+		 * @return int
+		 */
+		$ceiling = (int) apply_filters( 'perflocale/admin/per_page_ceiling', $ceiling, $option );
+
+		return max( 1, $ceiling );
+	}
+
+	/**
+	 * Clamp an effective rows-per-page value.
+	 *
+	 * ⭐ MUST BE APPLIED ON READ, NOT ONLY ON SAVE. Capping the save filter
+	 * alone leaves every PREVIOUSLY SAVED oversized preference in place:
+	 * measured with `max_input_vars = 64` (ceiling 25), a stored value of 777
+	 * still drove `posts_per_page=777` and rendered all 50 matching sources.
+	 * The protection has to sit where the value is USED.
+	 *
+	 * The stored preference is deliberately NOT rewritten — a render is not the
+	 * place to mutate a user's settings; only the effective value is clamped.
+	 *
+	 * @param int    $value   Raw stored value.
+	 * @param int    $default Fallback when unset/invalid.
+	 * @param string $option  Screen-option name, for the filter.
+	 * @return int
+	 */
+	public static function normalize_per_page( int $value, int $default = 20, string $option = '' ): int {
+		if ( $value < 1 ) {
+			$value = $default;
+		}
+
+		return min( max( 1, $value ), self::per_page_ceiling( $option ) );
 	}
 
 	/**
@@ -2930,5 +3095,119 @@ final class Helper {
 			// cache-buster lives on handles registered with one.
 			$style->src = substr( $src, 0, -4 ) . '-rtl.css' . substr( (string) $style->src, strlen( $src ) );
 		}
+	}
+
+	/**
+	 * Whether the current user may EDIT a translatable object.
+	 *
+	 * ⭐ WHY THIS IS NOT JUST `current_user_can( 'edit_post', $id )`.
+	 *
+	 * A post type registered with `map_meta_cap => false` does not get core's meta-cap
+	 * mapping. `current_user_can( 'edit_post', $id )` on such a type is mapped straight
+	 * to the type's PRIMITIVE capability — `edit_{$capability_type}` — and if the host
+	 * plugin never grants that capability to any role, the answer is `false` for
+	 * EVERYBODY, administrators included. It is not a permission failure; the question
+	 * simply has no answer in core's model, and only the host knows the real one.
+	 *
+	 * WPForms is exactly that shape. It registers
+	 * `'capability_type' => 'wpforms_form', 'map_meta_cap' => false` and adds no
+	 * `map_meta_cap` filter, so `edit_post` maps to `edit_wpforms_form`, which no role
+	 * holds. Measured on a real site as user 1 (administrator, `is_super_admin()`):
+	 *
+	 *     current_user_can( 'edit_post', 287348 )                   === false
+	 *     wpforms_current_user_can( 'edit_form_single', 287348 )    === true
+	 *
+	 * Contact Form 7 has the same registration but DOES add the filter (mapping to
+	 * `publish_pages`), which is why CF7 worked and WPForms did not: every per-object
+	 * route in the REST controller 403'd for every user on single site.
+	 *
+	 * ⚠️ SECURITY SHAPE. The filter is consulted, never trusted blindly, and the bundled
+	 * addons only ever answer for their OWN post type and only when core has already
+	 * said no — so they can widen for that type and can never revoke access core
+	 * granted. The REST routes additionally require the `perflocale_translate`
+	 * capability before this is even reached, so a filter cannot hand translation rights
+	 * to a user who has none. Deferring to the HOST's own authorization function is the
+	 * correct answer here; inventing capabilities inside another plugin's model is not.
+	 *
+	 * @since 1.0.5
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function user_can_edit_object( int $post_id ): bool {
+		return self::object_permission( 'edit', 'edit_post', $post_id );
+	}
+
+	/**
+	 * Whether the current user may DELETE a translatable object.
+	 *
+	 * Same reasoning as {@see self::user_can_edit_object()} — `delete_post` on a
+	 * `map_meta_cap => false` type maps to a primitive nobody holds — so removing a
+	 * translation was refused for everyone on those types too.
+	 *
+	 * @since 1.0.5
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function user_can_delete_object( int $post_id ): bool {
+		return self::object_permission( 'delete', 'delete_post', $post_id );
+	}
+
+	/**
+	 * Resolve one object-level permission, giving the host a say.
+	 *
+	 * ⚠️ PUBLISH transitions are deliberately NOT routed through here, but TRASH is. The
+	 * asymmetry is not an oversight:
+	 *
+	 *   - Trash is a deletion, and `update_translation()` says so in its own comment —
+	 *     it gates `status=trash` on the same check `delete_translation()` uses "so the
+	 *     two routes cannot disagree about who may remove content". Routing one and not
+	 *     the other would break exactly that invariant.
+	 *   - Publish has no reachable behaviour to fix. The one type that needs any of this
+	 *     today, `wpforms`, does not require a PUBLISHED translation to work:
+	 *     `PerfLocaleWPForms::translate_form_data()` reads the sibling's `post_content`
+	 *     directly and never consults `post_status`. Widening a publish path for
+	 *     behaviour nobody can reach is surface for nothing.
+	 *
+	 * @param string $action     Semantic action: 'edit' or 'delete'.
+	 * @param string $capability Core capability checked by default.
+	 * @param int    $post_id    Post ID.
+	 * @return bool
+	 */
+	private static function object_permission( string $action, string $capability, int $post_id ): bool {
+		$can = current_user_can( $capability, $post_id );
+
+		// Resolved once, and only to give the filter something to switch on. A listener
+		// that answers for the wrong post type is the main way this could go wrong.
+		$post_type = (string) get_post_type( $post_id );
+
+		if ( $post_type === '' ) {
+			return $can;
+		}
+
+		/**
+		 * Filter whether the current user may act on one translatable object.
+		 *
+		 * For a post type whose host registered `map_meta_cap => false` without adding a
+		 * `map_meta_cap` filter, core's answer is meaningless — see
+		 * {@see \PerfLocale\Helper::user_can_edit_object()}. A listener should answer
+		 * with the HOST's own authorization function rather than with a capability name,
+		 * and should return `$can` untouched for every type it does not own.
+		 *
+		 * ⚠️ Returning true GRANTS access to that object's translation list and edit
+		 * links. The REST routes still require the `perflocale_translate` capability
+		 * first, so this cannot grant translation rights to a user who has none.
+		 *
+		 * @hook  perflocale/object/user_can
+		 * @since 1.0.5
+		 *
+		 * @param bool   $can       Whether core's capability check passed.
+		 * @param string $action    Semantic action: 'edit' or 'delete'.
+		 * @param int    $post_id   Object being acted on.
+		 * @param string $post_type Its post type.
+		 * @return bool
+		 */
+		return (bool) apply_filters( 'perflocale/object/user_can', $can, $action, $post_id, $post_type );
 	}
 }

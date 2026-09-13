@@ -126,6 +126,37 @@ final class CacheInvalidator {
 
 		$this->cache->flush_object( $post_id, 'post' );
 
+		// ⭐ BLOCK TEMPLATES HAVE NO SINGULAR HREFLANG BUCKET TO CLEAR, so the
+		// sweep below is guaranteed-miss work for them — and it is not small.
+		//
+		// `HreflangTags::build_cache_key()` only mints the singular bucket
+		// `perflocale_hreflang_s_<id>_<lang>` inside `if ( is_singular() )`, from
+		// `get_queried_object_id()` (src/Frontend/HreflangTags.php:499-506). Core
+		// registers wp_template and wp_template_part with `public => false` and
+		// `publicly_queryable => false`, so neither can ever BE that queried
+		// object. No bucket is ever written; every delete is a miss.
+		//
+		// The cost is quadratic, because the sweep below is a
+		// (sibling × language) double loop and each delete without a persistent
+		// object cache becomes a `SELECT autoload FROM wp_options` probe. On an
+		// 8-language site that is 8 × 8 × 2 = 128 probes per template save — and
+		// since 1.0.5 fans a template out to every language on save, a group of
+		// siblings now exists to multiply. Measured first save at 8 languages:
+		// 422 autoload probes; steady save rose from 41 queries to 180 with no
+		// translation created at all. This gate removes both.
+		//
+		// ⚠️ PLACEMENT IS LOAD-BEARING: this returns AFTER flush_object() above,
+		// never before it. The Site Editor's Translations panel and
+		// detect_post_language() read `translations_post_*` /
+		// `translation_group_post_*`, so that flush must still happen.
+		//
+		// Deliberately the narrow `is_template_type()` rather than a broad
+		// `! is_post_type_viewable()`: the narrow test covers exactly the types
+		// this release changed and cannot regress anything else.
+		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( (string) get_post_type( $post_id ) ) ) {
+			return;
+		}
+
 		// Clear hreflang transients for this post AND its translation siblings.
 		// Hreflang links are bidirectional - when Post 10 (EN) changes,
 		// Post 20 (FR) also needs its hreflang cache cleared because it

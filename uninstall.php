@@ -45,8 +45,24 @@ $perflocale_includes = [
 	__DIR__ . '/src/Cache/CacheManager.php',
 	__DIR__ . '/src/Database/SiteCleanup.php',
 	__DIR__ . '/src/Addon/AddonInterface.php',
-	__DIR__ . '/src/Addon/AddonUninstaller.php',
+	// ⚠️ THE FULL CLOSURE, not "one more require". AddonUninstaller::plan()
+	// calls AddonSchemaManager::validate_addon_id() as its FIRST statement, and
+	// that class was missing here — so the entire manifest-driven addon purge
+	// threw "class not found" and the throw was swallowed, leaving addon tables
+	// and options behind on every uninstall with no error anywhere. Same shape
+	// as the PrivacyIntegration load-order note above.
+	//
+	// plan() also reaches PurgePlan (its return type) and AddonManifestWriter
+	// (reads/refreshes the manifest), so both are required or the path throws a
+	// few lines later instead. Listed BEFORE AddonUninstaller: none of these
+	// alias a constant at class-definition time today, but the ordering costs
+	// nothing and stops a future constant alias from reintroducing exactly the
+	// bug this comment describes.
 	__DIR__ . '/src/Addon/AddonMigrationErrors.php',
+	__DIR__ . '/src/Addon/AddonSchemaManager.php',
+	__DIR__ . '/src/Addon/AddonManifestWriter.php',
+	__DIR__ . '/src/Addon/PurgePlan.php',
+	__DIR__ . '/src/Addon/AddonUninstaller.php',
 ];
 
 foreach ( $perflocale_includes as $perflocale_include ) {

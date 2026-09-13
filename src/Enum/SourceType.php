@@ -39,12 +39,6 @@ enum SourceType: string {
 	/** Machine-translation result persisted to the link row. */
 	case MachineTranslation = 'mt';
 
-	/** Translation memory replay applied without going through MT. */
-	case TranslationMemory = 'tm';
-
-	/** Glossary substitution. */
-	case Glossary = 'glossary';
-
 	/** Imported from Polylang via the migration importer. */
 	case ImportedPolylang = 'imported_polylang';
 
@@ -56,9 +50,6 @@ enum SourceType: string {
 
 	/** WP-CLI bulk operation. */
 	case Cli = 'cli';
-
-	/** Webhook-driven write from an external translation service. */
-	case Webhook = 'webhook';
 
 	/** REST API write that did not specify a more specific source. */
 	case Api = 'api';
@@ -84,13 +75,10 @@ enum SourceType: string {
 		return match ( $this ) {
 			self::Manual             => __( 'Manual', 'perflocale' ),
 			self::MachineTranslation => __( 'Machine translation', 'perflocale' ),
-			self::TranslationMemory  => __( 'Locally cached', 'perflocale' ),
-			self::Glossary           => __( 'Glossary', 'perflocale' ),
 			self::ImportedPolylang   => __( 'Imported (Polylang)', 'perflocale' ),
 			self::ImportedWpml       => __( 'Imported (WPML)', 'perflocale' ),
 			self::ImportedTrp        => __( 'Imported (TranslatePress)', 'perflocale' ),
 			self::Cli                => __( 'WP-CLI', 'perflocale' ),
-			self::Webhook            => __( 'Webhook', 'perflocale' ),
 			self::Api                => __( 'REST API', 'perflocale' ),
 		};
 	}

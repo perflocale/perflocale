@@ -137,19 +137,32 @@ a.perflocale-status-badge--linked:focus .perflocale-status-badge__icon {
      `table-layout: fixed` a cell min-width overrides the colgroup, so it held
      the title at ~314px inside a 368px viewport: pinned, it covered the whole
      matrix it exists to label.
-   - the language columns must go back to auto so they absorb the leftover
-     width; with every column sized, fixed layout spreads the surplus over all
-     of them and re-inflates the title. The min-width is their floor, which is
-     what actually sets the table's scroll width once the surplus is gone. */
+   - ⚠️ the language columns need an EXPLICIT width, not `auto` + `min-width`.
+     The previous rule said `width: auto; min-width: 92px` on the theory that
+     the min-width would act as their floor and set the table's scroll width.
+     It does not: under `table-layout: fixed` a cell's `min-width` is IGNORED —
+     only the colgroup/first-row widths size a column — so `auto` handed them
+     whatever was left after the pinned title, which is almost nothing.
+     Measured in Chrome at 360px: the columns rendered **18px** wide (28px at
+     390px) against a 92px declared floor, and the 69-83px status badges spilled
+     52-98px out of them. That is the "Pu Pu Pu" clipping in the bug report.
+     An explicit width is honoured, and the wrapper's `overflow-x: auto` then
+     scrolls as intended. */
 @media screen and (max-width: 782px) {
 	.perflocale-translations-table .perflocale-col-title {
 			min-width: 0;
 		}
 
 	.perflocale-translations-table .perflocale-col-lang {
-			width: auto;
-			min-width: 92px;
+			/* Sized from the LONGEST status badge, not the most common one:
+			   "Needs Update" measures 106px and needs 118px once the 6px
+			   padding on each side is counted. "Published" fitted in 108px,
+			   which is how the first attempt still clipped one badge by 8px. */
+			width: 118px;
+			padding-left: 6px;
+			padding-right: 6px;
 		}
+
 }
 
 /* ---- "Translate the entire site" panel ---- */

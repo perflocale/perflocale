@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin\Pages;
 
+use PerfLocale\Admin\ObjectLinks;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Enum\TranslationStatus;
@@ -212,15 +213,30 @@ final class TranslationsPage {
 				_prime_post_caches( array_keys( $linked_ids ), false, false );
 			}
 
+			// Reconcile the stored status against the post's real status. Kept
+			// deliberately identical to the CASE in
+			// TranslationLinkRepository::count_status_matrix() — these two are
+			// the only readers that interpret a link status for display, and
+			// when they disagreed the Dashboard and this screen reported
+			// different numbers for the same site.
 			foreach ( $batch_map as $oid => $links ) {
 				foreach ( $links as $link ) {
-					if ( ( $link->status ?? '' ) !== 'empty' ) {
-						continue;
-					}
 					$linked_post = get_post( (int) ( $link->object_id ?? 0 ) );
 					if ( ! $linked_post instanceof \WP_Post ) {
 						continue;
 					}
+
+					// Downward arm: a trashed or never-started translation is
+					// not a translation, whatever the stored status claims.
+					if ( in_array( $linked_post->post_status, [ 'trash', 'auto-draft' ], true ) ) {
+						$link->status = 'empty';
+						continue;
+					}
+
+					if ( ( $link->status ?? '' ) !== 'empty' ) {
+						continue;
+					}
+
 					if ( $linked_post->post_status === 'publish' ) {
 						$link->status = 'published';
 					} elseif ( $linked_post->post_status === 'draft' ) {
@@ -316,8 +332,62 @@ final class TranslationsPage {
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Nothing was flagged: the database rejected the update. The translations are unchanged — check the error log and try again.', 'perflocale' ); ?></p></div>
 			<?php elseif ( $bulk_message === 'bulk_mt_unavailable' ) : ?>
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Machine translation is unavailable. Configure a provider with a valid API key under Settings → Addons → Machine Translation.', 'perflocale' ); ?></p></div>
+			<?php
+			/*
+			 * ⚠️ These three used to redirect with `perflocale_bulk=<key>`, which
+			 * NOTHING reads — this block switches on `$_GET['message']`. Every
+			 * failed "Translate the entire site" therefore bounced the operator
+			 * back to a silent page. The handler now uses the `message` key, and
+			 * these arms give each outcome words.
+			 */
+			?>
+			<?php elseif ( $bulk_message === 'site_translate_empty' ) : ?>
+				<div class="notice notice-warning is-dismissible"><p><?php echo esc_html__( 'Nothing to translate: pick at least one target language and one post type.', 'perflocale' ); ?></p></div>
+			<?php
+			elseif ( $bulk_message === 'site_translate_unregistered' ) :
+				// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only flash routing
+				$_missing = isset( $_GET['types'] ) ? sanitize_text_field( wp_unslash( $_GET['types'] ) ) : '';
+				?>
+				<div class="notice notice-error is-dismissible"><p>
+				<?php
+				printf(
+					/* translators: %s: comma-separated list of post type slugs. */
+					esc_html__( 'Nothing to translate. These post types are marked translatable but are not registered right now — the plugin that provides them is probably inactive: %s', 'perflocale' ),
+					esc_html( $_missing )
+				);
+				?>
+				</p></div>
+			<?php
+			elseif ( $bulk_message === 'site_translate_denied' ) :
+				$_st_error = get_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
+				if ( $_st_error ) {
+					delete_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
+				}
+				?>
+				<div class="notice notice-error is-dismissible"><p>
+				<?php
+				echo esc_html__( 'The site-wide translation run could not be queued.', 'perflocale' );
+				if ( $_st_error ) {
+					echo ' ' . esc_html( (string) $_st_error );
+				}
+				?>
+				</p></div>
 			<?php elseif ( $bulk_message === 'bulk_no_target_language' ) : ?>
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Pick a target language for the bulk action.', 'perflocale' ); ?></p></div>
+			<?php
+			elseif ( $bulk_message === 'bulk_truncated' ) :
+				// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only flash routing
+				$_limit = isset( $_GET['limit'] ) ? absint( $_GET['limit'] ) : 0;
+				?>
+				<div class="notice notice-error is-dismissible"><p>
+				<?php
+				printf(
+					/* translators: %d: the server's max_input_vars limit. */
+					esc_html__( 'Nothing was changed. The form did not arrive complete — this server accepts at most %d form fields (max_input_vars), and the request reached that limit. Lower "Rows per page" in Screen Options, or select fewer rows, and try again.', 'perflocale' ),
+					absint( $_limit )
+				);
+				?>
+				</p></div>
 			<?php elseif ( $bulk_message === 'bulk_no_selection' ) : ?>
 				<div class="notice notice-warning is-dismissible"><p><?php echo esc_html__( 'Pick a bulk action and at least one post first.', 'perflocale' ); ?></p></div>
 			<?php elseif ( $bulk_message === 'bulk_unknown' ) : ?>
@@ -469,6 +539,15 @@ final class TranslationsPage {
 					}
 				}
 				?>
+				<?php
+				// ⭐ COMPLETENESS MARKER — must be the LAST field in the form.
+				// PHP silently discards input past `max_input_vars`, so if this
+				// arrives the browser sent everything before it too. A recursive
+				// element COUNT cannot prove the same thing: it also counts array
+				// containers, so an intact 63-field submission was being refused
+				// as "truncated" at a limit of 64.
+				?>
+				<input type="hidden" name="perflocale_form_end" value="1">
 			</form>
 
 			<div class="tablenav top perflocale-bulk-tablenav-top">
@@ -634,8 +713,8 @@ final class TranslationsPage {
 							$type_label    = $post_type_obj ? $post_type_obj->labels->singular_name : $post->post_type;
 							?>
 							<?php
-							$edit_url   = (string) get_edit_post_link( $post->ID );
-							$view_url   = (string) get_permalink( $post );
+							$edit_url   = ObjectLinks::edit_url( $post->ID, $post->post_type );
+							$view_url   = ObjectLinks::view_url( $post );
 							$post_title = get_the_title( $post );
 
 							if ( $post_title === '' ) {
@@ -765,9 +844,9 @@ final class TranslationsPage {
 		$edit_url = '';
 
 		if ( $cross_link_id > 0 ) {
-			$resolved = get_edit_post_link( $cross_link_id );
+			$resolved = ObjectLinks::edit_url( $cross_link_id );
 
-			if ( is_string( $resolved ) && $resolved !== '' ) {
+			if ( $resolved !== '' ) {
 				$edit_url = $resolved;
 			}
 		}
@@ -983,7 +1062,12 @@ final class TranslationsPage {
 		$option = $screen ? $screen->get_option( 'per_page', 'option' ) : '';
 		$val    = $option ? (int) get_user_meta( $user, $option, true ) : 0;
 
-		return $val > 0 ? $val : 20;
+		// ⚠️ Clamp on READ. The save-time ceiling cannot touch values stored
+		// BEFORE it existed: measured with max_input_vars=64 (ceiling 25), a
+		// stored 777 still drove posts_per_page=777 and rendered every row.
+		// The protection has to sit where the value is USED. The stored
+		// preference is deliberately not rewritten - only the effective value.
+		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
 	}
 
 	/**
@@ -1002,14 +1086,19 @@ final class TranslationsPage {
 			return;
 		}
 
-		$public_types = get_post_types(
-			[
-				'public'  => true,
-				'show_ui' => true,
-			],
-			'objects'
-		);
-		unset( $public_types['attachment'] );
+		// ⭐ Offer exactly what the handler will accept — see
+		// Settings::get_site_translate_post_types(). Offering `public + show_ui`
+		// here meant the panel listed types the plugin refuses to translate and
+		// hid every addon type it would happily translate.
+		$public_types = [];
+
+		foreach ( $this->settings->get_site_translate_post_types() as $pt_name ) {
+			$pt_object = get_post_type_object( $pt_name );
+
+			if ( $pt_object instanceof \WP_Post_Type ) {
+				$public_types[ $pt_name ] = $pt_object;
+			}
+		}
 		?>
 		<details class="perflocale-site-translate" data-perflocale-site-translate>
 			<summary>
@@ -1064,6 +1153,15 @@ final class TranslationsPage {
 				<p class="description">
 					<?php echo esc_html__( 'Runs as a resumable background job in bounded chunks; existing translations are never overwritten. Track progress under PerfLocale → Jobs.', 'perflocale' ); ?>
 				</p>
+				<?php
+				// ⭐ COMPLETENESS MARKER — must be the LAST field in the form.
+				// PHP silently discards input past `max_input_vars`, so if this
+				// arrives the browser sent everything before it too. A recursive
+				// element COUNT cannot prove the same thing: it also counts array
+				// containers, so an intact 63-field submission was being refused
+				// as "truncated" at a limit of 64.
+				?>
+				<input type="hidden" name="perflocale_form_end" value="1">
 			</form>
 		</details>
 		<?php

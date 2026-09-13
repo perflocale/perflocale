@@ -273,7 +273,9 @@ final class StringTranslation {
 	private function load_fallback_translations( int $language_id ): void {
 		$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 		$slug     = $this->router->get_current_slug();
-		$chain    = $settings->get_language_fallbacks()[ $slug ] ?? [];
+		// 'strings' context: a missing string may legitimately borrow from a
+		// sibling locale, which is a different judgement from post content.
+		$chain    = $settings->get_fallback_chain( (string) $slug, 'strings' );
 
 		if ( empty( $chain ) ) {
 			return;

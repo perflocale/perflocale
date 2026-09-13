@@ -960,6 +960,23 @@ final class Bootstrap {
 			Helper::is_write_context()
 		);
 
+		// The shared "Translations" panel renderer, plus the registry an addon
+		// uses to mount it on a host plugin's own editor screen.
+		//
+		// Registered in the ALWAYS-ON scope on purpose, and lazily. Addons boot
+		// before the admin gate below decides anything, so an addon calling
+		// `$plugin->get( 'translations_panel' )->mount( ... )` from boot() must
+		// not depend on which context the request turned out to be — putting it
+		// in register_admin_services() would throw "service not registered" on
+		// the front end and during AJAX. Being lazy, the factory does not run
+		// until something actually mounts or renders, so the front end pays a
+		// closure and nothing else.
+		$plugin->register(
+			'translations_panel',
+			fn( Plugin $p ) => new Admin\TranslationsPanel( $p->get( 'cache' ) ),
+			false
+		);
+
 		// ---- Context-specific services ----
 
 		if ( is_admin() && ! wp_doing_ajax() ) {
@@ -1243,6 +1260,73 @@ final class Bootstrap {
 			true
 		);
 
+		// ---- Block-theme template translation (FSE) ----
+		//
+		// ⚠️ REGISTERED HERE, OUTSIDE THE FRONTEND/ADMIN SPLIT BELOW, AND THE
+		// DISTINCTION IS LOAD-BEARING — this is the THIRD service in this file
+		// to have been mis-placed the same way (see option_strings and the RTL
+		// stylesheet twins above, both moved out for exactly this reason).
+		//
+		// While these two lived in register_frontend_services() they did not
+		// exist on an ordinary wp-admin request, because that method only runs
+		// when `! is_admin() || wp_doing_ajax()`. Measured over authenticated
+		// HTTP on WP 7.1 with the feature enabled:
+		//
+		//   context            frontend branch   perflocale/translation/post_data
+		//   front end          yes               BlockTemplateSupport::shape_post_data
+		//   admin-ajax.php     yes (ajax)        BlockTemplateSupport::shape_post_data
+		//   REST               yes               BlockTemplateSupport::shape_post_data
+		//   WP-CLI             yes               BlockTemplateSupport::shape_post_data
+		//   normal wp-admin    NO                (nothing — the filter was absent)
+		//
+		// So `admin_post_perflocale_create_translation` created a template
+		// translation with NO `-pfl-<lang>` slug and NO `wp_theme` term, while
+		// the SAME operation through the bulk AJAX button produced a correct row.
+		//
+		// ⚠️ Scope, stated honestly: for the two TEMPLATE types that route is
+		// currently reachable only by a hand-built URL. Its only emitter is the
+		// classic metabox (Admin\MetaBox), metaboxes need an edit screen, and
+		// wp-admin/post.php refuses `show_ui => false` types — which these are.
+		// That makes the defect LATENT rather than operator-facing, and the fix
+		// is worth making anyway: the shape is wrong, the row it produced was
+		// unfindable by core forever, and any future per-row create action
+		// would have walked straight into it.
+		//
+		// ⭐ The unshaped row is not merely invisible. `get_edit_post_link()`
+		// builds a template's edit URL as `get_stylesheet() . '//' . post_name`
+		// (wp-includes/link-template.php:1479-1481) — from the SLUG, never the
+		// ID. A translation sharing the source's slug therefore yields the
+		// SOURCE's Site Editor URL, so "create translation" handed the operator
+		// their English original to type into.
+		//
+		// Registering in every context is safe and cheap. BlockTemplateSupport
+		// only adds two hooks that fire while a translation is being created and
+		// return immediately unless the post type IS a template type.
+		// BlockTemplateTranslator was ALREADY written for this: its
+		// register_hooks() attaches the listing filter everywhere on purpose
+		// (translations must be hidden from the Site Editor) and returns before
+		// the front-end-only content swap. Only the registration was wrong.
+		//
+		// ⚠️ Position matters as much as the branch: these stay BEFORE
+		// `addon_registry` in the eager order, which is only safe because
+		// neither constructor nor register_hooks() reads
+		// get_translatable_post_types(). is_enabled() does read it, but lazily,
+		// inside the filter callback. Verified at runtime: the first
+		// get_block_templates() of a request fires after the addon filters are
+		// bound, with the full addon-aware type list, in admin and on the front
+		// end alike. Do NOT add an eager read here.
+		$plugin->register(
+			'block_template_translator',
+			fn( Plugin $p ) => new Frontend\BlockTemplateTranslator( $p->get( 'router' ), $p->get( 'settings' ), $p->get( 'lang_repo' ) ),
+			true
+		);
+
+		$plugin->register(
+			'block_template_support',
+			fn( Plugin $p ) => new Translation\BlockTemplateSupport(),
+			true
+		);
+
 		if ( ! is_admin() || wp_doing_ajax() ) {
 			self::register_frontend_services( $plugin );
 		} else {
@@ -1300,6 +1384,13 @@ final class Bootstrap {
 				'wp_ajax_perflocale_assign_post_languages',
 				static function (): void {
 					self::ajax_assign_post_languages();
+				}
+			);
+
+			add_action(
+				'wp_ajax_perflocale_generate_missing_translations',
+				static function (): void {
+					self::ajax_generate_missing_translations();
 				}
 			);
 		}
@@ -2063,8 +2154,12 @@ final class Bootstrap {
 		// Abilities API (WP 6.9+) - disabled by default, enabled via filter.
 		// Registers PerfLocale translation operations as discoverable abilities
 		// for AI tools and external consumers. Zero overhead when disabled.
-		/** @hook perflocale/abilities/enabled Enable the WordPress Abilities API integration. Default: false. */
-		if ( apply_filters( 'perflocale/abilities/enabled', false ) ) {
+		// ⚠️ The default now comes from the SETTING, not a hard-coded false, so
+		// the feature is reachable without writing code. A filter that returns
+		// an explicit true/false still wins, so any site already using the
+		// filter is unaffected.
+		/** @hook perflocale/abilities/enabled Enable the WordPress Abilities API integration. Default: the `abilities_enabled` setting. */
+		if ( apply_filters( 'perflocale/abilities/enabled', (bool) $plugin->get( 'settings' )->get( 'abilities_enabled', true ) ) ) {
 			$registrar = new AbilitiesRegistrar( $plugin );
 			add_action( 'wp_abilities_api_categories_init', [ $registrar, 'register_category' ] );
 			add_action( 'wp_abilities_api_init', [ $registrar, 'register_abilities' ] );
@@ -2916,6 +3011,71 @@ final class Bootstrap {
 	 *
 	 * @return void
 	 */
+	/**
+	 * Release the debug query log and report whether a bulk admin run must stop
+	 * because it is approaching PHP's memory limit.
+	 *
+	 * ⭐ WHY THIS EXISTS — A REAL 500, REPRODUCED AND MEASURED.
+	 *
+	 * The Taxonomy Translations button returned HTTP 500 on a site with ~2,000
+	 * terms. Traced: `PHP Fatal error: Allowed memory size of 268435456 bytes
+	 * exhausted` inside the Redis client, after 90 created terms and 7,590
+	 * queries — memory climbing a flat 2.6 MB per created term.
+	 *
+	 * The cause was NOT the plugin's own data. `SAVEQUERIES` stores the SQL AND
+	 * a full backtrace for EVERY query in `$wpdb->queries`, and this work does
+	 * roughly 70 queries per created term. The decisive A/B, same batch, only
+	 * that array discarded as it grew:
+	 *
+	 *     as-is                    7,590 queries,  90 created, 256 MB -> FATAL
+	 *     $wpdb->queries dropped  12,266 queries, 173 created,  44 MB -> 200 OK
+	 *
+	 * More work, more queries, six times less memory. So: drop the log. It is a
+	 * debugging aid, and a bulk writer that fatals because of it helps nobody.
+	 * `num_queries` is a separate counter and is deliberately left intact, so
+	 * anything counting queries still gets the truth.
+	 *
+	 * ⚠️ A MEMORY CEILING IS A BUDGET, EXACTLY LIKE THE CLOCK. `SAVEQUERIES` was
+	 * this host's reason for running out; another host will find its own —
+	 * a large taxonomy, a verbose object cache, a profiler. Rather than pick a
+	 * smaller fixed batch and hope it fits everywhere, the caller yields when
+	 * real usage crosses 80% of the real limit and returns its cursor, so the
+	 * next request resumes. That adapts to the host instead of guessing at it,
+	 * and costs nothing when there is headroom.
+	 *
+	 * @param bool $release_query_log Whether to drop `$wpdb->queries` first.
+	 * @return bool True when the caller should stop and hand back its cursor.
+	 */
+	private static function bulk_memory_pressure( bool $release_query_log = true ): bool {
+		if ( $release_query_log && defined( 'SAVEQUERIES' ) && SAVEQUERIES ) {
+			global $wpdb;
+
+			if ( isset( $wpdb->queries ) && is_array( $wpdb->queries ) && count( $wpdb->queries ) > 200 ) {
+				$wpdb->queries = [];
+			}
+		}
+
+		$limit = wp_convert_hr_to_bytes( (string) ini_get( 'memory_limit' ) );
+
+		// -1 / 0 means no limit (typical under WP-CLI): nothing to yield for.
+		if ( $limit <= 0 ) {
+			return false;
+		}
+
+		/**
+		 * Fraction of PHP's memory limit at which a bulk admin run stops and
+		 * hands its cursor back instead of risking a fatal.
+		 *
+		 * @hook perflocale/admin/bulk_memory_ceiling
+		 *
+		 * @param float $fraction Default 0.8.
+		 */
+		$ceiling = (float) apply_filters( 'perflocale/admin/bulk_memory_ceiling', 0.8 );
+		$ceiling = min( 0.95, max( 0.5, $ceiling ) );
+
+		return memory_get_usage( true ) > (int) ( $limit * $ceiling );
+	}
+
 	private static function ajax_create_taxonomy_translations(): void {
 		// Verify the caller before any side effects (resource-limit
 		// raises, DB scans, etc.) — nonce + capability checks first.
@@ -2959,7 +3119,70 @@ final class Bootstrap {
 		$languages = $lang_repo->get_active();
 		$default   = $lang_repo->get_default();
 
+		// ⚠️ RESUMABLE CURSOR, not a re-scan. This handler walked EVERY term of
+		// EVERY translatable taxonomy in one request, behind set_time_limit()
+		// and ignore_user_abort() — on a large site the gateway 504s while PHP
+		// carries on writing, so the operator sees a failure while the work is
+		// in fact still happening.
+		//
+		// A clock alone would NOT fix it: each run would restart at the first
+		// taxonomy and spend its whole budget re-skipping finished terms, so a
+		// large site could never reach the end and the client would loop
+		// forever making no progress. The caller carries the position back.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+		$tax_index = isset( $_POST['tax_index'] ) ? max( 0, (int) $_POST['tax_index'] ) : 0;
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+		$term_offset = isset( $_POST['term_offset'] ) ? max( 0, (int) $_POST['term_offset'] ) : 0;
+
+		// ⚠️ CONCURRENCY GUARD. Two operators (or two impatient clicks) running
+		// this at once both read the same "already translated?" map, so both
+		// decide a term needs creating and both create it — duplicate terms
+		// that the unique link key cannot prevent, because the duplicate is a
+		// WP TERM, not a link row.
+		//
+		// acquire()/release() rather than Lock::with(): every exit from this
+		// handler is wp_send_json_*(), which calls die() — and die() does NOT
+		// run `finally`, so a with() wrapper would hold the lock until its TTL
+		// expired on every single successful run. The TTL is a backstop here,
+		// not the mechanism; release() is called on each exit path below.
+		$lock_name = 'create_term_translations';
+
+		if ( ! Concurrency\Lock::acquire( $lock_name, 120 ) ) {
+			// ⚠️ A HELD LOCK IS NOT PROOF A RUN IS ALIVE. release() only works in
+			// the process that took the lock, so a run that fataled leaves it
+			// standing for the rest of its TTL — and the operator then sees
+			// "already in progress" describing a run that died. Say how long,
+			// so a two-minute mystery becomes a two-minute wait.
+			$held_for = Concurrency\Lock::seconds_remaining( $lock_name );
+
+			wp_send_json_error(
+				[
+					'message' => $held_for > 0
+						? sprintf(
+							/* translators: %d: seconds remaining. */
+							__( 'Another translation run is in progress, or a previous one ended unexpectedly. This clears automatically in %d seconds — then try again.', 'perflocale' ),
+							$held_for
+						)
+						: __( 'Another translation run is already in progress. Wait for it to finish, then try again.', 'perflocale' ),
+				]
+			);
+		}
+
+		$started_at = microtime( true );
+		/** @hook perflocale/create_term_translations/budget_seconds Wall-clock budget for one run. */
+		$budget_seconds = (float) apply_filters( 'perflocale/create_term_translations/budget_seconds', 15.0 );
+		/** @hook perflocale/create_term_translations/batch_size Terms fetched per run. */
+		$term_batch = max( 1, (int) apply_filters( 'perflocale/create_term_translations/batch_size', 200 ) );
+		$hit_budget  = false;
+		$more        = false;
+		$next_index  = 0;
+		$next_offset = 0;
+
 		if ( ! $default || count( $languages ) < 2 ) {
+			// Release first: this exit is past the acquire(), and wp_send_json_*
+			// dies — without this the lock would sit until its TTL and block
+			// every retry for two minutes.
+			Concurrency\Lock::release( $lock_name );
 			wp_send_json_error( [ 'message' => __( 'At least two active languages are required.', 'perflocale' ) ] );
 		}
 
@@ -3049,7 +3272,15 @@ final class Bootstrap {
 		// wp_update_term_count() calls per wp_insert_term().
 		wp_defer_term_counting( true );
 
-		foreach ( $taxonomies as $taxonomy ) {
+		$taxonomies = array_values( $taxonomies );
+
+		foreach ( $taxonomies as $tax_i => $taxonomy ) {
+			// Resume: a taxonomy the previous run finished is skipped
+			// outright, so every run starts where the last one stopped.
+			if ( $tax_i < $tax_index ) {
+				continue;
+			}
+
 			$tax_obj = get_taxonomy( $taxonomy );
 
 			if ( ! $tax_obj ) {
@@ -3059,6 +3290,7 @@ final class Bootstrap {
 			$tax_label   = $tax_obj->labels->name;
 			$tax_created = 0;
 			$tax_skipped = 0;
+			$in_tax      = 0;
 
 			// Fetch only term IDs and names to minimize memory usage.
 			$terms = get_terms(
@@ -3067,6 +3299,8 @@ final class Bootstrap {
 					'hide_empty'               => false,
 					'orderby'                  => 'parent',
 					'order'                    => 'ASC',
+					'number'                   => $term_batch,
+					'offset'                   => ( $tax_i === $tax_index ) ? $term_offset : 0,
 					'perflocale_all_languages' => true,
 				]
 			);
@@ -3197,6 +3431,39 @@ final class Bootstrap {
 
 					++$tax_created;
 				}
+
+				++$in_tax;
+
+				// The atomic unit is a TERM, not a language: the cursor may only
+				// pass a term once every language has been attempted for it, or
+				// a resumed run would skip languages silently.
+				// ⚠️ TIME OR MEMORY. The memory arm is what stops this handler
+				// FATALING instead of yielding on a host whose limit this batch
+				// cannot fit in — see bulk_memory_pressure(). Both arms stop the
+				// same way, by handing the cursor back so the next request
+				// resumes exactly here.
+				if ( ( microtime( true ) - $started_at ) >= $budget_seconds || self::bulk_memory_pressure() ) {
+					$hit_budget = true;
+					break;
+				}
+			}
+
+			$base_offset = ( $tax_i === $tax_index ) ? $term_offset : 0;
+			$page_count  = is_array( $terms ) ? count( $terms ) : 0;
+
+			if ( $hit_budget ) {
+				$more        = true;
+				$next_index  = $tax_i;
+				$next_offset = $base_offset + $in_tax;
+			} elseif ( $page_count >= $term_batch ) {
+				// A full page came back, so this taxonomy probably has more.
+				$more        = true;
+				$next_index  = $tax_i;
+				$next_offset = $base_offset + $page_count;
+			} else {
+				// Taxonomy exhausted — the next run starts at the next one.
+				$next_index  = $tax_i + 1;
+				$next_offset = 0;
 			}
 
 			// Free term objects after each taxonomy.
@@ -3210,6 +3477,10 @@ final class Bootstrap {
 				'created'  => $tax_created,
 				'skipped'  => $tax_skipped,
 			];
+	
+			if ( $more ) {
+				break;
+			}
 		}
 
 		// Flush deferred term counts now that all inserts are done.
@@ -3280,16 +3551,26 @@ final class Bootstrap {
 			}
 		}
 
-		$message = sprintf(
-			/* translators: %1$d: number of translations created, %2$d: number already existing */
-			__( 'Done - %1$d translation(s) created, %2$d already existed.', 'perflocale' ),
-			$created,
-			$skipped
-		);
+		$message = $more
+			? sprintf(
+				/* translators: %1$d: created so far, %2$d: already existed */
+				__( '%1$d created, %2$d already existed - still working...', 'perflocale' ),
+				$created,
+				$skipped
+			)
+			: sprintf(
+				/* translators: %1$d: number of translations created, %2$d: number already existing */
+				__( 'Done - %1$d translation(s) created, %2$d already existed.', 'perflocale' ),
+				$created,
+				$skipped
+			);
 
 		if ( $mt_used ) {
 			$message .= ' ' . __( 'Term names were machine-translated.', 'perflocale' );
 		}
+
+		// Released BEFORE the response, because wp_send_json_success() dies.
+		Concurrency\Lock::release( $lock_name );
 
 		wp_send_json_success(
 			[
@@ -3297,6 +3578,321 @@ final class Bootstrap {
 				'created'          => $created,
 				'skipped'          => $skipped,
 				'taxonomy_details' => $taxonomy_details,
+				// The caller hands these straight back, so the next run starts
+				// exactly where this one stopped rather than re-scanning.
+				'more'             => $more,
+				'tax_index'        => $next_index,
+				'term_offset'      => $next_offset,
+			]
+		);
+	}
+
+	/**
+	 * AJAX handler: create the missing translation drafts for existing content.
+	 *
+	 * ⭐ WHY THIS EXISTS. Until now there was NO bulk, non-machine-translation
+	 * way to make translations exist. Every creation path in the plugin handles
+	 * exactly one (source, language) pair, and the automatic path fails six
+	 * separate ways — `auto_create_stubs` is off by default, it is bound once at
+	 * boot so enabling it is not retroactive, it is publish-only and
+	 * first-transition-only, it BAILS PERMANENTLY once a group has any
+	 * translation (so partial coverage can never be completed), there is no
+	 * backfill anywhere, and it depends on the post type being in a memo that
+	 * has been poisoned before. With machine translation off, the only route to
+	 * translating a few thousand Contact Form 7 forms was a few thousand
+	 * individual nonce'd requests.
+	 *
+	 * ⚠️ THIS IS A WRITE PATH THAT CREATES POSTS, so the guards matter more than
+	 * the feature:
+	 *   - drafts only. `create_translation()` inserts as draft/pending per the
+	 *     Default Translation Status setting, so nothing becomes publicly
+	 *     visible as a side effect of pressing a button.
+	 *   - content is NOT copied. An empty draft is an obvious "not done yet";
+	 *     a copy of the source reads as a finished translation that happens to
+	 *     be in the wrong language, which is worse.
+	 *   - never machine translation. That spends money and belongs behind the
+	 *     explicit bulk-MT action.
+	 *   - idempotent. An existing translation is skipped, so pressing the button
+	 *     twice creates nothing the second time.
+	 *   - bounded and resumable, on the same cursor contract as the other bulk
+	 *     admin actions, so a large site cannot 504 while PHP keeps writing.
+	 *
+	 * @return void
+	 */
+	private static function ajax_generate_missing_translations(): void {
+		check_ajax_referer( 'perflocale_generate_missing_translations', '_nonce' );
+
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			wp_send_json_error( [ 'message' => __( 'Insufficient permissions.', 'perflocale' ) ] );
+		}
+
+		$plugin    = Plugin::get_instance();
+		$cache     = $plugin->get( 'cache' );
+		$settings  = $plugin->get( 'settings' );
+		$lang_repo = new Database\Repository\LanguageRepository( $cache );
+		$default   = $lang_repo->get_default();
+		$languages = $lang_repo->get_active();
+
+		if ( ! $default || count( $languages ) < 2 ) {
+			wp_send_json_error( [ 'message' => __( 'At least two active languages are required.', 'perflocale' ) ] );
+		}
+
+		global $wpdb;
+
+		$targets = [];
+
+		foreach ( $languages as $lang ) {
+			if ( (int) $lang->id !== (int) $default->id ) {
+				$targets[] = $lang;
+			}
+		}
+
+		$lock_name = 'generate_missing_translations';
+
+		// See ajax_create_taxonomy_translations() for why this is
+		// acquire()/release() and not Lock::with(): wp_send_json_*() dies, and
+		// die() does not run `finally`.
+		if ( ! Concurrency\Lock::acquire( $lock_name, 120 ) ) {
+			// See ajax_create_taxonomy_translations(): a lock left by a crashed
+			// run is indistinguishable from a live one, so report the wait.
+			$held_for = Concurrency\Lock::seconds_remaining( $lock_name );
+
+			wp_send_json_error(
+				[
+					'message' => $held_for > 0
+						? sprintf(
+							/* translators: %d: seconds remaining. */
+							__( 'Another run is in progress, or a previous one ended unexpectedly. This clears automatically in %d seconds — then try again.', 'perflocale' ),
+							$held_for
+						)
+						: __( 'Another run is already in progress. Wait for it to finish, then try again.', 'perflocale' ),
+				]
+			);
+		}
+
+		$types = array_values( $settings->get_translatable_post_types() );
+
+		// ⭐ OPTIONAL SCOPING. Without it this is an all-or-nothing button over
+		// every translatable type — which is how it created 200 drafts of real
+		// content the first time it was exercised. An operator who only wants
+		// their contact forms translated should be able to say so, and a test
+		// must be able to confine it to a fixture type instead of the whole site.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$requested = isset( $_POST['post_types'] ) && is_array( $_POST['post_types'] )
+			? array_values( array_filter( array_map( 'sanitize_key', wp_unslash( $_POST['post_types'] ) ) ) )
+			: [];
+
+		if ( $requested !== [] ) {
+			$types = array_values( array_intersect( $types, $requested ) );
+		}
+
+		// ⭐ COUNT-FIRST MODE. The caller asks how much work this is BEFORE any
+		// of it happens, so the confirmation can state a number instead of the
+		// operator discovering the scale afterwards. Creates nothing.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		if ( isset( $_POST['mode'] ) && 'count' === sanitize_key( wp_unslash( $_POST['mode'] ) ) ) {
+			$counts = [];
+			$total  = 0;
+
+			foreach ( $types as $post_type ) {
+				if ( ! post_type_exists( $post_type ) ) {
+					continue;
+				}
+
+				// Same definition of "source" as the run below, or the estimate
+				// would describe different work from the work that happens.
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+				$n = (int) $wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(*) FROM {$wpdb->posts} p
+						 INNER JOIN %i l ON l.object_id = p.ID AND l.type = 'post' AND l.language_id = %d
+						 WHERE p.post_type = %s
+						   AND p.post_status IN ('publish','draft','pending','private','future')",
+						Database\Schema::table( 'translation_links' ),
+						(int) $default->id,
+						$post_type
+					)
+				);
+				// phpcs:enable
+
+				if ( $n > 0 ) {
+					$counts[] = [
+						'post_type' => $post_type,
+						'sources'   => $n,
+					];
+					$total    += $n * count( $targets );
+				}
+			}
+
+			Concurrency\Lock::release( $lock_name );
+
+			wp_send_json_success(
+				[
+					'mode'    => 'count',
+					// A ceiling, not a prediction: pairs that already exist are
+					// skipped, so the real number is this or fewer. Saying "up
+					// to" is honest; quoting an exact figure would not be.
+					'max'     => $total,
+					'types'   => $counts,
+					'message' => sprintf(
+						/* translators: %d: maximum number of drafts. */
+						__( 'This will create up to %d draft translation(s). Existing translations are skipped.', 'perflocale' ),
+						$total
+					),
+				]
+			);
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$type_index = isset( $_POST['type_index'] ) ? max( 0, (int) $_POST['type_index'] ) : 0;
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$post_offset = isset( $_POST['post_offset'] ) ? max( 0, (int) $_POST['post_offset'] ) : 0;
+
+		$started_at = microtime( true );
+		/** @hook perflocale/generate_translations/budget_seconds Wall-clock budget for one run. */
+		$budget = (float) apply_filters( 'perflocale/generate_translations/budget_seconds', 15.0 );
+		/** @hook perflocale/generate_translations/batch_size Source posts fetched per run. */
+		$batch = max( 1, (int) apply_filters( 'perflocale/generate_translations/batch_size', 100 ) );
+
+		$manager = new Translation\PostTranslationManager( $cache, $settings );
+
+		$created      = 0;
+		$skipped      = 0;
+		$failed       = 0;
+		$more         = false;
+		$next_index   = 0;
+		$next_offset  = 0;
+		$per_type     = [];
+		$hit_budget   = false;
+
+		foreach ( $types as $ti => $post_type ) {
+			if ( $ti < $type_index ) {
+				continue;
+			}
+
+			if ( ! post_type_exists( $post_type ) ) {
+				continue;
+			}
+
+			$base   = ( $ti === $type_index ) ? $post_offset : 0;
+			$in_type = 0;
+			$made    = 0;
+
+			// ⚠️ Only SOURCE-language posts. `perflocale_lang` is NOT a query arg
+			// that filters this - passing it returned every post of the type,
+			// including the translations created by the previous run, so a
+			// second run enumerated 9 "sources" for 3 real ones and did three
+			// times the work. Nothing was created (every pair already existed),
+			// which is exactly why it would have gone unnoticed.
+			//
+			// Join the link table instead: a row IS a source when it carries the
+			// DEFAULT language. Ordering by ID keeps the offset stable across runs.
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+			$source_ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT p.ID FROM {$wpdb->posts} p
+					 INNER JOIN %i l ON l.object_id = p.ID AND l.type = 'post' AND l.language_id = %d
+					 WHERE p.post_type = %s
+					   AND p.post_status IN ('publish','draft','pending','private','future')
+					 ORDER BY p.ID ASC
+					 LIMIT %d OFFSET %d",
+					Database\Schema::table( 'translation_links' ),
+					(int) $default->id,
+					$post_type,
+					$batch,
+					$base
+				)
+			);
+			// phpcs:enable
+
+			foreach ( (array) $source_ids as $source_id ) {
+				$source_id = (int) $source_id;
+
+				foreach ( $targets as $lang ) {
+					if ( $manager->get_translation_id( $source_id, $lang->slug ) !== null ) {
+						++$skipped;
+						continue;
+					}
+
+					// copy_content = false: an empty draft reads as "not done".
+					$new_id = $manager->create_translation( $source_id, $lang->slug, false );
+
+					if ( is_int( $new_id ) && $new_id > 0 ) {
+						++$created;
+						++$made;
+					} else {
+						++$failed;
+					}
+				}
+
+				++$in_type;
+
+				// A SOURCE is the atomic unit — every target language is
+				// attempted before the cursor may pass it, or a resumed run
+				// would skip languages silently.
+				// ⚠️ TIME OR MEMORY. The memory arm is what stops this handler
+				// FATALING instead of yielding on a host whose limit this batch
+				// cannot fit in — see bulk_memory_pressure(). Both arms stop the
+				// same way, by handing the cursor back so the next request
+				// resumes exactly here.
+				if ( ( microtime( true ) - $started_at ) >= $budget || self::bulk_memory_pressure() ) {
+					$hit_budget = true;
+					break;
+				}
+			}
+
+			$per_type[] = [
+				'post_type' => $post_type,
+				'created'   => $made,
+			];
+
+			$page = is_array( $source_ids ) ? count( $source_ids ) : 0;
+
+			if ( $hit_budget ) {
+				$more        = true;
+				$next_index  = $ti;
+				$next_offset = $base + $in_type;
+			} elseif ( $page >= $batch ) {
+				$more        = true;
+				$next_index  = $ti;
+				$next_offset = $base + $page;
+			} else {
+				$next_index  = $ti + 1;
+				$next_offset = 0;
+			}
+
+			if ( $more ) {
+				break;
+			}
+		}
+
+		$message = $more
+			? sprintf(
+				/* translators: %1$d: created so far, %2$d: already existed */
+				__( '%1$d created, %2$d already existed - still working...', 'perflocale' ),
+				$created,
+				$skipped
+			)
+			: sprintf(
+				/* translators: 1: created, 2: already existing, 3: failed */
+				__( 'Done - %1$d draft translation(s) created, %2$d already existed, %3$d failed.', 'perflocale' ),
+				$created,
+				$skipped,
+				$failed
+			);
+
+		Concurrency\Lock::release( $lock_name );
+
+		wp_send_json_success(
+			[
+				'message'     => $message,
+				'created'     => $created,
+				'skipped'     => $skipped,
+				'failed'      => $failed,
+				'details'     => $per_type,
+				'more'        => $more,
+				'type_index'  => $next_index,
+				'post_offset' => $next_offset,
 			]
 		);
 	}
@@ -3368,7 +3964,24 @@ final class Bootstrap {
 			wp_send_json_error( [ 'message' => __( 'No default language configured.', 'perflocale' ) ] );
 		}
 
-		$types = $settings->get_translatable_post_types();
+		$types = array_values( $settings->get_translatable_post_types() );
+
+		// ⭐ OPTIONAL SCOPING, mirroring ajax_generate_missing_translations().
+		// This is the OTHER bulk writer on the Settings screen and it was the
+		// only one that could not be confined: it always walked every
+		// translatable type. That matters twice over — an operator who only
+		// wants their forms assigned should be able to say so, and a
+		// regression test that exercises this handler on a real site MUST be
+		// able to scope it to its own fixture type rather than writing a link
+		// row for every unlinked post on the site.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$requested = isset( $_POST['post_types'] ) && is_array( $_POST['post_types'] )
+			? array_values( array_filter( array_map( 'sanitize_key', wp_unslash( $_POST['post_types'] ) ) ) )
+			: [];
+
+		if ( $requested !== [] ) {
+			$types = array_values( array_intersect( $types, $requested ) );
+		}
 
 		if ( empty( $types ) ) {
 			wp_send_json_error( [ 'message' => __( 'No translatable post types configured.', 'perflocale' ) ] );
@@ -3384,6 +3997,13 @@ final class Bootstrap {
 		$manager        = new Translation\PostTranslationManager( $cache, $settings );
 		$per_type       = [];
 		$total_assigned = 0;
+		$hit_budget     = false;
+		$started_at     = microtime( true );
+
+		/** @hook perflocale/assign_languages/budget_seconds Wall-clock budget for one assign run. */
+		$budget_seconds = (float) apply_filters( 'perflocale/assign_languages/budget_seconds', 15.0 );
+		/** @hook perflocale/assign_languages/batch_size Rows fetched per post type per run. */
+		$batch_size     = max( 1, (int) apply_filters( 'perflocale/assign_languages/batch_size', 500 ) );
 
 		foreach ( $types as $post_type ) {
 			// Find posts with NO valid post-type translation link. The
@@ -3403,10 +4023,13 @@ final class Bootstrap {
 					    SELECT 1 FROM %i l
 					    INNER JOIN %i g ON g.id = l.group_id AND g.type = 'post'
 					    WHERE l.object_id = p.ID
-					  )",
+					  )
+					ORDER BY p.ID ASC
+					LIMIT %d",
 					$post_type,
 					$links_table,
-					$groups_table
+					$groups_table,
+					$batch_size
 				)
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -3417,6 +4040,23 @@ final class Bootstrap {
 				if ( $manager->set_post_language( (int) $post_id, $default->slug ) ) {
 					++$assigned;
 				}
+
+				// ⚠️ BOUNDED. This loop used to run over EVERY unassigned post of
+				// every translatable type in one request, with no LIMIT, behind
+				// set_time_limit() and ignore_user_abort(). On a large site that
+				// fails INVISIBLY: the gateway returns 504 while PHP carries on
+				// writing, so the operator sees a failure and the work is
+				// actually still happening. Stop on a clock and report what is
+				// left; the caller resumes.
+				// ⚠️ TIME OR MEMORY. The memory arm is what stops this handler
+				// FATALING instead of yielding on a host whose limit this batch
+				// cannot fit in — see bulk_memory_pressure(). Both arms stop the
+				// same way, by handing the cursor back so the next request
+				// resumes exactly here.
+				if ( ( microtime( true ) - $started_at ) >= $budget_seconds || self::bulk_memory_pressure() ) {
+					$hit_budget = true;
+					break;
+				}
 			}
 
 			$per_type[] = [
@@ -3425,20 +4065,57 @@ final class Bootstrap {
 			];
 
 			$total_assigned += $assigned;
+
+			if ( $hit_budget ) {
+				break;
+			}
 		}
 
-		$message = sprintf(
-			/* translators: 1: number of posts assigned, 2: default language slug */
-			__( 'Done - %1$d post(s) assigned to %2$s.', 'perflocale' ),
-			$total_assigned,
-			Helper::format_locale_as_bcp47( (string) $default->slug )
-		);
+		// What is still unassigned, across every type — this is what makes the
+		// run resumable rather than merely truncated.
+		$remaining = 0;
+
+		foreach ( $types as $post_type ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+			$remaining += (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$wpdb->posts} p
+					WHERE p.post_status IN ('publish','draft','pending','private','future')
+					  AND p.post_type = %s
+					  AND NOT EXISTS (
+					    SELECT 1 FROM %i l
+					    INNER JOIN %i g ON g.id = l.group_id AND g.type = 'post'
+					    WHERE l.object_id = p.ID
+					  )",
+					$post_type,
+					$links_table,
+					$groups_table
+				)
+			);
+			// phpcs:enable
+		}
+
+		$message = $remaining > 0
+			? sprintf(
+				/* translators: 1: number assigned so far, 2: language, 3: number still to do */
+				__( '%1$d assigned to %2$s - %3$d still to go, continuing...', 'perflocale' ),
+				$total_assigned,
+				Helper::format_locale_as_bcp47( (string) $default->slug ),
+				$remaining
+			)
+			: sprintf(
+				/* translators: 1: number of items assigned, 2: default language slug */
+				__( 'Done - %1$d item(s) assigned to %2$s.', 'perflocale' ),
+				$total_assigned,
+				Helper::format_locale_as_bcp47( (string) $default->slug )
+			);
 
 		wp_send_json_success(
 			[
 				'message'           => $message,
 				'assigned'          => $total_assigned,
 				'post_type_details' => $per_type,
+				'remaining'         => $remaining,
 			]
 		);
 	}
@@ -3590,6 +4267,16 @@ final class Bootstrap {
 		int $post_parent,
 		string $original_slug
 	): string {
+		// ⚠️ NEVER collapse a template translation's slug. This filter
+		// deliberately removes WordPress's `-2` suffix so a German page keeps
+		// a clean slug — correct for content, fatal here: a template
+		// translation's DISTINCT post_name is the only handle core's
+		// `post_name__in` lookup has, and collapsing it onto the source's
+		// makes two rows answer one query.
+		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post_type ) ) {
+			return $slug;
+		}
+
 		// Only intervene if WP changed the slug (appended -2, -3, etc.).
 		if ( $slug === $original_slug ) {
 			return $slug;
@@ -3810,6 +4497,14 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function auto_create_translation_stubs( string $new_status, string $old_status, \WP_Post $post ): void {
+		// ⚠️ No empty stubs for templates. A published-but-EMPTY translation
+		// is exactly the state that rendered a blank header, and stubs would
+		// mint one per language on every template publish — junk rows in a
+		// table the operator cannot browse.
+		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post->post_type ) ) {
+			return;
+		}
+
 		// Only trigger when a post transitions to "publish" for the first time.
 		if ( $new_status !== 'publish' || $old_status === 'publish' ) {
 			return;
@@ -3898,6 +4593,14 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function auto_translate_on_publish( string $new_status, string $old_status, \WP_Post $post ): void {
+		// ⚠️ Never machine-translate raw block markup. A template's content is
+		// `<!-- wp:… {"json":"here"} -->` delimiters; sending those to a
+		// provider risks corrupting the markup, and costs provider budget on
+		// every Site Editor save.
+		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post->post_type ) ) {
+			return;
+		}
+
 		if ( $new_status !== 'publish' || $old_status === 'publish' ) {
 			return;
 		}

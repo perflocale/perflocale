@@ -90,6 +90,20 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// _perflocale_language meta but must not be duplicated per language.
 		add_filter( 'perflocale/translatable_post_types', [ $this, 'add_post_types' ] );
 
+		// `product_variation` is registered show_ui = false, so WordPress has no
+		// `_edit_link` for it and the Translations screen would render a dead
+		// link. A variation has no standalone editor in WooCommerce either — it
+		// is edited inside its parent product's Variations tab — so point there
+		// rather than inventing a URL that does not exist.
+		add_filter( 'perflocale/admin/edit_post_link', [ $this, 'edit_link' ], 10, 3 );
+
+		// A variation is not publicly_queryable, so PerfLocale's viewability
+		// gate drops its front-end link — but WooCommerce maps a variation
+		// permalink onto the parent product with the attributes as a query
+		// string (WC_Post_Data::variation_post_link), and that URL returns 200.
+		// Restore it rather than losing a working preview link.
+		add_filter( 'perflocale/admin/view_post_link', [ $this, 'view_link' ], 10, 2 );
+
 		// Register product taxonomies as translatable.
 		// Product attributes (pa_*) are discovered dynamically after WC registers them.
 		add_filter( 'perflocale/translatable_taxonomies', [ $this, 'add_taxonomies' ], 20 );
@@ -154,6 +168,23 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'woocommerce_product_get_cross_sell_ids', [ $this, 'map_related_ids_to_language' ] );
 		add_filter( 'woocommerce_product_get_upsell_ids', [ $this, 'map_related_ids_to_language' ] );
 		add_filter( 'woocommerce_cart_crosssell_ids', [ $this, 'map_related_ids_to_language' ] );
+
+		// ⭐ A GROUPED product's children are the same class of stored-ID list
+		// and were the one member of it not mapped. `_children` is copied
+		// verbatim to the translation, so on /de/ a grouped product handed
+		// WooCommerce the DEFAULT-language child ids — and those ids then went
+		// through a language-scoped lookup that dropped them, leaving the
+		// add-to-cart form rendered with no purchasable children at all.
+		// Two independent faults stacked; mapping the ids fixes this one at
+		// source, because the mapped sibling belongs to the current language
+		// and survives the scoping.
+		//
+		// Hook name verified in host source, not assumed:
+		// abstract-wc-data.php:917-919 `return 'woocommerce_' . $this->object_type . '_get_';`
+		// and :939 `apply_filters( $this->get_hook_prefix() . $prop, $value, $this )`,
+		// with WC_Product_Grouped::get_children() -> get_prop( 'children' )
+		// (class-wc-product-grouped.php:147-149).
+		add_filter( 'woocommerce_product_get_children', [ $this, 'map_related_ids_to_language' ] );
 
 		// ---- Coupon restrictions across translation siblings ----
 
@@ -255,6 +286,74 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// renders "out of stock" with no variation form — broken for the core
 		// WC store use case. Runs late (20) so create_translation's own meta
 		// copy has finished.
+		// ⭐ Carry the SOURCE's product_type onto the translation — for every
+		// product type, not just variable. `product_type` is an internal WC
+		// taxonomy, so it is not in get_translatable_taxonomies() and
+		// copy_taxonomy_terms() never touches it; a translation therefore
+		// materialises with NO product_type term and WooCommerce falls back to
+		// WC_Product_Simple. clone_product_variations() below already knew this
+		// ("The product_type taxonomy term is not part of the meta copy…") but
+		// patched it only after an `is_type( 'variable' )` guard, so GROUPED and
+		// EXTERNAL products silently degraded: measured on test.local, a
+		// translated grouped product came back as WC_Product_Simple with
+		// get_children() === [] even though its `_children` meta was copied
+		// intact — no child products, and the wrong add-to-cart form.
+		//
+		// Priority 15: after create_translation's own meta/term copy, and
+		// BEFORE clone_product_variations() at 20, which loads the target with
+		// wc_get_product() and needs the class to already be right.
+		// ⭐ Re-scope the front page when WooCommerce turns it into a product
+		// archive. PerfLocale decides at pre_get_posts priority 5 and correctly
+		// exempts the query because it names an explicit `page_id` — at that
+		// moment it IS a page request. WC_Query::pre_get_posts then runs at
+		// priority 10 and, when the shop page is the site's front page and the
+		// theme supports WooCommerce or FSE, rewrites the SAME query to
+		// `post_type => product` (includes/class-wc-query.php:348-358).
+		//
+		// The decision was made before the rewrite, so nothing ever stamps the
+		// query and the language WHERE is never added. Measured on test.local
+		// (Storefront, shop set as front page):
+		//   /        main query post_type="product"  SQL has language WHERE: NO
+		//   /de/     main query post_type="product"  SQL has language WHERE: NO
+		//   /shop/   (the same archive, NOT the front page)            WHERE: YES
+		// i.e. every language's products on the home page of a multilingual
+		// store, while the identical /shop/ archive is scoped correctly.
+		//
+		// Priority 20 so it runs after WC's rewrite, and it only ever ADDS the
+		// stamp to a query nobody stamped, so no existing exemption is undone.
+		add_action( 'pre_get_posts', [ $this, 'rescope_front_page_shop' ], 20 );
+
+		// ⭐ Give WooCommerce's cached block queries a per-language cache key.
+		//
+		// The eight product-grid blocks (Best Sellers, On Sale, New, Top Rated,
+		// By Category, By Tag, By Attribute, Handpicked) all run through
+		// `BlocksWpQuery::get_cached_posts()`, which caches results in a
+		// transient for 30 DAYS under
+		//   md5( wp_json_encode( $this->query_vars ) )
+		// (src/Blocks/Utils/BlocksWpQuery.php:50-68). That hash is computed
+		// BEFORE `get_posts()` runs, and `get_posts()` is what fires
+		// `pre_get_posts` — so PerfLocale's language stamp is not in the hash,
+		// and every language shares one cache entry. Whichever language warmed
+		// it first serves its product ids to all the others for a month.
+		//
+		// The fix is the one WooCommerce itself documents in that class's
+		// docblock: "you can still ensure there is a unique hash by injecting
+		// custom query vars via the parse_query filter … Doing so won't have any
+		// negative effect on the query itself, and it will cause the hash to
+		// change." `parse_query` fires from the constructor's
+		// parse_query_vars() (wp-includes/class-wp-query.php:567-569 ->
+		// :1164), i.e. before the hash is taken.
+		//
+		// Scoped to BlocksWpQuery instances ON PURPOSE. Injecting a language
+		// var into every WP_Query would also change WP core's own
+		// `generate_cache_key()` (class-wp-query.php:5010), which already
+		// includes the SQL — so scoped queries are separated per language
+		// ALREADY, and the only effect on exempt queries would be to multiply
+		// their cache entries by the language count for no benefit.
+		add_action( 'parse_query', [ $this, 'separate_block_query_cache_by_language' ] );
+
+		add_action( 'perflocale/translation/created', [ $this, 'mirror_product_type' ], 15, 4 );
+
 		add_action( 'perflocale/translation/created', [ $this, 'clone_product_variations' ], 20, 4 );
 
 		// Register WC non-gettext strings (attribute labels, email subjects/headings)
@@ -1228,6 +1327,67 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * @param array<int, string> $post_types Existing post types.
 	 * @return array<int, string>
 	 */
+	/**
+	 * Point a variation row at its parent product's editor.
+	 *
+	 * WooCommerce has no standalone screen for a variation: `post.php` on a
+	 * `product_variation` renders an empty editor. The Variations metabox on the
+	 * parent product is the only place one can be edited, so that is where the
+	 * link goes. A variation whose parent has been deleted gets no link at all —
+	 * better than one that opens a blank screen.
+	 *
+	 * @param string $url       URL resolved so far ('' when core could not).
+	 * @param int    $post_id   Object being linked.
+	 * @param string $post_type Its post type.
+	 * @return string
+	 */
+	public function edit_link( string $url, int $post_id, string $post_type ): string {
+		if ( 'product_variation' !== $post_type ) {
+			return $url;
+		}
+
+		$parent_id = (int) wp_get_post_parent_id( $post_id );
+		$parent    = $parent_id > 0 ? get_post( $parent_id ) : null;
+
+		// Historical or incomplete imports can leave a non-product parent ID.
+		if ( ! $parent instanceof \WP_Post || $parent->post_type !== 'product' ) {
+			return '';
+		}
+
+		$parent_url = get_edit_post_link( $parent_id, 'raw' );
+
+		return is_string( $parent_url ) ? $parent_url : '';
+	}
+
+	/**
+	 * Restore the front-end link for a product variation.
+	 *
+	 * @param string   $url  URL resolved so far ('' when the type is not viewable).
+	 * @param \WP_Post $post Object being linked.
+	 * @return string
+	 */
+	public function view_link( string $url, \WP_Post $post ): string {
+		if ( 'product_variation' !== $post->post_type ) {
+			return $url;
+		}
+
+		$parent_id = (int) wp_get_post_parent_id( $post->ID );
+		$parent    = $parent_id > 0 ? get_post( $parent_id ) : null;
+
+		// ⚠️ A positive parent ID does not prove a usable product exists. Woo's
+		// fallback can otherwise look like a link while opening no product.
+		if ( ! $parent instanceof \WP_Post || $parent->post_type !== 'product'
+			|| in_array( $parent->post_status, [ 'trash', 'auto-draft' ], true )
+			|| in_array( $post->post_status, [ 'trash', 'auto-draft' ], true )
+		) {
+			return $url;
+		}
+
+		$permalink = get_permalink( $post );
+
+		return is_string( $permalink ) ? $permalink : $url;
+	}
+
 	public function add_post_types( array $post_types ): array {
 		$post_types[] = 'product';
 		$post_types[] = 'product_variation';
@@ -1353,7 +1513,25 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				$language_id
 			);
 
-			return $translated_id ?? $page_id;
+			// ⚠️ ONLY A PUBLISHED TRANSLATION MAY STAND IN.
+			//
+			// "A translation exists" is not "a translation is reachable", and
+			// this returned the former while WooCommerce consumed it as the
+			// latter. Generate Missing Translations creates every translation
+			// as a DRAFT, so on a store where an operator ran it — which
+			// 1.0.5's own Settings copy tells them to do — wc_get_page_id(
+			// 'cart' ) on /de/ returned a draft page id. Measured on
+			// perflocale.local: 221 (live cart) became 1031357 (draft), so the
+			// cart, checkout and my-account links in the whole German funnel
+			// pointed at pages a visitor cannot open.
+			//
+			// The status read is a cache hit: prime_wc_page_translations()
+			// batch-primes these rows in the same one-shot pass above.
+			if ( $translated_id && get_post_status( $translated_id ) === 'publish' ) {
+				return $translated_id;
+			}
+
+			return $page_id;
 		} finally {
 			unset( $resolving[ $page_id_int ] );
 		}
@@ -1416,6 +1594,37 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		$repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $plugin->get( 'cache' ) );
 		$repo->prime_translations( \PerfLocale\Enum\ObjectType::Post, $ids );
+
+		// Prime the TRANSLATIONS' post rows as well, in one more query.
+		// filter_wc_page_id() has to know each candidate's post_status — a
+		// DRAFT translation must not replace a live store page — and without
+		// this that is a separate get_post() per WC page on a cold cache, five
+		// times per front-end request. The link lookups below are free: they
+		// read the map just primed above.
+		$language_id = $plugin->has( 'router' ) ? $plugin->get( 'router' )->get_current_language_id() : 0;
+
+		if ( $language_id === 0 ) {
+			return;
+		}
+
+		$translated_ids = [];
+
+		foreach ( $ids as $source_id ) {
+			$translated = $repo->get_translation_in_language(
+				$source_id,
+				\PerfLocale\Enum\ObjectType::Post,
+				$language_id
+			);
+
+			if ( $translated ) {
+				$translated_ids[] = (int) $translated;
+			}
+		}
+
+		if ( $translated_ids !== [] ) {
+			// Statuses only — no meta, no terms.
+			_prime_post_caches( $translated_ids, false, false );
+		}
 	}
 
 	/**
@@ -1575,7 +1784,21 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				$language_id
 			);
 
-			if ( $in_current_language !== null ) {
+			// ⚠️ ...but only a PUBLISHED translation owns a URL.
+			//
+			// "A translation exists" and "a translation is reachable" are not
+			// the same claim, and this guard was making the first one do the
+			// second one's job. Generate Missing Translations creates every
+			// translation as a DRAFT, so the moment an operator runs it — which
+			// 1.0.5's own Settings copy tells them to do — a draft cart page
+			// existed for German, this returned early, and get_permalink() of
+			// the cart, checkout and my-account pages handed a German shopper
+			// the UNPREFIXED English URL from the mini-cart and the terms link.
+			// Measured on perflocale.local: expected /de/cart-3/, got /cart-3/.
+			//
+			// A draft cannot be visited, so it cannot own the URL; fall through
+			// and prefix the source exactly as before the draft existed.
+			if ( $in_current_language !== null && get_post_status( $in_current_language ) === 'publish' ) {
 				return $link;
 			}
 
@@ -3096,6 +3319,147 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		return $attributes;
+	}
+
+	/**
+	 * Add the current language to a WooCommerce block query's cache key.
+	 *
+	 * Injects a query var that nothing reads, purely so
+	 * `BlocksWpQuery::get_cached_posts()`'s md5 of `query_vars` differs per
+	 * language. Deliberately NOT `perflocale_language_id`: that var drives
+	 * `modify_query_clauses()`, and setting it here — before
+	 * `filter_by_language()` has had its say at `pre_get_posts` — would scope
+	 * queries that are meant to be exempt. See the rationale in boot().
+	 *
+	 * @param \WP_Query $query Query being parsed.
+	 * @return void
+	 */
+	public function separate_block_query_cache_by_language( $query ): void {
+		if ( ! $query instanceof \Automattic\WooCommerce\Blocks\Utils\BlocksWpQuery ) {
+			return;
+		}
+
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'router' ) ) {
+			return;
+		}
+
+		$language = $plugin->get( 'router' )->get_current_language();
+
+		if ( ! is_object( $language ) || ( $language->slug ?? '' ) === '' ) {
+			return;
+		}
+
+		$query->set( 'perflocale_cache_language', (string) $language->slug );
+	}
+
+	/**
+	 * Language-scope the front page after WooCommerce turns it into a shop.
+	 *
+	 * Only touches a MAIN query that WC has rewritten to a product archive on
+	 * a site whose front page IS the shop page, and only when nothing has
+	 * stamped a language on it yet. See the rationale in boot().
+	 *
+	 * @param \WP_Query $query Query about to run.
+	 * @return void
+	 */
+	public function rescope_front_page_shop( $query ): void {
+		if ( ! $query instanceof \WP_Query || ! $query->is_main_query() || is_admin() ) {
+			return;
+		}
+
+		// Already decided by someone — never override an existing stamp.
+		if ( (int) $query->get( 'perflocale_language_id' ) > 0 ) {
+			return;
+		}
+
+		$post_type = $query->get( 'post_type' );
+		$post_type = is_string( $post_type ) ? [ $post_type ] : (array) $post_type;
+
+		if ( ! in_array( 'product', $post_type, true ) ) {
+			return;
+		}
+
+		// Narrow to the one configuration that produces the gap: the shop page
+		// standing in as the front page. Any other product archive was already
+		// scoped normally at priority 5.
+		if ( ! function_exists( 'wc_get_page_id' ) ) {
+			return;
+		}
+
+		$front = (int) get_option( 'page_on_front' );
+
+		if ( $front <= 0 || $front !== (int) wc_get_page_id( 'shop' ) ) {
+			return;
+		}
+
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'router' ) ) {
+			return;
+		}
+
+		$language = $plugin->get( 'router' )->get_current_language();
+
+		if ( ! is_object( $language ) || (int) ( $language->id ?? 0 ) <= 0 ) {
+			return;
+		}
+
+		$query->set( 'perflocale_language_id', (int) $language->id );
+	}
+
+	/**
+	 * Give a freshly-created product translation the SOURCE's product_type.
+	 *
+	 * `product_type` is one of WooCommerce's internal taxonomies, so it is not
+	 * in `get_translatable_taxonomies()` and `copy_taxonomy_terms()` never
+	 * copies it. A translation is therefore created with no product_type term
+	 * at all, and `wc_get_product()` resolves it to `WC_Product_Simple`.
+	 *
+	 * `clone_product_variations()` already compensated for this, but only after
+	 * an `is_type( 'variable' )` guard — so GROUPED and EXTERNAL products
+	 * degraded silently. Measured on test.local before this fix: a translated
+	 * grouped product came back as `WC_Product_Simple` with `get_children()`
+	 * empty, despite its `_children` meta having been copied intact. The
+	 * visitor got a simple product's add-to-cart form and none of the children.
+	 *
+	 * Runs at priority 15, before clone_product_variations() at 20, which calls
+	 * `wc_get_product( $new_id )` and needs the class already resolved.
+	 *
+	 * @param int    $new_id      Newly created translation post ID.
+	 * @param string $object_type Object type ('post' for post translations).
+	 * @param string $target_slug Target language slug (unused: product_type is
+	 *                            machinery and is never translated).
+	 * @param int    $source_id   Source post ID.
+	 * @return void
+	 */
+	public function mirror_product_type( $new_id, $object_type, $target_slug, $source_id ): void {
+		if ( 'post' !== (string) $object_type ) {
+			return;
+		}
+
+		$new_id    = (int) $new_id;
+		$source_id = (int) $source_id;
+
+		if ( $new_id <= 0 || $source_id <= 0 || 'product' !== get_post_type( $source_id ) ) {
+			return;
+		}
+
+		$types = wp_get_object_terms( $source_id, 'product_type', [ 'fields' => 'slugs' ] );
+
+		if ( is_wp_error( $types ) || $types === [] ) {
+			// A product with no product_type term IS a simple product as far as
+			// WooCommerce is concerned, and that is what the translation will
+			// resolve to as well. Nothing to mirror.
+			return;
+		}
+
+		// Not translated, deliberately: product_type is machinery
+		// ('simple' / 'grouped' / 'variable' / 'external'), never shown to a
+		// visitor. Translating these slugs would make wc_get_product() fail to
+		// resolve a class at all.
+		wp_set_object_terms( $new_id, array_map( 'strval', $types ), 'product_type' );
 	}
 
 	/**

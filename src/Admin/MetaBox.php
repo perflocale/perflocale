@@ -233,63 +233,27 @@ final class MetaBox {
 	 * @return void
 	 */
 	public function render( \WP_Post $post ): void {
-		$lang_repo    = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
-		$manager      = new PostTranslationManager( $this->cache, \PerfLocale\Plugin::get_instance()->get( 'settings' ) );
-		$languages    = $lang_repo->get_active();
-		$translations = $manager->get_translations( $post->ID );
+		$plugin    = \PerfLocale\Plugin::get_instance();
+		$lang_repo = $plugin->get( 'lang_repo' );
+		$manager   = new PostTranslationManager( $this->cache, $plugin->get( 'settings' ) );
+		$languages = $lang_repo->get_active();
 
 		wp_nonce_field( 'perflocale_meta_box', 'perflocale_meta_nonce' );
 
 		$post_lang = $manager->detect_post_language( $post->ID );
 
-		echo '<ul class="perflocale-mb-list">';
-
-		foreach ( $languages as $lang ) {
-			$has_translation = isset( $translations[ $lang->slug ] );
-			$translated_id   = $translations[ $lang->slug ] ?? null;
-
-			if ( $has_translation && $translated_id && ! get_post( $translated_id ) ) {
-				$has_translation = false;
-				$translated_id   = null;
-			}
-
-			$is_current = ( $post_lang && $post_lang->slug === $lang->slug );
-			$row_class  = 'perflocale-mb-item' . ( $is_current ? ' perflocale-mb-item--current' : '' );
-
-			echo '<li class="' . esc_attr( $row_class ) . '">';
-			echo '<span class="perflocale-mb-left">';
-			echo '<span class="perflocale-mb-badge">' . esc_html( \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ) ) . '</span>';
-			echo '<span class="perflocale-mb-native">' . esc_html( $lang->native_name ?: $lang->name ) . '</span>';
-			echo '</span>';
-
-			if ( $is_current ) {
-				echo '<span class="perflocale-mb-pill perflocale-mb-pill--current">' . esc_html__( 'Current', 'perflocale' ) . '</span>';
-			} elseif ( $has_translation && $translated_id ) {
-				$edit_url = get_edit_post_link( $translated_id );
-
-				if ( $edit_url ) {
-					echo '<a href="' . esc_url( $edit_url ) . '" class="perflocale-mb-pill perflocale-mb-pill--edit">' . esc_html__( 'Edit', 'perflocale' ) . '</a>';
-				}
-			} elseif ( 'auto-draft' === $post->post_status ) {
-				echo '<span class="perflocale-mb-pill perflocale-mb-pill--disabled" title="' . esc_attr__( 'Save the post before creating translations.', 'perflocale' ) . '">+ ' . esc_html__( 'Create', 'perflocale' ) . '</span>';
-			} else {
-				$create_url = add_query_arg(
-					[
-						'action'      => 'perflocale_create_translation',
-						'source_id'   => $post->ID,
-						'target_lang' => $lang->slug,
-						'_wpnonce'    => wp_create_nonce( 'perflocale_create_' . $post->ID ),
-					],
-					admin_url( 'admin-post.php' )
-				);
-
-				echo '<a href="' . esc_url( $create_url ) . '" class="perflocale-mb-pill perflocale-mb-pill--create">+ ' . esc_html__( 'Create', 'perflocale' ) . '</a>';
-			}
-
-			echo '</li>';
-		}
-
-		echo '</ul>';
+		// ⭐ The language list is SHARED. Every other place this panel appears —
+		// the block-editor sidebar, the Site Editor sidebar, and a host plugin's
+		// own editor screen via TranslationsPanel::mount() — renders the same
+		// rows from the same code, so a change to a row is a change everywhere
+		// instead of a change in one of four near-identical copies.
+		//
+		// What stays HERE is everything below: the language <select> and the two
+		// opt-out checkboxes are form inputs, and they only mean something on a
+		// screen whose submit reaches save_meta_box() on save_post. Rendering
+		// them on a host's own editor would show controls that silently discard
+		// whatever the operator changed.
+		$plugin->get( 'translations_panel' )->render( $post->ID, [ 'context' => 'metabox' ] );
 
 		echo '<div class="perflocale-mb-footer">';
 		$post_type_obj  = get_post_type_object( $post->post_type );
@@ -324,7 +288,7 @@ final class MetaBox {
 			echo '<div class="perflocale-mb-footer">';
 			echo '<label style="display:flex;gap:6px;align-items:flex-start;">';
 			echo '<input type="checkbox" name="perflocale_sync_optout" value="yes"' . checked( $optout, true, false ) . ' style="margin-top:2px;">';
-			echo '<span>' . esc_html__( 'Independent across languages — do not sync this post\'s shared fields (featured image, builder layout, configured sync fields) with its translations, in either direction.', 'perflocale' ) . '</span>';
+			echo '<span>' . esc_html__( 'Independent across languages — do not sync this post\'s shared fields (featured image, configured sync fields) with its translations, in either direction.', 'perflocale' ) . '</span>';
 			echo '</label>';
 			// Marker so programmatic saves that never render this box cannot
 			// clear the flag (an unchecked checkbox is indistinguishable from
