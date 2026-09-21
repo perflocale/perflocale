@@ -65,7 +65,7 @@ final class TranslatorRole {
 	 * @var array<int, string>
 	 */
 	private const LEGACY_CAPABILITIES = [
-		// Retired with the Glossary feature.
+		// Not granted by PerfLocale; stripped on deactivation and uninstall.
 		'perflocale_manage_glossary',
 	];
 

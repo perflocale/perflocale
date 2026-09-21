@@ -338,6 +338,9 @@ final class StringsPage {
 				$fuzzy_skipped  = (int) ( $po_import_result['fuzzy_skipped'] ?? 0 );
 				$err            = (int) ( $po_import_result['errors'] ?? 0 );
 				$total_entries  = (int) ( $po_import_result['total_entries'] ?? 0 );
+				$sanitized      = (int) ( $po_import_result['sanitized'] ?? 0 );
+				$not_imported   = (int) ( $po_import_result['sanitized_empty'] ?? 0 );
+				$err_messages   = array_filter( (array) ( $po_import_result['error_messages'] ?? [] ), 'is_string' );
 				// Headline: "added/updated/unchanged" + a separate hint for
 				// msgid-only rows so the user understands the breakdown.
 				$primary_changes = $inserted + $updated;
@@ -362,7 +365,7 @@ final class StringsPage {
 					}
 					?>
 					</strong></p>
-					<?php if ( $no_translation > 0 || $fuzzy_skipped > 0 || $err > 0 ) : ?>
+					<?php if ( $no_translation > 0 || $fuzzy_skipped > 0 || $err > 0 || $sanitized > 0 ) : ?>
 						<p style="margin:6px 0 0;color:#646970;font-size:13px;">
 						<?php
 							$bits = [];
@@ -378,6 +381,22 @@ final class StringsPage {
 								/* translators: %d: number of fuzzy entries skipped */
 								esc_html( _n( '%d fuzzy entry skipped (marked unreliable in the PO file).', '%d fuzzy entries skipped (marked unreliable in the PO file).', $fuzzy_skipped, 'perflocale' ) ),
 								$fuzzy_skipped
+							);
+						}
+						// `sanitized` includes the entries that were not imported at
+						// all; those get their own sentence.
+						if ( $sanitized - $not_imported > 0 ) {
+							$bits[] = sprintf(
+								/* translators: %d: number of imported PO entries the HTML filter changed */
+								esc_html( _n( '%d imported entry was changed by the HTML filter for accounts without the unfiltered_html capability (disallowed markup such as scripts is removed; other markup may be reformatted).', '%d imported entries were changed by the HTML filter for accounts without the unfiltered_html capability (disallowed markup such as scripts is removed; other markup may be reformatted).', $sanitized - $not_imported, 'perflocale' ) ),
+								$sanitized - $not_imported
+							);
+						}
+						if ( $not_imported > 0 ) {
+							$bits[] = sprintf(
+								/* translators: %d: number of PO entries not imported because the HTML filter emptied them */
+								esc_html( _n( '%d entry was not imported because nothing was left after removing HTML that is not allowed.', '%d entries were not imported because nothing was left after removing HTML that is not allowed.', $not_imported, 'perflocale' ) ),
+								$not_imported
 							);
 						}
 						if ( $err > 0 ) {
@@ -399,6 +418,13 @@ final class StringsPage {
 						}
 						?>
 						</p>
+					<?php endif; ?>
+					<?php if ( $err_messages !== [] ) : ?>
+						<ul class="ul-disc">
+							<?php foreach ( $err_messages as $err_message ) : ?>
+								<li><?php echo esc_html( $err_message ); ?></li>
+							<?php endforeach; ?>
+						</ul>
 					<?php endif; ?>
 				</div>
 			<?php elseif ( $po_message === 'no_lang' || $po_message === 'missing_input' ) : ?>
@@ -1601,10 +1627,21 @@ final class StringsPage {
 				continue;
 			}
 
-			// switch_to_locale() returns false when already in that locale.
-			// Translations for the current locale are already loaded, so
-			// we can still look them up - just skip restore afterward.
+			// WP_Locale_Switcher::switch_to_locale() in
+			// wp-includes/class-wp-locale-switcher.php returns false, pushing
+			// nothing, in two cases. In the first, the locale already equals
+			// determine_locale(): its translations are loaded, so they can be
+			// looked up, and there is nothing to restore. In the second, the
+			// locale is not en_US and is not in the list the switcher built from
+			// get_available_languages() when it was constructed (core packs in
+			// WP_LANG_DIR, filterable): nothing was loaded for it, so translate()
+			// would return the current locale's text and present it as this
+			// language's. That language gets no hints.
 			$switched = switch_to_locale( $lang->locale );
+
+			if ( ! $switched && determine_locale() !== $lang->locale ) {
+				continue;
+			}
 
 			foreach ( $strings as $s ) {
 				$original = $s->original;

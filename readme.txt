@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.5
+Stable tag: 1.0.6
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -12,7 +12,7 @@ Performance-first multilingual plugin. Translate posts, pages, products, taxonom
 
 == Description ==
 
-PerfLocale is a **performance-first multilingual plugin** for WordPress. A 3-layer cache, batch-preloaded queries, and conditional hook registration keep its own code to a small fraction of total page time.
+PerfLocale is a **performance-first multilingual plugin** for WordPress. A 3-layer cache, batch-preloaded queries, and conditional hook registration keep its own work per page small.
 
 = What you get =
 
@@ -84,7 +84,7 @@ Caddy:
 
 = Does PerfLocale slow down my site? =
 
-Very little — performance is a core design goal. The plugin's own code stays a small fraction of total page time, with three layers of caching so most requests never touch the database. Larger sites — many translated posts across many languages — benefit from running a persistent object cache like Redis. PerfLocale is fully compatible with page-cache plugins (WP Super Cache, W3 Total Cache, LiteSpeed Cache, etc.); cached pages already include the translated output from the request that filled the cache. Real-world page speed depends mostly on your theme, hosting, and other plugins.
+Very little — performance is a core design goal. The plugin keeps the work it does on each page small, with three layers of caching to keep its own database work low. Larger sites — many translated posts across many languages — benefit from running a persistent object cache like Redis. PerfLocale is fully compatible with page-cache plugins (WP Super Cache, W3 Total Cache, LiteSpeed Cache, etc.); cached pages already include the translated output from the request that filled the cache. Real-world page speed depends mostly on your theme, hosting, and other plugins.
 
 = Does it work with WooCommerce? =
 
@@ -96,7 +96,7 @@ Yes. PerfLocale integrates with Elementor, Beaver Builder, Bricks Builder, Oxyge
 
 = Does it translate block-theme templates and template parts? =
 
-Yes, from 1.0.5, and it is off by default. Switch on **Full Site Editing** under PerfLocale &rarr; Settings &rarr; Translation and the block templates and template parts you edit in the Site Editor - header, footer, 404, archive layouts - become translatable like any other content, along with the patterns, navigation labels and post content embedded in them.
+Yes. It is off by default. Switch on **Full Site Editing** under PerfLocale &rarr; Settings &rarr; Translation and the block templates and template parts you edit in the Site Editor - header, footer, 404, archive layouts - become translatable like any other content, along with the patterns, navigation labels and post content embedded in them.
 
 A translation only takes effect once you publish it. WordPress renders an empty region for a template part it cannot resolve, so a half-finished header would leave a blank strip across the site; until the translation is published, visitors keep seeing the original. The Site Editor's own Translations panel shows which languages exist and labels anything still in draft.
 
@@ -140,6 +140,8 @@ Yes. PerfLocale resolves every machine-translation API key from three sources in
 
 By default nothing is lost: uninstalling removes the plugin's roles, capabilities, scheduled tasks, and caches, but keeps all translations, languages, and settings in the database so a later re-install picks up exactly where you left off. If you want a complete removal instead, enable "Delete all plugin data when uninstalling" in PerfLocale → Settings → Advanced before uninstalling — then every plugin table and option is deleted. Your posts and pages (including translated ones) are always preserved as normal WordPress content.
 
+On a multisite network each site's own choice is applied to that site. Deleting the plugin from a very large network can run out of PHP execution time before every site is done: PerfLocale stops cleanly between sites, logs how many were purged and how many remain, and records where it stopped. Re-install the plugin and delete it again without activating it and the next pass carries on from there; from WP-CLI, `wp plugin uninstall perflocale` has no time limit and finishes the network in one pass.
+
 = Does PerfLocale expose anything to edge workers? =
 
 When you enable Edge Worker Integration (PerfLocale → Settings → Advanced), the plugin publishes a single public REST endpoint that edge runtimes (Cloudflare Workers, Vercel Edge, Netlify Edge, AWS Lambda@Edge) can read to pre-route visitors before the request ever hits PHP:
@@ -174,7 +176,7 @@ PerfLocale is privacy-first by default. No tracking, no analytics, no visitor fi
 * **Visitor IP:** never logged or stored. The optional GeoIP-redirect feature (disabled by default) ships with no lookup provider and no endpoint, so out of the box it sends the IP nowhere. If you wire a source yourself through the `perflocale/geo/lookup_country` or `perflocale/geo/providers` filter, the IP is passed to that source once per first visit to resolve a country code; the country code is then cached server-side (24 hours by default) under a salted, non-reversible key - an HMAC-SHA256, keyed with the site's auth salt, of the IP after `wp_privacy_anonymize_ip()` has zeroed the host bits - never the raw IP or any value reversible to it.
 * **WordPress Privacy API integration:** Tools → Export Personal Data and Tools → Erase Personal Data both work. The eraser zeroes `created_by` on the background jobs the data subject dispatched and deletes their per-user UI-state meta — returning `items_removed`/`items_retained` counts. The same flow runs on the admin `delete_user` path. Full detail in the docs.
 * **Consent gating:** the `perflocale/privacy/consent_given` filter lets any consent-management plugin (Cookiebot, Complianz, OneTrust, etc.) hold back PerfLocale until a visitor has consented. When the filter returns false, the `perflocale_lang` cookie is not set, and the GeoIP and browser-language redirects do not run (no outbound request is made).
-* **Cookieless mode:** PerfLocale → Settings → URL & Routing → "Language Cookie" turns the `perflocale_lang` cookie off entirely — no consent-management plugin required. URL-based language routing keeps working; you only lose "remember my language" on non-prefixed URLs.
+* **Cookieless mode:** PerfLocale → Settings → URL & Routing → "Language Cookie" turns the `perflocale_lang` cookie off entirely — no consent-management plugin required. URL-based language routing keeps working; you lose "remember my language" on non-prefixed URLs. On a WooCommerce store you also lose the cart and checkout language: the block cart/checkout posts to the non-prefixed Store API URLs, and the language stamped on a new order is read from that same cookie, so both fall back to the site's default language.
 * **Suggested privacy-policy text:** auto-registered via `wp_add_privacy_policy_content()`. The sections shown adapt to which features are enabled — GeoIP wording only appears if GeoIP is on, MT wording only appears if MT is on.
 
 Full technical detail: https://perflocale.com/docs/privacy/
@@ -222,6 +224,20 @@ Each release below is a short summary. The complete notes for every
 version, with the reasoning behind each change, live at
 https://perflocale.com/changelog/
 
+= 1.0.6 =
+
+Security hardening and stricter permission checks.
+
+Importing a JSON file from another site, or a backup of this site that records a language-specific address, can now ask you to confirm that this site is a copy of it: tick the checkbox under Settings → Export & Import, or pass --force in WP-CLI.
+
+On WooCommerce stores, a visitor's first page in the site's default language no longer sets the language cookie, so full-page caches can store those pages. Cart and checkout keep working in every language.
+
+Also fixes previews of draft translations that share their slug with a published page, synced patterns and navigation menus rendering blank when their translation was published empty, the WPForms builder's "+ Create" failing even for administrators, an error or a duplicate when two requests created the same translation at once, page titles (WooCommerce's Create Page Translations) and term names (Create Taxonomy Translations) saved in the admin's language when the target language had no WordPress language pack, Strings-screen hints shown in the wrong language, and the Jobs screen showing "Not scheduled" for a task that was running. Front-end pages, feeds, sitemaps and REST requests also run fewer database queries - 2 to 8 fewer on each one we measured on a WooCommerce test site with Redis - with the same output.
+
+On multisite, deleting the plugin now works through a large network in batches and records where it stopped if a request runs out of time: re-install the plugin and delete it again, without activating it, and the next pass carries on from there. Each site's own "Delete data on uninstall" choice survives the interruption. Network activation no longer stops at the first site that fails, and rendering content from another site no longer leaves the original site without its detected language.
+
+Full notes: https://perflocale.com/changelog/
+
 = 1.0.5 =
 
 Translates block-theme templates and template parts, so the header, footer and page layouts you customise in the Site Editor can be translated like any other content, and shows a Translations panel in the Site Editor and in the Contact Form 7 and WPForms form editors — screens the existing panels could not reach. Fixes a class of defect where content that a plugin looks up by identity rather than by language disappeared on every non-default language: Contact Form 7 embeds rendered "Error: Contact form not found", Oxygen pages rendered with no layout at all, block-theme navigation fell back to an auto-generated menu, and on WooCommerce block themes the entire product body vanished. Also fixes Contact Form 7 forms missing from the Translations screen, translated grouped products losing their product type and their child products, the shop page showing every language's products when it is the front page, cart and checkout links pointing at unpublished pages, a "Needs update" badge that could never be cleared, an Oxygen template that could render in the wrong language once its translation group was reduced to a single translation, a dashboard that counted trashed translations as translated, a multisite case where one subsite's active add-ons could switch off language filtering on another, and WPForms forms that could not be translated by anyone at all — every translation request was refused, administrators included. Elementor translations also no longer inherit the original page's generated CSS and cached HTML, which could make a newly created translation render unstyled or show the original language.
@@ -256,7 +272,7 @@ Full notes: https://perflocale.com/changelog/
 
 = 1.0.1 =
 
-Security and reliability release. Updating is recommended for every site, and required for any site that uses the Translator role or Contact Form 7.
+Security and reliability release: security hardening and stricter permission checks. Also fixes WooCommerce stock lost when several language versions of a product sold at once, and makes Replace-mode imports all-or-nothing.
 
 Full notes: https://perflocale.com/changelog/
 
@@ -268,6 +284,9 @@ Full notes: https://perflocale.com/changelog/
 
 == Upgrade Notice ==
 
+= 1.0.6 =
+Security hardening and stricter permission checks. Importing a JSON file from another site can now ask you to confirm this site is a copy of it. On WooCommerce stores, default-language pages no longer set the language cookie. Multisite uninstall and activation are more reliable.
+
 = 1.0.5 =
 Translates block-theme templates and template parts, and adds a Translations panel to the Site Editor and the Contact Form 7 and WPForms editors. Fixes forms, Oxygen layouts, menus and WooCommerce product bodies vanishing on non-default languages, and WPForms forms nobody could translate.
 
@@ -275,13 +294,13 @@ Translates block-theme templates and template parts, and adds a Translations pan
 Translates the site title, tagline, synced patterns and block-theme menus. Fixes a translated site title overwriting the original, a multisite call returning the wrong blog's name, and order emails resolving the wrong language.
 
 = 1.0.3 =
-Multisite: registering a webhook now needs network-administrator permissions - a breaking change, with a filter to restore the old rule. Also fixes WooCommerce order emails in the wrong language, percent signs deleted from titles, and the admin on phones and tablets.
+Fixes WooCommerce order emails in the wrong language, percent signs deleted from titles, and the admin on phones and tablets.
 
 = 1.0.2 =
 Machine Translation could not be switched on from the admin at all, and three settings were silently cleared by unrelated saves. Also fixes a fatal on servers without mbstring, translates WPForms confirmations, and makes XLIFF imports about three times cheaper.
 
 = 1.0.1 =
-Security release. Fixes capability bypasses that let the Translator role publish, trash or destroy content, closes a machine-translation quota bypass, stops translated Contact Form 7 forms exposing mail settings, and fixes a WooCommerce race that lost stock when several languages sold at once.
+Security and reliability release: security hardening and stricter permission checks. Also fixes a WooCommerce race that lost stock when several languages sold at once.
 
 = 1.0.0 =
 Initial release of PerfLocale.

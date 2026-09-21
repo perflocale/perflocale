@@ -2,13 +2,13 @@
 /**
  * Plugin Name: PerfLocale
  * Plugin URI: https://perflocale.com
- * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs without slowing your site down.
- * Version: 1.0.5
+ * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs, and keep your site fast.
+ * Version: 1.0.6
  * Requires at least: 6.4
  * Tested up to: 7.1
  * Requires PHP: 8.1
- * Author: Alex Georgiev
- * Author URI: https://alexgv.com
+ * Author: PerfLocale
+ * Author URI: https://perflocale.com/
  * License: GPL v2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: perflocale
@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ---- Plugin constants ----
 
-define( 'PERFLOCALE_VERSION', '1.0.5' );
+define( 'PERFLOCALE_VERSION', '1.0.6' );
 define( 'PERFLOCALE_FILE', __FILE__ );
 define( 'PERFLOCALE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );
@@ -75,7 +75,16 @@ require_once PERFLOCALE_DIR . 'template-tags.php';
 register_activation_hook(
 	__FILE__,
 	static function (): void {
-	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ( is_multisite() ) {
+			// A resume marker belongs to the uninstall that wrote it. Once the
+			// plugin is being activated again, that uninstall is over: the
+			// operator is installing, not recovering, and honouring the marker
+			// on the NEXT uninstall would silently skip every blog below it.
+			// Cleared here, once per activation, rather than per blog.
+			delete_site_option( PerfLocale\Database\SiteCleanup::RESUME_OPTION );
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( is_multisite() && ! empty( $_GET['networkwide'] ) ) {
 			// Network activation: iterate sites in chunks so networks with tens
 			// of thousands of sites don't spike memory loading every row at once.
@@ -120,7 +129,20 @@ register_activation_hook(
 					switch_to_blog( $site_id );
 
 					try {
-						PerfLocale\Activator::activate();
+						try {
+							PerfLocale\Activator::activate();
+						} catch ( \Throwable $e ) {
+							// One blog's activation must not abort the sweep:
+							// without this, a single subsite with a broken
+							// table, a full disk or a filtered-to-death
+							// schema left every LATER blog with no tables, no
+							// caps and no recurring crons, and the plugin
+							// network-active regardless. Activation is
+							// repeatable, so the operator can re-activate to
+							// retry this blog once the cause is fixed.
+							// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on activation-failure path.
+							error_log( '[PerfLocale] network-activate failed for site ' . (int) $site_id . ': ' . $e->getMessage() );
+						}
 
 						// Force AS schema on never-visited subsites (AS creates it
 						// lazily) so the ensure_recurring_schedules writes below

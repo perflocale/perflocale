@@ -459,10 +459,9 @@ final class HreflangTags {
 	 *
 	 * It deliberately does NOT bail on a logged-in view of unpublished
 	 * content: an editor opening a draft or private post DOES get a real
-	 * singular key and DOES fill the bucket. That is safe, and the reason is
-	 * worth stating because it is the only thing keeping this from being a
-	 * cache-poisoning hole. The alternate set is user-independent by
-	 * construction — UrlConverter::get_translations_for_current_page() admits
+	 * singular key and DOES fill the bucket. That is safe only because the
+	 * alternate set is user-independent by construction —
+	 * UrlConverter::get_translations_for_current_page() admits
 	 * a sibling only at `post_status === 'publish'`, with no capability check
 	 * anywhere in the path — so the editor stores exactly the bytes an
 	 * anonymous visitor would have computed. And an anonymous request to that
@@ -881,9 +880,9 @@ final class HreflangTags {
 	 * The query string is deliberately stripped before returning: the
 	 * cached hreflang payload is keyed only by (post_id|archive, language,
 	 * paged) — see {@see build_cache_key()}. Without the strip, the FIRST
-	 * visitor's `?utm=evil` would be baked into the 12h-cached
+	 * visitor's query string would be baked into the 12h-cached
 	 * `<link rel="alternate" href>` set served to EVERY subsequent visitor
-	 * of the same page (cache poisoning via cache-key/payload mismatch).
+	 * of the same page, because the cache key and the payload would differ.
 	 *
 	 * @return string
 	 */

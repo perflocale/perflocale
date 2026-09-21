@@ -191,36 +191,35 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * Only ever consulted when core has already said NO, and only for this addon's own
 	 * post type — so it can widen access for `wpforms` and can never revoke access core
-	 * granted for anything else. The REST routes require the `perflocale_translate`
-	 * capability before reaching this, so it cannot hand translation rights to a user
-	 * who has none.
+	 * granted for anything else. Callers apply their own `perflocale_translate` or
+	 * per-object checks as well, so it never hands translation rights to a user who
+	 * has none.
 	 *
-	 * ⚠️⚠️ DO NOT "SIMPLIFY" THIS TO `wpforms_current_user_can()`. THAT IS A PRIVILEGE
-	 * ESCALATION.
+	 * ⚠️ Keep this on the host's access object, not `wpforms_current_user_can()`. That
+	 * wrapper memoises per capability and form id without the user in the key
+	 * (wpforms-lite/includes/functions/access.php), which suits WPForms' one-user web
+	 * requests but not a permission check that may run for several users in one
+	 * process (WP-CLI, a background job).
 	 *
-	 * That wrapper memoises in a function static keyed on `md5( $caps . $id )` —
-	 * **the user is not part of the key** (wpforms-lite/includes/functions/access.php:
-	 * 234-243). The first answer computed for a given capability and form id is
-	 * therefore returned to every subsequent caller in the same PHP process, whoever
-	 * they are. Harmless for WPForms itself, because an ordinary web request has one
-	 * user for its whole life. NOT harmless for anything that evaluates permissions for
-	 * more than one user in a process — WP-CLI, a background job, a test harness — and
-	 * it is exactly what a permission check must never do.
-	 *
-	 * Measured in one process against a real form, admin queried first:
-	 *
-	 *     administrator  wrapper=true   direct=true
-	 *     subscriber     wrapper=TRUE   direct=false     <-- the wrapper is wrong
-	 *
-	 * So this calls the host's access object directly, which is user-correct, and then
-	 * applies the host's own documented `wpforms_current_user_can` filter so a site that
-	 * customises WPForms permissions still has that honoured. That is precisely what the
-	 * wrapper does, minus the cache.
+	 * So this calls the host's access object directly and then applies the host's own
+	 * documented `wpforms_current_user_can` filter so a site that customises WPForms
+	 * permissions still has that honoured. That is what the wrapper does, minus the
+	 * cache.
 	 *
 	 * Fails CLOSED: with no access object, core's original answer stands.
 	 *
+	 * 'read' (asked, together with 'edit', about the form a new translation is
+	 * copied from) is answered with edit_form_single like 'edit': stricter than
+	 * WPForms' view capability, so it never grants more than the 'edit' half.
+	 *
+	 * 'create' means "may create a form" and is asked about an existing form: the
+	 * one a new translation would be copied from, when one is about to be created,
+	 * and the one the Translations panel lists, to decide whether to offer Create.
+	 * It is answered with create_forms, WPForms' own form-creation capability,
+	 * which WPForms always checks without a form id.
+	 *
 	 * @param bool   $can       Whether core's capability check passed.
-	 * @param string $action    Semantic action: 'edit' or 'delete'.
+	 * @param string $action    Semantic action: 'edit', 'delete', 'read' or 'create'.
 	 * @param int    $post_id   Object being acted on.
 	 * @param string $post_type Its post type.
 	 * @return bool
@@ -249,18 +248,25 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 			return $can;
 		}
 
-		// WPForms' own capability names for a single form. 'delete' covers both the
-		// DELETE route and a `status=trash` update, which PerfLocale gates identically.
-		$cap = 'delete' === $action ? 'delete_form_single' : 'edit_form_single';
+		// WPForms' own capability names. 'delete' covers both the DELETE route and a
+		// `status=trash` update, which PerfLocale gates identically; 'create' is the
+		// form-level create_forms, which is not about an existing form and so is asked
+		// with no id; every other action, 'read' included, needs edit_form_single.
+		$cap = match ( $action ) {
+			'delete' => 'delete_form_single',
+			'create' => 'create_forms',
+			default  => 'edit_form_single',
+		};
+		$id = 'create' === $action ? 0 : $post_id;
 
-		$user_can = (bool) $access->current_user_can( $cap, $post_id );
+		$user_can = (bool) $access->current_user_can( $cap, $id );
 
 		/**
 		 * This is the HOST's filter, re-applied here because this method deliberately
 		 * bypasses the host wrapper that would normally apply it. Documented by WPForms
 		 * with exactly this signature (access.php:253-261).
 		 */
-		return (bool) apply_filters( 'wpforms_current_user_can', $user_can, $cap, $post_id ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WPForms' own filter, re-applied because this method bypasses the host wrapper that normally applies it.
+		return (bool) apply_filters( 'wpforms_current_user_can', $user_can, $cap, $id ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WPForms' own filter, re-applied because this method bypasses the host wrapper that normally applies it.
 	}
 
 	/**
@@ -318,11 +324,10 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 * feeds this filter the raw return of WPForms_Form_Handler::get()
 	 * (includes/class-process.php:2096), and that method returns the boolean
 	 * `false` whenever the posted form id resolves to no readable form
-	 * (includes/class-form.php:245) — a trashed or deleted form, or any id a
-	 * bot invents on the unauthenticated `wpforms_submit` endpoint. An `array`
-	 * declaration would make that a TypeError raised during argument binding,
-	 * before the is_admin() early return below, so a stray POST would fatal
-	 * admin-ajax instead of getting WPForms' own error response.
+	 * (includes/class-form.php:245) — a trashed, deleted or unknown form. An
+	 * `array` declaration would make that a TypeError raised during argument
+	 * binding, before the is_admin() early return below, instead of WPForms'
+	 * own error response.
 	 *
 	 * @param array<string, mixed>|mixed $form_data Form data array, or `false`
 	 *                                              when WPForms could not load

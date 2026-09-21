@@ -199,9 +199,9 @@ final class SlugRedirector {
 
 		$target = $new_path . ( $query_string !== '' ? '?' . $query_string : '' );
 
-		// Use `wp_safe_redirect` so off-site URLs can't be smuggled through
-		// the redirect map (they wouldn't be — get_slug_redirects() values
-		// are pure slug strings — but defence in depth is cheap).
+		// Use `wp_safe_redirect` so the redirect map can never send a visitor
+		// off-site (it could not anyway — get_slug_redirects() values are
+		// pure slug strings — but defence in depth is cheap).
 		wp_safe_redirect( $target, 301 );
 		exit;
 	}

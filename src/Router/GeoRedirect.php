@@ -74,9 +74,9 @@ final class GeoRedirect {
 	 *
 	 * CF-Connecting-IP is only trustworthy when the immediate peer really is
 	 * Cloudflare: a generic reverse proxy forwards a client-sent header of that
-	 * name verbatim. Authenticating REMOTE_ADDR against this list closes that
-	 * spoofing hole. A stale list fails SAFE — CF-Connecting-IP is simply
-	 * ignored and detection falls back to X-Forwarded-For / REMOTE_ADDR.
+	 * name verbatim, so REMOTE_ADDR is checked against this list first. A
+	 * stale list fails SAFE — CF-Connecting-IP is simply ignored and
+	 * detection falls back to X-Forwarded-For / REMOTE_ADDR.
 	 *
 	 * @var array<int, string>
 	 */
@@ -464,8 +464,8 @@ final class GeoRedirect {
 		if ( $cache instanceof CacheManager ) {
 			// Read-only: only POSITIVE results are ever written (see set() below),
 			// so any non-empty hit is a real country code — no sentinel needed.
-			// get_cached() (not get()) means a MISS writes nothing, so a flood of
-			// spoofed X-Forwarded-For IPs can't pile up negative-result rows.
+			// get_cached() (not get()) means a MISS writes nothing, so unseen
+			// IPs never add negative-result rows.
 			$cached = $cache->get_cached( $cache_key, 'perflocale_geo_lookup' );
 
 			if ( is_string( $cached ) && $cached !== '' ) {
@@ -500,10 +500,9 @@ final class GeoRedirect {
 			// Only cache POSITIVE results. Empty-result writes are skipped:
 			// on no-external-object-cache sites every wp_options write costs
 			// 2 rows (transient value + transient timeout), and the cache
-			// key is derived from $ip — an attacker spoofing thousands of
-			// distinct X-Forwarded-For headers would otherwise flood
-			// wp_options with negative-result rows until the daily GC sweep
-			// reaps them. Inline-fail recovery still works because L1
+			// key is derived from $ip, so negative-result rows would grow
+			// with the number of distinct client IPs until the daily GC
+			// sweep reaps them. Inline-fail recovery still works because L1
 			// (in-request static) prevents repeated provider calls within a
 			// single request; subsequent requests just re-call the provider
 			// (cheap when the breaker is OPEN, sub-µs short-circuit there).
@@ -624,10 +623,9 @@ final class GeoRedirect {
 	 * `fetch_callback` that performs its own request and returns a country-code
 	 * STRING — it never hands back a response for this to decode.
 	 *
-	 * Retained rather than deleted only to keep a release-time diff small;
-	 * recorded as verified-dead in `dev/OPEN-ITEMS-AFTER-1.0.3.md` (DC-03) for
-	 * removal in a housekeeping pass. If a bundled provider is ever reinstated,
-	 * wire this in rather than re-deriving it.
+	 * Retained rather than deleted only to keep a release-time diff small; it
+	 * is unused and due for removal in a housekeeping pass. If a bundled
+	 * provider is ever reinstated, wire this in rather than re-deriving it.
 	 *
 	 * @param mixed $response wp_remote_get return value.
 	 * @return array<string, mixed>|null Decoded body or null on any failure.
@@ -793,13 +791,9 @@ final class GeoRedirect {
 	 * @return string IP address or empty string.
 	 */
 	private function get_visitor_ip(): string {
-		// Proxy headers are ATTACKER-CONTROLLABLE on a default WordPress
-		// install — any client can set X-Forwarded-For / CF-Connecting-IP /
-		// X-Real-IP on their request, and WordPress passes them through.
-		// Trusting them by default means a single attacker can rotate
-		// thousands of distinct spoofed IPs, exhausting the GeoIP provider
-		// quota AND (without the negative-result cache-write skip in
-		// lookup_country) bloating wp_options with one row per spoofed IP.
+		// Proxy headers are CLIENT-CONTROLLED on a default WordPress install
+		// — X-Forwarded-For / CF-Connecting-IP / X-Real-IP arrive as the
+		// client sent them — so they are not trusted by default.
 		//
 		// Site operators who run behind a real reverse proxy (Cloudflare,
 		// Nginx with proxy_set_header, AWS ALB) must opt in by setting
@@ -826,7 +820,7 @@ final class GeoRedirect {
 		// Cloudflare sets authoritatively (it strips any client-sent copy). A
 		// generic nginx/ALB forwards a client-sent header of the same name
 		// verbatim, so honour it ONLY when the immediate peer is a published
-		// Cloudflare edge address; otherwise it is attacker-controllable.
+		// Cloudflare edge address; otherwise it is client-controlled.
 		if ( ! empty( $_SERVER['HTTP_CF_CONNECTING_IP'] ) && $this->is_cloudflare_ip( $remote_addr ) ) {
 			$cf_ip = trim( sanitize_text_field( wp_unslash( (string) $_SERVER['HTTP_CF_CONNECTING_IP'] ) ) );
 

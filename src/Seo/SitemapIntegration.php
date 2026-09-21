@@ -623,14 +623,10 @@ final class SitemapIntegration {
 		// Bound the prime by what ONE PAGE can actually consume, not by a flat
 		// multiple of it. A page renders at most $max_urls entries, and each
 		// entry needs its siblings — so $max_urls * languages is the most this
-		// request can use. The previous flat 10x meant a site with, say, 15,000
-		// translated posts loaded all 15,000 into memory on every sitemap page
-		// request (measured ~4 KB/post, so tens of MB) while rendering 2,000
-		// URLs — enough to exhaust a 128 MB frontend limit that bots then hit
-		// on every page of the tree. It also inverted the risk: a >20,000-post
-		// site fell through to the safe per-entry path while a 15,000-post site
-		// did not. Sites whose catalog fits inside one page's need are
-		// unaffected and still get the full bulk prime.
+		// request can use. A flat multiple would load far more posts than the
+		// page renders (about 4 KB each, so tens of MB on a large catalog) on
+		// every sitemap page request. Sites whose catalog fits inside one
+		// page's need are unaffected and still get the full bulk prime.
 		$lang_count = max( 2, count( self::$languages_cache ) );
 		$prime_cap  = max( 2000, (int) apply_filters( 'perflocale/sitemap/max_prime', $max_urls * $lang_count ) );
 

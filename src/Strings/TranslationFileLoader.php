@@ -428,8 +428,8 @@ final class TranslationFileLoader {
 		// Resolve the canonical translations directory once. Files whose
 		// realpath doesn't live inside this directory are rejected below
 		// (defence in depth against symlink escapes - the glob can't
-		// otherwise reach outside, but a rogue symlink inside the directory
-		// could redirect an `include` at an attacker-controlled PHP file).
+		// otherwise reach outside, and an `include` must never follow a
+		// symlink out of this directory).
 		$dir_real = realpath( $dir );
 
 		foreach ( $files as $file ) {

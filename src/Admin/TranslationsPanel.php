@@ -133,6 +133,9 @@ final class TranslationsPanel {
 	/**
 	 * Echo the panel for one object.
 	 *
+	 * Output passes through wp_kses_post(); this is the sanitized way to output
+	 * the panel. get_html() returns the same markup without that pass.
+	 *
 	 * @param int                  $post_id Post id to describe.
 	 * @param array<string, mixed> $args    Render arguments (context, title, heading).
 	 * @return void
@@ -147,8 +150,13 @@ final class TranslationsPanel {
 		// ESCAPED AT THE SINK, like every other echo in this plugin that emits
 		// built markup. Each dynamic value was already escaped as it was written
 		// (see render_row(), where every one passes through esc_html/esc_attr/
-		// esc_url), so wp_kses_post() changes nothing we produce — `ul`, `li`,
-		// `span` and `a` with class/href/title all survive it untouched.
+		// esc_url), so wp_kses_post() removes no element, attribute or class we
+		// produce — `ul`, `li`, `span` and `a` with class/href/title all survive
+		// it. It may still re-spell entities: from WordPress 7.0, wp_kses_hair()
+		// (wp-includes/kses.php) decodes each attribute value and re-encodes it,
+		// so the `&#038;` that esc_url() emits comes back as `&amp;` and an
+		// `&#039;` as `&apos;`. Different bytes, same decoded value; earlier
+		// versions leave the entities esc_url() and esc_attr() emit unchanged.
 		//
 		// What it buys is the `perflocale/panel/render` filter: that runs inside
 		// get_html() and a listener can return anything at all. Without an
@@ -156,8 +164,12 @@ final class TranslationsPanel {
 		// an admin screen. Escaping at the sink is the invariant this codebase
 		// holds everywhere else, and it should not have an exception.
 		//
-		// ⚠️ Consequence for listeners, documented on the hooks page: the panel's
-		// markup is limited to what wp_kses_post() permits.
+		// ⚠️ This line is the ONLY place PerfLocale sanitizes the filter's output.
+		// get_html() returns it as the listener left it, so the kses guarantee
+		// covers a panel echoed here — including every mount(), which calls
+		// this — and nothing that takes the string from get_html() instead.
+		// Consequence for listeners, documented on the hooks page: on the panels
+		// PerfLocale echoes, the markup is limited to what wp_kses_post() permits.
 		echo wp_kses_post( $html );
 	}
 
@@ -168,9 +180,20 @@ final class TranslationsPanel {
 	 * unsaved object, a user without edit rights on it, or a site with no active
 	 * languages.
 	 *
+	 * ⚠️ THE RETURN IS NOT SANITIZED. It is the result of the
+	 * `perflocale/panel/render` filter, exactly as the last listener left it.
+	 * PerfLocale escapes every row value it writes, but a listener may wrap or
+	 * replace that markup wholesale, and nothing in this method passes it through
+	 * kses — render() does that at its echo. So do not echo this string: call
+	 * render() with the same arguments to output the panel. A caller that needs
+	 * the string itself must pass it through wp_kses_post(), or its host's
+	 * narrower allowlist, at its own sink before output. kses filters HTML
+	 * only; a sink that interprets the string any other way needs its own
+	 * escaping as well.
+	 *
 	 * @param int                  $post_id Post id to describe.
 	 * @param array<string, mixed> $args    Render arguments.
-	 * @return string
+	 * @return string Unsanitized panel markup, or '' when nothing must render.
 	 */
 	public function get_html( int $post_id, array $args = [] ): string {
 		// ⚠️ `> 0` IS LOAD-BEARING, not defensive habit. Contact Form 7 passes
@@ -191,9 +214,10 @@ final class TranslationsPanel {
 
 		// The mount site is NOT the authorization. An addon can register this on
 		// any hook it likes, including one that fires on a screen whose own gate
-		// is weaker or absent, so the panel gates itself on the same check the
-		// REST route uses. It enumerates an object's translations and links to
-		// them, which is exactly what edit rights govern.
+		// is weaker or absent, so the panel gates itself on edit rights to the
+		// object. It enumerates an object's translations and links to them, which
+		// is exactly what edit rights govern. Creating a translation takes more
+		// (see $can_create below).
 		//
 		// Helper, not a bare `current_user_can( 'edit_post', … )`: a host that
 		// registers its type with `map_meta_cap => false` and never grants the
@@ -211,10 +235,20 @@ final class TranslationsPanel {
 			return '';
 		}
 
+		// Withhold Create from a user the Create action is certain to refuse:
+		// one without perflocale_translate, or without the create capability of
+		// the post's type (a translation has its source's type). The action also
+		// checks the default-language original a translation is copied from,
+		// which only the action evaluates, so a live link can still be refused
+		// there. Resolved once per panel, from the user and post already loaded,
+		// and passed to the renderer rather than put in the rows, which a
+		// `perflocale/panel/rows` listener can rewrite.
+		$can_create = current_user_can( 'perflocale_translate' ) && \PerfLocale\Helper::user_can_create_like( $post_id );
+
 		$html = '<ul class="perflocale-mb-list">';
 
 		foreach ( $rows as $row ) {
-			$html .= $this->render_row( $row );
+			$html .= $this->render_row( $row, $can_create );
 		}
 
 		$html .= '</ul>';
@@ -223,11 +257,17 @@ final class TranslationsPanel {
 		 * Filter the rendered Translations panel markup.
 		 *
 		 * Runs on the finished string, so a listener can wrap, replace or
-		 * suppress the panel wholesale. ⚠️ What is returned is passed through
-		 * `wp_kses_post()` before it is echoed, so a listener still escapes its
-		 * own dynamic values and cannot emit tags outside that allowlist. A host
+		 * suppress the panel wholesale. ⚠️ Wherever PerfLocale echoes the panel —
+		 * render(), which every mount() goes through — what is returned is passed
+		 * through `wp_kses_post()` first, so a listener still escapes its own
+		 * dynamic values: kses removes tags outside that allowlist but keeps the
+		 * text inside them, and removes disallowed attributes and URL protocols
+		 * rather than the elements that carry them. A host
 		 * that filters its own page through kses — Contact Form 7 does — narrows
-		 * it further still.
+		 * it further still. That escaping happens at render()'s echo, not here:
+		 * get_html() returns this filter's result unsanitized, and code that
+		 * outputs the string from get_html() instead of calling render() must
+		 * apply the same kses itself.
 		 *
 		 * @hook  perflocale/panel/render
 		 * @since 1.0.5
@@ -337,10 +377,11 @@ final class TranslationsPanel {
 	 * existed, so the classic metabox keeps its exact appearance and any CSS or
 	 * user stylesheet targeting it keeps working.
 	 *
-	 * @param array<string, mixed> $row Row data from get_rows().
+	 * @param array<string, mixed> $row        Row data from get_rows().
+	 * @param bool                 $can_create Whether the user may create translations here.
 	 * @return string
 	 */
-	private function render_row( array $row ): string {
+	private function render_row( array $row, bool $can_create ): string {
 		$is_current      = ! empty( $row['is_current'] );
 		$has_translation = ! empty( $row['has_translation'] );
 		$translated_id   = isset( $row['translated_id'] ) ? (int) $row['translated_id'] : 0;
@@ -370,6 +411,11 @@ final class TranslationsPanel {
 			}
 		} elseif ( 'auto-draft' === ( $row['source_status'] ?? '' ) ) {
 			$html .= '<span class="perflocale-mb-pill perflocale-mb-pill--disabled" title="' . esc_attr__( 'Save the post before creating translations.', 'perflocale' ) . '">+ ' . esc_html__( 'Create', 'perflocale' ) . '</span>';
+		} elseif ( ! $can_create ) {
+			// Untranslated, but the Create action would refuse this user. A live
+			// link would be a dead action, and no pill at all would hide that the
+			// language is still missing.
+			$html .= '<span class="perflocale-mb-pill perflocale-mb-pill--disabled" title="' . esc_attr__( 'You do not have permission to create translations of this content.', 'perflocale' ) . '">+ ' . esc_html__( 'Create', 'perflocale' ) . '</span>';
 		} else {
 			$create_url = add_query_arg(
 				[

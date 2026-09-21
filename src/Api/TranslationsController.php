@@ -410,11 +410,7 @@ final class TranslationsController extends RestController {
 
 		// This endpoint serves only the POST translation graph: get_manager()
 		// returns a PostTranslationManager and every field below (get_post,
-		// edit_url) is post-shaped. A term or string
-		// ID would be read through the POST link map, returning a different
-		// object's graph under a weaker gate than the type=post edit_post
-		// check (edit_term for terms, cap-only for strings). Reject the
-		// unsupported types rather than leak post data through them.
+		// edit_url) is post-shaped, so other object types are rejected.
 		if ( $type !== 'post' ) {
 			return new \WP_REST_Response(
 				[
@@ -559,7 +555,24 @@ final class TranslationsController extends RestController {
 		}
 
 		$manager = $this->get_manager();
-		$new_id  = $manager->create_translation( $id, $target_lang, $copy );
+
+		// The new post is copied from the group's default-language member, not
+		// necessarily from $id, so edit rights on $id are not enough. Refused
+		// outright: silently copying $id instead would make a translation's
+		// starting content depend on who clicked.
+		$copy_from = $manager->get_copy_source_id( $id, $target_lang );
+
+		if ( $copy_from > 0 && $copy_from !== $id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
+			return $this->error( 'source_forbidden', __( 'You cannot edit the original this translation is copied from.', 'perflocale' ), 403 );
+		}
+
+		// The new post is of the copy source's type, and wp_insert_post() checks
+		// no capability, so apply the type's own create gate here.
+		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_like( $copy_from ) ) {
+			return $this->error( 'cannot_create_type', __( 'You do not have permission to create translations of this content.', 'perflocale' ), 403 );
+		}
+
+		$new_id = $manager->create_translation( $id, $target_lang, $copy );
 
 		if ( $new_id === false ) {
 			return $this->error( 'create_failed', __( 'Failed to create translation.', 'perflocale' ), 500 );
@@ -708,11 +721,8 @@ final class TranslationsController extends RestController {
 
 			// An UNREGISTERED status is ignored, not rejected — the other
 			// fields in the same request still apply. That leniency is the
-			// documented contract and is pinned by cov-api-abilities I5/I6,
-			// which sends status=bogus alongside a title and content and
-			// requires both to land. Turning it into a 400 is an announced API
-			// change, not part of this security fix, so it is deliberately not
-			// made here. Nothing is written for an unknown status, so no
+			// documented contract; turning it into a 400 would be an API
+			// change. Nothing is written for an unknown status, so no
 			// capability question arises for it.
 			//
 			// is_object(), not instanceof stdClass: core builds these with a
@@ -720,15 +730,11 @@ final class TranslationsController extends RestController {
 			// disable the capability gates below.
 			if ( is_object( $status_obj ) ) {
 				// A STATUS TRANSITION IS NOT AN EDIT. Reaching this method proves
-				// `perflocale_translate` plus `edit_post` on the target, and until
-				// now that was the only gate — so a role holding edit rights but
-				// deliberately denied publish/delete rights (the bundled Translator
-				// role is exactly that) could publish or trash content through
-				// here. Core refuses the same transition on wp/v2/posts.
-				//
-				// Worse, the target is not always a translation: for the DEFAULT
-				// language PostTranslationManager::get_translation_id() resolves a
-				// post to ITSELF, so the source post was reachable too.
+				// `perflocale_translate` plus `edit_post` on the target; publishing
+				// and trashing need their own capabilities, as they do on
+				// wp/v2/posts. The target is not always a translation: for the
+				// DEFAULT language PostTranslationManager::get_translation_id()
+				// resolves a post to ITSELF.
 				//
 				// Mirror WP_REST_Posts_Controller::handle_status_param(): map the
 				// capability from the TARGET's own post type so custom post types
@@ -761,22 +767,10 @@ final class TranslationsController extends RestController {
 				// core registers with `internal => true`, which are lifecycle
 				// bookkeeping and are never a legitimate target here.
 				//
-				// Denying them is not tidiness. `auto-draft` is COLLECTED BY
-				// CORE: wp_delete_auto_drafts(), on the daily
-				// wp_scheduled_auto_draft_delete cron, runs
-				// `wp_delete_post( $id, true )` — a FORCE delete, no trash, no
-				// undo — over every auto-draft whose POST_DATE is more than
-				// seven days old. post_date, not post_modified. An article
-				// published last month already satisfies that, so setting it to
-				// auto-draft does not buy a week's grace: core destroys it on
-				// the next cron run.
-				//
-				// So a role holding edit rights but deliberately denied delete
-				// rights — the bundled Translator role is exactly that — could
-				// set a translation, or via get_translation_id() a
-				// DEFAULT-language SOURCE post, to auto-draft and have core
-				// permanently delete it within a day. The trash gate above
-				// cannot see that coming, because auto-draft is not trash.
+				// `auto-draft` is collected by core: its daily cleanup
+				// force-deletes old auto-drafts, so setting one is a deletion,
+				// not an editorial change, and the trash gate above would not
+				// see it.
 				//
 				// `inherit` is the other one: it makes the post take its
 				// parent's status, and on a post with no parent the result is

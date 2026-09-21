@@ -19,20 +19,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  * The ONE place that decides whether a machine-translation request is admitted.
  *
  * WHY THIS CLASS EXISTS
- *   This logic previously existed as two near-identical private copies, in
- *   MachineTranslateController and BlockTranslateController. A third entry
- *   point — the `perflocale/translate-post` Ability — was added later and
- *   simply had no copy, so it ran the provider with no admission check at all.
- *   With the per-user quota exhausted, the site-wide quota exhausted, or the
- *   rate lock held, the two REST routes returned 429 and made zero provider
- *   calls while the Ability succeeded and made real batched provider calls.
- *   Abilities are reachable over REST and MCP, so "the quota is enforced"
- *   was true of the paths people tested and false of the newest one.
- *
- *   Duplication was the mechanism, so the fix is de-duplication rather than a
- *   third copy. Every caller now shares one implementation, one pair of
- *   transient keys and one lock name, which is also what makes the per-user
- *   and site-wide budgets genuinely shared across entry points.
+ *   Every caller shares this one implementation, one pair of transient keys
+ *   and one lock name, which is what makes the per-user and site-wide budgets
+ *   genuinely shared across the entry points that call it. A new entry point
+ *   calls admit() rather than carrying its own copy.
  *
  * IMPORTANT: admit() is not a query — it INCREMENTS both counters when it
  * allows. Call it exactly once per translation request, at the point the
@@ -43,8 +33,8 @@ final class MtRateLimiter {
 	/**
 	 * Transient key prefix for the per-user window.
 	 *
-	 * Unchanged from the original controllers on purpose: an upgrade must not
-	 * hand every user a fresh empty quota window.
+	 * Kept stable on purpose: an upgrade must not hand every user a fresh empty
+	 * quota window.
 	 */
 	private const USER_KEY_PREFIX = 'perflocale_mt_rl_';
 
@@ -73,7 +63,7 @@ final class MtRateLimiter {
 	 * timestamp, an expired window — yields a fresh zeroed window.
 	 *
 	 * Integer-typed on the way out so callers can compare and increment without
-	 * casting, which is what let a corrupt value slip past the cap before.
+	 * casting, and the cap is always checked against a real count.
 	 *
 	 * @param mixed $stored Raw transient value.
 	 * @param int   $now    Current timestamp.
@@ -164,16 +154,8 @@ final class MtRateLimiter {
 
 				// VALIDATE THE SHAPE, NOT JUST ITS PRESENCE.
 				//
-				// The old guard accepted any array carrying the two keys, then
-				// compared with `(int) $state['count']` but incremented the raw
-				// value. With a corrupt transient that combination silently broke
-				// the cap: `count = "malformed"` casts to 0, so the limit was
-				// never reached, and `++` on that string produced "malformee",
-				// "malformef" … — an unbounded bypass that never converged on a
-				// number. `count = []` threw `TypeError: Cannot increment array`
-				// and turned the request into a 500, and `count = true` increments
-				// to itself, freezing the counter forever.
-				//
+				// A corrupt transient (a non-integer count, an implausible
+				// window start) must never be compared or incremented as it is.
 				// Anything that is not a non-negative integer, and any window
 				// start that is not a plausible timestamp, is therefore treated as
 				// no window at all and reset. That is fail-CLOSED for the caller:

@@ -190,10 +190,9 @@ final class BlockTemplateTranslator {
 		// to blog B carried A's answers across: on B the filter believed the
 		// feature was on and used A's language slugs, so a legitimate template
 		// of B's whose slug happened to end in one of A's language suffixes was
-		// dropped from B's Site Editor listing. Reproduced independently
-		// (codex/fse-performance-gate-audit-2026-09-11, FPG-C1): the entry
-		// survived with this reset in place, vanished without it, and came back
-		// on a manual reset.
+		// dropped from B's Site Editor listing. Reproduced: the entry survived
+		// with this reset in place, vanished without it, and came back on a
+		// manual reset.
 		//
 		// `get_block_templates` really does fire on ordinary admin screens —
 		// measured on wp-admin/edit.php, where WooCommerce's template
@@ -348,12 +347,11 @@ final class BlockTemplateTranslator {
 			// The map is a per-request memo primed by one SELECT that filters on
 			// `tr.post_status = 'publish'` and `tr.post_type = %s`. Anything that
 			// changes those AFTER priming — an import, a bulk edit, an extension
-			// unpublishing a row mid-render, a long render window — left this
-			// branch serving a translation that is no longer published. The part
-			// branch below has always re-checked both; this one only re-read the
-			// content, so each branch was missing exactly the guard the other
-			// had. Both properties are already on the WP_Post that `get_post()`
-			// just returned, so this costs two string comparisons and no query.
+			// unpublishing a row mid-render, a long render window — would
+			// otherwise leave this branch serving a translation that is no
+			// longer published. The part branch below re-checks both as well.
+			// Both properties are already on the WP_Post that `get_post()` just
+			// returned, so this costs two string comparisons and no query.
 			// Keep the literals in step with the prime SQL: widening one without
 			// the other makes every translated template silently fall back to
 			// source, and section D2 of the FSE suite pins that agreement.

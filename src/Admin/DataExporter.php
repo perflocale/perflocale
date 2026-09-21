@@ -42,8 +42,7 @@ final class DataExporter {
 	 * the exporter (skips these when emitting addon sections) and the importer
 	 * (skips these when dispatching addon sections) so the two can't drift.
 	 * addon_settings + disabled_addons are included because both carry
-	 * (redacted) credentials — an addon section of either name would smuggle a
-	 * full addon_settings blob past redaction on import.
+	 * (redacted) credentials, and only the core exporter may write them.
 	 */
 	public const RESERVED_SECTION_KEYS = [
 		'perflocale_export',
@@ -177,8 +176,8 @@ final class DataExporter {
 	 * array cyclic — an unbounded walk would then recurse until the stack
 	 * dies. Real config is one to three levels deep, so 8 is generous. Past
 	 * the cap the value is DROPPED rather than passed through: an un-walked
-	 * subtree is exactly the leak the recursion exists to close, so the cap
-	 * fails closed.
+	 * subtree could hold credentials the walk never checked, so the cap fails
+	 * closed.
 	 */
 	private const REDACT_MAX_DEPTH = 8;
 
@@ -324,12 +323,10 @@ final class DataExporter {
 		// no streaming API), so both halves here stay native and share a UID.
 		//
 		// 'xb' is O_CREAT|O_EXCL: it refuses to open ANY pre-existing node,
-		// which is what closes the symlink hole — the writer can no longer be
-		// steered through a planted final-component symlink the way
-		// fopen( $path, 'w' ) could, because $path is never opened at all now.
-		// rename() REPLACES a symlink sitting at $path rather than following
-		// it. The random component also means the temp name is at least as
-		// unguessable as the export name it is derived from.
+		// so the writer never follows a symlink, and $path itself is never
+		// opened. rename() REPLACES a symlink sitting at $path rather than
+		// following it. The random component also means the temp name is at
+		// least as unguessable as the export name it is derived from.
 		$tmp = $path . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
 
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Streaming to disk; WP_Filesystem has no streaming API.
@@ -514,17 +511,14 @@ final class DataExporter {
 	 * via suffix match so future additions are redacted by default. Exports
 	 * are commonly shared as backups - credentials must never travel.
 	 *
-	 * Two things this does that the flat version did not:
+	 * Two rules:
 	 *
-	 * 1. It RECURSES. The old walk read `array_keys()` at the top level only,
-	 *    so `addon_settings[x]['nested']['access_token']` travelled verbatim
-	 *    while `addon_settings[x]['access_token']` was stripped — whether a
-	 *    secret survived depended on how deep its addon happened to nest it.
+	 * 1. It RECURSES, so a credential key is stripped however deep its addon
+	 *    nests it.
 	 * 2. It looks at VALUES, not only keys, for `scheme://user:pass@host`
 	 *    userinfo. `mt_libre_url` / `mt_agency_url` are ordinary URL settings
 	 *    matching no credential suffix, and `esc_url_raw()` keeps both the
-	 *    `:` and the `@`, so a self-hosted endpoint configured with inline
-	 *    HTTP auth used to export its password in plain sight.
+	 *    `:` and the `@`.
 	 *
 	 * Both cases OMIT the key rather than rewriting the value, and that is
 	 * deliberate. `Settings::update()` merges (`array_merge( $current,
@@ -808,6 +802,29 @@ final class DataExporter {
 	}
 
 	/**
+	 * The address this export is stamped with, under the `site_url` key.
+	 *
+	 * The RAW `home` option, not `home_url()`: PerfLocale filters `home_url`
+	 * to carry the current language, and outside the admin that filter can
+	 * return a language-prefixed path, a language subdomain or an entirely
+	 * different configured domain. An export written from such a request
+	 * would record an address the importer could not match back to this site,
+	 * and the operator would be told their own backup came from somewhere
+	 * else. The `home` option is the one value that is the same on every
+	 * request.
+	 *
+	 * The network envelope in `wp perflocale network-export` stamps each
+	 * slice with this same value, so the two producers cannot drift.
+	 *
+	 * @return string Untrailingslashed site address.
+	 */
+	public static function site_address(): string {
+		$home = get_option( 'home' );
+
+		return is_string( $home ) ? untrailingslashit( $home ) : '';
+	}
+
+	/**
 	 * Shared streaming logic used by download() and write_to_file().
 	 *
 	 * @param resource           $out Output stream.
@@ -826,7 +843,7 @@ final class DataExporter {
 		self::write_chunk( $out, '"version": "' . PERFLOCALE_VERSION . '",' . "\n" );
 		self::write_chunk( $out, '"format_version": ' . (int) self::FORMAT_VERSION . ',' . "\n" );
 		self::write_chunk( $out, '"exported_at": "' . gmdate( 'c' ) . '",' . "\n" );
-		self::write_chunk( $out, '"site_url": ' . self::encode_or_fail( home_url(), 'site_url' ) . ',' . "\n" );
+		self::write_chunk( $out, '"site_url": ' . self::encode_or_fail( self::site_address(), 'site_url' ) . ',' . "\n" );
 		self::write_chunk( $out, '"sections": ' . self::encode_or_fail( $sections, 'sections' ) . ',' . "\n" );
 
 		if ( in_array( 'settings', $sections, true ) ) {
@@ -944,11 +961,10 @@ final class DataExporter {
 		foreach ( $external_sections as $name => $payload ) {
 			// Reserved keys can't be overwritten — addons append, never
 			// replace. addon_settings/disabled_addons are in the shared list
-			// too: both carry redacted credentials, so an addon-provided
-			// section of either name would let a crafted addon smuggle a full
-			// addon_settings blob (secrets included) past redaction on import.
-			// Names are also charset-restricted so the symmetric import hook
-			// perflocale/import/section/<name> stays well-formed.
+			// too: both carry redacted credentials, and only the core
+			// exporter may write them. Names are also charset-restricted so
+			// the symmetric import hook perflocale/import/section/<name>
+			// stays well-formed.
 			if (
 				! is_string( $name )
 				|| $name === ''

@@ -30,9 +30,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * Skipping DNS resolution for these avoids the theoretical multi-
 	 * second hang in `gethostbyname()` on hosts with a broken resolver
 	 * (the function has no timeout parameter). These are all well-known
-	 * public services; resolving them to private IPs would require an
-	 * attacker to control the site's DNS anyway, at which point SSRF is
-	 * not the weakest link.
+	 * public services.
 	 *
 	 * @var array<int, string>
 	 */
@@ -501,9 +499,8 @@ abstract class AbstractProvider implements ProviderInterface {
 		}
 
 		// Fast path: known public MT providers skip the slow gethostbyname()
-		// step. Their hostnames are operator-controlled (wp-config / settings),
-		// so a private-IP resolution would already need a DNS hijack. The
-		// hard-coded localhost/loopback check above ALWAYS runs and is not
+		// step. Their hostnames are operator-controlled (wp-config / settings).
+		// The hard-coded localhost/loopback check above ALWAYS runs and is not
 		// filterable; everything below this point — the IPv4/IPv6 private-range
 		// gates and the DNS resolution — is skipped for a listed entry. Be
 		// precise about that when reading it as a security boundary: a match
@@ -544,19 +541,9 @@ abstract class AbstractProvider implements ProviderInterface {
 			: $host;
 
 		// Unwrap IPv4-mapped IPv6 (::ffff:0:0/96) to the IPv4 it carries, so
-		// the checks below judge the address the socket will actually reach.
-		//
-		// This is not theoretical tidying. PHP's FILTER_FLAG_NO_PRIV_RANGE /
-		// NO_RES_RANGE reserved-range table has no entry for ::ffff:0:0/96 —
-		// verified: ::1, ::, 2001:db8::, fc00:: and fe80:: are all rejected by
-		// those flags, while ::ffff:127.0.0.1, ::ffff:10.0.0.1 and
-		// ::ffff:169.254.169.254 all PASS them. The fc00::/7 + fe80::/10 byte
-		// checks below don't catch them either (a mapped address starts with
-		// ten zero bytes). And make_request() deliberately does not set
-		// reject_unsafe_urls, so this method is the only gate: before this
-		// unwrap, http://[::ffff:127.0.0.1]:PORT/ was validated, requested, and
-		// answered by a loopback listener, while the plain http://127.0.0.1
-		// form was correctly refused.
+		// the range checks judge the address the socket reaches. Mirrors
+		// {@see \PerfLocale\Api\WebhookController::is_url_safe()}; keep them in
+		// sync.
 		//
 		// Unwrapping rather than blanket-rejecting keeps the rule identical for
 		// both spellings of the same address: a mapped PUBLIC IPv4 still passes
@@ -579,15 +566,15 @@ abstract class AbstractProvider implements ProviderInterface {
 		// If the host is already an IP literal, skip DNS entirely - this is
 		// both faster and avoids a potential hang on misconfigured resolvers.
 		if ( Helper::is_ip( $host_ip ) ) {
-			// FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE only cover IPv4.
+			// Helper::is_public_ipv4() judges both families; the fc00::/7 and
+			// fe80::/10 byte checks below are a second layer.
 			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
 				throw new \RuntimeException( 'Provider URL targets a private or reserved IP address.' );
 			}
 
-			// IPv6 equivalents: unique-local (fc00::/7) and link-local
-			// (fe80::/10). Both are "private" in the SSRF sense but pass
-			// PHP's IPv4-only private-range flag. Mirrors the byte check
-			// in WebhookController::is_url_safe().
+			// IPv6 unique-local (fc00::/7) and link-local (fe80::/10), both
+			// "private" in the SSRF sense, checked again as a second layer.
+			// Mirrors the byte check in WebhookController::is_url_safe().
 			if ( Helper::is_ipv6( $host_ip ) ) {
 				$bin = inet_pton( $host_ip );
 
@@ -624,12 +611,9 @@ abstract class AbstractProvider implements ProviderInterface {
 		}
 
 		// Fail closed, mirroring WebhookController::is_url_safe(). gethostbyname()
-		// returns the input unchanged on resolution failure AND does not
-		// canonicalise hex/octal IP literals (e.g. 0x7f000001, 0177.0.0.1) that
-		// libcurl and the PHP streams transport DO parse and connect to the
-		// encoded address. The old `if ( $ip !== $host )` gate treated those as
-		// "fine" and let obfuscated internal IPs slip past the private-range
-		// check — require a real resolution to a verifiable public IP instead.
+		// returns the input unchanged on resolution failure and does not
+		// canonicalise hex or octal IPv4 literals, so require a real resolution
+		// to a public IP.
 		if ( $ip === $host || ! Helper::is_ip( $ip ) ) {
 			throw new \RuntimeException( 'Provider URL could not be resolved to a verifiable public IP.' );
 		}
@@ -638,29 +622,23 @@ abstract class AbstractProvider implements ProviderInterface {
 			throw new \RuntimeException( 'Provider URL resolves to a private or reserved IP address.' );
 		}
 
-		// Loopback 127.0.0.0/8 isn't covered by NO_RES_RANGE — explicit check
-		// matches WebhookController::is_url_safe().
+		// Loopback 127.0.0.0/8. Helper::is_public_ipv4() above already rejects
+		// it; this second layer matches WebhookController::is_url_safe().
 		if ( str_starts_with( $ip, '127.' ) ) {
 			throw new \RuntimeException( 'Provider URL resolves to a loopback address.' );
 		}
 
-		// AAAA blind spot. Everything above this line is IPv4-only:
-		// gethostbyname() has no IPv6 form, and PHP's reserved-range flags were
-		// only ever applied to the A record. A hostname that publishes
-		// A=<public> alongside AAAA=::1 therefore passes every gate here, and on
-		// a dual-stack box glibc's RFC 6724 destination sorting hands libcurl the
-		// IPv6 answer. No timing, no rebinding — just an address family nothing
-		// checked.
+		// gethostbyname() is IPv4-only, so each AAAA record is checked too.
 		//
 		// Re-run THIS method against each AAAA literal rather than restating the
 		// rules: the bracketed form goes through the hard-coded loopback list,
-		// the IPv4-mapped unwrap above (load-bearing on BOTH sides of the PHP 8.4
-		// reserved-range change) and the fc00::/fe80:: byte checks exactly as a
-		// literal URL would, so the two spellings of one address can never drift
-		// apart. An IP literal returns before the DNS branch, so the recursion is
-		// exactly one level deep. A host on perflocale/mt/trusted_hosts returned
-		// long before this point — that documented full exemption is still the
-		// way to reach an internal endpoint.
+		// the IPv4-mapped unwrap above and the fc00::/fe80:: byte checks exactly
+		// as a literal URL would, so the two spellings of one address can never
+		// drift apart. An IP literal returns before the DNS branch, so the
+		// recursion is exactly one level deep. A host on
+		// perflocale/mt/trusted_hosts returned long before this point — that
+		// documented full exemption is still the way to reach an internal
+		// endpoint.
 		foreach ( self::resolve_aaaa( $host ) as $ipv6 ) {
 			try {
 				$this->validate_url( 'https://[' . $ipv6 . ']/' );
@@ -673,14 +651,13 @@ abstract class AbstractProvider implements ProviderInterface {
 	/**
 	 * Resolve a hostname's AAAA records, cached like the A-record lookup.
 	 *
-	 * Deliberately FAILS OPEN when the resolver cannot answer. `dns_get_record`
-	 * is disabled outright on some managed hosts, and refusing every provider
-	 * URL there would take machine translation offline on those sites to close
-	 * a hole the A-record gate already covers in the ordinary case. The result
-	 * is cached for the same 5 minutes as the A record, so a slow or broken
-	 * resolver is paid once per host per window rather than once per request —
-	 * and hosts on the trusted list, and every IP literal, return before this
-	 * is ever called.
+	 * Fails open when the resolver cannot answer; the A-record check still
+	 * applies. `dns_get_record` is disabled outright on some managed hosts, and
+	 * refusing every provider URL there would take machine translation offline
+	 * on those sites. The result is cached for the same 5 minutes as the A
+	 * record, so a slow or broken resolver is paid once per host per window
+	 * rather than once per request — and hosts on the trusted list, and every
+	 * IP literal, return before this is ever called.
 	 *
 	 * Mirrored in {@see \PerfLocale\Api\WebhookController}; keep them in sync.
 	 *

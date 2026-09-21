@@ -279,12 +279,10 @@ final class XliffImporter {
 				continue;
 			}
 
-			// IDOR guard: require edit rights on the SOURCE post before its
-			// content is copied into a new translation below. The unit id is
-			// attacker-controlled and perflocale_import_export is a delegatable
-			// capability, so without this a holder could reference an arbitrary
-			// (incl. private/draft) post id and exfiltrate its content. Mirrors
-			// the source-side edit_post gate the export path already enforces.
+			// Require edit rights on the SOURCE post named by the unit id, which
+			// comes from the uploaded file. Mirrors the source-side edit_post
+			// check on the export path. The copy source is checked below, where
+			// the translation is created.
 			if ( ! current_user_can( 'edit_post', $post_id ) ) {
 				$errors[] = __( 'You do not have permission to edit a referenced post.', 'perflocale' );
 				continue;
@@ -297,6 +295,21 @@ final class XliffImporter {
 			$target_id = $manager->get_translation_id( $post_id, $target_slug );
 
 			if ( ! $target_id ) {
+				// Check the copy source, not only the post the unit names.
+				$copy_from = $manager->get_copy_source_id( $post_id, $target_slug );
+
+				if ( $copy_from > 0 && $copy_from !== $post_id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
+					$errors[] = __( 'You cannot edit the original this translation is copied from.', 'perflocale' );
+					continue;
+				}
+
+				// The new post takes the copy source's type; apply that type's
+				// create capability.
+				if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_like( $copy_from ) ) {
+					$errors[] = __( 'You do not have permission to create translations of this content.', 'perflocale' );
+					continue;
+				}
+
 				// create_translation() copies the SOURCE row. On an import whose
 				// target language IS the site default, that source can be a post
 				// this loop is still holding unwritten fields for, so commit

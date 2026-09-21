@@ -538,6 +538,15 @@ final class PostQueryFilter {
 			// Step 2: Find the translation of the front page in the current language.
 			$target_id = $this->find_translated_page( $front_page_id, $language_id );
 
+			// Every translation of the front page, published or not, links to
+			// the language root (UrlConverter::filter_page_link()), so
+			// previewing an unpublished one requests the root with preview
+			// args and lands here. find_translated_page() skips it; only a
+			// logged-in preview by a user who can edit it may load it.
+			if ( ! $target_id ) {
+				$target_id = $this->find_preview_front_page( $query, $front_page_id, $language_id );
+			}
+
 			if ( ! $target_id ) {
 				// No translation found - show the front page as-is.
 				$target_id = $front_page_id;
@@ -736,6 +745,58 @@ final class PostQueryFilter {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Find the unpublished front-page translation a logged-in editor is
+	 * previewing on the language root.
+	 *
+	 * Same status rules as find_preview_target(): without a preview_id only a
+	 * protected status qualifies; a preview_id must name this translation,
+	 * which then qualifies under can_preview_post().
+	 *
+	 * Reads the translation links and post that find_translated_page() has
+	 * just loaded, so it adds no translation or post query of its own.
+	 *
+	 * @param \WP_Query $query         The main query.
+	 * @param int       $front_page_id page_on_front.
+	 * @param int       $language_id   Current language ID.
+	 * @return int Page ID, or 0 when this is not such a preview.
+	 */
+	private function find_preview_front_page( \WP_Query $query, int $front_page_id, int $language_id ): int {
+		$preview_id = $this->logged_in_preview_id( $query );
+
+		if ( $preview_id < 0 ) {
+			return 0;
+		}
+
+		$links = $this->get_groups_repo()->get_translations( $front_page_id, \PerfLocale\Enum\ObjectType::Post );
+
+		foreach ( $links as $link ) {
+			if ( (int) $link->language_id !== $language_id ) {
+				continue;
+			}
+
+			$post = get_post( (int) $link->object_id );
+
+			if ( ! $post instanceof \WP_Post ) {
+				return 0;
+			}
+
+			if ( $preview_id > 0 ) {
+				return $preview_id === (int) $post->ID && $this->can_preview_post( $preview_id ) ? $preview_id : 0;
+			}
+
+			if ( in_array( $post->post_status, get_post_stati( [ 'protected' => true ] ), true )
+				&& current_user_can( 'edit_post', (int) $post->ID )
+			) {
+				return (int) $post->ID;
+			}
+
+			return 0;
+		}
+
+		return 0;
 	}
 
 	/**
@@ -940,6 +1001,26 @@ final class PostQueryFilter {
 				$require_uri = trim( (string) $pagename, '/' );
 			}
 
+			// A preview that names a matching post the user can edit loads
+			// exactly that post, ahead of any published page sharing the slug
+			// in this language. Unlike the lookups below, the preview route
+			// checks the path at depth 0 too: page slugs are unique only among
+			// siblings (wp_unique_post_slug() compares post_parent,
+			// wp-includes/post.php:5632), so a top-level URL can share its
+			// basename with a nested page, and this route only runs for
+			// logged-in previews.
+			$preview_id  = $this->logged_in_preview_id( $query );
+			$preview_uri = $require_uri !== '' ? $require_uri : $lookup_slug;
+
+			if ( $preview_id > 0 ) {
+				$preview_target = $this->find_preview_target( $lookup_slug, $language_id, 'page', $preview_uri, $preview_id );
+
+				if ( $preview_target > 0 ) {
+					$this->route_to_preview_target( $query, $preview_target, true );
+					return;
+				}
+			}
+
 			$resolved_id = $this->find_post_by_slug_and_language( $lookup_slug, $language_id, 'page' );
 
 			if ( $resolved_id && $require_uri !== '' && get_page_uri( $resolved_id ) !== $require_uri ) {
@@ -958,6 +1039,18 @@ final class PostQueryFilter {
 				$query->queried_object    = null;
 				$query->queried_object_id = 0;
 				return;
+			}
+
+			// The candidates above are published only, and a new translation
+			// copies its source's slug, so a preview=true link to an unpublished
+			// translation would otherwise fall through to a published sibling.
+			if ( $preview_id === 0 ) {
+				$preview_target = $this->find_preview_target( $lookup_slug, $language_id, 'page', $preview_uri, 0 );
+
+				if ( $preview_target > 0 ) {
+					$this->route_to_preview_target( $query, $preview_target, true );
+					return;
+				}
 			}
 
 			// No translation in current language - fall back to the default
@@ -1020,6 +1113,35 @@ final class PostQueryFilter {
 				$post_type = 'post';
 			}
 
+			// Core keeps an array post_type query var as an array; the preview
+			// lookups bind a single type, so they only run for a string.
+			$preview_type = is_string( $post_type ) ? $post_type : '';
+			$preview_id   = $preview_type !== '' ? $this->logged_in_preview_id( $query ) : -1;
+
+			// A hierarchical type requested through its own query var is turned
+			// into a `pagename` lookup after pre_get_posts, and that lookup adds
+			// its own ID condition: the queried_object_id when one is set, else
+			// the language-blind get_page_by_path() match
+			// (wp-includes/class-wp-query.php:2156-2170, :2186-2217). A post
+			// routed by `p` survives only when it is that same post, so the
+			// preview route leaves these requests to the lookups below.
+			if ( $preview_id >= 0 ) {
+				$type_object = get_post_type_object( $preview_type );
+
+				if ( $type_object && $type_object->hierarchical && $type_object->query_var && ! empty( $query->get( (string) $type_object->query_var ) ) ) {
+					$preview_id = -1;
+				}
+			}
+
+			if ( $preview_id > 0 ) {
+				$preview_target = $this->find_preview_target( $name, $language_id, $preview_type, '', $preview_id );
+
+				if ( $preview_target > 0 ) {
+					$this->route_to_preview_target( $query, $preview_target, false );
+					return;
+				}
+			}
+
 			$resolved_id = $this->find_post_by_slug_and_language( $name, $language_id, $post_type );
 
 			if ( $resolved_id ) {
@@ -1029,6 +1151,16 @@ final class PostQueryFilter {
 				$query->queried_object    = null;
 				$query->queried_object_id = 0;
 				return;
+			}
+
+			// Same reason as the pagename branch above.
+			if ( $preview_id === 0 ) {
+				$preview_target = $this->find_preview_target( $name, $language_id, $preview_type, '', 0 );
+
+				if ( $preview_target > 0 ) {
+					$this->route_to_preview_target( $query, $preview_target, false );
+					return;
+				}
 			}
 
 			// No translation in current language - fall back to default language.
@@ -1181,6 +1313,190 @@ final class PostQueryFilter {
 		}
 
 		return $this->find_post_by_slug_and_language( $slug, (int) $default->id, $post_type );
+	}
+
+	/**
+	 * Whether the main query is a preview by a logged-in user, and which post
+	 * it names.
+	 *
+	 * Checks the query flag first, so a request that is not a preview costs
+	 * one property read. WP_Query::parse_query() sets `is_preview` from the
+	 * `preview` query var (wp-includes/class-wp-query.php:1032-1033) before
+	 * get_posts() fires pre_get_posts (:1916).
+	 *
+	 * @param \WP_Query $query The main query.
+	 * @return int -1 when this is not a logged-in preview, 0 when the preview
+	 *             names no post (a bare preview=true link), otherwise the
+	 *             preview_id.
+	 */
+	private function logged_in_preview_id( \WP_Query $query ): int {
+		if ( ! $query->is_preview() || ! is_user_logged_in() ) {
+			return -1;
+		}
+
+		// When a scalar preview_id arrives with preview_nonce, core's
+		// _show_post_preview() has already verified the nonce against this
+		// same (int) cast at init and refused the request on a mismatch
+		// (wp-includes/revision.php:897-903, hooked at
+		// wp-includes/default-filters.php:493). An
+		// array is read as no id here. Without a nonce the id is only a hint:
+		// every caller still requires edit_post on the post it names.
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$preview_id = isset( $_GET['preview_id'] ) && is_scalar( $_GET['preview_id'] ) ? (int) $_GET['preview_id'] : 0;
+
+		return max( 0, $preview_id );
+	}
+
+	/**
+	 * Find the post a logged-in editor is previewing under a slug URL.
+	 *
+	 * The slug candidates in find_slug_candidates() are published posts only,
+	 * and its memo feeds public routing, so it is not widened for this. This
+	 * lookup is separate, runs only for a logged-in preview, and is not
+	 * memoised.
+	 *
+	 * With a preview_id the named post is the only candidate. Without one,
+	 * the slug is looked up among the protected statuses (draft, pending,
+	 * future and any custom status registered as protected); private posts
+	 * are not included, so a private translation opened without a preview_id
+	 * is left to the published lookups.
+	 *
+	 * A candidate must have this slug and post type, be linked in the current
+	 * language through a post-type group, match the requested page path when
+	 * one is given, and pass can_preview_post(). WP_Query still applies its
+	 * own status and capability check to whatever is returned
+	 * (wp-includes/class-wp-query.php:3535-3567).
+	 *
+	 * @param string $slug        post_name to match.
+	 * @param int    $language_id Current language ID.
+	 * @param string $post_type   Post type.
+	 * @param string $require_uri Page path the post must have, or '' for no path check.
+	 * @param int    $preview_id  Post named by preview_id, or 0 to look the slug up.
+	 * @return int Post ID, or 0.
+	 */
+	private function find_preview_target( string $slug, int $language_id, string $post_type, string $require_uri, int $preview_id ): int {
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		global $wpdb;
+
+		$links_table  = Schema::table( 'translation_links' );
+		$groups_table = Schema::table( 'translation_groups' );
+
+		if ( $preview_id > 0 ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT p.ID FROM %i p
+					INNER JOIN %i tl ON tl.object_id = p.ID AND tl.language_id = %d
+					INNER JOIN %i tg ON tg.id = tl.group_id AND tg.type = 'post'
+					WHERE p.ID = %d AND p.post_name = %s AND p.post_type = %s",
+					$wpdb->posts,
+					$links_table,
+					$language_id,
+					$groups_table,
+					$preview_id,
+					$slug,
+					$post_type
+				)
+			);
+		} else {
+			$statuses = array_values( get_post_stati( [ 'protected' => true ] ) );
+
+			if ( $statuses === [] ) {
+				return 0;
+			}
+
+			$status_placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT p.ID FROM %i p
+					INNER JOIN %i tl ON tl.object_id = p.ID AND tl.language_id = %d
+					INNER JOIN %i tg ON tg.id = tl.group_id AND tg.type = 'post'
+					WHERE p.post_name = %s AND p.post_type = %s AND p.post_status IN ( {$status_placeholders} )
+					ORDER BY p.ID ASC",
+					array_merge( [ $wpdb->posts, $links_table, $language_id, $groups_table, $slug, $post_type ], $statuses )
+				)
+			);
+		}
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		$ids = array_map( 'intval', (array) $ids );
+
+		if ( count( $ids ) > 1 ) {
+			_prime_post_caches( $ids, false, false );
+		}
+
+		foreach ( $ids as $id ) {
+			if ( $require_uri !== '' && get_page_uri( $id ) !== $require_uri ) {
+				continue;
+			}
+
+			if ( $this->can_preview_post( $id ) ) {
+				return $id;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Whether a preview may be routed to this post: the current user can edit
+	 * it, and WP_Query's own status gate keeps it for them
+	 * (wp-includes/class-wp-query.php:3535-3567), so the route does not
+	 * replace today's fallback with a post that gate would drop.
+	 *
+	 * Uses the literal caps that gate uses (edit_post and read_post,
+	 * wp-includes/class-wp-query.php:2638-2639). edit_post is always
+	 * required; a public or protected status needs nothing more; a private
+	 * status also needs read_post, which edit_post does not imply. Any other
+	 * status (trash, auto-draft, other internal statuses) is refused, and so
+	 * is an unregistered one, which that gate would show to an editor: such a
+	 * request is left to the lookups that follow.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	private function can_preview_post( int $post_id ): bool {
+		$status = get_post_status_object( (string) get_post_status( $post_id ) );
+
+		if ( ! $status || ! current_user_can( 'edit_post', $post_id ) ) {
+			return false;
+		}
+
+		if ( $status->public || $status->protected ) {
+			return true;
+		}
+
+		return $status->private && current_user_can( 'read_post', $post_id );
+	}
+
+	/**
+	 * Point the main query at the post find_preview_target() chose.
+	 *
+	 * Unlike the fallback routes it sets neither `perflocale_all_languages`
+	 * nor $loaded_fallback: the post is linked in the current language, so
+	 * handle_missing_translation() returns at its same-language check instead
+	 * of applying the missing-translation action.
+	 *
+	 * @param \WP_Query $query   The main query.
+	 * @param int       $post_id Post to load.
+	 * @param bool      $is_page Whether the request came through `pagename`.
+	 * @return void
+	 */
+	private function route_to_preview_target( \WP_Query $query, int $post_id, bool $is_page ): void {
+		if ( $is_page ) {
+			$query->set( 'page_id', $post_id );
+			$query->set( 'pagename', '' );
+			$query->is_page     = true;
+			$query->is_singular = true;
+		} else {
+			$query->set( 'p', $post_id );
+			$query->set( 'name', '' );
+		}
+
+		$query->queried_object    = null;
+		$query->queried_object_id = 0;
 	}
 
 	/**
@@ -2728,8 +3044,8 @@ final class PostQueryFilter {
 
 			if ( is_array( $passthrough ) && $passthrough !== [] ) {
 				// Never forward `perflocale_fb` - the walker will re-add it,
-				// and accepting a user-supplied value would let attackers
-				// short-circuit the fallback guard.
+				// and the fallback guard must only ever see the walker's own
+				// sentinel, not a value from the incoming request.
 				unset( $passthrough['perflocale_fb'] );
 
 				// Never forward WP object-routing params either: they name the

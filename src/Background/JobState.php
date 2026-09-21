@@ -842,22 +842,17 @@ final class JobState {
 
 		// Remove the artifact BEFORE the row, because the row is the only
 		// record of what the artifact was. A completed data_export writes its
-		// file into wp-content/uploads, which is web-served; deleting the job
-		// used to leave that file behind with nothing left to identify or own
-		// it, and the only thing that eventually removed it was the 7-day
-		// age sweep. Ordering matters: if the unlink fails we still delete the
-		// row (the file is then swept by age, exactly as before), but if the
-		// row went first we would have lost the path entirely.
+		// file into wp-content/uploads, which is web-served. Ordering matters:
+		// if the unlink fails we still delete the row (the file is then swept
+		// by age), but if the row went first we would have lost the path
+		// entirely.
 		//
 		// The row still goes even when the unlink fails — a directory the web
 		// server cannot write to, or an artifact the cleanup refuses because it
 		// is no longer the file the job created. Making admin deletion fail
-		// instead would leave the operator unable to remove a job at all, and
-		// the artifact is web-served, so a stuck row is not a safer state than a
-		// swept file. What was missing was any RECORD of the orphan: the file
-		// survived with nothing owning it and nothing said so. Log it, so the
-		// gap between "job deleted" and "file gone" is visible before the
-		// 7-day sweep closes it.
+		// instead would leave the operator unable to remove a job at all. The
+		// orphan is logged, so the gap between "job deleted" and "file gone" is
+		// visible before the 7-day sweep closes it.
 		if ( ! self::delete_owned_artifact( $job_id ) ) {
 			$orphan_state  = self::get( $job_id );
 			$orphan_result = is_array( $orphan_state ) ? (array) ( $orphan_state['result'] ?? [] ) : [];
@@ -866,17 +861,11 @@ final class JobState {
 			// Only when there really was an artifact to remove. Every other job
 			// type has no file, and logging those would bury the real cases.
 			if ( '' !== $orphan_path && file_exists( $orphan_path ) ) {
-				// NEVER log the path, the basename or the token.
-				//
-				// An export filename is `perflocale-export-<date>-<32 CSPRN>.json`
-				// and that suffix IS the access control: the file lands in
-				// wp-content/uploads, which Apache guards with the .htaccess
-				// harden_directory() writes but which nginx and Caddy ignore
-				// entirely, so on those servers anyone holding the exact URL can
-				// fetch the export. Writing the full path here put that token
-				// into the PHP error log — a file support tooling, hosting
-				// dashboards and log shippers routinely read — which handed away
-				// the very secret the 32-character suffix exists to protect.
+				// NEVER log the path, the basename or the token. An export
+				// filename is `perflocale-export-<date>-<32 CSPRN>.json` and that
+				// suffix is what keeps the file private (see
+				// Helper::harden_directory()); error logs are read by support
+				// tooling, hosting dashboards and log shippers.
 				//
 				// The job UUID is enough to find the row and its recorded path
 				// through the admin UI or WP-CLI, and a truncated SHA-256 of the
@@ -937,19 +926,11 @@ final class JobState {
 			return false;
 		}
 
-		// RESOLVE THE PARENT DIRECTORY, NEVER THE FILE.
-		//
-		// This used to call realpath() on the recorded path itself and unlink
-		// whatever came back. realpath() FOLLOWS SYMLINKS, so a symlink left at
-		// job A's recorded path pointing at job B's export resolved to B's real
-		// file — which is genuinely inside the exports directory, so every
-		// containment check passed. Deleting job A then destroyed job B's data,
-		// left A's dangling symlink in place, and removed A's row while B's row
-		// survived pointing at a file that no longer existed.
-		//
-		// Resolving only the DIRECTORY gives the traversal protection that was
-		// wanted (`..` segments and a symlinked exports dir are still handled)
-		// without ever redirecting the unlink to a different file.
+		// RESOLVE THE PARENT DIRECTORY, NEVER THE FILE. realpath() follows
+		// symlinks, so resolving the recorded path itself could redirect the
+		// unlink to a different file that also lives in the exports directory.
+		// Resolving only the DIRECTORY still handles `..` segments and a
+		// symlinked exports dir without ever redirecting the unlink.
 		$real_parent = realpath( dirname( $path ) );
 		$base        = basename( $path );
 
@@ -984,23 +965,22 @@ final class JobState {
 		// file it created, require the entry at this path to still BE that
 		// file. This is what makes pathname reuse safe: the old file being
 		// unlinked while a handle stayed open, and an unrelated new file
-		// appearing at the same name, used to end with the cleanup deleting the
-		// newcomer. Absent on rows written before this was recorded, in which
-		// case the checks above stand alone and the age sweep is the backstop.
+		// appearing at the same name, would otherwise end with the cleanup
+		// deleting the newcomer. Absent on rows written before this was
+		// recorded; such a row is refused below and left to the age sweep.
 		$want_ino = (string) ( $result['ino'] ?? '' );
 		$want_dev = (string) ( $result['dev'] ?? '' );
 
 		// A row with no recorded identity cannot prove it owns the file that is
-		// there NOW. Rows written before 1.0.1 carry only `path` and `bytes`, and
-		// treating the pathname as ownership is exactly the mistake the identity
-		// binding exists to prevent: if the original artifact is gone and any
-		// other regular file has since taken that pathname, deleting the job
-		// would delete the newcomer. Reproduced on four roots and both multisite
-		// child blogs.
+		// there NOW. Such a row carries only `path` and `bytes`, and treating the
+		// pathname as ownership is exactly the mistake the identity binding
+		// exists to prevent: if the original artifact is gone and any other
+		// regular file has since taken that pathname, deleting the job would
+		// delete the newcomer.
 		//
 		// So a legacy row REFUSES to unlink and leaves the artifact to the bounded
 		// age sweep, which is the same backstop that already covers an unlink
-		// failure. The cost is that a pre-1.0.1 export lingers until the sweep;
+		// failure. The cost is that such a row's export lingers until the sweep;
 		// the alternative is deleting a file this row cannot show it owns.
 		if ( '' === $want_ino || '' === $want_dev ) {
 			return false;
@@ -1302,7 +1282,7 @@ final class JobState {
 	/**
 	 * Job-id shape check — defends option-name-ish areas of the codebase
 	 * (notably JobLock, which still keys per-job locks by UUID in
-	 * `wp_options`) against attacker-supplied IDs from REST endpoints.
+	 * `wp_options`) against malformed IDs from REST endpoints.
 	 *
 	 * @param string $job_id
 	 * @return bool

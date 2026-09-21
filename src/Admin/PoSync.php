@@ -345,6 +345,33 @@ final class PoSync {
 	}
 
 	/**
+	 * Convert CRLF and bare CR to LF.
+	 *
+	 * @see the export loop for why: core's PO serialiser does not escape \r.
+	 *
+	 * @param string $text Text to normalise.
+	 */
+	private static function normalise_newlines( string $text ): string {
+		return str_replace( [ "\r\n", "\r" ], "\n", $text );
+	}
+
+	/**
+	 * True when `$bytes` is well-formed UTF-8.
+	 *
+	 * preg_match with the /u modifier and an empty pattern is the standard test
+	 * and needs no extension: PCRE refuses to run a /u pattern against a subject
+	 * that is not valid UTF-8, so a false return IS the answer.
+	 * mb_check_encoding() would be the obvious choice and is not usable here —
+	 * WordPress core does not polyfill it, so it would fatal on a host built
+	 * without ext-mbstring.
+	 *
+	 * @param string $bytes Candidate.
+	 */
+	private static function is_valid_utf8( string $bytes ): bool {
+		return $bytes === '' || preg_match( '//u', $bytes ) === 1;
+	}
+
+	/**
 	 * Import a PO file into the strings + string_translations tables.
 	 *
 	 * Each PO entry becomes (or matches) a row in `strings`; the row is linked
@@ -358,12 +385,23 @@ final class PoSync {
 	 * The originating `domain` is read from the extracted comment that this
 	 * exporter emits; entries without that comment fall back to 'default'.
 	 *
-	 * @param string $path      Input PO path.
-	 * @param string $lang_slug Target language slug.
-	 * @param bool   $replace   When true, blow away every existing translation
-	 *                          for this language before importing (sources are
-	 *                          kept; only the per-language `string_translations`
-	 *                          rows for $lang_slug are wiped).
+	 * @param string        $path      Input PO path.
+	 * @param string        $lang_slug Target language slug.
+	 * @param bool          $replace   When true, blow away every existing
+	 *                                 translation for this language before
+	 *                                 importing (sources are kept; only the
+	 *                                 per-language `string_translations` rows
+	 *                                 for $lang_slug are wiped).
+	 * @param callable|null $sanitize  Applied to every non-empty translated
+	 *                                 value (msgstr and each extra plural form)
+	 *                                 of an entry that is neither msgid-only
+	 *                                 nor fuzzy, before that entry writes
+	 *                                 anything; returns the string to store.
+	 *                                 Null stores the file's bytes as they are.
+	 *                                 The importer never decides this itself:
+	 *                                 the admin upload handler passes a
+	 *                                 sanitizer for users without
+	 *                                 `unfiltered_html`, and WP-CLI passes none.
 	 * @return array{
 	 *     imported:int,
 	 *     skipped:int,
@@ -374,53 +412,35 @@ final class PoSync {
 	 *     no_translation:int,
 	 *     fuzzy_skipped:int,
 	 *     total_entries:int,
+	 *     sanitized:int,
+	 *     sanitized_empty:int,
 	 * } The first three keys match the standard importer shape; the rest
 	 * break the count down so callers can render an accurate notice
 	 * instead of an "8 imported, 22001 skipped" lump that hides the fact
 	 * most of those 22001 are msgid-only entries (no translation to upsert).
+	 * `sanitized` counts entries in which $sanitize changed at least one value,
+	 * whether it removed markup or only reformatted it; `sanitized_empty`
+	 * counts the subset not imported at all because no row kept a
+	 * translation. An entry with a value $sanitize emptied always has a line
+	 * in `errors`, and a row left without a translation counts in `skipped`.
 	 *
 	 * @throws \Throwable Re-thrown after the replace-mode transaction is rolled
 	 *                     back, so an unexpected failure can never leave the
 	 *                     wipe committed without its re-import.
 	 */
-	/**
-	 * True when `$bytes` is well-formed UTF-8.
-	 *
-	 * preg_match with the /u modifier and an empty pattern is the standard test
-	 * and needs no extension: PCRE refuses to run a /u pattern against a subject
-	 * that is not valid UTF-8, so a false return IS the answer.
-	 * mb_check_encoding() would be the obvious choice and is not usable here —
-	 * WordPress core does not polyfill it, so it would fatal on a host built
-	 * without ext-mbstring.
-	 *
-	 * @param string $bytes Candidate.
-	 */
-	/**
-	 * Convert CRLF and bare CR to LF.
-	 *
-	 * @see the export loop for why: core's PO serialiser does not escape \r.
-	 *
-	 * @param string $text Text to normalise.
-	 */
-	private static function normalise_newlines( string $text ): string {
-		return str_replace( [ "\r\n", "\r" ], "\n", $text );
-	}
-
-	private static function is_valid_utf8( string $bytes ): bool {
-		return $bytes === '' || preg_match( '//u', $bytes ) === 1;
-	}
-
-	public static function import_from_file( string $path, string $lang_slug, bool $replace = false ): array {
+	public static function import_from_file( string $path, string $lang_slug, bool $replace = false, ?callable $sanitize = null ): array {
 		$result = [
-			'imported'       => 0,
-			'skipped'        => 0,
-			'errors'         => [],
-			'inserted'       => 0,
-			'updated'        => 0,
-			'unchanged'      => 0,
-			'no_translation' => 0,
-			'fuzzy_skipped'  => 0,
-			'total_entries'  => 0,
+			'imported'        => 0,
+			'skipped'         => 0,
+			'errors'          => [],
+			'inserted'        => 0,
+			'updated'         => 0,
+			'unchanged'       => 0,
+			'no_translation'  => 0,
+			'fuzzy_skipped'   => 0,
+			'total_entries'   => 0,
+			'sanitized'       => 0,
+			'sanitized_empty' => 0,
 		];
 
 		if ( ! is_readable( $path ) ) {
@@ -491,6 +511,21 @@ final class PoSync {
 		if ( ! $has_entries ) {
 			$result['errors'][] = __( 'The PO file contains no translatable entries. If it was exported from another tool, check that it is saved as UTF-8.', 'perflocale' );
 			return $result;
+		}
+
+		// A file whose importable translations $sanitize empties entirely is the
+		// third trigger again: in replace mode it would wipe the language and
+		// import nothing. Such a file returns here, before anything is written,
+		// with the counters the entry loop would have reported for it.
+		if ( $sanitize !== null ) {
+			$emptied_file = self::counts_if_sanitizer_empties_file( $po, $sanitize );
+
+			if ( $emptied_file !== null ) {
+				$result             = array_merge( $result, $emptied_file );
+				$result['errors'][] = __( 'Nothing was imported: removing HTML that is not allowed left every importable translation in the PO file empty.', 'perflocale' );
+
+				return $result;
+			}
 		}
 
 		global $wpdb;
@@ -589,15 +624,7 @@ final class PoSync {
 				// singular lands where _n() looks it up instead of context ''.
 				$forms = self::entry_to_forms( $entry, $singular, $raw_context, $domain );
 
-				$has_translation = false;
-				foreach ( $forms as $form ) {
-					if ( $form['translation'] !== '' ) {
-						$has_translation = true;
-						break;
-					}
-				}
-
-				if ( ! $has_translation ) {
+				if ( ! self::forms_have_translation( $forms ) ) {
 					// No translation on any form; nothing to upsert. Dominant case
 					// for a fresh PO the translator hasn't filled in, or an export
 					// that carried every source string regardless of status. Track
@@ -618,6 +645,39 @@ final class PoSync {
 					++$result['fuzzy_skipped'];
 					++$result['skipped'];
 					continue;
+				}
+
+				// Sanitized only once the entry is known to be importable, so a
+				// msgid-only or fuzzy entry is counted exactly as it is for an
+				// import without a sanitizer. A value emptied here must not reach
+				// the per-form loop's silent `continue` unreported.
+				if ( $sanitize !== null ) {
+					[ $clean_forms, $altered ] = self::sanitize_forms( $forms, $sanitize );
+
+					if ( $altered ) {
+						++$result['sanitized'];
+					}
+
+					if ( ! self::forms_have_translation( $clean_forms ) ) {
+						++$result['sanitized_empty'];
+						++$result['skipped'];
+						$result['errors'][] = sprintf(
+							/* translators: %s: PO msgid */
+							__( 'Not imported: removing HTML that is not allowed left the translation of "%s" empty.', 'perflocale' ),
+							mb_substr( $singular, 0, 60 )
+						);
+						continue;
+					}
+
+					[ $rows_not_imported, $partial_errors ] = self::report_partly_sanitized( $forms, $clean_forms, $singular, $replace );
+
+					$result['skipped'] += $rows_not_imported;
+
+					foreach ( $partial_errors as $partial_error ) {
+						$result['errors'][] = $partial_error;
+					}
+
+					$forms = $clean_forms;
 				}
 
 				foreach ( $forms as $form ) {
@@ -953,6 +1013,205 @@ final class PoSync {
 	}
 
 	/**
+	 * True when at least one row of an entry carries a translation to store.
+	 *
+	 * Extra plural forms do not count: the per-form loop writes a row only for
+	 * a non-empty `translation`, and the extra forms ride on that row.
+	 *
+	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $forms Output of {@see self::entry_to_forms()}.
+	 */
+	private static function forms_have_translation( array $forms ): bool {
+		foreach ( $forms as $form ) {
+			if ( $form['translation'] !== '' ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The result counters for a file whose importable translations a sanitizer
+	 * empties entirely, or null when the import has something to write.
+	 *
+	 * "Importable" follows the entry loop's own order: msgid-only and fuzzy
+	 * entries are counted as the loop counts them and are never sanitized.
+	 * Null is also returned when no entry is importable even before
+	 * sanitizing, so such a file behaves exactly as it does without a
+	 * sanitizer. The scan stops at the first translation that survives.
+	 *
+	 * @param \PO      $po       Parsed file.
+	 * @param callable $sanitize Import sanitizer.
+	 * @return array{total_entries: int, no_translation: int, fuzzy_skipped: int, skipped: int, sanitized: int, sanitized_empty: int}|null
+	 */
+	private static function counts_if_sanitizer_empties_file( \PO $po, callable $sanitize ): ?array {
+		$counts = [
+			'total_entries'   => 0,
+			'no_translation'  => 0,
+			'fuzzy_skipped'   => 0,
+			'skipped'         => 0,
+			'sanitized'       => 0,
+			'sanitized_empty' => 0,
+		];
+
+		foreach ( (array) $po->entries as $entry ) {
+			if ( ! $entry instanceof \Translation_Entry || (string) $entry->singular === '' ) {
+				continue;
+			}
+
+			++$counts['total_entries'];
+			++$counts['skipped'];
+
+			$raw_context = $entry->context !== null ? (string) $entry->context : '';
+			$domain      = self::extract_domain( (string) ( $entry->extracted_comments ?? '' ) );
+			$forms       = self::entry_to_forms( $entry, (string) $entry->singular, $raw_context, $domain );
+
+			if ( ! self::forms_have_translation( $forms ) ) {
+				++$counts['no_translation'];
+				continue;
+			}
+
+			if ( in_array( 'fuzzy', (array) $entry->flags, true ) ) {
+				++$counts['fuzzy_skipped'];
+				continue;
+			}
+
+			[ $clean_forms ] = self::sanitize_forms( $forms, $sanitize );
+
+			if ( self::forms_have_translation( $clean_forms ) ) {
+				return null;
+			}
+
+			++$counts['sanitized'];
+			++$counts['sanitized_empty'];
+		}
+
+		return $counts['sanitized_empty'] > 0 ? $counts : null;
+	}
+
+	/**
+	 * Describe the rows and plural forms of a partly surviving entry that the
+	 * sanitizer emptied, so the import is never read as complete.
+	 *
+	 * A row whose translation was emptied is not written at all (the per-form
+	 * loop skips an empty translation), so in merge mode whatever is stored for
+	 * it stays; for msgstr[1] that includes the plural forms riding on the row.
+	 * An emptied msgstr[2..N] is stored as an empty form in its slot.
+	 *
+	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $forms       Forms as read from the file.
+	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $clean_forms The same forms after the sanitizer.
+	 * @param string                                                                                                      $msgid       The entry's msgid, for the messages.
+	 * @param bool                                                                                                        $replace     Replace mode (nothing stored is kept).
+	 * @return array{0: int, 1: array<int, string>} Rows left unwritten (each a skip), and one message per emptied value.
+	 */
+	private static function report_partly_sanitized( array $forms, array $clean_forms, string $msgid, bool $replace ): array {
+		$name     = mb_substr( $msgid, 0, 60 );
+		$rows     = 0;
+		$messages = [];
+
+		foreach ( $forms as $i => $form ) {
+			if ( $form['translation'] === '' ) {
+				continue;
+			}
+
+			if ( $clean_forms[ $i ]['translation'] === '' ) {
+				$later_forms = isset( $form['extra_forms'] ) && [] !== array_filter( $form['extra_forms'], static fn( string $extra ): bool => $extra !== '' );
+
+				$message = $later_forms
+					? sprintf(
+						/* translators: %s: PO msgid */
+						__( 'Partly imported: removing HTML that is not allowed left msgstr[1] of "%s" empty, so msgstr[1] and the plural forms after it were not imported.', 'perflocale' ),
+						$name
+					)
+					: sprintf(
+						/* translators: 1: plural form index (0 or 1), 2: PO msgid */
+						__( 'Partly imported: removing HTML that is not allowed left msgstr[%1$d] of "%2$s" empty, so that form was not imported.', 'perflocale' ),
+						(int) $i,
+						$name
+					);
+
+				if ( ! $replace ) {
+					$message .= ' ' . __( 'Any translation already stored for it was kept.', 'perflocale' );
+				}
+
+				++$rows;
+				$messages[] = $message;
+				continue;
+			}
+
+			foreach ( $form['extra_forms'] ?? [] as $k => $extra ) {
+				if ( $extra !== '' && ( $clean_forms[ $i ]['extra_forms'][ $k ] ?? '' ) === '' ) {
+					$messages[] = sprintf(
+						/* translators: 1: plural form index (2 or higher), 2: PO msgid */
+						__( 'Partly imported: removing HTML that is not allowed left msgstr[%1$d] of "%2$s" empty, and that plural form was stored without a translation.', 'perflocale' ),
+						(int) $k + 2,
+						$name
+					);
+				}
+			}
+		}
+
+		return [ $rows, $messages ];
+	}
+
+	/**
+	 * Run an import sanitizer over every translated value of one PO entry.
+	 *
+	 * Extra plural forms keep their positions: a form emptied here stays '' in
+	 * its slot, because the forms are indexed by CLDR category and dropping one
+	 * would move every later form into the wrong category.
+	 *
+	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $forms    Output of {@see self::entry_to_forms()}.
+	 * @param callable                                                                                                    $sanitize Maps a non-empty value to the string to store.
+	 * @return array{0: array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}>, 1: bool}
+	 *         The sanitized forms, and whether any value changed.
+	 */
+	private static function sanitize_forms( array $forms, callable $sanitize ): array {
+		$altered = false;
+
+		$apply = static function ( string $value ) use ( $sanitize, &$altered ): string {
+			if ( $value === '' ) {
+				return '';
+			}
+
+			$clean = self::apply_sanitizer( $sanitize, $value );
+
+			if ( $clean !== $value ) {
+				$altered = true;
+			}
+
+			return $clean;
+		};
+
+		foreach ( $forms as $i => $form ) {
+			$forms[ $i ]['translation'] = $apply( $form['translation'] );
+
+			if ( isset( $form['extra_forms'] ) ) {
+				$forms[ $i ]['extra_forms'] = array_map( $apply, $form['extra_forms'] );
+			}
+		}
+
+		return [ $forms, $altered ];
+	}
+
+	/**
+	 * Call an import sanitizer and normalise what it returns.
+	 *
+	 * Anything that is not a scalar counts as "nothing left", so a sanitizer
+	 * that fails by returning null or an array stores nothing rather than a
+	 * value it never produced.
+	 *
+	 * @param callable $sanitize Import sanitizer.
+	 * @param string   $value    Non-empty translated value.
+	 * @return string
+	 */
+	private static function apply_sanitizer( callable $sanitize, string $value ): string {
+		$clean = $sanitize( $value );
+
+		return is_scalar( $clean ) ? (string) $clean : '';
+	}
+
+	/**
 	 * Make one imported translation SERVABLE: heal the string's group when it
 	 * cannot legally own a link, then write the `translation_links` row.
 	 *
@@ -1227,7 +1486,7 @@ final class PoSync {
 	 * @param string             $singular The entry's msgid (already stringified).
 	 * @param string             $raw_ctx  The entry's raw msgctxt.
 	 * @param string             $domain   Domain resolved from the entry comment.
-	 * @return array<int,array{original:string,context:string,translation:string}>
+	 * @return array<int,array{original:string,context:string,translation:string,extra_forms?:array<int,string>}>
 	 */
 	private static function entry_to_forms( \Translation_Entry $entry, string $singular, string $raw_ctx, string $domain ): array {
 		$plural = (string) ( $entry->plural ?? '' );

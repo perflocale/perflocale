@@ -352,6 +352,46 @@ final class AdminController {
 	}
 
 	/**
+	 * Import an uploaded PO file at the trust level of the user uploading it.
+	 *
+	 * A user without `unfiltered_html` is held to the markup rules the Strings
+	 * screen applies to their saves (see
+	 * Helper::sanitize_untrusted_string_translation()). Users with it keep a
+	 * byte-exact import.
+	 *
+	 * The decision is made here, from the current user, and passed to
+	 * PoSync::import_from_file() explicitly, so WP-CLI and other trusted callers
+	 * of that method are unaffected. The upload handler calls this after its
+	 * nonce, capability and upload checks.
+	 *
+	 * @internal
+	 *
+	 * @param string $path    Readable PO file.
+	 * @param string $lang    Target language slug.
+	 * @param bool   $replace Replace mode, as PoSync::import_from_file().
+	 * @return array{
+	 *     imported:int,
+	 *     skipped:int,
+	 *     errors:array<int,string>,
+	 *     inserted:int,
+	 *     updated:int,
+	 *     unchanged:int,
+	 *     no_translation:int,
+	 *     fuzzy_skipped:int,
+	 *     total_entries:int,
+	 *     sanitized:int,
+	 *     sanitized_empty:int,
+	 * } PoSync::import_from_file() result.
+	 */
+	public static function import_po_upload( string $path, string $lang, bool $replace ): array {
+		$sanitize = current_user_can( 'unfiltered_html' )
+			? null
+			: [ \PerfLocale\Helper::class, 'sanitize_untrusted_string_translation' ];
+
+		return \PerfLocale\Admin\PoSync::import_from_file( $path, $lang, $replace, $sanitize );
+	}
+
+	/**
 	 * `size_format()` for a byte count that has to render no matter what.
 	 *
 	 * Core's size_format() returns false for a negative input — which only a
@@ -506,10 +546,10 @@ final class AdminController {
 	 * cannot be verified — the nonce was inside the discarded body — so it is
 	 * inert by construction. It reads no value out of `$_POST` or `$_FILES`
 	 * (only whether they are empty), echoes nothing from the request, writes
-	 * no option, transient, post or row, and performs no action. The whole of
-	 * what an attacker gains by forging the signature (an over-long POST to
-	 * one of these screens, in their own browser) is a fixed sentence that
-	 * already ships in this plugin's translation files. The screen gate reads
+	 * no option, transient, post or row, and performs no action. A forged
+	 * signature (an over-long POST to one of these screens, from the sender's
+	 * own browser) yields only a fixed sentence that already ships in this
+	 * plugin's translation files. The screen gate reads
 	 * `$_GET['page']`, which survives the discard because it travels in the
 	 * URL rather than the body, and is compared, never printed.
 	 *
@@ -742,6 +782,13 @@ final class AdminController {
 
 			$replace = ( sanitize_key( $_POST['perflocale_import_mode'] ?? 'merge' ) === 'replace' );
 
+			// The import form's confirmation checkbox: the operator stating
+			// that this site is a copy of the one the file came from, so its
+			// post and term IDs mean the same thing here. Read unconditionally
+			// because the form renders it unconditionally, and carried in the
+			// job args so an async replay keeps the same answer.
+			$same_ids = ! empty( $_POST['perflocale_import_same_ids'] );
+
 			// Route through Dispatcher. Sync below the threshold (admin
 			// sees counts on the redirect); async above (admin redirects
 			// to PerfLocale → Jobs to watch progress). DataImportJob
@@ -749,8 +796,9 @@ final class AdminController {
 			$result = \PerfLocale\Background\Dispatcher::dispatch(
 				new \PerfLocale\Background\Jobs\DataImportJob(),
 				[
-					'file_path' => $persisted_path,
-					'replace'   => $replace,
+					'file_path'         => $persisted_path,
+					'replace'           => $replace,
+					'allow_foreign_ids' => $same_ids,
 				]
 			);
 
@@ -794,13 +842,33 @@ final class AdminController {
 				exit;
 			}
 
+			// Said whether or not the import also reported errors: the rows
+			// were stored either way.
+			$sanitized_note = '';
+
+			if ( (int) ( $r['sanitized'] ?? 0 ) > 0 ) {
+				$sanitized_note = ' ' . sprintf(
+					/* translators: %d: number of imported rows (string translations, languages, translated slugs) the filters changed */
+					_n(
+						'%d imported item was changed by the filters that apply to accounts without the unfiltered_html capability (disallowed markup such as scripts is removed; other values may be reformatted the way the PerfLocale screens save them).',
+						'%d imported items were changed by the filters that apply to accounts without the unfiltered_html capability (disallowed markup such as scripts is removed; other values may be reformatted the way the PerfLocale screens save them).',
+						(int) $r['sanitized'],
+						'perflocale'
+					),
+					(int) $r['sanitized']
+				);
+			}
+
+			// rawurlencode(): the message is translated text and may carry the
+			// file's own error text, and an unencoded `&`, `#` or `+` would cut
+			// or alter it in the query string.
 			if ( ! empty( $r['errors'] ) ) {
-				$msg = implode( '; ', array_slice( $r['errors'], 0, 3 ) );
-				wp_safe_redirect( add_query_arg( 'import_error', $msg, $redirect_url ) );
+				$msg = implode( '; ', array_slice( $r['errors'], 0, 3 ) ) . $sanitized_note;
+				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $msg ), $redirect_url ) );
 			} else {
 				/* translators: %1$d: imported count, %2$d: skipped count */
-				$msg = sprintf( __( 'Import complete. %1$d items imported, %2$d skipped.', 'perflocale' ), (int) ( $r['imported'] ?? 0 ), (int) ( $r['skipped'] ?? 0 ) );
-				wp_safe_redirect( add_query_arg( 'import_result', $msg, $redirect_url ) );
+				$msg = sprintf( __( 'Import complete. %1$d items imported, %2$d skipped.', 'perflocale' ), (int) ( $r['imported'] ?? 0 ), (int) ( $r['skipped'] ?? 0 ) ) . $sanitized_note;
+				wp_safe_redirect( add_query_arg( 'import_result', rawurlencode( $msg ), $redirect_url ) );
 			}
 
 			exit;
@@ -2622,7 +2690,7 @@ final class AdminController {
 				exit;
 			}
 
-			$result = \PerfLocale\Admin\PoSync::import_from_file( $tmp_path, $lang, $replace );
+			$result = self::import_po_upload( $tmp_path, $lang, $replace );
 
 			// Pass the full breakdown via a per-user transient (not URL
 			// params) so the post-import page is clean — same flash
@@ -2632,16 +2700,22 @@ final class AdminController {
 			set_transient(
 				'perflocale_po_import_result_' . get_current_user_id(),
 				[
-					'imported'       => (int) $result['imported'],
-					'skipped'        => (int) $result['skipped'],
-					'errors'         => count( $result['errors'] ),
-					'inserted'       => (int) ( $result['inserted'] ?? 0 ),
-					'updated'        => (int) ( $result['updated'] ?? 0 ),
-					'unchanged'      => (int) ( $result['unchanged'] ?? 0 ),
-					'no_translation' => (int) ( $result['no_translation'] ?? 0 ),
-					'fuzzy_skipped'  => (int) ( $result['fuzzy_skipped'] ?? 0 ),
-					'total_entries'  => (int) ( $result['total_entries'] ?? 0 ),
-					'lang'           => $lang,
+					'imported'        => (int) $result['imported'],
+					'skipped'         => (int) $result['skipped'],
+					'errors'          => count( $result['errors'] ),
+					'inserted'        => (int) $result['inserted'],
+					'updated'         => (int) $result['updated'],
+					'unchanged'       => (int) $result['unchanged'],
+					'no_translation'  => (int) $result['no_translation'],
+					'fuzzy_skipped'   => (int) $result['fuzzy_skipped'],
+					'total_entries'   => (int) $result['total_entries'],
+					'sanitized'       => (int) $result['sanitized'],
+					'sanitized_empty' => (int) $result['sanitized_empty'],
+					// The first few messages, so the notice can say WHICH
+					// entries failed or were only partly imported rather
+					// than just how many.
+					'error_messages'  => array_slice( array_map( 'strval', $result['errors'] ), 0, 3 ),
+					'lang'            => $lang,
 				],
 				MINUTE_IN_SECONDS * 5
 			);
@@ -2663,9 +2737,10 @@ final class AdminController {
 	 *      touch any other admin pageload).
 	 *   2. Nonce verifies the per-job download intent (`perflocale_export_download_<JOB_ID>`).
 	 *   3. Caller has the same capability the export-data form required
-	 *      (`manage_options`) — handlers off the Jobs page are reachable
-	 *      by lower-tier translator roles, who must not pull a full
-	 *      database export.
+	 *      (`perflocale_import_export`, as
+	 *      DataExportJob::get_required_capability() does) — handlers off
+	 *      the Jobs page are reachable by lower-tier translator roles,
+	 *      who must not pull a full database export.
 	 *   4. Job is real, type `data_export`, status `complete`, and
 	 *      stores a `path` in its result.
 	 *   5. Realpath of that file is INSIDE wp-content/uploads/perflocale/exports/.
@@ -2863,7 +2938,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Handle the "Create translation" action from the MetaBox.
+	 * Handle the "Create translation" action from the Translations panel (the
+	 * classic metabox and the panels host plugins mount on their own screens).
 	 *
 	 * @return void
 	 */
@@ -2880,8 +2956,14 @@ final class AdminController {
 			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 		}
 
-		// Check capability.
-		if ( ! current_user_can( 'edit_post', $source_id ) ) {
+		// The same two checks as the REST create route. Edit rights through the
+		// Helper, not a bare `edit_post`: a host type registered with
+		// `map_meta_cap => false` (WPForms) answers `edit_post` false for
+		// everyone, so a bare check refuses the Create link the panel shows on
+		// that host's screen. The capability comes first because the Helper
+		// lets a host widen edit rights, which must never stand in for
+		// translation rights.
+		if ( ! current_user_can( 'perflocale_translate' ) || ! \PerfLocale\Helper::user_can_edit_object( $source_id ) ) {
 			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ) );
 		}
 
@@ -2891,6 +2973,31 @@ final class AdminController {
 		$manager  = new \PerfLocale\Translation\PostTranslationManager( $cache, $settings );
 		$new_id   = false;
 
+		// A live translation in the target language is opened, never created
+		// again or re-translated by the machine-translation branch below.
+		$existing = $manager->get_translation_id( $source_id, $target_lang );
+
+		if ( $existing !== null && get_post( $existing ) ) {
+			$new_id = (int) $existing;
+		}
+
+		// Both branches below create the translation through
+		// create_translation(), which copies from the post get_copy_source_id()
+		// names, so that post is checked as well. Checked before the MT branch
+		// so a refusal spends no provider call. 0 when nothing would be
+		// created: a live translation, or an unknown language.
+		$copy_from = $manager->get_copy_source_id( $source_id, $target_lang );
+
+		if ( $copy_from > 0 && $copy_from !== $source_id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
+			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
+		}
+
+		// The new post is of the copy source's type, so that type's own create
+		// capability applies.
+		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_like( $copy_from ) ) {
+			wp_die( esc_html__( 'You do not have permission to create translations of this content.', 'perflocale' ), '', [ 'response' => 403 ] );
+		}
+
 		// Auto-translate via MT if enabled — and only for languages inside the
 		// mt_auto_translate_languages scope (empty = all). An out-of-scope
 		// language falls through to the clean-stub branch below, which is the
@@ -2899,7 +3006,31 @@ final class AdminController {
 		$auto_scope  = (array) $settings->get( 'mt_auto_translate_languages', [] );
 		$mt_in_scope = ( $auto_scope === [] || in_array( $target_lang, $auto_scope, true ) );
 
-		if ( $settings->mt_enabled() && (bool) $settings->get( 'mt_auto_translate_on_create' ) && $mt_in_scope ) {
+		// MT runs only when a translation is about to be created ($copy_from),
+		// so an unknown language spends nothing, and only when no link row
+		// exists at all: a link left pointing at a deleted post would make
+		// translate_post() translate and then fail writing to it, and
+		// create_translation() below clears that row instead. It spends
+		// provider quota, so it takes the machine-translation capability and
+		// the shared rate limit the REST route applies. It sends the source's
+		// whole post_content to the provider, so it also takes core edit_post
+		// on the source, which every machine-translation route checks before
+		// translating a post: a host type core cannot answer for (WPForms,
+		// whose post_content is the form definition as JSON) gets the copied
+		// stub instead, the same result REST create gives. admit() counts the
+		// request when it allows it, so it is asked last, only when MT would
+		// otherwise run. A refusal falls through to the stub, as a provider
+		// failure does.
+		if (
+			$copy_from > 0
+			&& $existing === null
+			&& $settings->mt_enabled()
+			&& (bool) $settings->get( 'mt_auto_translate_on_create' )
+			&& $mt_in_scope
+			&& current_user_can( 'perflocale_use_mt' )
+			&& current_user_can( 'edit_post', $source_id )
+			&& null === \PerfLocale\Translation\MtRateLimiter::admit( get_current_user_id() )
+		) {
 			try {
 				$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $cache );
 				$result     = $mt_service->translate_post( $source_id, $target_lang );
@@ -2925,7 +3056,8 @@ final class AdminController {
 			wp_die( esc_html__( 'Failed to create translation.', 'perflocale' ) );
 		}
 
-		// Redirect to the new post's edit screen.
+		// Redirect to the translation's edit screen (the new post, or the live
+		// one found above).
 		//
 		// ⚠️ The translation is ALREADY WRITTEN at this point. A post type with
 		// no editor of its own (every addon-contributed type is non-public)
@@ -2970,14 +3102,25 @@ final class AdminController {
 			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 		}
 
-		if ( ! current_user_can( 'edit_term', $source_id ) ) {
+		// Creating translations takes perflocale_translate, as it does for posts;
+		// edit rights on the term alone are not translation rights.
+		if ( ! current_user_can( 'perflocale_translate' ) || ! current_user_can( 'edit_term', $source_id ) ) {
 			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ) );
 		}
 
 		$plugin  = \PerfLocale\Plugin::get_instance();
 		$cache   = $plugin->get( 'cache' );
 		$manager = new \PerfLocale\Translation\TermTranslationManager( $cache );
-		$new_id  = $manager->create_translation( $source_id, $taxonomy, $target_lang, true );
+
+		// The new term is seeded from the term get_copy_source_id() names, so
+		// that term is checked as well.
+		$copy_from = $manager->get_copy_source_id( $source_id, $taxonomy, $target_lang );
+
+		if ( $copy_from > 0 && $copy_from !== $source_id && ! current_user_can( 'edit_term', $copy_from ) ) {
+			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
+		}
+
+		$new_id = $manager->create_translation( $source_id, $taxonomy, $target_lang, true );
 
 		if ( $new_id === false ) {
 			wp_die( esc_html__( 'Failed to create term translation.', 'perflocale' ) );

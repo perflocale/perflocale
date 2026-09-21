@@ -19,9 +19,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Manages slug translation preloading and lookups.
  *
- * The key optimization: on the_posts hook, batch-load all slug
- * translations for the fetched posts in ONE query. This eliminates
- * per-post DB queries when rendering permalinks on archive pages.
+ * The key optimization: on the_posts hook, batch-load the slug
+ * translations for the fetched posts (all but the core infrastructure
+ * types in UNBATCHED_POST_TYPES) in ONE query. This eliminates per-post
+ * DB queries when rendering permalinks on archive pages.
  */
 final class SlugManager {
 
@@ -57,6 +58,32 @@ final class SlugManager {
 	 * (blog, type) pair.
 	 */
 	private const SLUGS_CAP = 5000;
+
+	/**
+	 * Core block-theme infrastructure post types left out of the slug batch.
+	 *
+	 * Core's own lookups fetch these posts through WP_Query (the theme.json
+	 * resolver for global styles, template-part rendering, block template
+	 * lookups), and nothing on those paths builds a permalink for them, so a
+	 * batch for their IDs fills memo entries no one reads. They get no null
+	 * sentinel either: a caller that does build a URL for one falls through
+	 * get_slug() to the repository and receives the same slug the batch would
+	 * have found. The zero-state branch still seeds them, because with no slug
+	 * rows at all null is also the repository's answer.
+	 *
+	 * An explicit list on purpose. A non-viewable test would also catch
+	 * wp_navigation and wp_block, whose REST responses carry a `link` built
+	 * through the permalink filters, and the never-scoped query list is
+	 * extended per site (Oxygen adds its public ct_template); either would
+	 * drop the batch from types whose slugs are read.
+	 *
+	 * @var array<string, true>
+	 */
+	private const UNBATCHED_POST_TYPES = [
+		'wp_global_styles' => true,
+		'wp_template'      => true,
+		'wp_template_part' => true,
+	];
 
 	/**
 	 * Per-request gate snapshot for preload_slugs(): translate_slugs
@@ -99,12 +126,40 @@ final class SlugManager {
 	private ?SlugTranslationRepository $repo = null;
 
 	/**
+	 * Runs a queued term slug prime before a term slug is read.
+	 *
+	 * UrlConverter's get_terms / get_the_terms callback queues term IDs
+	 * instead of querying their slugs at once, because most term reads never
+	 * build a link. Called from get_slug() for object type 'term' on an
+	 * in-memory miss, with the term ID being read, so when that term is
+	 * queued its batch lands in L1 before the repository read. Anchored here
+	 * rather than at UrlConverter's own call sites so every caller of the
+	 * shared slug_manager service, including addons, is covered.
+	 *
+	 * @var (\Closure(int): void)|null
+	 */
+	private ?\Closure $term_slug_prime_flusher = null;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param CacheManager $cache Cache manager.
 	 */
 	public function __construct( CacheManager $cache ) {
 		$this->cache = $cache;
+	}
+
+	/**
+	 * Register the callback that runs a queued term slug prime.
+	 *
+	 * @internal Wired by UrlConverter::register_hooks(); not an extension point.
+	 *
+	 * @param \Closure $flusher Receives the ID of the term whose slug is about to be read.
+	 * @phpstan-param \Closure(int): void $flusher
+	 * @return void
+	 */
+	public function set_term_slug_prime_flusher( \Closure $flusher ): void {
+		$this->term_slug_prime_flusher = $flusher;
 	}
 
 	/**
@@ -144,12 +199,15 @@ final class SlugManager {
 	 *
 	 * This is the key performance optimization. Instead of querying
 	 * slug translations one-by-one when rendering permalinks, we
-	 * batch-load them all in a single query here.
+	 * batch-load them in a single query here.
 	 *
 	 * Members that are not WP_Post instances are ignored: WP_Query::get_posts()
 	 * runs the_posts BEFORE its array_map( 'get_post' ) normalisation
 	 * (wp-includes/class-wp-query.php), so a sparse result from an earlier
 	 * filter or a hard-delete race can hand this callback a null member.
+	 *
+	 * Posts of the core infrastructure types in UNBATCHED_POST_TYPES are left
+	 * out of the batch; every other post type, viewable or not, is batched.
 	 *
 	 * @param array<int, mixed> $posts Posts returned by WP_Query; non-WP_Post members are skipped.
 	 * @param \WP_Query         $query The WP_Query instance.
@@ -237,8 +295,10 @@ final class SlugManager {
 		$all_lang_ids = $gate['all_lang_ids'];
 		$post_ids     = [];
 
+		// Infrastructure posts are skipped, not seeded (UNBATCHED_POST_TYPES);
+		// a result made only of them returns below without a query.
 		foreach ( $posts as $p ) {
-			if ( $p instanceof \WP_Post ) {
+			if ( $p instanceof \WP_Post && ! isset( self::UNBATCHED_POST_TYPES[ $p->post_type ] ) ) {
 				$post_ids[] = (int) $p->ID;
 			}
 		}
@@ -358,6 +418,8 @@ final class SlugManager {
 	 * Get the translated slug for an object.
 	 *
 	 * Checks the in-memory cache first, then falls back to the repository.
+	 * For terms, a miss first runs any queued term slug prime covering the
+	 * term (see $term_slug_prime_flusher).
 	 *
 	 * @param string $object_type Object type.
 	 * @param int    $object_id Object ID.
@@ -375,6 +437,10 @@ final class SlugManager {
 		if ( isset( $this->slugs[ $blog_id ][ $object_type ][ $object_id ] )
 			&& array_key_exists( $language_id, $this->slugs[ $blog_id ][ $object_type ][ $object_id ] ) ) {
 			return $this->slugs[ $blog_id ][ $object_type ][ $object_id ][ $language_id ];
+		}
+
+		if ( $object_type === 'term' && $this->term_slug_prime_flusher !== null ) {
+			( $this->term_slug_prime_flusher )( $object_id );
 		}
 
 		// Fallback to repository (which uses the 3-layer cache).

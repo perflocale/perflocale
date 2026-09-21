@@ -99,9 +99,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	public function get_settings_fields(): array {
 		// No user-configurable settings — ACF field auto-detection runs
 		// unconditionally on every translatable post type, which is the
-		// expected behaviour for an integration addon. Previously this
-		// returned an `acf_auto_detect` checkbox that was declared but
-		// never actually consumed by add_acf_meta_keys() (dead UI).
+		// expected behaviour for an integration addon.
 		// Empty return means the auto-generated settings subtab won't
 		// surface this addon — there's nothing to configure.
 		return [];

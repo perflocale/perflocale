@@ -30,8 +30,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * In **merge mode** each group re-imports as a NEW row (auto-increment
  * issues a fresh id), and the matching `translation_links` skip on the
- * `(object_id, language_id)` UNIQUE constraint — so the new groups never
- * get linked to anything. The transient orphan rows are cleaned up by
+ * `object_lang (type, object_id, language_id)` UNIQUE constraint — so the
+ * new groups never get linked to anything. The transient orphan rows are
+ * cleaned up by
  * {@see self::sweep_orphan_groups()} which runs once at the end of every
  * merge-mode import, but during the import window an operator who
  * inspects `wp_perflocale_translation_groups` directly will see
@@ -45,13 +46,52 @@ if ( ! defined( 'ABSPATH' ) ) {
  *     data corruption, just brief auto-increment-id waste during the
  *     import.
  *   - Operators concerned with deterministic re-import results should
- *     use **replace mode** (the default for full-site backups).
+ *     choose **replace mode** (merge is what both the admin form and the
+ *     CLI default to).
  *   - The migration importers (WPML / Polylang / TranslatePress) already
  *     get this guarantee via `perflocale_migration_source_map`; the
  *     export/import path is the only operator-facing gap.
  *
- * Documented as a known v1 constraint in the merge-mode admin-UI
- * tooltip and in readme.txt.
+ * Documented as a known v1 constraint in the merge-mode admin-UI tooltip
+ * ({@see \PerfLocale\Admin\Pages\SettingsPage::render_export_import_tab()}).
+ *
+ * ## Numeric IDs do not travel between sites
+ *
+ * `translation_links`, `slug_translations` and `content_hashes` name a post
+ * or a term by its numeric `object_id`, and {@see self::FK_REFS} has no
+ * entry for that column because no natural key exists to resolve one site's
+ * IDs to another's. The same holds for a `type='string'` link, whose
+ * `object_id` is the exporting site's `strings.id`. Rows that name a
+ * language by `language_id` are remapped only while the bundle's own
+ * `languages` section is being imported, and only in merge mode.
+ *
+ * So a bundle carrying those rows is meaningful on the site that wrote it
+ * and on a copy of that site, and nowhere else. {@see self::import()}
+ * refuses such a bundle when the envelope's recorded address is not this
+ * site's, unless the operator confirms the copy relationship
+ * (`$options['allow_foreign_ids']`). Settings and roles name nothing by id
+ * and travel unconditionally; strings match on `original_hash` and travel
+ * too, as long as the `languages` section their `language_id` points into
+ * travels with them.
+ *
+ * In REPLACE mode the same refusal fires on a foreign bundle that merely
+ * DECLARES its sections, because {@see self::tables_to_wipe()} plans the
+ * DELETE from `sections` rather than from the rows carried: an otherwise
+ * empty file from another site would silently empty this site's tables.
+ *
+ * What the gate does NOT cover, because a language row names nothing by id
+ * and is matched by slug: a foreign bundle whose only section is
+ * `languages` imports in merge mode, and in replace mode is refused only
+ * for the wipe it declares. A CONFIRMED foreign replace that carries
+ * `languages` still re-inserts the exporting site's language ids, and the
+ * destination rows the bundle does not own keep pointing at the ids those
+ * numbers used to mean.
+ *
+ * The gate reads the sections this class owns. A section an addon shipped
+ * through `perflocale/export/sections` is dispatched to its own
+ * `perflocale/import/section/<name>` listener AFTER the gate, and nothing
+ * here inspects its payload — whether those rows survive a move to another
+ * site is the addon's question to answer.
  */
 final class DataImporter {
 
@@ -126,15 +166,51 @@ final class DataImporter {
 	/**
 	 * Import data from a JSON file.
 	 *
-	 * @param string $file_path Path to the JSON file.
-	 * @param bool   $replace Whether to replace all existing data (true) or merge (false).
-	 * @return array{imported: int, skipped: int, errors: array<int, string>}
+	 * @param string               $file_path        Path to the JSON file.
+	 * @param bool                 $replace          Whether to replace all existing data (true) or merge (false).
+	 * @param bool                 $sanitize_strings Run the text columns of three tables through
+	 *                                               the sanitizers the plugin's own writers
+	 *                                               apply for a user without `unfiltered_html`:
+	 *                                               `string_translations` values (the
+	 *                                               translation and each extra plural form)
+	 *                                               through Helper::sanitize_untrusted_string_translation();
+	 *                                               `languages` rows through
+	 *                                               LanguageRepository::sanitize_data(), with a
+	 *                                               row refused when sanitizing empties its code
+	 *                                               (the code's shape check is not applied);
+	 *                                               `slug_translations` slugs through
+	 *                                               sanitize_title() and object types through
+	 *                                               sanitize_key(), as
+	 *                                               SlugTranslationRepository::insert() does.
+	 *                                               The flag changes nothing else in the file.
+	 *                                               The caller decides: the admin import job
+	 *                                               passes true for a user without
+	 *                                               `unfiltered_html`; WP-CLI passes false
+	 *                                               and restores the file's bytes.
+	 * @param array<string, mixed> $options          Import options. One key is read:
+	 *                                               `allow_foreign_ids` — the operator has
+	 *                                               confirmed this site is a copy of the site
+	 *                                               the bundle came from, so the site-identity
+	 *                                               gate below is skipped. Read with
+	 *                                               `! empty()`: a replayed job's args come
+	 *                                               back out of JSON as `1`, `'1'` or `true`.
+	 * @return array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool}
+	 *         `sanitized` counts stored string translation, language and
+	 *         translated-slug rows that `$sanitize_strings` changed, whether
+	 *         markup was removed or a value was only reformatted.
+	 *         `refused` is present only when the site-identity gate stopped the
+	 *         import before its first write, so a caller can report a refusal
+	 *         that changed nothing as a failure rather than as a finished
+	 *         import. No other early return sets it: a replace that wiped and
+	 *         then failed every row also ends with zero imported rows, and
+	 *         re-running that is not free.
 	 */
-	public function import( string $file_path, bool $replace = false ): array {
+	public function import( string $file_path, bool $replace = false, bool $sanitize_strings = false, array $options = [] ): array {
 		$result = [
-			'imported' => 0,
-			'skipped'  => 0,
-			'errors'   => [],
+			'imported'  => 0,
+			'skipped'   => 0,
+			'errors'    => [],
+			'sanitized' => 0,
 		];
 
 		// Reset cross-table id maps so independent import() calls don't
@@ -170,6 +246,111 @@ final class DataImporter {
 		if ( ! empty( $validation ) ) {
 			$result['errors'] = $validation;
 			return $result;
+		}
+
+		// Site-identity gate. As early as the envelope allows: validate() has
+		// guaranteed a `data` array, and everything read below is an address
+		// and a set of array keys. Ahead of the data-quality scan on purpose —
+		// that scan walks every value in the file, and it never looks at
+		// `site_url`, so nothing here depends on it having run. A refusal
+		// therefore costs one address comparison rather than a full walk, which
+		// is what the async path pays on each of its retries; and it leaves
+		// settings, add-on settings, the disabled list, the role grants, the
+		// undo ledger and the replace transaction all untouched.
+		//
+		// The rows this protects name posts, terms and strings by numeric ID
+		// (see the class docblock). On a site that is not the one the bundle
+		// came from, those IDs address unrelated content, and importing them
+		// groups that content as translations of each other. There is nothing
+		// to remap them with, so the only honest outcomes are "refuse" and
+		// "the operator says this site is a copy".
+		$allow_foreign_ids = ! empty( $options['allow_foreign_ids'] );
+		$recorded_url      = $data['site_url'] ?? null;
+
+		// Three shapes, two verdicts. No address at all — the key absent, or an
+		// empty string — is the legacy envelope shape and is NOT checked. An
+		// address that is present but yields no host (a number, an array, a
+		// bare scheme, a JSON `false`) identifies nothing and so cannot be this
+		// site: it counts as a mismatch. `wp perflocale network-import` has
+		// always judged its slices that way, and both paths read the same key
+		// out of the same file.
+		$has_recorded_url = isset( $data['site_url'] ) && '' !== $data['site_url'];
+		$identity         = self::bundle_matches_this_site( $recorded_url );
+
+		if ( ! $allow_foreign_ids
+			&& ( false === $identity || ( $has_recorded_url && null === $identity ) ) ) {
+			// The normalized identity, never the envelope's raw string: the
+			// message is carried through an admin redirect and a CLI warning,
+			// and the file chooses its own bytes.
+			//
+			// Every message quotes with typographic marks. On the job path the
+			// text is escaped when it becomes an exception message and escaped
+			// again when the Jobs screen prints it, so a straight quote would
+			// reach the operator as an entity. Each one also leads with the
+			// refusal and the remedy: that screen renders only the first ~137
+			// characters beside the failed row and hides the rest behind a
+			// tooltip, so a diagnosis-first sentence would bury the fix.
+			$theirs = self::site_identity( $recorded_url );
+
+			if ( null === $theirs ) {
+				/* translators: stands in for the address recorded in the export file when the recorded value is not a readable address. */
+				$theirs = __( 'an unreadable address', 'perflocale' );
+			}
+
+			$ours = (string) ( self::site_identity( get_option( 'home' ) ) ?? self::site_identity( home_url() ) );
+
+			// Replace mode's destructive half is keyed on the DECLARED
+			// sections, not on the rows carried: tables_to_wipe() plans a
+			// DELETE for every unscoped table a declared section owns, whether
+			// or not the file holds one row for it. A foreign bundle that
+			// declares its sections and carries nothing therefore passes both
+			// row tests below and still empties this site's tables. The plan is
+			// the thing to test, and it is a pure static over the envelope, so
+			// testing it costs nothing and adds no query. Named apart from the
+			// `$wipe_plan` the replace branch builds further down: this one is
+			// reached only on a refusal, and the accept path still resolves the
+			// plan exactly once.
+			$foreign_wipe_plan = $replace ? self::tables_to_wipe( $data ) : [];
+
+			if ( [] !== $foreign_wipe_plan ) {
+				$result['errors'][] = sprintf(
+					/* translators: 1: site address recorded in the export file, 2: this site's address. The quoted phrase is the import form's checkbox label and must match it word for word. */
+					__( 'Import refused. Tick the copy-confirmation box on the import form (WP-CLI: --force) to import it anyway. This file was exported from %1$s, not this site (%2$s), and Replace mode deletes this site\'s rows for every section the file declares - including the sections it carries no rows for. Its translation links, translated slugs and content hashes name posts and terms by numeric ID, and on a site that was set up separately the same IDs belong to different content. Tick the box only when this site is a copy of %1$s and its post and term IDs still match - a staging clone, a domain migration, or a backup of this site that records a language-specific address. The box is labelled “This site is a copy of the site the file was exported from”.', 'perflocale' ),
+					$theirs,
+					$ours
+				);
+				$result['refused'] = true;
+
+				return $result;
+			}
+
+			if ( self::carries_object_ids( $data ) ) {
+				$result['errors'][] = sprintf(
+					/* translators: 1: site address recorded in the export file, 2: this site's address. The quoted phrase is the import form's checkbox label and must match it word for word. */
+					__( 'Import refused. Tick the copy-confirmation box on the import form (WP-CLI: --force) to import it anyway. This file was exported from %1$s, not this site (%2$s). Its translation links, translated slugs and content hashes name posts and terms by numeric ID, and on a site that was set up separately the same IDs belong to different content. Tick the box only when this site is a copy of %1$s and its post and term IDs still match - a staging clone, a domain migration, or a backup of this site that records a language-specific address. The box is labelled “This site is a copy of the site the file was exported from”.', 'perflocale' ),
+					$theirs,
+					$ours
+				);
+				$result['refused'] = true;
+
+				return $result;
+			}
+
+			// No object IDs, but rows that name a language by its numeric id
+			// and no `languages` section to resolve them against. Nothing maps
+			// them, so a German translation lands under whatever language holds
+			// that id here.
+			if ( self::carries_language_refs( $data ) && ! self::has_rows( $data, 'languages' ) ) {
+				$result['errors'][] = sprintf(
+					/* translators: 1: site address recorded in the export file, 2: this site's address. "Languages" names a section on the export screen which is rendered untranslated, so leave that one word in English. The quoted phrase is the import form's checkbox label and must match it word for word. */
+					__( 'Import refused. Export again from %1$s with the Languages section included, or tick the copy-confirmation box on the import form (WP-CLI: --force). This file was exported from %1$s, not this site (%2$s), and it carries no Languages section. Its translations name their language by numeric ID, and the same ID belongs to a different language here. Tick the box only when this site is a copy of %1$s, or for a backup of this site that records a language-specific address. The box is labelled “This site is a copy of the site the file was exported from”.', 'perflocale' ),
+					$theirs,
+					$ours
+				);
+				$result['refused'] = true;
+
+				return $result;
+			}
 		}
 
 		// Data-quality gate: invalid UTF-8, null bytes, cardinality bombs,
@@ -446,9 +627,10 @@ final class DataImporter {
 					// Signal both via the second arg; import_table still treats
 					// $replace==true as "preserve IDs" but now NO-OPs the wipe
 					// (we already did it).
-					$table_result        = $this->import_table( $table_name, $rows, $replace );
-					$result['imported'] += $table_result['imported'];
-					$result['skipped']  += $table_result['skipped'];
+					$table_result         = $this->import_table( $table_name, $rows, $replace, $sanitize_strings );
+					$result['imported']  += $table_result['imported'];
+					$result['skipped']   += $table_result['skipped'];
+					$result['sanitized'] += $table_result['sanitized'];
 
 					if ( ! empty( $table_result['errors'] ) ) {
 						foreach ( $table_result['errors'] as $err ) {
@@ -552,12 +734,13 @@ final class DataImporter {
 			}
 
 			// Merge mode strands groups: translation_groups have no natural
-			// key, so each re-inserts as a NEW row while its links skip on the
-			// (object_id, language_id) unique key - leaving the fresh group
-			// with nothing pointing at it. (Replace mode truncates first, so it
-			// never strands.) Run ONCE here, after the whole loop - especially
-			// after translation_links - so we never sweep freshly-imported
-			// groups before their links have landed.
+			// key, so each re-inserts as a NEW row while its links skip on
+			// the object_lang (type, object_id, language_id) unique key -
+			// leaving the fresh group with nothing pointing at it. (Replace
+			// mode truncates first, so it never strands.) Run ONCE here, after
+			// the whole loop - especially after translation_links - so we
+			// never sweep freshly-imported groups before their links have
+			// landed.
 			if ( ! $replace ) {
 				$this->sweep_orphan_groups();
 			}
@@ -697,10 +880,15 @@ final class DataImporter {
 		 * @since 1.0.0
 		 *
 		 * @param array{
-		 *     imported: int,
-		 *     skipped:  int,
-		 *     errors:   array<int,string>,
-		 * } $result The DataImporter result.
+		 *     imported:  int,
+		 *     skipped:   int,
+		 *     errors:    array<int,string>,
+		 *     sanitized: int,
+		 * } $result The DataImporter result. `sanitized` counts stored
+		 *           string translation, language and translated-slug rows
+		 *           the sanitizers changed because the import ran at the
+		 *           trust level of a user without `unfiltered_html` (always
+		 *           0 for WP-CLI).
 		 * @param string $file_path Absolute path to the imported file.
 		 * @param bool   $replace   Whether the import ran in replace mode.
 		 */
@@ -734,7 +922,10 @@ final class DataImporter {
 	 *   carrying the slice. Wiping on its behalf would delete the target's
 	 *   groups with nothing left to restore them.
 	 *
-	 * @param array<string,mixed> $data Decoded envelope.
+	 * @param array<array-key, mixed> $data Decoded envelope, exactly as
+	 *                                      json_decode() produced it — the
+	 *                                      site-identity gate resolves the
+	 *                                      plan straight off the decode.
 	 * @return array<string, string|null> Table short-name => type scope (null = whole table).
 	 */
 	private static function tables_to_wipe( array $data ): array {
@@ -799,6 +990,144 @@ final class DataImporter {
 		return isset( $carried['strings'] )
 			&& is_array( $carried['strings'] )
 			&& $carried['strings'] !== [];
+	}
+
+	/**
+	 * Does this envelope's `data` carry at least one row for a table?
+	 *
+	 * @param array<array-key, mixed> $data  Decoded envelope.
+	 * @param string                  $table Table short-name.
+	 * @return bool
+	 */
+	private static function has_rows( array $data, string $table ): bool {
+		$carried = ( isset( $data['data'] ) && is_array( $data['data'] ) ) ? $data['data'] : [];
+
+		return isset( $carried[ $table ] )
+			&& is_array( $carried[ $table ] )
+			&& $carried[ $table ] !== [];
+	}
+
+	/**
+	 * Does this envelope carry rows keyed by a post, term or string ID?
+	 *
+	 * Every `translation_links` row counts, `type='string'` included: a string
+	 * link's `object_id` is the exporting site's `strings.id`, and `strings`
+	 * is imported AFTER `translation_links` (see self::TABLES), so even a
+	 * natural key could not resolve it in time. `slug_translations` and
+	 * `content_hashes` carry the same raw `object_id`.
+	 *
+	 * The `strings` and `string_translations` sections are not listed: strings
+	 * match on `original_hash`, so they stay portable between sites.
+	 *
+	 * Pure over its argument — no DB access, no memo (the network importer
+	 * reuses one instance across switch_to_blog()).
+	 *
+	 * @param array<array-key, mixed> $data Decoded envelope.
+	 * @return bool
+	 */
+	private static function carries_object_ids( array $data ): bool {
+		return self::has_rows( $data, 'translation_links' )
+			|| self::has_rows( $data, 'slug_translations' )
+			|| self::has_rows( $data, 'content_hashes' );
+	}
+
+	/**
+	 * Does this envelope carry rows that name a language by its numeric id?
+	 *
+	 * These are the three tables FK_REFS maps a `language_id` for. The map is
+	 * consulted only for ids captured while the bundle's own `languages`
+	 * section was imported, and only in merge mode, so without that section
+	 * the exporting site's ids are written verbatim.
+	 *
+	 * @param array<array-key, mixed> $data Decoded envelope.
+	 * @return bool
+	 */
+	private static function carries_language_refs( array $data ): bool {
+		return self::has_rows( $data, 'translation_links' )
+			|| self::has_rows( $data, 'string_translations' )
+			|| self::has_rows( $data, 'slug_translations' );
+	}
+
+	/**
+	 * Does the address recorded in a bundle name THIS site?
+	 *
+	 * The COMPARISON both import paths share — the admin/job gate in
+	 * {@see self::import()} and the per-slice guard in
+	 * `wp perflocale network-import` — so neither can grow its own idea of
+	 * what "the same site" means. The null POLICY is the caller's, and each
+	 * one spells it out: null covers two different shapes, and only one of
+	 * them ("no address recorded at all") is the legacy envelope both paths
+	 * wave through.
+	 *
+	 * Scheme-agnostic, because an http → https move does not change which
+	 * site the IDs belong to. Port-sensitive, because two local installs on
+	 * the same host and different ports are different sites.
+	 *
+	 * Compared against the raw `home` option, which is what the exporter
+	 * records, AND against `home_url()`: bundles written before the exporter
+	 * stopped passing the value through the `home_url` filter carry the
+	 * filtered form, which in domain or subdomain mode is a different host.
+	 *
+	 * A matching address is not proof the IDs match — a site rebuilt at the
+	 * same address keeps the address and loses the IDs — and the value comes
+	 * from the file itself. This catches an honest mistake.
+	 *
+	 * @param mixed $site_url The envelope's `site_url` value, exactly as the
+	 *                        JSON decoder produced it.
+	 * @return bool|null True or false when the value names an address; null
+	 *                   when it is absent or has no host to compare. The
+	 *                   caller decides what null means.
+	 */
+	public static function bundle_matches_this_site( $site_url ): ?bool {
+		$theirs = self::site_identity( $site_url );
+
+		if ( null === $theirs ) {
+			return null;
+		}
+
+		foreach ( [ get_option( 'home' ), home_url() ] as $ours ) {
+			if ( $theirs === self::site_identity( $ours ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Normalize a site address down to the identity the gate compares.
+	 *
+	 * Lowercase host, the port unless it is the scheme's default, and the
+	 * path without a trailing slash. The scheme, query and fragment are
+	 * dropped.
+	 *
+	 * @param mixed $url Candidate address. Anything at all: the envelope's
+	 *                   value is whatever the file put there, and the quality
+	 *                   gate never looks at it.
+	 * @return string|null Normalized identity, or null when there is no host.
+	 */
+	private static function site_identity( $url ): ?string {
+		if ( ! is_string( $url ) || trim( $url ) === '' ) {
+			return null;
+		}
+
+		$parts = wp_parse_url( trim( $url ) );
+
+		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
+			return null;
+		}
+
+		$port = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
+
+		// A bundle that spells out the scheme's default port and a site that
+		// leaves it implicit are the same address.
+		if ( 80 === $port || 443 === $port ) {
+			$port = 0;
+		}
+
+		return strtolower( (string) $parts['host'] )
+			. ( $port > 0 ? ':' . $port : '' )
+			. untrailingslashit( (string) ( $parts['path'] ?? '' ) );
 	}
 
 	/**
@@ -1162,26 +1491,28 @@ final class DataImporter {
 	/**
 	 * Import a single table's data.
 	 *
-	 * @param string                          $table_name Short table name.
-	 * @param array<int, array<string,mixed>> $rows Row data.
-	 * @param bool                            $replace Whether to truncate first.
-	 * @return array{imported: int, skipped: int, failed: int, errors: array<int, string>}
+	 * @param string                          $table_name       Short table name.
+	 * @param array<int, array<string,mixed>> $rows             Row data.
+	 * @param bool                            $replace          Whether to truncate first.
+	 * @param bool                            $sanitize_strings See {@see self::import()}.
+	 * @return array{imported: int, skipped: int, failed: int, errors: array<int, string>, sanitized: int}
 	 *         `skipped` counts every row that did not insert; `failed` counts
 	 *         the subset that failed for a reason OTHER than a duplicate-key
 	 *         collision. The replace-mode abort gate in import() reads
 	 *         `failed` to tell a systematic insert failure from the benign
 	 *         duplicate-skips a scoped wipe leaves behind.
 	 */
-	private function import_table( string $table_name, array $rows, bool $replace ): array {
+	private function import_table( string $table_name, array $rows, bool $replace, bool $sanitize_strings = false ): array {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		global $wpdb;
 
 		$full_table = Schema::table( $table_name );
 		$result     = [
-			'imported' => 0,
-			'skipped'  => 0,
-			'failed'   => 0,
-			'errors'   => [],
+			'imported'  => 0,
+			'skipped'   => 0,
+			'failed'    => 0,
+			'errors'    => [],
+			'sanitized' => 0,
 		];
 
 		// Merge-mode is expected to see duplicate-unique-key collisions (e.g.
@@ -1216,10 +1547,16 @@ final class DataImporter {
 			$old_id = isset( $row['id'] ) ? (int) $row['id'] : 0;
 
 			// Rewrite FK columns from old parent id to the new one captured
-			// during the parent table's pass. If a parent id wasn't mapped
-			// (parent table wasn't in the export) the row keeps its export
-			// value — that's the same fragile behavior as before, but only
-			// reachable when a partial export breaks dependency order.
+			// during the parent table's pass. If a parent id wasn't mapped the
+			// row keeps its export value, which on another site means a
+			// different parent or none at all. That is reached by an ordinary
+			// operator choice: the export form lets any section be unticked,
+			// so a bundle can carry translations, strings or slugs without the
+			// `languages` section their language_id refers to. Replace mode
+			// (the `! $replace` below) never rewrites at all — it restores the
+			// export's ids by design. The site-identity gate in import()
+			// refuses such a bundle from another site unless the operator
+			// confirms this site is a copy of it.
 			if ( ! $replace && isset( self::FK_REFS[ $table_name ] ) ) {
 				foreach ( self::FK_REFS[ $table_name ] as $col => $parent_table ) {
 					if ( isset( $row[ $col ], $this->id_maps[ $parent_table ][ (int) $row[ $col ] ] ) ) {
@@ -1251,6 +1588,75 @@ final class DataImporter {
 				continue;
 			}
 
+			// Read before the sanitizer runs: the refusal below is for a code
+			// that sanitizing emptied, not for one the file left empty.
+			$had_code = $sanitize_strings && 'languages' === $table_name && is_string( $row['slug'] ?? null ) && '' !== $row['slug'];
+
+			// Sanitized after the FK rewrite and the column filter, and before
+			// the insert, so the duplicate-skip lookup below matches the bytes
+			// this row would have stored.
+			//
+			// A sanitized value is stored even when nothing is left of it, except
+			// a language code (see below). Both serving paths treat an empty
+			// translation as untranslated, and UrlConverter treats an empty
+			// translated slug as no translation, whereas skipping a string
+			// translation would leave the bundle's `translated` link with no
+			// value behind it, and a table of nothing but skipped rows would trip
+			// the replace-mode zero-insert abort in import().
+			$row_sanitized = $sanitize_strings && match ( $table_name ) {
+				'string_translations' => self::sanitize_string_translation_row( $row ),
+				'languages'           => self::sanitize_language_row( $row ),
+				'slug_translations'   => self::sanitize_slug_translation_row( $row ),
+				default               => false,
+			};
+
+			// A language code that sanitizing emptied is refused. The code is
+			// the routing key and this table's natural key; storing '' would
+			// turn a language the file names by code into one no URL can reach,
+			// which LanguageRepository::insert() refuses too. A code the file
+			// itself leaves empty is stored, as on the trusted path: update()
+			// lets a language hold '' (the Edit Language form can blank it), so
+			// a site's own export can carry one, and refusing it would roll back
+			// a replace-mode restore of that site. A code that is not a string
+			// is neither sanitized nor refused, so it fares the same on both
+			// paths: a missing code, an array or `false` reaches the column as
+			// '' (wpdb binds a non-scalar or `false` as '', and under
+			// WordPress's SQL modes MySQL fills a missing NOT NULL column with
+			// ''); a number or `true` is bound as text ('12', '1.5', '1'),
+			// which cannot carry markup; and null is sent as NULL, which the
+			// NOT NULL column rejects, so that row counts as failed and a
+			// replace-mode restore rolls back.
+			//
+			// Counted as a failure, so a replace-mode restore rolls back rather
+			// than committing without it. In merge mode the row's locale still
+			// maps its export id onto a language that already has that locale,
+			// as the duplicate-skip path below does; without one, the rows that
+			// name this language keep the export's language_id, as for any
+			// language row that does not insert.
+			if ( $had_code && '' === $row['slug'] ) {
+				++$result['skipped'];
+				++$result['failed'];
+				++$batch_count;
+
+				if ( count( $result['errors'] ) < 20 ) {
+					$result['errors'][] = sprintf(
+						/* translators: %d: the language's ID in the export file. */
+						__( 'The language with export ID %d was not imported: nothing was left of its code after removing the characters a language code cannot contain.', 'perflocale' ),
+						$old_id
+					);
+				}
+
+				if ( ! $replace && $old_id > 0 && $natural_key_lookup !== null ) {
+					$existing_id = $natural_key_lookup( $row );
+
+					if ( is_int( $existing_id ) && $existing_id > 0 ) {
+						$this->id_maps[ $table_name ][ $old_id ] = $existing_id;
+					}
+				}
+
+				continue;
+			}
+
 			// Build the format array from the COLUMN TYPE, not the value shape.
 			// Value-shape detection (ctype_digit => %d) silently corrupts string
 			// columns holding all-digit content: a leading-zero SKU/zip/EAN like
@@ -1268,6 +1674,10 @@ final class DataImporter {
 
 			if ( $inserted !== false ) {
 				++$result['imported'];
+
+				if ( $row_sanitized ) {
+					++$result['sanitized'];
+				}
 
 				// Capture parent's old→new id mapping for child table rewrites.
 				if ( ! $replace && $old_id > 0 && $this->is_parent_table( $table_name ) ) {
@@ -1328,6 +1738,137 @@ final class DataImporter {
 		$wpdb->suppress_errors( $was_suppressing );
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		return $result;
+	}
+
+	/**
+	 * Sanitize one imported `string_translations` row in place.
+	 *
+	 * `translation` goes through Helper::sanitize_untrusted_string_translation().
+	 * `extra_forms` is a JSON list of plural forms 2..N that every reader
+	 * decodes (StringTranslation::preload_translations(),
+	 * StringTranslationRepository::get_extra_forms_map()), so the check runs on
+	 * the decoded strings: each string at any depth is sanitized and the value
+	 * re-encoded, positions and empty forms intact. A value that does not
+	 * decode to an array is ignored by every reader; it is stored as NULL, the
+	 * column's "no extra forms" state, only when it contains a `<`, so no
+	 * markup is kept that a later change to a reader could expose. Anything
+	 * the sanitizer leaves unchanged keeps its original bytes.
+	 *
+	 * @param array<string, mixed> $row Row, after the unknown-column filter.
+	 * @return bool True when the row was changed.
+	 */
+	private static function sanitize_string_translation_row( array &$row ): bool {
+		$changed = false;
+
+		if ( isset( $row['translation'] ) && is_string( $row['translation'] ) ) {
+			$clean = \PerfLocale\Helper::sanitize_untrusted_string_translation( $row['translation'] );
+
+			if ( $clean !== $row['translation'] ) {
+				$row['translation'] = $clean;
+				$changed            = true;
+			}
+		}
+
+		if ( isset( $row['extra_forms'] ) && is_string( $row['extra_forms'] ) && $row['extra_forms'] !== '' ) {
+			$forms = json_decode( $row['extra_forms'], true );
+
+			if ( is_array( $forms ) ) {
+				$clean = map_deep(
+					$forms,
+					static fn( $form ) => is_string( $form ) ? \PerfLocale\Helper::sanitize_untrusted_string_translation( $form ) : $form
+				);
+
+				if ( $clean !== $forms ) {
+					$encoded            = wp_json_encode( $clean );
+					$row['extra_forms'] = is_string( $encoded ) ? $encoded : null;
+					$changed            = true;
+				}
+			} elseif ( str_contains( $row['extra_forms'], '<' ) ) {
+				$row['extra_forms'] = null;
+				$changed            = true;
+			}
+		}
+
+		return $changed;
+	}
+
+	/**
+	 * Sanitize one imported `languages` row in place.
+	 *
+	 * Runs the row's string cells through LanguageRepository::sanitize_data(),
+	 * the rules the Languages screen and the REST route store with, so each
+	 * name, format and code is sanitized exactly as those writers sanitize it.
+	 * The code's shape check (LanguageRepository::SLUG_PATTERN, which insert()
+	 * applies to every code and update() to a changed one) is not applied, so
+	 * the import can store a code insert() would refuse: a restore can carry a
+	 * code created before insert() enforced the shape, or the '' that update()
+	 * accepts. Sanitizing still limits a code to what sanitize_key() keeps.
+	 * Only string cells are passed and written back: a JSON number, boolean or
+	 * null cannot carry markup, and the numeric columns are bound as integers
+	 * anyway.
+	 *
+	 * The result can be longer than the input: an unclosed `<` becomes `&lt;`,
+	 * so a value can outgrow its column. wpdb's insert refuses such a
+	 * value before the query, in every SQL mode, and the row counts as failed:
+	 * merge mode reports it and replace mode rolls back. The Languages screen
+	 * writes through the same wpdb call and refuses the same value.
+	 *
+	 * @param array<string, mixed> $row Row, after the unknown-column filter.
+	 * @return bool True when the row was changed.
+	 */
+	private static function sanitize_language_row( array &$row ): bool {
+		$changed = false;
+
+		foreach ( \PerfLocale\Database\Repository\LanguageRepository::sanitize_data( array_filter( $row, 'is_string' ) ) as $column => $clean ) {
+			if ( is_string( $clean ) && $clean !== $row[ $column ] ) {
+				$row[ $column ] = $clean;
+				$changed        = true;
+			}
+		}
+
+		return $changed;
+	}
+
+	/**
+	 * Sanitize one imported `slug_translations` row in place.
+	 *
+	 * The same sanitizers SlugTranslationRepository::insert() applies:
+	 * sanitize_title() on the slug, which every slug writer runs, and
+	 * sanitize_key() on the object type. A stored slug becomes part of a
+	 * permalink, so it holds only what core's sanitize_title_with_dashes()
+	 * keeps: lowercase letters, digits, `%`, `_` and `-`. `object_subtype` is
+	 * left as it is, as the repository leaves it, because its readers match
+	 * the raw bytes.
+	 *
+	 * A slug that sanitizes to '' is stored; UrlConverter reads '' as no
+	 * translation. A second such row for the same language, object type and
+	 * subtype collides on the `slug_lookup` key and is skipped as a duplicate.
+	 *
+	 * @param array<string, mixed> $row Row, after the unknown-column filter.
+	 * @return bool True when the row was changed.
+	 */
+	private static function sanitize_slug_translation_row( array &$row ): bool {
+		$changed = false;
+
+		if ( isset( $row['slug'] ) && is_string( $row['slug'] ) ) {
+			$clean = sanitize_title( $row['slug'] );
+
+			if ( $clean !== $row['slug'] ) {
+				$row['slug'] = $clean;
+				$changed     = true;
+			}
+		}
+
+		if ( isset( $row['object_type'] ) && is_string( $row['object_type'] ) ) {
+			$clean = sanitize_key( $row['object_type'] );
+
+			if ( $clean !== $row['object_type'] ) {
+				$row['object_type'] = $clean;
+				$changed            = true;
+			}
+		}
+
+		return $changed;
 	}
 
 	/**

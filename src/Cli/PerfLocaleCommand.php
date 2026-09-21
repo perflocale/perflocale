@@ -1074,10 +1074,25 @@ final class PerfLocaleCommand {
 	 * [--yes]
 	 * : Skip the confirmation prompt shown in replace mode.
 	 *
+	 * [--force]
+	 * : Import a bundle whose recorded site address is not this site's. The
+	 *   translation links, translated slugs and content hashes it carries name
+	 *   posts and terms by numeric ID, so use this only when this site is a
+	 *   copy of the exporting one and those IDs still match (a staging clone, a
+	 *   domain migration), or for a backup this site itself wrote under an
+	 *   older version, which could record a language-specific address.
+	 *   Addresses compare as host, port and path with the scheme ignored. A
+	 *   file that records no address at all is not checked; one whose recorded
+	 *   address cannot be read counts as a mismatch. With `--mode=replace` a
+	 *   foreign bundle is refused for the sections it DECLARES, carrying rows
+	 *   for them or not, because replace deletes this site's rows for those
+	 *   sections first. Same meaning as `network-import --force`.
+	 *
 	 * ## EXAMPLES
 	 *
 	 * wp perflocale import /tmp/perflocale-backup.json
 	 * wp perflocale import /tmp/backup.json --mode=replace --yes
+	 * wp perflocale import /tmp/staging.json --force
 	 *
 	 * @subcommand import
 	 * @param array<int, string>    $args Positional args.
@@ -1105,7 +1120,15 @@ final class PerfLocaleCommand {
 		\WP_CLI::log( "Importing from {$file} (mode: {$mode})..." );
 
 		$importer = new \PerfLocale\Admin\DataImporter();
-		$result   = $importer->import( $file, $replace );
+		$result   = $importer->import(
+			$file,
+			$replace,
+			false,
+			// Shell access is the trust level here, so the flag is the whole
+			// confirmation: the same "this site is a copy, the IDs match"
+			// statement the admin form's checkbox makes.
+			[ 'allow_foreign_ids' => ! empty( $assoc_args['force'] ) ]
+		);
 
 		if ( ! empty( $result['errors'] ) ) {
 			foreach ( $result['errors'] as $error ) {
@@ -1261,8 +1284,14 @@ final class PerfLocaleCommand {
 					continue;
 				}
 
+				// Written from the same producer as the per-site envelope's
+				// own `site_url`, which is the value network-import actually
+				// reads back (it reaches for `$slice['export']['site_url']`).
+				// Nothing reads this outer copy; it is here so an operator
+				// reading the network file sees each slice's origin without
+				// unwrapping it, and so the two can never disagree.
 				$envelope['sites'][ (string) $site_id ] = [
-					'site_url' => home_url(),
+					'site_url' => \PerfLocale\Admin\DataExporter::site_address(),
 					'export'   => $decoded,
 				];
 				++$exported_count;
@@ -1320,6 +1349,11 @@ final class PerfLocaleCommand {
 	 *   target blog. Use only when the blog IDs are known-correct (e.g. after
 	 *   a domain migration); by default a mismatched slice is skipped because
 	 *   its translation links reference site-specific post/term IDs.
+	 *   Addresses compare as host, port and path with the scheme ignored, so an
+	 *   http-to-https move still matches while two installs that differ only by
+	 *   port do not. The target is the blog's `home` option. A file written by
+	 *   an older version from a front-end request may have recorded the address
+	 *   of whichever language was active then, and needs this flag.
 	 *
 	 * ## EXAMPLES
 	 *
@@ -1368,6 +1402,7 @@ final class PerfLocaleCommand {
 		}
 
 		$only_site      = isset( $assoc_args['site'] ) ? (string) (int) $assoc_args['site'] : '';
+		$forced         = ! empty( $assoc_args['force'] );
 		$total_imported = 0;
 		$total_errors   = 0;
 		$importer       = new \PerfLocale\Admin\DataImporter();
@@ -1399,37 +1434,49 @@ final class PerfLocaleCommand {
 			// Blog IDs are matched positionally, but they are NOT stable across
 			// networks — importing a backup taken on a DIFFERENT network can land
 			// a slice on the wrong site, whose translation_links/slug_translations
-			// then reference alien post/term IDs (corruption). Compare the slice's
-			// recorded site_url (host + path, scheme-agnostic) against the target
-			// blog's home_url(); on mismatch skip unless --force. A domain-migrated
-			// network mismatches uniformly while IDs stay valid, so --force is the
-			// operator's explicit "IDs are still correct" override.
-			$slice_url = isset( $slice['export']['site_url'] ) ? (string) $slice['export']['site_url'] : '';
+			// then reference alien post/term IDs (corruption). DataImporter owns
+			// the comparison (host + port + path, scheme-agnostic) so this guard
+			// and the one inside import() cannot drift; on mismatch skip unless
+			// --force. A domain-migrated network mismatches uniformly while IDs
+			// stay valid, so --force is the operator's explicit "IDs are still
+			// correct" override.
+			//
+			// Three cases, and the helper's null covers two of them, so they
+			// are told apart here — exactly as DataImporter::import() tells
+			// them apart for a single-site bundle, so the same file gets the
+			// same verdict from either command. No address at all (key absent,
+			// or empty) is NOT checked: every released exporter writes one, so
+			// such a slice is hand-made or ancient and the operator is on
+			// their own. An address that is present but unreadable — a number,
+			// an array, a bare scheme, a JSON `false` — is a mismatch, because
+			// nothing in it identifies the site the slice came from.
+			// Everything else is compared.
+			$slice_url = $slice['export']['site_url'] ?? null;
+			$has_url   = isset( $slice['export']['site_url'] ) && '' !== $slice['export']['site_url'];
+			$verdict   = \PerfLocale\Admin\DataImporter::bundle_matches_this_site( $slice_url );
 
-			if ( $slice_url !== '' && empty( $assoc_args['force'] ) ) {
-				$want = wp_parse_url( $slice_url );
-				$have = wp_parse_url( home_url() );
-				$norm = static function ( $u ): string {
-					return strtolower( (string) ( $u['host'] ?? '' ) ) . untrailingslashit( (string) ( $u['path'] ?? '' ) );
-				};
+			if ( ! $forced && ( false === $verdict || ( $has_url && null === $verdict ) ) ) {
+				// The slice address prints as the file recorded it, so the
+				// operator can match it against what they exported. The target
+				// prints as the value the comparison anchors on — the raw
+				// `home` option — rather than home_url(), which in a
+				// non-default language is a different address and would make
+				// a correct skip look like a bug.
+				\WP_CLI::warning(
+					sprintf(
+						'Site %1$s: export site_url (%2$s) does not match target (%3$s); skipping. Pass --force if the blog IDs are correct (e.g. after a domain migration).',
+						$source_site_id,
+						is_string( $slice_url ) ? $slice_url : '(none)',
+						\PerfLocale\Admin\DataExporter::site_address()
+					)
+				);
 
-				if ( $norm( $want ) !== $norm( $have ) ) {
-					\WP_CLI::warning(
-						sprintf(
-							'Site %1$s: export site_url (%2$s) does not match target (%3$s); skipping. Pass --force if the blog IDs are correct (e.g. after a domain migration).',
-							$source_site_id,
-							$slice_url,
-							home_url()
-						)
-					);
-
-					if ( $switched ) {
-						restore_current_blog();
-					}
-
-					++$total_errors;
-					continue;
+				if ( $switched ) {
+					restore_current_blog();
 				}
+
+				++$total_errors;
+				continue;
 			}
 
 			try {
@@ -1450,7 +1497,11 @@ final class PerfLocaleCommand {
 					continue;
 				}
 
-				$result = $importer->import( $tmp, $replace );
+				// --force carries through: the slice has already passed the
+				// identical check above, or the operator forced past it, so
+				// re-running it inside import() could only contradict the
+				// decision the operator already made.
+				$result = $importer->import( $tmp, $replace, false, [ 'allow_foreign_ids' => $forced ] );
 				wp_delete_file( $tmp );
 
 				$total_imported += (int) ( $result['imported'] ?? 0 );

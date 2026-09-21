@@ -116,7 +116,8 @@ final class BackgroundEvents {
 	}
 
 	/**
-	 * Whether at least one pending instance matches (hook, args).
+	 * Whether at least one instance matching (hook, args) is pending, or is an
+	 * Action Scheduler action in progress.
 	 *
 	 * Checks both engines so callers don't have to know which one stored
 	 * the event.
@@ -128,13 +129,16 @@ final class BackgroundEvents {
 	 * explicit array only when the exact-args instance matters.
 	 *
 	 * Deliberately NOT `next_run() !== null`. as_next_scheduled_action()
-	 * returns bool `true` for an ASYNC (run-as-soon-as-possible) action:
-	 * genuinely pending, but with no timestamp of its own. next_run() has
-	 * to discard that — its contract is a timestamp — so building this on
-	 * top of it reported "not scheduled" for every async action, and every
-	 * caller here is an idempotence or health guard. Activator::activate()
-	 * stacked a fresh resume sweep on each activation, and Site Health
-	 * reported missing events that were in fact queued.
+	 * returns bool `true`, with no timestamp, for two shapes: an action that
+	 * is IN PROGRESS right now, and a pending ASYNC (run-as-soon-as-possible)
+	 * action. See Action Scheduler's functions.php (3.9.3 / 4.0.0): the
+	 * `@return` at :344, the in-progress probe at :362-366 and the
+	 * NullSchedule branch at :378-379. next_run() has to discard that — its
+	 * contract is a timestamp — so building this on top of it would report
+	 * "not scheduled" for every running or async action, and every caller
+	 * here is an idempotence or health guard: Activator::activate() would
+	 * stack a fresh resume sweep on each activation, and Site Health would
+	 * report missing events that are in fact queued or running.
 	 *
 	 * @param string                 $hook
 	 * @param array<int, mixed>|null $args Exact args, or null for any.
@@ -143,7 +147,8 @@ final class BackgroundEvents {
 	public static function is_scheduled( string $hook, ?array $args = null ): bool {
 		$next_as = self::as_next_raw( $hook, $args );
 
-		// true = pending async action, int = pending scheduled action.
+		// true = in-progress action or pending async action, int = pending
+		// scheduled action.
 		if ( true === $next_as || is_int( $next_as ) ) {
 			return true;
 		}
@@ -159,13 +164,27 @@ final class BackgroundEvents {
 	 * Raw Action Scheduler next-run lookup for a hook.
 	 *
 	 * Action Scheduler's as_next_scheduled_action() has THREE return shapes
-	 * and callers must distinguish them: `false` (nothing pending), an int
-	 * timestamp, and bool `true` for an async action that is pending without
-	 * a timestamp. Returns false when Action Scheduler is not available.
+	 * and callers must distinguish them: `false` (nothing pending or
+	 * running), an int timestamp of a pending scheduled action, and bool
+	 * `true` with no timestamp. `true` means EITHER an action that is in
+	 * progress right now OR a pending async action; the in-progress probe
+	 * runs first, so a running match answers `true` even when a pending
+	 * instance with a timestamp also exists. See Action Scheduler's
+	 * functions.php (3.9.3 / 4.0.0): the `@return` at :344, the in-progress
+	 * probe at :362-366 and the NullSchedule branch at :378-379.
+	 *
+	 * A running RECURRING action has no pending successor to report: the
+	 * queue runner creates the next instance only after the current one
+	 * completes (ActionScheduler_Abstract_QueueRunner::process_action(),
+	 * 3.9.3: log_execution() at :102, mark_complete() at :105,
+	 * schedule_next_instance() at :118-119).
+	 *
+	 * Returns false when Action Scheduler is not available.
 	 *
 	 * @param string                 $hook Hook name.
 	 * @param array<int, mixed>|null $args Exact args, or null for any.
-	 * @return int|bool Timestamp, true for a pending async action, else false.
+	 * @return int|bool Timestamp, true for an in-progress action or a pending
+	 *                  async action, else false.
 	 */
 	private static function as_next_raw( string $hook, ?array $args ) {
 		if ( ! JobRunnerFactory::action_scheduler_available() ) {
@@ -272,20 +291,55 @@ final class BackgroundEvents {
 	 *
 	 * Returns the earlier of the AS and WP-Cron next-runs (in case both
 	 * happen to be scheduled — e.g. after an engine-setting flip), or
-	 * null when nothing is pending.
+	 * null when no match has a timestamp (see the NULL paragraph below).
 	 *
 	 * `$args = null` (the default) matches ANY args — see is_scheduled().
 	 *
 	 * NULL IS NOT "NOTHING PENDING". A pending ASYNC Action Scheduler action
-	 * has no timestamp, so it cannot be represented here and returns null.
+	 * and an Action Scheduler action that is IN PROGRESS have no timestamp,
+	 * so they cannot be represented here and return null. That includes a
+	 * recurring task in the middle of its run, whose next instance does not
+	 * exist until the run completes (see as_next_raw()).
 	 * Use is_scheduled() for "is anything pending"; use this only when you
-	 * need a time to display.
+	 * need a time to display. A display that has to tell "running" apart
+	 * from "not scheduled" uses next_run_detail(), which answers both from
+	 * the same probe.
 	 *
 	 * @param string                 $hook
 	 * @param array<int, mixed>|null $args Exact args, or null for any.
 	 * @return int|null
 	 */
 	public static function next_run( string $hook, ?array $args = null ): ?int {
+		return self::next_run_detail( $hook, $args )['next'];
+	}
+
+	/**
+	 * The next_run() result plus whether Action Scheduler reported a match it
+	 * could not put a time on.
+	 *
+	 * Both values come from the same single probe per engine that next_run()
+	 * makes, so a caller that needs to tell "running" apart from "not
+	 * scheduled" pays no extra query. Following a null next_run() with
+	 * is_scheduled() instead repeats the Action Scheduler probe on exactly
+	 * the rows that have no timestamp.
+	 *
+	 * `untimed` is true when as_next_scheduled_action() answered bool `true`:
+	 * an action that is in progress, or a pending async action (see
+	 * as_next_raw()). It can be true while the engine is forced to WP-Cron,
+	 * because the Action Scheduler probe runs whenever Action Scheduler is
+	 * available, whichever engine is selected. It is always false when
+	 * Action Scheduler is not available.
+	 *
+	 * @internal Display helper for the Jobs screen's scheduled-tasks panel.
+	 *           Despite being public-static, it is NOT part of the @api
+	 *           surface; its shape may change between minor releases.
+	 *
+	 * @param string                 $hook Hook name.
+	 * @param array<int, mixed>|null $args Exact args, or null for any.
+	 * @return array{next: int|null, untimed: bool} `next` is exactly what
+	 *                                              next_run() returns.
+	 */
+	public static function next_run_detail( string $hook, ?array $args = null ): array {
 		$next_as = self::as_next_raw( $hook, $args );
 
 		$next_wp = null === $args
@@ -297,10 +351,15 @@ final class BackgroundEvents {
 				is_int( $next_as ) ? $next_as : null,
 				is_int( $next_wp ) ? $next_wp : null,
 			],
-			static fn( $v ) => $v !== null
+			static function ( $v ) {
+				return null !== $v;
+			}
 		);
 
-			return $candidates ? min( $candidates ) : null;
+		return [
+			'next'    => $candidates ? min( $candidates ) : null,
+			'untimed' => true === $next_as,
+		];
 	}
 
 	/**

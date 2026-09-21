@@ -1879,8 +1879,8 @@ final class SiteHealth {
 			'libxml'    => __( 'XLIFF import', 'perflocale' ),
 			'xmlwriter' => __( 'XLIFF export', 'perflocale' ),
 			'simplexml' => __( 'XML sitemaps (WordPress core needs this one too)', 'perflocale' ),
-			// NOT "machine translation and webhooks": those address checks moved to
-			// native IP predicates in 1.0.2 and no longer call filter_var() at all.
+			// NOT "machine translation and webhooks": those address checks use
+			// native IP predicates and do not call filter_var() at all.
 			// The single remaining use is Helper::is_valid_url(), which already has a
 			// hand-rolled fallback, so the honest description is the narrow one.
 			'filter'    => __( 'stricter URL syntax validation when adding a webhook (a simpler built-in check is used without it)', 'perflocale' ),
@@ -3850,14 +3850,11 @@ final class SiteHealth {
 		 * not be able to turn a real exposure green, only to stop testing for
 		 * it. Verify the rule yourself if you turn this off.
 		 *
-		 * That last sentence used to be untrue of the code beneath it. Every
-		 * "could not be checked" outcome returned `good`, and WordPress files
-		 * every `good` result inside the "Passed tests" accordion, which ships
-		 * collapsed. So on precisely the hosts where the exposure is most likely
-		 * real — loopback blocked, no deny rule, nobody watching — the owner saw
-		 * a clean panel. All five unverified branches now return `recommended`:
-		 * a security control whose state could not be determined is not a passed
-		 * test. Only a measured refusal returns `good`.
+		 * Every outcome the probe could not verify returns `recommended`, never
+		 * `good`: WordPress files `good` results in the collapsed "Passed tests"
+		 * accordion, and a security control whose state could not be determined
+		 * is not a passed test. Only a measured refusal, or a site with no
+		 * export directory yet, returns `good`.
 		 *
 		 * @hook perflocale/site_health/probe_export_exposure Set false to skip the active export-exposure probe.
 		 * @param bool $probe Whether to write the canary and make the request. Default true.

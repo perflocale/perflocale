@@ -22,15 +22,15 @@ if ( ! defined( 'ABSPATH' ) ) {
  * canonical and the two MUST agree. Removing any case is a schema-level
  * change: existing rows may carry that value.
  *
- * Usage map (audited 2026-05-30):
+ * Usage map:
  *   - Published, Empty, NeedsUpdate — referenced via enum AND raw strings
  *     throughout the codebase (active hot paths).
- *   - Draft        — referenced via raw `'draft'` SQL literals (5 sites);
- *                    no direct enum reference yet. The case stays so the
- *                    enum remains the canonical schema definition and
- *                    future code paths can swap to type-safe access.
- *   - Pending      — same shape as Draft (1 raw-string reference).
- *                    Review state — populated when an editor sends a
+ *   - Draft        — referenced via the enum in the Polylang/WPML
+ *                    importers and via raw `'draft'` string literals
+ *                    elsewhere.
+ *   - Pending      — referenced via raw `'pending'` literals only; the
+ *                    case stays so the enum remains the canonical schema
+ *                    definition. Review state — populated when an editor sends a
  *                    translation to review without publishing.
  *
  * Both Draft and Pending have full match() arms in label()/color() below
@@ -40,8 +40,8 @@ enum TranslationStatus: string {
 
 	/**
 	 * Translator is still working on it — `wp_posts.post_status='draft'`
-	 * is the typical paired post status. Referenced from raw `'draft'`
-	 * SQL literals in PostTranslationManager + import paths.
+	 * is the typical paired post status. Referenced via the enum in the
+	 * importers and via raw `'draft'` string literals elsewhere.
 	 */
 	case Draft = 'draft';
 

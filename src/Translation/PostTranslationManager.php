@@ -49,6 +49,35 @@ final class PostTranslationManager {
 	private const LANG_CACHE_CAP = 5000;
 
 	/**
+	 * Seconds a process may sleep, in total, waiting for creation locks other
+	 * processes hold (post and term creates together). The cap is on time
+	 * slept, not wall time: the lock reads and lock attempts between sleeps
+	 * add their own query time on top.
+	 */
+	private const CREATE_LOCK_WAIT_SECONDS = 5.0;
+
+	/**
+	 * Seconds a creation lock may read free while it still cannot be taken
+	 * before the wait gives up on it.
+	 */
+	private const CREATE_LOCK_REFUSED_SECONDS = 1.5;
+
+	/**
+	 * Creation locks (post and term) held by this process right now, keyed
+	 * "{blog_id}:{lock name}".
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $creation_locks_held = [];
+
+	/**
+	 * What is left of this process's CREATE_LOCK_WAIT_SECONDS.
+	 *
+	 * @var float
+	 */
+	private static float $create_wait_left = self::CREATE_LOCK_WAIT_SECONDS;
+
+	/**
 	 * Filter context for `wp_unique_post_slug`.
 	 *
 	 * Set to the target language slug while create_translation() is running
@@ -140,6 +169,9 @@ final class PostTranslationManager {
 	 * Always resolves the default-language post as the content source,
 	 * then copies content, meta, featured image, and taxonomy terms.
 	 *
+	 * Applies no user policy. A caller acting for a user must also authorize
+	 * the post {@see self::get_copy_source_id()} returns.
+	 *
 	 * @param int        $source_id Source post ID (any language in the group).
 	 * @param string     $target_slug Target language slug.
 	 * @param bool       $copy_content Whether to copy content from source.
@@ -148,9 +180,22 @@ final class PostTranslationManager {
 	 *     REST / CLI manual-translate flows pass nothing. Bulk-MT,
 	 *     auto-translate-on-save, and the abilities API pass a more
 	 *     specific value.
-	 * @return int|false New post ID or false on failure.
+	 * @param bool|null  $created Set to true when this call inserted the
+	 *     translation it returns, false otherwise. A translation this call did
+	 *     not create can be another author's, and the caller's own earlier
+	 *     reads may not have shown it: a caller that writes into the returned
+	 *     post must check this first.
+	 * @return int|false Post ID of the translation: newly created, or one
+	 *     already linked in the target language, which may be another
+	 *     process's. False on failure. Also false when another process holds
+	 *     the creation lock and this call gets no answer: the lock was still
+	 *     held when the wait budget ran out, or read free but could not be
+	 *     taken; or this call did not wait (this process already holds a
+	 *     creation lock, or has spent its wait budget) and this process knows
+	 *     of no linked translation.
 	 */
-	public function create_translation( int $source_id, string $target_slug, bool $copy_content = false, SourceType $source = SourceType::Manual ): int|false {
+	public function create_translation( int $source_id, string $target_slug, bool $copy_content = false, SourceType $source = SourceType::Manual, ?bool &$created = null ): int|false {
+		$created     = false;
 		$source_post = get_post( $source_id );
 
 		// Auto-drafts are unsaved editor placeholders; cloning one links an
@@ -174,11 +219,11 @@ final class PostTranslationManager {
 		}
 
 		// Per-(source_id, target_slug) lock so two concurrent callers that both
-		// pass the existing-check can't both reach wp_insert_post() and orphan
-		// a post. The UNIQUE (group_id, language_id) catches the duplicate link
-		// only after both posts are written, forcing a racy rollback delete;
-		// serialising here closes the window. Key is narrow: other posts /
-		// other target languages never contend.
+		// pass the existing-check can't both reach wp_insert_post(). No unique
+		// key stops the second insert: link_object() deletes the language's
+		// current link before writing its own, so the later post would take
+		// the language's slot and leave the earlier translation unlinked. Key
+		// is narrow: other posts / other target languages never contend.
 		/**
 		 * @hook perflocale/translation/create_lock_ttl
 		 *
@@ -193,47 +238,161 @@ final class PostTranslationManager {
 		 */
 		$lock_ttl = max( 5, (int) apply_filters( 'perflocale/translation/create_lock_ttl', 60 ) );
 
-		$result = \PerfLocale\Concurrency\Lock::with(
+		return self::create_under_lock(
 			'create_xlat_post_' . $source_id . '_' . $target_slug,
 			$lock_ttl,
-			function () use ( $source_id, $target_slug, $copy_content, $source ): int|false {
-				return $this->do_create_translation( $source_id, $target_slug, $copy_content, $source );
+			function () use ( $source_id, $target_slug, $target_lang, $copy_content, $source, &$created ): int|false {
+				return $this->do_create_translation( $source_id, $target_slug, $target_lang, $copy_content, $source, $created );
+			},
+			function () use ( $source_id, $target_slug ): int|false {
+				$existing_after = $this->get_translation_id( $source_id, $target_slug );
+
+				return $existing_after !== null && get_post( $existing_after ) ? $existing_after : false;
 			}
 		);
+	}
+
+	/**
+	 * Run a translation create under its creation lock, waiting a bounded time
+	 * when another process holds the lock.
+	 *
+	 * The other process's link row is written before it copies meta, the
+	 * featured image and terms (or, for a term, records display slugs), so a
+	 * link appearing does not mean it has finished. The wait is for the lock
+	 * itself; the create then runs under it, and its existence check, which
+	 * reads the database, returns that process's translation when it landed
+	 * and creates one when that process failed.
+	 *
+	 * @internal Shared with TermTranslationManager: a post create copies terms,
+	 *     so both kinds of create draw on one wait budget and one record of the
+	 *     creation locks this process holds.
+	 *
+	 * @param string   $lock_name Creation lock name.
+	 * @param int      $lock_ttl  Lock TTL in seconds.
+	 * @param callable $create    Critical section: the translation ID or false.
+	 * @param callable $fallback  The answer when the create cannot wait for the
+	 *                            lock: what this process already knows.
+	 * @phpstan-param callable(): (int|false) $create
+	 * @phpstan-param callable(): (int|false) $fallback
+	 * @return int|false
+	 */
+	public static function create_under_lock( string $lock_name, int $lock_ttl, callable $create, callable $fallback ): int|false {
+		$held_key = get_current_blog_id() . ':' . $lock_name;
+
+		$run = static function () use ( $create, $held_key ): int|false {
+			self::$creation_locks_held[ $held_key ] = true;
+
+			try {
+				return $create();
+			} finally {
+				unset( self::$creation_locks_held[ $held_key ] );
+			}
+		};
+
+		$result = \PerfLocale\Concurrency\Lock::with( $lock_name, $lock_ttl, $run );
 
 		if ( $result !== null ) {
-			return $result;
+			return is_int( $result ) ? $result : false;
 		}
 
-		// Lost the lock race — a sibling request is creating the same
-		// translation right now. Defer to whatever it produces: re-check
-		// existence and return the sibling translation if it landed,
-		// otherwise return false so the caller can retry.
-		$existing_after = $this->get_translation_id( $source_id, $target_slug );
-		if ( $existing_after !== null && get_post( $existing_after ) ) {
-			return $existing_after;
+		// No wait while this process holds a creation lock. If the lock it
+		// failed to take is its own (a hook inside the critical section asked
+		// for the same translation), nothing else will release it. If it holds
+		// another one (a post create copying terms), every second waited keeps
+		// that lock a second longer, and a lock held past its TTL can be taken
+		// over while its create is still running. Nor once the process has
+		// spent its wait budget.
+		if ( self::$creation_locks_held !== [] || self::$create_wait_left <= 0.0 ) {
+			return $fallback();
 		}
 
-		return false;
+		return self::create_after_lock_wait( $lock_name, $lock_ttl, $run );
+	}
+
+	/**
+	 * Wait for a creation lock held by another process, then run the create
+	 * under it.
+	 *
+	 * Each poll reads the lock row and, when the row reads free, tries to take
+	 * the lock. The delay between polls doubles up to a cap. The time slept
+	 * comes out of the budget the whole process shares, not the lock's TTL: a
+	 * holder that died costs the process at most CREATE_LOCK_WAIT_SECONDS of
+	 * sleep, however many creates it runs (a publish creating stubs in every
+	 * language, a bulk run). The polls' own query time is not counted, so the
+	 * wall time spent waiting can be longer on a slow database.
+	 *
+	 * @param string   $lock_name Lock name.
+	 * @param int      $lock_ttl  Lock TTL in seconds.
+	 * @param callable $run       The critical section passed to Lock::with().
+	 * @phpstan-param callable(): (int|false) $run
+	 * @return int|false The critical section's result; false when the lock was
+	 *                   not taken before the budget ran out, or when it read
+	 *                   free but could not be taken for
+	 *                   CREATE_LOCK_REFUSED_SECONDS.
+	 */
+	private static function create_after_lock_wait( string $lock_name, int $lock_ttl, callable $run ): int|false {
+		$delay   = 0.02;
+		$refused = 0.0;
+
+		while ( true ) {
+			$free = 0 === \PerfLocale\Concurrency\Lock::seconds_remaining( $lock_name );
+
+			if ( $free ) {
+				$result = \PerfLocale\Concurrency\Lock::with( $lock_name, $lock_ttl, $run );
+
+				if ( $result !== null ) {
+					return is_int( $result ) ? $result : false;
+				}
+
+				// The row reads free, yet the lock was not taken. For up to a
+				// second that is the lock's expiry second, or another process
+				// taking the lock first (the next poll then reads it held).
+				// Longer, the lock cannot be taken at all: a row Lock cannot
+				// parse, which only the daily reaper removes, or a failing write.
+				if ( $refused >= self::CREATE_LOCK_REFUSED_SECONDS ) {
+					return false;
+				}
+			} else {
+				$refused = 0.0;
+			}
+
+			if ( self::$create_wait_left <= 0.0 ) {
+				return false;
+			}
+
+			$sleep                   = min( $delay, self::$create_wait_left );
+			self::$create_wait_left -= $sleep;
+
+			if ( $free ) {
+				$refused += $sleep;
+			}
+
+			usleep( (int) round( $sleep * 1000000 ) );
+			$delay = min( $delay * 2, 0.2 );
+		}
 	}
 
 	/**
 	 * Actual create_translation() body, executed under the
 	 * per-(source_id, target_slug) lock acquired by the public wrapper.
 	 *
-	 * Re-checks existence inside the lock (closes the TOCTOU between
-	 * the public method's fast-path check and lock acquisition) before
-	 * doing any wp_insert_post() / linking work.
+	 * Re-checks existence inside the lock, against the database, before doing
+	 * any wp_insert_post() / linking work.
 	 *
 	 * @param int        $source_id    Source post ID.
 	 * @param string     $target_slug  Target language slug.
+	 * @param object     $target_lang  Target language row (resolved by the caller).
 	 * @param bool       $copy_content Whether to copy source content.
 	 * @param SourceType $source       Provenance tag.
-	 * @return int|false New post ID, existing post ID if a sibling worker
-	 *                   created it between the public-method check and lock
-	 *                   acquisition, or false on failure.
+	 * @param bool       $inserted     Set to true once a new post is inserted
+	 *                                 and linked.
+	 * @return int|false New post ID; the ID of a live post already linked in
+	 *                   the target language, which another process may have
+	 *                   created after this process last read the group; or
+	 *                   false on failure, including no answer from the
+	 *                   existence query.
 	 */
-	private function do_create_translation( int $source_id, string $target_slug, bool $copy_content, SourceType $source ): int|false {
+	private function do_create_translation( int $source_id, string $target_slug, object $target_lang, bool $copy_content, SourceType $source, bool &$inserted ): int|false {
 		// ⭐ A TEMPLATE TRANSLATION ALWAYS STARTS FROM THE SOURCE'S BLOCKS.
 		//
 		// For a post, starting empty is a defensible default: the translator
@@ -265,14 +424,33 @@ final class PostTranslationManager {
 			}
 		}
 
-		// Re-check existing INSIDE the lock. A sibling worker can have
-		// created the same translation between the public method's
-		// fast-path check and us reaching here; if so, return that
-		// post's ID instead of inserting a duplicate.
-		$existing = $this->get_translation_id( $source_id, $target_slug );
+		// Re-check existing INSIDE the lock, and read the database to do it.
+		// get_translation_id() answers from this process's memo, filled before
+		// the lock was taken - by the public method's fast path, or much
+		// earlier by a batch that primed it - and blind to a translation
+		// another process has linked since. Inserting on that answer would
+		// make a second post, and linking it would take the language's slot
+		// from the other translation. No answer from the database returns false
+		// for the same reason: inserting on an unknown answer risks that
+		// duplicate.
+		$linked = $this->groups->find_translation_link_uncached( $source_id, ObjectType::Post, (int) $target_lang->id );
 
-		if ( $existing !== null ) {
+		if ( $linked === false ) {
+			return false;
+		}
+
+		if ( $linked !== null ) {
+			$existing = $linked['object_id'];
+
 			if ( get_post( $existing ) ) {
+				// Later reads in this process, the caller's follow-up save of
+				// the returned post among them, must not answer from the view
+				// that missed it.
+				if ( $this->get_translation_id( $source_id, $target_slug ) !== $existing ) {
+					$this->groups->forget_stale_group( $linked['group_id'], ObjectType::Post );
+					self::forget_post_language( $existing );
+				}
+
 				return $existing;
 			}
 
@@ -385,6 +563,8 @@ final class PostTranslationManager {
 			return false;
 		}
 
+		$inserted = true;
+
 		// Flush the source object's translation cache so get_translations()
 		// returns the updated list immediately (not stale for up to 1 hour).
 		$source_group = $this->groups->find_for_object( $source_id, ObjectType::Post );
@@ -467,10 +647,54 @@ final class PostTranslationManager {
 	}
 
 	/**
+	 * The post create_translation() would copy from, for a caller to authorize.
+	 *
+	 * Mirrors create_translation()'s own decisions so the post a caller checks
+	 * is the post that gets copied: 0 when nothing would be copied (the source
+	 * is missing or an auto-draft, the target language is unknown, or a live
+	 * translation already exists and would simply be returned), otherwise the
+	 * resolved content source — the default-language member of the group, or
+	 * `$source_id` itself. A link whose post is gone does not count as an
+	 * existing translation, exactly as in create_translation(), which unlinks
+	 * it and creates a fresh copy.
+	 *
+	 * Side-effect free, and reads the same cached group map as
+	 * create_translation(), so both resolve the same content source unless
+	 * that map is refreshed between the two calls. It carries no user policy:
+	 * callers acting for a user apply their own check to the returned id.
+	 *
+	 * @param int    $source_id   Post ID the caller was given.
+	 * @param string $target_slug Target language slug.
+	 * @return int Post ID that would be copied, or 0 when nothing would be.
+	 */
+	public function get_copy_source_id( int $source_id, string $target_slug ): int {
+		$source_post = get_post( $source_id );
+
+		if ( ! $source_post || 'auto-draft' === $source_post->post_status ) {
+			return 0;
+		}
+
+		if ( ! $this->languages->find_by_slug( $target_slug ) ) {
+			return 0;
+		}
+
+		$existing = $this->get_translation_id( $source_id, $target_slug );
+
+		if ( $existing !== null && get_post( $existing ) ) {
+			return 0;
+		}
+
+		$content_source = $this->resolve_source_post( $source_id );
+
+		return $content_source instanceof \WP_Post ? (int) $content_source->ID : 0;
+	}
+
+	/**
 	 * Resolve the default-language post as the content source.
 	 *
 	 * When creating a translation from a non-default language post,
 	 * this ensures content always comes from the default language (source of truth).
+	 * The default-language post is used whatever its status, trash included.
 	 *
 	 * @param int $source_id Any post ID in the translation group.
 	 * @return \WP_Post|null The default-language post, the source post as
@@ -577,16 +801,11 @@ final class PostTranslationManager {
 			}
 
 			foreach ( $values as $value ) {
-				// allowed_classes=false neutralises PHP-object-injection
-				// payloads (POP gadgets) in attacker-controllable post_meta
-				// before they're copied into the target post. Lower-privileged
-				// users who can edit the source post can stash serialised
-				// objects via meta_input/update_post_meta; without this guard,
-				// the translator (typically a higher-privileged role)
-				// triggering the copy would unserialise them. Matches the
-				// PolylangImporter mitigation pattern already in place. The
-				// @ suppresses the unsupported-class notice that the
-				// allowed_classes option itself neutralises.
+				// Restricted allowed_classes: post meta is user-written data,
+				// so no class with unserialize side effects is instantiated
+				// while it is copied into the target post. Same pattern as
+				// PolylangImporter. The @ suppresses the unsupported-class
+				// notice that the allowed_classes option itself neutralises.
 				if ( is_string( $value ) && is_serialized( $value ) ) {
 					// Allow ONLY stdClass: it has no __wakeup/__destruct so it
 					// can't be a POP gadget (the object-injection risk that

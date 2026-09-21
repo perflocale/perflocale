@@ -69,6 +69,20 @@ final class UrlConverter {
 	private const MAX_CACHE_ENTRIES = 500;
 
 	/**
+	 * Cap on each blog's queue of term IDs awaiting a slug prime.
+	 *
+	 * Queueing past it runs that blog's queued prime first. The bound is per
+	 * blog, not across blogs: a long-running process (WP-CLI, queue runners)
+	 * that reads terms on several blogs without building links keeps up to
+	 * this many IDs for each blog it visited. It also keeps each batch's IN
+	 * list and L1 writes within what a single preload_term_languages() call
+	 * may issue. Both hold only while that method's per-call guard on the
+	 * count of missing IDs admits no more than this cap, because the IDs of
+	 * the call that triggered the prime are queued after it.
+	 */
+	private const MAX_PENDING_TERM_SLUG_IDS = 500;
+
+	/**
 	 * Default language query variable for query-parameter URL mode.
 	 */
 	public const DEFAULT_QUERY_VAR = 'lang';
@@ -315,6 +329,29 @@ final class UrlConverter {
 	 * @var array<string, object|null>
 	 */
 	private static array $object_language_cache = [];
+
+	/**
+	 * Term IDs whose slug prime is queued, keyed by blog ID, then term ID.
+	 *
+	 * The term prime in preload_term_languages() queues here instead of
+	 * querying slugs, because most term reads (WooCommerce product data,
+	 * block-template lookups) never build a link. The SELECT runs when
+	 * SlugManager::get_slug() reads the slug of a queued term
+	 * (flush_pending_term_slug_prime()), or sooner when queueing would take
+	 * the blog's queue past MAX_PENDING_TERM_SLUG_IDS.
+	 *
+	 * Keyed by blog: the prime reads the current blog's slug table and
+	 * languages, and term IDs repeat across blogs, so each blog flushes only
+	 * its own IDs. Deliberately NOT cleared by reset_static_caches(), which
+	 * runs on switch_blog, language CRUD and the order-email language
+	 * override: the queue holds only term IDs, and the prime reads the
+	 * active languages when it runs, so nothing in it goes stale there,
+	 * while dropping queued IDs would send their slug reads to the per-key
+	 * path, which costs more than the batch.
+	 *
+	 * @var array<int, array<int, true>>
+	 */
+	private static array $pending_term_slug_ids = [];
 
 	/**
 	 * Per-request memoization for filter_home_url().
@@ -594,6 +631,12 @@ final class UrlConverter {
 		// costing its own translation lookup without this batch prime.
 		add_filter( 'get_terms', [ $this, 'preload_term_languages' ], 5 );
 		add_filter( 'get_the_terms', [ $this, 'preload_term_languages' ], 5 );
+
+		// The slug half of that prime is queued rather than run; SlugManager
+		// runs the queue when a queued term's slug is first read.
+		$this->slug_manager->set_term_slug_prime_flusher(
+			fn( int $term_id ) => $this->flush_pending_term_slug_prime( $term_id )
+		);
 
 		// oEmbed of a translated post URL 404s: WP's oEmbed controller resolves
 		// the URL via url_to_postid(), whose internal query is language-scoped
@@ -2399,7 +2442,7 @@ final class UrlConverter {
 			// source menu's items and then watch the translated menu render,
 			// turning one batched query into one lookup per menu item on exactly
 			// the pages that use the feature. The translator memoises, so asking
-			// twice costs nothing.
+			// twice costs no query.
 			$plugin = \PerfLocale\Plugin::get_instance();
 
 			if ( $plugin->has( 'block_ref_translator' ) ) {
@@ -2602,7 +2645,8 @@ final class UrlConverter {
 	 * Prime slug translations for a batch of object IDs across every active
 	 * language with null-sentinels for untranslated pairs. Extracted from
 	 * prime_menu_post_ids so it can be reused independently of the
-	 * translation-link prime; the term leg is fed by preload_term_languages.
+	 * translation-link prime; the term leg runs the queue that
+	 * preload_term_languages() fills (prime_pending_term_slugs()).
 	 *
 	 * @param array<int, int> $object_ids Object IDs to prime.
 	 * @param string          $object_type Object type ('post' or 'term').
@@ -2772,6 +2816,10 @@ final class UrlConverter {
 	 * Woo product-category lists) pays its own get_translations() lookup
 	 * inside filter_term_link — a JOIN each on no-object-cache sites.
 	 *
+	 * Translations and languages are primed here. The terms' slug prime is
+	 * only queued (queue_term_slug_prime()) and runs when one of their slugs
+	 * is read.
+	 *
 	 * Hooked to `get_terms` and `get_the_terms`; tolerant of both signatures
 	 * (terms may be WP_Term objects, ids, or other field shapes — anything
 	 * non-batchable passes through untouched).
@@ -2835,17 +2883,23 @@ final class UrlConverter {
 
 		// Terms get the same multi-language slug prime posts have: without
 		// it, every unique rendered term link on a translate-slugs site pays
-		// its own per-(term,language) L3 transient read inside
-		// SlugManager::get_slug. Gated like SlugManager::preload_slugs, which
-		// also bails on is_admin(): is_admin() requests still run
-		// filter_term_link, so their term links resolve one (term, language)
-		// at a time through SlugManager::get_slug (in-memory memo, then the
-		// repository's cached read). Both gate reads are memoized (url_config
-		// + the repo's has_any_slugs verdict).
+		// its own per-(term, language) repository read inside
+		// SlugManager::get_slug. The prime is queued, not run here: a
+		// listing reads terms for every item (WooCommerce product data,
+		// template-part lookups) while building few or no term links, and
+		// on a warm persistent cache each of those reads would otherwise
+		// issue its own SELECT for slugs nothing reads. The queue runs, as
+		// one SELECT, when get_slug() reads a queued term.
+		// Gated like SlugManager::preload_slugs, which also bails on
+		// is_admin(): is_admin() requests still run filter_term_link, so
+		// their term links resolve one (term, language) at a time through
+		// SlugManager::get_slug (in-memory memo, then the repository's cached
+		// read). Both gate reads are memoized (url_config + the repo's
+		// has_any_slugs verdict).
 		if ( ! is_admin()
 			&& $this->url_config()['translate_slugs']
 			&& $this->slug_manager->has_any_slugs() ) {
-			$this->prime_slug_translations_multilang( $missing, 'term' );
+			$this->queue_term_slug_prime( $missing );
 		}
 
 		$current = $this->router->get_current_language();
@@ -2868,6 +2922,78 @@ final class UrlConverter {
 		}
 
 		return $terms;
+	}
+
+	/**
+	 * Queue term IDs for the current blog's deferred slug prime.
+	 *
+	 * The queue is a keyed set, so repeated IDs (a term seen by several
+	 * get_the_terms calls, or re-queued after an object_language_cache
+	 * eviction) are stored once. When adding new IDs would take the queue
+	 * past MAX_PENDING_TERM_SLUG_IDS, the queued prime runs first.
+	 *
+	 * IDs queued from inside that prime's SELECT (a `query` filter that reads
+	 * terms) are replaced by this call's IDs rather than kept: their slug
+	 * reads take the per-key path, with the same values, and the queue stays
+	 * within the cap.
+	 *
+	 * @param array<int, int> $term_ids Term IDs, duplicates allowed.
+	 * @return void
+	 */
+	private function queue_term_slug_prime( array $term_ids ): void {
+		$blog_id = (int) get_current_blog_id();
+		$queued  = self::$pending_term_slug_ids[ $blog_id ] ?? [];
+		$fresh   = array_diff_key( array_fill_keys( $term_ids, true ), $queued );
+
+		if ( $fresh === [] ) {
+			return;
+		}
+
+		if ( count( $queued ) + count( $fresh ) > self::MAX_PENDING_TERM_SLUG_IDS ) {
+			$this->prime_pending_term_slugs( $blog_id );
+			$queued = [];
+		}
+
+		self::$pending_term_slug_ids[ $blog_id ] = $queued + $fresh;
+	}
+
+	/**
+	 * Run the current blog's queued term slug prime when $term_id is queued.
+	 *
+	 * Registered with SlugManager, which calls it just before a term slug
+	 * read that missed its in-memory memo. All of the blog's queued IDs share
+	 * one SELECT; a read of a term that is not queued leaves the queue for a
+	 * later read. A prime runs only when the queue is non-empty and empties
+	 * it, and the queue only fills through a queue_term_slug_prime() call that
+	 * added an ID, so a request never runs more of these SELECTs than it made
+	 * such calls.
+	 *
+	 * @param int $term_id ID of the term whose slug is about to be read.
+	 * @return void
+	 */
+	private function flush_pending_term_slug_prime( int $term_id ): void {
+		$blog_id = (int) get_current_blog_id();
+
+		if ( isset( self::$pending_term_slug_ids[ $blog_id ][ $term_id ] ) ) {
+			$this->prime_pending_term_slugs( $blog_id );
+		}
+	}
+
+	/**
+	 * Prime the slugs of every term queued for a blog, and empty its queue.
+	 *
+	 * The queue is emptied before the query so nothing reached during the
+	 * prime can run it a second time.
+	 *
+	 * @param int $blog_id Blog whose queue to run; must be the current blog.
+	 * @return void
+	 */
+	private function prime_pending_term_slugs( int $blog_id ): void {
+		$term_ids = array_keys( self::$pending_term_slug_ids[ $blog_id ] ?? [] );
+
+		unset( self::$pending_term_slug_ids[ $blog_id ] );
+
+		$this->prime_slug_translations_multilang( $term_ids, 'term' );
 	}
 
 	/**
@@ -3099,7 +3225,7 @@ final class UrlConverter {
 		// Search results are the one archive whose identity LIVES in the query
 		// string: re-append `s` alone so the language switcher targets the same
 		// search in the other language instead of its bare home page. Safe for
-		// the cache-poisoning fix above — HreflangTags skips is_search()
+		// the query-string strip above — HreflangTags skips is_search()
 		// entirely (never cached/emitted), and og:url/schema on a search page
 		// are computed per-request.
 		if ( is_search() ) {

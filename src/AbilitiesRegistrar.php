@@ -5,8 +5,9 @@
  * Registers PerfLocale translation operations as discoverable abilities
  * for AI tools, external consumers, and the WordPress Abilities REST API.
  *
- * Disabled by default. Enable via filter:
- *   add_filter( 'perflocale/abilities/enabled', '__return_true' );
+ * On by default, through the `abilities_enabled` setting. Turn the whole
+ * integration off with:
+ *   add_filter( 'perflocale/abilities/enabled', '__return_false' );
  *
  * Requires WordPress 6.9+ (Abilities API). On older versions, the hooks
  * never fire and this class has zero overhead.
@@ -133,9 +134,7 @@ final class AbilitiesRegistrar {
 	 * `perflocale_translate` cap (already enforced by the permission_callback)
 	 * PLUS edit_post / edit_term on the object actually named in the input.
 	 * The REST twin GET /perflocale/v1/translations/<type>/<id> returns the
-	 * same sibling map behind that gate, so answering on the cap alone let any
-	 * translator enumerate the translation relationships and the language
-	 * assignment of private or draft objects they hold no rights to.
+	 * same sibling map behind that gate, so the two answer alike.
 	 *
 	 * @param int    $object_id   Post or term ID (already validated > 0).
 	 * @param string $object_type Either 'post' or 'term'; anything else is
@@ -330,10 +329,10 @@ final class AbilitiesRegistrar {
 					}
 
 					// Per-object read gate. The permission_callback only checks
-					// the BROAD `perflocale_translate` cap; the sibling map below
-					// discloses the IDs of every language version of this object,
-					// including private and draft ones. Same gate the REST twin
-					// GET /perflocale/v1/translations/<type>/<id> applies.
+					// the BROAD `perflocale_translate` cap, and the sibling map
+					// below lists every language version of this object. Same gate
+					// the REST twin GET /perflocale/v1/translations/<type>/<id>
+					// applies.
 					$denied = $this->authorize_object_read( $object_id, (string) $object_type );
 
 					if ( $denied instanceof \WP_Error ) {
@@ -596,34 +595,24 @@ final class AbilitiesRegistrar {
 	 *
 	 *   1. edit_post on the SOURCE — kept inline in the execute_callback so
 	 *      its `cannot_edit_post` code and ordering are unchanged;
-	 *   2. the existing-target overwrite guard — edit_post on the source is
-	 *      not authority to rewrite a translation the caller cannot edit;
+	 *   2. the target-side guards — edit_post on the source is neither
+	 *      authority to rewrite a translation the caller cannot edit (the
+	 *      overwrite guard, `cannot_overwrite_translation`) nor, when no live
+	 *      translation exists, authority over the default-language post whose
+	 *      shell, slug, meta and terms the new one is copied from
+	 *      (`source_forbidden`), nor permission to create a post of that
+	 *      post's type (`cannot_create_type`);
 	 *   3. the per-user / site-wide hourly MT rate limit;
 	 *   4. mt_enabled().
 	 *
-	 * The ability shipped with only (1), which made it the one MT entry point
-	 * in the plugin that ran a provider while MT was switched off (WP-CLI
-	 * refuses, BulkTranslateJob re-checks per row) and that could rewrite a
-	 * sibling post the caller has no rights to. Gates 2 and 4 are enforced
-	 * here against the same predicates and in the same order the controller
-	 * uses.
-	 *
-	 * Gate 3 used to be missing here, and that omission was real: with the
-	 * per-user quota exhausted, the site quota exhausted, or the rate lock
-	 * held, both REST routes returned 429 and made zero provider calls while
-	 * this ability succeeded and made real batched provider calls. Abilities
-	 * are reachable over REST and MCP, so the quota was enforced on the paths
-	 * people tested and absent on the newest one.
-	 *
-	 * The reason given for omitting it — that a third copy of a duplicated
-	 * private method is how the policy diverged in the first place — was
-	 * correct about the cause and wrong about the remedy. The limiter now
-	 * lives in MtRateLimiter, both controllers delegate to it, and this is the
-	 * third caller of one implementation rather than a third copy.
+	 * Gates 2 to 4 are enforced here against the same predicates and in the
+	 * same order the controller uses. The rate limiter lives in MtRateLimiter;
+	 * both REST controllers and the admin create action also call it, and this
+	 * is one more caller of that one implementation rather than a copy of it.
 	 *
 	 * ORDER MATTERS: admit() increments both counters when it allows, so it is
-	 * called in the same position the controllers call it — after the
-	 * overwrite guard, before mt_enabled() — so the ability and the routes
+	 * called in the same position the controllers call it — after both
+	 * target-side guards, before mt_enabled() — so the ability and the routes
 	 * cannot disagree about which denial a caller sees, and so a request is
 	 * counted exactly once.
 	 *
@@ -649,9 +638,33 @@ final class AbilitiesRegistrar {
 			);
 		}
 
+		// No live translation: translate_post() creates one. Its translated
+		// title, body and excerpt come from $post_id, but the post shell, slug,
+		// meta and terms are copied from the group's default-language post,
+		// which can be a different one.
+		$copy_from = $manager->get_copy_source_id( $post_id, $target_slug );
+
+		if ( $copy_from > 0 && $copy_from !== $post_id && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
+			return new \WP_Error(
+				'source_forbidden',
+				__( 'You cannot edit the original this translation is copied from.', 'perflocale' ),
+				[ 'status' => 403 ]
+			);
+		}
+
+		// The new post is of the copy source's type, and wp_insert_post()
+		// checks no capability, so apply the type's own create gate here.
+		if ( $copy_from > 0 && ! Helper::user_can_create_like( $copy_from ) ) {
+			return new \WP_Error(
+				'cannot_create_type',
+				__( 'You do not have permission to create translations of this content.', 'perflocale' ),
+				[ 'status' => 403 ]
+			);
+		}
+
 		// Gate 3: per-user quota, site-wide quota, and the rate lock. Shared
-		// with both REST controllers, so all three entry points draw down the
-		// same two budgets instead of this one being free.
+		// with both REST controllers and the admin create action, so these
+		// entry points draw down the same two budgets.
 		$limited = Translation\MtRateLimiter::admit( get_current_user_id() );
 
 		if ( $limited instanceof \WP_Error ) {
@@ -734,10 +747,8 @@ final class AbilitiesRegistrar {
 					}
 
 					// Per-target capability check. The permission_callback only
-					// gates the BROAD `perflocale_use_mt` cap; without this
-					// check, a user with translator caps but no edit rights to
-					// THIS post can MT-translate it (creating a sibling whose
-					// content reveals the source). Mirrors the per-target
+					// gates the BROAD `perflocale_use_mt` cap, so edit rights on
+					// THIS post are checked here. Mirrors the per-target
 					// `edit_post` enforcement in MachineTranslateController.
 					if ( ! current_user_can( 'edit_post', $post_id ) ) {
 						return new \WP_Error(
@@ -748,10 +759,12 @@ final class AbilitiesRegistrar {
 					}
 
 					// Remaining MachineTranslateController::translate() gates: the
-					// existing-target overwrite guard, the shared MT rate
-					// limiter, and mt_enabled() — in that order, matching the
-					// controller so the two entry points cannot disagree about
-					// which denial a caller sees.
+					// existing-target overwrite guard, the copy-source check
+					// (`source_forbidden`), the create check on its type
+					// (`cannot_create_type`), the shared MT rate limiter, and
+					// mt_enabled() — in that order, matching the controller so
+					// the two entry points cannot disagree about which denial a
+					// caller sees.
 					$denied = $this->authorize_mt( $post_id, (string) $slug );
 
 					if ( $denied instanceof \WP_Error ) {
@@ -869,11 +882,9 @@ final class AbilitiesRegistrar {
 					}
 
 					// Per-target capability check. The permission_callback
-					// only gates the BROAD `perflocale_translate` cap; without
-					// this check, a user can copy_content=true to clone the
-					// source body of a private/draft post they have no read
-					// rights to into a new translation post they DO control,
-					// effectively exfiltrating it.
+					// only gates the BROAD `perflocale_translate` cap, and the
+					// new translation can carry the source's content, so the
+					// caller must be able to read the source.
 					if ( ! current_user_can( 'read_post', $source_id ) ) {
 						return new \WP_Error(
 							'cannot_read_source',
@@ -886,10 +897,9 @@ final class AbilitiesRegistrar {
 					// read_post. On a private post owned by someone else read_post
 					// needs read_private_posts while edit_post needs
 					// edit_others_posts + edit_private_posts — independent
-					// primitives, so SWAPPING the check above would re-open the
-					// copy_content exfiltration it exists to stop. This second half
-					// is the write authority: create_translation() mints a post and
-					// a link row against the source, and the REST twin
+					// primitives, so both checks stay. This second half is the
+					// write authority: create_translation() mints a post and a
+					// link row against the source, and the REST twin
 					// POST /perflocale/v1/translations/post/<id> already requires
 					// edit_post on that source before it will do so.
 					if ( ! current_user_can( 'edit_post', $source_id ) ) {
@@ -903,6 +913,31 @@ final class AbilitiesRegistrar {
 					$cache    = $this->plugin->get( 'cache' );
 					$settings = $this->plugin->get( 'settings' );
 					$manager  = new Translation\PostTranslationManager( $cache, $settings );
+
+					// The two checks above cover the post named by source_id.
+					// create_translation() copies the group's default-language
+					// post, which can be a different one, so that post needs the
+					// same read and edit authority.
+					$copy_from = $manager->get_copy_source_id( $source_id, (string) $slug );
+
+					if ( $copy_from > 0 && $copy_from !== $source_id && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
+						return new \WP_Error(
+							'source_forbidden',
+							__( 'You cannot edit the original this translation is copied from.', 'perflocale' ),
+							[ 'status' => 403 ]
+						);
+					}
+
+					// The new post is of the copy source's type, and
+					// wp_insert_post() checks no capability, so apply the
+					// type's own create gate here.
+					if ( $copy_from > 0 && ! Helper::user_can_create_like( $copy_from ) ) {
+						return new \WP_Error(
+							'cannot_create_type',
+							__( 'You do not have permission to create translations of this content.', 'perflocale' ),
+							[ 'status' => 403 ]
+						);
+					}
 
 					$new_id = $manager->create_translation( $source_id, $slug, $copy_content, \PerfLocale\Enum\SourceType::Api );
 

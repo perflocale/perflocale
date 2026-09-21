@@ -407,8 +407,9 @@ final class MediaTranslationManager {
 				'label' => sprintf( __( 'Alt Text (%s)', 'perflocale' ), $label ),
 				'input' => 'text',
 				'value' => get_post_meta( $post->ID, '_perflocale_alt_' . $slug, true ),
+				// Core prints `helps` as HTML, so it is escaped here.
 				/* translators: %s: Language name */
-				'helps' => sprintf( __( 'Alternative text for %s', 'perflocale' ), $lang->name ),
+				'helps' => esc_html( sprintf( __( 'Alternative text for %s', 'perflocale' ), $lang->name ) ),
 			];
 
 			// Caption per language.

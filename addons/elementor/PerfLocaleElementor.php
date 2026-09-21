@@ -164,9 +164,9 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 		// whose rules are scoped to the SOURCE post's element IDs, so a sibling holding
 		// it serves wrong-ID CSS.
 		//
-		// ⚠️ Leaving it out of THIS filter does not actually prevent the copy, and this
-		// comment used to claim it did. The seed path is a blanket copy of every meta
-		// row minus a small blocklist, so exclusion has to be stated explicitly — see
+		// ⚠️ Leaving it out of THIS filter does not prevent the copy. The seed path is
+		// a blanket copy of every meta row minus a small blocklist, so exclusion has
+		// to be stated explicitly — see
 		// exclude_generated_caches(), registered on
 		// `perflocale/translation/excluded_meta_keys` in boot().
 

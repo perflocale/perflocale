@@ -169,8 +169,16 @@
 					);
 				}
 				fetchTranslations();
-			} ).catch( function() {
+			} ).catch( function( err ) {
 				setBusySlug( null );
+				// Say why: a refusal (for example a translation copied from an
+				// original this user may not edit) otherwise just stops the
+				// spinner and leaves the row unchanged.
+				wp.data.dispatch( 'core/notices' ).createNotice(
+					'error',
+					( err && err.message ) || __( 'Failed to create translation.', 'perflocale' ),
+					{ type: 'snackbar', isDismissible: true }
+				);
 				// Re-sync: the translation may already exist (created in
 				// another tab) or the source state changed under us.
 				fetchTranslations();

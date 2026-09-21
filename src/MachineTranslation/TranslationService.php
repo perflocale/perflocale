@@ -754,7 +754,8 @@ final class TranslationService {
 					throw new \RuntimeException( $update_result->get_error_message() );
 				}
 			} else {
-				$translated_id = $manager->create_translation( $post_id, $target_lang, false, \PerfLocale\Enum\SourceType::MachineTranslation );
+				$inserted      = false;
+				$translated_id = $manager->create_translation( $post_id, $target_lang, false, \PerfLocale\Enum\SourceType::MachineTranslation, $inserted );
 
 				if ( ! $translated_id ) {
 					// create_translation can return false on race or invalid
@@ -765,6 +766,18 @@ final class TranslationService {
 					// would report as success. Surface the failure.
 					throw new \RuntimeException(
 						esc_html__( 'Failed to create the translation post; the source-language post may have been moved or its translation group invalidated mid-translation.', 'perflocale' )
+					);
+				}
+
+				// Write machine output only into a translation this call
+				// inserted. One it did not insert already existed (created
+				// elsewhere, or missed by the cached check above) and may hold a
+				// person's work that the callers' overwrite checks never saw.
+				// The write below also skips the update branch's empty-field
+				// guard, so such a translation is left as it is.
+				if ( ! $inserted ) {
+					throw new \RuntimeException(
+						esc_html__( 'This translation already exists, so the machine translation was not written to it.', 'perflocale' )
 					);
 				}
 
@@ -818,6 +831,15 @@ final class TranslationService {
 			do_action( 'perflocale/machine_translation/failed', $post_id, $provider->get_id(), $e );
 
 			throw $e;
+		} finally {
+			// BlockSkipFilter holds this post's "do not translate" subtrees
+			// aside at pre_translate and takes them back at post_translate.
+			// An exception in between, or a restore that bailed, would leave
+			// them in its static for the rest of the process, so the entry is
+			// cleared here. The raw triple is the key both the restore and
+			// this call derive; on the success path the restore has normally
+			// taken the entry already.
+			\PerfLocale\Translation\BlockSkipFilter::discard_stash( [ $post->post_title, $post->post_content, $post->post_excerpt ] );
 		}
 	}
 

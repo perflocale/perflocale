@@ -553,12 +553,8 @@ final class CacheInvalidator {
 	 *
 	 * WHY THIS EXISTS
 	 *   A translated page is a separate post with its own language-prefixed
-	 *   URL. When such a page was public, was fetched anonymously (warming a
-	 *   full-page cache), and was then made private, the cached copy stayed
-	 *   anonymously readable. Reproduced on both multisites, root and child
-	 *   blogs, with Redis hot and with Redis disabled; the same transition
-	 *   invalidated correctly when the full-page cache was bypassed, so the
-	 *   stale copy lives in the page-cache layer, not the object cache.
+	 *   URL, and a full-page cache must drop its copy when the page stops (or
+	 *   starts) being publicly readable.
 	 *
 	 *   Two things combine. A page cache purges what it believes the post's URL
 	 *   to be, and it computes that during an admin/CLI request — where this

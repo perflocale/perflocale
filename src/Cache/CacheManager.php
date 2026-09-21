@@ -844,17 +844,34 @@ final class CacheManager {
 	 *      `[blog_id:]perflocale_slugs:slug_<type>_<id>_<lang>` — drop
 	 *      every entry whose key contains the group name).
 	 *   2. Persistent L2 (wp_cache group `perflocale_slugs`).
-	 *   3. Autoloaded zero-state flag `perflocale_has_any_slugs`. This
-	 *      option is written to `'1'` when the FIRST slug row appears and
-	 *      is never cleared during normal writes. After a wholesale slug
-	 *      delete (e.g. when a language is removed and all its slug rows
-	 *      go with it) the flag may be wrong; deleting it forces the next
-	 *      has_any_slugs() call to recompute from a single LIMIT 1 query.
+	 *   3. The zero-state TRUE pin behind has_any_slugs(): the autoloaded
+	 *      option `perflocale_has_any_slugs` and the raw persistent-cache
+	 *      key `has_any_slugs` in group `perflocale_trans`. Both are set
+	 *      when a slug row is seen (the key only while L2 is enabled) and
+	 *      never cleared by normal writes, so after a wholesale slug delete
+	 *      (a removed language taking all its slug rows with it) they may
+	 *      claim rows that are gone. The raw key is written without
+	 *      l2_key(), so no generation bump reaches it; it has to be deleted
+	 *      by name. With both gone, the next request's has_any_slugs() runs
+	 *      a single SELECT 1 LIMIT 1, which re-pins TRUE if any slug row
+	 *      remains.
 	 *
-	 * Called from LanguageRepository::delete() after the slug_translations
-	 * cascade. Routing would otherwise resolve cached slug→object_id
-	 * lookups for a language that no longer exists, and has_any_slugs()
-	 * would keep paying the SELECT cost when the table is now empty.
+	 * The in-process copies of that pin are not touched here: the
+	 * repository's per-request memo (SlugTranslationRepository::
+	 * reset_static_caches()) and its L1 entry in `perflocale_trans` (dropped
+	 * by flush_translations()). A recompute within the same request needs
+	 * both reset as well.
+	 *
+	 * LanguageRepository::delete() calls this after the slug_translations
+	 * cascade and then resets both in-process copies. Routing would
+	 * otherwise resolve cached slug→object_id lookups for a language that no
+	 * longer exists, and has_any_slugs() would keep answering TRUE for a
+	 * table that may now be empty. Paths that remove slug rows without
+	 * calling this (post and term deletes, a replace-mode data import) leave
+	 * the pin at TRUE: that costs slug queries that find nothing, never a
+	 * missed translated slug. Writers that add rows without setting the pin
+	 * are harmless too: FALSE is never stored, so the next request's probe
+	 * finds the rows.
 	 *
 	 * @return void
 	 */
@@ -887,10 +904,13 @@ final class CacheManager {
 		// rows on language delete is bounded by the per-language slug count).
 		$this->delete_group_transients( 'perflocale_slugs' );
 
-		// Zero-state flag: defensive delete (no harm if it was already
-		// absent; next has_any_slugs() rebuilds it from a SELECT 1 LIMIT 1
-		// when at least one slug row remains, or stays absent otherwise).
+		// Zero-state TRUE pin: the option and the raw L2 key go together, or
+		// a later has_any_slugs() short-circuits on whichever survived and
+		// never reaches its SELECT 1 LIMIT 1. The key is deleted even while
+		// L2 is off: one written while it was on is read again as soon as it
+		// is switched back on. Both deletes are no-ops when already absent.
 		delete_option( 'perflocale_has_any_slugs' );
+		wp_cache_delete( 'has_any_slugs', 'perflocale_trans' );
 
 		/** @hook perflocale/cache/flush_slugs Fires after slug caches are flushed. */
 		do_action( 'perflocale/cache/flush_slugs' );

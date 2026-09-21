@@ -1620,6 +1620,43 @@ final class Helper {
 	}
 
 	/**
+	 * Sanitize a gettext string translation imported by someone WordPress does
+	 * not trust with raw HTML.
+	 *
+	 * Holds an import to the markup rules of the Strings screen, which runs
+	 * wp_kses_post() on every value it saves
+	 * ({@see \PerfLocale\Admin\AdminController::process_string_translations()}),
+	 * so an import cannot store markup that screen would strip. Unlike that
+	 * screen, it keeps a value with no `<` as supplied (see below).
+	 *
+	 * Where it runs, it is the same filter, with the same losses. Post-safe
+	 * markup survives, and so does a printf placeholder inside an attribute
+	 * value (`<a href="%s">`) or in text. A placeholder standing where an attribute
+	 * would (`<a href="%1$s" %2$s>`, `<button %s>`) is removed, and so is a
+	 * `<…>` that kses does not read as an allowed tag (the `<link>` of
+	 * `<link>-Tag`, a `< >` in prose, the `<%2$s>` of an email address). What
+	 * survives may be reformatted: attribute quotes become double quotes,
+	 * `<br/>` becomes `<br />`, and a bare `&` becomes `&amp;`.
+	 *
+	 * kses runs only when the value contains `<`. Without one, no element or
+	 * attribute can form in an HTML sink, yet wp_kses() would still rewrite the
+	 * text: a bare `&` becomes `&amp;` and a lone `>` becomes `&gt;`, which a
+	 * plain-text consumer (an email subject, a JavaScript string) then shows
+	 * literally.
+	 *
+	 * The caller decides who is untrusted and nothing here reads the current
+	 * user, so an import path that does not call it (WP-CLI) keeps the file's
+	 * bytes. Like any kses pass, this makes a value safe for HTML text only;
+	 * output in any other context still needs its own escaping.
+	 *
+	 * @param string $value Translation as supplied.
+	 * @return string
+	 */
+	public static function sanitize_untrusted_string_translation( string $value ): string {
+		return str_contains( $value, '<' ) ? wp_kses_post( $value ) : $value;
+	}
+
+	/**
 	 * IP and URL predicates that need no PHP extension.
 	 *
 	 * WordPress core states the position at `wp-includes/functions.php:7452`:
@@ -1644,9 +1681,8 @@ final class Helper {
 	public static function is_ip( string $ip ): bool {
 		// Two ways this can fatal rather than answer, both closed here. inet_pton
 		// cannot be compiled out but disable_functions CAN remove it; and it
-		// throws a ValueError on a string containing a NUL byte, which an
-		// attacker controls on the webhook and provider-URL paths, where
-		// filter_var simply returned false. Fail closed on both.
+		// throws a ValueError on a string containing a NUL byte, where
+		// filter_var simply returns false. Fail closed on both.
 		if ( ! function_exists( 'inet_pton' ) || $ip === '' || strpos( $ip, "\0" ) !== false ) {
 			return false;
 		}
@@ -1688,21 +1724,15 @@ final class Helper {
 	 * replaces, which on an SSRF guard is the one direction that is never safe.
 	 *
 	 * Note the name is historical: it judges IPv6 as well. Callers still apply
-	 * their own fc00::/7 and fe80::/10 byte checks afterwards, because PHP's
-	 * private-range flag skips IPv6 entirely when the literal is dotted.
+	 * their own fc00::/7 and fe80::/10 byte checks afterwards, as a second
+	 * layer.
 	 *
-	 * ⚠ DO NOT widen this toward WordPress core's fuller block list — 100.64.0.0/10
-	 * (CGNAT), 198.18.0.0/15 (benchmarking), the TEST-NETs, multicast — however
-	 * reasonable that looks from the webhook/SSRF side. This predicate has a
-	 * SECOND caller that judges INBOUND visitor addresses:
-	 * {@see \PerfLocale\Router\GeoRedirect} (`! Helper::is_public_ipv4( $ip )` at
-	 * GeoRedirect.php:980) uses it to decide whether a visitor's IP is local and
-	 * therefore not worth geolocating. Adding CGNAT here would classify every
-	 * visitor behind a mobile carrier's CGNAT as local and silently switch off
-	 * geo-redirect for them — a large, invisible group.
-	 *
-	 * If a webhook-specific block list is ever wanted, add it as a separate
-	 * predicate at the webhook call sites, never here.
+	 * ⚠ Do not add blocks here. {@see \PerfLocale\Router\GeoRedirect} also
+	 * uses this predicate (`! Helper::is_public_ipv4( $ip )`) to decide whether
+	 * a visitor's address is local and not worth geolocating, so a wider list
+	 * would switch geo-redirect off for real visitors (a mobile carrier's
+	 * shared NAT range, for example). Any extra list for outbound requests
+	 * belongs in a separate predicate at those call sites.
 	 *
 	 * @param string $ip Candidate address.
 	 */
@@ -1762,11 +1792,8 @@ final class Helper {
 
 		// IPv4-mapped, ::ffff:0:0/96. PHP rejects the whole block, and it has to
 		// be checked in BYTES rather than by looking for a dot: the dotted form
-		// ::ffff:127.0.0.1 is caught by the rule above, but the identical
-		// address written ::ffff:7f00:1 is not, and accepting that would let
-		// loopback, RFC1918 and the cloud metadata address through an SSRF
-		// guard. The first differential corpus for this predicate never
-		// generated the ::ffff: prefix and so reported a clean sweep.
+		// is caught by the rule above, but the same address also has a hex-only
+		// spelling.
 		if ( substr( $bin, 0, 10 ) === str_repeat( "\x00", 10 ) && substr( $bin, 10, 2 ) === "\xFF\xFF" ) {
 			return false;
 		}
@@ -1806,14 +1833,12 @@ final class Helper {
 	 * no userinfo, and RFC 1035 label and host length limits. Differentially
 	 * fuzzed against filter_var over 330,056 URLs — hostile authority alphabets,
 	 * 80,000 random raw-byte hosts, and every label and host length across the
-	 * 63 and 253 boundaries. That corpus did NOT bracket a dotted quad, and an
-	 * adversarial review found the gap: `http://[1.2.3.4]/` was accepted where
-	 * filter_var rejects it, brackets being legal only around IPv6. Closed, and
-	 * the gate now covers bracketed hosts explicitly (php-extension-guards J11).
-	 * The standing property is that it never accepts what filter_var rejects. It does refuse about one URL in seven that filter_var
-	 * allows, almost all non-http schemes and malformed hosts, which on such a
-	 * host costs a webhook registration and never admits an unsafe target. The
-	 * caller re-validates scheme, host and address in
+	 * 63 and 253 boundaries; bracketed hosts are checked separately. The
+	 * standing property is that it never accepts what filter_var rejects. It
+	 * does refuse about one URL in seven that filter_var allows, almost all
+	 * non-http schemes and malformed hosts, which on such a host costs a webhook
+	 * registration and never admits an unsafe target. The caller re-validates
+	 * scheme, host and address in
 	 * {@see \PerfLocale\Api\WebhookController::is_url_safe()} either way.
 	 *
 	 * @param string $url Candidate URL.
@@ -1840,9 +1865,8 @@ final class Helper {
 			}
 		}
 
-		// Every per cent must introduce exactly two hex digits. filter_var
-		// rejects a malformed escape and an earlier fallback did not, which let
-		// a bogus authority through.
+		// Every per cent must introduce exactly two hex digits, as filter_var
+		// requires.
 		$pos = 0;
 
 		while ( ( $pos = strpos( $url, '%', $pos ) ) !== false ) {
@@ -1884,11 +1908,8 @@ final class Helper {
 		$host = (string) $parts['host'];
 
 		if ( $host[0] === '[' ) {
-			// Brackets are legal ONLY around an IPv6 literal, so the length test
-			// is not decoration: accepting any inet_pton success let
-			// http://[1.2.3.4]/ and http://[127.0.0.1]/ through, both of which
-			// filter_var rejects. That was the one looseness class a 330,056-URL
-			// fuzz missed, because its generators never bracketed a dotted quad.
+			// Brackets are legal ONLY around an IPv6 literal, and filter_var
+			// rejects a bracketed IPv4, so the length test is not decoration.
 			if ( substr( $host, -1 ) !== ']' || ! function_exists( 'inet_pton' ) ) {
 				return false;
 			}
@@ -2617,20 +2638,15 @@ final class Helper {
 	 * and WooCommerce's `woocommerce_uploads/` pattern (`class-wc-install.php`
 	 * `create_files()`).
 	 *
-	 * IMPORTANT: `.htaccess` is honoured by Apache and LiteSpeed ONLY. Nginx
-	 * and Caddy ignore it outright, and so does Apache configured with
-	 * `AllowOverride None`. On those hosts an anonymous GET of the exact file
-	 * URL returns 200 with the full body — measured, not assumed. So the file
-	 * this function writes is defence in depth and NEVER the access control.
-	 * What actually protects a plugin-written upload there is the CSPRN in its
+	 * IMPORTANT: `.htaccess` is honoured by Apache and LiteSpeed only, so the
+	 * file this function writes is defence in depth and NEVER the access
+	 * control. What protects a plugin-written upload is the CSPRN in its
 	 * filename: `AdminController` names import temp files with
-	 * `wp_generate_password( 16, false )` (62^16 ≈ 5×10^28) and
+	 * `wp_generate_password( 16, false )` and
 	 * `DataExportJob::default_export_path()` names exports with 32 characters
 	 * — the same length WP core uses for privacy exports, which live in this
 	 * same public tree (`wp_privacy_generate_personal_data_export_file()`). Do
-	 * not shorten either token on the strength of this file. (The export token
-	 * WAS 6 characters while this docblock claimed 62^16; the 62^16 figure was
-	 * only ever true of the import temp names.)
+	 * not shorten either token on the strength of this file.
 	 *
 	 * Directory listings are covered separately and on every server:
 	 * `autoindex off` is the nginx default and `index.php` neutralises
@@ -2659,13 +2675,10 @@ final class Helper {
 		$mode = defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644;
 
 		// Helper::filesystem() returns null on an FS_METHOD=ftpext host, and
-		// wherever WP_Filesystem() cannot assemble credentials. This used to
-		// `return` there, which wrote NEITHER file — so precisely the hosts
-		// least likely to be well configured got no `.htaccess` AND no
-		// `index.php`, leaving the directory browsable under
-		// `Options +Indexes` even on Apache. Fall back to a direct write: the
-		// directory was created by wp_mkdir_p() as this same PHP user moments
-		// earlier, so if anything can write here, this can.
+		// wherever WP_Filesystem() cannot assemble credentials. Both files are
+		// still wanted there, so fall back to a direct write: the directory was
+		// created by wp_mkdir_p() as this same PHP user moments earlier, so if
+		// anything can write here, this can.
 		$fs    = self::filesystem();
 		$files = [
 			trailingslashit( $dir ) . '.htaccess' => "Deny from all\n",
@@ -3124,10 +3137,23 @@ final class Helper {
 	 * ⚠️ SECURITY SHAPE. The filter is consulted, never trusted blindly, and the bundled
 	 * addons only ever answer for their OWN post type and only when core has already
 	 * said no — so they can widen for that type and can never revoke access core
-	 * granted. The REST routes additionally require the `perflocale_translate`
-	 * capability before this is even reached, so a filter cannot hand translation rights
-	 * to a user who has none. Deferring to the HOST's own authorization function is the
-	 * correct answer here; inventing capabilities inside another plugin's model is not.
+	 * granted. What a widened answer opens depends on the caller:
+	 *
+	 *   - the Translations REST routes and the admin Create action require the
+	 *     `perflocale_translate` capability before asking, so there a filter cannot
+	 *     hand translation rights to a user who has none;
+	 *   - the machine-translation routes, the translate-post ability and the bulk
+	 *     translation job (`perflocale_use_mt`), XLIFF import
+	 *     (`perflocale_import_export`) and the create-translation ability
+	 *     (`perflocale_translate`) check core `edit_post` on the post they name
+	 *     before asking, so there a filter widens nothing for a user core does not
+	 *     already let edit that post;
+	 *   - the Translations panel asks with no PerfLocale capability: a widened
+	 *     'edit' shows the object's translation list and edit links, and Create is
+	 *     offered only to a user who also holds `perflocale_translate`.
+	 *
+	 * Deferring to the HOST's own authorization function is the correct answer here;
+	 * inventing capabilities inside another plugin's model is not.
 	 *
 	 * @since 1.0.5
 	 *
@@ -3155,6 +3181,63 @@ final class Helper {
 	}
 
 	/**
+	 * Whether the current user may have a new translation copied from this post.
+	 *
+	 * A new translation is copied from the post
+	 * {@see \PerfLocale\Translation\PostTranslationManager::get_copy_source_id()}
+	 * names; callers pass that post here.
+	 *
+	 * Both halves are required: in core neither `edit_post` nor `read_post`
+	 * implies the other.
+	 *
+	 * Both go through the host seam, so a `map_meta_cap => false` type such as
+	 * WPForms is answered by its host instead of being refused for everyone.
+	 *
+	 * @param int $post_id Post ID the translation would be copied from.
+	 * @return bool
+	 */
+	public static function user_can_copy_translation_source( int $post_id ): bool {
+		return self::object_permission( 'edit', 'edit_post', $post_id )
+			&& self::object_permission( 'read', 'read_post', $post_id );
+	}
+
+	/**
+	 * Whether the current user may create a new post of this post's type.
+	 *
+	 * Creating a translation inserts a post of the copy source's type, so the
+	 * type's `create_posts` capability applies, as it does to any new post of
+	 * that type. It is not always the edit capability: a type can register any
+	 * capability there. Entry points that create pass the post
+	 * {@see \PerfLocale\Translation\PostTranslationManager::get_copy_source_id()}
+	 * names, and ask only when a translation would be created; the Translations
+	 * panel asks about the post it lists, to decide whether to offer Create.
+	 *
+	 * Goes through the host seam as 'create', so a `map_meta_cap => false` type
+	 * such as WPForms, whose `create_posts` maps to a primitive no role holds, is
+	 * answered by its host instead of being refused for everyone.
+	 *
+	 * A type whose `create_posts` is not a capability name (Pods sets it to false
+	 * when a type's Add New is disabled) is refused for everyone, a multisite super
+	 * admin included. Core lets a super admin past such a value only because
+	 * has_cap() grants a super admin any capability, not because the type allows
+	 * creation, and there is no capability to ask the host about.
+	 *
+	 * @param int $post_id Post the new translation would be copied from.
+	 * @return bool False when the post's type is not registered, or its create
+	 *              capability is not a capability name.
+	 */
+	public static function user_can_create_like( int $post_id ): bool {
+		$type_object = get_post_type_object( (string) get_post_type( $post_id ) );
+		$capability  = $type_object instanceof \WP_Post_Type ? ( $type_object->cap->create_posts ?? null ) : null;
+
+		if ( ! is_string( $capability ) ) {
+			return false;
+		}
+
+		return self::object_permission( 'create', $capability, $post_id );
+	}
+
+	/**
 	 * Resolve one object-level permission, giving the host a say.
 	 *
 	 * ⚠️ PUBLISH transitions are deliberately NOT routed through here, but TRASH is. The
@@ -3170,7 +3253,7 @@ final class Helper {
 	 *     directly and never consults `post_status`. Widening a publish path for
 	 *     behaviour nobody can reach is surface for nothing.
 	 *
-	 * @param string $action     Semantic action: 'edit' or 'delete'.
+	 * @param string $action     Semantic action: 'edit', 'delete', 'read' or 'create'.
 	 * @param string $capability Core capability checked by default.
 	 * @param int    $post_id    Post ID.
 	 * @return bool
@@ -3195,15 +3278,38 @@ final class Helper {
 		 * with the HOST's own authorization function rather than with a capability name,
 		 * and should return `$can` untouched for every type it does not own.
 		 *
-		 * ⚠️ Returning true GRANTS access to that object's translation list and edit
-		 * links. The REST routes still require the `perflocale_translate` capability
-		 * first, so this cannot grant translation rights to a user who has none.
+		 * ⚠️ Returning true GRANTS access, and what it opens depends on the caller
+		 * ({@see \PerfLocale\Helper::user_can_edit_object()}). The Translations panel
+		 * requires no PerfLocale capability, so 'edit' alone shows that object's
+		 * translation list and edit links. The Translations REST routes and the admin
+		 * Create action require `perflocale_translate` first. The machine-translation
+		 * routes, both abilities, the bulk translation job and XLIFF import require
+		 * their own capability (`perflocale_use_mt`, `perflocale_translate`,
+		 * `perflocale_import_export`) and core `edit_post` on the post they name
+		 * before asking, so a listener cannot open those to a user core does not
+		 * already let edit that post.
+		 *
+		 * 'read' is asked, together with 'edit', about the post a new translation
+		 * would be copied from ({@see \PerfLocale\Helper::user_can_copy_translation_source()}).
+		 * A listener that treats every action other than 'delete' as 'edit' answers it
+		 * with its edit rule, which never grants more than the 'edit' half already
+		 * requires.
+		 *
+		 * 'create' is asked about that same copy source, when a translation would be
+		 * created (and by the Translations panel about the post it lists), and means
+		 * "may create a new post of this post's type"
+		 * ({@see \PerfLocale\Helper::user_can_create_like()}): `$post_id` is an
+		 * existing post, never the post that will be created, and `$can` is core's
+		 * answer for the type's `create_posts` capability. A listener that answers it with
+		 * its edit rule lets everyone who may edit that post create posts of its type; one
+		 * that returns `$can` for actions it does not know leaves 'create' to core, which
+		 * on a `map_meta_cap => false` type refuses everyone.
 		 *
 		 * @hook  perflocale/object/user_can
 		 * @since 1.0.5
 		 *
 		 * @param bool   $can       Whether core's capability check passed.
-		 * @param string $action    Semantic action: 'edit' or 'delete'.
+		 * @param string $action    Semantic action: 'edit', 'delete', 'read' or 'create'.
 		 * @param int    $post_id   Object being acted on.
 		 * @param string $post_type Its post type.
 		 * @return bool

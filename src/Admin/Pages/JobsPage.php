@@ -273,7 +273,19 @@ final class JobsPage {
 		$overdue_seen = false;
 
 		foreach ( $tasks as $task ) {
-			$next     = BackgroundEvents::next_run( $task['hook'], (array) ( $task['args'] ?? [] ) );
+			// A recurring Action Scheduler task that is running right now has
+			// no next timestamp: its next instance is created only after the
+			// run completes (cited in BackgroundEvents::as_next_raw()).
+			// `untimed` comes from the same probe as `next`, so telling
+			// "running" apart from "not scheduled" adds no query.
+			// `untimed` also covers a pending ASYNC action. These four hooks
+			// are only ever scheduled through enqueue_recurring()
+			// (Bootstrap::ensure_recurring_schedules(),
+			// ExchangeRateSync::ensure_scheduled()), never enqueued async, so
+			// here it means running. Enqueueing one of them async would make
+			// the "Running" label wrong for that row.
+			$detail   = BackgroundEvents::next_run_detail( $task['hook'], (array) ( $task['args'] ?? [] ) );
+			$next     = $detail['next'];
 			$overdue  = false;
 			$drift_by = 0;
 
@@ -294,6 +306,7 @@ final class JobsPage {
 				'description' => $task['description'],
 				'hook'        => $task['hook'],
 				'next_run'    => $next,
+				'in_progress' => null === $next && $detail['untimed'],
 				'overdue'     => $overdue,
 				'drift_by'    => $drift_by,
 				'last_run'    => BackgroundEvents::last_run( $task['hook'] ),
@@ -455,7 +468,9 @@ final class JobsPage {
 							<?php endif; ?>
 						</td>
 						<td>
-							<?php if ( $row['next_run'] === null ) : ?>
+							<?php if ( $row['next_run'] === null && $row['in_progress'] ) : ?>
+								<span style="color:#646970;"><?php esc_html_e( 'Running', 'perflocale' ); ?></span>
+							<?php elseif ( $row['next_run'] === null ) : ?>
 								<span style="color:#646970;"><?php esc_html_e( 'Not scheduled', 'perflocale' ); ?></span>
 							<?php elseif ( $row['overdue'] ) : ?>
 								<?php

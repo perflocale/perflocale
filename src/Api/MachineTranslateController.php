@@ -202,6 +202,13 @@ final class MachineTranslateController extends RestController {
 			return $this->error( 'invalid_params', __( 'object_id and target_lang are required.', 'perflocale' ) );
 		}
 
+		// Before the rate limiter, so a refused request spends no quota.
+		$denied = $this->creation_denial( $type === 'post' ? 'post' : 'term', $id, $target_lang );
+
+		if ( $denied instanceof \WP_Error ) {
+			return $denied;
+		}
+
 		$limited = $this->enforce_rate_limit( get_current_user_id() );
 		if ( $limited instanceof \WP_Error ) {
 			return $limited;
@@ -368,11 +375,29 @@ final class MachineTranslateController extends RestController {
 		}
 
 		if ( ! $sibling ) {
-			$created = $ttm->create_translation( $id, $term->taxonomy, $target_lang, true, \PerfLocale\Enum\SourceType::MachineTranslation );
+			$inserted = false;
+			$created  = $ttm->create_translation( $id, $term->taxonomy, $target_lang, true, \PerfLocale\Enum\SourceType::MachineTranslation, $inserted );
 			if ( ! $created ) {
 				return $this->error( 'create_failed', __( 'Failed to create the term translation.', 'perflocale' ), 500 );
 			}
 			$sibling = (int) $created;
+
+			// Another request created the sibling while the provider ran, after
+			// the checks above: apply them to it before writing.
+			if ( ! $inserted ) {
+				if ( ! $overwrite ) {
+					return $this->success(
+						[
+							'status'         => 'exists',
+							'translation_id' => $sibling,
+						]
+					);
+				}
+
+				if ( ! current_user_can( 'edit_term', $sibling ) ) {
+					return $this->error( 'rest_forbidden', __( 'You cannot overwrite this translation.', 'perflocale' ), 403 );
+				}
+			}
 		}
 
 		$update = [];
@@ -426,7 +451,7 @@ final class MachineTranslateController extends RestController {
 		if ( $kind === 'posts' ) {
 			$post_ids = array_map( 'intval', (array) $request->get_param( 'post_ids' ) );
 
-			// The estimate leaks CHAR_LENGTH aggregates of the named posts, so
+			// The estimate exposes CHAR_LENGTH aggregates of the named posts, so
 			// require read access to every named source (mirrors the job's own
 			// per-row edit checks without being as strict — this is read-only).
 			foreach ( $post_ids as $pid ) {
@@ -514,6 +539,18 @@ final class MachineTranslateController extends RestController {
 			return $this->error( 'rest_forbidden', __( 'You cannot overwrite this translation.', 'perflocale' ), 403 );
 		}
 
+		// No live translation: translate_post() creates one. Its translated
+		// title, body and excerpt come from $post_id, but the post shell, slug,
+		// meta and terms are copied from the group's default-language post,
+		// which can be a different one, and the new post takes that post's
+		// type. Checked before the rate limiter, so a refused request spends no
+		// quota and no provider call.
+		$denied = $this->creation_denial( 'post', $post_id, $target_lang );
+
+		if ( $denied instanceof \WP_Error ) {
+			return $denied;
+		}
+
 		// Budget guard - cap per-user MT requests per hour. A runaway UI
 		// script or accidental loop across thousands of posts can exhaust
 		// provider quota fast; the rate limit protects the site owner's
@@ -543,6 +580,50 @@ final class MachineTranslateController extends RestController {
 	}
 
 	/**
+	 * Refuse a request whose new translation the user may not create.
+	 *
+	 * Creating a translation copies from the group's default-language member,
+	 * which is not necessarily the object the request named. A post needs read
+	 * and edit authority ({@see \PerfLocale\Helper::user_can_copy_translation_source()}),
+	 * a term edit_term. A post also needs the create capability of that
+	 * member's type, the type the new post gets
+	 * ({@see \PerfLocale\Helper::user_can_create_like()}). When a translation
+	 * already exists nothing is created, so nothing is checked here. translate()
+	 * then reads only the requested post, which its own edit_post gate covers.
+	 * translate_object() pivots to the default-language member and reads that;
+	 * its edit_post / edit_term check on the pivoted id, after the rate limiter,
+	 * is what covers the default there.
+	 *
+	 * @param string $type        'post' or 'term'.
+	 * @param int    $id          Object ID the request named.
+	 * @param string $target_lang Target language slug.
+	 * @return \WP_Error|null WP_Error on denial, null when allowed.
+	 */
+	private function creation_denial( string $type, int $id, string $target_lang ): ?\WP_Error {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( $type === 'post' ) {
+			$copy_from = ( new \PerfLocale\Translation\PostTranslationManager( $plugin->get( 'cache' ), $plugin->get( 'settings' ) ) )
+				->get_copy_source_id( $id, $target_lang );
+			$allowed   = $copy_from <= 0 || $copy_from === $id || \PerfLocale\Helper::user_can_copy_translation_source( $copy_from );
+
+			if ( $allowed && $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_like( $copy_from ) ) {
+				return $this->error( 'cannot_create_type', __( 'You do not have permission to create translations of this content.', 'perflocale' ), 403 );
+			}
+		} else {
+			$term      = get_term( $id );
+			$copy_from = $term instanceof \WP_Term
+				? ( new \PerfLocale\Translation\TermTranslationManager( $plugin->get( 'cache' ) ) )->get_copy_source_id( $id, $term->taxonomy, $target_lang )
+				: 0;
+			$allowed   = $copy_from <= 0 || $copy_from === $id || current_user_can( 'edit_term', $copy_from );
+		}
+
+		return $allowed
+			? null
+			: $this->error( 'source_forbidden', __( 'You cannot edit the original this translation is copied from.', 'perflocale' ), 403 );
+	}
+
+	/**
 	 * Sliding-window rate limit for per-user MT requests.
 	 *
 	 * Protects the site owner from runaway scripts or mis-clicks that
@@ -557,12 +638,11 @@ final class MachineTranslateController extends RestController {
 	 * @return \WP_Error|null WP_Error on denial, null when allowed.
 	 */
 	private function enforce_rate_limit( int $user_id ): ?\WP_Error {
-		// Delegates to the shared policy. This method used to hold the whole
-		// implementation, and BlockTranslateController held a second copy;
-		// the `perflocale/translate-post` Ability, added later, had no copy at
-		// all and therefore no rate limit. Keeping a thin wrapper here
-		// preserves this class's gate ordering and error codes exactly while
-		// leaving exactly one implementation to change.
+		// Delegates to MtRateLimiter, the one hourly limiter shared with
+		// BlockTranslateController, the translate-post Ability and the admin
+		// create action. Keeping a thin wrapper here preserves this class's
+		// gate ordering and error codes exactly while leaving exactly one
+		// implementation to change.
 		return MtRateLimiter::admit( $user_id );
 	}
 }

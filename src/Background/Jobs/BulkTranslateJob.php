@@ -298,6 +298,14 @@ final class BulkTranslateJob extends AbstractJob {
 				continue;
 			}
 
+			// Whether the dispatching user may have translations of this source
+			// copied from the group's default-language post. Resolved once per
+			// source, at the first row that would create a translation, and
+			// reused for its remaining targets. A later row can add the
+			// default-language member itself; that copy derives from $source_id,
+			// which the user may edit, so the answer stays sound.
+			$copy_allowed = null;
+
 			foreach ( $target_ids as $target_lang_id ) {
 				$target_lang = $lang_by_id[ $target_lang_id ] ?? null;
 
@@ -319,6 +327,31 @@ final class BulkTranslateJob extends AbstractJob {
 					++$skipped;
 					++$processed;
 					$tick( $processed );
+					continue;
+				}
+
+				// The row creates a translation, which is copied from the group's
+				// default-language post rather than necessarily from $source_id,
+				// so edit_post on $source_id above is not enough. A 0 answer
+				// (nothing would be copied) is not remembered: it can depend on
+				// the target.
+				if ( $copy_allowed === null ) {
+					$copy_from = $manager->get_copy_source_id( (int) $source_id, (string) $target_lang->slug );
+
+					if ( $copy_from > 0 ) {
+						$copy_allowed = $copy_from === (int) $source_id || \PerfLocale\Helper::user_can_copy_translation_source( $copy_from );
+					}
+				}
+
+				if ( $copy_allowed === false ) {
+					++$skipped;
+					++$processed;
+					$tick( $processed );
+
+					if ( $first_error === '' ) {
+						$first_error = __( 'You cannot edit the original this translation is copied from.', 'perflocale' );
+					}
+
 					continue;
 				}
 

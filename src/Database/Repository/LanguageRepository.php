@@ -514,7 +514,7 @@ final class LanguageRepository implements RepositoryInterface {
 	 * @return int|false Inserted ID or false.
 	 */
 	public function insert( array $data ): int|false {
-		$sanitized = $this->sanitize_data( $data );
+		$sanitized = self::sanitize_data( $data );
 
 		// A language with no slug can never match a rewrite rule, so the row is
 		// dead on arrival. It was reachable: the Add Language screen sanitises
@@ -1230,7 +1230,7 @@ final class LanguageRepository implements RepositoryInterface {
 			return false;
 		}
 
-		$sanitized = $this->sanitize_data( $data );
+		$sanitized = self::sanitize_data( $data );
 
 		// sanitize_data() whitelists `slug`, and the Edit Language form
 		// renders the Slug field editable — so a rename can arrive here and
@@ -1919,10 +1919,17 @@ final class LanguageRepository implements RepositoryInterface {
 	/**
 	 * Sanitize language data for insert/update.
 	 *
+	 * Public so the JSON data import can store a language row from a user
+	 * without `unfiltered_html` exactly as this repository would, rather than
+	 * through a copy of these rules. It sanitizes only; the slug-shape check
+	 * stays in insert() and update().
+	 *
+	 * @internal
+	 *
 	 * @param array<string, mixed> $data Raw data.
 	 * @return array<string, mixed> Sanitized data.
 	 */
-	private function sanitize_data( array $data ): array {
+	public static function sanitize_data( array $data ): array {
 		$sanitized = [];
 
 		$string_fields = [ 'slug', 'locale', 'name', 'native_name', 'flag', 'date_format', 'time_format', 'text_direction' ];

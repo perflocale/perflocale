@@ -72,8 +72,20 @@ final class SiteCleanup {
 	 */
 	private const AS_GROUP = 'perflocale';
 
+	/**
+	 * The settings row, which is also where each blog's
+	 * `delete_data_on_uninstall` decision lives.
+	 *
+	 * Named as a constant because the purge has to treat it specially: it is
+	 * in STATIC_OPTIONS like every other option, but it is deleted LAST (see
+	 * purge_current_site()).
+	 *
+	 * @var string
+	 */
+	public const MODE_OPTION = 'perflocale_settings';
+
 	public const STATIC_OPTIONS = [
-		'perflocale_settings',
+		self::MODE_OPTION,
 		'perflocale_tables_exist',
 		'perflocale_db_version',
 		'perflocale_version',
@@ -168,7 +180,63 @@ final class SiteCleanup {
 		// Addon bootable-cache generation token, written on multisite by
 		// AddonRegistry::flush_bootable_cache() (BOOTABLE_GEN_OPTION).
 		'perflocale_bootable_gen',
+		// Resume marker for an uninstall sweep that ran out of execution
+		// budget. Listed here so the orphan-data audit covers it and so the
+		// run that finishes the sweep removes it — uninstall.php deletes this
+		// list ONLY on the completing pass, precisely so an interrupted sweep
+		// keeps its own marker.
+		self::RESUME_OPTION,
 	];
+
+	/**
+	 * Network option holding the uninstall sweep's resume marker.
+	 *
+	 * Shape: `[ 'last_site_id' => int, 'updated' => int ]`, where
+	 * `last_site_id` means "every blog whose id is <= this has been purged".
+	 *
+	 * @var string
+	 */
+	public const RESUME_OPTION = 'perflocale_uninstall_resume';
+
+	/**
+	 * How long a resume marker may be trusted.
+	 *
+	 * ⚠️ A marker that is honoured forever is worse than no marker at all.
+	 * An interrupted uninstall that the operator never finishes leaves one
+	 * behind in `wp_sitemeta`, where it would silently skip every blog at or
+	 * below `last_site_id` on the NEXT uninstall — months later, after a
+	 * re-install, on data that has nothing to do with the pass that wrote it.
+	 * Past this age the marker is dropped and the sweep starts from the
+	 * beginning.
+	 *
+	 * Every pass rewrites the marker, so a genuine multi-pass recovery keeps
+	 * it fresh however long it takes. The failure mode of expiring too early
+	 * is re-walking blogs that are already clean, which costs a little work
+	 * and loses nothing; the failure mode of expiring too late is skipping
+	 * blogs that still hold data. The asymmetry is the whole reason this
+	 * constant exists.
+	 *
+	 * Spelled as a number rather than `DAY_IN_SECONDS`: this class is the one
+	 * the uninstall path loads by hand, and it must not depend on a WordPress
+	 * constant being defined wherever it is included — a bare-PHP harness
+	 * without WP loaded fataled on exactly that.
+	 *
+	 * @var int
+	 */
+	private const RESUME_MAX_AGE = 86400;
+
+	/**
+	 * Share of PHP's `max_execution_time` the network purge may spend.
+	 *
+	 * Same number as Deactivator::NETWORK_SWEEP_TIME_SHARE, and deliberately
+	 * so: an operator tuning one sweep is tuning the same kind of work in the
+	 * other. The remaining share covers the blog that is mid-purge when the
+	 * deadline lands, the network-option sweep after the loop, and core's own
+	 * deletion of the plugin directory once uninstall.php returns.
+	 *
+	 * @var float
+	 */
+	private const NETWORK_PURGE_TIME_SHARE = 0.7;
 
 	/**
 	 * wp_options name patterns (LIKE) cleared on full uninstall.
@@ -257,6 +325,250 @@ final class SiteCleanup {
 	];
 
 	/**
+	 * Purge every blog of the installation, each one per its own
+	 * `delete_data_on_uninstall` setting.
+	 *
+	 * `uninstall.php` is the only caller. It passes a deadline, because a
+	 * plugin deletion is an ordinary admin request; under WP-CLI
+	 * (`wp plugin uninstall perflocale`) there is no execution limit, the
+	 * deadline is null, and one pass sweeps the whole network.
+	 *
+	 * ⚠️ This work cannot be deferred to a background job. `uninstall.php`
+	 * runs while the plugin is being deleted and WordPress removes the files
+	 * immediately afterwards, so a queued job would fire against a callback
+	 * that no longer exists. Whatever does not finish in this request never
+	 * happens — which is why an interrupted sweep leaves a marker instead.
+	 *
+	 * Scope, chunking and the deadline mirror
+	 * {@see \PerfLocale\Deactivator::deactivate_for_network()}, with one
+	 * deliberate difference: `network_id` is NOT scoped here. Deactivation
+	 * acts on the one network whose admin pressed the button; uninstall
+	 * removes the plugin's FILES from the whole installation, so every blog
+	 * of every network loses the code that owns these rows. Narrowing this
+	 * query would strand sibling networks' tables, options and schedules
+	 * forever with nothing left on disk to clean them up.
+	 *
+	 * The resume marker holds the highest blog id for which every blog at or
+	 * below it has been purged. It stops advancing at the first blog that
+	 * throws, so a resumed sweep re-runs that blog rather than stepping over
+	 * a half-cleaned one; every purge step is idempotent, so re-running costs
+	 * work, never data.
+	 *
+	 * @param float|null $deadline Wall-clock time (microtime(true)) after
+	 *     which the loop stops between blogs, or null for no limit.
+	 * @return array{complete: bool, entered: int, purged: int, failed: int, skipped: int, last_site_id: int, total: int}
+	 */
+	public static function purge_network( ?float $deadline = null ): array {
+		/** This filter is documented in src/Deactivator.php. */
+		$filtered_chunk = apply_filters( 'perflocale/activation/chunk_size', 100 );
+		// A non-numeric return falls back to the default rather than casting
+		// to 0 and clamping to a chunk of 1, which would turn one site query
+		// into one site query per blog.
+		$chunk = is_numeric( $filtered_chunk ) ? max( 1, (int) $filtered_chunk ) : 100;
+
+		// Everything about the marker is checked before it is trusted: it is
+		// whatever happens to be in wp_sitemeta. A hand-edited row, a
+		// half-written one, or one left by an uninstall nobody ever finished
+		// must all degrade to "start from the beginning" — the safe
+		// direction, because it re-walks clean blogs instead of skipping
+		// dirty ones.
+		$marker     = get_site_option( self::RESUME_OPTION, [] );
+		$done_up_to = 0;
+
+		if ( is_array( $marker )
+			&& isset( $marker['last_site_id'], $marker['updated'] )
+			&& is_numeric( $marker['last_site_id'] )
+			&& is_numeric( $marker['updated'] )
+		) {
+			$age = time() - (int) $marker['updated'];
+
+			if ( $age >= 0 && $age <= self::RESUME_MAX_AGE ) {
+				$done_up_to = max( 0, (int) $marker['last_site_id'] );
+			} else {
+				// Stale, or stamped in the future by a clock change. Drop it
+				// rather than carry it: leaving it would let the next
+				// uninstall inherit a skip nobody asked for.
+				delete_site_option( self::RESUME_OPTION );
+			}
+		}
+
+		$offset         = 0;
+		$entered        = 0;
+		$purged         = 0;
+		$failed         = 0;
+		$skipped        = 0;
+		$high_water     = $done_up_to;
+		$had_failure    = false;
+		$out_of_time    = false;
+		$got_full_chunk = false;
+
+		do {
+			$site_ids = (array) get_sites(
+				[
+					'fields'  => 'ids',
+					'number'  => $chunk,
+					'offset'  => $offset,
+					// `offset` paging is only stable against a fixed sort,
+					// and ascending id is also what the resume marker means.
+					'orderby' => 'id',
+					'order'   => 'ASC',
+				]
+			);
+
+			foreach ( $site_ids as $site_id ) {
+				$site_id = (int) $site_id;
+				if ( $site_id <= 0 ) {
+					continue;
+				}
+
+				// Already purged by an earlier pass. Paging from offset 0 and
+				// skipping is deliberate: WP_Site_Query has no "id greater
+				// than" argument, and a blog deleted between passes would
+				// shift every stored offset by one. Id-only chunks are ~10
+				// bytes each, so re-walking them costs a query per chunk.
+				if ( $site_id <= $done_up_to ) {
+					++$skipped;
+					continue;
+				}
+
+				// `$entered > 0` guarantees forward progress: a request that
+				// arrives having already spent its budget must still purge one
+				// blog rather than turning the whole sweep into a no-op. The
+				// test sits BEFORE switch_to_blog(), so no blog is ever left
+				// half-purged by the deadline itself.
+				if ( $entered > 0 && null !== $deadline && microtime( true ) >= $deadline ) {
+					$out_of_time = true;
+					break 2;
+				}
+
+				++$entered;
+
+				// switch_to_blog() is INSIDE the try, unlike the deactivation
+				// sweep's otherwise identical loop. Core pushes onto the
+				// switched stack before it fires `switch_blog`, so a listener
+				// that throws would leave the wrong blog current for the rest
+				// of the request - and, with the switch outside the try, abort
+				// the sweep for every remaining blog on the installation. The
+				// finally below restores either way.
+				try {
+					switch_to_blog( $site_id );
+
+					self::purge_current_site( self::blog_wants_data_deleted() );
+					++$purged;
+
+					if ( ! $had_failure ) {
+						$high_water = $site_id;
+					}
+				} catch ( \Throwable $e ) {
+					// One blog's failure must not abort the sweep — every
+					// other blog still loses the code that owns its rows.
+					++$failed;
+					$had_failure = true;
+
+					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on the uninstall path; there is no UI left to surface it in.
+					error_log( '[PerfLocale] uninstall purge failed on site ' . $site_id . ': ' . $e->getMessage() );
+				} finally {
+					restore_current_blog();
+				}
+			}
+
+			$offset        += $chunk;
+			$got_full_chunk = ( count( $site_ids ) === $chunk );
+		} while ( $got_full_chunk );
+
+		$complete = ! $out_of_time;
+		$total    = 0;
+
+		if ( $complete ) {
+			// Nothing left to resume. On the uninstall path the marker is in
+			// NETWORK_OPTIONS as well, so this is a harmless second delete;
+			// on the CLI path it is the only one.
+			delete_site_option( self::RESUME_OPTION );
+		} else {
+			$total = (int) get_sites( [ 'count' => true ] );
+
+			update_site_option(
+				self::RESUME_OPTION,
+				[
+					'last_site_id' => $high_water,
+					'updated'      => time(),
+				]
+			);
+		}
+
+		return [
+			'complete'     => $complete,
+			'entered'      => $entered,
+			'purged'       => $purged,
+			'failed'       => $failed,
+			'skipped'      => $skipped,
+			// Blogs this pass did not reach at all. `purged` counts only this
+			// pass and `skipped` only what earlier passes did, so neither on
+			// its own tells an operator how much is left — and an earlier
+			// draft's log line said "purged 12 of 40" when 8 remained.
+			'remaining'    => max( 0, $total - $skipped - $purged ),
+			'last_site_id' => $high_water,
+			'total'        => $total,
+		];
+	}
+
+	/**
+	 * Wall-clock deadline for the network purge, or null when PHP imposes no
+	 * execution limit (WP-CLI, most cron runners) and the loop may run to
+	 * completion.
+	 *
+	 * Why bound it at all: a kill lands in the middle of one blog's purge —
+	 * tables dropped, options half-swept — and WordPress then deletes the
+	 * plugin directory anyway, leaving nothing on disk that knows how to
+	 * finish. Stopping between blogs instead leaves every unswept blog
+	 * internally consistent and records where to pick up.
+	 *
+	 * ⚠️ `max_execution_time` is a CPU-time limit on most builds, and a purge
+	 * is mostly waiting on the database, so PHP's own timer may never fire.
+	 * It is used here as the best available PROXY for the wall-clock budget
+	 * that actually kills plugin-deletion requests — the web server's or
+	 * proxy's own timeout, which PHP cannot see. Being early costs one extra
+	 * pass; being late costs a half-purged blog.
+	 *
+	 * Measured from the request start rather than from the loop, because
+	 * bootstrap and core's own pre-delete work have already spent part of the
+	 * limit by the time uninstall.php runs. `$timestart` is set by
+	 * timer_start() in wp-settings.php; it is read via $GLOBALS so a missing
+	 * or odd value falls back instead of fatalling.
+	 *
+	 * @return float|null
+	 */
+	public static function uninstall_deadline(): ?float {
+		$limit = (int) ini_get( 'max_execution_time' );
+
+		if ( $limit <= 0 ) {
+			return null;
+		}
+
+		$started = isset( $GLOBALS['timestart'] ) && is_numeric( $GLOBALS['timestart'] )
+			? (float) $GLOBALS['timestart']
+			: microtime( true );
+
+		return $started + max( 1.0, $limit * self::NETWORK_PURGE_TIME_SHARE );
+	}
+
+	/**
+	 * Read the current blog's "delete data on uninstall" decision.
+	 *
+	 * Read INSIDE the per-blog loop so every subsite's own preference is
+	 * respected: reading it once from whatever blog happened to be current
+	 * when uninstall.php loaded (usually the network's main site) would
+	 * silently purge data on subsites whose admin chose to preserve it.
+	 *
+	 * @return bool True if this blog opted in to full data deletion.
+	 */
+	public static function blog_wants_data_deleted(): bool {
+		$settings = get_option( 'perflocale_settings', [] );
+
+		return is_array( $settings ) && ! empty( $settings['delete_data_on_uninstall'] );
+	}
+
+	/**
 	 * Run the chosen cleanup path for the current blog. Caller is
 	 * responsible for switch_to_blog / restore_current_blog on multisite.
 	 *
@@ -293,6 +605,16 @@ final class SiteCleanup {
 		// "no callback" / missing-class errors. Cleaning loses nothing (no user
 		// data in schedules; AS actions restart on the next install).
 		self::clear_all_scheduled_events();
+
+		// LAST, and only on the deleting path: the settings row is what
+		// `blog_wants_data_deleted()` reads. While it is still there, an
+		// interrupted purge is a purge that will be finished in the same mode
+		// when the operator resumes or deletes again. Once it is gone the
+		// blog looks like one that chose to preserve its data, so it must not
+		// go until there is nothing left to get wrong.
+		if ( $delete_data ) {
+			delete_option( self::MODE_OPTION );
+		}
 	}
 
 	/**
@@ -315,7 +637,19 @@ final class SiteCleanup {
 		Schema::drop_tables();
 
 		// 3. Plugin options - static list + LIKE-patterns.
+		//
+		// `perflocale_settings` is held back to the END of the whole purge
+		// (see purge_current_site()). It is the option this blog's
+		// delete-or-preserve decision is read from, so deleting it here left
+		// a purge that died part-way - a max_execution_time kill, a fatal on
+		// one blog - coming back as PRESERVE mode on the retry, stranding
+		// that blog's meta, translation files and role permanently. Nothing
+		// else in the purge reads it, so holding it back costs nothing.
 		foreach ( self::STATIC_OPTIONS as $opt ) {
+			if ( self::MODE_OPTION === $opt ) {
+				continue;
+			}
+
 			delete_option( $opt );
 		}
 
@@ -663,7 +997,10 @@ final class SiteCleanup {
 	 * @return void
 	 */
 	private static function preserve_purge(): void {
-		self::strip_role_and_caps();
+		// `true`: this path may skip blogs that never had our caps. The full
+		// purge may NOT - by the time it calls this, its own option sweep has
+		// already deleted the flag the skip reads.
+		self::strip_role_and_caps( true );
 	}
 
 	/**
@@ -784,9 +1121,36 @@ final class SiteCleanup {
 	 * from the standard caps roles. Honors the perflocale/roles/cap_roles
 	 * filter so operators can keep custom roles untouched.
 	 *
+	 * @param bool $allow_skip When true (preserve path only), a blog that has
+	 *     neither `perflocale_caps_version` nor the Translator role is left
+	 *     alone. The full-data path must pass false: by the time it calls
+	 *     this, its own option sweep has already deleted that flag.
 	 * @return void
 	 */
-	private static function strip_role_and_caps(): void {
+	private static function strip_role_and_caps( bool $allow_skip = false ): void {
+		// A blog that never had our caps installed has nothing to strip. On a
+		// network uninstall in preserve mode this is the entire per-blog
+		// cost: without it every blog of the installation pays a
+		// remove_role() write, a remove_cap() write per cap per cap-role, and
+		// a usermeta scan - on a large network, tens of thousands of writes
+		// for blogs the plugin was never activated on.
+		//
+		// Both markers have to be absent. `perflocale_caps_version` is
+		// written whenever caps are installed, and the role's presence is
+		// checked directly, so a blog that has either one takes the full
+		// path.
+		//
+		// Only the preserve path may take this shortcut. On the full-data
+		// path the caller has already deleted `perflocale_caps_version` in
+		// its option sweep, so the flag would read as absent on every blog
+		// and a role-less blog would keep its editor/administrator caps.
+		if ( $allow_skip
+			&& false === get_option( 'perflocale_caps_version', false )
+			&& null === get_role( \PerfLocale\Admin\TranslatorRole::ROLE_SLUG )
+		) {
+			return;
+		}
+
 		remove_role( \PerfLocale\Admin\TranslatorRole::ROLE_SLUG );
 
 		$caps = self::canonical_caps();
@@ -802,6 +1166,19 @@ final class SiteCleanup {
 			}
 
 			foreach ( $caps as $cap ) {
+				// WP_Roles::remove_cap() calls update_option() on the whole
+				// `wp_user_roles` array every time, including for a cap the
+				// role never had — serialising the array and comparing it
+				// against the stored copy on each call. update_option()
+				// no-ops when the value is unchanged, so those calls cost
+				// work rather than DB writes; skipping them is the saving,
+				// and it is not a row-count saving. An earlier draft of this
+				// patch claimed "14 writes to 4" because the bench measuring
+				// it counted calls as writes.
+				if ( ! isset( $role->capabilities[ $cap ] ) ) {
+					continue;
+				}
+
 				$role->remove_cap( $cap );
 			}
 		}

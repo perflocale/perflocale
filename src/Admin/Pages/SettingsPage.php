@@ -3580,13 +3580,28 @@ final class SettingsPage {
 							<strong><?php echo esc_html__( 'Replace', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'delete all existing data first', 'perflocale' ); ?>
 						</label>
 					</fieldset>
+
 					<p class="description" style="margin-top:0;">
 						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale tables before loading, so anything the uploaded bundle does not carry is gone; Merge only adds.', 'perflocale' ); ?>
 						<a href="https://perflocale.com/docs/export-import/#merge-vs-replace" target="_blank" rel="noopener"><?php echo esc_html__( 'Merge vs Replace — what Replace clears', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 					<p class="description" style="margin-top:0;">
-						<?php echo esc_html__( 'Tip: re-importing the same backup in Merge mode creates fresh translation_groups rows (the table has no natural key) — the matching links de-duplicate via their (object_id, language_id) UNIQUE constraint, so the duplicate groups are linked to nothing and are swept by the daily orphan-group GC. For deterministic re-imports use Replace mode.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Tip: re-importing the same backup in Merge mode creates fresh translation_groups rows (the table has no natural key) — the matching links de-duplicate via their object_lang (type, object_id, language_id) UNIQUE key, so the duplicate groups are linked to nothing and are swept at the end of every Merge import. For deterministic re-imports use Replace mode.', 'perflocale' ); ?>
 					</p>
+
+					<fieldset style="margin:12px 0;">
+						<legend class="screen-reader-text"><?php echo esc_html__( 'Cross-site import', 'perflocale' ); ?></legend>
+						<label style="display:block;">
+							<input type="checkbox" name="perflocale_import_same_ids" value="1">
+							<?php
+							/* translators: the import refusal messages in DataImporter quote this label back to the operator, minus the parenthetical. Translate the two together or the message will name a control that is not on screen. */
+							echo esc_html__( 'This site is a copy of the site the file was exported from (post and term IDs match)', 'perflocale' );
+							?>
+						</label>
+						<p class="description" style="margin:4px 0 0 24px;">
+							<?php echo esc_html__( 'Translation links, translated slugs and content hashes name posts and terms by numeric ID. A file whose recorded site address is not this one is refused unless you tick this, because the same IDs belong to different content on a site that was set up separately. Tick it for a staging clone, a domain migration, or a backup of this site that records a language-specific address - not for a site that was rebuilt from a content export, which keeps the address and changes the IDs.', 'perflocale' ); ?>
+						</p>
+					</fieldset>
 
 					<?php submit_button( __( 'Import Data', 'perflocale' ), 'secondary', 'submit', false ); ?>
 				</form>

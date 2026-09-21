@@ -79,18 +79,23 @@ final class OptionStrings {
 
 	/**
 	 * Translations resolved ONCE when the filters are attached, keyed by option
-	 * name. Resolving at attach time rather than memoising per read is the
-	 * cheapest possible read path: the filter closes over a plain string and does
-	 * no lookup at all.
+	 * name, held in core's escaped storage form (see attach_read_filters()).
+	 * Resolving at attach time rather than memoising per read is the cheapest
+	 * possible read path: the filter closes over a plain string and does no
+	 * lookup at all.
 	 *
 	 * @var array<string, string>
 	 */
 	private array $resolved = [];
 
 	/**
-	 * The sanitized form of each resolved translation — i.e. the bytes
-	 * WordPress would actually store — keyed by option name. Filled lazily by
-	 * {@see self::sanitized_translation()} and cleared alongside $resolved.
+	 * Each resolved translation after sanitize_option() — the bytes
+	 * update_option() would hand the write-side veto — keyed by option name.
+	 * Usually identical to $resolved, which is already escaped, but
+	 * sanitize_option() can do more than escape (a utf8mb3 options column
+	 * encodes emoji; a sanitize_option_* filter may rewrite the value). Filled
+	 * lazily by {@see self::sanitized_translation()} and cleared alongside
+	 * $resolved.
 	 *
 	 * @var array<string, string>
 	 */
@@ -280,6 +285,23 @@ final class OptionStrings {
 
 			$translated = $this->lookup( $raw, $option );
 
+			// ⚠️ Serve the translation in core's STORAGE form: sanitize_option()
+			// esc_html()s both options (wp-includes/formatting.php), and core
+			// treats the stored value as already escaped. Escape once here, when
+			// resolved, so every translation and both serving modes match that
+			// form. Not in filter_option(), which runs on every read; not
+			// sanitize_option(), which can query the options column charset on a
+			// front-end request.
+			//
+			// esc_html() does not double-encode, so a translation already in the
+			// stored form is unchanged and renders exactly as the same title typed
+			// into Settings > General would. It runs BEFORE the comparison below:
+			// a translation that differs from the source only by escaping is no
+			// translation, and invalid UTF-8 (escaped to '') serves the source.
+			if ( null !== $translated ) {
+				$translated = esc_html( $translated );
+			}
+
 			// Only attach a filter for an option that actually has a translation.
 			// A site that has translated neither pays nothing.
 			if ( null !== $translated && '' !== $translated && $translated !== $raw ) {
@@ -357,8 +379,8 @@ final class OptionStrings {
 
 		// ⚠️ This callback fires for EVERY blog's details, not only ours. Writing
 		// this blog's raw title onto another blog's object relabels that blog
-		// with this one's name — `get_site( $other )->blogname` came back as the
-		// caller's title, which an audit reproduced on both networks.
+		// with this one's name — `get_site( $other )->blogname` comes back as
+		// the caller's title.
 		//
 		// Only OUR blog can have been poisoned in the first place: filter_option()
 		// bails when ms_is_switched(), and get_blog_details() for another blog
@@ -413,19 +435,18 @@ final class OptionStrings {
 		}
 
 		// ⚠️ COMPARE AT WORDPRESS'S SANITIZATION BOUNDARY, NOT BEFORE IT.
-		// update_option() runs sanitize_option() at option.php:41 and only then
-		// applies this filter at option.php:56, so $value has ALREADY been
-		// through esc_html(). Comparing it against the raw translation misses
-		// every title containing an apostrophe, ampersand or angle bracket —
-		// "Alex's Bakery" arrives as "Alex&#039;s Bakery" — and the guard silently
-		// lets the round-trip through, destroying the operator's real title with
-		// no backup and no error. An audit demonstrated exactly this on five
-		// translated cases; the raw-only comparison passed every one of them.
+		// update_option() runs sanitize_option() before it applies this filter,
+		// so $value has ALREADY been through esc_html(). A translation compared
+		// in any other form misses every title containing an apostrophe,
+		// ampersand or angle bracket — "Alex's Bakery" arrives as
+		// "Alex&#039;s Bakery" — and the guard silently lets the round-trip
+		// through, destroying the operator's real title with no backup and no
+		// error.
 		//
-		// Both representations are checked because a caller that writes the value
-		// straight back (the round-trip this exists to stop) produces the
-		// sanitized form, while a caller inside our own read window may hand back
-		// the raw one.
+		// $resolved is already held in that escaped form, which covers the
+		// ordinary round-trip. The sanitized form is checked as well because
+		// sanitize_option() can change more than the escaping (see $sanitized),
+		// and a miss here is unrecoverable.
 		if ( $value === $this->resolved[ $option ] || $value === $this->sanitized_translation( $option ) ) {
 			return $this->raw_option( $option );
 		}
@@ -436,10 +457,10 @@ final class OptionStrings {
 	/**
 	 * The resolved translation as WordPress would store it.
 	 *
-	 * Memoised per option: sanitize_option() applies filters and kses, and a
-	 * write path should not pay for it twice. Computed lazily rather than at
-	 * attach time so the ordinary front-end read path — which never writes —
-	 * pays nothing at all.
+	 * Memoised per option: sanitize_option() applies filters and can query the
+	 * options column charset, and a write path should not pay for it twice.
+	 * Computed lazily rather than at attach time so the ordinary front-end read
+	 * path — which never writes — pays nothing at all.
 	 *
 	 * @param string $option Option name.
 	 * @return string

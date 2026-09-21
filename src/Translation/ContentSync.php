@@ -259,14 +259,10 @@ final class ContentSync {
 			 * both directions: the translator saves and overwrites the source,
 			 * then the next source save overwrites the translation.
 			 *
-			 * Until 1.0.5 the builder addons added their layout documents here,
-			 * justified by a claim that "a layout must stay structurally
-			 * identical across siblings (text inside is translated at render)".
-			 * Nothing translated it at render, and a German Elementor save was
-			 * observed replacing the English page with visitors then served the
-			 * wrong language. Those documents are seed-only now; only text-free
-			 * keys (Beaver's `_fl_builder_enabled`, Oxygen's `ct_page_settings`)
-			 * still mirror. Pinned by builder-layout-ownership.php.
+			 * Page-builder layout documents hold their text inside them, so they
+			 * are seed-only; only text-free builder keys (Beaver's
+			 * `_fl_builder_enabled`, Oxygen's `ct_page_settings`) mirror.
+			 * Pinned by builder-layout-ownership.php.
 			 *
 			 * Every other addon-contributed "translatable" key (SEO titles/
 			 * descriptions, ACF/Meta Box/Pods field values, WooCommerce

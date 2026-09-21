@@ -148,15 +148,30 @@ final class TermTranslationManager {
 	 *     translation_links row. Manual is the default for the metabox /
 	 *     REST manual flows; auto-translate-on-save passes
 	 *     MachineTranslation.
-	 * @return int|false New term ID or false.
+	 * @param bool|null  $created Set to true when this call inserted the
+	 *     translation it returns, false otherwise. A translation this call did
+	 *     not create can be another author's, and the caller's own earlier
+	 *     reads may not have shown it: a caller that writes into the returned
+	 *     term must check this first.
+	 * @return int|false Term ID of the translation: newly created, or one
+	 *     already linked in the target language, which may be another
+	 *     process's. False on failure. Also false when another process holds
+	 *     the creation lock and this call gets no answer: the lock was still
+	 *     held when the wait budget ran out, or read free but could not be
+	 *     taken; or this call did not wait (this process already holds a
+	 *     creation lock, as a term create inside a post create does, or has
+	 *     spent its wait budget) and this process knows of no linked
+	 *     translation.
 	 */
 	public function create_translation(
 		int $source_id,
 		string $taxonomy,
 		string $target_slug,
 		bool $copy_content = false,
-		SourceType $source = SourceType::Manual
+		SourceType $source = SourceType::Manual,
+		?bool &$created = null
 	): int|false {
+		$created     = false;
 		$source_term = get_term( $source_id, $taxonomy );
 
 		if ( ! $source_term instanceof \WP_Term ) {
@@ -200,33 +215,22 @@ final class TermTranslationManager {
 		 */
 		$lock_ttl = max( 5, (int) apply_filters( 'perflocale/translation/create_term_lock_ttl', 30 ) );
 
-		$result = \PerfLocale\Concurrency\Lock::with(
+		return PostTranslationManager::create_under_lock(
 			'create_xlat_term_' . $source_id . '_' . $target_slug,
 			$lock_ttl,
-			function () use ( $source_id, $taxonomy, $target_slug, $target_lang, $copy_content, $source, $source_term ): int|false {
-				return $this->do_create_translation( $source_id, $taxonomy, $target_slug, $target_lang, $copy_content, $source, $source_term );
+			function () use ( $source_id, $taxonomy, $target_slug, $target_lang, $copy_content, $source, $source_term, &$created ): int|false {
+				return $this->do_create_translation( $source_id, $taxonomy, $target_slug, $target_lang, $copy_content, $source, $source_term, $created );
+			},
+			function () use ( $source_id, $target_slug ): int|false {
+				return $this->get_translation_id( $source_id, $target_slug ) ?? false;
 			}
 		);
-
-		if ( $result !== null ) {
-			return $result;
-		}
-
-		// Lost the lock race — sibling worker is creating this
-		// translation right now. Re-check; if it landed, return its ID.
-		$existing_after = $this->get_translation_id( $source_id, $target_slug );
-		if ( $existing_after !== null ) {
-			return $existing_after;
-		}
-
-		return false;
 	}
 
 	/**
 	 * Body of create_translation() executed under the
 	 * per-(source_id, target_slug) lock. Re-checks existence inside the
-	 * lock to close the TOCTOU between the public-method fast-path and
-	 * lock acquisition.
+	 * lock, against the database, before inserting anything.
 	 *
 	 * @param int        $source_id      Source term ID.
 	 * @param string     $taxonomy       Taxonomy slug.
@@ -235,8 +239,13 @@ final class TermTranslationManager {
 	 * @param bool       $copy_content   Whether to copy source description.
 	 * @param SourceType $source         Provenance tag.
 	 * @param \WP_Term   $source_term    Source term object (resolved by caller).
-	 * @return int|false New term ID, existing if a sibling worker created
-	 *                   it concurrently, or false on failure.
+	 * @param bool       $inserted       Set to true once a new term is inserted
+	 *                                   and linked.
+	 * @return int|false New term ID; the ID of a term already linked in the
+	 *                   target language, which another process may have
+	 *                   created after this process last read the group; or
+	 *                   false on failure, including no answer from the
+	 *                   existence query.
 	 */
 	private function do_create_translation(
 		int $source_id,
@@ -245,14 +254,33 @@ final class TermTranslationManager {
 		object $target_lang,
 		bool $copy_content,
 		SourceType $source,
-		\WP_Term $source_term
+		\WP_Term $source_term,
+		bool &$inserted
 	): int|false {
-		// Re-check existing INSIDE the lock. Another worker may have
-		// created the translation between the public method's
-		// fast-path check and us reaching here.
-		$existing = $this->get_translation_id( $source_id, $target_slug );
-		if ( $existing !== null ) {
-			return $existing;
+		// Re-check existing INSIDE the lock, and read the database to do it.
+		// get_translation_id() answers from this process's memo, filled before
+		// the lock was taken - by the public method's fast path, or much
+		// earlier by a batch that primed it - and blind to a translation
+		// another process has linked since. Inserting on that answer would
+		// write a second term (force_insert_term() walks past the taken slug),
+		// and linking it would take the language's slot from the other
+		// translation. No answer from the database returns false for the same
+		// reason: inserting on an unknown answer risks that duplicate.
+		$language_id = (int) $target_lang->id;
+		$linked      = $this->groups->find_translation_link_uncached( $source_id, ObjectType::Term, $language_id );
+
+		if ( $linked === false ) {
+			return false;
+		}
+
+		if ( $linked !== null ) {
+			// Later reads in this process must not answer from the view that
+			// missed it.
+			if ( $this->get_translation_id( $source_id, $target_slug ) !== $linked['object_id'] ) {
+				$this->groups->forget_stale_group( $linked['group_id'], ObjectType::Term );
+			}
+
+			return $linked['object_id'];
 		}
 
 		// Resolve the default-language term as the content source.
@@ -334,11 +362,13 @@ final class TermTranslationManager {
 			return false;
 		}
 
+		$inserted = true;
+
 		// Record the display slug so translated URLs resolve correctly.
 		// The DB slug is "base-lang" (e.g. uncategorized-de) but the URL
 		// should use the base slug (e.g. uncategorized).
 		$slug_manager = new \PerfLocale\Router\SlugManager( $this->cache );
-		$slug_manager->set_slug( 'term', $taxonomy, $new_term_id, (int) $target_lang->id, $base_slug );
+		$slug_manager->set_slug( 'term', $taxonomy, $new_term_id, $language_id, $base_slug );
 
 		// Also ensure the source term has a slug translation entry.
 		$source_lang = $this->detect_term_language( $source_id );
@@ -514,6 +544,41 @@ final class TermTranslationManager {
 		$translations = $this->get_translations( $term_id );
 
 		return $translations[ $lang_slug ] ?? null;
+	}
+
+	/**
+	 * The term create_translation() would copy from, for a caller to authorize.
+	 *
+	 * Mirrors create_translation()'s decisions: 0 when nothing would be copied
+	 * (the source term is missing, the target language is unknown, or a
+	 * translation is already linked and would simply be returned), otherwise
+	 * the resolved content source — the default-language member of the group,
+	 * or `$source_id` itself.
+	 *
+	 * Side-effect free, with no user policy: callers acting for a user apply
+	 * their own check to the returned id.
+	 *
+	 * @param int    $source_id   Term ID the caller was given.
+	 * @param string $taxonomy    Taxonomy slug.
+	 * @param string $target_slug Target language slug.
+	 * @return int Term ID that would be copied, or 0 when nothing would be.
+	 */
+	public function get_copy_source_id( int $source_id, string $taxonomy, string $target_slug ): int {
+		if ( ! get_term( $source_id, $taxonomy ) instanceof \WP_Term ) {
+			return 0;
+		}
+
+		if ( ! $this->languages->find_by_slug( $target_slug ) ) {
+			return 0;
+		}
+
+		if ( $this->get_translation_id( $source_id, $target_slug ) !== null ) {
+			return 0;
+		}
+
+		$content_source = $this->resolve_source_term( $source_id, $taxonomy );
+
+		return $content_source instanceof \WP_Term ? (int) $content_source->term_id : 0;
 	}
 
 	/**

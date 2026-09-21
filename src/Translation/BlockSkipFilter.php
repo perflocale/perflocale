@@ -16,12 +16,24 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * When a block in the post's content carries the `perflocaleSkipTranslation`
  * attribute (set by the Gutenberg block-toolbar "Do not translate" toggle),
- * hold its innerHTML aside during machine translation and restore it
- * verbatim afterwards.
+ * hold its WHOLE serialized subtree - delimiters, attributes, innerHTML and
+ * every innerBlock - aside during machine translation and restore it verbatim
+ * afterwards. Nothing inside it reaches the provider on this path.
+ *
+ * "On this path" is the whole-post pipeline only. The editor's block-level
+ * REST routes do not run through these filters and apply their own rules: the
+ * "translate this section / entire post" batches walk into a marked CONTAINER
+ * on purpose - marking a wrapper there means "keep the wrapper", not "keep
+ * everything under it", and only a marked LEAF is left out of the batch -
+ * while "Fill in from <lang> source" reads the block at the same position in
+ * the SOURCE post and translates it.
  *
  * Works across every MT callsite that flows through `TranslationService::translate_post`
  * because it hooks the existing `perflocale/mt/pre_translate` +
- * `perflocale/mt/post_translate` filters - nothing else changes.
+ * `perflocale/mt/post_translate` filters. The one thing that call site does for
+ * this class is call {@see self::discard_stash()} in its `finally`, so a
+ * provider failure between the two filters cannot leave the held-aside content
+ * behind.
  */
 final class BlockSkipFilter {
 
@@ -33,13 +45,25 @@ final class BlockSkipFilter {
 	public const SKIP_ATTRIBUTE = 'perflocaleSkipTranslation';
 
 	/**
-	 * Per-request store: index of the content text (within the $texts
-	 * batch) =&gt; array of [ placeholder =&gt; original_innerHTML ] to
+	 * Per-process store: index of the content text (within the $texts
+	 * batch) =&gt; array of [ placeholder =&gt; serialized block subtree ] to
 	 * restore post-translation.
 	 *
-	 * Keyed by `md5(serialize($texts))` so concurrent MT runs (rare but
-	 * possible under load) can't cross-contaminate each other's
-	 * restoration maps.
+	 * Keyed by the md5 of the batch's texts joined with `\x1F`, so one
+	 * translate_post run cannot restore another's map. A second run over the
+	 * same source content overwrites the same key rather than adding one.
+	 *
+	 * An entry is removed when {@see self::unmask_after()} consumes it, and
+	 * otherwise by {@see self::discard_stash()} from `translate_post`'s
+	 * `finally`. That pairing is a property of THAT call site: anything else
+	 * that applies `perflocale/mt/pre_translate` directly masks without a
+	 * matching discard, and the entry is then its caller's to clear. Inside
+	 * `translate_post` the pairing does not hold for a
+	 * `perflocale/mt/pre_translate` callback below priority 15 that rewrites
+	 * the texts (the key is then computed from text neither the restore nor the
+	 * discard re-derives), nor for a same-content `translate_post` nested
+	 * inside the mask-to-unmask window (the inner call owns the key) - both
+	 * pathological, both noted where they matter.
 	 *
 	 * @var array<string, array<int, array<string, string>>>
 	 */
@@ -58,8 +82,10 @@ final class BlockSkipFilter {
 	/**
 	 * Mask skip-marked blocks before MT runs. Called from
 	 * {@see TranslationService::translate_post} via
-	 * `perflocale/mt/pre_translate` (priority 15 so the glossary
-	 * pre-pass at priority 10 has already run).
+	 * `perflocale/mt/pre_translate`, late enough (priority 15) to mask what
+	 * earlier callbacks put into the content. A callback below that priority
+	 * which REWRITES the texts breaks the stash key, because the restore side
+	 * re-derives it from the raw post fields.
 	 *
 	 * @param array<int, string> $texts [title, content, excerpt].
 	 * @param string             $source_lang
@@ -88,16 +114,25 @@ final class BlockSkipFilter {
 			return $texts;
 		}
 
-		$blocks       = parse_blocks( $content );
-		$placeholders = [];
+		$blocks        = parse_blocks( $content );
+		$placeholders  = [];
+		$deep_withheld = false;
 
-		$this->mask_blocks( $blocks, $placeholders );
+		$this->mask_blocks( $blocks, $placeholders, $deep_withheld );
+
+		if ( $deep_withheld ) {
+			// Withholding a subtree leaves part of the post untranslated, which
+			// is a quieter outcome than the operator asked for. Report it once
+			// per run, the same way a lost placeholder is reported below.
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a deliberate partial-translation point.
+			error_log( 'PerfLocale BlockSkipFilter: content nested deeper than ' . self::MAX_DEPTH . ' block levels holds a subtree whose serialization carries the "do not translate" marker string; that whole subtree was kept out of the machine-translation request, so everything inside it stays untranslated.' );
+		}
 
 		if ( $placeholders === [] ) {
 			return $texts;
 		}
 
-		$key = $this->stash_key( $texts );
+		$key = self::stash_key( $texts );
 
 		self::$stash[ $key ][1] = $placeholders;
 
@@ -108,7 +143,7 @@ final class BlockSkipFilter {
 	}
 
 	/**
-	 * Restore masked innerHTML after MT.
+	 * Put the held-aside subtrees back after MT.
 	 *
 	 * @param array<int, string> $translated
 	 * @param array<int, string> $original [title, content, excerpt] pre-mask.
@@ -127,7 +162,7 @@ final class BlockSkipFilter {
 		// we saw pre-mask. Re-derive the key the same way.
 		$pre_mask_texts    = $original;
 		$pre_mask_texts[1] = $original[1];
-		$key               = $this->stash_key( $pre_mask_texts );
+		$key               = self::stash_key( $pre_mask_texts );
 
 		if ( empty( self::$stash[ $key ][1] ) ) {
 			return $translated;
@@ -163,28 +198,75 @@ final class BlockSkipFilter {
 	}
 
 	/**
-	 * Maximum innerBlocks recursion depth. Real WP content nests < 10 levels;
-	 * this is a safety valve against pathological / malicious input that
-	 * could otherwise blow the PHP stack during MT.
+	 * Drop the stash entry a run left behind.
+	 *
+	 * {@see self::unmask_after()} consumes the entry on the way out, but it
+	 * only runs once `perflocale/mt/post_translate` is reached: a provider that
+	 * throws in between never gets there, and the held-aside subtrees would
+	 * then sit in this static for the rest of the process - one entry per
+	 * distinct failing source post, which a long CLI or worker run through a
+	 * provider outage repeats. {@see TranslationService::translate_post} calls
+	 * this from its `finally`, so the failure path costs what the success path
+	 * already did.
+	 *
+	 * Keyed exactly as `unmask_after` keys its lookup, from the raw
+	 * [title, content, excerpt] triple, so it removes an entry in precisely the
+	 * cases the restore side would have found one.
+	 *
+	 * @param array<int, string> $texts Raw [title, content, excerpt] triple the run started from.
+	 * @return void
+	 */
+	public static function discard_stash( array $texts ): void {
+		if ( self::$stash === [] ) {
+			return;
+		}
+
+		unset( self::$stash[ self::stash_key( $texts ) ] );
+	}
+
+	/**
+	 * Depth at which the traversal below stops reading block attributes and
+	 * starts withholding whole subtrees instead. Real WP content nests < 10
+	 * levels. It bounds this class's own recursion only.
 	 */
 	private const MAX_DEPTH = 50;
 
 	/**
-	 * Walk a parsed-blocks tree, replacing innerHTML of skip-marked
-	 * blocks with a unique placeholder token. Recurses into innerBlocks
-	 * so nested blocks inherit the skip.
+	 * Walk a parsed-blocks tree, replacing each skip-marked block with a unique
+	 * placeholder token and stashing its whole serialized subtree. A marked
+	 * block is not descended into - everything inside it is preserved with it.
 	 *
 	 * @param array<int, array<string, mixed>> $blocks By reference.
-	 * @param array<string, string>            $placeholders By reference - filled with token =&gt; original HTML.
+	 * @param array<string, string>            $placeholders By reference - filled with token =&gt; serialized subtree.
+	 * @param bool                             $deep_withheld By reference - set when the past-depth branch withheld a subtree.
 	 * @param int                              $depth Current recursion depth (internal).
 	 * @return void
 	 */
-	private function mask_blocks( array &$blocks, array &$placeholders, int $depth = 0 ): void {
-		if ( $depth > self::MAX_DEPTH ) {
-			return;
-		}
+	private function mask_blocks( array &$blocks, array &$placeholders, bool &$deep_withheld, int $depth = 0 ): void {
+		// Past this depth the walk no longer reads attributes, and whatever it
+		// leaves in the tree is what the provider is sent. Withhold rather than
+		// hand a marked block over: every subtree whose SERIALIZATION contains
+		// the marker string is replaced whole, unmarked descendants included.
+		// Over-withholding at a depth real content never reaches is the safe
+		// side of that trade; translating a block the author marked "do not
+		// translate" is not.
+		$past_depth = $depth > self::MAX_DEPTH;
 
 		foreach ( $blocks as &$block ) {
+			if ( $past_depth ) {
+				$serialized = serialize_block( $block );
+
+				if ( strpos( $serialized, self::SKIP_ATTRIBUTE ) === false ) {
+					continue;
+				}
+
+				$token                  = $this->replace_with_token( $block );
+				$placeholders[ $token ] = $serialized;
+				$deep_withheld          = true;
+
+				continue;
+			}
+
 			$is_skip = ! empty( $block['attrs'][ self::SKIP_ATTRIBUTE ] );
 
 			if ( $is_skip ) {
@@ -192,11 +274,6 @@ final class BlockSkipFilter {
 				$has_kids = ! empty( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] );
 
 				if ( $original !== '' || $has_kids ) {
-					// Plain HTML-comment placeholder so it round-trips through
-					// providers unchanged (they treat comments as
-					// untranslatable boilerplate in HTML mode).
-					$token = '<!-- perflocale-skip-' . wp_generate_uuid4() . ' -->';
-
 					// Stash the ENTIRE serialized subtree - delimiters, attrs,
 					// innerHTML AND every innerBlock. Stashing only innerHTML
 					// while overwriting innerContent with a single string chunk
@@ -206,21 +283,10 @@ final class BlockSkipFilter {
 					// drops every child. A protected Quote kept its cite and
 					// lost its paragraph; a protected Group lost everything
 					// inside it.
-					$placeholders[ $token ] = serialize_block( $block );
+					$serialized = serialize_block( $block );
 
-					// Replace the whole node with a freeform block
-					// (blockName === null), which serialize_block() renders as
-					// its innerHTML verbatim - i.e. the bare token. The
-					// wrapper's own delimiters and attribute JSON therefore
-					// never reach the provider either, which is what the
-					// "whole block subtree is preserved" contract always said.
-					$block = [
-						'blockName'    => null,
-						'attrs'        => [],
-						'innerBlocks'  => [],
-						'innerHTML'    => $token,
-						'innerContent' => [ $token ],
-					];
+					$token                  = $this->replace_with_token( $block );
+					$placeholders[ $token ] = $serialized;
 				}
 
 				// Don't recurse - the whole block subtree is preserved.
@@ -228,19 +294,56 @@ final class BlockSkipFilter {
 			}
 
 			if ( ! empty( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] ) ) {
-				$this->mask_blocks( $block['innerBlocks'], $placeholders, $depth + 1 );
+				$this->mask_blocks( $block['innerBlocks'], $placeholders, $deep_withheld, $depth + 1 );
 			}
 		}
+
+		// The loop variable still points at the last element; a later write to
+		// it would rewrite that element rather than the variable.
+		unset( $block );
 	}
 
 	/**
-	 * Deterministic key for the current batch so `mask_before` and
-	 * `unmask_after` find the same stash entry.
+	 * Swap one block node for a freeform placeholder node and return the token.
+	 *
+	 * Both withholding paths go through here so they cannot drift apart. The
+	 * replacement is 1:1 - one node in, one node out - because the parent's
+	 * innerContent carries one NULL per inner block and serialize_block()
+	 * emits the next innerBlock for each of them: collapsing several nodes into
+	 * one would walk past the end of that list.
+	 *
+	 * @param array<string, mixed> $block By reference - replaced with the token node.
+	 * @return string The placeholder token now standing in for $block.
+	 */
+	private function replace_with_token( array &$block ): string {
+		// Plain HTML-comment placeholder so it round-trips through providers
+		// unchanged (they treat comments as untranslatable boilerplate in HTML
+		// mode).
+		$token = '<!-- perflocale-skip-' . wp_generate_uuid4() . ' -->';
+
+		// A freeform block (blockName === null) serializes as its innerHTML
+		// verbatim - i.e. the bare token. The original's own delimiters and
+		// attribute JSON therefore never reach the provider either, which is
+		// what the "whole block subtree is preserved" contract always said.
+		$block = [
+			'blockName'    => null,
+			'attrs'        => [],
+			'innerBlocks'  => [],
+			'innerHTML'    => $token,
+			'innerContent' => [ $token ],
+		];
+
+		return $token;
+	}
+
+	/**
+	 * Deterministic key for the current batch so `mask_before`, `unmask_after`
+	 * and `discard_stash` find the same stash entry.
 	 *
 	 * @param array<int, string> $texts
 	 * @return string
 	 */
-	private function stash_key( array $texts ): string {
+	private static function stash_key( array $texts ): string {
 		return md5( implode( "\x1F", array_map( 'strval', $texts ) ) );
 	}
 }

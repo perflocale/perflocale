@@ -108,9 +108,9 @@ final class StringScanner {
 		// and matching it against the full realpath means an installation that
 		// merely LIVES below a directory of that name — `/var/www/test/`,
 		// `/srv/build/`, a checkout under `dist/` — has every one of its files
-		// excluded and scans silently return "found 0". An audit reproduced
-		// exactly that: a readable file yielded a string through scan_file() while
-		// scan() on its own directory found nothing.
+		// excluded and scans silently return "found 0": a readable file yields
+		// a string through scan_file() while scan() on its own directory finds
+		// nothing.
 		//
 		// Anchoring to the scan root keeps every intentional exclusion working —
 		// a `vendor/` or `tests/` directory INSIDE the tree being scanned is still

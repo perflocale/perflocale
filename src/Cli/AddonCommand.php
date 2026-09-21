@@ -89,9 +89,8 @@ final class AddonCommand {
 				'id'            => $id,
 				'name'          => method_exists( $addon, 'get_name' ) ? $addon->get_name() : '',
 				// Bundled = ships inside the plugin's own addons/ directory.
-				// Bundled addons need --force to be disabled; external ones
-				// honour the disabled list without opt-in. Operator's main
-				// signal for "is this one of yours or one of mine".
+				// Operator's main signal for "is this one of yours or one of
+				// mine"; both kinds honour the disabled list.
 				'bundled'       => $reg && method_exists( $reg, 'is_bundled' ) ? $this->bool_label( $reg->is_bundled( $id ) ) : '-',
 				'booted'        => $reg && method_exists( $reg, 'is_booted' ) ? $this->bool_label( $reg->is_booted( $id ) ) : '-',
 				'disabled'      => $this->bool_label( AddonRegistry::is_disabled( $id ) ),

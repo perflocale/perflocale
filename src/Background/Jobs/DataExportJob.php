@@ -209,17 +209,9 @@ final class DataExportJob extends AbstractJob {
 		// different operators are otherwise unprotected at the filesystem
 		// layer.
 		// 2. ACCESS CONTROL. This file lands in wp-content/uploads, which is
-		// web-served. Helper::harden_directory() drops a `Deny from all`
-		// .htaccess beside it, but nginx, Caddy and Apache configured with
-		// `AllowOverride None` ignore that file completely: an anonymous
-		// GET of the exact URL returns 200 with the whole export body.
-		// Until process_export_download() streams and unlinks it, the
-		// filename IS the secret — and an export nobody downloads survives
-		// until Helper::gc_stale_upload_files() sweeps it, 7 days later.
-		//
-		// It used to be 6 characters: 62^6 = ~5.7e10, brute-forceable, while
-		// harden_directory()'s docblock justified the arrangement with 62^16
-		// — a figure true only of the import temp names. 32 is what WP core
+		// web-served, and not every server honours the `.htaccess`
+		// Helper::harden_directory() drops beside it, so the filename is the
+		// secret (see harden_directory()). 32 is what WP core
 		// uses for the privacy exports it stores in this same public tree
 		// (wp_privacy_generate_personal_data_export_file()). Do not shorten
 		// it; nothing parses this filename, so length costs nothing.

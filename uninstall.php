@@ -7,7 +7,14 @@
  * code path runs for both plugin uninstall and wp_uninitialize_site (when
  * a network admin permanently deletes a subsite).
  *
- * Handles both single-site and multisite installations.
+ * Handles both single-site and multisite installations. The multisite path
+ * is chunked and budget-bounded: it stops BETWEEN blogs rather than being
+ * killed inside one, and leaves a resume marker so a network too large for
+ * one request can be finished by re-installing the plugin and deleting it
+ * again WITHOUT activating it — core runs this file for an installed,
+ * inactive plugin, and the next pass carries on from the marker. From
+ * WP-CLI, `wp plugin uninstall perflocale` finishes it in one pass.
+ * See SiteCleanup::purge_network().
  *
  * @package PerfLocale
  */
@@ -58,10 +65,18 @@ $perflocale_includes = [
 	// alias a constant at class-definition time today, but the ordering costs
 	// nothing and stops a future constant alias from reintroducing exactly the
 	// bug this comment describes.
+	//
+	// PurgeResult is the SAME BUG a second time: uninstall() constructs it on
+	// every exit path and returns it, so without this line the purge throws
+	// after the deletions and the documented perflocale/addon/uninstalled
+	// action never fires — swallowed by the catch in SiteCleanup. A class this
+	// file does not require is only as safe as the last person who checked;
+	// the reachable set is asserted, not eyeballed.
 	__DIR__ . '/src/Addon/AddonMigrationErrors.php',
 	__DIR__ . '/src/Addon/AddonSchemaManager.php',
 	__DIR__ . '/src/Addon/AddonManifestWriter.php',
 	__DIR__ . '/src/Addon/PurgePlan.php',
+	__DIR__ . '/src/Addon/PurgeResult.php',
 	__DIR__ . '/src/Addon/AddonUninstaller.php',
 ];
 
@@ -76,11 +91,14 @@ unset( $perflocale_includes, $perflocale_include );
  * Read the "delete data on uninstall" decision from the CURRENT site's
  * settings. Must run inside the correct blog context on multisite.
  *
+ * Delegates so the single-site branch below and the per-blog network sweep
+ * in SiteCleanup::purge_network() cannot drift apart on what "delete my
+ * data" means. Kept as a function because this file has always exposed it.
+ *
  * @return bool True if the site opted in to full data deletion.
  */
 function perflocale_should_delete_data(): bool {
-	$settings = get_option( 'perflocale_settings', [] );
-	return ! empty( $settings['delete_data_on_uninstall'] );
+	return \PerfLocale\Database\SiteCleanup::blog_wants_data_deleted();
 }
 
 // Bail out cleanly if the SiteCleanup class never loaded — happens on
@@ -99,32 +117,15 @@ if ( ! class_exists( \PerfLocale\Database\SiteCleanup::class ) ) {
 // applied it to every subsite - which could silently purge data on
 // subsites whose admin explicitly chose to preserve it.
 if ( is_multisite() ) {
-	// Deliberately NOT scoped with `network_id`. Deactivator's sweep is - it
-	// acts on the one network whose admin pressed the button - but uninstall
-	// removes the plugin's FILES from the whole installation, so every blog of
-	// every network loses the code that owns these rows. Narrowing this query
-	// would strand sibling networks' tables, options and schedules forever
-	// with nothing left on disk to clean them up.
-	$perflocale_sites = get_sites(
-		[
-			'number' => 0,
-			'fields' => 'ids',
-		]
+	// The per-blog sweep lives in SiteCleanup, which keeps this file to the
+	// decisions that belong to an uninstall. It is chunked, budget-bounded,
+	// isolates one blog's failure from the rest, and records where it
+	// stopped. Its docblock carries the reasoning, including why `network_id`
+	// is deliberately NOT scoped here and why a background job cannot do this
+	// work.
+	$perflocale_sweep = \PerfLocale\Database\SiteCleanup::purge_network(
+		\PerfLocale\Database\SiteCleanup::uninstall_deadline()
 	);
-
-	foreach ( $perflocale_sites as $perflocale_site_id ) {
-		switch_to_blog( $perflocale_site_id );
-
-		// try/finally so a fatal on one site doesn't leave subsequent
-		// iterations running against the wrong blog context.
-		try {
-			\PerfLocale\Database\SiteCleanup::purge_current_site( perflocale_should_delete_data() );
-		} finally {
-			restore_current_blog();
-		}
-	}
-
-	unset( $perflocale_sites, $perflocale_site_id );
 
 	// Action Scheduler's tables are PER-BLOG on multisite, not network-wide:
 	// ActionScheduler_Abstract_Schema::get_full_table_name() builds its names
@@ -146,11 +147,34 @@ if ( is_multisite() ) {
 	// so the per-site purge loop above never touches them. Remove the plugin's
 	// network-scoped keys here (canonical list on SiteCleanup so the orphan
 	// audit can enforce coverage). These are regenerable cache tokens, safe to
-	// drop unconditionally on a network uninstall.
-	foreach ( \PerfLocale\Database\SiteCleanup::NETWORK_OPTIONS as $perflocale_network_option ) {
-		delete_site_option( $perflocale_network_option );
+	// drop on a network uninstall.
+	//
+	// ONLY on the pass that finished the sweep. That list contains the resume
+	// marker itself, so deleting it after an interrupted pass would throw away
+	// the one record of which blogs are still to do.
+	if ( $perflocale_sweep['complete'] ) {
+		foreach ( \PerfLocale\Database\SiteCleanup::NETWORK_OPTIONS as $perflocale_network_option ) {
+			delete_site_option( $perflocale_network_option );
+		}
+		unset( $perflocale_network_option );
+	} else {
+		// Logged unconditionally, not behind WP_DEBUG_LOG: by the time this
+		// happens the plugin's files are about to be deleted, so there is no
+		// UI left to surface it in, and the operator has to act.
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on the incomplete-uninstall path.
+		error_log(
+			sprintf(
+				'[PerfLocale] uninstall ran out of execution budget: %1$d site(s) purged in this pass, %2$d already done earlier, %3$d of %4$d still holding PerfLocale tables, options and scheduled events (everything above site id %5$d). Re-install the plugin and delete it again WITHOUT activating it - the next pass resumes from there. From WP-CLI, `wp plugin uninstall perflocale` finishes it in one pass, because WP-CLI has no execution limit. Nothing is deleted twice; the resume marker expires after a day, after which a fresh pass starts from the beginning.',
+				$perflocale_sweep['purged'],
+				$perflocale_sweep['skipped'],
+				$perflocale_sweep['remaining'],
+				$perflocale_sweep['total'],
+				$perflocale_sweep['last_site_id']
+			)
+		);
 	}
-	unset( $perflocale_network_option );
+
+	unset( $perflocale_sweep );
 } else {
 	\PerfLocale\Database\SiteCleanup::purge_current_site( perflocale_should_delete_data() );
 }

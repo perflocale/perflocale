@@ -1705,6 +1705,109 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	}
 
 	/**
+	 * The link in a language in an object's translation group, read from the
+	 * database.
+	 *
+	 * For a decision that must see what other processes have written:
+	 * get_translation_in_language() answers from this process's caches, which
+	 * keep what they held before another process linked a translation. One
+	 * indexed query, so keep it off read paths the caches serve correctly.
+	 *
+	 * @param int        $object_id   Any object in the group.
+	 * @param ObjectType $type        The object's type.
+	 * @param int        $language_id Language to look up.
+	 * @return array{group_id: int, object_id: int}|false|null The link; null
+	 *     when the object has no group of that type or nothing is linked in the
+	 *     language; false when there is no answer: the query did not run, failed,
+	 *     or returned a row of the wrong shape.
+	 */
+	public function find_translation_link_uncached( int $object_id, ObjectType $type, int $language_id ): array|false|null {
+		$links_table = $this->links_table();
+
+		// object_id is shared by the post, term and string id spaces, so the type
+		// is bound on the groups join. The language's link shares that group, so
+		// it has the same type.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- A read that must bypass every cache. Identifiers are bound with %i; WPCS cannot follow prepare() called on a property.
+		$sql = $this->wpdb->prepare(
+			'SELECT t.group_id, t.object_id FROM %i s
+			INNER JOIN %i g ON g.id = s.group_id AND g.type = %s
+			INNER JOIN %i t ON t.group_id = s.group_id AND t.language_id = %d
+			WHERE s.object_id = %d
+			LIMIT 1',
+			$links_table,
+			$this->groups_table(),
+			$type->value,
+			$links_table,
+			$language_id,
+			$object_id
+		);
+
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return false;
+		}
+
+		// Not get_row(): it cannot tell "no row" from "no answer". wpdb::query()
+		// returns false, before it resets last_error and last_result, when the
+		// connection is not ready or a `query` filter emptied the SQL, and
+		// get_row() then returns the previous query's row. query() returns the
+		// number of rows only when this query ran without an error.
+		$rows = $this->wpdb->query( $sql );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( ! is_int( $rows ) ) {
+			return false;
+		}
+
+		if ( 0 === $rows ) {
+			return null;
+		}
+
+		$result = $this->wpdb->last_result;
+		$row    = is_array( $result ) ? ( $result[0] ?? null ) : null;
+		$fields = is_object( $row ) ? get_object_vars( $row ) : [];
+		$group  = $fields['group_id'] ?? null;
+		$linked = $fields['object_id'] ?? null;
+
+		if ( ! is_numeric( $group ) || ! is_numeric( $linked ) || (int) $group <= 0 || (int) $linked <= 0 ) {
+			return false;
+		}
+
+		return [
+			'group_id'  => (int) $group,
+			'object_id' => (int) $linked,
+		];
+	}
+
+	/**
+	 * Drop this process's cached view of a group after the database showed a
+	 * link that view did not have.
+	 *
+	 * Calls invalidate_group_cache(), which clears the group's entries and
+	 * deletes the eager link map option. Two in-process copies survive that:
+	 * the memo of an earlier "no groups at all" answer, and the eager map inside
+	 * this process's alloptions, which delete_option() leaves alone when the
+	 * process that wrote the link has already deleted the option row. Dropping
+	 * alloptions costs one reload of the autoloaded options in this process
+	 * (and, with a persistent object cache, in the next request that reads
+	 * them); this runs only when two processes created the same translation.
+	 *
+	 * @param int        $group_id Group the link was found in.
+	 * @param ObjectType $type     The group's type.
+	 * @return void
+	 */
+	public function forget_stale_group( int $group_id, ObjectType $type ): void {
+		$this->invalidate_group_cache( $group_id );
+
+		if ( false === self::$has_any_groups_memo ) {
+			self::reset_static_caches();
+		}
+
+		if ( array_key_exists( 'perflocale_eager_links_' . $type->value, wp_load_alloptions() ) ) {
+			wp_cache_delete( 'alloptions', 'options' );
+		}
+	}
+
+	/**
 	 * Create a new translation group and link the first object.
 	 *
 	 * When `$migration_source` is provided, the (migration_type, source_key)

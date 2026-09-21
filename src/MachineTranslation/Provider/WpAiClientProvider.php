@@ -536,13 +536,10 @@ final class WpAiClientProvider extends AbstractProvider {
 				// Call the SNAKE_CASE method. Core's WP_AI_Client_Prompt_Builder
 				// applies wp_supports_ai() and the site-wide
 				// `wp_ai_client_prevent_prompt` policy filter ONLY inside its
-				// __call() proxy, i.e. only for snake_case names. The camelCase
+				// __call() proxy, i.e. only for snake_case names; the camelCase
 				// generateText() is the underlying SDK method and reaches the
-				// provider with no policy check at all — so a site that had
-				// blocked AI prompts globally was still being prompted by this
-				// plugin (found by tools/regression-tests/cov-machine-translation.php
-				// I15f). A builder without __call (a non-core SDK object) has no
-				// policy layer to bypass, so it keeps the direct call.
+				// provider without them. A builder without __call (a non-core
+				// SDK object) has no policy layer, so it keeps the direct call.
 				//
 				// When no AI provider is configured / available / the prompt is
 				// blocked, __call returns `$this->error` (a WP_Error) or the

@@ -360,7 +360,11 @@ final class LanguageRouter {
 		// rest of the request. Gated behind is_multisite() — switch_to_blog is
 		// a no-op on single-site, so the handler has nothing to do there.
 		if ( is_multisite() ) {
-			add_action( 'switch_blog', [ self::class, 'maybe_reset_on_switch' ], 10, 2 );
+			// Three args: core has passed 'switch' or 'restore' as the third
+			// since WP 5.4, and the handler needs it to tell a switch from the
+			// return leg of one. The plugin's floor is WP 6.4, so it is always
+			// there; the parameter is defaulted anyway.
+			add_action( 'switch_blog', [ self::class, 'maybe_reset_on_switch' ], 10, 3 );
 		}
 	}
 
@@ -2187,15 +2191,6 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Skip the write entirely when nothing in the active config can ever
-		// CONSUME the cookie. A Set-Cookie on every first anonymous view is
-		// poison for page caches (Varnish builtin turns it into hit-for-pass
-		// and every follow-up request carries an uncacheable Cookie header) —
-		// paid for a value no code path would read.
-		if ( ! $this->language_cookie_is_consumable() ) {
-			return;
-		}
-
 		// Validate the slug is a known active language to prevent cookie injection.
 		$slug_map = $this->get_language_slug_map();
 
@@ -2206,6 +2201,147 @@ final class LanguageRouter {
 		// Skip if cookie already has this value (avoids unnecessary Set-Cookie headers).
 		if ( isset( $_COOKIE['perflocale_lang'] ) && $_COOKIE['perflocale_lang'] === $slug ) {
 			return;
+		}
+
+		// Skip the write entirely when nothing in the active config can ever
+		// CONSUME the cookie. A Set-Cookie on every first anonymous view is
+		// poison for page caches (Varnish builtin turns it into hit-for-pass
+		// and every follow-up request carries an uncacheable Cookie header) —
+		// paid for a value no code path would read. The answer carries WHICH
+		// consumer kept it alive, because the narrowing below turns on that.
+		//
+		// LAST of the pure guards on purpose: it is the most expensive of them.
+		// This one costs up to three settings reads plus the detection order —
+		// and the filters each of those dispatches — where the five above it are
+		// an in-memory flag, a memoised UA match, ONE settings read and two
+		// lookups in a bundle this request has already loaded. Below the
+		// same-value guard it
+		// runs at most ONCE PER VISITOR, on the first request that was genuinely
+		// about to emit a Set-Cookie, instead of on every request of every
+		// returning visitor who already holds the right cookie. Every guard here
+		// is a pure early return with the same outcome — no write — so the order
+		// is free to be the cheap one; moving this back above them is a straight
+		// loss on the busiest path.
+		//
+		// $unrouted_default is an OUT-PARAMETER, not a second question. The
+		// narrowing below needs the same answer, so the consumer hands over the
+		// one it already resolved rather than being asked twice. It stays null
+		// when the redirect branch answers before reaching that point, which is
+		// why the narrowing keeps a fallback for it.
+		$unrouted_default = null;
+		$consumer         = $this->language_cookie_consumer( $unrouted_default );
+
+		if ( self::COOKIE_CONSUMER_NONE === $consumer ) {
+			return;
+		}
+
+		// A first-visit DEFAULT-language cookie on a WooCommerce-only site
+		// changes no answer anywhere, so do not pay a Set-Cookie for it.
+		//
+		// WHY IT IS REDUNDANT. When WooCommerce is the SOLE reason this cookie is
+		// readable, both of its readers treat "no cookie" and "cookie === the
+		// default slug" identically — PROVIDED the router itself answers with the
+		// default on a URL that carries no language (the clause below).
+		// detect_locale_early() then falls through to self::$default_language when
+		// its Store API branch finds nothing, and
+		// EmailTranslation::get_current_language_slug() only lets a cookie
+		// override the router when the router's own answer is empty or already
+		// the default. The header bought nothing and cost the page cache
+		// everything — Varnish's builtin VCL turns a Set-Cookie response into
+		// hit-for-pass, and every follow-up request then carries a Cookie header.
+		//
+		// EVERY CLAUSE IS LOAD-BEARING. What breaks if one is "simplified" away:
+		//
+		// WooCommerce must be the SOLE consumer. The three redirect features read
+		// this cookie on every request as "returning visitor — never steer
+		// again", and the detection loop of a subdirectory + visible-default-
+		// prefix site resolves the language FROM it. For those the default value
+		// is the whole point, so they still write — which is why
+		// language_cookie_consumer() reports the detection shape BEFORE the
+		// WooCommerce one instead of letting a store hide it. That ordering is
+		// the honest model, not the guard: the url_mode clause below refuses the
+		// same shape even when the operator has taken the cookie step out of the
+		// detection order, so neither one has to be trusted alone.
+		//
+		// The slug must be the DEFAULT one. A non-default shopper browses
+		// prefixed URLs and MUST keep their cookie: the block cart/checkout posts
+		// to the unprefixed /wp-json/wc/store/... base, so without it a German
+		// shopper gets English coupon/stock/checkout errors and an English order
+		// email. That is the bug the WooCommerce branch exists for, and this
+		// narrowing must never reach it. "Default" is asked of the same row the
+		// readers ask — the repository's default language, not the is_default
+		// flag on an arbitrary slug-map row, so a table carrying two flagged rows
+		// can never make this skip a write the readers would not call redundant.
+		//
+		// No cookie may be set yet. Drop this and the fix becomes the same bug
+		// inverted: a shopper who browsed /de/ and then switched back to the
+		// default language would keep perflocale_lang=de forever, and their cart,
+		// checkout and order emails would stay German. Overwriting a stale value
+		// is exactly what this write is for; only the first, no-cookie case is
+		// redundant — and a visitor who already carries a cookie is uncacheable
+		// anyway, so no cache benefit is given up.
+		//
+		// An un-routed URL must resolve to the default WITHOUT the cookie. In
+		// subdirectory mode with a VISIBLE default prefix it does not: the
+		// fallback in detect_locale_early() deliberately refuses to force the
+		// default there, so an un-prefixed URL leaves current_language null.
+		//
+		// WHICH REQUEST SHAPES THAT REALLY REACHES, precisely — a half-true
+		// version of this paragraph is how a future reader talks themselves out
+		// of the clause. Anything that runs wp() gets a language regardless:
+		// detect_language() fires on parse_request and its FINAL fallback is
+		// un-guarded, so /?wc-ajax=checkout (WooCommerce dispatches wc-ajax on
+		// template_redirect, i.e. after parse_request) and the Store API both end
+		// up on the default language there. admin-ajax.php is the shape that does
+		// not: it never calls wp() at all, so parse_request never fires and the
+		// router answers '' for the whole request. The classic checkout and any
+		// third-party wp_ajax_nopriv_ order handler post there, and at
+		// woocommerce_new_order the cookie is then the ONLY thing tagging the
+		// order's language. Skip the write in that shape and save_order_language()
+		// drops the order's _perflocale_language meta entirely: nothing to migrate
+		// on a slug rename, and the order silently follows the site default if the
+		// default language ever changes. E7/E8 of the regression suite drive that
+		// reader with the router forced to null and assert the two answers differ.
+		//
+		// detect_locale_early()'s Store API branch leans on the same clause for a
+		// narrower reason: it is what gives such a shopper a language BEFORE
+		// WooCommerce loads its text domain on init — which parse_request, where
+		// the fallback above lives, is far too late for.
+		//
+		// No edge worker may be in front. assets/js/edge-helper.js reads any
+		// perflocale_lang value as "returning visitor — stop steering"; with no
+		// cookie it re-derives the language from Accept-Language on every request
+		// and the default language becomes unreachable for that visitor. See
+		// edge_worker_may_steer() for how both worker strategies are covered.
+		//
+		// Cost: two free comparisons, then a memoised default-language read, then
+		// the url_mode answer the consumer above already resolved (recomputed only
+		// if the redirect branch answered first, in which case this whole block is
+		// unreachable), and only if all of those still match, one settings read and
+		// the filters it dispatches. All of it on a path that was about to emit a
+		// header anyway, at most once per visitor; nothing here adds a query, an
+		// option read or a cache round-trip, and every earlier guard still returns
+		// before reaching it.
+		if (
+			self::COOKIE_CONSUMER_WOOCOMMERCE === $consumer
+			&& ! isset( $_COOKIE['perflocale_lang'] )
+			&& $this->slug_is_default( $slug )
+			&& ( $unrouted_default ?? $this->unrouted_url_resolves_to_default() )
+			&& ! $this->edge_worker_may_steer()
+		) {
+			/**
+			 * Whether to skip a language-cookie write that would change no
+			 * answer (the default slug, first visit, WooCommerce the only
+			 * reader). Return false to always write the cookie — for an edge,
+			 * CDN or analytics layer of your own that reads it.
+			 *
+			 * @hook perflocale/cookie/skip_redundant_write
+			 * @param bool   $skip Whether to skip the redundant write. Default true.
+			 * @param string $slug Language slug that would have been written.
+			 */
+			if ( (bool) apply_filters( 'perflocale/cookie/skip_redundant_write', true, $slug ) ) {
+				return;
+			}
 		}
 
 		/** @hook perflocale/cookie_lifetime Filter the language cookie lifetime in days. */
@@ -2225,44 +2361,184 @@ final class LanguageRouter {
 		);
 	}
 
+	/** No active code path can read the language cookie. */
+	private const COOKIE_CONSUMER_NONE = '';
+
+	/** A redirect feature reads it as "returning visitor — don't steer". */
+	private const COOKIE_CONSUMER_REDIRECT = 'redirect';
+
+	/** Only WooCommerce reads it (Store API language, order-email language). */
+	private const COOKIE_CONSUMER_WOOCOMMERCE = 'woocommerce';
+
+	/** The detection loop resolves the language FROM it on unprefixed URLs. */
+	private const COOKIE_CONSUMER_DETECTION = 'detection';
+
 	/**
-	 * Whether any active code path can ever READ the language cookie.
+	 * Which active code path can READ the language cookie.
+	 *
+	 * Returns the REASON, not a yes/no, because set_language_cookie() narrows
+	 * exactly one of them: a WooCommerce-only site does not need the cookie
+	 * written for its own default language, while every other consumer does.
+	 * Checked in precedence order — the redirect features read the cookie on
+	 * every request, so they answer first and cheapest.
 	 *
 	 * Consumers: the redirect features (browser / geo / edge-hint all treat
-	 * an existing cookie as "returning visitor — don't redirect"), and the
-	 * cookie step of the detection loop — which is only reachable when a
-	 * URL can lack language routing, i.e. subdirectory mode with a VISIBLE
-	 * default prefix (every other mode force-resolves unprefixed URLs to
-	 * the default in detect_locale_early()).
+	 * an existing cookie as "returning visitor — don't redirect"), the cookie
+	 * step of the detection loop — which is only reachable when a URL can lack
+	 * language routing, i.e. subdirectory mode with a VISIBLE default prefix
+	 * (every other mode force-resolves unprefixed URLs to the default in
+	 * detect_locale_early()) — and WooCommerce (see below).
 	 *
-	 * @return bool
+	 * ONE READER IS DELIBERATELY ABSENT from that list: clean_redirect_sentinel()
+	 * is registered unconditionally and reads the cookie before stripping
+	 * ?perflocale_redirected=1. It never needs the cookie kept alive on its own
+	 * account — that sentinel is only ever appended by the three redirect paths,
+	 * which answer REDIRECT above — but it is the reader an exhaustive reading
+	 * of the list would otherwise miss.
+	 *
+	 * ORDER MATTERS. WooCommerce is reported LAST of the three, because it is
+	 * the only answer the narrowing acts on: checking it first made the
+	 * detection consumer unreachable on every store, so a subdirectory site
+	 * with a visible default prefix silently lost the cookie its own detection
+	 * loop reads the moment WooCommerce was installed. Cheap checks still come
+	 * first — the redirect flags are in-memory booleans, and the detection
+	 * shape stops at one settings read in every url_mode but subdirectory.
+	 *
+	 * @param bool|null $unrouted_resolves_to_default Out-parameter, so the
+	 *                    caller's narrowing reuses the answer this method already
+	 *                    needed instead of recomputing it. Left null when the
+	 *                    redirect branch answers before it is resolved.
+	 * @return string One of the COOKIE_CONSUMER_* constants.
 	 */
-	private function language_cookie_is_consumable(): bool {
+	private function language_cookie_consumer( ?bool &$unrouted_resolves_to_default = null ): string {
+		$unrouted_resolves_to_default = null;
+
 		if (
 			(bool) $this->settings->get( 'redirect_browser_lang', false )
 			|| (bool) $this->settings->get( 'redirect_geo_enabled', false )
 			|| (bool) $this->settings->get( 'redirect_edge_hint_enabled', false )
 		) {
-			return true;
+			return self::COOKIE_CONSUMER_REDIRECT;
+		}
+
+		// Where an un-routed URL does NOT mean the default language, something
+		// has to resolve it — and the detection loop's cookie / edge_hint steps
+		// are what read this cookie to do it. Resolved INTO the out-parameter:
+		// the caller's narrowing needs the same answer and must not ask twice.
+		$unrouted_resolves_to_default = $this->unrouted_url_resolves_to_default();
+
+		if ( ! $unrouted_resolves_to_default ) {
+			$order = (array) $this->settings->get_detection_order();
+
+			if ( in_array( 'cookie', $order, true ) || in_array( 'edge_hint', $order, true ) ) {
+				return self::COOKIE_CONSUMER_DETECTION;
+			}
 		}
 
 		// WooCommerce Store API requests (block cart/checkout) post to the
 		// unprefixed REST base and resolve their language FROM this cookie
 		// (see detect_locale_early) — on WC sites the cookie is functional.
+		// EmailTranslation::get_current_language_slug() is a second, prefix-
+		// independent reader: the classic checkout posts to admin-ajax.php,
+		// where the cookie is the only thing tagging the order's language.
 		if ( class_exists( 'WooCommerce' ) ) {
+			return self::COOKIE_CONSUMER_WOOCOMMERCE;
+		}
+
+		return self::COOKIE_CONSUMER_NONE;
+	}
+
+	/**
+	 * Whether this slug is the site's default language.
+	 *
+	 * Asks the same row every reader whose equivalence the narrowing relies on
+	 * asks — LanguageRepository::get_default(), which is what
+	 * detect_locale_early() falls back to and what
+	 * EmailTranslation::get_current_language_slug() compares against — rather
+	 * than the is_default flag on a slug-map row. The two agree only while
+	 * exactly one active row carries the flag; a hand-edited or half-migrated
+	 * table would otherwise make the narrowing skip a write for a slug the
+	 * readers do not treat as the default.
+	 *
+	 * Reads the memoised bootstrap bundle already loaded for this request: no
+	 * query, no option read.
+	 *
+	 * @param string $slug Language slug about to be written.
+	 * @return bool
+	 */
+	private function slug_is_default( string $slug ): bool {
+		$this->load_default_language();
+
+		$default = self::$default_language;
+
+		return $default !== null && (string) $default->slug === $slug;
+	}
+
+	/**
+	 * Whether a URL carrying no language routing resolves to the DEFAULT
+	 * language on its own, without help from the cookie.
+	 *
+	 * This is the precondition that makes a default-slug cookie redundant, and
+	 * it is deliberately the SAME condition detect_locale_early() guards its
+	 * default fallback with. Subdirectory mode with a visible default prefix is
+	 * the one shape where an un-prefixed URL is NOT the default language, so
+	 * there the cookie is the only language signal a request that never reaches
+	 * parse_request has — admin-ajax.php above all, where the classic checkout
+	 * posts. set_language_cookie() spells out which shapes those are, and which
+	 * ones detect_language() answers for anyway.
+	 *
+	 * Two in-memory settings reads; no query, no option read.
+	 *
+	 * @return bool
+	 */
+	private function unrouted_url_resolves_to_default(): bool {
+		return $this->settings->get_url_mode() !== 'subdirectory'
+			|| $this->settings->hide_default_prefix();
+	}
+
+	/**
+	 * Whether an edge worker may be steering this visitor by language.
+	 *
+	 * Both bundled worker strategies stop steering the moment they see a
+	 * perflocale_lang cookie, so the cookie is functional for them even when
+	 * nothing inside WordPress would read it. Strategy B announces itself on
+	 * every request it forwards, with the hint header; Strategy A rewrites the
+	 * URL silently and announces nothing — but neither can run without
+	 * `edge_integration_enabled`, which is what exposes the /config endpoint
+	 * both of them fetch. Checking the setting first therefore covers the
+	 * silent strategy, and the header covers a worker pointed at a config it
+	 * cached earlier.
+	 *
+	 * Reached only from the narrowing in set_language_cookie(), i.e. at most
+	 * once per visitor and only on a request that was about to emit a header,
+	 * so its one settings read and the filters that read dispatches (the edge
+	 * enable override, then the header-name filter when the override is off)
+	 * cost nothing measurable.
+	 *
+	 * @return bool
+	 */
+	private function edge_worker_may_steer(): bool {
+		if ( $this->settings->edge_integration_enabled() ) {
 			return true;
 		}
 
-		if (
-			$this->settings->get_url_mode() === 'subdirectory'
-			&& ! $this->settings->hide_default_prefix()
-		) {
-			$order = (array) $this->settings->get_detection_order();
+		// Same filter and default detect_from_edge_hint() resolves the header
+		// name with. Never hard-code the name here: an operator who renamed it
+		// would silently lose the exemption and with it the default language.
+		$header_name = (string) apply_filters( 'perflocale/edge/hint_header', 'X-PerfLocale-Lang' );
 
-			return in_array( 'cookie', $order, true ) || in_array( 'edge_hint', $order, true );
+		if ( $header_name === '' ) {
+			return false;
 		}
 
-		return false;
+		// PHP exposes HTTP headers as HTTP_UPPER_WITH_UNDERSCORES.
+		$server_key = 'HTTP_' . strtoupper( str_replace( '-', '_', $header_name ) );
+
+		if ( ! isset( $_SERVER[ $server_key ] ) ) {
+			return false;
+		}
+
+		return sanitize_key( wp_unslash( (string) $_SERVER[ $server_key ] ) ) !== '';
 	}
 
 	/**
@@ -2270,6 +2546,17 @@ final class LanguageRouter {
 	 *
 	 * Used by GeoRedirect and other components that need to set
 	 * the cookie outside the detection loop.
+	 *
+	 * NOT an unconditional write, and this is the one case that surprises: where
+	 * WooCommerce is the ONLY thing on the site that can read the cookie, a
+	 * FIRST visit asking for the site's DEFAULT slug writes nothing, because no
+	 * reader can tell that value apart from no cookie at all. set_language_cookie()
+	 * carries the full reasoning and every clause of it. Everything else still
+	 * writes: a non-default slug, an existing cookie of any value, any redirect
+	 * feature on, an edge worker in front, or a site in subdirectory mode with a
+	 * visible default prefix. An integration that needs the header for a reader
+	 * of its own — an edge, CDN or analytics layer — restores the old behaviour
+	 * with `add_filter( 'perflocale/cookie/skip_redundant_write', '__return_false' )`.
 	 *
 	 * @param string $slug Language slug.
 	 * @return void
@@ -2492,16 +2779,27 @@ final class LanguageRouter {
 	}
 
 	/**
-	 * Per-blog state stack so nested switch_to_blog → … → restore_current_blog
-	 * sequences preserve each blog's detected language state. Keyed by blog id.
+	 * Language state parked by open switch_to_blog() calls, one frame per
+	 * call, in depth order — a stack, mirroring core's own
+	 * `$GLOBALS['_wp_switched_stack']`. `blog` records which blog the frame
+	 * belongs to so a restore can prove the frame it pops is its own.
 	 *
-	 * Bounded to MAX_STACK_DEPTH entries to prevent unbounded growth from
-	 * misbehaving plugins that call switch_to_blog() without a matching
-	 * restore_current_blog(). When the cap is hit, the oldest frame is evicted
-	 * (FIFO) - the most recently pushed states are more likely to be restored
-	 * next, so keep those.
+	 * ⚠️ DEPTH-ORDERED, NOT KEYED BY BLOG ID, and that is the whole point.
+	 * Keyed by blog id, a switch back INTO a blog that is still open lower
+	 * down the stack consumed the frame that blog's own restore would later
+	 * need, and the request came back to it with no language at all. Core
+	 * reaches that shape without any plugin misbehaving: get_home_url( $id ),
+	 * get_site_url( $id ) and get_blog_post( $id, … ) all switch and restore
+	 * internally, so passing the id of a blog you are already switched out of
+	 * is enough. Third-party code doing `switch_to_blog( get_main_site_id() )`
+	 * inside a switched context does the same.
 	 *
-	 * @var array<int, array{current: ?object, default: ?object, final: bool}>
+	 * Bounded to MAX_STACK_DEPTH entries so a plugin that switches without
+	 * restoring cannot grow it without limit. At the cap the OLDEST frame is
+	 * evicted: the deepest, most recently parked states are the ones about to
+	 * be restored.
+	 *
+	 * @var array<int, array{blog: int, current: ?object, default: ?object, final: bool}>
 	 */
 	private static array $blog_state_stack = [];
 
@@ -2513,18 +2811,52 @@ final class LanguageRouter {
 	private const MAX_STACK_DEPTH = 32;
 
 	/**
-	 * switch_blog hook handler. Behavior:
-	 * - Same blog id (e.g. WooCommerce's self-scoping switch_to_blog calls):
-	 * no-op - preserve state so the current request keeps working.
-	 * - Different blog id: push the leaving blog's state onto the stack,
-	 * then pop the entering blog's state if we have it (so a restore
-	 * recovers the original state), otherwise reset for fresh detection.
+	 * switch_blog hook handler.
 	 *
-	 * @param int|string $new_blog_id Target blog id.
+	 * Core fires this action on BOTH legs of a blog switch, with a `$context`
+	 * of 'switch' from switch_to_blog() and 'restore' from
+	 * restore_current_blog() (WP 5.4+; the plugin's floor is 6.4). The two
+	 * legs do opposite things here:
+	 *
+	 *   - 'switch'  — park the leaving blog's language state one frame deeper,
+	 *                 then start the entering blog clean, exactly as a first
+	 *                 visit to it would. If that blog is already open further
+	 *                 down the stack (a re-entrant switch), its live state is
+	 *                 COPIED from that frame rather than detected again — the
+	 *                 frame stays where it is, because the restore that owns
+	 *                 it still has to find it.
+	 *   - 'restore' — pop the frame this leg's matching switch parked and hand
+	 *                 its state back. Nothing is parked on the way out.
+	 *
+	 * Same blog id on either leg (WooCommerce and AIOWPSecurity both call
+	 * switch_to_blog( get_current_blog_id() ) to scope internal lookups) is a
+	 * no-op: the state must survive, or the switcher, hreflang and query
+	 * filters lose the detected language mid-request.
+	 *
+	 * ⚠️ Two failure modes this shape exists to avoid, both observed:
+	 *
+	 *   - parking on the 'restore' leg as well left one frame per completed
+	 *     switch/restore pair, keyed by a blog nothing would pop again: 31
+	 *     orphans after 40 paired switches on a real network, the cap reached,
+	 *     and a warning blaming a third-party plugin for a loop that was
+	 *     balanced. A later, unrelated switch into one of those blogs then
+	 *     picked its stale state back up instead of detecting afresh.
+	 *   - keying the store by blog id instead of by depth let a re-entrant
+	 *     switch consume the frame an outer restore still needed, so the
+	 *     request returned to that blog with no language at all and nothing
+	 *     to re-detect it — `detect_language()` runs on parse_request, once.
+	 *
+	 * @param int|string $new_blog_id  Target blog id.
 	 * @param int|string $prev_blog_id Previous blog id.
+	 * @param mixed      $context      'switch' from switch_to_blog(),
+	 *     'restore' from restore_current_blog(). Untyped on purpose: the
+	 *     action is public, and third-party code firing it by hand with
+	 *     something that is not a string must not fatal here. Anything that
+	 *     is not the string 'restore' is treated as a switch, which is what
+	 *     a two-argument caller got before WP 5.4.
 	 * @return void
 	 */
-	public static function maybe_reset_on_switch( $new_blog_id, $prev_blog_id ): void {
+	public static function maybe_reset_on_switch( $new_blog_id, $prev_blog_id, mixed $context = 'switch' ): void {
 		// WP core always passes int blog ids, but third-party code calling
 		// do_action( 'switch_blog', … ) directly could pass anything. is_numeric
 		// rejects null, bool, arrays, objects, and non-numeric strings - the
@@ -2542,50 +2874,71 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Defend against unbounded growth: if the stack is at cap, evict the
-		// oldest frame before pushing the new one. array_shift() would rekey
-		// numeric keys (blog_ids), so use the reset()/key()/unset() dance to
-		// drop the first entry while preserving all other blog_id keys.
-		if ( count( self::$blog_state_stack ) >= self::MAX_STACK_DEPTH ) {
-			reset( self::$blog_state_stack );
-			$oldest_blog_id = key( self::$blog_state_stack );
-			if ( $oldest_blog_id !== null ) {
-				unset( self::$blog_state_stack[ $oldest_blog_id ] );
-			}
+		if ( 'restore' === $context ) {
+			self::restore_blog_frame( $new );
 
-			// Surface the overflow in WP_DEBUG. Reaching this branch in
-			// normal multisite traffic indicates a third-party plugin is
-			// calling switch_to_blog() without matching restore_current_blog()
-			// — diagnose-aid for "language switcher mysteriously broke"
-			// support tickets where the original-blog state quietly vanishes.
+			// Always drop the path-prefix lookup: it's derived from the prior
+			// blog's slug_map and has no mapping back to a per-blog frame.
+			self::$path_prefix_map = null;
+			return;
+		}
+
+		// Defend against unbounded growth: at the cap, drop the OLDEST frame
+		// before parking a new one. The frames about to be restored are the
+		// deep ones, so the shallow end is what goes.
+		if ( count( self::$blog_state_stack ) >= self::MAX_STACK_DEPTH ) {
+			$evicted = array_shift( self::$blog_state_stack );
+
+			// Surface the overflow in WP_DEBUG. With the return leg no longer
+			// parking anything, reaching this branch means MAX_STACK_DEPTH
+			// switch_to_blog() calls are open at once with no matching
+			// restore_current_blog() — worth knowing, because the evicted
+			// frame is a blog whose language will not come back when its
+			// restore finally arrives. The message reports what was measured
+			// and names no culprit: the unbalanced calls may be anyone's,
+			// this plugin's included.
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+				// Read through is_array(): $GLOBALS is `mixed` to static
+				// analysis, and this only exists to put a number in a log line.
+				$open = isset( $GLOBALS['_wp_switched_stack'] ) && is_array( $GLOBALS['_wp_switched_stack'] )
+					? count( $GLOBALS['_wp_switched_stack'] )
+					: 0;
+
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Intentional WP_DEBUG diagnostic for stack-overflow detection; gated on WP_DEBUG_LOG above.
 				error_log(
 					sprintf(
-						'PerfLocale: LanguageRouter blog_state_stack hit MAX_STACK_DEPTH (%d). Evicted oldest frame for blog_id=%s. A plugin is likely calling switch_to_blog() without restore_current_blog().',
+						'PerfLocale: LanguageRouter parked %1$d blog-state frames with %2$d switch_to_blog() calls open; evicted the oldest (blog_id=%3$s), whose language state will be detected afresh instead of restored. switch_to_blog() calls outnumber restore_current_blog() calls in this request.',
 						self::MAX_STACK_DEPTH,
-						(string) $oldest_blog_id
+						$open,
+						(string) $evicted['blog']
 					)
 				);
 			}
 		}
 
-		self::$blog_state_stack[ $prev ] = [
+		self::$blog_state_stack[] = [
+			'blog'    => $prev,
 			'current' => self::$current_language,
 			'default' => self::$default_language,
 			'final'   => self::$detection_finalized,
 		];
 
-		if ( isset( self::$blog_state_stack[ $new ] ) ) {
-			$saved                     = self::$blog_state_stack[ $new ];
-			self::$current_language    = $saved['current'];
-			self::$default_language    = $saved['default'];
-			self::$detection_finalized = $saved['final'];
-			unset( self::$blog_state_stack[ $new ] );
+		// Re-entering a blog that is still open lower down the stack: copy its
+		// live state instead of detecting again, and LEAVE the frame in place
+		// — the restore that parked it still has to find it. A blog whose
+		// visit already finished has no frame left, so it is detected afresh,
+		// which is the point: state captured before anything changed must not
+		// be reused as if it were current.
+		$open_frame = self::find_open_frame( $new );
+
+		if ( null !== $open_frame ) {
+			self::$current_language    = $open_frame['current'];
+			self::$default_language    = $open_frame['default'];
+			self::$detection_finalized = $open_frame['final'];
 		} else {
-			// Clear state fields individually - do NOT call reset() here: reset()
-			// empties $blog_state_stack which would wipe the prev-blog frame we
-			// just pushed above and break the eventual restore.
+			// Clear the three state fields individually. Nothing here may
+			// empty $blog_state_stack: the frame parked a few lines above is
+			// what this switch's restore will come back for.
 			self::$current_language    = null;
 			self::$default_language    = null;
 			self::$detection_finalized = false;
@@ -2594,5 +2947,59 @@ final class LanguageRouter {
 		// Always drop the path-prefix lookup: it's derived from the prior
 		// blog's slug_map and has no mapping back to a per-blog frame.
 		self::$path_prefix_map = null;
+	}
+
+	/**
+	 * Pop the frame parked by the switch this restore is unwinding, and put
+	 * its language state back.
+	 *
+	 * The frame is only accepted when it belongs to the blog being returned
+	 * to. A mismatch means this handler's stack and core's have drifted apart
+	 * — third-party code firing `switch_blog` by hand, a frame evicted at the
+	 * cap, or the plugin being loaded mid-request with switches already open.
+	 * In that case the frame is put back untouched (it may still be somebody
+	 * else's) and the blog is treated as freshly entered, which is always
+	 * safe: detection runs again rather than the wrong blog's language being
+	 * applied.
+	 *
+	 * @param int $new Blog id being returned to.
+	 * @return void
+	 */
+	private static function restore_blog_frame( int $new ): void {
+		$frame = array_pop( self::$blog_state_stack );
+
+		if ( null !== $frame && $frame['blog'] === $new ) {
+			self::$current_language    = $frame['current'];
+			self::$default_language    = $frame['default'];
+			self::$detection_finalized = $frame['final'];
+			return;
+		}
+
+		if ( null !== $frame ) {
+			self::$blog_state_stack[] = $frame;
+		}
+
+		self::$current_language    = null;
+		self::$default_language    = null;
+		self::$detection_finalized = false;
+	}
+
+	/**
+	 * The frame of a blog whose switch_to_blog() is still open, if any.
+	 *
+	 * Scans at most MAX_STACK_DEPTH entries and only on a cross-blog switch,
+	 * so the cost is bounded and off the per-request path.
+	 *
+	 * @param int $blog_id Blog id to look for.
+	 * @return array{blog: int, current: ?object, default: ?object, final: bool}|null
+	 */
+	private static function find_open_frame( int $blog_id ): ?array {
+		for ( $i = count( self::$blog_state_stack ) - 1; $i >= 0; $i-- ) {
+			if ( self::$blog_state_stack[ $i ]['blog'] === $blog_id ) {
+				return self::$blog_state_stack[ $i ];
+			}
+		}
+
+		return null;
 	}
 }

@@ -126,8 +126,8 @@ final class Dispatcher {
 	 *
 	 * Anything larger would bloat the `args` column of the JobState
 	 * row. 100 KB comfortably covers every realistic job (an import job's
-	 * args are paths + IDs, not the payload itself) while rejecting a
-	 * hostile caller that tries to use the queue as a data sink.
+	 * args are paths + IDs, not the payload itself) while keeping the queue
+	 * from becoming a data sink.
 	 *
 	 * Filterable via `perflocale/jobs/max_args_bytes` for ops who genuinely
 	 * need bigger payloads (e.g. a custom job that ships inline data).
@@ -144,8 +144,7 @@ final class Dispatcher {
 
 		// Reject oversized args before they reach JobState::create — the
 		// args array is persisted in the `args` LONGTEXT column of the
-		// per-job row, and an attacker with dispatch permission could
-		// otherwise stuff the jobs table with megabytes of garbage per call.
+		// per-job row, which must not grow by megabytes per call.
 		$encoded = wp_json_encode( $args );
 		$limit   = (int) apply_filters( 'perflocale/jobs/max_args_bytes', self::MAX_ARGS_BYTES );
 

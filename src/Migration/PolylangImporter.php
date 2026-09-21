@@ -433,11 +433,8 @@ final class PolylangImporter {
 		}
 
 		foreach ( $translation_terms as $term ) {
-			// allowed_classes=false blocks object instantiation: Polylang
-			// writes this row when lower-privileged users assign language
-			// links via Polylang's UI, so unserialising without restriction
-			// would let editor-level POP gadgets run as the manage_options
-			// admin who triggers the migration.
+			// allowed_classes=false blocks object instantiation: this row is
+			// user-written data, so no object is created from it.
 			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false is the exact mitigation the rule warns about; @ suppresses the unsupported-class notice that the unserialize() options already neutralise.
 			$translations = is_serialized( (string) $term->description )
 				? @unserialize( (string) $term->description, [ 'allowed_classes' => false ] )
@@ -664,11 +661,8 @@ final class PolylangImporter {
 		$imported = 0;
 
 		foreach ( $translation_terms as $term ) {
-			// allowed_classes=false blocks object instantiation: Polylang
-			// writes this row when lower-privileged users assign language
-			// links via Polylang's UI, so unserialising without restriction
-			// would let editor-level POP gadgets run as the manage_options
-			// admin who triggers the migration.
+			// allowed_classes=false blocks object instantiation: this row is
+			// user-written data, so no object is created from it.
 			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false is the exact mitigation the rule warns about; @ suppresses the unsupported-class notice that the unserialize() options already neutralise.
 			$translations = is_serialized( (string) $term->description )
 				? @unserialize( (string) $term->description, [ 'allowed_classes' => false ] )

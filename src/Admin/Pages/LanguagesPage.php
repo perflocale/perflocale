@@ -107,6 +107,7 @@ final class LanguagesPage {
 					</strong>
 					<?php echo esc_html__( 'This cannot be undone. The rows below are removed in a single transaction — if any step fails, nothing is deleted.', 'perflocale' ); ?>
 				</p>
+				<p><?php echo esc_html( $this->routing_loss_warning( $language, true ) ); ?></p>
 			</div>
 
 			<table class="widefat striped" style="max-width: 760px;">
@@ -160,6 +161,94 @@ final class LanguagesPage {
 			</p>
 		</div>
 		<?php
+	}
+
+	/**
+	 * Warning shown where a language's URLs are about to stop being routed.
+	 *
+	 * Deleting a language drops its prefix from the rewrite rules AND from the
+	 * slug-redirect map (there is no successor language to remap onto);
+	 * deactivating it drops the rewrite rules alone.
+	 *
+	 * WHAT THAT COSTS DEPENDS ON THE URL MODE, and the wording must follow it.
+	 * Only subdirectory mode routes a language by a PATH prefix, so only there
+	 * does a retired URL become a 404 that core's redirect_guess_404_permalink()
+	 * may answer with a fuzzy match on an unrelated post — a guess that is not
+	 * even stable between requests, because core's query has no ORDER BY.
+	 * Subdomain, per-domain and query modes carry the language in the host or a
+	 * query argument: detect_from_subdomain() / detect_from_domain() /
+	 * detect_from_query_param() simply return null and LanguageRouter's fallback
+	 * forces the default language, so those URLs still answer 200 — in the
+	 * default language. Telling that operator to expect core's guess would
+	 * describe a failure their site cannot have, and send them off writing
+	 * redirects they do not need.
+	 *
+	 * TENSE FOLLOWS THE ROW, NOT THE SCREEN. The Active checkbox renders this
+	 * for a language that is still active, where the loss is what unticking the
+	 * box would cause; on an already-inactive language it is a present fact, on
+	 * the delete screen too.
+	 *
+	 * This only TELLS the operator. Routing is deliberately left alone: a
+	 * stored map of retired prefixes would hijack a later legitimate page at
+	 * the same path, and forcing a 410 or a home redirect would replace a guess
+	 * that is often right with a dead end.
+	 *
+	 * @param object $language  Language row being deleted or deactivated.
+	 * @param bool   $permanent True on the delete screen, false for the active toggle.
+	 * @return string Plain text — escape at the point of output.
+	 */
+	private function routing_loss_warning( object $language, bool $permanent ): string {
+		$settings     = Plugin::get_instance()->get( 'settings' );
+		$is_path_mode = $settings->get_url_mode() === 'subdirectory';
+		$prefix       = '';
+
+		if ( $is_path_mode ) {
+			// The language segment sits under the site's own home path, which is
+			// not always '/'. A single-site install in a subfolder
+			// (example.com/blog/) and a subdirectory multisite child
+			// (example.com/sub/) both carry one, so this language's real URLs are
+			// /blog/de/ or /sub/de/, never /de/ — and an operator told to look for
+			// the wrong path would find nothing to redirect, which is the whole
+			// point of this notice.
+			//
+			// home_url() is the right source because it is exactly what the router
+			// strips before reading the language segment
+			// (LanguageRouter::detect_slug_from_request_uri()), and it covers both
+			// shapes; current_blog->path knows only about the network one. Asking
+			// for '/' guarantees a path component even on a root install, and
+			// PerfLocale's own home_url filter returns early in wp-admin, so the
+			// value never comes back language-prefixed here.
+			$home_path = (string) ( wp_parse_url( home_url( '/' ), PHP_URL_PATH ) ?? '/' );
+
+			if ( '' === $home_path ) {
+				$home_path = '/';
+			}
+
+			$prefix = trailingslashit( $home_path ) . $settings->get_url_prefix( $language ) . '/';
+		}
+
+		if ( empty( $language->is_active ) ) {
+			$lead = $is_path_mode
+				/* translators: %s: URL path prefix, e.g. /de/. */
+				? sprintf( __( 'This language is inactive, so URLs under %s are not recognised.', 'perflocale' ), $prefix )
+				: __( 'This language is inactive, so its URLs are not recognised.', 'perflocale' );
+		} elseif ( $permanent ) {
+			$lead = $is_path_mode
+				/* translators: %s: URL path prefix, e.g. /de/. */
+				? sprintf( __( 'Existing URLs under %s will no longer be recognised.', 'perflocale' ), $prefix )
+				: __( 'Existing URLs for this language will no longer be recognised.', 'perflocale' );
+		} else {
+			$lead = $is_path_mode
+				/* translators: %s: URL path prefix, e.g. /de/. */
+				? sprintf( __( 'If you deactivate this language, URLs under %s will no longer be recognised.', 'perflocale' ), $prefix )
+				: __( 'If you deactivate this language, its URLs will no longer be recognised.', 'perflocale' );
+		}
+
+		$tail = $is_path_mode
+			? __( 'WordPress answers an unrecognised URL with its own guess, which is often an unrelated post, so add redirects for any you still need.', 'perflocale' )
+			: __( 'Those URLs still answer, but in the site default language rather than this one.', 'perflocale' );
+
+		return $lead . ' ' . $tail;
 	}
 
 	/**
@@ -711,6 +800,9 @@ final class LanguagesPage {
 								<input type="hidden" name="is_active" value="1">
 							<?php endif; ?>
 						</label>
+						<?php if ( $is_edit && ! $is_default ) : ?>
+							<p class="description" style="margin-left: 24px;"><?php echo esc_html( $this->routing_loss_warning( $language, false ) ); ?></p>
+						<?php endif; ?>
 					</div>
 					<?php if ( $is_edit ) : ?>
 					<div class="perflocale-lang-form__toggle">

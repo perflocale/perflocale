@@ -129,6 +129,12 @@ final class TermMetaBox {
 
 		wp_nonce_field( 'perflocale_term_lang', 'perflocale_term_nonce' );
 
+		// Withhold Create from a user the Create action is certain to refuse (no
+		// perflocale_translate). The action also requires edit_term on the
+		// default-language term a translation is seeded from, which only the
+		// action checks. Resolved once for every row.
+		$can_create = current_user_can( 'perflocale_translate' );
+
 		// Translation rows.
 		echo '<tr class="form-field">';
 		echo '<th scope="row">' . esc_html__( 'Translations', 'perflocale' ) . '</th>';
@@ -170,6 +176,10 @@ final class TermMetaBox {
 					echo esc_html__( 'Edit', 'perflocale' );
 					echo '</a>';
 				}
+			} elseif ( ! $can_create ) {
+				echo '<span class="perflocale-mb__status" title="' . esc_attr__( 'You do not have permission to create translations of this content.', 'perflocale' ) . '">';
+				echo '+ ' . esc_html__( 'Create', 'perflocale' );
+				echo '</span>';
 			} else {
 				$create_url = add_query_arg(
 					[

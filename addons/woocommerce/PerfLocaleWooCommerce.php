@@ -188,13 +188,12 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// ---- Coupon restrictions across translation siblings ----
 
-		// A coupon restricted to product/category X must also apply to X's
-		// translation siblings: the SAME physical product carries a
-		// different post/term ID per language, so WC's raw-ID comparison
-		// rejected valid coupons on translated carts (and exclusion lists
-		// leaked through sibling IDs). Expand the lists at READ time on the
-		// frontend only — the stored coupon and the admin edit screen keep
-		// the raw saved IDs.
+		// A coupon's product/category inclusions and exclusions must also
+		// cover each listed item's translation siblings: the SAME physical
+		// product carries a different post/term ID per language, and WC
+		// compares raw IDs. Expand the lists at READ time on the frontend
+		// only — the stored coupon and the admin edit screen keep the raw
+		// saved IDs.
 		add_filter( 'woocommerce_coupon_get_product_ids', [ $this, 'expand_coupon_product_ids' ] );
 		add_filter( 'woocommerce_coupon_get_excluded_product_ids', [ $this, 'expand_coupon_product_ids' ] );
 		add_filter( 'woocommerce_coupon_get_product_categories', [ $this, 'expand_coupon_term_ids' ] );
@@ -1542,18 +1541,16 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * Called once per request, the first time filter_wc_page_id() fires.
 	 *
-	 * Reads page IDs directly from wp_options (not via get_option, which
-	 * would re-trigger our own filter and recurse). The sibling-cascade
-	 * inside prime_translations() means priming the primary page IDs also
-	 * seeds the cache for their language siblings, so downstream calls for
-	 * translated pages are L1 hits too.
+	 * The page IDs come from read_stored_option_values(), never get_option(),
+	 * which would re-enter our own filter. The sibling-cascade inside
+	 * prime_translations() means priming the primary page IDs also seeds the
+	 * cache for their language siblings, so downstream calls for translated
+	 * pages are L1 hits too.
 	 *
 	 * @param \PerfLocale\Plugin $plugin Plugin container.
 	 * @return void
 	 */
 	private function prime_wc_page_translations( \PerfLocale\Plugin $plugin ): void {
-		global $wpdb;
-
 		$option_names = [
 			'woocommerce_cart_page_id',
 			'woocommerce_checkout_page_id',
@@ -1562,26 +1559,11 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			'woocommerce_terms_page_id',
 		];
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$placeholders = implode( ',', array_fill( 0, count( $option_names ), '%s' ) );
+		$stored = $this->read_stored_option_values( $option_names );
+		$ids    = [];
 
-		// Read raw option_values from wp_options to avoid re-entering our own
-		// option_{name}_page_id filter chain. $placeholders is a runtime-built
-		// %s-list whose length matches count($option_names); scanner can't see
-		// that statically. $wpdb->options is core-owned.
-		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name IN ({$placeholders})",
-				...$option_names
-			)
-		);
-		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-
-		$ids = [];
-
-		foreach ( (array) $rows as $r ) {
-			$id = (int) $r->option_value;
+		foreach ( $option_names as $option_name ) {
+			$id = isset( $stored[ $option_name ] ) && is_scalar( $stored[ $option_name ] ) ? (int) $stored[ $option_name ] : 0;
 
 			if ( $id > 0 ) {
 				$ids[] = $id;
@@ -1625,6 +1607,130 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// Statuses only — no meta, no terms.
 			_prime_post_caches( $translated_ids, false, false );
 		}
+	}
+
+	/**
+	 * Stored values of the given options, read without any option_* filter.
+	 *
+	 * Not get_option(): its option_{$name} filter chain runs
+	 * filter_wc_page_id(), which would resolve each page unprimed before the
+	 * batch prime exists and hand back TRANSLATED ids instead of the stored
+	 * ones.
+	 *
+	 * The values come from the same caches get_option() reads — alloptions for
+	 * autoloaded names, the per-key options cache for the rest, which
+	 * wp_prime_option_caches() fills in one query or one multi-get. That also
+	 * serves WooCommerce's own get_option() calls for these names later in the
+	 * request, so they cost nothing more. Names in `notoptions` are left out
+	 * before anything is fetched: a persistent cache stores no negative
+	 * entries, so asking for a missing name would be a round trip on every
+	 * request.
+	 *
+	 * A name whose value cannot be read back (a persistent-cache store that
+	 * failed) is simply omitted. The prime is only a hint: filter_wc_page_id()
+	 * resolves every page correctly without it.
+	 *
+	 * Two cases keep one direct SELECT instead. While installing, a multisite
+	 * wp_load_alloptions() reads every option uncached. And behind a
+	 * persistent object cache that is not known to answer a multi-get in one
+	 * round trip (see options_multiget_is_batched()), priming could cost a
+	 * round trip per name.
+	 *
+	 * @param string[] $option_names Option names.
+	 * @return array<string, mixed> Option name => stored value, for the names found.
+	 */
+	private function read_stored_option_values( array $option_names ): array {
+		$values = [];
+
+		if ( wp_installing() || ! $this->options_multiget_is_batched() ) {
+			global $wpdb;
+
+			$placeholders = implode( ',', array_fill( 0, count( $option_names ), '%s' ) );
+
+			// $placeholders is a runtime-built %s-list whose length matches
+			// count($option_names); scanner can't see that statically.
+			// $wpdb->options is core-owned.
+			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name IN ({$placeholders})",
+					...$option_names
+				),
+				OBJECT_K
+			);
+			// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			foreach ( (array) $rows as $option_name => $row ) {
+				$values[ (string) $option_name ] = $row->option_value;
+			}
+
+			return $values;
+		}
+
+		$alloptions = wp_load_alloptions();
+		$pending    = [];
+
+		foreach ( $option_names as $option_name ) {
+			if ( isset( $alloptions[ $option_name ] ) ) {
+				$values[ $option_name ] = $alloptions[ $option_name ];
+			} else {
+				$pending[] = $option_name;
+			}
+		}
+
+		if ( $pending === [] ) {
+			return $values;
+		}
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		if ( is_array( $notoptions ) ) {
+			$pending = array_values( array_diff( $pending, array_keys( $notoptions ) ) );
+		}
+
+		if ( $pending === [] ) {
+			return $values;
+		}
+
+		wp_prime_option_caches( $pending );
+
+		foreach ( wp_cache_get_multiple( $pending, 'options' ) as $option_name => $value ) {
+			if ( false !== $value ) {
+				$values[ (string) $option_name ] = $value;
+			}
+		}
+
+		return $values;
+	}
+
+	/**
+	 * Whether a wp_cache_get_multiple() call costs at most one round trip.
+	 *
+	 * WordPress's own object cache lives in the request, and Redis Object
+	 * Cache 2.x (the drop-in that exposes redis_instance() and declares
+	 * get_multiple()) answers a multi-get with one MGET. No other persistent
+	 * drop-in is assumed to batch.
+	 * wp_cache_supports( 'get_multiple' ) only says the method exists, and some
+	 * drop-ins implement it as one get() per key (LiteSpeed Cache's does). Nor
+	 * is redis_instance() enough on its own: Hummingbird's Redis drop-in and
+	 * Redis Object Cache before 2.0 have it but no get_multiple(), so core's
+	 * wp_cache_get_multiple() fallback runs one get() per key. On those,
+	 * priming the page-id options would cost a backend round trip per name,
+	 * more than the single SELECT it replaces, on requests that never read
+	 * those options again.
+	 *
+	 * @return bool
+	 */
+	private function options_multiget_is_batched(): bool {
+		global $wp_object_cache;
+
+		if ( ! wp_using_ext_object_cache() ) {
+			return true;
+		}
+
+		return is_object( $wp_object_cache )
+			&& method_exists( $wp_object_cache, 'redis_instance' )
+			&& method_exists( $wp_object_cache, 'get_multiple' );
 	}
 
 	/**
@@ -1687,18 +1793,14 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * to the translated ID and UrlConverter built the correct /de/warenkorb/ —
 	 * so a page that resolves in the current language is left exactly as it is.
 	 *
-	 * Costs the request nothing, though not for the reason it looks like:
 	 * WooCommerce keeps the cart, checkout, my-account and terms page IDs at
-	 * `autoload = off`, so reading them is a real fetch, not an alloptions
-	 * lookup. get_wc_page_ids() collapses the set into one primed read, that
-	 * read runs each ID through filter_wc_page_id() — which batch-primes every
-	 * WC page's translation links — and the lookup below is then an L1 cache
-	 * hit. WooCommerce asks for the same options moments later on every
-	 * front-end render (wc_body_class() calls is_cart(), is_checkout() and
-	 * is_account_page()), so this only pulls that fetch forward. Measured on
-	 * perflocale.local: with a cold options cache a render costs 4 option
-	 * queries without this filter and 2 with it; with a warm persistent object
-	 * cache, 1 either way.
+	 * `autoload = off`, so get_wc_page_ids() has to fetch them rather than find
+	 * them in alloptions. Where prime_wc_page_translations() reads them through
+	 * the options cache, the first filter_wc_page_id() call of the request has
+	 * already put all four there, so that fetch adds no database query;
+	 * otherwise it goes through the persistent object cache like any other
+	 * wp_prime_option_caches() call. That first call has also primed every WC
+	 * page's translation links, so the lookup below is an L1 cache hit.
 	 *
 	 * @param mixed $link    Page permalink, already filtered by UrlConverter.
 	 * @param mixed $post_id ID of the page the permalink belongs to.

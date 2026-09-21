@@ -46,15 +46,25 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  *   - a post whose `post_type` is not `wp_block` renders EMPTY, not fallback;
  *   - a post that is not `publish`, or has a password, renders EMPTY;
+ *   - a published post with no password whose content is empty or only
+ *     whitespace passes every check (:27 and :42 look at type, status and
+ *     password only), and renders a blank because there is nothing in it;
  *   - `$seen_refs` is a static recursion guard keyed BY REF, so a rewritten ref
  *     is still guarded and nesting keeps working;
  *   - pattern overrides live in the INSTANCE attributes in the host post, not in
  *     the `wp_block`, so per-instance overrides survive the swap untouched.
  *
- * The first two are why resolve() verifies post type and status itself and
- * returns 0 rather than a bad id: the failure mode we must never ship is a
- * pattern that silently VANISHES from a translated page. Falling back to the
- * source text is always better than rendering nothing.
+ * The first three are why translated_ref() verifies post type, status, password
+ * and content itself and returns 0 rather than a bad id: the failure mode we
+ * must never ship is a pattern that silently VANISHES from a translated page.
+ * Falling back to the source text is always better than rendering nothing. An
+ * empty target is the one core does not reject, and it is also the easiest to
+ * reach: a translation created without copying content is an empty draft, so
+ * publishing one unedited is enough. `core/navigation` is no better:
+ * `get_inner_blocks_from_navigation_post()` turns a published post with no
+ * blocks into an empty `WP_Block_List`, and `get_inner_blocks()` only falls
+ * back on `empty( $inner_blocks )` (blocks/navigation.php:547), which an
+ * object never is, so the menu renders with no items.
  *
  * ⚠️ NEVER rewrite in the editor. The block editor must load the original `ref`,
  * or the next save writes the translated id into the source page and the two
@@ -68,15 +78,17 @@ final class BlockRefTranslator {
 	 * Blocks that reference another post by `ref`, mapped to the post type that
 	 * reference is required to be.
 	 *
-	 * Both render EMPTY in core when the ref does not resolve, which is why
-	 * translated_ref() verifies the type itself rather than trusting the swap:
+	 * Neither shows the source when the ref points at the wrong post, which is
+	 * why translated_ref() verifies the type itself rather than trusting the
+	 * swap:
 	 *
-	 *   - `core/block`      → blocks/block.php:26 rejects a non-`wp_block` post
+	 *   - `core/block`      → blocks/block.php:27 rejects a non-`wp_block` post
 	 *                        outright.
-	 *   - `core/navigation` → navigation.php:323 does NOT check the post type at
-	 *                        all; it parses whatever post it finds as navigation
-	 *                        blocks. A wrong-type ref there yields an empty menu,
-	 *                        so the check has to live HERE.
+	 *   - `core/navigation` → navigation.php:323-330 does NOT check the post
+	 *                        type at all; it parses whatever published post it
+	 *                        finds as navigation blocks. A wrong-type ref there
+	 *                        renders that post's blocks, or no items, instead
+	 *                        of the source menu, so the check has to live HERE.
 	 *
 	 * @var array<string, string>
 	 */
@@ -115,7 +127,20 @@ final class BlockRefTranslator {
 	private bool $primed = false;
 
 	/**
-	 * Per-request memo of source ref => translated ref (0 = keep the source).
+	 * Memo of source ref => translated ref (0 = keep the source).
+	 *
+	 * A static, so it lives as long as the PHP process: across every render in
+	 * a WP-CLI command, a cron batch or a sequence of language-override
+	 * windows, not just one page. A target resolved early can be unpublished,
+	 * trashed, deleted, protected or emptied before a later render, so a
+	 * positive entry is re-checked against the post on every hit. That reads
+	 * the post cache core's own render reads next, so a cached target costs no
+	 * query. A 0 entry is returned as is: it renders the source, never a
+	 * blank, and re-resolving it would add a link lookup for every
+	 * untranslated reference. A target that is still usable is served until
+	 * the memo resets even if the link has since moved: it still renders
+	 * content, never a blank, and following the link would mean resolving it
+	 * again on every hit.
 	 *
 	 * Blog-keyed: a switch_to_blog() in the middle of a render must not serve
 	 * blog A's pattern ids to blog B.
@@ -290,7 +315,14 @@ final class BlockRefTranslator {
 		$key = get_current_blog_id() . ':' . $this->slug . ':' . $post_type . ':' . $ref;
 
 		if ( isset( self::$memo[ $key ] ) ) {
-			return self::$memo[ $key ];
+			$memoised = self::$memo[ $key ];
+
+			if ( $memoised <= 0 || self::is_usable_target( get_post( $memoised ), $post_type ) ) {
+				return $memoised;
+			}
+
+			// The remembered target can no longer render: resolve again, which
+			// settles on the source unless the link now points somewhere usable.
 		}
 
 		self::$memo[ $key ] = 0;
@@ -314,15 +346,7 @@ final class BlockRefTranslator {
 			return 0;
 		}
 
-		$post = get_post( $id );
-
-		// Every one of these three renders EMPTY in core if we let it through,
-		// and an empty pattern is worse than an untranslated one.
-		if ( ! $post instanceof \WP_Post
-			|| $post_type !== $post->post_type
-			|| 'publish' !== $post->post_status
-			|| '' !== (string) $post->post_password
-		) {
+		if ( ! self::is_usable_target( get_post( $id ), $post_type ) ) {
 			return 0;
 		}
 
@@ -332,15 +356,56 @@ final class BlockRefTranslator {
 	}
 
 	/**
+	 * Whether a reference of this type may be pointed at this post.
+	 *
+	 * Core never falls back to the source for a post rejected here (line
+	 * numbers in this class are WordPress 7.1):
+	 *
+	 *   - `core/block` (blocks/block.php) returns '' for a missing or
+	 *     non-`wp_block` post (:27) and for one that is not `publish` or has a
+	 *     non-empty password (:42), and renders a blank from a post whose
+	 *     content is empty or only whitespace.
+	 *   - `core/navigation` (blocks/navigation.php) renders its generic fallback
+	 *     menu for a post that is not `publish` (:330 returns nothing, so :547
+	 *     falls back), and a menu with no items for a missing post (:324) or an
+	 *     empty or whitespace-only one (the parser's whitespace block is dropped
+	 *     by `block_core_navigation_filter_out_empty_blocks()`). It never checks
+	 *     the post type, so a wrong-type post is parsed as menu blocks. Each one
+	 *     loses the source menu. Core ignores a menu's password; refusing one is
+	 *     the conservative choice that keeps one rule for both blocks.
+	 *
+	 * The same checks serve a first resolution and a memo hit, so the two can
+	 * never disagree.
+	 *
+	 * `trim()` rather than `=== ''`: content holding only whitespace renders
+	 * just as blank, which is the case BlockTemplateTranslator records for
+	 * templates. Not `empty()`, which would also reject the content "0". Block
+	 * markup is not parsed — that would cost CPU on every reference. The
+	 * password arm is stricter than core's `! empty()`: a password of "0" is
+	 * refused too.
+	 *
+	 * @param mixed  $post      get_post() result.
+	 * @param string $post_type Post type the reference requires.
+	 * @return bool
+	 */
+	private static function is_usable_target( $post, string $post_type ): bool {
+		return $post instanceof \WP_Post
+			&& $post_type === $post->post_type
+			&& 'publish' === $post->post_status
+			&& '' === (string) $post->post_password
+			&& '' !== trim( (string) $post->post_content );
+	}
+
+	/**
 	 * Warm the caches every reference on this page will need, in one batch.
 	 *
 	 * WHY: resolution is per reference, and each one costs a link query plus a
 	 * post read. Measured cold on this machine, 25 distinct patterns cost 30
 	 * queries; batching the links and priming the post cache costs 3, after
-	 * which the per-reference path costs 0. An audit measured the same shape at
-	 * scale — 50 distinct patterns added 49 queries on three sites without an
-	 * object cache. A warm persistent cache hides most of it, which is exactly
-	 * why the sites that lack one are the ones that need this.
+	 * which the per-reference path costs 0. The same shape holds at scale — 50
+	 * distinct patterns added 49 queries on sites without an object cache. A
+	 * warm persistent cache hides most of it, which is exactly why the sites
+	 * that lack one are the ones that need this.
 	 *
 	 * ⚠️ This ONLY warms caches. It does not populate the memo, decide anything,
 	 * or change what translated_ref() returns — every guard still runs per
@@ -349,12 +414,26 @@ final class BlockRefTranslator {
 	 * back to the previous per-reference cost. It cannot produce a wrong answer,
 	 * which is the property worth having in a page-render path.
 	 *
+	 * WHICH CONTENT IS SCANNED: the queried post's. When no object id is queried
+	 * (search, date and post-type archives, a latest-posts front page),
+	 * get_post( 0 ) falls back to the global post, so the first queried post or
+	 * the loop item being rendered is scanned instead. A term or author archive
+	 * is skipped: its queried id is a term or user id, and reading a post by
+	 * that number either scans unrelated content or queries for a post that
+	 * does not exist.
+	 *
 	 * @return void
 	 */
 	private function prime_references(): void {
 		$this->primed = true;
 
-		$post = get_post( get_queried_object_id() );
+		$queried_id = get_queried_object_id();
+
+		if ( $queried_id > 0 && ! get_queried_object() instanceof \WP_Post ) {
+			return;
+		}
+
+		$post = get_post( $queried_id );
 
 		if ( ! $post instanceof \WP_Post ) {
 			return;

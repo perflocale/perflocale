@@ -316,31 +316,20 @@ final class WebhookController extends RestController {
 	 * Who may CREATE a webhook.
 	 *
 	 * Registering a webhook tells this site to make an outbound HTTP request to
-	 * an address the caller chose. {@see is_url_safe()} refuses loopback and
-	 * private ranges, but that check resolves the host and then hands
-	 * `wp_remote_post()` the HOSTNAME, which libcurl resolves again on its own —
-	 * so it is validate-then-connect, and a short-TTL DNS answer can differ
-	 * between the two. Pinning the validated address is not a fix worth its
-	 * cost here (see the delivery notes below), so the boundary is drawn at who
-	 * may ask for the request at all.
+	 * an address the caller chose. {@see is_url_safe()} judges the address; this
+	 * decides who may ask for the request at all.
 	 *
-	 * On SINGLE SITE that is not a boundary: `manage_options` already implies
-	 * `install_plugins` and `edit_plugins`, so the same user can execute
-	 * arbitrary PHP. Nothing is gained by tightening this, and requiring a
-	 * network capability that does not exist would break every single-site
-	 * install. `manage_options` is therefore kept there.
+	 * On SINGLE SITE `manage_options` already implies `install_plugins` and
+	 * `edit_plugins`, and requiring a network capability that does not exist
+	 * would break every single-site install. `manage_options` is therefore kept
+	 * there.
 	 *
-	 * On MULTISITE it is a real boundary: a subsite administrator has
-	 * `manage_options` but NOT `install_plugins`, so without this gate the one
-	 * configuration where an outbound-request primitive is a privilege
-	 * escalation is exactly the one that allowed it. Creating a webhook now
-	 * needs `manage_network_options`; reading and deleting stay at
-	 * `manage_options` so a subsite admin can still audit and remove what is
-	 * pointed at their site.
-	 *
-	 * BREAKING CHANGE on multisite networks that delegated webhook creation to
-	 * subsite administrators. Networks that need the old behaviour can restore
-	 * it with the filter below.
+	 * On MULTISITE a subsite administrator has `manage_options` but NOT
+	 * `install_plugins`, so creating a webhook needs `manage_network_options`;
+	 * reading and deleting stay at `manage_options` so a subsite admin can still
+	 * review and remove what is pointed at their site. Networks that delegate
+	 * webhook creation to subsite administrators can lower it with the filter
+	 * below.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return bool|\WP_Error
@@ -381,11 +370,9 @@ final class WebhookController extends RestController {
 	/**
 	 * Reject URLs that target loopback or link-local addresses.
 	 *
-	 * Webhooks are a classic SSRF surface - an admin (or a plugin that
-	 * mistakenly accepts less-privileged input) could register a URL like
-	 * http://127.0.0.1:6379/ or http://169.254.169.254/latest/meta-data/
-	 * to probe internal services. Block the common cases here. Sites that
-	 * genuinely need internal delivery can opt in via the filter.
+	 * Webhooks are an SSRF surface, so loopback, link-local and private
+	 * targets are refused here. Sites that genuinely need internal delivery
+	 * can opt in via the filter.
 	 *
 	 * @param string $url        Raw URL.
 	 * @param bool   $filterable Whether to run the `perflocale/webhooks/url_safe`
@@ -510,15 +497,7 @@ final class WebhookController extends RestController {
 			: $host;
 
 		// Unwrap IPv4-mapped IPv6 (::ffff:0:0/96) to the IPv4 it carries, so the
-		// checks below judge the address a socket would actually reach. PHP's
-		// FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE tables have no entry for that
-		// prefix — ::ffff:127.0.0.1, ::ffff:10.0.0.1 and ::ffff:169.254.169.254
-		// all PASS them — and the fc00::/fe80:: byte checks below cannot catch
-		// them either, because a mapped address begins with ten zero bytes.
-		// Measured before this unwrap: is_url_safe( 'http://[::ffff:127.0.0.1]/h' )
-		// returned true while the plain 'http://127.0.0.1/h' form was correctly
-		// refused, so a webhook could be REGISTERED against loopback, cloud
-		// metadata or any RFC1918 host.
+		// checks below judge the address a socket would actually reach.
 		//
 		// This mirrors {@see \PerfLocale\MachineTranslation\AbstractProvider::validate_url()}
 		// exactly, and the two are meant to agree — that method's own comment
@@ -544,15 +523,15 @@ final class WebhookController extends RestController {
 		$is_ip_literal = Helper::is_ip( $host_ip );
 
 		if ( $is_ip_literal ) {
-			// FILTER_FLAG_NO_PRIV_RANGE / NO_RES_RANGE only cover IPv4.
+			// Helper::is_public_ipv4() judges both families; the fc00::/7 and
+			// fe80::/10 byte checks below are a second layer.
 			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
 				$safe   = false;
 				$reason = 'private_address';
 			}
 
-			// IPv6 equivalents: unique-local (fc00::/7) and link-local
-			// (fe80::/10). Both are "private" in the SSRF sense but pass
-			// PHP's IPv4-only private-range flag.
+			// IPv6 unique-local (fc00::/7) and link-local (fe80::/10), both
+			// "private" in the SSRF sense, checked again as a second layer.
 			if ( Helper::is_ipv6( $host_ip ) ) {
 				// $host_ip was just validated as a well-formed IPv6 literal,
 				// so inet_pton() can't emit a warning here - no @-suppression
@@ -580,36 +559,20 @@ final class WebhookController extends RestController {
 		}
 
 		// Hostname — resolve via DNS and re-check the IP against the same
-		// private/reserved ranges. Catches the admin-mistake case (a domain
-		// resolving to 169.254.169.254 metadata / 127.0.0.1 / an internal
-		// service). Uses gethostbyname() to mirror WP core's
+		// private/reserved ranges. Uses gethostbyname() to mirror WP core's
 		// wp_http_validate_url() and avoid warnings on failure. Skipped for IP
-		// literals and once $safe is already false.
+		// literals and once $safe is already false. gethostbyname() answers
+		// IPv4 only; the AAAA loop below covers IPv6.
 		//
-		// IPv4 only — but NOT "single-A-record only", as this comment used to
-		// say while sitting a few dozen lines above the AAAA loop that has
-		// covered the v6 side since 1.0.2.
-		//
-		// What remains out of scope, deliberately: DNS rebinding. This validates
-		// an address and then hands wp_remote_post() the HOSTNAME, which libcurl
-		// resolves again on its own, so a short-TTL answer can differ between the
-		// two. Closing that means pinning the validated address through the
-		// transport, and pinning is silently inert on the streams transport,
-		// behind a proxy, and whenever another plugin intervenes in
-		// pre_http_request — three ways to believe you are protected when you are
-		// not. The boundary is drawn at who may register a webhook instead: see
-		// register_permissions_check(), which requires manage_network_options on
-		// multisite. On single site the caller already has manage_options and can
-		// execute arbitrary PHP, so there is no boundary left to defend.
+		// Who may register a URL at all is decided in
+		// register_permissions_check().
 		if ( $safe && ! $is_ip_literal ) {
 			$resolved = gethostbyname( $host );
 
 			if ( $resolved === $host || ! Helper::is_ip( $resolved ) ) {
 				// gethostbyname() returns the input string unchanged on
 				// resolution failure. Fail closed: if we can't resolve the
-				// host now, refuse the URL rather than fail-open - a hostile
-				// DNS server could otherwise return a public IP at
-				// validation time and a private IP at delivery time.
+				// host now, refuse the URL rather than fail open.
 				//
 				// This is the one rejection that is NOT a statement about the
 				// URL. A SERVFAIL or a timeout says nothing about where the
@@ -622,15 +585,15 @@ final class WebhookController extends RestController {
 				$reason = 'private_address';
 				$safe   = false;
 			} elseif ( str_starts_with( $resolved, '127.' ) ) {
-				// Loopback 127.0.0.0/8 - not covered by NO_RES_RANGE.
+				// Loopback 127.0.0.0/8. Helper::is_public_ipv4() above already
+				// rejects it; this is a second layer.
 				$reason = 'loopback_address';
 				$safe   = false;
 			}
 
-			// AAAA blind spot. gethostbyname() is IPv4-only, so a hostname
-			// publishing A=<public> alongside AAAA=::1 passes everything above
-			// and a dual-stack box may still deliver over the IPv6 answer.
-			// Re-enter this method with each AAAA literal rather than restating
+			// AAAA records. gethostbyname() is IPv4-only, and a dual-stack
+			// host may deliver over the IPv6 answer, so each AAAA literal is
+			// judged too. Re-enter this method with each one rather than restating
 			// the rules, so the IPv4-mapped unwrap and the fc00::/fe80:: byte
 			// checks apply verbatim; $filterable is false so the public
 			// url_safe filter is not handed a URL nobody registered. An IP
@@ -688,8 +651,7 @@ final class WebhookController extends RestController {
 	 *
 	 * Fails OPEN when `dns_get_record` is unavailable (some managed hosts
 	 * disable it): refusing every webhook there would break delivery on those
-	 * sites to close a hole the A-record gate already covers in the ordinary
-	 * case. Twin of
+	 * sites, and the A-record check still applies. Twin of
 	 * {@see \PerfLocale\MachineTranslation\AbstractProvider::resolve_aaaa()};
 	 * keep them in sync.
 	 *
@@ -1353,11 +1315,9 @@ final class WebhookController extends RestController {
 		// Defense in depth: re-apply the per-event whitelist filter BEFORE
 		// HMAC signing, every delivery. The dispatch path already filters
 		// at enqueue time, but the cron action arg is just a serialized
-		// array — any future bug (or unrelated cron-injection vector) that
-		// lets an attacker influence the queued $data would otherwise
-		// launder arbitrary attacker-controlled fields through our HMAC
-		// signature into trusted downstream systems. Idempotent: a payload
-		// that was already whitelisted at enqueue is unchanged here.
+		// array, and only whitelisted fields should ever carry our
+		// signature. Idempotent: a payload that was already whitelisted at
+		// enqueue is unchanged here.
 		$data = self::filter_payload( $event, $data );
 
 		$webhooks = $this->get_stored_webhooks();
@@ -1371,12 +1331,8 @@ final class WebhookController extends RestController {
 
 		// Re-check URL safety at delivery time in case the filter changed.
 		//
-		// This used to be a bare `return`: the event was destroyed with no
-		// retry, no failure-log row and no breaker signal — the third instance
-		// in this file of the silent-drop class the two branches below already
-		// fix. It needs no attacker to hurt: gethostbyname() fails closed on a
-		// SERVFAIL or a timeout (measured at 2.2-4.6s against a broken
-		// resolver), so one DNS hiccup silently ate a customer's event.
+		// gethostbyname() fails closed on a SERVFAIL or a timeout, so one DNS
+		// hiccup must not destroy the event.
 		//
 		// A resolver that could not answer says nothing about where the host
 		// points and recovers on its own, so that case goes through the same
@@ -1404,13 +1360,9 @@ final class WebhookController extends RestController {
 				// failure without touching the resolver and the ladder would
 				// collapse to a single real try.
 				//
-				// This divergence from the MT twin is intentional and has now
-				// been proposed twice by separate reviews, from opposite
-				// directions ("sync it for consistency" and "add a transient for
-				// speed"). Both are wrong for the same two reasons: the ladder
-				// collapse above, and that a shared negative cache would widen
-				// the validate-then-connect window from per-delivery to 300
-				// seconds. Do not sync these two paths.
+				// This divergence from the MT twin is intentional: a shared
+				// negative cache would collapse the ladder as above. Do not
+				// sync these two paths.
 				$requeued = BackgroundEvents::enqueue(
 					self::RETRY_HOOK,
 					[ $webhook_id, $event, $data, $timestamp, $attempt + 1, $delivery_id ],
@@ -1532,11 +1484,9 @@ final class WebhookController extends RestController {
 		}
 
 		// `redirection => 0` is an SSRF guard: is_url_safe() validates the
-		// registered URL, but following a redirect would let an attacker host
-		// 302 us to 127.0.0.1:6379 / 169.254.169.254 metadata and we'd POST the
-		// signed payload there. `reject_unsafe_urls => true` adds defense-in-
-		// depth, rejecting private-address resolutions at transport time
-		// (partial DNS-rebinding mitigation: public at register, RFC1918 at delivery).
+		// registered URL, not wherever a redirect points. `reject_unsafe_urls
+		// => true` adds defense in depth, rejecting private-address resolutions
+		// at transport time.
 		$response = wp_remote_post(
 			$webhook['url'],
 			[

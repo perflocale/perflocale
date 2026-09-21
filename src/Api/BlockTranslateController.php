@@ -663,10 +663,8 @@ final class BlockTranslateController extends RestController {
 		}
 
 		// Read-cap on the SOURCE post. `edit_post` on the target alone is not
-		// enough — a user with edit rights on a translation but not on its
-		// private/draft source could otherwise exfiltrate source content
-		// through this endpoint. This denies that even though it's a sibling
-		// the caller is "logically related to".
+		// enough: the request translates the source's content, so the caller
+		// must be able to read the source too, even though it is a sibling.
 		if ( ! current_user_can( 'read_post', (int) $source_post->ID ) ) {
 			return $this->error( 'cannot_read_source', __( 'You do not have permission to read the source post.', 'perflocale' ), 403 );
 		}

@@ -37,11 +37,36 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                            validated below.
  *   - 'replace'   : bool    Whether to TRUNCATE-then-restore (true) or
  *                            merge into existing rows (false).
+ *   - 'allow_foreign_ids' : bool  The operator ticked "this site is a copy of
+ *                            the site the file was exported from" on the
+ *                            import form, so DataImporter's site-identity gate
+ *                            is skipped. Recorded in the args, not decided at
+ *                            run time, because it is a statement about the
+ *                            FILE the operator chose — a replay has to keep
+ *                            the same answer.
  *
  * Result shape (matches DataImporter::import()):
- *   - 'imported' : int      Rows successfully imported.
- *   - 'skipped'  : int      Rows skipped (e.g. duplicates, validation fail).
- *   - 'errors'   : string[] Per-row errors, capped by DataImporter.
+ *   - 'imported'  : int      Rows successfully imported.
+ *   - 'skipped'   : int      Rows skipped (e.g. duplicates, validation fail).
+ *   - 'errors'    : string[] Per-row errors, capped by DataImporter.
+ *   - 'sanitized' : int      Stored string translation, language and
+ *                            translated-slug rows the import's sanitizers
+ *                            changed because the dispatching user lacks
+ *                            `unfiltered_html`.
+ *
+ * A bundle the importer refuses on the site-identity gate never becomes a
+ * result: `execute()` throws instead, so the job ends `failed` with the
+ * refusal sentence in its `error` column where both the Jobs list and the
+ * sync dispatcher already show it.
+ *
+ * The pipeline has no terminal-failure signal, so the worker retries a
+ * thrown job with backoff up to `perflocale/jobs/max_attempts` (5) — the
+ * same shape the two path guards below already have. A refusal is
+ * deterministic, so each retry re-reads the file, re-decodes it and refuses
+ * again; DataImporter runs the site-identity gate AHEAD of its per-value
+ * data-quality scan precisely so that those retries do not each walk the
+ * whole envelope. Until the cap is reached the Jobs list shows the row as
+ * queued with no reason, because it renders `error` only on a failed row.
  */
 final class DataImportJob extends AbstractJob {
 
@@ -136,7 +161,9 @@ final class DataImportJob extends AbstractJob {
 	 *   same reason: no tick means no lock refresh for the whole import.
 	 *
 	 * @return array<string, mixed>
-	 * @throws \RuntimeException When the import path is unsafe or unreadable.
+	 * @throws \RuntimeException When the import path is unsafe or unreadable,
+	 *                           or the importer refused the bundle before
+	 *                           writing anything.
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$file    = isset( $args['file_path'] ) ? (string) $args['file_path'] : '';
@@ -159,11 +186,65 @@ final class DataImportJob extends AbstractJob {
 
 		$progress( 0, 1 );
 
+		// String translations, languages and translated slugs in the file are
+		// stored at the trust level of the user who asked for the import, and
+		// that user is the current user on both paths:
+		// Dispatcher::execute_inline() runs inside their request,
+		// and WorkerRegistry::run_on_current_blog() calls wp_set_current_user()
+		// with the job's `created_by` before execute(). Decided at run time
+		// rather than from a flag in the stored args, so nothing in the args
+		// can change the answer. WP-CLI calls DataImporter directly, at the
+		// shell-access trust level.
+		$sanitize_strings = ! current_user_can( 'unfiltered_html' );
+
 		$importer = new DataImporter();
-		$result   = $importer->import( $file, $replace );
+		$result   = $importer->import(
+			$file,
+			$replace,
+			$sanitize_strings,
+			// ! empty(): JobState round-trips args through JSON, so a ticked
+			// checkbox comes back as true, 1 or '1' depending on the path.
+			[ 'allow_foreign_ids' => ! empty( $args['allow_foreign_ids'] ) ]
+		);
+
+		// A refusal that never reached the first write is a failure, not a
+		// finished import.
+		//
+		// This throw exists for the ASYNC path only. Dispatch compares
+		// self::args_size() — the file size divided by 200 — against
+		// self::get_default_threshold() (1000), so a bundle under roughly
+		// 200 KB runs INLINE, and there the refusal already surfaces without
+		// help: Dispatcher::execute_inline returns the importer's array and
+		// AdminController redirects on its `error`. Above the threshold the
+		// operator is redirected to a job instead, and a job that RETURNED
+		// the refusal would be marked complete — "0 imported", with the
+		// reason readable only inside the result JSON in the detail drawer.
+		// Throwing puts the sentence in the job row's `error`, which the Jobs
+		// list renders beside the failed row.
+		//
+		// Keyed on the importer's own `refused` flag rather than on "zero
+		// imported plus some errors": a replace that wiped its tables and
+		// then failed every row ends that way too, and the worker's retry
+		// would re-run that wipe. A site-identity refusal wrote nothing and
+		// refuses identically on a replay, so re-running it costs a file
+		// parse. The importer always pairs the flag with the sentence that
+		// explains it.
+		//
+		// esc_html() is required here by WordPress.Security.EscapeOutput: an
+		// exception message is treated as output. That makes this the one
+		// import error that reaches the operator pre-escaped — every other one
+		// is plain __() text — so the refusal sentences quote with typographic
+		// marks, which survive the second escape the Jobs screen applies. An
+		// `&` inside an address the FILE recorded still renders as `&amp;`;
+		// cosmetic, and the address is the operator's own upload.
+		if ( ! empty( $result['refused'] ) ) {
+			throw new \RuntimeException( esc_html( (string) ( $result['errors'][0] ?? '' ) ) );
+		}
 
 		// Flush post-import caches — see MigrationCacheHelper for the
-		// full sequence + rationale.
+		// full sequence + rationale. Deliberately below the refusal above: a
+		// refused import wrote nothing, and this regenerates every
+		// translation file in files mode.
 		\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
 
 		$progress( 1, 1 );

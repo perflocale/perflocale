@@ -277,9 +277,8 @@ final class Bootstrap {
 		// would skip the block-editor REST save path AND WP-CLI saves,
 		// and the warning notice would persist forever in those contexts.
 		//
-		// Rationale: the wp.org review's 31 May pass flagged
-		// `delete_post_meta` happening inside `admin_notices` (a GET-driven
-		// render hook) as a state change without nonce verification.
+		// Rationale: a state change such as `delete_post_meta` does not
+		// belong in `admin_notices`, a GET-driven render hook with no nonce.
 		// Moving the state change to `save_post` means it inherits the
 		// nonce + capability gates WP-core has already verified upstream
 		// in each save path:
@@ -289,7 +288,7 @@ final class Bootstrap {
 		// - Block-editor / REST save: WP_REST_Posts_Controller's
 		// permission_callback enforces current_user_can('edit_post',$id)
 		// and the request carries X-WP-Nonce.
-		// - WP-CLI / cron / programmatic: no web-attacker CSRF surface.
+		// - WP-CLI / cron / programmatic: no browser request, so no CSRF surface.
 		//
 		// Cost on the every-post-save hot path: one get_post_meta cache
 		// hit (~sub-µs on a warmed cache) + early return for the 99%+ of
@@ -1105,7 +1104,7 @@ final class Bootstrap {
 						wp_send_json_error( 'Insufficient permissions.' );
 					}
 
-					// Cap the payload so an attacker can't flood user_meta with a
+					// Cap the payload so user_meta can't be flooded with a
 					// multi-megabyte JSON string. sanitize_text_field() is safe
 					// to apply to the JSON envelope here: it strips tags/control
 					// chars but leaves `[`, `]`, `{`, `}`, `"`, `,`, `:` intact.
@@ -1235,8 +1234,7 @@ final class Bootstrap {
 		// ⚠️ Registered HERE, outside the frontend/admin split below, and the
 		// distinction is load-bearing. register_frontend_services() only runs
 		// when `! is_admin() || wp_doing_ajax()`, so while this lived there the
-		// class did not exist on an ordinary wp-admin request. Three consequences,
-		// all confirmed by audit:
+		// class did not exist on an ordinary wp-admin request. Three consequences:
 		//
 		//   1. The Strings screen showed `blogname` instead of "Site Title",
 		//      because the context-label filter was never added.
@@ -3360,21 +3358,23 @@ final class Bootstrap {
 					$term_source = $mt_provider !== null
 						? \PerfLocale\Enum\SourceType::MachineTranslation
 						: \PerfLocale\Enum\SourceType::Manual;
-					$new_id      = $term_manager->create_translation( $tid, $taxonomy, $lang->slug, true, $term_source );
+					$inserted    = false;
+					$new_id      = $term_manager->create_translation( $tid, $taxonomy, $lang->slug, true, $term_source, $inserted );
 
 					if ( ! $new_id || $new_id === $tid ) {
 						++$tax_skipped;
 						continue;
 					}
 
-					// Safety net: if create_translation returned a term_id
-					// that was already present in our bulk-read map at the
-					// start of this run, the translation already existed
-					// (covers edge cases where our group-aware pre-check
-					// couldn't see it - e.g. a stale-cache rehydrate or a
-					// prior corruption where the source term had multiple
-					// group memberships).
-					if ( isset( $term_lang_map[ $new_id ] ) ) {
+					// Safety net: if create_translation returned a term it did
+					// not insert, or a term_id that was already present in our
+					// bulk-read map at the start of this run, the translation
+					// already existed (covers edge cases where our group-aware
+					// pre-check couldn't see it - e.g. another request created
+					// it meanwhile, a stale-cache rehydrate or a prior
+					// corruption where the source term had multiple group
+					// memberships). Its name is left as it is.
+					if ( ! $inserted || isset( $term_lang_map[ $new_id ] ) ) {
 						++$tax_skipped;
 						continue;
 					}
@@ -3815,13 +3815,19 @@ final class Bootstrap {
 					}
 
 					// copy_content = false: an empty draft reads as "not done".
-					$new_id = $manager->create_translation( $source_id, $lang->slug, false );
+					$inserted = false;
+					$new_id   = $manager->create_translation( $source_id, $lang->slug, false, \PerfLocale\Enum\SourceType::Manual, $inserted );
 
-					if ( is_int( $new_id ) && $new_id > 0 ) {
+					if ( ! is_int( $new_id ) || $new_id <= 0 ) {
+						++$failed;
+					} elseif ( ! $inserted ) {
+						// Returned but not inserted by this call: it already
+						// existed, though the check above did not see it
+						// (another request can create it in between).
+						++$skipped;
+					} else {
 						++$created;
 						++$made;
-					} else {
-						++$failed;
 					}
 				}
 
@@ -4127,12 +4133,29 @@ final class Bootstrap {
 	 * for a match. Useful for strings that ship with plugin/theme translations
 	 * (e.g., WooCommerce page titles, default category names).
 	 *
+	 * A locale WordPress cannot switch to counts as a miss, so callers fall back
+	 * exactly as they do when no loaded domain translates the text.
+	 *
 	 * @param string $text Original text to translate.
 	 * @param string $locale Target WordPress locale (e.g., 'de_DE', 'ar').
 	 * @return string Translated text, or empty string if no local translation found.
 	 */
 	private static function find_local_translation( string $text, string $locale ): string {
-		switch_to_locale( $locale );
+		// switch_to_locale() returns false WITHOUT pushing a stack frame in two
+		// cases (wp-includes/class-wp-locale-switcher.php:76-83, WP 7.1): the
+		// locale already equals determine_locale(), or it is not in the list the
+		// switcher built at construction (:50) from 'en_US' plus the filterable
+		// get_available_languages() (wp-includes/l10n.php:1552-1581). In the
+		// first case the loaded translations are already the target's. In the
+		// second nothing was reloaded, so $l10n answers in the CURRENT locale —
+		// and both callers save the result as the target language's page title
+		// or term name. The failed call changed nothing, so determine_locale()
+		// here is the value core compared against.
+		$switched = switch_to_locale( $locale );
+
+		if ( ! $switched && determine_locale() !== $locale ) {
+			return '';
+		}
 
 		$result = '';
 
@@ -4149,7 +4172,11 @@ final class Bootstrap {
 			}
 		}
 
-		restore_previous_locale();
+		// Pop only a frame this call pushed. On a false return the top of the
+		// stack, if any, belongs to whoever switched before this call.
+		if ( $switched ) {
+			restore_previous_locale();
+		}
 
 		return $result;
 	}
@@ -4546,8 +4573,9 @@ final class Bootstrap {
 		// loop. Without this, two near-simultaneous publish transitions (e.g.
 		// quick-edit + autosave colliding, double-clicks, cron race) both
 		// pass the `count($existing) > 1` guard and both call create_translation
-		// per language. The translation_links unique key catches the link
-		// rows but the duplicate WP posts are still inserted, leaving orphans.
+		// per language; the second then waits on the first's creation locks,
+		// one language at a time, to get its translations back. With this lock
+		// the second skips the loop.
 		// 60s TTL is well above any realistic per-post stub-creation time and
 		// well below WP-Cron's 15-min hard timeout.
 		Concurrency\Lock::with(

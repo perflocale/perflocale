@@ -49,15 +49,9 @@ final class JobsController extends RestController {
 	 * JobState::get() directly to bypass the stale entry.
 	 *
 	 * The blog id is part of the key because the jobs table is per-blog while
-	 * this memo is not. A controller instance that outlives a switch_to_blog()
-	 * — a CLI or worker context rather than a normal REST dispatch — otherwise
-	 * answered the second blog with the first blog's row. Reproduced on a real
-	 * network: the same id planted `complete` on blog 1 and `queued` on blog 2
-	 * returned `complete` for both, and a terminal-state guard read the wrong
-	 * blog's status. Reaching it needs a job id present in two blogs, which for
-	 * wp_generate_uuid4() ids means a collision — so this is hardening, not a
-	 * live hole, but it is the same per-blog-state-in-shared-memory class that
-	 * has bitten this codebase before.
+	 * this memo is not, and a controller instance can outlive a
+	 * switch_to_blog() in a CLI or worker context rather than a normal REST
+	 * dispatch.
 	 *
 	 * @var array<string, array<string, mixed>|null>
 	 */
@@ -529,25 +523,15 @@ final class JobsController extends RestController {
 			}
 		}
 
-		// `result` is not automatically safe just because the caller cleared
-		// user_can_read(). For a data_export job it is
-		// `[ 'path' => …, 'bytes' => … ]`, and `path` names a full site dump
-		// sitting in wp-content/uploads until somebody downloads it. The cap
-		// that got the caller this far — `perflocale_manage_translations` —
-		// is granted to EDITORS by default (TranslatorRole::EDITOR_CAPS),
-		// while BOTH running an export and downloading one require
-		// `perflocale_import_export`, which is Administrator-only. So an
-		// Editor deliberately denied the download endpoint could read the
-		// filename here and then fetch the file directly — and on a server
-		// that ignores .htaccess (nginx, Caddy, Apache with AllowOverride
-		// None) that fetch needs no authentication at all.
-		//
-		// So gate the path on the DOWNLOAD capability, not on $show_args:
-		// whoever may not have the artifact may not learn where it is. Keyed
-		// on the field name rather than the job type so an addon job that
-		// returns a path is covered too. Everything else in `result`
-		// (`bytes`, counts) stays visible, so the Jobs UI still shows that
-		// the job finished and how large the output was.
+		// `result` can name a file: for a data_export job it is
+		// `[ 'path' => …, 'bytes' => … ]`. The cap that got the caller this
+		// far is not the one that may download that file
+		// (`perflocale_import_export`), so `path` is gated on the DOWNLOAD
+		// capability, not on $show_args. Keyed on the field name rather than
+		// the job type so an addon job that returns a path is covered too.
+		// Everything else in `result` (`bytes`, counts) stays visible, so the
+		// Jobs UI still shows that the job finished and how large the output
+		// was.
 		$result = (array) ( $state['result'] ?? [] );
 
 		if ( isset( $result['path'] ) && ! current_user_can( 'perflocale_import_export' ) ) {
