@@ -24,5 +24,35 @@ if ( ! defined( 'ABSPATH' ) ) {
  * get the cancel signal for free — the next progress tick throws. Jobs
  * that don't call progress (sub-second work) finish naturally; the
  * cancellation arrives too late to interrupt them, which is fine.
+ *
+ * A job may attach the counts it reached before the cancel with
+ * set_result(); the worker stores them on the canceled job.
  */
-final class JobCanceledException extends \RuntimeException {}
+final class JobCanceledException extends \RuntimeException {
+
+	/**
+	 * Partial result attached by the job, if any.
+	 *
+	 * @var array<string, mixed>
+	 */
+	private array $result = [];
+
+	/**
+	 * Attach the job's partial result.
+	 *
+	 * @param array<string, mixed> $result Counts reached before the cancel.
+	 * @return void
+	 */
+	public function set_result( array $result ): void {
+		$this->result = $result;
+	}
+
+	/**
+	 * The partial result attached by the job ([] when none).
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function get_result(): array {
+		return $this->result;
+	}
+}

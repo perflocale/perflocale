@@ -194,6 +194,7 @@ final class BlockRefTranslator {
 		$this->attached = true;
 
 		add_action( 'perflocale/language/overridden', [ $this, 'relanguage' ], 20 );
+		add_action( 'perflocale/language/restored', [ $this, 'relanguage' ], 20 );
 
 		add_action( 'switch_blog', [ self::class, 'reset_memo' ] );
 	}

@@ -22,11 +22,64 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 	/**
+	 * WC email settings registered as translatable strings, one context per
+	 * field and email id.
+	 */
+	private const EMAIL_STRING_FIELDS = [ 'subject', 'heading', 'additional_content' ];
+
+	/**
 	 * Lazily instantiated term translation manager.
 	 *
 	 * @var \PerfLocale\Translation\TermTranslationManager|null
 	 */
 	private ?\PerfLocale\Translation\TermTranslationManager $term_manager = null;
+
+	/**
+	 * How many Store API cart or checkout route callbacks are running (a batch
+	 * nests them).
+	 *
+	 * @var int
+	 */
+	private int $store_api_cart_depth = 0;
+
+	/**
+	 * The Inventory Sync service, or null when the sync is off.
+	 *
+	 * @var \PerfLocale\WooCommerce\InventorySync|null
+	 */
+	private ?\PerfLocale\WooCommerce\InventorySync $inventory_sync = null;
+
+	/**
+	 * Current-language sibling data of each cart line, for the open Store API
+	 * cart window only. Keyed by blog, language and product/variation id;
+	 * emptied when the window closes, so it never outlives one cart response.
+	 *
+	 * @var array<string, array{title: ?string, excerpt: ?string, image: int, gallery: ?array<int, int>}|null>
+	 */
+	private array $store_api_cart_siblings = [];
+
+	/**
+	 * Whether the open Store API cart window has primed its siblings' caches.
+	 *
+	 * @var bool
+	 */
+	private bool $store_api_cart_primed = false;
+
+	/**
+	 * WooCommerce's product data store, loaded on the first product type lookup.
+	 *
+	 * @var \WC_Data_Store|null
+	 */
+	private ?\WC_Data_Store $product_data_store = null;
+
+	/**
+	 * Product type mirror_product_type() gave each translation created in this
+	 * request, keyed by "<blog id>:<post id>". refresh_copy_lookup_row() reads
+	 * and clears it in the same perflocale/translation/created action.
+	 *
+	 * @var array<string, string>
+	 */
+	private array $created_product_types = [];
 
 	/**
 	 * Get the term translation manager (lazy).
@@ -115,6 +168,18 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// Translate cart item permalink to the current language.
 		add_filter( 'woocommerce_cart_item_permalink', [ $this, 'translate_cart_item_permalink' ], 10, 3 );
+
+		// The Store API cart item (block Cart, Mini-Cart, Checkout summary)
+		// applies the permalink filter above but builds its name, short
+		// description and images straight from the product object, so the label
+		// never followed the link. Map those to the current-language sibling
+		// while a Store API cart or checkout route runs, and only then.
+		add_filter( 'rest_request_before_callbacks', [ $this, 'open_store_api_cart_window' ], 10, 3 );
+		add_filter( 'rest_request_after_callbacks', [ $this, 'close_store_api_cart_window' ], 10, 3 );
+		// WooCommerce's block hydration (the first paint of the Cart, Checkout
+		// and All Products blocks and the Mini-Cart) calls the route's
+		// controller itself and never fires the two filters above.
+		add_filter( 'woocommerce_hydration_dispatch_request', [ $this, 'dispatch_store_api_hydration' ], PHP_INT_MAX, 4 );
 
 		// Translate WooCommerce built-in page URLs to include the language prefix.
 		//
@@ -219,9 +284,17 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// ---- Optional services ----
 
+		// Order language - every order is tagged with the language it is
+		// placed or paid in, whether or not its emails are translated.
+		$email = new \PerfLocale\WooCommerce\EmailTranslation();
+		$email->register_order_language_hooks();
+
+		// Personal-data export of an order: its language.
+		add_filter( 'woocommerce_privacy_export_order_personal_data_props', [ $this, 'add_order_language_export_prop' ], 10, 1 );
+		add_filter( 'woocommerce_privacy_export_order_personal_data_prop', [ $this, 'export_order_language_prop' ], 10, 3 );
+
 		// Email translation - send order emails in the customer's stored language.
 		if ( (bool) $settings->get( 'wc_email_translation', true ) ) {
-			$email = new \PerfLocale\WooCommerce\EmailTranslation();
 			$email->register_hooks();
 		}
 
@@ -229,6 +302,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		if ( (bool) $settings->get( 'wc_sync_stock', true ) ) {
 			$sync = new \PerfLocale\WooCommerce\InventorySync( $plugin->get( 'cache' ) );
 			$sync->register_hooks();
+			$this->inventory_sync = $sync;
 
 			// Per-product opt-out checkbox (product data → Advanced): lets a
 			// merchant give ONE language's product independent prices/stock
@@ -293,7 +367,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// WC_Product_Simple. clone_product_variations() below already knew this
 		// ("The product_type taxonomy term is not part of the meta copy…") but
 		// patched it only after an `is_type( 'variable' )` guard, so GROUPED and
-		// EXTERNAL products silently degraded: measured on test.local, a
+		// EXTERNAL products silently degraded: measured on a test store, a
 		// translated grouped product came back as WC_Product_Simple with
 		// get_children() === [] even though its `_children` meta was copied
 		// intact — no child products, and the wrong add-to-cart form.
@@ -310,13 +384,17 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// `post_type => product` (includes/class-wc-query.php:348-358).
 		//
 		// The decision was made before the rewrite, so nothing ever stamps the
-		// query and the language WHERE is never added. Measured on test.local
+		// query and the language WHERE is never added. Measured on a test store
 		// (Storefront, shop set as front page):
 		//   /        main query post_type="product"  SQL has language WHERE: NO
 		//   /de/     main query post_type="product"  SQL has language WHERE: NO
 		//   /shop/   (the same archive, NOT the front page)            WHERE: YES
 		// i.e. every language's products on the home page of a multilingual
 		// store, while the identical /shop/ archive is scoped correctly.
+		//
+		// The same rewrite turns a translated shop page (/fr/boutique/, resolved
+		// as a page) into an unscoped product archive on any site with a static
+		// front page.
 		//
 		// Priority 20 so it runs after WC's rewrite, and it only ever ADDS the
 		// stamp to a query nobody stamped, so no existing exemption is undone.
@@ -355,6 +433,19 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		add_action( 'perflocale/translation/created', [ $this, 'clone_product_variations' ], 20, 4 );
 
+		// Give a non-variable product translation its wc_product_meta_lookup
+		// row (WooCommerce 10.8+). Priority 25: after mirror_product_type()
+		// (15), whose recorded product type picks the data store, and the
+		// variation clone (20).
+		add_action( 'perflocale/translation/created', [ $this, 'refresh_copy_lookup_row' ], 25, 2 );
+
+		// Machine translation of a product also translates its variations'
+		// descriptions and its local (non-taxonomy) attribute options, which
+		// the post translation itself does not carry.
+		if ( $settings->mt_enabled() ) {
+			add_action( 'perflocale/machine_translation/after', [ $this, 'translate_variation_texts' ], 10, 5 );
+		}
+
 		// Register WC non-gettext strings (attribute labels, email subjects/headings)
 		// when the user runs "Scan for Strings" from the Strings page.
 		add_action( 'perflocale/strings/after_scan', [ $this, 'sync_attribute_labels' ] );
@@ -363,6 +454,13 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// Re-register email strings when WC email settings are saved,
 		// so changed subjects/headings are immediately available for translation.
 		add_action( 'woocommerce_settings_saved', [ $this, 'sync_email_strings' ] );
+
+		// Every other write of an email's settings - WC_Email::update_option(),
+		// the WC REST settings API, the block email editor, update_option()
+		// from code or WP-CLI - reaches the option without
+		// woocommerce_settings_saved. Core fires these two for every caller.
+		add_action( 'added_option', [ $this, 'register_email_strings_on_add' ], 10, 2 );
+		add_action( 'updated_option', [ $this, 'register_email_strings_on_update' ], 10, 3 );
 
 		// ---- Cart fragment invalidation ----
 
@@ -419,9 +517,15 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// raw DB value without calling __(), so gettext never sees it.
 			add_filter( 'woocommerce_attribute_label', [ $this, 'translate_attribute_label' ], 5, 3 );
 
-			// Translate variation attribute names in the product title
-			// when WC generates it (data-store level).
-			add_filter( 'woocommerce_product_variation_title', [ $this, 'translate_variation_title' ], 10, 4 );
+			// Variation names are translated where they are shown (the cart,
+			// order and Store API filters here), never through
+			// `woocommerce_product_variation_title`: WooCommerce's variation
+			// data store writes that filter's result to wp_posts.post_title
+			// whenever it differs from the stored title, so a translated title
+			// there turns every read in another language into a database write.
+
+			// Name order lines in the checkout language.
+			add_action( 'woocommerce_checkout_create_order_line_item', [ $this, 'name_order_line_in_checkout_language' ], 10, 4 );
 
 			// Translate variation names displayed in cart, mini-cart, and checkout.
 			add_filter( 'woocommerce_cart_item_name', [ $this, 'translate_cart_item_name' ], 10, 3 );
@@ -436,6 +540,11 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// Translate attribute values in order item meta display.
 			add_filter( 'woocommerce_display_item_meta', [ $this, 'translate_order_item_meta' ], 10, 3 );
 		}
+
+		// Hide attribute rows whose value, in any language, is already in the
+		// order line name. Every context: admin screens and admin-sent emails
+		// show the stored name too.
+		add_filter( 'woocommerce_order_item_get_formatted_meta_data', [ $this, 'hide_attribute_meta_in_item_name' ], 10, 2 );
 	}
 
 	/**
@@ -1254,6 +1363,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * Runs on perflocale/strings/after_scan (when user clicks "Scan for Strings")
 	 * and on woocommerce_settings_saved (when WC email settings change).
+	 * A write of one email's settings anywhere else is registered by
+	 * register_changed_email_strings().
 	 *
 	 * @return void
 	 */
@@ -1269,7 +1380,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		$emails = $mailer->get_emails();
-		$fields = [ 'subject', 'heading', 'additional_content' ];
+		$fields = self::EMAIL_STRING_FIELDS;
 
 		foreach ( $emails as $email ) {
 			if ( ! $email instanceof \WC_Email ) {
@@ -1295,6 +1406,114 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 					"email_{$field}_{$email->id}"
 				);
 			}
+		}
+	}
+
+	/**
+	 * Register the email strings of a WC email settings option that was
+	 * created (added_option).
+	 *
+	 * @param mixed $option Option name.
+	 * @param mixed $value  Stored value.
+	 * @return void
+	 */
+	public function register_email_strings_on_add( $option, $value = null ): void {
+		$this->register_changed_email_strings( $option, null, $value );
+	}
+
+	/**
+	 * Register the email strings of a WC email settings option that was
+	 * updated (updated_option).
+	 *
+	 * @param mixed $option    Option name.
+	 * @param mixed $old_value Previous value.
+	 * @param mixed $value     Stored value.
+	 * @return void
+	 */
+	public function register_email_strings_on_update( $option, $old_value = null, $value = null ): void {
+		$this->register_changed_email_strings( $option, $old_value, $value );
+	}
+
+	/**
+	 * Register the subject, heading and additional content a write of one
+	 * `woocommerce_{id}_settings` option changed, so the old translation moves
+	 * to the new text as Needs Update whatever wrote the option.
+	 *
+	 * Every option write on the site passes through here, so everything up to
+	 * the mailer lookup is string and array work. Payment gateway and shipping
+	 * settings share the option name pattern but carry none of the fields, and
+	 * a write that leaves all three fields as they were (an email switched on
+	 * or off) registers nothing. The texts come from the NEW value: a direct
+	 * update_option() leaves the mailer's cached copy of the settings stale.
+	 *
+	 * Skipped while WordPress or WooCommerce installs, before init (loading the
+	 * mailer loads every email class and its translations), and inside the WC
+	 * Settings page save, whose woocommerce_settings_saved runs
+	 * sync_email_strings() for every email once the save has finished.
+	 *
+	 * @param mixed $option    Option name.
+	 * @param mixed $old_value Previous value; null for a new option.
+	 * @param mixed $value     Stored value.
+	 * @return void
+	 */
+	private function register_changed_email_strings( $option, $old_value, $value ): void {
+		if ( ! is_string( $option ) || ! is_array( $value ) || ! str_starts_with( $option, 'woocommerce_' ) || ! str_ends_with( $option, '_settings' ) ) {
+			return;
+		}
+
+		$previous = is_array( $old_value ) ? $old_value : [];
+		$changed  = [];
+
+		foreach ( self::EMAIL_STRING_FIELDS as $field ) {
+			if ( ( $value[ $field ] ?? null ) !== ( $previous[ $field ] ?? null ) ) {
+				$changed[] = $field;
+			}
+		}
+
+		if ( [] === $changed || wp_installing() || ( defined( 'WC_INSTALLING' ) && WC_INSTALLING ) || ! did_action( 'init' ) || ! function_exists( 'WC' ) ) {
+			return;
+		}
+
+		$tab = $GLOBALS['current_tab'] ?? '';
+
+		if ( is_string( $tab ) && '' !== $tab && doing_action( 'woocommerce_settings_save_' . $tab ) ) {
+			return;
+		}
+
+		$mailer = WC()->mailer();
+		$email  = null;
+
+		foreach ( ( $mailer ? $mailer->get_emails() : [] ) as $candidate ) {
+			if ( $candidate instanceof \WC_Email && $candidate->get_option_key() === $option ) {
+				$email = $candidate;
+				break;
+			}
+		}
+
+		if ( null === $email ) {
+			return;
+		}
+
+		// Read through the email's own get_option() - defaults and the
+		// woocommerce_email_get_option filter included - exactly as
+		// EmailTranslation does at send time, on a copy holding the new value.
+		$reader           = clone $email;
+		$reader->settings = $value;
+
+		foreach ( $changed as $field ) {
+			$default_method = 'get_default_' . $field;
+
+			if ( ! method_exists( $reader, $default_method ) ) {
+				continue;
+			}
+
+			$text = $reader->get_option( $field, $reader->{$default_method}() );
+
+			if ( ! is_string( $text ) || '' === $text ) {
+				continue;
+			}
+
+			$this->ensure_string_registered( $text, 'woocommerce', "email_{$field}_{$reader->id}" );
 		}
 	}
 
@@ -1520,7 +1739,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// as a DRAFT, so on a store where an operator ran it — which
 			// 1.0.5's own Settings copy tells them to do — wc_get_page_id(
 			// 'cart' ) on /de/ returned a draft page id. Measured on
-			// perflocale.local: 221 (live cart) became 1031357 (draft), so the
+			// a test store: 221 (live cart) became 1031357 (draft), so the
 			// cart, checkout and my-account links in the whole German funnel
 			// pointed at pages a visitor cannot open.
 			//
@@ -1829,7 +2048,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// og:url and the hreflang alternate set are all derived from it, and a
 		// fallback render's canonical is deliberately pinned to the SOURCE
 		// language ({@see \PerfLocale\Frontend\HreflangTags::filter_fallback_canonical}).
-		// Measured on perflocale.local browsing /de/: drop this guard and
+		// Measured on a test store browsing /de/: drop this guard and
 		// get_permalink() of the cart, checkout and my-account pages returns
 		// the /de/ URL even while that page is the one being rendered, so its
 		// own og:url and its en-US and x-default alternates all move onto the
@@ -1896,7 +2115,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// existed for German, this returned early, and get_permalink() of
 			// the cart, checkout and my-account pages handed a German shopper
 			// the UNPREFIXED English URL from the mini-cart and the terms link.
-			// Measured on perflocale.local: expected /de/cart-3/, got /cart-3/.
+			// Measured on a test store: expected /de/cart-3/, got /cart-3/.
 			//
 			// A draft cannot be visited, so it cannot own the URL; fall through
 			// and prefix the source exactly as before the draft existed.
@@ -1917,7 +2136,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * WooCommerce page, and it is reachable as a link target while ANOTHER page
 	 * is queried (the product archive queries products, not the shop page), so
 	 * the guard in force_wc_page_language_prefix() cannot protect it: measured
-	 * on perflocale.local, including it moved /de/shop-3/'s canonical and
+	 * on a test store, including it moved /de/shop-3/'s canonical and
 	 * og:url off /shop-3/ onto itself and broke the source-language pinning.
 	 * Every WooCommerce-sanctioned way of asking for the shop URL runs through
 	 * wc_get_page_permalink( 'shop' ), which boot() hooks directly.
@@ -2186,7 +2405,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return $name;
 		}
 
-		$translated_name = $this->build_translated_variation_name( $variation );
+		$translated_name = $this->build_translated_variation_name( $variation, true );
 
 		if ( $translated_name === null ) {
 			return $name;
@@ -2202,27 +2421,47 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * @return string|null Translated title, or null when there is nothing to swap.
 	 */
 	private function translated_product_title( int $product_id ): ?string {
-		if ( $product_id <= 0 ) {
+		$translated_id = $this->public_translation_id( $product_id );
+
+		if ( $translated_id <= 0 ) {
 			return null;
+		}
+
+		// The stored title, as WooCommerce's own cart line name is: no
+		// "Protected:" prefix or other `the_title` output.
+		$title = (string) get_post_field( 'post_title', $translated_id, 'raw' );
+
+		return $title !== '' ? $title : null;
+	}
+
+	/**
+	 * ID of a product's published translation in the current language.
+	 *
+	 * @param int $product_id Source product ID.
+	 * @return int Translation ID, or 0 when there is nothing to swap.
+	 */
+	private function public_translation_id( int $product_id ): int {
+		if ( $product_id <= 0 ) {
+			return 0;
 		}
 
 		$plugin = \PerfLocale\Plugin::get_instance();
 
 		if ( ! $plugin->has( 'router' ) ) {
-			return null;
+			return 0;
 		}
 
 		$current_slug = $plugin->get( 'router' )->get_current_slug();
 
 		if ( $current_slug === '' ) {
-			return null;
+			return 0;
 		}
 
 		$manager       = new \PerfLocale\Translation\PostTranslationManager( $plugin->get( 'cache' ), $plugin->get( 'settings' ) );
 		$translated_id = $manager->get_translation_id( $product_id, $current_slug );
 
 		if ( ! $translated_id || $translated_id === $product_id ) {
-			return null;
+			return 0;
 		}
 
 		// The cart, mini-cart and checkout render for GUESTS. A translation is
@@ -2232,12 +2471,375 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// Keep the source label instead. Same rule the cross-sell mapper already
 		// applies in map_related_ids_to_language().
 		if ( ! $this->is_publicly_viewable_translation( (int) $translated_id ) ) {
+			return 0;
+		}
+
+		// A group that links products of different types (a simple product
+		// with a variable one) is not a translation of the purchased item:
+		// its title and image would name a different product in the cart,
+		// the order and the emails. Keep the purchased product's own.
+		if ( $this->product_type( $product_id ) !== $this->product_type( (int) $translated_id ) ) {
+			return 0;
+		}
+
+		return (int) $translated_id;
+	}
+
+	/**
+	 * A product's WooCommerce type.
+	 *
+	 * WooCommerce's product data store answers from its own product cache;
+	 * the store is loaded once per request rather than once per lookup. A site
+	 * that overrides the lookup through `woocommerce_product_type_query` gets
+	 * WooCommerce's factory answer.
+	 *
+	 * @param int $product_id Product or variation ID.
+	 * @return string Product type, '' when the ID is not a product.
+	 */
+	private function product_type( int $product_id ): string {
+		if ( has_filter( 'woocommerce_product_type_query' ) ) {
+			return (string) \WC_Product_Factory::get_product_type( $product_id );
+		}
+
+		$this->product_data_store ??= \WC_Data_Store::load( 'product' );
+
+		return (string) $this->product_data_store->get_product_type( $product_id );
+	}
+
+	/**
+	 * Add the order language to the fields WooCommerce's personal-data
+	 * exporter lists for an order.
+	 *
+	 * @param mixed $props Field key => label.
+	 * @return mixed
+	 */
+	public function add_order_language_export_prop( mixed $props ): mixed {
+		if ( ! is_array( $props ) ) {
+			return $props;
+		}
+
+		$props['perflocale_language'] = __( 'Order language', 'perflocale' );
+
+		return $props;
+	}
+
+	/**
+	 * Value of the order-language field in the personal-data export: the
+	 * language's name, or its code when the language no longer exists.
+	 *
+	 * @param mixed $value Value so far.
+	 * @param mixed $prop  Field key.
+	 * @param mixed $order Order being exported.
+	 * @return mixed
+	 */
+	public function export_order_language_prop( mixed $value, mixed $prop = '', mixed $order = null ): mixed {
+		if ( 'perflocale_language' !== $prop || ! $order instanceof \WC_Order ) {
+			return $value;
+		}
+
+		$slug = sanitize_key( (string) $order->get_meta( '_perflocale_language', true ) );
+
+		if ( $slug === '' ) {
+			return $value;
+		}
+
+		$language = null;
+
+		try {
+			$language = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' )->find_by_slug( $slug );
+		} catch ( \Throwable $e ) {
+			$language = null;
+		}
+
+		$name = is_object( $language ) && isset( $language->name ) ? (string) $language->name : '';
+
+		return $name !== '' ? $name : $slug;
+	}
+
+	/**
+	 * Open the Store API cart window: attach the cart-line mappers.
+	 *
+	 * Runs on `rest_request_before_callbacks`, so it covers a real HTTP call,
+	 * a REST preload (rest_preload_api_request) and every cart or checkout
+	 * sub-request of a batch; WooCommerce's block hydration opens it through
+	 * dispatch_store_api_hydration(). Nothing else does: catalogue routes,
+	 * the order-pay route and every non-REST render never see the mappers.
+	 * The checkout route embeds the cart in its response
+	 * (`__experimentalCart`, and `cart` in a 409 error), which the block
+	 * Checkout summary shows. Only the product objects the cart itself holds
+	 * are mapped, never a cross-sell or any other product the response embeds.
+	 * Price, quantity, keys, ids, stock, item data and the order line name
+	 * (built from get_name(), which no mapper touches) stay those of the
+	 * purchased product.
+	 *
+	 * @param mixed $response Result so far (passed through).
+	 * @param mixed $handler  Route handler.
+	 * @param mixed $request  Request being dispatched.
+	 * @return mixed $response, unchanged.
+	 */
+	public function open_store_api_cart_window( mixed $response, mixed $handler = null, mixed $request = null ): mixed {
+		if ( ! $request instanceof \WP_REST_Request || ! self::is_store_api_cart_window_route( $request->get_route() ) ) {
+			return $response;
+		}
+
+		if ( 0 === $this->store_api_cart_depth++ ) {
+			add_filter( 'woocommerce_product_title', [ $this, 'map_store_api_cart_title' ], 10, 2 );
+			add_filter( 'woocommerce_product_get_short_description', [ $this, 'map_store_api_cart_short_description' ], 10, 2 );
+			add_filter( 'woocommerce_product_get_image_id', [ $this, 'map_store_api_cart_image_id' ], 10, 2 );
+			add_filter( 'woocommerce_product_variation_get_image_id', [ $this, 'map_store_api_cart_image_id' ], 10, 2 );
+			add_filter( 'woocommerce_product_get_gallery_image_ids', [ $this, 'map_store_api_cart_gallery_image_ids' ], 10, 2 );
+		}
+
+		return $response;
+	}
+
+	/**
+	 * Close the Store API cart window opened for the same request.
+	 *
+	 * Core fires `rest_request_after_callbacks` for every request that fired
+	 * the opening filter, including a permission failure or an error response.
+	 *
+	 * @param mixed $response Result to send (passed through).
+	 * @param mixed $handler  Route handler.
+	 * @param mixed $request  Request being dispatched.
+	 * @return mixed $response, unchanged.
+	 */
+	public function close_store_api_cart_window( mixed $response, mixed $handler = null, mixed $request = null ): mixed {
+		if ( $this->store_api_cart_depth <= 0 || ! $request instanceof \WP_REST_Request || ! self::is_store_api_cart_window_route( $request->get_route() ) ) {
+			return $response;
+		}
+
+		if ( 0 === --$this->store_api_cart_depth ) {
+			remove_filter( 'woocommerce_product_title', [ $this, 'map_store_api_cart_title' ], 10 );
+			remove_filter( 'woocommerce_product_get_short_description', [ $this, 'map_store_api_cart_short_description' ], 10 );
+			remove_filter( 'woocommerce_product_get_image_id', [ $this, 'map_store_api_cart_image_id' ], 10 );
+			remove_filter( 'woocommerce_product_variation_get_image_id', [ $this, 'map_store_api_cart_image_id' ], 10 );
+			remove_filter( 'woocommerce_product_get_gallery_image_ids', [ $this, 'map_store_api_cart_gallery_image_ids' ], 10 );
+
+			$this->store_api_cart_siblings = [];
+			$this->store_api_cart_primed   = false;
+		}
+
+		return $response;
+	}
+
+	/**
+	 * Run a Store API cart or checkout route for WooCommerce's block
+	 * hydration inside the cart window.
+	 *
+	 * The Hydration service builds the first paint of the Cart, Checkout and
+	 * All Products blocks and the Mini-Cart by calling the route's handler
+	 * directly, between `woocommerce_hydration_dispatch_request` and
+	 * `woocommerce_hydration_request_after_callbacks`. This runs last on the
+	 * first, only when no other callback has answered, and calls the handler
+	 * as WooCommerce would. The window closes in `finally`, so a handler or a
+	 * later filter that throws cannot leave the mappers attached for the rest
+	 * of the page. Inventory Sync's frame for the request (see
+	 * InventorySync::enter_store_api_request()) closes in the same `finally`.
+	 *
+	 * @param mixed $result  Result so far; anything but null is passed through.
+	 * @param mixed $request Request built for the hydrated path.
+	 * @param mixed $path    Hydrated path.
+	 * @param mixed $handler Route handler WooCommerce matched.
+	 * @return mixed The handler's response, or $result unchanged.
+	 */
+	public function dispatch_store_api_hydration( mixed $result, mixed $request = null, mixed $path = '', mixed $handler = null ): mixed {
+		unset( $path );
+
+		if ( null !== $result || ! $request instanceof \WP_REST_Request || ! is_array( $handler ) || ! isset( $handler['callback'] ) || ! is_callable( $handler['callback'] ) || ! self::is_store_api_cart_window_route( $request->get_route() ) ) {
+			return $result;
+		}
+
+		$this->open_store_api_cart_window( null, $handler, $request );
+
+		try {
+			if ( null !== $this->inventory_sync ) {
+				$this->inventory_sync->enter_store_api_request( $request, \PerfLocale\WooCommerce\InventorySync::is_display_cart_read( $request ) );
+			}
+
+			return call_user_func( $handler['callback'], $request );
+		} finally {
+			$this->inventory_sync?->leave_store_api_request( $request );
+			$this->close_store_api_cart_window( null, $handler, $request );
+		}
+	}
+
+	/**
+	 * Whether a REST route opens the Store API cart window: the cart routes
+	 * (`/cart` and everything under it) and the checkout route (`/checkout`
+	 * itself, not the order-pay route under it), versioned or not.
+	 *
+	 * @param string $route REST route.
+	 * @return bool
+	 */
+	private static function is_store_api_cart_window_route( string $route ): bool {
+		return str_starts_with( $route, '/wc/store/' )
+			&& 1 === preg_match( '#^/wc/store(?:/v[0-9]+)?/(?:cart(?:/|$)|checkout/?$)#', $route );
+	}
+
+	/**
+	 * Store API cart line name: the published sibling's title (a variation
+	 * carries its parent's title here, so it maps through the parent).
+	 *
+	 * @param mixed $title   Product title.
+	 * @param mixed $product Product object.
+	 * @return mixed
+	 */
+	public function map_store_api_cart_title( mixed $title, mixed $product = null ): mixed {
+		$sibling = $this->store_api_cart_sibling( $product );
+
+		return ( $sibling !== null && $sibling['title'] !== null ) ? $sibling['title'] : $title;
+	}
+
+	/**
+	 * Store API cart line short description: the published sibling's, even
+	 * when that one is empty, since the line links to the sibling's page.
+	 * A sibling that still needs its password for this visitor keeps the
+	 * purchased product's own. Variations carry no short description of
+	 * their own and are left alone.
+	 *
+	 * @param mixed $value   Short description.
+	 * @param mixed $product Product object.
+	 * @return mixed
+	 */
+	public function map_store_api_cart_short_description( mixed $value, mixed $product = null ): mixed {
+		$sibling = $this->store_api_cart_sibling( $product );
+
+		return ( $sibling !== null && $sibling['excerpt'] !== null ) ? $sibling['excerpt'] : $value;
+	}
+
+	/**
+	 * Store API cart line image: the published sibling's own image. A sibling
+	 * without one keeps the purchased product's image.
+	 *
+	 * @param mixed $image_id Image attachment ID.
+	 * @param mixed $product  Product object.
+	 * @return mixed
+	 */
+	public function map_store_api_cart_image_id( mixed $image_id, mixed $product = null ): mixed {
+		$sibling = $this->store_api_cart_sibling( $product );
+
+		return ( $sibling !== null && $sibling['image'] > 0 ) ? $sibling['image'] : $image_id;
+	}
+
+	/**
+	 * Store API cart line gallery: follows the image, so a line never mixes
+	 * the sibling's main image with the source's gallery.
+	 *
+	 * @param mixed $ids     Gallery attachment IDs.
+	 * @param mixed $product Product object.
+	 * @return mixed
+	 */
+	public function map_store_api_cart_gallery_image_ids( mixed $ids, mixed $product = null ): mixed {
+		$sibling = $this->store_api_cart_sibling( $product );
+
+		return ( $sibling !== null && $sibling['gallery'] !== null ) ? $sibling['gallery'] : $ids;
+	}
+
+	/**
+	 * Current-language sibling data for a product object the cart holds.
+	 *
+	 * Identity, not ID: only the exact objects in the cart's lines qualify, so
+	 * a cross-sell or any other product built from the same ID is left alone.
+	 * Cost, once per window: one pass that primes every line's sibling post
+	 * and meta (no query when they are cached, at most two when not), then
+	 * cached reads per line.
+	 *
+	 * @param mixed $product Product object.
+	 * @return array{title: ?string, excerpt: ?string, image: int, gallery: ?array<int, int>}|null
+	 */
+	private function store_api_cart_sibling( mixed $product ): ?array {
+		if ( ! $product instanceof \WC_Product || ! function_exists( 'WC' ) || ! WC()->cart instanceof \WC_Cart ) {
 			return null;
 		}
 
-		$title = get_the_title( $translated_id );
+		$line = null;
 
-		return $title !== '' ? $title : null;
+		foreach ( WC()->cart->cart_contents as $cart_item ) {
+			if ( ( $cart_item['data'] ?? null ) === $product ) {
+				$line = $cart_item;
+				break;
+			}
+		}
+
+		if ( $line === null ) {
+			return null;
+		}
+
+		$product_id   = (int) ( $line['product_id'] ?? 0 );
+		$variation_id = (int) ( $line['variation_id'] ?? 0 );
+		$plugin       = \PerfLocale\Plugin::get_instance();
+		$slug         = $plugin->has( 'router' ) ? (string) $plugin->get( 'router' )->get_current_slug() : '';
+		$key          = get_current_blog_id() . ':' . $slug . ':' . $product_id . ':' . $variation_id;
+
+		if ( array_key_exists( $key, $this->store_api_cart_siblings ) ) {
+			return $this->store_api_cart_siblings[ $key ];
+		}
+
+		// One pass over the whole cart the first time: the posts and meta of
+		// every line's sibling in two queries instead of one meta read per line.
+		// The translation lookups are the ones the permalink filter makes anyway.
+		if ( ! $this->store_api_cart_primed ) {
+			$this->store_api_cart_primed = true;
+
+			if ( $slug !== '' ) {
+				$manager = new \PerfLocale\Translation\PostTranslationManager( $plugin->get( 'cache' ), $plugin->get( 'settings' ) );
+				$prime   = [];
+
+				foreach ( WC()->cart->cart_contents as $cart_item ) {
+					$pid = (int) ( $cart_item['product_id'] ?? 0 );
+					$tid = $pid > 0 ? (int) $manager->get_translation_id( $pid, $slug ) : 0;
+
+					if ( $tid > 0 && $tid !== $pid ) {
+						$prime[ $tid ] = $tid;
+					}
+				}
+
+				if ( $prime !== [] ) {
+					_prime_post_caches( array_values( $prime ), false, true );
+				}
+			}
+		}
+
+		$sibling_id = $this->public_translation_id( $product_id );
+		$data       = null;
+
+		if ( $sibling_id > 0 ) {
+			// The stored title, as WooCommerce's own product name is: no
+			// "Protected:" prefix or other `the_title` output.
+			$title   = (string) get_post_field( 'post_title', $sibling_id, 'raw' );
+			$image   = 0;
+			$gallery = null;
+
+			if ( $variation_id > 0 ) {
+				// A variation with an image of its own keeps it: translated
+				// variations copy it and are not linked one-to-one. One that
+				// falls back to its parent's image follows the sibling parent.
+				if ( (int) $product->get_image_id( 'edit' ) <= 0 ) {
+					$image = (int) get_post_thumbnail_id( $sibling_id );
+				}
+			} else {
+				$image = (int) get_post_thumbnail_id( $sibling_id );
+
+				if ( $image > 0 ) {
+					$gallery = array_values( array_filter( array_map( 'absint', explode( ',', (string) get_post_meta( $sibling_id, '_product_image_gallery', true ) ) ) ) );
+				}
+			}
+
+			$data = [
+				'title'   => $title !== '' ? $title : null,
+				// A sibling behind a password keeps the purchased product's
+				// short description until the visitor has entered that
+				// password, as WooCommerce's own product responses do.
+				'excerpt' => ( $variation_id > 0 || post_password_required( $sibling_id ) ) ? null : (string) get_post_field( 'post_excerpt', $sibling_id, 'raw' ),
+				'image'   => $image,
+				'gallery' => $gallery,
+			];
+		}
+
+		$this->store_api_cart_siblings[ $key ] = $data;
+
+		return $data;
 	}
 
 	/**
@@ -2317,7 +2919,9 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return $name;
 		}
 
-		$translated_name = $this->build_translated_variation_name( $variation );
+		// The parent's stored title, as the order line WooCommerce stored and
+		// the cart line are: no "Protected:" prefix or other `the_title` output.
+		$translated_name = $this->build_translated_variation_name( $variation, true );
 
 		if ( $translated_name === null ) {
 			return $name;
@@ -2347,10 +2951,13 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * Combines the parent product title with translated attribute values.
 	 * Returns null if no translation is needed or possible.
 	 *
-	 * @param \WC_Product_Variation $variation Variation product.
+	 * @param \WC_Product_Variation $variation    Variation product.
+	 * @param bool                  $stored_title Use the parent's stored title, as
+	 *                                            WooCommerce's own cart line name
+	 *                                            does, instead of get_the_title().
 	 * @return string|null Translated name or null.
 	 */
-	private function build_translated_variation_name( \WC_Product_Variation $variation ): ?string {
+	private function build_translated_variation_name( \WC_Product_Variation $variation, bool $stored_title = false ): ?string {
 		$plugin = \PerfLocale\Plugin::get_instance();
 
 		if ( ! $plugin->has( 'router' ) ) {
@@ -2442,7 +3049,9 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return null;
 		}
 
-		$title_base = get_the_title( $variation->get_parent_id() );
+		$title_base = $stored_title
+			? (string) get_post_field( 'post_title', $variation->get_parent_id(), 'raw' )
+			: get_the_title( $variation->get_parent_id() );
 
 		/** This filter is documented in WooCommerce class-wc-product-variation-data-store-cpt.php */
 		$separator = apply_filters( 'woocommerce_product_variation_title_attributes_separator', ' - ', $variation ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WooCommerce core filter.
@@ -2451,97 +3060,91 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Translate the variation product title (e.g. "Test Product - Blue" → "Test Product - Синьо").
+	 * Name a new variation order line in the checkout language.
 	 *
-	 * Fires when WooCommerce generates the variation title for display in
-	 * cart, checkout, mini-cart, order details, and emails. Translates each
-	 * attribute value in the suffix to the current language.
+	 * WooCommerce names the line with the variation's get_name(), which is its
+	 * stored title. A shopper who checks out in another language gets the
+	 * name the cart showed: the parent's stored title with the attribute
+	 * values in that language. Nothing changes when the checkout language is
+	 * the default or when no attribute value has a translation in it. Lines
+	 * of other product types keep WooCommerce's own name.
 	 *
-	 * @param string      $title Full variation title.
-	 * @param \WC_Product $product Variation product object.
-	 * @param string      $title_base Parent product title.
-	 * @param string      $title_suffix Formatted attribute values.
-	 * @return string Translated variation title.
+	 * @param \WC_Order_Item_Product|mixed $item          Order line being created.
+	 * @param string                       $cart_item_key Cart item key.
+	 * @param array<string, mixed>|mixed   $values        Cart item.
+	 * @param \WC_Order|null|mixed         $order         Order being created.
+	 * @return void
 	 */
-	public function translate_variation_title( string $title, $product, string $title_base, string $title_suffix ): string {
-		if ( $title_suffix === '' || ! $product instanceof \WC_Product_Variation ) {
-			return $title;
+	public function name_order_line_in_checkout_language( $item, $cart_item_key = '', $values = [], $order = null ): void {
+		if ( ! $item instanceof \WC_Order_Item_Product ) {
+			return;
 		}
 
-		$plugin = \PerfLocale\Plugin::get_instance();
-
-		if ( ! $plugin->has( 'router' ) ) {
-			return $title;
+		if ( $item->get_variation_id() <= 0 ) {
+			return;
 		}
 
-		$router       = $plugin->get( 'router' );
-		$current_slug = $router->get_current_slug();
+		// The cart line's own object: WooCommerce built the line from it.
+		$variation = is_array( $values ) && ( $values['data'] ?? null ) instanceof \WC_Product_Variation ? $values['data'] : $item->get_product();
+		$name      = $variation instanceof \WC_Product_Variation ? $this->build_translated_variation_name( $variation, true ) : null;
 
-		if ( $current_slug === '' ) {
-			return $title;
+		if ( $name !== null && $name !== '' ) {
+			$item->set_name( $name );
+		}
+	}
+
+	/**
+	 * Hide an order line's attribute rows whose value is already in its name.
+	 *
+	 * WooCommerce hides a variation attribute row when the term's name is in
+	 * the line name, and it compares the term's own name only. A line named in
+	 * the checkout language ("Blanket - Blue") kept the "Color: Bleu" row,
+	 * which the order views then show translated under a name that already
+	 * says Blue. The row is hidden when the name of the term or of any of its
+	 * translations is in the line name.
+	 *
+	 * @param array<int|string, object>|mixed $formatted_meta Formatted meta rows.
+	 * @param \WC_Order_Item|mixed            $item           Order item.
+	 * @return array<int|string, object>|mixed
+	 */
+	public function hide_attribute_meta_in_item_name( $formatted_meta, $item = null ) {
+		if ( ! is_array( $formatted_meta ) || $formatted_meta === [] || ! $item instanceof \WC_Order_Item_Product || $item->get_variation_id() <= 0 ) {
+			return $formatted_meta;
 		}
 
-		// Skip on default language - variation title is already correct.
-		$default = $router->get_default_language();
+		$item_name    = (string) $item->get_name();
+		$term_manager = null;
 
-		if ( $default && $current_slug === $default->slug ) {
-			return $title;
-		}
+		foreach ( $formatted_meta as $id => $meta ) {
+			$taxonomy = is_object( $meta ) && isset( $meta->key, $meta->value ) ? str_replace( 'attribute_', '', (string) $meta->key ) : '';
 
-		$term_manager = $this->get_term_manager();
-		$attributes   = $product->get_attributes();
-
-		if ( empty( $attributes ) ) {
-			return $title;
-		}
-
-		$translated_parts = [];
-
-		foreach ( $attributes as $taxonomy => $slug_value ) {
-			// "Any <attribute>" variations carry an empty slug; WooCommerce
-			// omits them from the title, so skip rather than emit an empty
-			// part that implode() turns into a stray ", " separator.
-			if ( $slug_value === '' ) {
+			if ( $taxonomy === '' || ! taxonomy_exists( $taxonomy ) ) {
 				continue;
 			}
 
-			if ( ! taxonomy_exists( $taxonomy ) ) {
-				// Custom (non-taxonomy) attribute — keep its raw stored value.
-				$translated_parts[] = $slug_value;
-				continue;
-			}
-
-			$term = get_term_by( 'slug', $slug_value, $taxonomy );
+			$term = get_term_by( 'slug', (string) $meta->value, $taxonomy );
 
 			if ( ! $term instanceof \WP_Term ) {
-				$translated_parts[] = $slug_value;
 				continue;
 			}
 
-			$translated_id = $term_manager->get_translation_id( $term->term_id, $current_slug );
+			$term_manager ??= $this->get_term_manager();
+			$translations   = $term_manager->get_translations( (int) $term->term_id );
 
-			if ( $translated_id !== null && $translated_id !== $term->term_id ) {
-				$translated_term = get_term( $translated_id );
+			// The translated terms in one query, rather than one per language.
+			_prime_term_caches( array_values( array_diff( array_map( 'intval', $translations ), [ (int) $term->term_id ] ) ), false );
 
-				if ( $translated_term instanceof \WP_Term ) {
-					$translated_parts[] = $translated_term->name;
-					continue;
+			foreach ( $translations as $translated_id ) {
+				$translated = (int) $translated_id === (int) $term->term_id ? $term : get_term( (int) $translated_id );
+
+				if ( $translated instanceof \WP_Term && $translated->name !== '' && wc_is_attribute_in_product_name( $translated->name, $item_name ) ) {
+					unset( $formatted_meta[ $id ] );
+					break;
 				}
 			}
-
-			$translated_parts[] = $term->name;
 		}
 
-		if ( empty( $translated_parts ) ) {
-			return $title;
-		}
-
-		$translated_suffix = implode( ', ', $translated_parts );
-
-		/** This filter is documented in WooCommerce class-wc-product-variation-data-store-cpt.php */
-		$separator = apply_filters( 'woocommerce_product_variation_title_attributes_separator', ' - ', $product ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WooCommerce core filter.
-
-		return $title_base . $separator . $translated_suffix;
+		return $formatted_meta;
 	}
 
 	/**
@@ -2926,7 +3529,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 					<input type="checkbox" name="wc_sync_stock" value="1" <?php checked( $sync_stock ); ?>>
 					<?php echo esc_html__( 'Sync stock, SKU, and pricing across all language variants', 'perflocale' ); ?>
 				</label>
-				<p class="description"><?php echo esc_html__( 'Keeps stock levels, SKU, price, weight, and dimensions identical across all translations of the same product. Prevents over-selling when the same physical product exists in multiple languages.', 'perflocale' ); ?></p>
+				<p class="description"><?php echo esc_html__( 'Keeps stock levels, SKU, GTIN, price, weight, and dimensions identical across all translations of the same product whenever WooCommerce saves it, whether the change comes from an order, the product editor, Quick Edit, the REST API, an import, or another plugin. Prevents over-selling when the same physical product exists in multiple languages.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 		<tr>
@@ -3134,6 +3737,18 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 					</p>
 				<?php else : ?>
 					<select name="wc_exchange_rate_provider" id="perflocale-rate-provider">
+						<?php
+						// A stored id that no provider registers right now keeps its own
+						// option, so saving the tab unchanged does not switch providers.
+						if ( '' !== $rate_provider && ! isset( $providers[ $rate_provider ] ) ) :
+							?>
+							<option value="<?php echo esc_attr( $rate_provider ); ?>" selected="selected">
+								<?php
+								/* translators: %s: provider id stored in the settings. */
+								echo esc_html( sprintf( __( '%s (not registered)', 'perflocale' ), $rate_provider ) );
+								?>
+							</option>
+						<?php endif; ?>
 						<?php foreach ( $providers as $pid => $prov ) : ?>
 							<option value="<?php echo esc_attr( $pid ); ?>" <?php selected( $rate_provider, $pid ); ?>
 								data-needs-key="<?php echo esc_attr( ! empty( $prov['needs_key'] ) ? '1' : '0' ); ?>"
@@ -3319,7 +3934,9 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 			$out[ $slug ] = [
 				'currency_code' => $code,
-				'exchange_rate' => max( 0.0001, (float) ( $data['exchange_rate'] ?? 1.0 ) ),
+				// Not a finite number above zero: refused, the stored rate of
+				// the row stays (rate_to_store()).
+				'exchange_rate' => \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $existing[ $slug ] ?? null, $code ),
 				// Carry the manual-rate pin through the POST handler — without it
 				// the auto-sync skip (ExchangeRateSync / MultiCurrency) never sees
 				// the flag, so a user-entered rate is silently overwritten.
@@ -3457,11 +4074,13 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Language-scope the front page after WooCommerce turns it into a shop.
+	 * Language-scope a page request after WooCommerce turns it into a shop.
 	 *
-	 * Only touches a MAIN query that WC has rewritten to a product archive on
-	 * a site whose front page IS the shop page, and only when nothing has
-	 * stamped a language on it yet. See the rationale in boot().
+	 * Only touches a MAIN query that WC has rewritten to a product archive:
+	 * the front page of a site whose front page IS the shop page, or a
+	 * request for the (translated) shop page on a site with a static front
+	 * page. Only when nothing has stamped a language on it yet. See the
+	 * rationale in boot().
 	 *
 	 * @param \WP_Query $query Query about to run.
 	 * @return void
@@ -3483,16 +4102,25 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return;
 		}
 
-		// Narrow to the one configuration that produces the gap: the shop page
-		// standing in as the front page. Any other product archive was already
-		// scoped normally at priority 5.
+		// Narrow to the configurations that produce the gap. Any other product
+		// archive was already scoped normally at priority 5.
 		if ( ! function_exists( 'wc_get_page_id' ) ) {
 			return;
 		}
 
-		$front = (int) get_option( 'page_on_front' );
+		// The shop page standing in as the front page.
+		$front     = (int) get_option( 'page_on_front' );
+		$shop_home = $front > 0 && $front === (int) wc_get_page_id( 'shop' );
 
-		if ( $front <= 0 || $front !== (int) wc_get_page_id( 'shop' ) ) {
+		// WooCommerce makes the same rewrite for any page request whose page
+		// is the shop page while the site shows a static front page
+		// (includes/class-wc-query.php:377-380), and leaves it marked both a
+		// page and a product archive with page_id emptied. A translated shop
+		// page (/fr/boutique/) is such a request: it resolves as a page, which
+		// PerfLocale exempts for naming a page_id.
+		$shop_page = $query->is_page && $query->is_post_type_archive && '' === (string) $query->get( 'page_id' );
+
+		if ( ! $shop_home && ! $shop_page ) {
 			return;
 		}
 
@@ -3519,12 +4147,17 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * copies it. A translation is therefore created with no product_type term
 	 * at all, and `wc_get_product()` resolves it to `WC_Product_Simple`.
 	 *
-	 * `clone_product_variations()` already compensated for this, but only after
-	 * an `is_type( 'variable' )` guard — so GROUPED and EXTERNAL products
-	 * degraded silently. Measured on test.local before this fix: a translated
-	 * grouped product came back as `WC_Product_Simple` with `get_children()`
-	 * empty, despite its `_children` meta having been copied intact. The
-	 * visitor got a simple product's add-to-cart form and none of the children.
+	 * `clone_product_variations()` sets the term only behind an
+	 * `is_type( 'variable' )` guard, so GROUPED and EXTERNAL products rely on
+	 * this method. Without the term a translated grouped product loads as
+	 * `WC_Product_Simple` with `get_children()` empty, although its
+	 * `_children` meta is copied intact, and the visitor gets a simple
+	 * product's add-to-cart form and none of the children.
+	 *
+	 * The same gap covers the other WooCommerce taxonomies a product's props
+	 * live in: visibility, shipping class and brand. mirror_catalog_terms()
+	 * gives the translation those terms here as well, so the variable
+	 * product that clone_product_variations() loads next carries them too.
 	 *
 	 * Runs at priority 15, before clone_product_variations() at 20, which calls
 	 * `wc_get_product( $new_id )` and needs the class already resolved.
@@ -3550,18 +4183,102 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		$types = wp_get_object_terms( $source_id, 'product_type', [ 'fields' => 'slugs' ] );
 
-		if ( is_wp_error( $types ) || $types === [] ) {
-			// A product with no product_type term IS a simple product as far as
-			// WooCommerce is concerned, and that is what the translation will
-			// resolve to as well. Nothing to mirror.
-			return;
+		// A product with no product_type term IS a simple product as far as
+		// WooCommerce is concerned, and so is a translation without one: the
+		// type is mirrored only when the source has it.
+		if ( ! is_wp_error( $types ) && $types !== [] ) {
+			// Not translated, deliberately: product_type is machinery
+			// ('simple' / 'grouped' / 'variable' / 'external'), never shown to a
+			// visitor. Translating these slugs would make wc_get_product() fail
+			// to resolve a class at all.
+			wp_set_object_terms( $new_id, array_map( 'strval', $types ), 'product_type' );
+			$this->created_product_types[ get_current_blog_id() . ':' . $new_id ] = (string) reset( $types );
 		}
 
-		// Not translated, deliberately: product_type is machinery
-		// ('simple' / 'grouped' / 'variable' / 'external'), never shown to a
-		// visitor. Translating these slugs would make wc_get_product() fail to
-		// resolve a class at all.
-		wp_set_object_terms( $new_id, array_map( 'strval', $types ), 'product_type' );
+		$this->mirror_catalog_terms( $new_id, $source_id );
+
+		// WooCommerce caches each product's type the first time it loads the
+		// product. A translation created as published has been loaded already
+		// (publish-time hooks do that) while it had no type term, so the cache
+		// says 'simple', and clone_product_variations() and every later load in
+		// the request would get a simple product. Changing the term drops it.
+		if ( class_exists( \WC_Cache_Helper::class ) ) {
+			\WC_Cache_Helper::invalidate_cache_group( 'product_' . $new_id );
+		}
+	}
+
+	/**
+	 * Give a freshly-created product translation the source's visibility,
+	 * shipping class and brand terms.
+	 *
+	 * `product_visibility`, `product_shipping_class` and `product_brand` are
+	 * WooCommerce taxonomies outside `get_translatable_taxonomies()` (unless
+	 * the site added one), so `copy_taxonomy_terms()` never copies them, and
+	 * WooCommerce reads the props from these terms alone. Without them the
+	 * translation of a hidden or search-only product is listed in the
+	 * catalog, the translation of a featured product is not featured, and the
+	 * translation has no shipping class (so it is charged at the no-class
+	 * rate) and no brand.
+	 *
+	 * `product_visibility` holds two kinds of term, both written by
+	 * WC_Product_Data_Store_CPT::update_visibility():
+	 *   - `featured`, `exclude-from-catalog` and `exclude-from-search` are the
+	 *     operator's settings, and are copied from the source;
+	 *   - `outofstock` and `rated-N` follow the product's own stock status and
+	 *     average rating. They are derived from the TRANSLATION's
+	 *     `_stock_status` and `_wc_average_rating` the way update_visibility()
+	 *     derives them, never copied from the source.
+	 *
+	 * Shipping class and brand are shared: the translation gets the source's
+	 * own terms. A taxonomy the site made translatable is left alone, because
+	 * copy_taxonomy_terms() has already given the translation that language's
+	 * terms. `product_brand` exists from WooCommerce 9.6, and a taxonomy that
+	 * is not registered is skipped.
+	 *
+	 * The terms are written directly, as product_type is: a CRUD set_*() and
+	 * save() would fire woocommerce_update_product and every other save
+	 * listener in the middle of the create. Running it again writes the same
+	 * terms.
+	 *
+	 * @param int $new_id    Newly created translation post ID.
+	 * @param int $source_id Source post ID.
+	 * @return void
+	 */
+	private function mirror_catalog_terms( int $new_id, int $source_id ): void {
+		$plugin       = \PerfLocale\Plugin::get_instance();
+		$translatable = $plugin->has( 'settings' ) ? (array) $plugin->get( 'settings' )->get_translatable_taxonomies() : [];
+
+		if ( taxonomy_exists( 'product_visibility' ) && ! in_array( 'product_visibility', $translatable, true ) ) {
+			$flags = wp_get_object_terms( $source_id, 'product_visibility', [ 'fields' => 'slugs' ] );
+
+			if ( ! is_wp_error( $flags ) ) {
+				$terms = array_values( array_intersect( [ 'featured', 'exclude-from-search', 'exclude-from-catalog' ], array_map( 'strval', $flags ) ) );
+
+				if ( 'outofstock' === (string) get_post_meta( $new_id, '_stock_status', true ) ) {
+					$terms[] = 'outofstock';
+				}
+
+				$rating = min( 5, (int) round( (float) get_post_meta( $new_id, '_wc_average_rating', true ) ) );
+
+				if ( $rating > 0 ) {
+					$terms[] = 'rated-' . $rating;
+				}
+
+				wp_set_object_terms( $new_id, $terms, 'product_visibility' );
+			}
+		}
+
+		foreach ( [ 'product_shipping_class', 'product_brand' ] as $taxonomy ) {
+			if ( ! taxonomy_exists( $taxonomy ) || in_array( $taxonomy, $translatable, true ) ) {
+				continue;
+			}
+
+			$term_ids = wp_get_object_terms( $source_id, $taxonomy, [ 'fields' => 'ids' ] );
+
+			if ( ! is_wp_error( $term_ids ) ) {
+				wp_set_object_terms( $new_id, array_map( 'intval', $term_ids ), $taxonomy );
+			}
+		}
 	}
 
 	/**
@@ -3719,5 +4436,586 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				error_log( 'PerfLocale WC: variation clone failed for translation ' . (int) $new_id . ': ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			}
 		}
+	}
+
+	/**
+	 * Build the wc_product_meta_lookup row of a freshly-created, non-variable
+	 * product translation.
+	 *
+	 * A translation is inserted with wp_insert_post() and its meta copied with
+	 * add_post_meta() (PostTranslationManager::finish_new_translation()), so
+	 * WooCommerce's CRUD create, which is what writes a product's lookup row,
+	 * never runs for it. The lookup table backs the catalog's price sort and
+	 * price filter, the stock filter and WooCommerce's product search by SKU:
+	 * a translation without a row sorts ahead of every priced product with a
+	 * NULL price, and a search by its SKU does not find it. WooCommerce
+	 * writes the row on a later save only when a lookup prop changes, so a
+	 * translator who publishes the translation with its price, SKU and stock
+	 * untouched leaves it without one.
+	 *
+	 * Variable products are left to clone_product_variations(), which saves
+	 * the translation through CRUD and rebuilds its row with
+	 * WC_Product_Variable::sync(). Grouped, external and simple products, and
+	 * custom types that are not 'variable', are built here.
+	 *
+	 * WooCommerce 10.8+ only: refresh_product_lookup_table() reads the row
+	 * from the translation's meta and writes it with one REPLACE. The product
+	 * object is not loaded for it: the row is built from meta alone, and loading
+	 * the product would also read every term of the translation and, outside
+	 * wp-admin, rewrite WooCommerce's term-count cache. WC_Data_Store::load()
+	 * with 'product-<type>' resolves the same data store the product object
+	 * uses (a registered custom type's own store, else the product store), and
+	 * the type is the one mirror_product_type() just wrote. Older
+	 * versions have no public single-product rebuild, and the translation is
+	 * left as it is there; WooCommerce → Status → Tools → Product lookup
+	 * tables builds the missing rows. The row is never written by hand, and
+	 * wc_update_product_stock() is not used: it fires
+	 * woocommerce_product_set_stock, whose sibling mirror would write the
+	 * translation's just-copied quantity to the whole group and could
+	 * overwrite a concurrent sale.
+	 *
+	 * With a row, the translation holds its SKU and GTIN in WooCommerce's
+	 * uniqueness checks. allow_translation_duplicate_sku() and
+	 * allow_translation_duplicate_global_unique_id() exempt translation
+	 * siblings, so the source and the translation both keep saving.
+	 *
+	 * Runs at priority 25, after mirror_product_type() at 15 and
+	 * clone_product_variations() at 20. A failure is contained here: the
+	 * translation and its link stay, and the row is left to WooCommerce's
+	 * regenerate tool or the next lookup-prop save.
+	 *
+	 * @param int    $new_id      Newly created translation post ID.
+	 * @param string $object_type Object type ('post' for post translations).
+	 * @return void
+	 */
+	public function refresh_copy_lookup_row( $new_id, $object_type ): void {
+		if ( 'post' !== (string) $object_type || ! function_exists( 'WC' ) || ! class_exists( \WC_Data_Store::class ) || ! class_exists( \WC_Product_Factory::class ) ) {
+			return;
+		}
+
+		$new_id = (int) $new_id;
+		$key    = get_current_blog_id() . ':' . $new_id;
+		$type   = $this->created_product_types[ $key ] ?? null;
+
+		unset( $this->created_product_types[ $key ] );
+
+		if ( $new_id <= 0 || 'product' !== get_post_type( $new_id ) ) {
+			return;
+		}
+
+		if ( version_compare( (string) WC()->version, '10.8.0', '<' ) ) {
+			return;
+		}
+
+		try {
+			$type = $type ?? \WC_Product_Factory::get_product_type( $new_id );
+
+			if ( ! is_string( $type ) || $type === '' || 'variable' === $type ) {
+				return;
+			}
+
+			\WC_Data_Store::load( 'product-' . sanitize_key( $type ) )->refresh_product_lookup_table( $new_id );
+		} catch ( \Throwable $e ) {
+			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+				error_log( 'PerfLocale WC: lookup row rebuild failed for translation ' . $new_id . ': ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			}
+		}
+	}
+
+	/**
+	 * Machine-translate a translated product's variation descriptions and its
+	 * local (non-taxonomy) attribute options.
+	 *
+	 * Runs after the post translation, whether or not meta translation was
+	 * asked for. A value is translated only while the translation still holds
+	 * the source's copy (a translator's own text is kept), and never when its
+	 * key is a Sync Field or was emptied on the translation. Both batches go
+	 * through TranslationService, so the monthly character limit applies.
+	 *
+	 * Translated local options are written to the parent and, in lock-step, to
+	 * each variation's value, and the parent records translated => original
+	 * (InventorySync::LOCAL_ATTR_SOURCE_META) so stock and price sync keep
+	 * pairing the variations across languages. An attribute whose translated
+	 * options would be empty, repeat one another, or whose variations hold a
+	 * value that is not one of its options keeps its source options.
+	 *
+	 * Failures never fail the post translation: they are recorded on the
+	 * translation's meta breadcrumb and reported through
+	 * perflocale/mt/meta_translate_failed.
+	 *
+	 * @param int|mixed   $source_id   Source post ID.
+	 * @param string      $provider_id Provider that translated the post.
+	 * @param array|mixed $result      translate_post() result (post_id = the translation).
+	 * @param string      $target_slug Target language slug.
+	 * @param string      $source_slug Source language slug.
+	 * @return void
+	 */
+	public function translate_variation_texts( $source_id = 0, $provider_id = '', $result = [], $target_slug = '', $source_slug = '' ): void {
+		$source_id = (int) $source_id;
+		$target_id = is_array( $result ) ? (int) ( $result['post_id'] ?? 0 ) : 0;
+
+		if ( $source_id <= 0 || $target_id <= 0 || $source_id === $target_id || '' === (string) $target_slug || '' === (string) $source_slug ) {
+			return;
+		}
+
+		if ( 'product' !== get_post_type( $source_id ) || ! function_exists( 'wc_get_product' ) ) {
+			return;
+		}
+
+		$source = wc_get_product( $source_id );
+		$target = wc_get_product( $target_id );
+
+		if ( ! $source instanceof \WC_Product || ! $target instanceof \WC_Product ) {
+			return;
+		}
+
+		$plugin   = \PerfLocale\Plugin::get_instance();
+		$settings = $plugin->get( 'settings' );
+		$errors   = [];
+
+		/** This filter is documented in src/Translation/ContentSync.php */
+		$mirror_variation = (array) apply_filters( 'perflocale/sync/mirror_meta_keys', (array) $settings->get( 'sync_fields', [] ), 'product_variation' );
+		/** This filter is documented in src/Translation/ContentSync.php */
+		$mirror_product = (array) apply_filters( 'perflocale/sync/mirror_meta_keys', (array) $settings->get( 'sync_fields', [] ), 'product' );
+
+		$pairs        = $source instanceof \WC_Product_Variable && $target instanceof \WC_Product_Variable
+			? $this->variation_pairs( $source, $target, (string) $target_slug )
+			: [];
+		$descriptions = in_array( '_variation_description', array_map( 'strval', $mirror_variation ), true )
+			? []
+			: $this->seeded_variation_descriptions( $pairs );
+		$options      = in_array( '_product_attributes', array_map( 'strval', $mirror_product ), true ) || isset( \PerfLocale\Translation\ContentSync::seed_cleared_keys( $target_id )['_product_attributes'] )
+			? []
+			: $this->seeded_local_options( $source, $target );
+
+		if ( [] === $descriptions && [] === $options ) {
+			return;
+		}
+
+		try {
+			$service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $plugin->get( 'cache' ) );
+		} catch ( \Throwable $e ) {
+			return;
+		}
+
+		// One check for both batches, so a limit that covers only one of them
+		// sends neither.
+		$needed = 0;
+
+		foreach ( $descriptions as $text ) {
+			$needed += mb_strlen( $text );
+		}
+
+		foreach ( $options as $list ) {
+			foreach ( $list as $option ) {
+				$needed += mb_strlen( $option );
+			}
+		}
+
+		if ( $service->would_exceed_limit( $needed ) ) {
+			$descriptions = [];
+			$options      = [];
+			$errors[]     = sprintf(
+				/* translators: %1$s: Characters required, %2$s: Monthly limit */
+				__( 'Monthly character limit would be exceeded (~%1$s characters required, limit %2$s). Translation blocked to prevent overage charges.', 'perflocale' ),
+				number_format_i18n( $needed ),
+				number_format_i18n( (int) $settings->get( 'mt_monthly_char_limit', 500000 ) )
+			);
+		}
+
+		if ( [] !== $descriptions ) {
+			$errors = array_merge( $errors, $this->write_variation_descriptions( $service, $descriptions, (string) $source_slug, (string) $target_slug, (string) $provider_id ) );
+		}
+
+		if ( [] !== $options ) {
+			$errors = array_merge( $errors, $this->write_local_options( $service, $source_id, $target_id, $options, (string) $source_slug, (string) $target_slug, (string) $provider_id ) );
+		}
+
+		if ( [] !== $errors ) {
+			$message = sprintf(
+				/* translators: %s: the reasons, separated by " | ". */
+				__( 'Variation descriptions or attribute options were not translated: %s', 'perflocale' ),
+				implode( ' | ', array_unique( $errors ) )
+			);
+
+			\PerfLocale\MachineTranslation\MetaTranslator::record_meta_errors( $target_id, [ $message ] );
+
+			/** This action is documented in src/MachineTranslation/MetaTranslator.php */
+			do_action( 'perflocale/mt/meta_translate_failed', $source_id, $target_id, [ '_variation_description', '_product_attributes' ], $message );
+		}
+	}
+
+	/**
+	 * Pair each source variation with the translation's variation of the same
+	 * attributes (taxonomy values mapped to the target language's terms,
+	 * local values read through the translation's translated => original map).
+	 *
+	 * @param \WC_Product_Variable $source      Source product.
+	 * @param \WC_Product_Variable $target      Translated product.
+	 * @param string               $target_slug Target language slug.
+	 * @return array<int, int> source variation id => target variation id.
+	 */
+	private function variation_pairs( \WC_Product_Variable $source, \WC_Product_Variable $target, string $target_slug ): array {
+		$source_children = array_map( 'intval', $source->get_children() );
+		$target_children = array_map( 'intval', $target->get_children() );
+
+		if ( [] === $source_children || [] === $target_children ) {
+			return [];
+		}
+
+		_prime_post_caches( array_merge( $source_children, $target_children ), false, true );
+
+		$local = get_post_meta( $target->get_id(), \PerfLocale\WooCommerce\InventorySync::LOCAL_ATTR_SOURCE_META, true );
+		$local = is_array( $local ) ? $local : [];
+
+		$by_signature = [];
+
+		foreach ( $target_children as $child_id ) {
+			$child = wc_get_product( $child_id );
+
+			if ( ! $child instanceof \WC_Product_Variation ) {
+				continue;
+			}
+
+			$attrs = [];
+
+			foreach ( $child->get_attributes() as $key => $value ) {
+				$key   = (string) $key;
+				$value = (string) $value;
+
+				if ( isset( $local[ $key ][ $value ] ) && is_string( $local[ $key ][ $value ] ) ) {
+					$value = $local[ $key ][ $value ];
+				}
+
+				$attrs[ $key ] = $value;
+			}
+
+			ksort( $attrs );
+			$sig = (string) wp_json_encode( $attrs );
+
+			if ( ! isset( $by_signature[ $sig ] ) ) {
+				$by_signature[ $sig ] = $child_id;
+			}
+		}
+
+		$pairs = [];
+
+		foreach ( $source_children as $child_id ) {
+			$child = wc_get_product( $child_id );
+
+			if ( ! $child instanceof \WC_Product_Variation ) {
+				continue;
+			}
+
+			$attrs = array_map( 'strval', $this->translate_variation_attributes( $child->get_attributes(), $target_slug ) );
+			ksort( $attrs );
+			$sig = (string) wp_json_encode( $attrs );
+
+			if ( isset( $by_signature[ $sig ] ) ) {
+				$pairs[ $child_id ] = $by_signature[ $sig ];
+			}
+		}
+
+		return $pairs;
+	}
+
+	/**
+	 * The paired variations whose translation still holds the source's
+	 * description, and whose description was not emptied there.
+	 *
+	 * @param array<int, int> $pairs source variation id => target variation id.
+	 * @return array<int, string> target variation id => source description.
+	 */
+	private function seeded_variation_descriptions( array $pairs ): array {
+		$out = [];
+
+		foreach ( $pairs as $source_vid => $target_vid ) {
+			$sv = wc_get_product( $source_vid );
+			$tv = wc_get_product( $target_vid );
+
+			if ( ! $sv instanceof \WC_Product_Variation || ! $tv instanceof \WC_Product_Variation ) {
+				continue;
+			}
+
+			$text = (string) $sv->get_description( 'edit' );
+
+			if ( '' === trim( $text ) || (string) $tv->get_description( 'edit' ) !== $text ) {
+				continue;
+			}
+
+			if ( isset( \PerfLocale\Translation\ContentSync::seed_cleared_keys( $target_vid )['_variation_description'] ) ) {
+				continue;
+			}
+
+			$out[ $target_vid ] = $text;
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The local attributes whose options the translation still holds as the
+	 * source's copy.
+	 *
+	 * @param \WC_Product $source Source product.
+	 * @param \WC_Product $target Translated product.
+	 * @return array<string, array<int, string>> attribute key => source options.
+	 */
+	private function seeded_local_options( \WC_Product $source, \WC_Product $target ): array {
+		$target_attrs = [];
+
+		foreach ( $target->get_attributes() as $attribute ) {
+			if ( $attribute instanceof \WC_Product_Attribute && ! $attribute->is_taxonomy() ) {
+				$target_attrs[ sanitize_title( $attribute->get_name() ) ] = array_values( array_map( 'strval', $attribute->get_options() ) );
+			}
+		}
+
+		$out = [];
+
+		foreach ( $source->get_attributes() as $attribute ) {
+			if ( ! $attribute instanceof \WC_Product_Attribute || $attribute->is_taxonomy() ) {
+				continue;
+			}
+
+			$key     = sanitize_title( $attribute->get_name() );
+			$options = array_values( array_map( 'strval', $attribute->get_options() ) );
+
+			if ( '' === $key || [] === $options || ( $target_attrs[ $key ] ?? null ) !== $options ) {
+				continue;
+			}
+
+			$out[ $key ] = $options;
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Translate and write variation descriptions (HTML, placeholders masked).
+	 *
+	 * @param \PerfLocale\MachineTranslation\TranslationService $service      MT service.
+	 * @param array<int, string>                                $descriptions target variation id => source description.
+	 * @param string                                            $source_slug  Source language slug.
+	 * @param string                                            $target_slug  Target language slug.
+	 * @param string                                            $provider_id  Provider id.
+	 * @return array<int, string> Error reasons.
+	 */
+	private function write_variation_descriptions( \PerfLocale\MachineTranslation\TranslationService $service, array $descriptions, string $source_slug, string $target_slug, string $provider_id ): array {
+		$masked = [];
+
+		foreach ( $descriptions as $vid => $text ) {
+			$masked[ $vid ] = \PerfLocale\Translation\PlaceholderMasker::mask( $text );
+		}
+
+		try {
+			$out = $service->translate_batch_texts( array_values( array_map( static fn( array $m ): string => (string) $m[0], $masked ) ), $source_slug, $target_slug, $provider_id, false, 'html' );
+		} catch ( \Throwable $e ) {
+			return [ $e->getMessage() ];
+		}
+
+		$errors = [];
+		$i      = 0;
+
+		foreach ( $masked as $vid => $m ) {
+			$translated = (string) ( $out[ $i ] ?? '' );
+			++$i;
+
+			if ( '' === trim( $translated ) ) {
+				$errors[] = 'empty translation';
+				continue;
+			}
+
+			$restored = \PerfLocale\Translation\PlaceholderMasker::restore( $translated, $m[1] );
+
+			if ( ! \PerfLocale\Translation\PlaceholderMasker::preserves_placeholders( $descriptions[ $vid ], $restored ) ) {
+				$errors[] = 'placeholder lost';
+				continue;
+			}
+
+			// The provider wait can be long: a description someone changed
+			// meanwhile is theirs.
+			clean_post_cache( $vid );
+			$variation = wc_get_product( $vid );
+
+			if ( ! $variation instanceof \WC_Product_Variation || (string) $variation->get_description( 'edit' ) !== $descriptions[ $vid ] ) {
+				continue;
+			}
+
+			$variation->set_description( $restored );
+			$variation->save();
+		}
+
+		return $errors;
+	}
+
+	/**
+	 * Translate a product's local attribute options and write them to the
+	 * parent and, in lock-step, to its variations' values.
+	 *
+	 * @param \PerfLocale\MachineTranslation\TranslationService $service     MT service.
+	 * @param int                                               $source_id   Source product id.
+	 * @param int                                               $target_id   Translated product id.
+	 * @param array<string, array<int, string>>                 $options     attribute key => source options.
+	 * @param string                                            $source_slug Source language slug.
+	 * @param string                                            $target_slug Target language slug.
+	 * @param string                                            $provider_id Provider id.
+	 * @return array<int, string> Error reasons.
+	 */
+	private function write_local_options( \PerfLocale\MachineTranslation\TranslationService $service, int $source_id, int $target_id, array $options, string $source_slug, string $target_slug, string $provider_id ): array {
+		$target = wc_get_product( $target_id );
+
+		if ( ! $target instanceof \WC_Product ) {
+			return [];
+		}
+
+		$children = $target instanceof \WC_Product_Variable ? array_map( 'intval', $target->get_children() ) : [];
+		$values   = [];
+
+		foreach ( $children as $child_id ) {
+			$child = wc_get_product( $child_id );
+
+			if ( $child instanceof \WC_Product_Variation ) {
+				$values[ $child_id ] = array_map( 'strval', $child->get_attributes() );
+			}
+		}
+
+		// An attribute whose variations hold a value that is not one of its
+		// options (an older slug form, a hand edit) keeps its options: moving
+		// the options without those values would unpair the variations.
+		foreach ( $options as $key => $list ) {
+			foreach ( $values as $attrs ) {
+				$value = $attrs[ $key ] ?? '';
+
+				if ( '' !== $value && ! in_array( $value, $list, true ) ) {
+					unset( $options[ $key ] );
+					break;
+				}
+			}
+		}
+
+		if ( [] === $options ) {
+			return [];
+		}
+
+		$flat = [];
+
+		foreach ( $options as $list ) {
+			foreach ( $list as $option ) {
+				$flat[] = $option;
+			}
+		}
+
+		try {
+			$out = $service->translate_batch_texts( $flat, $source_slug, $target_slug, $provider_id, false, 'text' );
+		} catch ( \Throwable $e ) {
+			return [ $e->getMessage() ];
+		}
+
+		// The original of each option, through the source's own map when the
+		// source is itself a translated copy, so every copy maps to one value.
+		$source_map = get_post_meta( $source_id, \PerfLocale\WooCommerce\InventorySync::LOCAL_ATTR_SOURCE_META, true );
+		$source_map = is_array( $source_map ) ? $source_map : [];
+		$maps       = [];
+		$renames    = [];
+		$errors     = [];
+		$i          = 0;
+
+		foreach ( $options as $key => $list ) {
+			$translated = [];
+			$seen       = [];
+			$usable     = true;
+
+			foreach ( $list as $option ) {
+				// WooCommerce joins local options with "|".
+				$t = trim( str_replace( '|', '/', sanitize_text_field( (string) ( $out[ $i ] ?? '' ) ) ) );
+				++$i;
+				$fold = wc_strtolower( $t );
+
+				if ( '' === $t || isset( $seen[ $fold ] ) ) {
+					$usable = false;
+					continue;
+				}
+
+				$seen[ $fold ]         = true;
+				$translated[ $option ] = $t;
+			}
+
+			if ( ! $usable ) {
+				$errors[] = sprintf(
+					/* translators: %s: product attribute name. */
+					__( 'attribute "%s" kept its options (a translated option was empty or repeated)', 'perflocale' ),
+					$key
+				);
+				continue;
+			}
+
+			$renames[ $key ] = $translated;
+
+			foreach ( $translated as $option => $t ) {
+				$original           = $source_map[ $key ][ $option ] ?? $option;
+				$maps[ $key ][ $t ] = is_string( $original ) ? $original : $option;
+			}
+		}
+
+		if ( [] === $renames ) {
+			return $errors;
+		}
+
+		// The map first, so a sync fired by the saves below already pairs
+		// the renamed variations.
+		$stored = get_post_meta( $target_id, \PerfLocale\WooCommerce\InventorySync::LOCAL_ATTR_SOURCE_META, true );
+		$stored = is_array( $stored ) ? $stored : [];
+		update_post_meta( $target_id, \PerfLocale\WooCommerce\InventorySync::LOCAL_ATTR_SOURCE_META, wp_slash( array_replace( $stored, $maps ) ) );
+
+		// New attribute objects: WooCommerce records a change only when the
+		// array it is given differs from the one it holds, and the objects
+		// get_attributes() returns are the held ones.
+		$attributes = [];
+
+		foreach ( $target->get_attributes() as $name => $attribute ) {
+			if ( $attribute instanceof \WC_Product_Attribute && ! $attribute->is_taxonomy() && isset( $renames[ sanitize_title( $attribute->get_name() ) ] ) ) {
+				$attribute = clone $attribute;
+				$attribute->set_options( array_values( $renames[ sanitize_title( $attribute->get_name() ) ] ) );
+			}
+
+			$attributes[ $name ] = $attribute;
+		}
+
+		$target->set_attributes( $attributes );
+		$target->save();
+
+		foreach ( $values as $child_id => $attrs ) {
+			$changed = false;
+
+			foreach ( $renames as $key => $translated ) {
+				$value = $attrs[ $key ] ?? '';
+
+				if ( '' !== $value && isset( $translated[ $value ] ) ) {
+					$attrs[ $key ] = $translated[ $value ];
+					$changed       = true;
+				}
+			}
+
+			if ( ! $changed ) {
+				continue;
+			}
+
+			$child = wc_get_product( $child_id );
+
+			if ( $child instanceof \WC_Product_Variation ) {
+				$child->set_attributes( $attrs );
+				$child->save();
+			}
+		}
+
+		if ( $target instanceof \WC_Product_Variable ) {
+			\WC_Product_Variable::sync( $target_id );
+		}
+
+		if ( function_exists( 'wc_delete_product_transients' ) ) {
+			wc_delete_product_transients( $target_id );
+		}
+
+		return $errors;
 	}
 }

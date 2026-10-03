@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.6
+Stable tag: 1.0.7
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -22,7 +22,7 @@ PerfLocale is a **performance-first multilingual plugin** for WordPress. A 3-lay
 * **Language switcher** - block, shortcode, widget, menu, admin-bar, and template tags with full ARIA listbox accessibility
 * **SEO** - hreflang (HTML + HTTP) and sitemap alternates; integrates with Yoast, Rank Math, AIOSEO, SEOPress, The SEO Framework, and Slim SEO
 * **Machine translation** - DeepL, Google, Microsoft, LibreTranslate, a custom agency endpoint, and the WordPress 7.0 AI Client, with monthly usage caps
-* **Translator role** - a dedicated role with translation-only capabilities for your translation staff
+* **Translator role** - a role for translation staff: it can create and edit translations and use machine translation. Like WordPress's editing roles, it can also edit any post or page and upload media, but it cannot publish, delete or change settings.
 * **E-commerce** - WooCommerce product/variation/attribute translation, multi-currency (rates supplied by your own provider hook), inventory sync, localized order emails
 * **Reliability** - circuit breakers around every external dependency, token-guarded atomic locks, self-healing background jobs, and Site Health diagnostics
 
@@ -32,53 +32,38 @@ Translation-aware features generic SEO plugins can't provide: Content-Language H
 
 = For developers =
 
-200+ action/filter hooks, a full REST API, WP-CLI commands, and a documented addon system. A PHP helper API lets you translate a string or render a block of markup in any language from your own code. Every internal primitive is `@api` and semver-stable across 1.x. Multisite-ready. Full docs at **https://perflocale.com/docs/**.
+200+ action/filter hooks, a full REST API, WP-CLI commands, and a documented addon system. A PHP helper API lets you translate a string or render a block of markup in any language from your own code. Classes and methods marked @api are semver-stable across 1.x. Multisite-ready. Full docs at **[perflocale.com/docs](https://perflocale.com/docs/)**.
 
-**Try it without installing anything.** Open a throwaway WordPress site in your browser with PerfLocale already active: https://playground.wordpress.net/?blueprint-url=https://perflocale.com/blueprint.json
+**Try it without installing anything.** Open a throwaway WordPress site in your browser with PerfLocale already active: [Open PerfLocale in WordPress Playground](https://playground.wordpress.net/?blueprint-url=https://perflocale.com/blueprint.json)
 
 = Where to go next =
 
-* **Set-up guide** — a fresh install to a translated post with a working switcher: https://perflocale.com/docs/getting-started/
-* **Switching from another plugin** — importers for WPML, Polylang and TranslatePress: https://perflocale.com/docs/migration/
-* **How it compares** — PerfLocale against WPML, Polylang and TranslatePress: https://perflocale.com/compare/
-* **WooCommerce** — products, variations, currencies, stock and order emails: https://perflocale.com/docs/woocommerce/
-* **Multisite** — activation, per-site languages and background jobs across a network: https://perflocale.com/docs/multisite/
-* **Something not working?** — symptom-first troubleshooting: https://perflocale.com/docs/troubleshooting/
-* **Hooks reference** — every action and filter: https://perflocale.com/docs/hooks/
-* **REST API and WP-CLI** — https://perflocale.com/docs/rest-api/ and https://perflocale.com/docs/wp-cli/
-* **Source code** — https://github.com/perflocale/perflocale
+* **Set-up guide** — a fresh install to a translated post with a working switcher: [perflocale.com/docs/getting-started](https://perflocale.com/docs/getting-started/)
+* **Switching from another plugin** — importers for WPML, Polylang and TranslatePress: [perflocale.com/docs/migration](https://perflocale.com/docs/migration/)
+* **How it compares** — PerfLocale against WPML, Polylang and TranslatePress: [perflocale.com/compare](https://perflocale.com/compare/)
+* **WooCommerce** — products, variations, currencies, stock and order emails: [perflocale.com/docs/woocommerce](https://perflocale.com/docs/woocommerce/)
+* **Multisite** — activation, per-site languages and background jobs across a network: [perflocale.com/docs/multisite](https://perflocale.com/docs/multisite/)
+* **Something not working?** — symptom-first troubleshooting: [perflocale.com/docs/troubleshooting](https://perflocale.com/docs/troubleshooting/)
+* **Hooks reference** — every action and filter: [perflocale.com/docs/hooks](https://perflocale.com/docs/hooks/)
+* **REST API and WP-CLI** — [perflocale.com/docs/rest-api](https://perflocale.com/docs/rest-api/) and [perflocale.com/docs/wp-cli](https://perflocale.com/docs/wp-cli/)
+* **Source code** — [github.com/perflocale/perflocale](https://github.com/perflocale/perflocale)
 
 == Installation ==
 
-**Permalinks:** pretty permalinks (**Settings → Permalinks** set to anything other than "Plain") are recommended — with them WordPress guarantees that language-prefixed URLs such as `/de/…` reach WordPress on every server. Plain permalinks also work (URLs become `/de/?p=123`) as long as the server routes all paths to WordPress, which nginx configurations and Apache setups with the standard WordPress `.htaccess` block do. Subdomain and per-domain URL modes carry the language in the hostname and work with any permalink setting. For servers that do not route unknown paths to WordPress, query-parameter mode (URLs become `example.com/page?lang=de`, selectable under **PerfLocale → Settings → URL & Routing**) works with any permalink structure — including Plain — on every server, keeping clean URLs for the default language. Site Health reports the exact status for your server.
+1. Go to **Plugins → Add New Plugin**, search for **PerfLocale**, then click **Install Now** and **Activate**.
+2. Go to **PerfLocale → Languages**, add your languages, and click **Set as Default** on your site's main language.
+3. Go to **PerfLocale → Settings → URL & Routing** and choose your language URLs: `/de/` (the default), `de.example.com`, one domain per language, or `?lang=de`.
+4. Translate: open a post, page or category, and in its **Translations** panel click **+ Create** beside a language. Then edit the new translation in the normal editor.
+5. Add a language switcher: the **Language Switcher** block or widget, the `[perflocale_switcher]` shortcode, or a menu under **PerfLocale → Settings → Language Switcher**.
+6. Optional: under **PerfLocale → Settings → SEO**, select your SEO plugin. Hreflang tags are on by default.
+7. Optional: for machine translation, enable **Machine Translation** under **PerfLocale → Addons**, then choose a provider under **PerfLocale → Settings → Addons → Machine Translation** and add its API key (DeepL, Google or Microsoft). On WordPress 7.0 or newer you can choose the **WordPress AI Client** instead and connect an AI provider under **Settings → Connectors**.
+8. Open **Tools → Site Health**. It tells you if your server needs anything.
 
-**Data exports and your web server (nginx and Caddy users, please read).** Exports are written to `wp-content/uploads/perflocale/exports/` and are downloaded through an authenticated, nonce-checked admin link that deletes the file as soon as it is served. The directory also gets a `Deny from all` .htaccess — but **only Apache and LiteSpeed honour .htaccess. nginx and Caddy ignore it.** On those servers an export stays fetchable by its exact URL until it is downloaded or swept, so add an explicit rule:
+**Good to know**
 
-nginx:
-
-`location ~* /wp-content/uploads/perflocale/exports/ { deny all; return 404; }`
-
-Caddy:
-
-`@perflocale_exports path /wp-content/uploads/perflocale/exports/*`
-`respond @perflocale_exports 404`
-
-*Tools → Site Health* tells you which situation you are in: PerfLocale writes a temporary random file into that directory, requests it over HTTP, and reports a **critical** result if the server hands it back. Nothing to configure — just look at the check after your first export.
-
-1. Upload the `perflocale` folder to `/wp-content/plugins/`
-2. Activate PerfLocale through the **Plugins** menu in WordPress
-3. Go to **PerfLocale → Languages** and add your languages
-4. Set one language as the default
-5. Go to **PerfLocale → Settings → URL & Routing** and choose your URL structure (subdirectory, subdomain, per-language domain, or query parameter)
-6. Start translating - click the language badges next to any post, page, or term to create translations
-
-= Quick Start =
-
-1. **Add languages**: Go to PerfLocale → Languages. Add English as default, then add Bulgarian, German, etc.
-2. **Translate a post**: Edit any post. In the PerfLocale meta box, click a language badge to create a translation. Edit the translation in the standard WordPress editor.
-3. **Add the language switcher**: Add the "Language Switcher" block to any template or page, drop the Language Switcher widget into a widget area, or use the `[perflocale_switcher]` shortcode. To append it to a classic theme menu, tick the menu location under **PerfLocale → Settings → Language Switcher → Append to classic menus** (developers can also control it with the `perflocale/switcher/add_to_menu` filter).
-4. **Configure SEO**: Go to PerfLocale → Settings → SEO. Enable hreflang tags and select your SEO plugin for automatic integration.
-5. **Set up machine translation** (optional): Enable Machine Translation on the PerfLocale → Addons screen, then go to PerfLocale → Settings → Addons → Machine Translation. Enter your API key for DeepL, Google, or Microsoft, and enable auto-translate on publish. For production / staging deployments you can also supply API keys via environment variables (e.g. `PERFLOCALE_DEEPL_API_KEY`) or `wp-config.php` constants of the same name — env wins over constant wins over the database value, matching WordPress 7.0's AI Connectors source-priority pattern. See the API Keys documentation page for the full list of supported names.
+* Permalinks: any setting except "Plain" is recommended. Plain also works (URLs become `/de/?p=123`). If your server does not pass unknown paths to WordPress, use the query parameter URL mode (`?lang=de`).
+* nginx and Caddy ignore `.htaccess`, so add one rule that blocks direct access to exports: see [Production tuning](https://perflocale.com/docs/production-tuning/#export-directory). Site Health shows whether you need it.
+* API keys can also come from environment variables or `wp-config.php` constants, such as `PERFLOCALE_DEEPL_API_KEY`. See [API keys](https://perflocale.com/docs/api-key-constants/).
 
 == Frequently Asked Questions ==
 
@@ -88,7 +73,7 @@ Very little — performance is a core design goal. The plugin keeps the work it 
 
 = Does it work with WooCommerce? =
 
-Yes. PerfLocale includes a deep WooCommerce integration: translate products, variations, categories, and attributes. Inventory (stock, SKU, weight, dimensions) syncs automatically across language variants. Multi-currency support, with exchange rates supplied by a provider your site registers via filter. Order emails are sent in the customer's language. The mini-cart, cart, and checkout all display correctly in every language.
+Yes. PerfLocale includes a deep WooCommerce integration: translate products, variations, categories, and attributes. Inventory (stock, SKU, GTIN, price, weight, dimensions) stays in sync across language variants whenever WooCommerce saves a product, whether the change comes from an order, the product editor, Quick Edit, the REST API, an import, or another plugin. Multi-currency support, with exchange rates supplied by a provider your site registers via filter. Order emails are sent in the customer's language. The mini-cart, cart, and checkout all display correctly in every language.
 
 = Does it work with page builders? =
 
@@ -118,7 +103,7 @@ Your original title and tagline are never overwritten. PerfLocale serves the tra
 
 = Can I migrate from WPML, Polylang, or TranslatePress? =
 
-Yes. PerfLocale includes built-in migration tools for all three plugins. PerfLocale refuses to run while WPML, Polylang or TranslatePress is active, so deactivate the old plugin first — its data stays in the database — then go to PerfLocale → Settings → Export & Import and use the Migration section. All migrations run in batches with transaction safety - if anything fails, your data is rolled back.
+Yes. PerfLocale includes built-in migration tools for all three plugins. PerfLocale refuses to run while WPML, Polylang or TranslatePress is active, so deactivate the old plugin first — its data stays in the database — then go to PerfLocale → Settings → Export & Import and use the Migration section. Migrations run in batches and leave the old plugin's data untouched. An import that stops part-way can be run again: translations already imported are reused, not duplicated. Back up your database before a large import.
 
 = Does it support RTL languages? =
 
@@ -126,7 +111,7 @@ Yes. PerfLocale detects the text direction from the language configuration and s
 
 = Is it compatible with caching plugins? =
 
-Yes. PerfLocale works with all major caching plugins (WP Super Cache, W3 Total Cache, LiteSpeed Cache, WP Rocket). Each language version has its own URL, so page caches naturally separate content by language. Any response whose language was decided by something other than the URL — a GeoIP or browser-language redirect, a returning visitor's language cookie — is automatically marked uncacheable (via WordPress' `nocache_headers()`), so one visitor's language can never be cached and served to everyone. On an edge or server cache (Varnish, nginx fastcgi_cache) make sure Cache-Control is honoured or those responses are excluded. Note that enabling GeoIP / browser redirection makes default-language entry URLs uncacheable by design — a page cache serving them from cache would skip the redirect entirely; if you need both, use the bundled edge worker (assets/js/edge-helper.js) to route at the CDN instead.
+Yes. PerfLocale works with all major caching plugins (WP Super Cache, W3 Total Cache, LiteSpeed Cache, WP Rocket). Each language version has its own URL, so page caches naturally separate content by language. Any response whose language was decided by something other than the URL — a GeoIP or browser-language redirect, a returning visitor's language cookie — is automatically marked uncacheable (via WordPress' `nocache_headers()`), so one visitor's language can never be cached and served to everyone. On an edge or server cache (Varnish, nginx fastcgi_cache) make sure Cache-Control is honoured or those responses are excluded. Note that enabling GeoIP / browser redirection makes default-language entry URLs uncacheable by design — a page cache serving them from cache would skip the redirect entirely; if you need both, use the bundled edge worker (assets/js/edge-helper.js) to route at the CDN instead. In cookieless mode those redirects do not run, so the default-language entry URLs stay cacheable.
 
 = Can I use it on multisite? =
 
@@ -138,15 +123,15 @@ Yes. PerfLocale resolves every machine-translation API key from three sources in
 
 = What happens to my translations if I uninstall the plugin? =
 
-By default nothing is lost: uninstalling removes the plugin's roles, capabilities, scheduled tasks, and caches, but keeps all translations, languages, and settings in the database so a later re-install picks up exactly where you left off. If you want a complete removal instead, enable "Delete all plugin data when uninstalling" in PerfLocale → Settings → Advanced before uninstalling — then every plugin table and option is deleted. Your posts and pages (including translated ones) are always preserved as normal WordPress content.
+By default nothing is lost: uninstalling removes the plugin's roles, capabilities, and scheduled tasks, but keeps all translations, languages, and settings in the database so a later re-install picks up exactly where you left off. If you want a complete removal instead, enable "Delete all plugin data when uninstalling" in PerfLocale → Settings → Advanced before uninstalling — then every plugin table and option is deleted. Your posts and pages (including translated ones) are always preserved as normal WordPress content.
 
-On a multisite network each site's own choice is applied to that site. Deleting the plugin from a very large network can run out of PHP execution time before every site is done: PerfLocale stops cleanly between sites, logs how many were purged and how many remain, and records where it stopped. Re-install the plugin and delete it again without activating it and the next pass carries on from there; from WP-CLI, `wp plugin uninstall perflocale` has no time limit and finishes the network in one pass.
+On a multisite network each site's own choice is applied to that site, and your users' PerfLocale screen preferences, which every site shares, are removed only if no site chose to keep its data. Deleting the plugin from a very large network can run out of PHP execution time before every site is done: PerfLocale stops cleanly between sites, logs how many were purged and how many remain, and records where it stopped. Re-install the plugin and delete it again without activating it and the next pass carries on from there; from WP-CLI, `wp plugin uninstall perflocale` has no time limit and finishes the network in one pass. If a site fails, the log names it and the same steps retry it once the cause is fixed.
 
 = Does PerfLocale expose anything to edge workers? =
 
 When you enable Edge Worker Integration (PerfLocale → Settings → Advanced), the plugin publishes a single public REST endpoint that edge runtimes (Cloudflare Workers, Vercel Edge, Netlify Edge, AWS Lambda@Edge) can read to pre-route visitors before the request ever hits PHP:
 
-* `GET /wp-json/perflocale/v1/config` - returns the minimum routing + language metadata an edge worker needs: active language slugs and locales, URL mode (subdirectory / subdomain / domain / query), URL prefix type, default language, hide-default-prefix flag, excluded paths, detection order, the edge-hint header name (`X-PerfLocale-Lang`) and cookie name. Response includes `Cache-Control: public, max-age=300, s-maxage=3600, stale-while-revalidate=86400` plus an `ETag` so edges and browsers can revalidate cheaply with `If-None-Match` (304 on hit).
+* `GET /wp-json/perflocale/v1/config` - returns the minimum routing + language metadata an edge worker needs: active language slugs and locales, URL mode (subdirectory / subdomain / domain / query), URL prefix type, default language, hide-default-prefix flag, excluded paths, detection order, the edge-hint header name (`X-PerfLocale-Lang`) and cookie name. Response includes `Cache-Control: public, max-age=300, s-maxage=3600, stale-while-revalidate=86400` plus an `ETag` so edges and browsers can revalidate cheaply with `If-None-Match` (304 on hit). When code hooks the permission filter described below, or the caller is logged in, the response is sent with `Cache-Control: private, no-store` instead.
 
 **The response NEVER contains:** machine-translation API keys, provider tokens, user data, internal post or term IDs, or any data that is not already observable from the rendered site (hreflang tags, language switcher, URL prefixes). That non-sensitive invariant is what justifies the public default. If you extend the payload via the `perflocale/api/config` filter, your additions must preserve this invariant.
 
@@ -172,14 +157,14 @@ The plugin does not invent its own bearer-token or custom-header authentication 
 
 PerfLocale is privacy-first by default. No tracking, no analytics, no visitor fingerprinting.
 
-* **Cookie:** one cookie, `perflocale_lang`, stores only the active language slug. `HttpOnly`, `Secure` on HTTPS, `SameSite=Lax`, 365-day default lifetime (filterable via `perflocale/cookie_lifetime`). It can be turned off entirely (see "Cookieless mode" below) — language routing is URL-based and works without it.
+* **Cookie:** one cookie, `perflocale_lang`, stores only the active language slug. `HttpOnly`, `Secure` on HTTPS, `SameSite=Lax`, 365-day default lifetime (filterable via `perflocale/cookie_lifetime`). It can be turned off (see "Cookieless mode" below) — language routing is URL-based and works without it.
 * **Visitor IP:** never logged or stored. The optional GeoIP-redirect feature (disabled by default) ships with no lookup provider and no endpoint, so out of the box it sends the IP nowhere. If you wire a source yourself through the `perflocale/geo/lookup_country` or `perflocale/geo/providers` filter, the IP is passed to that source once per first visit to resolve a country code; the country code is then cached server-side (24 hours by default) under a salted, non-reversible key - an HMAC-SHA256, keyed with the site's auth salt, of the IP after `wp_privacy_anonymize_ip()` has zeroed the host bits - never the raw IP or any value reversible to it.
 * **WordPress Privacy API integration:** Tools → Export Personal Data and Tools → Erase Personal Data both work. The eraser zeroes `created_by` on the background jobs the data subject dispatched and deletes their per-user UI-state meta — returning `items_removed`/`items_retained` counts. The same flow runs on the admin `delete_user` path. Full detail in the docs.
 * **Consent gating:** the `perflocale/privacy/consent_given` filter lets any consent-management plugin (Cookiebot, Complianz, OneTrust, etc.) hold back PerfLocale until a visitor has consented. When the filter returns false, the `perflocale_lang` cookie is not set, and the GeoIP and browser-language redirects do not run (no outbound request is made).
-* **Cookieless mode:** PerfLocale → Settings → URL & Routing → "Language Cookie" turns the `perflocale_lang` cookie off entirely — no consent-management plugin required. URL-based language routing keeps working; you lose "remember my language" on non-prefixed URLs. On a WooCommerce store you also lose the cart and checkout language: the block cart/checkout posts to the non-prefixed Store API URLs, and the language stamped on a new order is read from that same cookie, so both fall back to the site's default language.
+* **Cookieless mode:** PerfLocale → Settings → URL & Routing → "Language Cookie" turns the `perflocale_lang` cookie off — no consent-management plugin required. Code on your site can still decide per request through the `perflocale/language_cookie/enabled` filter. URL-based language routing keeps working; you lose "remember my language" on non-prefixed URLs. On a WooCommerce store you also lose the cart and checkout language: the block cart/checkout posts to the non-prefixed Store API URLs, and the language stamped on a new order is read from that same cookie, so both fall back to the site's default language. The automatic first-visit redirects (browser language, GeoIP, edge hint) do not run in cookieless mode unless code hooks that filter: without the cookie they would redirect the same visitor again on every default-language page.
 * **Suggested privacy-policy text:** auto-registered via `wp_add_privacy_policy_content()`. The sections shown adapt to which features are enabled — GeoIP wording only appears if GeoIP is on, MT wording only appears if MT is on.
 
-Full technical detail: https://perflocale.com/docs/privacy/
+Full technical detail: [perflocale.com/docs/privacy](https://perflocale.com/docs/privacy/)
 
 == External Services ==
 
@@ -191,7 +176,7 @@ API keys for the providers below can be supplied via an environment variable, a 
 
 = Machine Translation =
 
-When you enable machine translation and configure an API key in PerfLocale → Settings → Addons → Machine Translation, the plugin sends the text you ask it to translate to the selected provider, together with source/target language codes and your API key. That text is: post titles, content and excerpts; taxonomy term names and descriptions; interface strings listed on the Strings screen (which can include strings registered by other plugins and themes) when you use its machine-translation controls; and, when meta translation is enabled, registered meta values such as SEO titles and descriptions or custom text fields. It is sent when you click "Machine Translate", run a bulk or site-wide translation, translate via WP-CLI or the REST API, or enable auto-translate on publish. Each provider below receives exactly that data, and only for the actions just listed. The provider API additionally defines a connection-test call that sends only your API key (no post content) so an add-on can verify credentials; no screen, WP-CLI command or REST route in PerfLocale itself invokes it.
+When you enable machine translation and configure an API key in PerfLocale → Settings → Addons → Machine Translation, the plugin sends the text you ask it to translate to the selected provider, together with source/target language codes and your API key. That text is: post titles, content and excerpts; taxonomy term names and descriptions; interface strings listed on the Strings screen (which can include strings registered by other plugins and themes) when you use its machine-translation controls; and, when meta translation is enabled, registered meta values such as SEO titles and descriptions or custom text fields. It is sent when you click "Machine Translate" or use the block editor's translate actions, run a bulk or site-wide translation, translate via WP-CLI or the REST API, or enable auto-translate on publish or on create. Each provider below receives exactly that data, and only for the actions just listed. The provider API additionally defines a connection-test call that sends your API key and, for some providers, a fixed test word — never your content — so an add-on can verify credentials; no screen, WP-CLI command or REST route in PerfLocale itself invokes it.
 
 * **DeepL** - api.deepl.com / api-free.deepl.com. Commercial neural-translation API (free and paid tiers). Receives the text, language codes and API key described above.
  [Terms of Service](https://www.deepl.com/en/pro-license) | [Privacy Policy](https://www.deepl.com/en/privacy)
@@ -201,7 +186,7 @@ When you enable machine translation and configure an API key in PerfLocale → S
  [Terms of Service](https://azure.microsoft.com/en-us/support/legal/) | [Privacy Policy](https://www.microsoft.com/en-us/privacy/privacystatement)
 * **LibreTranslate** - self-hosted or user-configured URL. Open-source translation server you host yourself or point at an instance you trust; the plugin calls no hard-coded LibreTranslate endpoint. Receives the text and language codes described above at the URL you configure. Terms of service and privacy policy are governed by the LibreTranslate instance you configure; the AGPL-3.0 linked below is the governing license of the software itself.
  [Terms (AGPL-3.0 License)](https://github.com/LibreTranslate/LibreTranslate/blob/main/LICENSE) | [Source Code](https://github.com/LibreTranslate/LibreTranslate)
-* **WordPress AI Client** - no hard-coded endpoint; delegated to WordPress core. When you select the "WP AI Client" provider on WordPress 7.0+ (or a host that ships the AI Client feature plugin), PerfLocale builds a short translation prompt (the text described above plus source/target language codes) and hands it to WordPress core's `wp_ai_client_prompt()` function. PerfLocale itself makes no outbound HTTP request for this provider: WordPress core (and whichever AI provider you configured under core's AI Connectors settings) performs the network call. The data sent, the destination, and the governing Terms of Service / Privacy Policy are therefore those of the AI provider you configured in WordPress core, only for the actions listed above.
+* **WordPress AI Client** - no hard-coded endpoint; delegated to WordPress core. When you select the "WordPress AI Client" provider on WordPress 7.0+ (or a host that ships the AI Client feature plugin), PerfLocale builds a short translation prompt (the text described above plus source/target language codes) and hands it to WordPress core's `wp_ai_client_prompt()` function. PerfLocale itself makes no outbound HTTP request for this provider: WordPress core (and whichever AI provider you connected under Settings → Connectors) performs the network call. The data sent, the destination, and the governing Terms of Service / Privacy Policy are therefore those of the AI provider you configured in WordPress core, only for the actions listed above.
  [WordPress AI Building Blocks](https://make.wordpress.org/ai/2025/07/17/ai-building-blocks/)
 
 = External Translation Agency =
@@ -222,13 +207,53 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Each release below is a short summary. The complete notes for every
 version, with the reasoning behind each change, live at
-https://perflocale.com/changelog/
+[perflocale.com/changelog](https://perflocale.com/changelog/)
+
+= 1.0.7 =
+
+Security hardening.
+
+Languages: a language that still has posts, pages or products outside the Trash can no longer be deleted; the Languages screen, the REST API (409 language_has_content) and WP-CLI say what it still has. Move that content to the Trash first, or deactivate the language instead. Terms, media and block theme template copies do not block a delete.
+
+Export and import: a Merge import no longer changes this site's settings, add-on settings, add-on list or roles; it reports them as not applied. Replace applies them, and a file with only the Settings and Roles sections deletes no rows.
+
+Sync Fields: copying a field to the other language versions changes only that field; their content, title, excerpt, publish date and status stay exactly as they are, whoever saves.
+
+Custom fields: ACF, Meta Box and SEO values stay correct however a post is saved (editor, REST API, WP-CLI, WooCommerce saves from code), including nested groups, repeaters and flexible content. A field a translator empties stays empty. Field changes made during a front-end page view are copied to translations on the next save, and on multisite each site follows its own Sync Fields setting.
+
+WooCommerce: language copies of a product share one stock at checkout, in the cart and when adding to the cart, including stock held by pending orders. Saving a product no longer overwrites the stock of a copy that manages its own stock, so a sale made during the save is never lost. New product translations get the source's catalog visibility, featured flag, shipping class and brand, and on WooCommerce 10.8 or newer their product lookup row, so they sort by price and are found by SKU; on older versions, and for translations created before this update, WooCommerce → Status → Tools → Product lookup tables → Regenerate builds the missing rows. Shop managers can create product translations. The block Cart and Checkout show product names, short descriptions and images in the page language from the first view, order line names no longer start with "Protected:", and a sold-individually product cannot be bought twice as two language copies. Every order is tagged with its language whenever the WooCommerce add-on is active, and an order without a language that is paid on a translated order-pay page takes that page's language, so its emails use it. Each order email keeps its own language and exchange rate, and an order's personal-data export includes its language.
+
+Machine translation: the WordPress AI Client prefers small models (filterable), and its error message, Site Health and the editor's setup link point to Settings → Connectors when no provider is ready. A password-protected post is sent to a machine translation service only when someone picks that post (in the editor, with a bulk action on selected rows, or by its ID); automatic runs and wp perflocale translate --all skip it. The new perflocale/mt/send_password_protected filter can change this for any run. In the block editor, "Fill in from source" fills each block's own text, and blocks marked "Do not translate" are kept; a block inside one shows why it cannot be translated. Bulk and site-wide translation say how many new translations kept the source content because of "Do not translate", on the Translations screen and the Jobs page. Bulk string translation selects only strings still missing a translation, fills every plural form, and says how many remain. Product translation also covers variation descriptions and local attribute options. A machine translation server on a private network (for example a self-hosted LibreTranslate) must be listed with the perflocale/mt/trusted_hosts filter.
+
+Background jobs: bulk translation jobs run in slices of up to 20 seconds or 500 pairs and continue where they stopped, so hosts that stop long requests no longer kill them. A job that stops on a PHP fatal error is marked failed at once, and a killed worker no longer holds up the Action Scheduler queue (WooCommerce included) once its lock expires.
+
+Importers: WPML, Polylang and TranslatePress imports run one at a time, refuse a first import when the default language differs or a language is missing (a later catch-up import shows a warning instead), and bring menus, strings and order languages. The TranslatePress import brings full post data and WooCommerce order languages, replaces only the whole texts, attributes, block settings and translation blocks that TranslatePress translated, and reports translations it skipped. The Jobs page shows each import's current stage and how many of its items are done, and a background import whose worker stopped can be started again after 15 minutes. The WPML importer reports conflicting translation sets instead of relinking them, and large imports and interrupted background jobs are handled reliably; an import that loses its lock stops with a message instead of continuing. Bulk tools ask before running on data that has not been imported yet.
+
+URLs and redirects: with the language cookie turned off, the browser-language, GeoIP and edge-hint redirects no longer run, so the default language stays reachable; otherwise they redirect only to a page that shows content in that language. Domain mode serves a default language without a domain of its own on the site's own host. Fallback chains work in subdomain and domain mode.
+
+Translations screen: the status filters, the Dashboard and wp perflocale status take each translation's status from its own post, so a translation in the Trash counts as missing.
+
+Block themes: customising a template part again after "Reset to theme default" brings its translations back, and a Navigation block without a chosen menu shows the default-language menu or its translation.
+
+Strings: in files mode, translation files are rebuilt when languages change, and Site Health names each language without files.
+
+Roles: changes a site owner makes to the Translator role are kept across updates and reactivation.
+
+Multisite: network activation is refused, listing the IDs of the sites that failed, when any site cannot be set up.
+
+New filters: perflocale/language_cookie/enabled decides per request whether the language cookie is written (consent still comes first), and perflocale/addon/enabled turns an add-on off or on per request; perflocale()->is_addon_active() tells whether it runs. Also perflocale/mt/send_password_protected, perflocale/jobs/bulk_translate/slice_seconds and perflocale/jobs/bulk_translate/slice_max_pairs, perflocale/roles/translator_caps, perflocale/roles/shop_manager_caps and perflocale/sync/seed_meta_value.
+
+Changing an existing post's language (on its edit screen, in Quick Edit or with WP-CLI) swaps its categories, tags and other translatable terms for their translations in the new language; a term without one is kept.
+
+Also fixes hreflang tags on page 2 and later of a listing pointing to pages that do not exist in another language, force-deleting a translation leaving its siblings' hreflang tags pointing to it, page 2 and later and the feeds of translated term archives redirecting to page 1, redirects to another language's domain in domain and subdomain URL mode, posts without a translation link (shown on their own URL, with hreflang tags), unknown two-segment URLs loading the front page, a settings tab saved without changes resetting settings it does not show, the per-language domain table showing in subdomain mode, wp perflocale languages delete reporting success for a delete that was rolled back, excluded paths matching part of a path segment or missing non-Latin paths, custom fields such as book_author, whose names hold a credential word inside a longer word, not being copied into a new translation, uninstall with "Delete all plugin data" leaving WooCommerce order data (including High-Performance Order Storage) and scheduled actions behind, a server error from an unusual post_type query parameter, deleting a language with an empty code removing the language tag from every menu, links showing untranslated slugs after a failed database query, an expired cached translation list being rebuilt on every request on sites without a persistent object cache, and a converted price that rounded to zero in a store currency without decimals. Admin notices appear above the PerfLocale tab strip, and the perflocale() helper can be called from a perflocale/loaded listener.
+
+Full notes: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
 = 1.0.6 =
 
 Security hardening and stricter permission checks.
 
-Importing a JSON file from another site, or a backup of this site that records a language-specific address, can now ask you to confirm that this site is a copy of it: tick the checkbox under Settings → Export & Import, or pass --force in WP-CLI.
+Importing a JSON file from another site, or a backup of this site that records a language-specific address, can now ask you to confirm that this site is a copy of it: tick the checkbox under Settings → Export & Import, or pass `--force` in WP-CLI.
 
 On WooCommerce stores, a visitor's first page in the site's default language no longer sets the language cookie, so full-page caches can store those pages. Cart and checkout keep working in every language.
 
@@ -236,7 +261,7 @@ Also fixes previews of draft translations that share their slug with a published
 
 On multisite, deleting the plugin now works through a large network in batches and records where it stopped if a request runs out of time: re-install the plugin and delete it again, without activating it, and the next pass carries on from there. Each site's own "Delete data on uninstall" choice survives the interruption. Network activation no longer stops at the first site that fails, and rendering content from another site no longer leaves the original site without its detected language.
 
-Full notes: https://perflocale.com/changelog/
+Full notes: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
 = 1.0.5 =
 
@@ -250,57 +275,15 @@ Numbers and currency now follow the requested language's own conventions rather 
 
 On WordPress 6.9 and newer, four read-only AI-agent abilities (list languages, get a post's translations, detect a post's language, convert a URL between languages) now register by default; the two write abilities stay off. Both switches live under PerfLocale → Settings → Advanced → AI Agent Abilities.
 
-Full notes: https://perflocale.com/changelog/
-
-= 1.0.4 =
-
-Adds translation for the site title and tagline, synced patterns and block-theme navigation menus, and a PHP API for translating from your own code. Fixes a case where a translated site title could overwrite the original, a multisite call returning the wrong blog's name, and scheduled rendering windows resolving the wrong language.
-
-Full notes: https://perflocale.com/changelog/
-
-= 1.0.3 =
-
-Fixes WooCommerce order emails going out in the wrong language, percent signs deleted from translated titles, exports publishing unreadable bytes, Site Health checks that never reached the dashboard, and the admin on phones and tablets.
-
-Full notes: https://perflocale.com/changelog/
-
-= 1.0.2 =
-
-Fixes translated content served in the wrong language on sites whose slugs are not Latin script, permanently corrupted slugs for long non-Latin names, fatal errors on servers built without an optional PHP extension, a PO import that could delete a language's translations, and a group of settings that could not be reached or were silently cleared.
-
-Full notes: https://perflocale.com/changelog/
-
-= 1.0.1 =
-
-Security and reliability release: security hardening and stricter permission checks. Also fixes WooCommerce stock lost when several language versions of a product sold at once, and makes Replace-mode imports all-or-nothing.
-
-Full notes: https://perflocale.com/changelog/
-
-= 1.0.0 =
-
-Initial public release. Translation for posts, pages, custom post types, taxonomies and URL slugs; four routing modes with self-healing rewrite rules; gettext string translation with full CLDR plural rules; SEO output including hreflang and sitemaps; WooCommerce support; machine translation; importers for WPML, Polylang and TranslatePress; a REST API and WP-CLI commands.
-
-Full notes: https://perflocale.com/changelog/
+Full notes: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
 == Upgrade Notice ==
+
+= 1.0.7 =
+Security hardening. A language that still has posts can no longer be deleted (deactivate it instead), and a Merge import no longer changes this site's settings or roles. Custom fields, WooCommerce stock, bulk translation jobs and imports are more reliable.
 
 = 1.0.6 =
 Security hardening and stricter permission checks. Importing a JSON file from another site can now ask you to confirm this site is a copy of it. On WooCommerce stores, default-language pages no longer set the language cookie. Multisite uninstall and activation are more reliable.
 
 = 1.0.5 =
 Translates block-theme templates and template parts, and adds a Translations panel to the Site Editor and the Contact Form 7 and WPForms editors. Fixes forms, Oxygen layouts, menus and WooCommerce product bodies vanishing on non-default languages, and WPForms forms nobody could translate.
-
-= 1.0.4 =
-Translates the site title, tagline, synced patterns and block-theme menus. Fixes a translated site title overwriting the original, a multisite call returning the wrong blog's name, and order emails resolving the wrong language.
-
-= 1.0.3 =
-Fixes WooCommerce order emails in the wrong language, percent signs deleted from titles, and the admin on phones and tablets.
-
-= 1.0.2 =
-Machine Translation could not be switched on from the admin at all, and three settings were silently cleared by unrelated saves. Also fixes a fatal on servers without mbstring, translates WPForms confirmations, and makes XLIFF imports about three times cheaper.
-
-= 1.0.1 =
-Security and reliability release: security hardening and stricter permission checks. Also fixes a WooCommerce race that lost stock when several languages sold at once.
-
-= 1.0.0 =
-Initial release of PerfLocale.

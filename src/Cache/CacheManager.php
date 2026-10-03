@@ -123,11 +123,24 @@ final class CacheManager {
 	/**
 	 * Register hooks.
 	 *
+	 * One hook, on write requests only (the same test CacheInvalidator uses
+	 * for `save_post`): a status change of a translatable post deletes the
+	 * Translations screen's cached all-language status selections
+	 * (TranslationGroupRepository::on_post_status_transition()). A front-end
+	 * GET registers nothing. Every other hook-based invalidation lives in
+	 * CacheInvalidator.
+	 *
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Nothing to hook - the cache manager is a passive service.
-		// CacheInvalidator handles the hook-based invalidation.
+		$is_write_context = is_admin() || wp_doing_ajax() || wp_doing_cron()
+			|| ( isset( $_SERVER['REQUEST_METHOD'] ) && 'GET' !== $_SERVER['REQUEST_METHOD'] )
+			|| defined( 'REST_REQUEST' )
+			|| ( defined( 'WP_CLI' ) && WP_CLI );
+
+		if ( $is_write_context ) {
+			add_action( 'transition_post_status', [ \PerfLocale\Database\Repository\TranslationGroupRepository::class, 'on_post_status_transition' ], 10, 3 );
+		}
 	}
 
 	/**
@@ -299,12 +312,22 @@ final class CacheManager {
 	 * which a host with the old 1 MB `max_allowed_packet` default answers
 	 * by rejecting the statement AND closing the connection mid-request.
 	 *
+	 * `$drop_timeout_keys` names entries whose L3 row carries an EXPIRED
+	 * `_transient_timeout_` twin (set() writes a twin; set_many() does not).
+	 * A row rewritten here next to such a twin still reads as expired, so the
+	 * next request recomputes and rewrites it again, on every request until a
+	 * sweep removes the twin. Those twins are deleted once every INSERT batch
+	 * has succeeded, so the rewritten row reads like every other set_many()
+	 * row. After a failed batch every twin stays, so a row that may not have
+	 * been rewritten keeps its expiry.
+	 *
 	 * @param array<string, mixed> $entries map of cache_key => value
 	 * @param int                  $ttl
 	 * @param string               $group
+	 * @param string[]             $drop_timeout_keys Keys of $entries whose expired timeout twin is deleted after the write.
 	 * @return void
 	 */
-	public function set_many( array $entries, int $ttl = HOUR_IN_SECONDS, string $group = self::GROUP ): void {
+	public function set_many( array $entries, int $ttl = HOUR_IN_SECONDS, string $group = self::GROUP, array $drop_timeout_keys = [] ): void {
 		if ( $entries === [] ) {
 			return;
 		}
@@ -377,11 +400,16 @@ final class CacheManager {
 		// transient mechanism's auto-expiration is unused — writing the
 		// timeout row would just double the wp_options inserts. With
 		// timeout missing, WP's get_transient() falls through to "no
-		// expiration set; return the value" — exactly what we want.
+		// expiration set; return the value" — exactly what we want. An
+		// expired twin a set() left beside a key in $drop_timeout_keys is
+		// deleted after the INSERTs (see the docblock).
 		$option_names  = [];
+		$timeout_names = [];
+		$drop_timeouts = array_fill_keys( $drop_timeout_keys, true );
 		$values_clause = [];
 		$args          = [];
 		$batch_bytes   = 0;
+		$all_written   = true;
 
 		foreach ( $entries as $key => $value ) {
 			$transient_id = $this->derive_transient_key( (string) $key, $group );
@@ -399,7 +427,7 @@ final class CacheManager {
 				&& ( count( $values_clause ) >= self::L3_INSERT_MAX_ROWS
 					|| $batch_bytes + $row_bytes > self::L3_INSERT_MAX_BYTES )
 			) {
-				$this->insert_transient_rows( $values_clause, $args );
+				$all_written = $this->insert_transient_rows( $values_clause, $args ) && $all_written;
 
 				$values_clause = [];
 				$args          = [];
@@ -414,10 +442,18 @@ final class CacheManager {
 			$args[] = 'no';
 
 			$batch_bytes += $row_bytes;
+
+			if ( isset( $drop_timeouts[ $key ] ) ) {
+				$timeout_names[] = '_transient_timeout_' . $transient_id;
+			}
 		}
 
 		if ( $values_clause !== [] ) {
-			$this->insert_transient_rows( $values_clause, $args );
+			$all_written = $this->insert_transient_rows( $values_clause, $args ) && $all_written;
+		}
+
+		if ( $all_written && $timeout_names !== [] ) {
+			$this->delete_transient_timeout_rows( $timeout_names );
 		}
 
 		// Wipe the WP options cache for the keys we just touched — direct
@@ -464,9 +500,9 @@ final class CacheManager {
 	 *
 	 * @param string[]     $values_clause One `(%s, %s, %s)` tuple per row.
 	 * @param array<mixed> $args Flattened bind values matching $values_clause.
-	 * @return void
+	 * @return bool False when the statement failed.
 	 */
-	private function insert_transient_rows( array $values_clause, array $args ): void {
+	private function insert_transient_rows( array $values_clause, array $args ): bool {
 		global $wpdb;
 
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -474,8 +510,34 @@ final class CacheManager {
 			. implode( ',', $values_clause )
 			. ' ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = VALUES(autoload)';
 
-		$wpdb->query( $wpdb->prepare( $sql, ...$args ) );
+		$result = $wpdb->query( $wpdb->prepare( $sql, ...$args ) );
 		// phpcs:enable
+
+		return false !== $result;
+	}
+
+	/**
+	 * Delete `_transient_timeout_*` rows by exact name, at most
+	 * L3_INSERT_MAX_ROWS names per statement, and drop each name from the
+	 * options cache (the rows go by raw SQL, not delete_option()).
+	 *
+	 * @param string[] $timeout_names Full option names.
+	 * @return void
+	 */
+	private function delete_transient_timeout_rows( array $timeout_names ): void {
+		global $wpdb;
+
+		foreach ( array_chunk( $timeout_names, self::L3_INSERT_MAX_ROWS ) as $chunk ) {
+			$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%s' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->query( $wpdb->prepare( "DELETE FROM %i WHERE option_name IN ({$placeholders})", $wpdb->options, ...$chunk ) );
+			// phpcs:enable
+		}
+
+		foreach ( $timeout_names as $name ) {
+			wp_cache_delete( $name, 'options' );
+		}
 	}
 
 	/**
@@ -495,6 +557,64 @@ final class CacheManager {
 		}
 
 		delete_transient( $this->transient_key( $key, $group ) );
+	}
+
+	/**
+	 * Delete several values from all cache layers.
+	 *
+	 * The batch form of delete() for entries stored with a TTL by get()/set():
+	 * L1 entries are dropped, L2 keys go in one wp_cache_delete_multiple(),
+	 * and the L3 rows (value and timeout row of each key) in one prepared
+	 * DELETE per L3_INSERT_MAX_ROWS names, where delete() spends up to four
+	 * queries per key. L3 is skipped under a persistent object cache, which
+	 * get() and set() never use for it.
+	 *
+	 * @param string[] $keys  Cache keys.
+	 * @param string   $group Cache group.
+	 * @return void
+	 */
+	public function delete_many( array $keys, string $group = self::GROUP ): void {
+		if ( $keys === [] ) {
+			return;
+		}
+
+		$l2_keys = [];
+		$names   = [];
+
+		foreach ( $keys as $key ) {
+			$key = (string) $key;
+
+			unset( $this->static_cache[ $this->make_static_key( $group, $key ) ] );
+
+			$l2_keys[]    = self::l2_key( $key, $group );
+			$transient_id = $this->derive_transient_key( $key, $group );
+			$names[]      = '_transient_' . $transient_id;
+			$names[]      = '_transient_timeout_' . $transient_id;
+		}
+
+		if ( $this->object_cache_enabled ) {
+			wp_cache_delete_multiple( $l2_keys, $group );
+		}
+
+		if ( wp_using_ext_object_cache() ) {
+			return;
+		}
+
+		global $wpdb;
+
+		foreach ( array_chunk( $names, self::L3_INSERT_MAX_ROWS ) as $chunk ) {
+			$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%s' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->query( $wpdb->prepare( "DELETE FROM %i WHERE option_name IN ({$placeholders})", $wpdb->options, ...$chunk ) );
+			// phpcs:enable
+		}
+
+		// The rows went by raw SQL, so the options cache that get_transient()
+		// reads through drops them by name.
+		foreach ( $names as $name ) {
+			wp_cache_delete( $name, 'options' );
+		}
 	}
 
 	/**
@@ -771,6 +891,12 @@ final class CacheManager {
 		// survived every flush forever (5,659 of them non-expiring on that
 		// same site). The bulk DELETE reaps them.
 		$this->delete_transients_by_prefix( 'perflocale_' );
+
+		// The epoch of the stored variation maps, by name: with a persistent
+		// object cache the maps and their epoch live only in its `transient`
+		// group, which the sweep above does not reach. A missing epoch
+		// retires every stored map of the blog (InventorySync).
+		delete_transient( \PerfLocale\WooCommerce\InventorySync::STORED_MAP_EPOCH );
 
 		// L0: the eager link map is a plain autoloaded option, not a
 		// transient, so neither the generation bumps above nor the L3 sweep

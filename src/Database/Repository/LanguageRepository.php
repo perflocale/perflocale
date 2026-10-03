@@ -1150,6 +1150,7 @@ final class LanguageRepository implements RepositoryInterface {
 		// column visibility). Stored as `[slug, slug, ...]` in user
 		// meta. Walk via direct query so we touch only the rows that
 		// contain the old slug; full users-table scan would be wasteful.
+		// Network-wide per user, like the delete-time sweep: see delete().
 		$user_meta_keys = [
 			'perflocale_strings_hidden_langs',
 			'perflocale_translations_hidden_langs',
@@ -1459,6 +1460,92 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
+	 * Count the content that blocks deleting a language.
+	 *
+	 * Deleting a language removes its translation links but keeps the linked
+	 * objects. Everything WooCommerce shares across a translation group (one
+	 * stock, the SKU / GTIN exemption between siblings) is keyed on those links,
+	 * and an unlinked post is served as default-language content, so the
+	 * language's posts would turn into default-language duplicates with split
+	 * stock. The admin, REST and CLI delete entry points therefore refuse while
+	 * this reports any post: the operator moves those posts to the Trash (a
+	 * trashed product holds no SKU and cannot be bought) or deactivates the
+	 * language instead (an inactive language keeps every link).
+	 *
+	 * Not called inside delete(): fixtures and scenarios use delete() to remove
+	 * languages that still have links.
+	 *
+	 * One grouped COUNT over the language's links. translation_groups.type is
+	 * the authority on what a link points at (links written before
+	 * translation_links.type existed carry it empty). Posts in the Trash or
+	 * auto-drafts do not block, and neither does a link whose post is gone.
+	 * Attachments and terms are reported for information only: terms have no
+	 * Trash, and an unlinked media copy serves nothing on its own.
+	 *
+	 * Block theme templates and template parts are reported for information
+	 * only too. Every template save seeds a draft copy in each active language
+	 * (BlockTemplateSupport::ensure_translations_exist()), so counting them
+	 * would block the delete of any language on a site that translates its
+	 * templates. Core finds a template by its slug, and a copy's slug carries
+	 * the language suffix (BlockTemplateSupport::translation_slug()), so an
+	 * unlinked copy never takes the place of the original.
+	 *
+	 * @param int $id Language ID.
+	 * @return array{posts: array<string, int>, attachments: int, terms: int, templates: int}|null
+	 *         Blocking post counts by post type, plus the informational counts;
+	 *         null when the count query failed (callers must refuse).
+	 */
+	public function delete_blockers( int $id ): ?array {
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Uncached on purpose: a delete decision reads the live rows; tables bound through %i.
+		$rows = $this->wpdb->get_results(
+			$this->wpdb->prepare(
+				"SELECT g.type AS group_type, p.post_type AS post_type, COUNT(*) AS n
+				 FROM %i l
+				 INNER JOIN %i g ON g.id = l.group_id
+				 LEFT JOIN %i p ON g.type = 'post' AND p.ID = l.object_id
+				 WHERE l.language_id = %d
+				   AND (
+				     g.type = 'term'
+				     OR ( g.type = 'post' AND p.ID IS NOT NULL AND p.post_status NOT IN ( 'trash', 'auto-draft' ) )
+				   )
+				 GROUP BY g.type, p.post_type",
+				Schema::table( 'translation_links' ),
+				Schema::table( 'translation_groups' ),
+				$this->wpdb->posts,
+				$id
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( ! is_array( $rows ) || $this->wpdb->last_error !== '' ) {
+			return null;
+		}
+
+		$blockers = [
+			'posts'       => [],
+			'attachments' => 0,
+			'terms'       => 0,
+			'templates'   => 0,
+		];
+
+		foreach ( $rows as $row ) {
+			$count = (int) $row->n;
+
+			if ( (string) $row->group_type === 'term' ) {
+				$blockers['terms'] += $count;
+			} elseif ( (string) $row->post_type === 'attachment' ) {
+				$blockers['attachments'] += $count;
+			} elseif ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( (string) $row->post_type ) ) {
+				$blockers['templates'] += $count;
+			} else {
+				$blockers['posts'][ (string) $row->post_type ] = $count;
+			}
+		}
+
+		return $blockers;
+	}
+
+	/**
 	 * Delete a language.
 	 *
 	 * @param int $id Language ID.
@@ -1599,80 +1686,95 @@ final class LanguageRepository implements RepositoryInterface {
 		// map. Mirror the slug cleanup above for the translation-link layer.
 		$this->flush_translation_link_caches();
 
-		// Per-language attachment + nav-menu meta is keyed by the language
-		// slug, not its id, so it isn't caught by the FK cascades above and
-		// would linger as dead data (and auto-re-link if the slug is re-added).
-		// Use delete_metadata( $type, 0, $key, '', true ) — the "delete every
-		// row matching $key" core API — not a raw $wpdb->delete(), so the
-		// per-object meta cache is busted alongside the row.
-		$post_meta_prefixes = [
-			'_perflocale_alt_',
-			'_perflocale_caption_',
-			'_perflocale_description_',
-		];
+		// Everything in this block is keyed by the language slug. For a code
+		// of '' the meta keys collapse to their bare prefixes and core reads a
+		// '' meta value as "any value", so the `_perflocale_language` sweep
+		// would untag every nav menu and the hidden-langs scan would read every
+		// user's row. Skip the block for an empty code.
+		if ( '' !== (string) $language->slug ) {
+			// Per-language attachment + nav-menu meta is keyed by the language
+			// slug, not its id, so it isn't caught by the FK cascades above and
+			// would linger as dead data (and auto-re-link if the slug is re-added).
+			// Use delete_metadata( $type, 0, $key, '', true ) — the "delete every
+			// row matching $key" core API — not a raw $wpdb->delete(), so the
+			// per-object meta cache is busted alongside the row.
+			$post_meta_prefixes = [
+				'_perflocale_alt_',
+				'_perflocale_caption_',
+				'_perflocale_description_',
+			];
 
-		foreach ( $post_meta_prefixes as $prefix ) {
-			delete_metadata( 'post', 0, $prefix . $language->slug, '', true );
-		}
-
-		delete_metadata( 'term', 0, '_perflocale_menu_' . $language->slug, '', true );
-
-		// `_perflocale_language` term meta stores the slug as the VALUE (one
-		// row per nav-menu term). On delete the rows must go entirely, else
-		// menus stay tagged with a slug that no longer resolves. Passing the
-		// slug as $meta_value + $delete_all=true removes every matching
-		// termmeta row (and busts cache per affected term).
-		delete_metadata( 'term', 0, '_perflocale_language', $language->slug, true );
-
-		// Per-user `hidden_langs` arrays (Strings + Translations admin
-		// column visibility) may still list the deleted slug. Mirror the
-		// rename-time logic in `migrate_slug_references()` but REMOVE the
-		// entry instead of replacing it. Targeted SELECT on `meta_value
-		// LIKE '%slug%'` keeps the row scan small (only users who have
-		// hidden some column) and avoids a full users-table walk.
-		$user_meta_keys = [
-			'perflocale_strings_hidden_langs',
-			'perflocale_translations_hidden_langs',
-		];
-
-		foreach ( $user_meta_keys as $meta_key ) {
-			// $this->wpdb->usermeta is the WordPress core usermeta table name,
-			// supplied by wpdb itself. The $meta_key and language slug are
-			// passed through prepare()'s %s placeholders below. Plugin Check
-			// can't trace the wpdb-supplied table name through dynamic
-			// property access, so we wrap the whole prepare() in a block-
-			// scoped disable.
-			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-			$rows = $this->wpdb->get_results(
-				$this->wpdb->prepare(
-					"SELECT umeta_id, user_id, meta_value FROM {$this->wpdb->usermeta}
-					WHERE meta_key = %s AND meta_value LIKE %s",
-					$meta_key,
-					'%' . $this->wpdb->esc_like( $language->slug ) . '%'
-				)
-			);
-			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-			if ( ! is_array( $rows ) ) {
-				continue;
+			foreach ( $post_meta_prefixes as $prefix ) {
+				delete_metadata( 'post', 0, $prefix . $language->slug, '', true );
 			}
 
-			foreach ( $rows as $row ) {
-				$arr = maybe_unserialize( $row->meta_value );
+			delete_metadata( 'term', 0, '_perflocale_menu_' . $language->slug, '', true );
 
-				if ( ! is_array( $arr ) ) {
+			// `_perflocale_language` term meta stores the slug as the VALUE (one
+			// row per nav-menu term). On delete the rows must go entirely, else
+			// menus stay tagged with a slug that no longer resolves. Passing the
+			// slug as $meta_value + $delete_all=true removes every matching
+			// termmeta row (and busts cache per affected term).
+			delete_metadata( 'term', 0, '_perflocale_language', $language->slug, true );
+
+			// Per-user `hidden_langs` arrays (Strings + Translations admin
+			// column visibility) may still list the deleted slug. Mirror the
+			// rename-time logic in `migrate_slug_references()` but REMOVE the
+			// entry instead of replacing it. Targeted SELECT on `meta_value
+			// LIKE '%slug%'` keeps the row scan small (only users who have
+			// hidden some column) and avoids a full users-table walk.
+			//
+			// These keys are unprefixed user meta, so on a network one array per
+			// user serves every site, as core's own column preferences do:
+			// removing the slug here also un-hides its column on other sites that
+			// still have that slug. Every Screen Options save already rewrites the
+			// whole array from the current site's languages, so a per-site scope
+			// would need blog-prefixed keys (update_user_option()), not a
+			// narrower sweep.
+			$user_meta_keys = [
+				'perflocale_strings_hidden_langs',
+				'perflocale_translations_hidden_langs',
+			];
+
+			foreach ( $user_meta_keys as $meta_key ) {
+				// $this->wpdb->usermeta is the WordPress core usermeta table name,
+				// supplied by wpdb itself. The $meta_key and language slug are
+				// passed through prepare()'s %s placeholders below. Plugin Check
+				// can't trace the wpdb-supplied table name through dynamic
+				// property access, so we wrap the whole prepare() in a block-
+				// scoped disable.
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+				$rows = $this->wpdb->get_results(
+					$this->wpdb->prepare(
+						"SELECT umeta_id, user_id, meta_value FROM {$this->wpdb->usermeta}
+						WHERE meta_key = %s AND meta_value LIKE %s",
+						$meta_key,
+						'%' . $this->wpdb->esc_like( $language->slug ) . '%'
+					)
+				);
+				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+				if ( ! is_array( $rows ) ) {
 					continue;
 				}
 
-				$next = array_values(
-					array_filter(
-						$arr,
-						static fn( $entry ): bool => $entry !== $language->slug
-					)
-				);
+				foreach ( $rows as $row ) {
+					$arr = maybe_unserialize( $row->meta_value );
 
-				if ( $next !== $arr ) {
-					update_user_meta( (int) $row->user_id, $meta_key, $next );
+					if ( ! is_array( $arr ) ) {
+						continue;
+					}
+
+					$next = array_values(
+						array_filter(
+							$arr,
+							static fn( $entry ): bool => $entry !== $language->slug
+						)
+					);
+
+					if ( $next !== $arr ) {
+						update_user_meta( (int) $row->user_id, $meta_key, $next );
+					}
 				}
 			}
 		}

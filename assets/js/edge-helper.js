@@ -154,6 +154,53 @@ function langHostname( domain ) {
 	return ( domain || '' ).replace( /^https?:\/\//, '' ).replace( /\/.*$/, '' );
 }
 
+// Percent-decode the way PHP's rawurldecode() does: over the UTF-8 bytes,
+// leaving a malformed escape ("%ZZ", a trailing "%E6%97") as it is, never
+// throwing. Returns a byte string (one char per byte), so comparisons are
+// byte for byte, as in PHP.
+function rawUrlDecodeBytes( value ) {
+	const bytes = new TextEncoder().encode( String( value ) );
+	const isHex = ( b ) => ( b >= 0x30 && b <= 0x39 ) || ( b >= 0x41 && b <= 0x46 ) || ( b >= 0x61 && b <= 0x66 );
+	let out = '';
+
+	for ( let i = 0; i < bytes.length; i++ ) {
+		if ( bytes[ i ] === 0x25 && i + 2 < bytes.length && isHex( bytes[ i + 1 ] ) && isHex( bytes[ i + 2 ] ) ) {
+			out += String.fromCharCode( parseInt( String.fromCharCode( bytes[ i + 1 ], bytes[ i + 2 ] ), 16 ) );
+			i += 2;
+		} else {
+			out += String.fromCharCode( bytes[ i ] );
+		}
+	}
+
+	return out;
+}
+
+// Is the path inside one of the excluded paths? The same rule as the plugin's
+// Helper::path_matches_excluded(): both sides percent-decoded, and a match only
+// on the whole path or at a boundary after the excluded path ("/", "." or "?"),
+// so an excluded "/api" does not cover "/apifoo", and "/日本語/" matches the
+// encoded path a browser sends.
+function pathMatchesExcluded( path, needles ) {
+	const normalised = '/' + rawUrlDecodeBytes( path ).replace( /^\/+/, '' );
+
+	for ( const needle of needles || [] ) {
+		const candidate = rawUrlDecodeBytes( needle ).replace( /\/+$/, '' );
+
+		if ( candidate === '' ) {
+			continue;
+		}
+
+		if ( normalised === candidate ||
+			normalised.startsWith( candidate + '/' ) ||
+			normalised.startsWith( candidate + '.' ) ||
+			normalised.startsWith( candidate + '?' ) ) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // Has the URL already been routed to a language, per the site's url_mode?
 function isAlreadyRouted( url, config ) {
 	const mode = config.url_mode || 'subdirectory';
@@ -188,10 +235,8 @@ async function handle( request ) {
 	}
 
 	// If this is an excluded path (REST, admin, etc.) pass through untouched.
-	for ( const excluded of config.excluded_paths ) {
-		if ( url.pathname.indexOf( excluded ) === 0 ) {
-			return fetch( request );
-		}
+	if ( pathMatchesExcluded( url.pathname, config.excluded_paths ) ) {
+		return fetch( request );
 	}
 
 	// === Strategy A: URL rewrite (recommended) ============================

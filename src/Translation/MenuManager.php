@@ -351,6 +351,86 @@ final class MenuManager {
 	}
 
 	/**
+	 * Label a set of menus that translate each other and link them all to each other.
+	 *
+	 * Writes `_perflocale_language` on every menu and a
+	 * `_perflocale_menu_<slug>` pointer from every menu to every other, the
+	 * term meta get_menu_for_language() reads. Nothing is written when a menu
+	 * already carries a different language, or a pointer for one of the set's
+	 * languages to another existing menu: a set the site already curated wins.
+	 * A value already in place is not written again.
+	 *
+	 * @param array<string, int> $set Language slug => nav menu term ID.
+	 * @return array{written: int, conflict: string|null} Meta rows written, and why nothing was written.
+	 */
+	public static function link_imported_menus( array $set ): array {
+		$menus = [];
+
+		foreach ( $set as $slug => $menu_id ) {
+			$slug    = sanitize_key( (string) $slug );
+			$menu_id = (int) $menu_id;
+
+			if ( $slug !== '' && $menu_id > 0 && is_nav_menu( $menu_id ) ) {
+				$menus[ $slug ] = $menu_id;
+			}
+		}
+
+		if ( count( $menus ) < 2 ) {
+			return [
+				'written'  => 0,
+				'conflict' => null,
+			];
+		}
+
+		foreach ( $menus as $slug => $menu_id ) {
+			$label = (string) get_term_meta( $menu_id, '_perflocale_language', true );
+
+			if ( $label !== '' && $label !== $slug ) {
+				return [
+					'written'  => 0,
+					'conflict' => 'language',
+				];
+			}
+
+			foreach ( $menus as $other_slug => $other_id ) {
+				if ( $other_slug === $slug ) {
+					continue;
+				}
+
+				$pointer = (int) get_term_meta( $menu_id, '_perflocale_menu_' . $other_slug, true );
+
+				if ( $pointer > 0 && $pointer !== $other_id && is_nav_menu( $pointer ) ) {
+					return [
+						'written'  => 0,
+						'conflict' => 'link',
+					];
+				}
+			}
+		}
+
+		$written = 0;
+
+		foreach ( $menus as $slug => $menu_id ) {
+			if ( (string) get_term_meta( $menu_id, '_perflocale_language', true ) !== $slug ) {
+				update_term_meta( $menu_id, '_perflocale_language', $slug );
+				++$written;
+			}
+
+			foreach ( $menus as $other_slug => $other_id ) {
+				if ( $other_slug !== $slug && (int) get_term_meta( $menu_id, '_perflocale_menu_' . $other_slug, true ) !== $other_id ) {
+					update_term_meta( $menu_id, '_perflocale_menu_' . $other_slug, $other_id );
+					++$written;
+				}
+			}
+		}
+
+		return [
+			'written'  => $written,
+			'conflict' => null,
+		];
+	}
+
+	/**
 	 * Save menu language and linked menus when a menu is updated.
 	 *
 	 * @param int $menu_id Menu ID.

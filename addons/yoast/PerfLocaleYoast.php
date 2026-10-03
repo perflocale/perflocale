@@ -149,6 +149,11 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
+		// A field a person empties stays empty: its clear is recorded in the
+		// post's seed-cleared marker, which machine translation and the seed
+		// honour.
+		\PerfLocale\Translation\ContentSync::track_seed_clears( $this->add_meta_keys( [], '' ) );
+
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so Yoast's own og:locale already reflects the current language.
 
@@ -561,7 +566,9 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 				// sibling exists at all. get_post() above has already primed
 				// the cache, so the check costs no query.
 				if ( $translated_post instanceof \WP_Post && $this->is_publicly_viewable_translation( $translated_id ) ) {
-					$link['text'] = $translated_post->post_title;
+					// The stored title without tags, as Yoast makes the text of
+					// its own crumbs: its presenter prints crumb text as is.
+					$link['text'] = wp_strip_all_tags( $translated_post->post_title, true );
 					$link['url']  = get_permalink( $translated_id );
 					$link['id']   = $translated_id;
 				}

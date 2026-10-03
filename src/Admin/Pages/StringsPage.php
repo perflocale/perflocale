@@ -277,8 +277,6 @@ final class StringsPage {
 				<?php endif; ?>
 
 			</div>
-
-			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 			<hr class="wp-header-end">
 
 			<?php if ( $scan_new >= 0 ) : ?>
@@ -433,7 +431,7 @@ final class StringsPage {
 				</div>
 			<?php elseif ( $po_message === 'export_fail' ) : ?>
 				<div class="notice notice-error is-dismissible">
-					<p><?php echo esc_html__( 'PO export failed. Check the language slug and try again.', 'perflocale' ); ?></p>
+					<p><?php echo esc_html__( 'PO export failed: the language could not be found, its translations could not be read, or the export file could not be written. Try again.', 'perflocale' ); ?></p>
 				</div>
 			<?php elseif ( $po_message === 'too_large' ) : ?>
 				<div class="notice notice-error is-dismissible">
@@ -473,30 +471,6 @@ final class StringsPage {
 			<?php endif; ?>
 
 			<?php
-			// AI quality "Mark reviewed" / "Re-score" flash notice. Sourced
-			// from the admin-post redirect (?message=mt_review_done&op=clear|rescore
-			// or message=mt_review_nochange). No nonce read — pure display
-			// state that just confirms a write the handler already validated.
-			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-			$_review_msg = isset( $_GET['message'] ) ? sanitize_key( wp_unslash( (string) $_GET['message'] ) ) : '';
-			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-			$_review_op = isset( $_GET['op'] ) ? sanitize_key( wp_unslash( (string) $_GET['op'] ) ) : '';
-			?>
-			<?php if ( $_review_msg === 'mt_review_done' ) : ?>
-				<div class="notice notice-success is-dismissible"><p>
-				<?php
-					echo esc_html(
-						$_review_op === 'rescore'
-							? __( 'Translation queued for re-scoring on the next cron run.', 'perflocale' )
-							: __( 'Translation marked as reviewed. The badge will disappear after the page reload.', 'perflocale' )
-					);
-				?>
-				</p></div>
-			<?php elseif ( $_review_msg === 'mt_review_nochange' ) : ?>
-				<div class="notice notice-warning is-dismissible"><p><?php echo esc_html__( 'No score row matched the request — it may have already been cleared.', 'perflocale' ); ?></p></div>
-			<?php endif; ?>
-
-			<?php
 			// Strip stale PO error params after the notice has rendered so
 			// reloads don't replay the message and pagination URLs stay clean.
 			// Attached as inline JS to the registered `perflocale-admin` handle
@@ -517,6 +491,8 @@ final class StringsPage {
 				);
 			}
 			?>
+
+			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
 			<!-- Toolbar -->
 			<div class="perflocale-str-toolbar">

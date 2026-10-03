@@ -59,8 +59,10 @@ final class Migrator {
 		add_action( 'rest_api_init', [ $this, 'maybe_migrate_addons' ] );
 
 		// Catch-all for WP-CLI / wp-cron / frontend-only traffic that never
-		// hits admin_init or rest_api_init. Idempotent so the duplicate
-		// firing on admin/REST requests is a no-op.
+		// hits admin_init or rest_api_init. The duplicate firing on admin/REST
+		// requests costs nothing once everything is current; while an add-on
+		// table cannot be created, each firing retries it and logs the
+		// server's refusal.
 		add_action( 'wp_loaded', [ $this, 'maybe_migrate' ], 1 );
 		add_action( 'wp_loaded', [ $this, 'maybe_update' ], 1 );
 		add_action( 'wp_loaded', [ $this, 'maybe_migrate_addons' ], 2 );
@@ -160,11 +162,13 @@ final class Migrator {
 		try {
 			// Run version-specific migrations BEFORE the additive dbDelta so
 			// structural changes (drop-an-index, rename-a-column) complete
-			// cleanly first. Commit the version AFTER each step's migrate_to_N
-			// AND its dbDelta both succeed — mirroring AddonSchemaManager — so a
-			// failure in a LATER step never re-runs an already-applied earlier
-			// step (which, if not perfectly idempotent, would corrupt on the
-			// second pass). Retry resumes from exactly the failed version.
+			// cleanly first. Record the version after each step, and only once
+			// that step's migrate_to_N has returned without throwing and the
+			// table post-condition below passes (the same record-per-step
+			// model as AddonSchemaManager). A failure in a LATER step then
+			// never re-runs an already-applied earlier step (which, if not
+			// perfectly idempotent, would corrupt on the second pass). Retry
+			// resumes from exactly the failed version.
 			for ( $version = $current_version + 1; $version <= $target_version; $version++ ) {
 				$method = 'migrate_to_' . $version;
 
@@ -180,8 +184,7 @@ final class Migrator {
 
 				// Additive column/index changes for this version. dbDelta
 				// reflects the full current schema and is idempotent, so running
-				// it per step is safe; committing the version only after it runs
-				// means version N is never recorded before N's columns exist.
+				// it per step is safe.
 				Schema::create_tables();
 
 				// dbDelta swallows DDL errors and its return value reports
@@ -192,6 +195,13 @@ final class Migrator {
 				// stamping; leaving the version behind means the next request
 				// re-runs this step instead of silently moving on with a
 				// half-provisioned schema.
+				//
+				// This proves the tables exist, not their columns or indexes:
+				// a CREATE is all-or-nothing, but an ALTER on an existing
+				// table can fail and leave the table in place. A step whose
+				// dbDelta adds a column or index must also check that one
+				// here, by name (SHOW COLUMNS / SHOW INDEX), before the
+				// version is recorded.
 				$missing = Schema::missing_tables();
 
 				if ( $missing !== [] ) {
@@ -217,6 +227,10 @@ final class Migrator {
 	/**
 	 * Show a persistent admin notice when a migration fails.
 	 *
+	 * The notice is shown only to users who manage the site's options (the
+	 * network's on multisite), with filesystem paths redacted; the debug log
+	 * keeps the full text.
+	 *
 	 * @param int    $version Target version that failed.
 	 * @param string $message Error message.
 	 * @return void
@@ -226,9 +240,15 @@ final class Migrator {
 			error_log( sprintf( 'PerfLocale migration to v%d failed: %s', $version, $message ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
 
+		$message = \PerfLocale\Util\PathRedactor::redact( $message );
+
 		add_action(
 			'admin_notices',
 			static function () use ( $version, $message ): void {
+				if ( ! current_user_can( is_multisite() ? 'manage_network_options' : 'manage_options' ) ) {
+					return;
+				}
+
 				printf(
 					'<div class="notice notice-error"><p><strong>PerfLocale</strong>: %s</p></div>',
 					sprintf(

@@ -25,7 +25,11 @@ if ( ! defined( 'ABSPATH' ) ) {
  * The basename is deliberately kept: `<path>/import.csv` is actionable,
  * `<path>` alone is not.
  *
- * Tuned for the shape PHP actually throws ("... in /var/www/.../Foo.php:1033").
+ * Tuned for the shape PHP actually throws ("... in /var/www/.../Foo.php:1033",
+ * "(previously declared in /var/www/.../foo.php:83)"). Directory and file
+ * names may hold single spaces ("/home/me/Local Sites/..."): PHP reports a
+ * file's real path, which for a symlinked plugin lies outside both known
+ * prefixes.
  * Conservative: only sequences that look like absolute Unix paths ending in a
  * recognised extension are matched, so ordinary prose is left alone.
  * Multi-line safe, and never returns a string longer than the input.
@@ -59,11 +63,13 @@ final class PathRedactor {
 		}
 
 		// Anything that escaped the prefix pass (/tmp, /var/log, a path from
-		// another install). Anchored on a leading boundary so paths already
-		// rewritten above are not mangled a second time, and bounded to avoid
-		// pathological backtracking.
+		// another install, a symlinked plugin's real path). Anchored on a
+		// leading boundary so paths already rewritten above are not mangled a
+		// second time, and bounded to avoid pathological backtracking. Words
+		// inside a directory or file name are joined by single spaces; only
+		// the directories are replaced, the file name and what follows stay.
 		$message = preg_replace_callback(
-			'#(^|[\s\'",;:()\[\]])/(?:[a-zA-Z0-9._-]+/){1,30}([a-zA-Z0-9._-]+\.[a-zA-Z0-9]{1,8})#',
+			'#(^|[\s\'",;:()\[\]])/(?:[a-zA-Z0-9._-]+(?: [a-zA-Z0-9._-]+)*/){1,30}([a-zA-Z0-9._-]+(?: [a-zA-Z0-9._-]+)*\.[a-zA-Z0-9]{1,8})#',
 			static fn( array $m ): string => $m[1] . '<path>/' . $m[2],
 			$message
 		);

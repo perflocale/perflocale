@@ -36,6 +36,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   6. On uncaught exception, schedules a retry with exponential backoff
  *      (up to `perflocale/jobs/max_attempts`, default 5).
  *   7. Releases the lock in a finally block.
+ *   8. When PHP stops inside `execute()` (a fatal error, an exit), a
+ *      shutdown function releases the locks and marks the job failed (just
+ *      before WordPress's fatal error page, when it shows one).
  *
  * Jobs are constructed lazily via a factory closure so the worker has a
  * fresh instance per invocation (any cached state from one run cannot
@@ -49,6 +52,30 @@ final class WorkerRegistry {
 	 * @var array<string, callable(): AbstractJob>
 	 */
 	private static array $factories = [];
+
+	/**
+	 * The error types WordPress's fatal error handler treats as fatal.
+	 *
+	 * @var array<int, int>
+	 */
+	private const FATAL_ERROR_TYPES = [ E_ERROR, E_PARSE, E_USER_ERROR, E_COMPILE_ERROR, E_RECOVERABLE_ERROR ];
+
+	/**
+	 * The job whose execute() runs in this process: its blog, id and type,
+	 * and whether this worker holds the type lock. Set just before
+	 * execute() and cleared in `finally`, so {@see release_on_shutdown()}
+	 * finds it only when PHP stopped inside execute().
+	 *
+	 * @var array{blog_id: int, job_id: string, type: string, type_locked: bool}|null
+	 */
+	private static ?array $in_execute = null;
+
+	/**
+	 * Whether {@see release_on_shutdown()} is registered in this process.
+	 *
+	 * @var bool
+	 */
+	private static bool $shutdown_registered = false;
 
 	/**
 	 * Register a job type's worker hook.
@@ -361,7 +388,9 @@ final class WorkerRegistry {
 			return;
 		}
 
-		$prev_user = (int) get_current_user_id();
+		$prev_user     = (int) get_current_user_id();
+		$outer_execute = self::$in_execute;
+		$continue_job  = false;
 
 		try {
 			// Re-validate cap against stored `created_by`. Catches user
@@ -408,6 +437,8 @@ final class WorkerRegistry {
 			// spend, created posts, the completion hook - would happen
 			// against a row that still says `queued` and is still eligible
 			// to be picked up and replayed by the next sweep.
+			$resume = [];
+
 			if ( ! JobState::mark_running( $job_id ) ) {
 				// The claim did not transition anything. Read the row FRESH
 				// (the gate at the top of this method reads a cached one) and
@@ -440,8 +471,19 @@ final class WorkerRegistry {
 				// busy-retry path instead). So the row is ours, resuming:
 				// the cooperative pause bail deliberately leaves it running,
 				// and mark_running() is a documented no-op there so the
-				// attempts counter is not charged twice for one run.
+				// attempts counter is not charged twice for one run. A job
+				// that runs in slices resumes from the result stored on it.
+				$resume = is_array( $fresh['result'] ?? null ) ? $fresh['result'] : [];
 				unset( $fresh );
+			}
+
+			// A job that runs in slices gets its resume point in a local copy
+			// of the args; the re-schedule paths below keep the original args.
+			$exec_args = $args;
+
+			if ( $job->supports_continuation() ) {
+				unset( $exec_args['__perflocale_slice'] );
+				$exec_args['__perflocale_slice'] = [ 'resume' => $resume ];
 			}
 
 			// Tick-throttle: refresh the lock on a wall-clock cadence so the
@@ -452,10 +494,37 @@ final class WorkerRegistry {
 			// within ~1 progress tick of the operator action.
 			$last_lock_refresh   = time();
 			$lock_refresh_window = max( 30, (int) floor( $lock_ttl / 4 ) );
+			$last_stage          = '';
 
+			// A fatal error or an exit inside execute() skips `finally`; the
+			// shutdown guard then releases both locks and fails the job.
+			// WordPress's fatal error handler is a shutdown function registered
+			// before this one. When it shows its error page (an admin request,
+			// or no output sent yet) it calls wp_die(), and a wp_die handler
+			// that exits, as WP-CLI's does, ends the process before the guard
+			// runs; the page's arguments are filtered just before that call.
+			if ( ! self::$shutdown_registered ) {
+				register_shutdown_function( [ self::class, 'release_on_shutdown' ] );
+				add_filter( 'wp_php_error_args', [ self::class, 'release_before_error_page' ], 10, 1 );
+				self::$shutdown_registered = true;
+			}
+
+			self::$in_execute = [
+				'blog_id'     => function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0,
+				'job_id'      => $job_id,
+				'type'        => $type,
+				'type_locked' => $type_locked,
+			];
+
+			// The progress callback: items done and in total, and an optional
+			// detail. A detail `stage` (a key) with its `label` starts a stage:
+			// its first report appends a log line keyed `stage:<key>`, which
+			// the Jobs page reads as the running job's stage. A detail
+			// `percent` is the job's overall progress when processed / total
+			// count the current stage only.
 			$result = $job->execute(
-				$args,
-				static function ( int $processed, int $total ) use ( $job_id, $type, $type_locked, $lock_ttl, &$last_lock_refresh, $lock_refresh_window ): void {
+				$exec_args,
+				static function ( int $processed, int $total, array $detail = [] ) use ( $job_id, $type, $type_locked, $lock_ttl, &$last_lock_refresh, $lock_refresh_window, &$last_stage ): void {
 					$now = JobState::get_fresh( $job_id );
 
 					// Cancellation check. An operator Cancel (Jobs page / REST /
@@ -478,7 +547,15 @@ final class WorkerRegistry {
 						throw new JobCanceledException( 'Queue paused mid-flight.' );
 					}
 
-					JobState::update_progress( $job_id, $processed, $total );
+					$stage = isset( $detail['stage'] ) ? sanitize_key( (string) $detail['stage'] ) : '';
+
+					if ( $stage !== '' && $stage !== $last_stage ) {
+						$label = isset( $detail['label'] ) ? (string) $detail['label'] : '';
+						JobState::append_log( $job_id, $label !== '' ? $label : $stage, 'stage:' . $stage );
+						$last_stage = $stage;
+					}
+
+					JobState::update_progress( $job_id, $processed, $total, isset( $detail['percent'] ) ? (int) $detail['percent'] : -1 );
 
 					// Refresh the lock on a wall-clock cadence (default: every
 					// TTL/4 seconds). Avoids a DB write per progress tick from
@@ -495,18 +572,63 @@ final class WorkerRegistry {
 				}
 			);
 
-			JobState::mark_complete( $job_id, is_array( $result ) ? $result : [] );
+			// A job may report a run that did nothing but fail with
+			// `run_failed` and a reason in `first_error`. It is recorded as
+			// failed with its result, so the Jobs page offers Retry, and is not
+			// re-run automatically: every item already failed once and was
+			// paid for.
+			$run_failed_reason = is_array( $result ) && ! empty( $result['run_failed'] )
+				? trim( (string) ( $result['first_error'] ?? '' ) )
+				: '';
 
-			/**
-			 * Fires after a background job finishes successfully.
-			 *
-			 * @hook perflocale/jobs/completed
-			 * @param string $job_id Identifier of the completed job.
-			 * @param string $type   Job type slug.
-			 * @param array  $result Result payload (already stored on the job row).
-			 */
-			do_action( 'perflocale/jobs/completed', $job_id, $type, is_array( $result ) ? $result : [] );
+			if ( $job->supports_continuation() && ! empty( $result['__perflocale_continue'] ) ) {
+				// The slice stopped before the last item. The row stays running
+				// with the counts so far and, once they are stored, the job is
+				// scheduled again after both locks are released (below).
+				// Completion is recorded, and its hook fires, once: after the
+				// last slice.
+				unset( $result['__perflocale_continue'] );
 
+				$continue_job = self::store_checkpoint( $job_id, $type, $result );
+			} elseif ( $run_failed_reason !== '' ) {
+				JobState::mark_failed( $job_id, self::redact_paths( $run_failed_reason ) );
+				JobState::record_result( $job_id, $result );
+
+				$stored = JobState::get_fresh( $job_id );
+
+				if ( 'failed' === ( $stored['status'] ?? null ) ) {
+					/** This action is documented in src/Background/WorkerRegistry.php */
+					do_action( 'perflocale/jobs/failed', $job_id, $type, new \RuntimeException( $run_failed_reason ) );
+				}
+			} elseif ( JobState::mark_complete( $job_id, is_array( $result ) ? $result : [] ) ) {
+				/**
+				 * Fires after a background job finishes successfully.
+				 *
+				 * @hook perflocale/jobs/completed
+				 * @param string $job_id Identifier of the completed job.
+				 * @param string $type   Job type slug.
+				 * @param array  $result Result payload (already stored on the job row).
+				 */
+				do_action( 'perflocale/jobs/completed', $job_id, $type, is_array( $result ) ? $result : [] );
+			} else {
+				// The row did not move running -> complete, so the completion
+				// hook must not claim it did. Report what is actually stored.
+				// Never throw from here: the Throwable catch below would mark
+				// the finished work failed and schedule an automatic re-run.
+				$stored        = JobState::get_fresh( $job_id );
+				$stored_status = $stored['status'] ?? null;
+
+				if ( 'canceled' === $stored_status ) {
+					self::report_late_cancel( $job_id, $type, $result );
+				} elseif ( 'running' === $stored_status ) {
+					// The status write itself failed. The row stays running
+					// until the hourly watchdog marks it failed as stalled.
+					JobState::append_log(
+						$job_id,
+						__( 'The work finished, but the job could not be marked complete (the database refused the status update).', 'perflocale' )
+					);
+				}
+			}
 		} catch ( JobCanceledException $e ) {
 			// Two cooperative bails share this sentinel: operator CANCEL
 			// (row status is already 'canceled' — that's how the progress
@@ -522,6 +644,9 @@ final class WorkerRegistry {
 					$job_id,
 					__( 'Worker aborted by operator cancel.', 'perflocale' )
 				);
+
+				// The counts the job reached before the cancel, when it attached them.
+				JobState::record_result( $job_id, $e->get_result() );
 
 				/**
 				 * Fires when a worker aborted itself in response to a cancel.
@@ -581,7 +706,195 @@ final class WorkerRegistry {
 			if ( $type_locked ) {
 				JobLock::release_type( $type );
 			}
+			self::$in_execute = $outer_execute;
 		}
+
+		// After `finally`: a continuation that ran while this worker still held
+		// the per-job lock would take the lock-busy path and wait lock_ttl/4.
+		if ( $continue_job ) {
+			self::schedule_continuation( $job_id, $type, $args, $target_blog );
+		}
+	}
+
+	/**
+	 * Store the counts a slice stopped at on the running row, and say whether
+	 * the next slice may be scheduled.
+	 *
+	 * The next slice resumes from what is stored, so it is scheduled only
+	 * after the write lands. A refused write is tried once more, after a
+	 * fresh read of the row. A cancel found by either read wins, as it does
+	 * at the last progress tick. When the second write is refused too, the
+	 * job is failed with a plain message and nothing is scheduled; if that
+	 * status write is refused as well, the row stays running with no worker
+	 * and the dead-worker check fails it. A row in any other state (failed
+	 * by the watchdog, gone) is left as it is.
+	 *
+	 * @param string               $job_id Job identifier.
+	 * @param string               $type   Job type slug.
+	 * @param array<string, mixed> $result The counts the slice stopped at.
+	 * @return bool Whether the counts are stored and the next slice may run.
+	 */
+	private static function store_checkpoint( string $job_id, string $type, array $result ): bool {
+		for ( $write = 1; $write <= 2; $write++ ) {
+			$stored = JobState::get_fresh( $job_id );
+			$status = $stored['status'] ?? null;
+
+			if ( 'canceled' === $status ) {
+				self::report_late_cancel( $job_id, $type, $result );
+				return false;
+			}
+
+			if ( 'running' !== $status ) {
+				return false;
+			}
+
+			if ( JobState::record_result( $job_id, $result ) ) {
+				return true;
+			}
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic: the jobs table refused the same write twice.
+		error_log( '[PerfLocale] Job ' . $job_id . ': the database refused twice to store the progress of a slice, so the job was stopped and marked failed.' );
+
+		$reason = __( 'The progress of this job could not be saved (the database refused the update), so the job was stopped. Retry it to run it again.', 'perflocale' );
+
+		JobState::mark_failed( $job_id, $reason );
+
+		if ( 'failed' === ( JobState::get_fresh( $job_id )['status'] ?? null ) ) {
+			/** This action is documented in src/Background/WorkerRegistry.php */
+			do_action( 'perflocale/jobs/failed', $job_id, $type, new \RuntimeException( $reason ) );
+		}
+
+		return false;
+	}
+
+	/**
+	 * Schedule the next slice of a job that runs in slices.
+	 *
+	 * Due now, with the args the job was dispatched with: the busy counters
+	 * of an earlier deferral are dropped, so the event has the arg shape the
+	 * runners' cancel and is_scheduled() probes and the Resumer look for, and
+	 * a deferral's backoff does not carry into the next slice.
+	 *
+	 * @param string               $job_id      Job identifier.
+	 * @param string               $type        Job type slug.
+	 * @param array<string, mixed> $args        Worker args (sentinel stripped).
+	 * @param int                  $target_blog Blog ID to re-inject as sentinel (0 on single-site).
+	 * @return void
+	 */
+	private static function schedule_continuation( string $job_id, string $type, array $args, int $target_blog ): void {
+		unset( $args['__perflocale_type_busy_count'], $args['__perflocale_lock_busy_count'] );
+
+		self::schedule_recording_engine(
+			time(),
+			Dispatcher::worker_hook( $type ),
+			self::with_blog_sentinel( $args, $target_blog ),
+			$job_id
+		);
+	}
+
+	/**
+	 * Record an operator cancel that landed after the job's last progress tick.
+	 *
+	 * Cancel wins, as it does when the last tick sees it: the result is not
+	 * recorded, the chunk this execution queued to continue itself is
+	 * canceled, and `perflocale/jobs/canceled` fires.
+	 *
+	 * @param string               $job_id Job identifier.
+	 * @param string               $type   Job type slug.
+	 * @param array<string, mixed> $result The result execute() returned.
+	 * @return void
+	 */
+	private static function report_late_cancel( string $job_id, string $type, array $result ): void {
+		JobState::append_log(
+			$job_id,
+			__( 'Canceled by the operator after the work had finished; the result was not recorded.', 'perflocale' )
+		);
+
+		self::cancel_queued_successor( $job_id, $type, $result );
+
+		/** This action is documented in src/Background/WorkerRegistry.php */
+		do_action( 'perflocale/jobs/canceled', $job_id, $type );
+	}
+
+	/**
+	 * Release the locks of a job whose execute() never returned, and mark the
+	 * job failed.
+	 *
+	 * Registered once per process as a shutdown function. A no-op unless PHP
+	 * stopped inside execute(): a fatal error (memory, execution time) or an
+	 * exit. Switches to the job's blog first. JobLock releases only the values
+	 * this process stamped, so a lock another worker took over stays, and
+	 * JobState::mark_failed() moves only queued or running rows. The stored
+	 * error is the fatal error's message with paths redacted, or a generic
+	 * message when there was no fatal error. A process killed without a
+	 * shutdown (SIGKILL, the kernel's out-of-memory killer) never gets here;
+	 * its locks expire. Also run from {@see release_before_error_page()},
+	 * before WordPress's fatal error page; the record is cleared on the first
+	 * run, so the second does nothing.
+	 *
+	 * @return void
+	 */
+	public static function release_on_shutdown(): void {
+		$record = self::$in_execute;
+
+		if ( null === $record ) {
+			return;
+		}
+
+		self::$in_execute = null;
+		$switched_blog    = false;
+
+		if ( $record['blog_id'] > 0 && function_exists( 'is_multisite' ) && is_multisite()
+			&& $record['blog_id'] !== (int) get_current_blog_id()
+		) {
+			switch_to_blog( $record['blog_id'] );
+			$switched_blog = true;
+		}
+
+		try {
+			JobLock::release( $record['job_id'] );
+
+			if ( $record['type_locked'] ) {
+				JobLock::release_type( $record['type'] );
+			}
+
+			$error   = error_get_last();
+			$message = is_array( $error ) && in_array( $error['type'], self::FATAL_ERROR_TYPES, true )
+				? self::redact_paths( $error['message'] )
+				: '';
+
+			JobState::mark_failed(
+				$record['job_id'],
+				'' !== $message
+					? $message
+					/* translators: Stored as the error of a background job whose PHP process ended while the job was running, without a PHP error. */
+					: __( 'The worker stopped before finishing.', 'perflocale' )
+			);
+		} finally {
+			if ( $switched_blog ) {
+				restore_current_blog();
+			}
+		}
+	}
+
+	/**
+	 * `wp_php_error_args`: run the shutdown guard before WordPress's fatal
+	 * error page calls wp_die(), which ends the process when its handler
+	 * exits (WP-CLI). The arguments are returned unchanged, and a failure
+	 * here does not stop the page.
+	 *
+	 * @param mixed $args wp_die() arguments of the error page.
+	 * @return mixed
+	 */
+	public static function release_before_error_page( mixed $args = [] ): mixed {
+		try {
+			self::release_on_shutdown();
+		} catch ( \Throwable $e ) {
+			unset( $e );
+		}
+
+		return $args;
 	}
 
 	/**
@@ -659,6 +972,68 @@ final class WorkerRegistry {
 				$delay
 			)
 		);
+	}
+
+	/**
+	 * Cancel the job a canceled job queued to continue itself.
+	 *
+	 * A chained job (SiteTranslateJob) enqueues its next chunk before the
+	 * worker records the result, so a cancel that lands in between leaves
+	 * that chunk queued and scheduled. The chunk is named by the result's
+	 * `next_job` key. It is canceled only when it is a different job of the
+	 * same type and `next_duplicate` is explicitly false: a dispatch folded
+	 * into an identical job already in flight belongs to someone else.
+	 *
+	 * Mirrors the REST cancel: the row first, then the worker event and the
+	 * per-job lock; the per-type lock is left to its owner. Never throws, so
+	 * the Throwable catch in the caller cannot misreport the canceled job as
+	 * failed and schedule a retry.
+	 *
+	 * @param string               $job_id Canceled job id.
+	 * @param string               $type   Its job type.
+	 * @param array<string, mixed> $result The result execute() returned.
+	 * @return void
+	 */
+	private static function cancel_queued_successor( string $job_id, string $type, array $result ): void {
+		$next = $result['next_job'] ?? null;
+
+		if ( ! is_string( $next ) || $next === $job_id || ! JobState::is_safe_id( $next )
+			|| false !== ( $result['next_duplicate'] ?? null )
+		) {
+			return;
+		}
+
+		try {
+			$next_state = JobState::get_fresh( $next );
+
+			if ( ! $next_state || ( $next_state['type'] ?? null ) !== $type || ! JobState::cancel( $next ) ) {
+				return;
+			}
+
+			$engine = $next_state['engine'] ?? '';
+			JobRunnerFactory::for_engine( is_string( $engine ) ? $engine : '' )->cancel( $next );
+			JobLock::release( $next );
+
+			JobState::append_log(
+				$next,
+				sprintf(
+					/* translators: %s: id of the canceled job that queued this one. */
+					__( 'Canceled because job %s, which queued this one, was canceled.', 'perflocale' ),
+					$job_id
+				)
+			);
+			JobState::append_log(
+				$job_id,
+				sprintf(
+					/* translators: %s: id of the job this one had queued. */
+					__( 'The job it had queued next (%s) was canceled as well.', 'perflocale' ),
+					$next
+				)
+			);
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic: the successor may still be queued.
+			error_log( '[PerfLocale] could not cancel job ' . $next . ' queued by canceled job ' . $job_id . ': ' . self::redact_paths( $e->getMessage() ) );
+		}
 	}
 
 	/**

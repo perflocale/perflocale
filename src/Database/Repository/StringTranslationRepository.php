@@ -560,4 +560,54 @@ final class StringTranslationRepository {
 
 		return $out;
 	}
+
+	/**
+	 * Upsert many translations with one statement per 200 rows.
+	 *
+	 * The same write as set() for each row (INSERT … ON DUPLICATE KEY UPDATE
+	 * of `translation` only, so extra_forms and the review columns are kept),
+	 * for bulk writers such as the WPML import. Rows with an empty
+	 * translation or a non-positive id are skipped; set() deletes on empty,
+	 * which a bulk writer never asks for.
+	 *
+	 * @param array<int, array{0: int, 1: int, 2: string}> $rows string_id, language_id, translation.
+	 * @return bool False when a statement failed (earlier chunks stay written).
+	 */
+	public function set_many( array $rows ): bool {
+		$rows = array_values(
+			array_filter(
+				$rows,
+				static fn( array $r ): bool => (int) $r[0] > 0 && (int) $r[1] > 0 && (string) $r[2] !== ''
+			)
+		);
+
+		foreach ( array_chunk( $rows, 200 ) as $chunk ) {
+			$values = implode( ',', array_fill( 0, count( $chunk ), '(%d, %d, %s)' ) );
+			$args   = [ $this->table() ];
+
+			foreach ( $chunk as $r ) {
+				$args[] = (int) $r[0];
+				$args[] = (int) $r[1];
+				$args[] = (string) $r[2];
+			}
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $values is a generated placeholder list bound to $args.
+			$result = $this->wpdb->query(
+				$this->wpdb->prepare(
+					"INSERT INTO %i (string_id, language_id, translation)
+					 VALUES {$values}
+					 ON DUPLICATE KEY UPDATE
+						translation = VALUES(translation)",
+					$args
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			if ( $result === false ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
 }

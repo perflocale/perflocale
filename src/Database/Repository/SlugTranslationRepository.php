@@ -175,24 +175,36 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			return null;
 		}
 
-		$result = $this->cache->get(
-			$cache_key,
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			fn() => $this->wpdb->get_var(
-				$this->wpdb->prepare(
-					'SELECT slug FROM %i
-					WHERE object_type = %s AND object_id = %d AND language_id = %d',
-					$this->table(),
-					$object_type,
-					$object_id,
-					$language_id
-				)
-			),
-			HOUR_IN_SECONDS,
-			'perflocale_slugs'
+		$miss   = new \stdClass();
+		$cached = $this->cache->get_cached( $cache_key, 'perflocale_slugs', $miss );
+
+		if ( $cached !== $miss ) {
+			return is_string( $cached ) ? $cached : null;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$result = $this->wpdb->get_var(
+			$this->wpdb->prepare(
+				'SELECT slug FROM %i
+				WHERE object_type = %s AND object_id = %d AND language_id = %d',
+				$this->table(),
+				$object_type,
+				$object_id,
+				$language_id
+			)
 		);
 
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		// A failed read (lost connection, deadlock) answers null like a
+		// missing row; it is returned but not cached, so the next call reads
+		// the row again.
+		if ( '' !== (string) $this->wpdb->last_error ) {
+			return null;
+		}
+
+		$this->cache->set( $cache_key, $result, HOUR_IN_SECONDS, 'perflocale_slugs' );
+
 		return $result;
 	}
 

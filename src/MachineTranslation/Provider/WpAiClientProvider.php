@@ -26,7 +26,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Targets the WP 7.0+ surface — `wp_ai_client_prompt( $prompt )` returns a
  * fluent `WP_AI_Client_Prompt_Builder`, which the wrapper closure inside
  * `resolve_client_callback()` configures (temperature / max tokens /
- * provider / system instruction) and finalises with `->generateText()`.
+ * provider / system instruction / model preference / request timeout) and
+ * finalises with `->generate_text()`.
  *
  * Feature-detected: when `wp_ai_client_prompt()` is absent (WP 6.x), OR
  * `wp_supports_ai()` returns false on this request,
@@ -36,6 +37,44 @@ if ( ! defined( 'ABSPATH' ) ) {
  * `perflocale/mt/wp_ai_client_resolver` filter.
  */
 final class WpAiClientProvider extends AbstractProvider {
+
+	/**
+	 * Default model preference: small, inexpensive models across the common
+	 * providers, in order (OpenAI, then Anthropic, then Google). Handed to
+	 * core's `using_model_preference()`; the first id that a configured
+	 * provider offers wins, and when none is offered core picks its own
+	 * model. Every entry advertises temperature support in its provider's
+	 * model metadata, so none of them drops out of the candidate list while
+	 * the default temperature is sent. Anthropic is listed by alias and by
+	 * dated id because its model list may carry either.
+	 *
+	 * @var list<string>
+	 */
+	private const DEFAULT_MODEL_PREFERENCE = [
+		'gpt-5.4-mini',
+		'gpt-4.1-mini',
+		'gpt-4o-mini',
+		'claude-haiku-4-5',
+		'claude-haiku-4-5-20251001',
+		'gemini-2.5-flash',
+		'gemini-2.5-flash-lite',
+	];
+
+	/**
+	 * Transient holding the last readiness answer, see is_ready_for_text().
+	 * Written with an expiry, so it is never autoloaded.
+	 */
+	private const READY_TRANSIENT = 'perflocale_mt_wp_ai_ready';
+
+	/**
+	 * Routes whose model refused the temperature in this request, keyed by
+	 * blog id and a hash of the provider + model preference. Later calls on
+	 * the same route go out without temperature instead of paying for a
+	 * rejected request first. Per request only.
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $temperature_rejected = [];
 
 	/**
 	 * {@inheritDoc}
@@ -52,16 +91,130 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Available only when the host site has the AI Client API loaded AND a
-	 * provider configured behind it. We can't introspect "is a provider
-	 * configured" without calling the API, so the looser check (function
-	 * exists) is what gates the picker UI; an unconfigured client surfaces
-	 * later as a RuntimeException at translate time.
+	 * Whether the AI Client API is available on this request. Deliberately
+	 * cheap (no model listing): it runs on every get_provider() call. Whether
+	 * a connected provider can actually generate text is
+	 * {@see self::is_ready_for_text()}.
 	 *
 	 * {@inheritDoc}
 	 */
 	public function is_configured(): bool {
 		return $this->resolve_client_callback() !== null;
+	}
+
+	/**
+	 * Whether a connected AI provider can generate text right now.
+	 *
+	 * Stricter than is_configured(): asks core's builder whether any model of a
+	 * configured provider supports text generation and, when the `provider`
+	 * arg names one provider, whether that provider is configured. Core lists
+	 * each provider's models to answer, which is an HTTP request per provider
+	 * on a site without a persistent object cache, so the answer is kept in a
+	 * transient: 10 minutes when ready, 1 minute when not. The stored answer
+	 * is tied to a fingerprint of the registered providers, their connector
+	 * settings and the `provider` arg, so connecting or removing a provider is
+	 * seen on the next call.
+	 *
+	 * Callers are the block editor's asset config, the editor sidebar and Site
+	 * Health (through TranslationService::is_active_provider_ready()). A
+	 * custom resolver (`perflocale/mt/wp_ai_client_resolver`) owns its own
+	 * routing, so it is taken as ready.
+	 *
+	 * @return bool
+	 */
+	public function is_ready_for_text(): bool {
+		if ( $this->custom_resolver() !== null ) {
+			return true;
+		}
+
+		if ( $this->resolve_client_callback() === null ) {
+			return false;
+		}
+
+		$args        = $this->client_args( true );
+		$provider    = isset( $args['provider'] ) && is_string( $args['provider'] ) ? trim( $args['provider'] ) : '';
+		$fingerprint = self::connectors_fingerprint( $provider );
+		$cached      = get_transient( self::READY_TRANSIENT );
+
+		if ( is_array( $cached ) && isset( $cached['f'], $cached['r'] ) && $cached['f'] === $fingerprint ) {
+			return (bool) $cached['r'];
+		}
+
+		$ready = false;
+
+		try {
+			// resolve_client_callback() above has confirmed the AI Client.
+			$builder = self::new_builder( 'Hello' );
+
+			if ( is_object( $builder ) ) {
+				// The snake_case name on core's builder runs wp_supports_ai()
+				// and the wp_ai_client_prevent_prompt policy, as generate_text() does.
+				$check = [ $builder, method_exists( $builder, '__call' ) ? 'is_supported_for_text_generation' : 'isSupportedForTextGeneration' ];
+				$ready = is_callable( $check ) && true === $check();
+			}
+
+			// The support check looks across every provider; a call routed to
+			// one provider also needs that provider to be configured.
+			if ( $ready && $provider !== '' ) {
+				$registry_factory = [ '\WordPress\AiClient\AiClient', 'defaultRegistry' ];
+				$registry         = is_callable( $registry_factory ) ? $registry_factory() : null;
+				$is_configured    = is_object( $registry ) ? [ $registry, 'isProviderConfigured' ] : null;
+				$ready            = is_callable( $is_configured ) && true === $is_configured( $provider );
+			}
+		} catch ( \Throwable $e ) {
+			$ready = false;
+		}
+
+		set_transient(
+			self::READY_TRANSIENT,
+			[
+				'f' => $fingerprint,
+				'r' => $ready ? 1 : 0,
+			],
+			$ready ? 10 * MINUTE_IN_SECONDS : MINUTE_IN_SECONDS
+		);
+
+		return $ready;
+	}
+
+	/**
+	 * Fingerprint of what decides readiness: the providers registered with
+	 * the AI Client, the API key of each wherever core reads it from (the
+	 * `<ID>_API_KEY` environment variable, the constant of the same name and
+	 * core's connector setting `connectors_ai_<id>_api_key`; hashed), and the
+	 * `provider` arg.
+	 *
+	 * @param string $provider Provider id from the args ('' = any).
+	 * @return string
+	 */
+	private static function connectors_fingerprint( string $provider ): string {
+		$parts = [ 'provider' => $provider ];
+
+		$registry_factory = [ '\WordPress\AiClient\AiClient', 'defaultRegistry' ];
+		$registry         = is_callable( $registry_factory ) ? $registry_factory() : null;
+		$list_ids         = is_object( $registry ) ? [ $registry, 'getRegisteredProviderIds' ] : null;
+
+		if ( is_callable( $list_ids ) ) {
+			foreach ( (array) $list_ids() as $id ) {
+				if ( is_string( $id ) && $id !== '' ) {
+					$sanitized = str_replace( '-', '_', $id );
+					// Core's naming for AI connector keys (wp-includes/connectors.php).
+					$key_name = strtoupper( (string) preg_replace( '/([a-z])([A-Z])/', '$1_$2', $sanitized ) ) . '_API_KEY';
+
+					$parts['keys'][ $id ] = md5(
+						(string) wp_json_encode(
+							[
+								getenv( $key_name ),
+								defined( $key_name ) ? constant( $key_name ) : null,
+								get_option( 'connectors_ai_' . $sanitized . '_api_key', '' ),
+							]
+						)
+					);
+				}
+			}
+		}
+
+		return md5( (string) wp_json_encode( $parts ) );
 	}
 
 	/**
@@ -109,41 +262,36 @@ final class WpAiClientProvider extends AbstractProvider {
 		}
 
 		$prompt = $this->build_prompt( $text, $source_lang, $target_lang, $format );
+		$args   = $this->client_args( $fast_fail );
+		$route  = self::route_key( $args );
+
+		// This route's model already refused the temperature in this request:
+		// send without it straight away.
+		if ( isset( self::$temperature_rejected[ $route ] ) ) {
+			unset( $args['temperature'] );
+		}
 
 		try {
-			$result = $client( $prompt, $this->client_args( $fast_fail ) );
+			$result = $client( $prompt, $args );
 		} catch ( \Throwable $e ) {
-			// Record the failure on the breaker BEFORE re-throwing so the
-			// next caller in this request (or shortly after) gets the open
-			// breaker instead of another failing upstream call. Auth errors
-			// trip on the first hit (threshold_override=1) — no number of
-			// retries fixes a bad API key, so the breaker should open fast
-			// and let the operator see it in Site Health.
-			$reason             = self::classify_error( $e );
-			$threshold_override = $reason === 'auth' ? 1 : 0;
-			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, $reason, $threshold_override );
+			// A model that does not take a temperature is not a provider
+			// fault. Some models reject the parameter (HTTP 400, not billed);
+			// when every connected model lacks it, core finds no model at all.
+			// Either way the request is repeated exactly once without the
+			// temperature, and this first rejection is NOT recorded on the
+			// breaker: only the retry's outcome counts.
+			if ( ! isset( $args['temperature'] ) || ! ( self::is_temperature_rejection( $e ) || self::is_no_model_error( $e ) ) ) {
+				$this->fail( $e, $breaker_key );
+			}
 
-			// Mask credential-shaped runs BEFORE the message is surfaced.
-			// This provider bypasses AbstractProvider::make_request(), which is
-			// where every HTTP provider's error body gets masked — so without
-			// this call the raw upstream text is what gets thrown, and for a
-			// background job it is persisted verbatim on the job row that the
-			// Jobs page and the REST detail endpoint render. Real upstreams do
-			// echo key material: OpenAI's 401 reads `Incorrect API key
-			// provided: sk-…`. classify_error() above runs on the RAW message
-			// so redaction can't change the category.
-			$safe_message = self::mask_credentials( $e->getMessage() );
+			self::$temperature_rejected[ $route ] = true;
+			unset( $args['temperature'] );
 
-			throw new \RuntimeException(
-				esc_html(
-					sprintf(
-						/* translators: 1: classified category (auth/rate-limit/transient/unknown), 2: underlying error message */
-						__( 'AI Client translation failed [%1$s]: %2$s', 'perflocale' ),
-						$reason,
-						$safe_message
-					)
-				)
-			);
+			try {
+				$result = $client( $prompt, $args );
+			} catch ( \Throwable $retry_error ) {
+				$this->fail( $retry_error, $breaker_key );
+			}
 		}
 
 		// A returned-without-throwing call is not yet a success: the AI
@@ -163,6 +311,123 @@ final class WpAiClientProvider extends AbstractProvider {
 		$this->track_usage( $text );
 
 		return apply_filters( 'perflocale/machine_translation/result', $translated, $text, $this->get_id() );
+	}
+
+	/**
+	 * Record a failed call on the breaker and throw the surfaced error.
+	 *
+	 * @param \Throwable $e           What the client threw.
+	 * @param string     $breaker_key Breaker key for this provider.
+	 * @return never
+	 *
+	 * @throws \RuntimeException Always.
+	 */
+	private function fail( \Throwable $e, string $breaker_key ): never {
+		// Record the failure on the breaker BEFORE re-throwing so the
+		// next caller in this request (or shortly after) gets the open
+		// breaker instead of another failing upstream call. Auth errors
+		// trip on the first hit (threshold_override=1) — no number of
+		// retries fixes a bad API key, so the breaker should open fast
+		// and let the operator see it in Site Health.
+		$reason             = self::classify_error( $e );
+		$threshold_override = $reason === 'auth' ? 1 : 0;
+		\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, $reason, $threshold_override );
+
+		// An auth failure (a revoked key or approval) makes a cached "ready"
+		// answer wrong: drop it so the next readiness check asks core again.
+		if ( $reason === 'auth' ) {
+			delete_transient( self::READY_TRANSIENT );
+		}
+
+		// Core answers "No models found…" when no connected provider can
+		// generate text; say what to do about it instead.
+		//
+		// Otherwise mask credential-shaped runs BEFORE the message is
+		// surfaced. This provider bypasses AbstractProvider::make_request(),
+		// which is where every HTTP provider's error body gets masked — so
+		// without this call the raw upstream text is what gets thrown, and for
+		// a background job it is persisted verbatim on the job row that the
+		// Jobs page and the REST detail endpoint render. Real upstreams do
+		// echo key material: OpenAI's 401 reads `Incorrect API key
+		// provided: sk-…`. classify_error() above runs on the RAW message
+		// so redaction can't change the category.
+		$safe_message = self::is_no_model_error( $e )
+			? __( 'No AI provider is connected. Connect one under Settings → Connectors.', 'perflocale' )
+			: self::mask_credentials( $e->getMessage() );
+
+		throw new \RuntimeException(
+			esc_html(
+				sprintf(
+					/* translators: 1: classified category (auth/rate-limit/transient/invalid_request/unknown), 2: underlying error message */
+					__( 'AI Client translation failed [%1$s]: %2$s', 'perflocale' ),
+					$reason,
+					$safe_message
+				)
+			)
+		);
+	}
+
+	/**
+	 * Key of a route (blog + provider + model preference) for the
+	 * temperature-rejection memo. Blog-keyed: a per-request memo is shared by
+	 * every blog a multisite request switches to.
+	 *
+	 * @param array<string, mixed> $args Client args.
+	 * @return string
+	 */
+	private static function route_key( array $args ): string {
+		return get_current_blog_id() . '|' . md5( (string) wp_json_encode( [ $args['provider'] ?? '', $args['model'] ?? [] ] ) );
+	}
+
+	/**
+	 * Whether a failed call was the model refusing the temperature parameter.
+	 *
+	 * Matches the provider's HTTP 400/422 answer ("Bad Request (400) -
+	 * Unsupported parameter: 'temperature' is not supported with this
+	 * model.") and the SDK's local check ("The parameter(s) "temperature"
+	 * cannot be combined with reasoning effort…"). The exception code carries
+	 * the HTTP status on the built-in path; a custom resolver throws with code
+	 * 0, so the status is then read from the message. The message may arrive
+	 * HTML-escaped, so it is decoded first. Any other 400 is not a match.
+	 *
+	 * @param \Throwable $e What the client threw.
+	 * @return bool
+	 */
+	public static function is_temperature_rejection( \Throwable $e ): bool {
+		$msg = strtolower( html_entity_decode( $e->getMessage(), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+
+		if ( ! str_contains( $msg, 'temperature' ) ) {
+			return false;
+		}
+
+		$code = (int) $e->getCode();
+
+		if ( 400 === $code || 422 === $code ) {
+			return true;
+		}
+
+		if ( 0 !== $code ) {
+			return false;
+		}
+
+		foreach ( [ '(400)', '(422)', 'unsupported', 'not supported', 'does not support', 'cannot be combined' ] as $needle ) {
+			if ( str_contains( $msg, $needle ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether core found no model able to answer: no provider is connected,
+	 * or no connected model supports what the prompt asks for.
+	 *
+	 * @param \Throwable $e What the client threw.
+	 * @return bool
+	 */
+	public static function is_no_model_error( \Throwable $e ): bool {
+		return str_contains( strtolower( $e->getMessage() ), 'no models found' );
 	}
 
 	/**
@@ -264,21 +529,88 @@ final class WpAiClientProvider extends AbstractProvider {
 			'capability'  => $capability,
 			'temperature' => 0.2,
 			'timeout'     => $fast_fail ? 10 : 60,
+			'model'       => self::DEFAULT_MODEL_PREFERENCE,
 		];
 
 		/**
 		 * Filter the argument array passed to the WordPress AI Client call.
 		 *
-		 * Site owners can route translation to a specific provider/model
-		 * (e.g. `[ 'provider' => 'anthropic', 'model' => 'claude-opus-4-7' ]`),
-		 * adjust temperature, or set timeouts.
+		 * Recognised keys:
+		 * - `model`: a model id (`'gpt-5.4-mini'`) or an ordered list of
+		 *   preferences, each a model id or a `[ provider_id, model_id ]` pair
+		 *   (`[ 'gpt-5.4-mini', [ 'anthropic', 'claude-haiku-4-5' ] ]`). Passed
+		 *   to core's model preference: the first one a connected provider
+		 *   offers is used, otherwise core chooses. The default is a list of
+		 *   small models; `null` or `[]` leaves the choice to core. Entries of
+		 *   any other shape are dropped.
+		 * - `provider`: a provider id, to use only that provider.
+		 * - `temperature`: default 0.2; `null` sends none. A model that does
+		 *   not advertise temperature is not chosen while one is sent, so an
+		 *   explicit `model` of that kind needs `'temperature' => null` too.
+		 *   When a model refuses the temperature, the call is repeated once
+		 *   without it.
+		 * - `max_tokens`, `system_instruction`.
+		 * - `timeout`: seconds for the provider request (10 for editor calls,
+		 *   60 otherwise).
 		 *
 		 * @hook perflocale/mt/wp_ai_client_args
 		 *
 		 * @param array<string, mixed> $args      Default args.
 		 * @param bool                 $fast_fail Whether the caller asked for fast fail.
 		 */
-		return (array) apply_filters( 'perflocale/mt/wp_ai_client_args', $args, $fast_fail );
+		$args = (array) apply_filters( 'perflocale/mt/wp_ai_client_args', $args, $fast_fail );
+
+		$args['model'] = self::normalize_model_preference( $args['model'] ?? null );
+
+		return $args;
+	}
+
+	/**
+	 * Reduce a `model` arg to the entries core's model preference accepts: a
+	 * non-empty model id, or a list of non-empty ids and `[ provider, model ]`
+	 * pairs. Anything else is dropped here, because one invalid entry puts
+	 * core's builder into an error state that fails the whole call.
+	 *
+	 * @param mixed $model Raw `model` arg.
+	 * @return list<string|array{0: string, 1: string}>
+	 */
+	private static function normalize_model_preference( mixed $model ): array {
+		if ( is_string( $model ) ) {
+			$model = trim( $model );
+
+			return $model === '' ? [] : [ $model ];
+		}
+
+		if ( ! is_array( $model ) ) {
+			return [];
+		}
+
+		$preference = [];
+
+		foreach ( $model as $entry ) {
+			if ( is_string( $entry ) ) {
+				$entry = trim( $entry );
+
+				if ( $entry !== '' ) {
+					$preference[] = $entry;
+				}
+
+				continue;
+			}
+
+			if (
+				is_array( $entry )
+				&& array_keys( $entry ) === [ 0, 1 ]
+				&& is_string( $entry[0] )
+				&& is_string( $entry[1] )
+				&& trim( $entry[0] ) !== ''
+				&& trim( $entry[1] ) !== ''
+			) {
+				$preference[] = [ trim( $entry[0] ), trim( $entry[1] ) ];
+			}
+		}
+
+		return $preference;
 	}
 
 	/**
@@ -414,6 +746,30 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
+	 * The custom resolver a site or test installed, or null.
+	 *
+	 * @return null|callable(string, array<string, mixed>): mixed
+	 */
+	private function custom_resolver(): ?callable {
+		/**
+		 * Filter the callable used to invoke the WordPress AI Client.
+		 *
+		 * Return any callable accepting `(string $prompt, array $args)` and
+		 * returning the model output (string, array, or object — the
+		 * response normaliser handles all three). Useful for unit tests,
+		 * custom routing, or as a forward-compatibility shim if core
+		 * renames the API.
+		 *
+		 * @hook perflocale/mt/wp_ai_client_resolver
+		 *
+		 * @param null|callable $resolver Default null (auto-detect).
+		 */
+		$custom = apply_filters( 'perflocale/mt/wp_ai_client_resolver', null );
+
+		return is_callable( $custom ) ? $custom : null;
+	}
+
+	/**
 	 * Locate the runtime that drives this provider, or null when the AI
 	 * Client API isn't available on this WP install.
 	 *
@@ -432,31 +788,19 @@ final class WpAiClientProvider extends AbstractProvider {
 	 *   - `max_tokens`         → `->usingMaxTokens( int )`
 	 *   - `provider`           → `->usingProvider( string )`
 	 *   - `system_instruction` → `->usingSystemInstruction( string )`
+	 *   - `model`              → `->usingModelPreference( ...$preference )`
+	 *   - `timeout`            → `->usingRequestOptions( RequestOptions )`,
+	 *                            when the SDK's RequestOptions class exists
 	 *
-	 * Anything else in `$args` is ignored. `timeout` and `capability` —
-	 * carried in the args for older API shapes — are intentionally NOT
-	 * passed to the builder; the WP 7.0 builder has no equivalent
-	 * properties for them.
+	 * Anything else in `$args` is ignored; `capability` has no builder
+	 * equivalent.
 	 *
-	 * @return null|callable(string, array): string
+	 * @return null|callable(string, array<string, mixed>): mixed
 	 */
 	private function resolve_client_callback(): ?callable {
-		/**
-		 * Filter the callable used to invoke the WordPress AI Client.
-		 *
-		 * Return any callable accepting `(string $prompt, array $args)` and
-		 * returning the model output (string, array, or object — the
-		 * response normaliser handles all three). Useful for unit tests,
-		 * custom routing, or as a forward-compatibility shim if core
-		 * renames the API.
-		 *
-		 * @hook perflocale/mt/wp_ai_client_resolver
-		 *
-		 * @param null|callable $resolver Default null (auto-detect).
-		 */
-		$custom = apply_filters( 'perflocale/mt/wp_ai_client_resolver', null );
+		$custom = $this->custom_resolver();
 
-		if ( is_callable( $custom ) ) {
+		if ( $custom !== null ) {
 			return $custom;
 		}
 
@@ -474,8 +818,8 @@ final class WpAiClientProvider extends AbstractProvider {
 			function_exists( $prompt_fn )
 			&& ( ! function_exists( $supports_fn ) || $supports_fn() )
 		) {
-			return static function ( string $prompt, array $args ) use ( $prompt_fn ): string {
-				$builder = $prompt_fn( $prompt );
+			return static function ( string $prompt, array $args ): string {
+				$builder = self::new_builder( $prompt );
 
 				// Type-narrow for PHPStan + defensive at runtime. The
 				// builder API may evolve in WP 7.x and any non-object
@@ -533,6 +877,29 @@ final class WpAiClientProvider extends AbstractProvider {
 					$apply( $builder, 'usingSystemInstruction', $args['system_instruction'] );
 				}
 
+				// Model preference: variadic, so not routed through $apply. The
+				// entries were validated in client_args(); an invalid one would
+				// put core's builder into its error state.
+				$prefer = [ $builder, 'usingModelPreference' ];
+
+				if ( isset( $args['model'] ) && is_array( $args['model'] ) && $args['model'] !== [] && is_callable( $prefer ) ) {
+					$prefer( ...array_values( $args['model'] ) );
+				}
+
+				// PerfLocale's own request timeout replaces core's default one.
+				$options_class   = '\WordPress\AiClient\Providers\Http\DTO\RequestOptions';
+				$options_factory = [ $options_class, 'fromArray' ];
+
+				if (
+					isset( $args['timeout'] )
+					&& is_numeric( $args['timeout'] )
+					&& (float) $args['timeout'] > 0
+					&& class_exists( $options_class )
+					&& is_callable( $options_factory )
+				) {
+					$apply( $builder, 'usingRequestOptions', $options_factory( [ 'timeout' => (float) $args['timeout'] ] ) );
+				}
+
 				// Call the SNAKE_CASE method. Core's WP_AI_Client_Prompt_Builder
 				// applies wp_supports_ai() and the site-wide
 				// `wp_ai_client_prevent_prompt` policy filter ONLY inside its
@@ -556,8 +923,16 @@ final class WpAiClientProvider extends AbstractProvider {
 					return $result;
 				}
 
+				// The WP_Error carries the HTTP status (core's
+				// exception_to_wp_error()); it travels on as the exception
+				// code, which is_temperature_rejection() reads.
 				if ( $result instanceof \WP_Error ) {
-					throw new \RuntimeException( esc_html( $result->get_error_message() ?: 'wp_ai_client error' ) );
+					$data = $result->get_error_data();
+
+					throw new \RuntimeException(
+						esc_html( $result->get_error_message() ?: 'wp_ai_client error' ),
+						is_array( $data ) && isset( $data['status'] ) && is_numeric( $data['status'] ) ? (int) $data['status'] : 0
+					);
 				}
 
 				throw new \RuntimeException(
@@ -570,12 +945,28 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
+	 * A new core prompt builder for a prompt. Called by name: the AI Client
+	 * exists on WP 7.0+ only, and every caller checks for it first.
+	 *
+	 * @param string $prompt Prompt text.
+	 * @return mixed The builder (an object), as wp_ai_client_prompt() returns it.
+	 */
+	private static function new_builder( string $prompt ): mixed {
+		$prompt_fn = 'wp_ai_client_prompt';
+
+		return $prompt_fn( $prompt );
+	}
+
+	/**
 	 * Classify an upstream AI-client Throwable into a coarse category the
 	 * cron log / Site Health card can act on. Returns one of:
-	 *   - 'auth'      → bad / missing / revoked API key (admin must rotate)
-	 *   - 'rate_limit'→ provider throttled the call (operator can wait)
-	 *   - 'transient' → network / timeout / 5xx (retries help)
-	 *   - 'unknown'   → couldn't classify; surface raw message verbatim
+	 *   - 'auth'            → bad / missing / revoked API key (admin must
+	 *                         rotate), or a connector this plugin has not been
+	 *                         approved to use
+	 *   - 'rate_limit'      → provider throttled the call (operator can wait)
+	 *   - 'transient'       → network / timeout / 5xx (retries help)
+	 *   - 'invalid_request' → the provider refused the request itself (400)
+	 *   - 'unknown'         → couldn't classify; surface raw message verbatim
 	 *
 	 * Heuristic only — every AI provider phrases errors differently. We
 	 * inspect the message + HTTP status hints from `WP_Error`-style codes
@@ -583,7 +974,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * 'unknown' rather than misclassify and mask a real issue.
 	 *
 	 * @param \Throwable $e Original exception from the AI client.
-	 * @return string Category tag (one of: auth, rate_limit, transient, unknown).
+	 * @return string Category tag (one of: auth, rate_limit, transient, invalid_request, unknown).
 	 */
 	public static function classify_error( \Throwable $e ): string {
 		$msg = strtolower( $e->getMessage() );
@@ -599,6 +990,7 @@ final class WpAiClientProvider extends AbstractProvider {
 			|| str_contains( $msg, 'forbidden' )
 			|| str_contains( $msg, ' 401' )
 			|| str_contains( $msg, ' 403' )
+			|| str_contains( $msg, 'not been approved' )
 		) {
 			return 'auth';
 		}
@@ -623,10 +1015,20 @@ final class WpAiClientProvider extends AbstractProvider {
 			|| str_contains( $msg, ' 502' )
 			|| str_contains( $msg, ' 503' )
 			|| str_contains( $msg, ' 504' )
+			|| str_contains( $msg, '(500)' )
+			|| str_contains( $msg, '(502)' )
+			|| str_contains( $msg, '(503)' )
+			|| str_contains( $msg, '(504)' )
+			|| str_contains( $msg, '(529)' )
 			|| str_contains( $msg, 'service unavailable' )
 			|| str_contains( $msg, 'gateway' )
 		) {
 			return 'transient';
+		}
+
+		// The SDK words a client error as "Bad Request (400) - …".
+		if ( str_contains( $msg, '(400)' ) ) {
+			return 'invalid_request';
 		}
 
 		return 'unknown';

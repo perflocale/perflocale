@@ -91,9 +91,10 @@ unset( $perflocale_includes, $perflocale_include );
  * Read the "delete data on uninstall" decision from the CURRENT site's
  * settings. Must run inside the correct blog context on multisite.
  *
- * Delegates so the single-site branch below and the per-blog network sweep
- * in SiteCleanup::purge_network() cannot drift apart on what "delete my
- * data" means. Kept as a function because this file has always exposed it.
+ * Delegates to SiteCleanup::blog_wants_data_deleted(), whose test the
+ * network sweep's per-blog classification applies too, so the two cannot
+ * drift apart on what "delete my data" means. Kept as a function because
+ * this file exposes it.
  *
  * @return bool True if the site opted in to full data deletion.
  */
@@ -153,25 +154,47 @@ if ( is_multisite() ) {
 	// marker itself, so deleting it after an interrupted pass would throw away
 	// the one record of which blogs are still to do.
 	if ( $perflocale_sweep['complete'] ) {
-		foreach ( \PerfLocale\Database\SiteCleanup::NETWORK_OPTIONS as $perflocale_network_option ) {
-			delete_site_option( $perflocale_network_option );
-		}
-		unset( $perflocale_network_option );
+		// Every network of the installation, not only the calling one — see
+		// the method.
+		\PerfLocale\Database\SiteCleanup::purge_network_scope();
 	} else {
 		// Logged unconditionally, not behind WP_DEBUG_LOG: by the time this
 		// happens the plugin's files are about to be deleted, so there is no
 		// UI left to surface it in, and the operator has to act.
+		//
+		// The two causes need different advice. Running out of budget needs
+		// only another pass; a site that FAILED needs its cause fixed first,
+		// or the next pass fails on it again — and under WP-CLI there is no
+		// budget at all, so "ran out of time" would be simply untrue. A pass
+		// that did both gets the failure advice: it is the one that blocks.
+		if ( $perflocale_sweep['list_error'] ) {
+			$perflocale_cause = 'could not read the list of sites';
+			$perflocale_next  = 'The line above has the database error. Once the database is healthy, re-install the plugin and delete it again WITHOUT activating it - the next pass carries on from the last site purged.';
+		} elseif ( $perflocale_sweep['failed'] > 0 ) {
+			$perflocale_cause = sprintf( 'could not purge %d site(s)', $perflocale_sweep['failed'] );
+			$perflocale_next  = 'The lines above name each site and the error. Fix the cause, then re-install the plugin and delete it again WITHOUT activating it - the next pass starts at the first site that failed.';
+		} elseif ( $perflocale_sweep['meta_error'] ) {
+			$perflocale_cause = 'could not delete PerfLocale user preferences';
+			$perflocale_next  = 'Every site is purged; the line above has the database error. Once the database is healthy, re-install the plugin and delete it again WITHOUT activating it - the next pass retries only that step.';
+		} else {
+			$perflocale_cause = 'ran out of execution budget';
+			$perflocale_next  = 'Re-install the plugin and delete it again WITHOUT activating it - the next pass resumes from there. From WP-CLI, `wp plugin uninstall perflocale` finishes it in one pass, because WP-CLI has no execution limit.';
+		}
+
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on the incomplete-uninstall path.
 		error_log(
 			sprintf(
-				'[PerfLocale] uninstall ran out of execution budget: %1$d site(s) purged in this pass, %2$d already done earlier, %3$d of %4$d still holding PerfLocale tables, options and scheduled events (everything above site id %5$d). Re-install the plugin and delete it again WITHOUT activating it - the next pass resumes from there. From WP-CLI, `wp plugin uninstall perflocale` finishes it in one pass, because WP-CLI has no execution limit. Nothing is deleted twice; the resume marker expires after a day, after which a fresh pass starts from the beginning.',
+				'[PerfLocale] uninstall %1$s: %2$d site(s) purged in this pass, %3$d already done earlier, %4$d of %5$d not yet purged. %6$s Nothing is deleted twice; the resume marker expires after a day, after which a fresh pass starts from the beginning.',
+				$perflocale_cause,
 				$perflocale_sweep['purged'],
 				$perflocale_sweep['skipped'],
 				$perflocale_sweep['remaining'],
 				$perflocale_sweep['total'],
-				$perflocale_sweep['last_site_id']
+				$perflocale_next
 			)
 		);
+
+		unset( $perflocale_cause, $perflocale_next );
 	}
 
 	unset( $perflocale_sweep );

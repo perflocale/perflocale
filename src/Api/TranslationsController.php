@@ -305,6 +305,7 @@ final class TranslationsController extends RestController {
 					'source_ids'      => $post_ids,
 					'target_lang_ids' => $lang_ids,
 					'include_meta'    => $include_meta,
+					'trigger'         => 'rest',
 				]
 			);
 		}

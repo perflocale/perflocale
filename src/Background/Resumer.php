@@ -35,6 +35,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  * resolve the engine setting correctly. Doing the resume synchronously
  * inside `Activator::activate()` would risk the container not being
  * ready yet on some early-activation flows.
+ *
+ * A `running` row whose worker lock is still held is skipped, because the
+ * lock may belong to a live worker. When a sweep skips one, it schedules a
+ * single follow-up sweep on the same hook for shortly after the earliest
+ * of those locks expires (see {@see schedule_followup()}), so a worker
+ * that died holding its lock is resumed once the lock lapses instead of
+ * waiting for the watchdog to fail it.
  */
 final class Resumer {
 
@@ -43,6 +50,17 @@ final class Resumer {
 	 * trigger the resume sweep.
 	 */
 	public const HOOK = 'perflocale_resume_jobs';
+
+	/**
+	 * Seconds after a lock's expiry before the follow-up sweep runs, and the
+	 * shortest delay it is ever scheduled with.
+	 */
+	private const FOLLOWUP_MARGIN = 60;
+
+	/**
+	 * Key of the held-lock skip line in a job's log (see note_held_skip()).
+	 */
+	private const HELD_SKIP_KEY = 'resume_held_skip';
 
 	/**
 	 * Scan the active index and re-enqueue every `queued` or `running`
@@ -85,6 +103,10 @@ final class Resumer {
 		// beyond the cap would never be resumed after a deactivate/reactivate.
 		$idx     = JobState::list_resumable();
 		$resumed = 0;
+
+		// Earliest lock expiry among the rows skipped below that still
+		// qualify for a follow-up sweep; 0 = none.
+		$followup_at = 0;
 
 		if ( empty( $idx ) ) {
 			return 0;
@@ -180,15 +202,20 @@ final class Resumer {
 				continue;
 			}
 
-			// A 'running' row whose JobLock is still HELD belongs to a live
+			// A 'running' row whose JobLock is still HELD may belong to a live
 			// worker (it refreshes the lock every TTL/4 via its progress
-			// callback) — resetting + rescheduling here would run a SECOND
-			// worker over the same job concurrently. Leave it; it will finish
-			// and mark_complete normally. A genuinely crashed worker's lock
-			// expires (bounded by get_lock_ttl), after which a later sweep
-			// resumes it cleanly.
-			if ( $status === 'running' && \PerfLocale\Background\JobLock::is_held( (string) $job_id ) ) {
-				JobState::append_log( (string) $job_id, __( 'Resume skipped: worker lock still held.', 'perflocale' ) );
+			// callback), and resetting + rescheduling here would run a SECOND
+			// worker over the same job concurrently. The lock cannot tell a
+			// live owner from a dead one, so leave the row and schedule one
+			// follow-up sweep for after the lock expires: a live worker has
+			// refreshed it by then and is skipped again, a dead one's lock
+			// has lapsed and the row is resumed.
+			if ( $status === 'running' && JobLock::is_held( (string) $job_id ) ) {
+				$expiry = self::note_held_skip( (string) $job_id, $state );
+
+				if ( $expiry > 0 && ( 0 === $followup_at || $expiry < $followup_at ) ) {
+					$followup_at = $expiry;
+				}
 				continue;
 			}
 
@@ -228,7 +255,119 @@ final class Resumer {
 			++$resumed;
 		}
 
+		if ( $followup_at > 0 ) {
+			self::schedule_followup( $followup_at );
+		}
+
 		return $resumed;
+	}
+
+	/**
+	 * Record that a running row was skipped because its lock is held, and
+	 * say whether it still qualifies for a follow-up sweep.
+	 *
+	 * The skip is logged once, not on every follow-up pass: each log write
+	 * bumps `updated_at`, and a row whose lock never lapses (a wedged or
+	 * malformed lock value) must still age into the watchdog's stuck window
+	 * rather than be kept "fresh" by the sweeps themselves. For the same
+	 * reason a row stops qualifying once `updated_at` is older than that
+	 * window: the watchdog then fails it and the follow-up chain ends. A
+	 * live worker keeps `updated_at` current through its progress ticks.
+	 *
+	 * @param string               $job_id Job id.
+	 * @param array<string, mixed> $state  The row as read for this sweep.
+	 * @return int The lock's expiry when the row qualifies, else 0.
+	 */
+	private static function note_held_skip( string $job_id, array $state ): int {
+		$message = __( 'Resume skipped: worker lock still held. The job is checked again after the lock expires; if it is still stuck then, run "wp perflocale jobs resume" or cancel and retry it.', 'perflocale' );
+		$log     = (array) ( $state['log'] ?? [] );
+		$last    = end( $log );
+		$logged  = false;
+
+		// Matched by key, not by text: the line reads differently in another
+		// locale, and a pass that failed to recognise it would log again.
+		if ( ! is_array( $last ) || self::HELD_SKIP_KEY !== ( $last['k'] ?? null ) ) {
+			JobState::append_log( $job_id, $message, self::HELD_SKIP_KEY );
+			$logged = true;
+		}
+
+		$updated = $state['updated_at'] ?? 0;
+
+		if ( ! $logged && time() - ( is_int( $updated ) ? $updated : 0 ) >= self::stuck_after() ) {
+			return 0;
+		}
+
+		// A lock released since is_held() (its worker just finished) reads
+		// as 0; the follow-up then only confirms the row is done.
+		return max( time(), JobLock::expires_at( $job_id ) );
+	}
+
+	/**
+	 * Schedule one follow-up sweep for shortly after `$expiry`.
+	 *
+	 * Deduplicated against any PENDING sweep in either store: a pending one
+	 * runs the same check, and it re-arms itself if a lock is still held.
+	 * An Action Scheduler action that is running right now (this sweep,
+	 * when Action Scheduler fired it) does not count. The delay is at least
+	 * FOLLOWUP_MARGIN and at most the stuck window, so a lock with a
+	 * far-future or corrupt expiry is looked at once more, when the row has
+	 * aged out of note_held_skip() and the watchdog fails it. Uses the event
+	 * shape Activator::activate() uses, so deactivation, an engine change
+	 * and uninstall clear it.
+	 *
+	 * @param int $expiry Earliest expiry among the skipped rows' locks.
+	 * @return void
+	 */
+	private static function schedule_followup( int $expiry ): void {
+		if ( self::followup_pending() ) {
+			return;
+		}
+
+		$delay = max( self::FOLLOWUP_MARGIN, $expiry + self::FOLLOWUP_MARGIN - time() );
+
+		BackgroundEvents::enqueue( self::HOOK, [], min( max( self::FOLLOWUP_MARGIN, self::stuck_after() ), $delay ) );
+	}
+
+	/**
+	 * Seconds without an `updated_at` bump after which the watchdog and the
+	 * daily GC treat a queued or running row as stuck.
+	 *
+	 * @return int
+	 */
+	private static function stuck_after(): int {
+		/** This filter is applied in JobState::gc() and JobState::watchdog(). */
+		$seconds = apply_filters( 'perflocale/jobs/stuck_timeout_seconds', JobState::STUCK_TIMEOUT );
+
+		return is_numeric( $seconds ) ? (int) $seconds : JobState::STUCK_TIMEOUT;
+	}
+
+	/**
+	 * Whether a resume sweep is pending in either store.
+	 *
+	 * Not BackgroundEvents::is_scheduled(): that also answers true for an
+	 * Action Scheduler action in progress, which is this very sweep when
+	 * Action Scheduler runs it. WP-Cron removes an event before running it.
+	 *
+	 * @return bool
+	 */
+	private static function followup_pending(): bool {
+		if ( JobRunnerFactory::action_scheduler_available() && function_exists( 'as_get_scheduled_actions' ) ) {
+			$pending = as_get_scheduled_actions(
+				[
+					'hook'     => self::HOOK,
+					'status'   => 'pending',
+					'group'    => ActionSchedulerRunner::GROUP,
+					'per_page' => 1,
+				],
+				'ids'
+			);
+
+			if ( ! empty( $pending ) ) {
+				return true;
+			}
+		}
+
+		return false !== wp_next_scheduled( self::HOOK );
 	}
 
 	/**

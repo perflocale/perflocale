@@ -27,14 +27,15 @@ final class MultiCurrency {
 	/**
 	 * Cached currency settings.
 	 *
-	 * @var array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool}>|null
+	 * @var array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool, display: string, position: string}>|null
 	 */
 	private ?array $currencies = null;
 
 	/**
-	 * Cached exchange rate for the current request.
+	 * Cached exchange rate for the current language.
 	 *
 	 * Avoids repeated Settings + Router lookups on every convert_price() call.
+	 * Dropped when a rendering window changes the language (forget_rate()).
 	 *
 	 * @var float|null
 	 */
@@ -105,6 +106,11 @@ final class MultiCurrency {
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ $this, 'reset_caches' ] );
 		}
+
+		// The rate memo belongs to the current language. A rendering window
+		// that imposes another language (an order email, with_language())
+		// fires this action when it opens and again when it closes.
+		add_action( 'perflocale/language/overridden', [ $this, 'forget_rate' ], 10, 0 );
 	}
 
 	/**
@@ -116,6 +122,18 @@ final class MultiCurrency {
 	 */
 	public function reset_caches(): void {
 		$this->currencies  = null;
+		$this->cached_rate = null;
+	}
+
+	/**
+	 * Drop the exchange-rate memo. Hooked to `perflocale/language/overridden`
+	 * so a price read inside a language window uses that language's rate,
+	 * and a read after the window the request language's rate again. The
+	 * currency settings stay loaded: they hold every language.
+	 *
+	 * @return void
+	 */
+	public function forget_rate(): void {
 		$this->cached_rate = null;
 	}
 
@@ -257,6 +275,31 @@ final class MultiCurrency {
 	}
 
 	/**
+	 * An amount converted at a rate and rounded to the active price decimals.
+	 *
+	 * An amount above zero converts to at least the smallest unit at those
+	 * decimals. Without that floor a store whose price decimals are 0 (JPY,
+	 * KRW, ...) prices a language at a rate below 1 in whole units, so a
+	 * small price or shipping cost becomes 0 and the item free at any
+	 * quantity. Zero and negative amounts, and every amount that does not
+	 * round to zero, convert as rounded.
+	 *
+	 * @param float $amount Amount in the store's base currency.
+	 * @param float $rate   Exchange rate.
+	 * @return float
+	 */
+	private static function convert_amount( float $amount, float $rate ): float {
+		$decimals  = wc_get_price_decimals();
+		$converted = round( $amount * $rate, $decimals );
+
+		if ( $converted <= 0.0 && $amount > 0.0 && is_int( $decimals ) ) {
+			return 1 / 10 ** $decimals;
+		}
+
+		return $converted;
+	}
+
+	/**
 	 * Convert a product price using the exchange rate for the current language.
 	 *
 	 * WooCommerce may pass null for unset sale prices (get_prop returns null
@@ -277,7 +320,7 @@ final class MultiCurrency {
 			return $price;
 		}
 
-		return (string) round( (float) $price * $rate, wc_get_price_decimals() );
+		return (string) self::convert_amount( (float) $price, $rate );
 	}
 
 	/**
@@ -308,7 +351,7 @@ final class MultiCurrency {
 				continue;
 			}
 
-			$shipping_rate->set_cost( round( (float) $shipping_rate->get_cost() * $rate, wc_get_price_decimals() ) );
+			$shipping_rate->set_cost( self::convert_amount( (float) $shipping_rate->get_cost(), $rate ) );
 
 			$taxes = $shipping_rate->get_taxes();
 
@@ -354,6 +397,10 @@ final class MultiCurrency {
 	 * amount; percentage coupons are proportional to the already-converted line
 	 * totals and must NOT be scaled. The filter receives the coupon's stored
 	 * (base) amount each call and returns base*rate, so there is no accumulation.
+	 *
+	 * A discount takes no floor (convert_amount()): one that rounds to zero
+	 * gives no discount, while a floored one would take the smallest unit off
+	 * a price that convert_amount() floored to that unit and make it free.
 	 *
 	 * @param mixed      $amount Coupon amount.
 	 * @param \WC_Coupon $coupon Coupon.
@@ -448,7 +495,7 @@ final class MultiCurrency {
 			return $price;
 		}
 
-		return (string) round( (float) $price * $rate, wc_get_price_decimals() );
+		return (string) self::convert_amount( (float) $price, $rate );
 	}
 
 	/**
@@ -493,13 +540,52 @@ final class MultiCurrency {
 	}
 
 	/**
+	 * An exchange rate that can price something: a finite number above zero.
+	 *
+	 * @param mixed $raw Rate as stored, submitted or synced.
+	 * @return float|null The rate, or null when it is not usable.
+	 */
+	public static function usable_rate( mixed $raw ): ?float {
+		if ( ! is_int( $raw ) && ! is_float( $raw ) && ! ( is_string( $raw ) && is_numeric( $raw ) ) ) {
+			return null;
+		}
+
+		$rate = (float) $raw;
+
+		return is_finite( $rate ) && $rate > 0 ? $rate : null;
+	}
+
+	/**
+	 * The exchange rate a settings writer stores for one language row.
+	 *
+	 * A submitted rate that is not a finite number above zero is refused: the
+	 * row keeps its stored rate while it stays in the same currency, and
+	 * otherwise gets 1.0, the rate of a row submitted without one. A usable
+	 * rate is stored with the 0.0001 floor.
+	 *
+	 * @param mixed  $raw    Submitted rate.
+	 * @param mixed  $stored The language's stored currency row, if any.
+	 * @param string $code   Currency code stored for the row.
+	 * @return float
+	 */
+	public static function rate_to_store( mixed $raw, mixed $stored, string $code ): float {
+		$rate = self::usable_rate( $raw );
+
+		if ( $rate === null && is_array( $stored ) && strtoupper( (string) ( $stored['currency_code'] ?? '' ) ) === $code ) {
+			$rate = self::usable_rate( $stored['exchange_rate'] ?? null );
+		}
+
+		return max( 0.0001, $rate ?? 1.0 );
+	}
+
+	/**
 	 * Load currency settings.
 	 *
 	 * Reads from `perflocale_settings.wc_currencies` (the canonical
 	 * storage). Returns an empty array when the settings service is
 	 * unavailable — callers downstream gate on emptiness.
 	 *
-	 * @return array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool}>
+	 * @return array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool, display: string, position: string}>
 	 */
 	private function load_currencies(): array {
 		if ( $this->currencies !== null ) {
@@ -555,11 +641,15 @@ final class MultiCurrency {
 
 			$slug_key    = sanitize_key( (string) $slug );
 			$manual_rate = (bool) ( $data['manual_rate'] ?? false );
-			$rate        = (float) ( $data['exchange_rate'] ?? 1.0 );
 			$code        = sanitize_text_field( (string) $data['currency_code'] );
 
+			// A rate that is not a finite number above zero cannot price
+			// anything: a stored one counts as no rate (1.0), a synced one as
+			// no synced rate.
+			$rate = self::usable_rate( $data['exchange_rate'] ?? 1.0 ) ?? 1.0;
+
 			if ( $auto_sync_on && ! $manual_rate && isset( $auto_rates[ $slug_key ] ) ) {
-				$rate = (float) $auto_rates[ $slug_key ];
+				$rate = self::usable_rate( $auto_rates[ $slug_key ] ) ?? $rate;
 			}
 
 			// A language priced in the store's BASE currency is by definition

@@ -17,9 +17,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Wraps the main content with `<div data-nosnippet>` when the current
- * request is serving a default-language post under a non-default-language
- * URL - i.e. the "show_default" branch of `missing_translation_action`.
+ * Wraps the main content with `<div data-nosnippet>` whenever the rendered
+ * singular post's language differs from the URL's language — in practice
+ * the show_default branch of `missing_translation_action`.
  *
  * Without this wrapper, Google happily indexes the default-language text
  * under the non-default URL and shows (say) English snippets in German

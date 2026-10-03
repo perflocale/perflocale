@@ -53,6 +53,11 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                            translated-slug rows the import's sanitizers
  *                            changed because the dispatching user lacks
  *                            `unfiltered_html`.
+ *   - 'not_applied', 'notice' : after a merge of a file that carries
+ *                            configuration, the parts left unapplied
+ *                            (settings, add-on settings, the add-on list,
+ *                            roles) and the sentence that says so; the job's
+ *                            details on PerfLocale → Jobs show both.
  *
  * A bundle the importer refuses on the site-identity gate never becomes a
  * result: `execute()` throws instead, so the job ends `failed` with the

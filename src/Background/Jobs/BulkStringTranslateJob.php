@@ -15,6 +15,7 @@ use PerfLocale\Database\Repository\StringTranslationRepository;
 use PerfLocale\Database\Schema;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
+use PerfLocale\Strings\PluralRules;
 use PerfLocale\Translation\PlaceholderMasker;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -36,12 +37,19 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                          after a fresh scan when nothing is translated
  *                          yet.
  *
- * Provider calls are batched via {@see TranslationService::translate_batch_texts}
- * (one provider request per N strings, not per string). Placeholders
- * (`%s`, `%1$d`, `{var}`, inline `<a>`/`<strong>`) are masked before MT
- * and restored after via {@see PlaceholderMasker}; translations that
- * lose a placeholder are rejected rather than silently shipping a
- * broken string to every page on the site.
+ * With skip-existing (the default), `filter` and `all` select only rows
+ * that still miss a translation in a target language, so repeated runs
+ * work through a table larger than the per-dispatch cap.
+ *
+ * Providers that translate a list in one request are called once per
+ * chunk via {@see TranslationService::translate_batch_texts}; the others
+ * once per string. Tag-free strings are sent and sanitised as plain text,
+ * the rest as HTML. Placeholders (`%s`, `%1$d`, `{var}`, inline
+ * `<a>`/`<strong>`) are masked before MT and restored after via
+ * {@see PlaceholderMasker}; translations that lose a placeholder are
+ * rejected rather than silently shipping a broken string to every page on
+ * the site. Plural rows get every plural form of the target language
+ * (see {@see self::plural_form_texts()}).
  *
  * Source provenance: the translated VALUE goes to `string_translations`
  * (which has no provenance column of its own); the provenance lives on the
@@ -57,6 +65,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * string is therefore healed onto a fresh string-type group at the moment of
  * its first write — never up-front, and never counted as translated when the
  * heal fails. See {@see self::save_translation()}.
+ *
+ * @phpstan-type StringItem array{id: int, row: object, original: string, format: string, texts: array<int, string>, phs: array<int, array<int, string>>, numbers: array<int, int>|null, only: array<int, bool>, token: string}
  */
 final class BulkStringTranslateJob extends AbstractJob {
 
@@ -84,11 +94,12 @@ final class BulkStringTranslateJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Same cap the per-row MT endpoint gates on, so the worker re-check
-	 * inside the job pipeline matches the dispatch-side gate.
+	 * The capability post bulk machine translation requires: a bulk run can
+	 * overwrite every string translation on the site. The REST route also
+	 * requires `perflocale_use_mt`.
 	 */
 	public function get_required_capability(): string {
-		return 'perflocale_use_mt';
+		return 'perflocale_manage_translations';
 	}
 
 	/**
@@ -118,9 +129,9 @@ final class BulkStringTranslateJob extends AbstractJob {
 	/**
 	 * Resolve how many strings this dispatch will touch, without actually
 	 * loading their rows. Used by args_size() pre-dispatch and by execute()
-	 * to bound the work it'll do post-dispatch.
+	 * to report the rows left beyond the per-dispatch cap.
 	 *
-	 * @param array<string, mixed> $args
+	 * @param array<string, mixed> $args Dispatch args.
 	 * @return int
 	 */
 	private function resolve_string_count( array $args ): int {
@@ -135,15 +146,21 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 		$repo = new StringRepository( Plugin::get_instance()->get( 'cache' ) );
 
-		if ( $mode === 'all' ) {
-			return $repo->count();
-		}
+		return $repo->count( $this->selection_filter( $args ) );
+	}
 
-		if ( $mode === 'filter' ) {
-			return $repo->count( $this->normalize_filter( $args ) );
-		}
-
-		return 0;
+	/**
+	 * Resolve the string IDs a dispatch with these args WOULD translate —
+	 * public so the pre-dispatch budget gate and the /machine-translate/estimate
+	 * endpoint can estimate cost with the job's exact selection semantics
+	 * (mode=ids|filter|all, the skip-existing selection and the per-dispatch
+	 * cap). Read-only.
+	 *
+	 * @param array<string, mixed> $args Dispatch args.
+	 * @return int[] String row IDs.
+	 */
+	public function resolve_ids_for_estimate( array $args ): array {
+		return $this->resolve_string_ids( $args );
 	}
 
 	/**
@@ -154,22 +171,14 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * works on the admin page (domain, context, search + search_mode,
 	 * status, language_id) behaves identically here — no SQL drift.
 	 *
-	 * @param array<string, mixed> $args
-	 * @return int[]
-	 */
-	/**
-	 * Resolve the string IDs a dispatch with these args WOULD translate —
-	 * public so the pre-dispatch budget gate and the /machine-translate/estimate
-	 * endpoint can estimate cost with the job's exact selection semantics
-	 * (mode=ids|filter|all, including the per-dispatch cap). Read-only.
+	 * With skip-existing (the default) `all` and `filter` select only rows
+	 * that still miss a translation in at least one target language, so each
+	 * run advances past the rows the previous run translated. Overwrite runs
+	 * select the first rows in table order.
 	 *
 	 * @param array<string, mixed> $args Dispatch args.
-	 * @return int[] String row IDs.
+	 * @return int[]
 	 */
-	public function resolve_ids_for_estimate( array $args ): array {
-		return $this->resolve_string_ids( $args );
-	}
-
 	private function resolve_string_ids( array $args ): array {
 		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'ids';
 		$cap  = (int) apply_filters( 'perflocale/mt/bulk_string_max_per_dispatch', self::MAX_STRINGS_PER_DISPATCH );
@@ -180,12 +189,11 @@ final class BulkStringTranslateJob extends AbstractJob {
 			return array_slice( $ids, 0, $cap );
 		}
 
-		$repo   = new StringRepository( Plugin::get_instance()->get( 'cache' ) );
-		$filter = $mode === 'filter' ? $this->normalize_filter( $args ) : [];
+		$repo = new StringRepository( Plugin::get_instance()->get( 'cache' ) );
 
 		$rows = $repo->find_all(
 			array_merge(
-				$filter,
+				$this->selection_filter( $args ),
 				[
 					'limit'  => $cap,
 					'offset' => 0,
@@ -194,6 +202,26 @@ final class BulkStringTranslateJob extends AbstractJob {
 		);
 
 		return array_values( array_map( static fn( $r ): int => (int) $r->id, $rows ) );
+	}
+
+	/**
+	 * StringRepository filter for the `all` and `filter` modes.
+	 *
+	 * @param array<string, mixed> $args Dispatch args.
+	 * @param bool                 $with_missing Add the skip-existing selection (rows still missing a target translation).
+	 * @return array<string, mixed>
+	 */
+	private function selection_filter( array $args, bool $with_missing = true ): array {
+		$filter = ( ( $args['mode'] ?? '' ) === 'filter' ) ? $this->normalize_filter( $args ) : [];
+
+		$skip_existing = isset( $args['skip_existing'] ) ? (bool) $args['skip_existing'] : true;
+		$targets       = array_values( array_filter( wp_parse_id_list( (array) ( $args['target_lang_ids'] ?? [] ) ) ) );
+
+		if ( $with_missing && $skip_existing && $targets !== [] ) {
+			$filter['missing_translation_language_ids'] = $targets;
+		}
+
+		return $filter;
 	}
 
 	/**
@@ -216,12 +244,47 @@ final class BulkStringTranslateJob extends AbstractJob {
 	}
 
 	/**
+	 * Why a dispatch selected no rows.
+	 *
+	 * @param array<string, mixed> $args Dispatch args.
+	 * @return string
+	 */
+	private function nothing_selected_reason( array $args ): string {
+		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'ids';
+
+		if ( $mode !== 'ids' ) {
+			$filter = $this->selection_filter( $args );
+
+			if ( isset( $filter['missing_translation_language_ids'] ) ) {
+				$repo = new StringRepository( Plugin::get_instance()->get( 'cache' ) );
+
+				if ( $repo->count( $this->selection_filter( $args, false ) ) > 0 ) {
+					return __( 'Every selected string already has a translation in the chosen languages.', 'perflocale' );
+				}
+			}
+		}
+
+		return __( 'No matching strings to translate.', 'perflocale' );
+	}
+
+	/**
 	 * Execute the bulk translation.
+	 *
+	 * Providers that translate a whole list in one request (DeepL, Google,
+	 * Microsoft) get one call per chunk and destination format. Every other
+	 * provider (the WordPress AI Client, LibreTranslate, providers built on
+	 * AbstractProvider's per-text loop) is called once per string: a failure
+	 * then fails that string only, and a cancel lands before the next string.
+	 *
+	 * A run in which nothing was translated and something failed (or the
+	 * provider's breaker stopped it) returns `run_failed => true`, which the
+	 * worker records as a failed job, retryable from the Jobs page.
 	 *
 	 * @param array<string, mixed> $args
 	 * @param callable             $progress
 	 * @return array<string, mixed>
-	 * @throws \RuntimeException When the active MT provider returns an unrecoverable error mid-batch.
+	 * @throws \RuntimeException When machine translation is disabled or no default language is configured.
+	 * @throws \PerfLocale\Background\JobCanceledException When the operator cancels or pauses; it carries the counts so far.
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$target_lang_ids = array_values( array_filter( array_map( 'intval', (array) ( $args['target_lang_ids'] ?? [] ) ) ) );
@@ -229,19 +292,19 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$skip_existing   = isset( $args['skip_existing'] ) ? (bool) $args['skip_existing'] : true;
 
 		if ( $target_lang_ids === [] ) {
-			return $this->empty_result( 'No target languages provided.' );
+			return $this->empty_result( __( 'No target languages provided.', 'perflocale' ) );
 		}
 
 		$string_ids = $this->resolve_string_ids( $args );
 		if ( $string_ids === [] ) {
-			return $this->empty_result( 'No matching strings to translate.' );
+			return $this->empty_result( $this->nothing_selected_reason( $args ) );
 		}
 
 		// Surface (never silently swallow) any rows beyond the per-dispatch
 		// cap. resolve_string_ids() truncates to MAX_STRINGS_PER_DISPATCH; if
-		// the filter/all set actually matched more, report the shortfall in the
-		// result so the operator knows to re-run rather than assuming the whole
-		// set was translated.
+		// the selection actually matched more, report how many are left so the
+		// operator knows to re-run rather than assuming the whole set was
+		// translated.
 		$cap     = (int) apply_filters( 'perflocale/mt/bulk_string_max_per_dispatch', self::MAX_STRINGS_PER_DISPATCH );
 		$dropped = 0;
 		if ( count( $string_ids ) >= $cap ) {
@@ -271,9 +334,10 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 		$service = new TranslationService( $settings, $cache );
 
-		$string_repo      = new StringRepository( $cache );
 		$translation_repo = new StringTranslationRepository( $cache );
 		$group_repo       = new \PerfLocale\Database\Repository\TranslationGroupRepository( $cache );
+
+		$per_string = ! $this->provider_batches_natively( $service, $provider_id );
 
 		// Bulk-load every source row once. resolve_string_ids() has already
 		// bounded the set to MAX_STRINGS_PER_DISPATCH so the SELECT-IN
@@ -294,6 +358,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$already_translated = 0;
 		$failed             = 0;
 		$first_error        = '';
+		$breaker_stopped    = false;
 
 		// Throttle progress to ~100 callbacks total — see BulkTranslateJob
 		// for the rationale; same shape. Count-based AND wall-clock-based: the
@@ -302,6 +367,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 		// under a rate-limited provider — a pure count-based gap (total/100) can
 		// then exceed the 1800s lock TTL and let a second same-type job reclaim
 		// the type lock mid-run. One microtime comparison per chunk is the cost.
+		// Per-string mode calls $progress directly after every provider call
+		// instead, so a cancel lands before the next string is sent.
 		$tick_every   = max( 1, (int) floor( $total / 100 ) );
 		$last_tick    = -1;
 		$last_tick_at = microtime( true );
@@ -320,239 +387,734 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$tick( 0 );
 
 		// try/finally: the $tick()/$progress() callbacks THROW JobCanceledException
-	// when the operator cancels — without the finally, a cancel at e.g. 80%
-	// skipped the post-loop cache sync below, leaving every ALREADY-translated
-	// string invisible on the front end until the cache expired on its own.
-	try {
-	foreach ( $target_lang_ids as $target_lang_id ) {
-			$target_lang = $lang_by_id[ $target_lang_id ] ?? null;
-			if ( $target_lang === null ) {
-				$processed += count( $string_ids );
-				$failed    += count( $string_ids );
-				if ( $first_error === '' ) {
-					$first_error = 'Unknown target language id: ' . (int) $target_lang_id;
-				}
-				$tick( $processed );
-				continue;
-			}
-
-			$target_lang_slug = (string) $target_lang->slug;
-
-			// Walk the ID list in BATCH_SIZE chunks. Each chunk is one
-			// provider call.
-			foreach ( array_chunk( $string_ids, self::BATCH_SIZE ) as $chunk_ids ) {
-				$batch_inputs     = []; // batch index → masked source text.
-				$batch_string_ids = []; // batch index → string ID.
-				$batch_phs        = []; // batch index → list of placeholder tokens.
-
-				// Prefetch existing translations for the whole chunk in ONE
-				// query (was one get() per string). Missing key === no/empty
-				// translation === translatable, matching get()==='' semantics.
-				$existing_for_chunk = $skip_existing
-					? $translation_repo->get_many( $chunk_ids, (int) $target_lang->id )
-					: [];
-
-				foreach ( $chunk_ids as $sid ) {
-					$row = $strings_by_id[ $sid ] ?? null;
-					if ( ! $row ) {
-						++$skipped;
-						++$processed;
-						continue;
-					}
-
-					// Skip rule: existing non-empty translation for this
-					// (string, target language) — never overwrite a
-					// human-edited translation with MT output.
-					if ( $skip_existing && ( $existing_for_chunk[ (int) $row->id ] ?? '' ) !== '' ) {
-						++$skipped;
-						++$already_translated;
-						++$processed;
-						continue;
-					}
-
-					$source = (string) $row->original;
-					if ( trim( $source ) === '' ) {
-						++$skipped;
-						++$processed;
-						continue;
-					}
-
-					[ $masked, $phs ] = PlaceholderMasker::mask( $source );
-
-					$batch_inputs[]     = $masked;
-					$batch_string_ids[] = (int) $row->id;
-					$batch_phs[]        = $phs;
-				}
-
-				if ( $batch_inputs === [] ) {
-					$tick( $processed );
-					continue;
-				}
-
-				// One provider call per batch.
-				try {
-					$results = $service->translate_batch_texts(
-						$batch_inputs,
-						$source_lang_slug,
-						$target_lang_slug,
-						$provider_id,
-						/* fast_fail */ false
-					);
-				} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
-					// Provider breaker tripped mid-run: every remaining call
-					// would throw instantly. Abort so the un-attempted strings
-					// stay untranslated (not failed) for a later re-run, rather
-					// than the generic catch below flooding them all as failures.
+		// when the operator cancels — without the finally, a cancel at e.g. 80%
+		// skipped the post-loop cache sync below, leaving every ALREADY-translated
+		// string invisible on the front end until the cache expired on its own.
+		try {
+			foreach ( $target_lang_ids as $target_lang_id ) {
+				$target_lang = $lang_by_id[ $target_lang_id ] ?? null;
+				if ( $target_lang === null ) {
+					$processed += count( $string_ids );
+					$failed    += count( $string_ids );
 					if ( $first_error === '' ) {
-						$first_error = $e->getMessage();
-					}
-					break 2;
-				} catch ( \Throwable $e ) {
-					$failed    += count( $batch_inputs );
-					$processed += count( $batch_inputs );
-					if ( $first_error === '' ) {
-						$first_error = $e->getMessage();
+						$first_error = sprintf(
+							/* translators: %d: language ID. */
+							__( 'Unknown target language id: %d', 'perflocale' ),
+							(int) $target_lang_id
+						);
 					}
 					$tick( $processed );
 					continue;
 				}
 
-				// Per-batch-entry post-processing: restore placeholders,
-				// verify integrity, persist.
-				foreach ( $batch_inputs as $i => $_input ) {
-					$string_id         = $batch_string_ids[ $i ] ?? 0;
-					$phs               = $batch_phs[ $i ] ?? [];
-					$row               = $strings_by_id[ $string_id ] ?? null;
-					$translated_masked = (string) ( $results[ $i ] ?? '' );
+				$target_lang_slug = (string) $target_lang->slug;
+				$target_vars      = is_object( $target_lang ) ? get_object_vars( $target_lang ) : [];
+				$target_locale    = is_string( $target_vars['locale'] ?? null ) && $target_vars['locale'] !== '' ? $target_vars['locale'] : $target_lang_slug;
 
-					if ( ! $row || $translated_masked === '' ) {
-						++$failed;
-						++$processed;
-						if ( $first_error === '' ) {
-							$first_error = 'Empty translation returned for string #' . $string_id;
+				// Walk the ID list in BATCH_SIZE chunks.
+				foreach ( array_chunk( $string_ids, self::BATCH_SIZE ) as $chunk_ids ) {
+					$items = [];
+
+					// Prefetch existing translations for the whole chunk in ONE
+					// query (was one get() per string). Missing key === no/empty
+					// translation === translatable, matching get()==='' semantics.
+					$existing_for_chunk = $skip_existing
+						? $translation_repo->get_many( $chunk_ids, (int) $target_lang->id )
+						: [];
+
+					foreach ( $chunk_ids as $sid ) {
+						$row = $strings_by_id[ $sid ] ?? null;
+						if ( ! $row ) {
+							++$skipped;
+							++$processed;
+							continue;
 						}
+
+						// Skip rule: existing non-empty translation for this
+						// (string, target language) — never overwrite a
+						// human-edited translation with MT output.
+						if ( $skip_existing && ( $existing_for_chunk[ (int) $row->id ] ?? '' ) !== '' ) {
+							++$skipped;
+							++$already_translated;
+							++$processed;
+							continue;
+						}
+
+						if ( trim( (string) $row->original ) === '' ) {
+							++$skipped;
+							++$processed;
+							continue;
+						}
+
+						$items[] = self::build_item( $row, $target_locale );
+					}
+
+					if ( $items === [] ) {
+						$tick( $processed );
 						continue;
 					}
 
-					$translated_text = PlaceholderMasker::restore( $translated_masked, $phs );
+					if ( $per_string ) {
+						foreach ( $items as $item ) {
+							try {
+								$outputs = $service->translate_batch_texts( $item['texts'], $source_lang_slug, $target_lang_slug, $provider_id, false, $item['format'] );
+							} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
+								// Provider breaker tripped: every further call would
+								// throw instantly. Stop, leaving the un-attempted
+								// strings untranslated (not failed) for a re-run.
+								if ( $first_error === '' ) {
+									$first_error = $e->getMessage();
+								}
+								$breaker_stopped = true;
+								break 3;
+							} catch ( \Throwable $e ) {
+								++$failed;
+								++$processed;
+								if ( $first_error === '' ) {
+									$first_error = $e->getMessage();
+								}
+								$progress( $processed, $total );
+								continue;
+							}
 
-					// Integrity gate: reject translations that lost a
-					// placeholder. Better to mark the row failed than to
-					// ship a malformed gettext string to every visitor.
-					if ( ! PlaceholderMasker::preserves_placeholders( (string) $row->original, $translated_text ) ) {
-						++$failed;
-						++$processed;
-						if ( $first_error === '' ) {
-							$first_error = sprintf(
-								'Translation for string #%d dropped a placeholder; rejected.',
-								$string_id
-							);
-						}
-						continue;
-					}
-
-					// Persist the pair. save_translation() repairs a string whose
-					// group_id cannot legally carry a link BEFORE it writes
-					// anything, and writes the link before the value, so a row
-					// this job counts as translated is a row the front end can
-					// actually serve. Anything it could not complete comes back
-					// as an operator-facing reason and the row is counted failed
-					// — a job that spends money must not report an attempt as a
-					// success. See the method for the ordering rules.
-					$save_error = $this->save_translation(
-						$group_repo,
-						$translation_repo,
-						$row,
-						(int) $target_lang->id,
-						$translated_text
-					);
-
-					if ( $save_error !== '' ) {
-						++$failed;
-						++$processed;
-
-						if ( $first_error === '' ) {
-							$first_error = $save_error;
+							$this->settle_item( $group_repo, $translation_repo, $item, $outputs, $target_lang_id, $translated, $failed, $processed, $first_error );
+							$progress( $processed, $total );
 						}
 
 						continue;
 					}
 
-					++$translated;
+					// One provider call per destination format for the chunk.
+					$keys_by_format = [];
+					foreach ( $items as $k => $item ) {
+						$keys_by_format[ $item['format'] ][] = $k;
+					}
 
-					/**
-					 * Fires after each successful string MT save. Lets
-					 * 3rd-party code mark the row, trigger review
-					 * workflows, etc.
-					 *
-					 * @hook  perflocale/mt/string_translated
-					 * @param int    $string_id
-					 * @param int    $target_lang_id
-					 * @param string $translation
-					 * @param string $source
-					 */
-					do_action(
-						'perflocale/mt/string_translated',
-						$string_id,
-						(int) $target_lang->id,
-						$translated_text,
-						(string) $row->original
-					);
+					foreach ( $keys_by_format as $format => $keys ) {
+						$flat   = [];
+						$slices = [];
+						foreach ( $keys as $k ) {
+							$slices[ $k ] = [ count( $flat ), count( $items[ $k ]['texts'] ) ];
+							foreach ( $items[ $k ]['texts'] as $text ) {
+								$flat[] = $text;
+							}
+						}
 
-					++$processed;
+						try {
+							$results = $service->translate_batch_texts( $flat, $source_lang_slug, $target_lang_slug, $provider_id, false, (string) $format );
+						} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
+							if ( $first_error === '' ) {
+								$first_error = $e->getMessage();
+							}
+							$breaker_stopped = true;
+							break 3;
+						} catch ( \Throwable $e ) {
+							// The whole request failed: every string in it was attempted.
+							$failed    += count( $keys );
+							$processed += count( $keys );
+							if ( $first_error === '' ) {
+								$first_error = $e->getMessage();
+							}
+							continue;
+						}
+
+						foreach ( $keys as $k ) {
+							$this->settle_item( $group_repo, $translation_repo, $items[ $k ], array_slice( $results, $slices[ $k ][0], $slices[ $k ][1] ), $target_lang_id, $translated, $failed, $processed, $first_error );
+						}
+					}
+
+					$tick( $processed );
+				}
+			}
+
+			// Final tick — ensures the UI sees 100% even when total isn't
+			// divisible by tick_every. Can throw on cancel too — the finally still runs.
+			$progress( $processed, $total );
+		} catch ( \PerfLocale\Background\JobCanceledException $e ) {
+			// The worker stores these counts on the canceled job.
+			$e->set_result( $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, false ) );
+			throw $e;
+		} finally {
+			// Runs on normal completion AND on cancel/exception: saving via the
+			// repository skips the cache invalidation the
+			// single-string admin path performs, so bust the per-language bulk
+			// translation cache here — otherwise the new strings stay invisible on
+			// the front end until the cache expires. In files mode also regenerate
+			// the `*.l10n.php` files, which are the source of truth there.
+			if ( $translated > 0 || $already_translated > 0 ) {
+				foreach ( $target_lang_ids as $tlid ) {
+					$cache->delete( "all_string_translations_{$tlid}", 'perflocale_strings' );
 				}
 
-				$tick( $processed );
+				if ( (string) $settings->get( 'string_translation_mode', '' ) === 'files' ) {
+					set_transient( 'perflocale_strings_regenerating', 1, 5 * MINUTE_IN_SECONDS );
+					/** @hook perflocale/strings/regenerate_files Regenerate the files-mode translation files after bulk string MT. */
+					do_action( 'perflocale/strings/regenerate_files', $cache );
+				}
+
+				/**
+				 * Fires after a bulk string-translation job changes the
+				 * `string_translations` table — parity with the admin Strings
+				 * save (AdminController) and PO import (PoSync) paths so addons
+				 * that derive state from strings (e.g. per-language bundles)
+				 * invalidate it after bulk MT too.
+				 *
+				 * @hook perflocale/strings/changed
+				 *
+				 * @param string $origin What changed the strings ('bulk_mt').
+				 */
+				do_action( 'perflocale/strings/changed', 'bulk_mt' );
 			}
 		}
 
-		// Final tick — ensures the UI sees 100% even when total isn't
-		// divisible by tick_every. Can throw on cancel too — the finally still runs.
-		$progress( $processed, $total );
-	} finally {
-		// Runs on normal completion AND on cancel/exception: saving via the
-		// repository skips the cache invalidation the
-		// single-string admin path performs, so bust the per-language bulk
-		// translation cache here — otherwise the new strings stay invisible on
-		// the front end until the cache expires. In files mode also regenerate
-		// the `*.l10n.php` files, which are the source of truth there.
-		if ( $translated > 0 || $already_translated > 0 ) {
-			foreach ( $target_lang_ids as $tlid ) {
-				$cache->delete( "all_string_translations_{$tlid}", 'perflocale_strings' );
-			}
+		$run_failed = $translated === 0 && ( $failed > 0 || $breaker_stopped ) && $first_error !== '';
 
-			if ( (string) $settings->get( 'string_translation_mode', '' ) === 'files' ) {
-				set_transient( 'perflocale_strings_regenerating', 1, 5 * MINUTE_IN_SECONDS );
-				/** @hook perflocale/strings/regenerate_files Regenerate the files-mode translation files after bulk string MT. */
-				do_action( 'perflocale/strings/regenerate_files', $cache );
-			}
-
-			/**
-			 * Fires after a bulk string-translation job changes the
-			 * `string_translations` table — parity with the admin Strings
-			 * save (AdminController) and PO import (PoSync) paths so addons
-			 * that derive state from strings (e.g. the Visual Editor's
-			 * per-language bundles) invalidate it after bulk MT too.
-			 *
-			 * @hook perflocale/strings/changed
-			 *
-			 * @param string $origin What changed the strings ('bulk_mt').
-			 */
-			do_action( 'perflocale/strings/changed', 'bulk_mt' );
-		}
+		return $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $run_failed );
 	}
 
-		return [
+	/**
+	 * Apply one item's provider answer and update the run's counters.
+	 *
+	 * @param \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo       Group/link repository.
+	 * @param StringTranslationRepository                                $translation_repo Value repository.
+	 * @param array<string, mixed>                                       $item             From build_item().
+	 * @phpstan-param StringItem $item
+	 * @param string[]                                                   $outputs          Provider answers, parallel to the item's texts.
+	 * @param int                                                        $language_id      Target language id.
+	 * @param int                                                        $translated       Saved count (by ref).
+	 * @param int                                                        $failed           Failed count (by ref).
+	 * @param int                                                        $processed        Processed count (by ref).
+	 * @param string                                                     $first_error      First failure reason (by ref).
+	 * @return void
+	 */
+	private function settle_item(
+		\PerfLocale\Database\Repository\TranslationGroupRepository $group_repo,
+		StringTranslationRepository $translation_repo,
+		array $item,
+		array $outputs,
+		int $language_id,
+		int &$translated,
+		int &$failed,
+		int &$processed,
+		string &$first_error
+	): void {
+		$outcome = $this->persist_item( $group_repo, $translation_repo, $item, $outputs, $language_id );
+
+		++$processed;
+
+		if ( $outcome['error'] !== '' && $first_error === '' ) {
+			$first_error = $outcome['error'];
+		}
+
+		if ( ! $outcome['saved'] ) {
+			++$failed;
+			return;
+		}
+
+		++$translated;
+
+		/**
+		 * Fires after each successful string MT save. Lets
+		 * 3rd-party code mark the row, trigger review
+		 * workflows, etc.
+		 *
+		 * @hook  perflocale/mt/string_translated
+		 * @param int    $string_id
+		 * @param int    $target_lang_id
+		 * @param string $translation
+		 * @param string $source
+		 */
+		do_action(
+			'perflocale/mt/string_translated',
+			$item['id'],
+			$language_id,
+			$outcome['translation'],
+			$item['original']
+		);
+	}
+
+	/**
+	 * The result array execute() returns.
+	 *
+	 * @param int    $total       Rows × targets.
+	 * @param int    $translated  Saved.
+	 * @param int    $skipped     Skipped (already translated, blank, missing row).
+	 * @param int    $failed      Attempted and failed.
+	 * @param int    $targets     Target language count.
+	 * @param int    $capped      Rows still missing beyond the per-dispatch cap.
+	 * @param string $first_error First failure reason.
+	 * @param bool   $run_failed  Nothing was translated and the run failed.
+	 * @return array<string, mixed>
+	 */
+	private function run_result( int $total, int $translated, int $skipped, int $failed, int $targets, int $capped, string $first_error, bool $run_failed ): array {
+		$result = [
 			'total'       => $total,
 			'translated'  => $translated,
 			'skipped'     => $skipped,
 			'failed'      => $failed,
-			'targets'     => count( $target_lang_ids ),
-			'capped'      => $dropped,
+			'targets'     => $targets,
+			'capped'      => $capped,
 			'first_error' => $first_error,
+		];
+
+		if ( $run_failed ) {
+			$result['run_failed'] = true;
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Whether the provider translates a list in one request.
+	 *
+	 * AbstractProvider::translate_batch() loops translate() text by text, so a
+	 * provider that inherits it gains nothing from a chunk call and loses the
+	 * already-paid texts when one text fails.
+	 *
+	 * @param TranslationService $service     Service.
+	 * @param string             $provider_id Provider id ('' = configured).
+	 * @return bool
+	 */
+	private function provider_batches_natively( TranslationService $service, string $provider_id ): bool {
+		try {
+			$provider = $service->get_provider( $provider_id );
+			$method   = new \ReflectionMethod( $provider, 'translate_batch' );
+		} catch ( \Throwable $e ) {
+			unset( $e );
+			// The chunk call reports the provider error for every row, as before.
+			return true;
+		}
+
+		return $method->getDeclaringClass()->getName() !== \PerfLocale\MachineTranslation\AbstractProvider::class;
+	}
+
+	/**
+	 * Build the provider input for one string row.
+	 *
+	 * A plural row (context `plural` or `… (plural)`) whose original holds
+	 * exactly one count placeholder (`%d`, `%s`, `%1$d`, …) is sent once per
+	 * plural form 1..N-1 of a target language with three or more forms, with a
+	 * sample count in place of the placeholder ("%d items" → "2 items",
+	 * "5 items" for Polish), so the provider writes each grammatical form.
+	 * Every other row is sent once, as its own text.
+	 *
+	 * @param object $row    Source `strings` row (id, context, original).
+	 * @param string $locale Target locale or language slug.
+	 * @return array<string, mixed>
+	 * @phpstan-return StringItem
+	 */
+	private static function build_item( object $row, string $locale ): array {
+		$original = (string) $row->original;
+		$forms    = self::plural_form_texts( $original, (string) ( $row->context ?? '' ), $locale );
+
+		$item = [
+			'id'       => (int) $row->id,
+			'row'      => $row,
+			'original' => $original,
+			'format'   => 'html',
+			'texts'    => [],
+			'phs'      => [],
+			'numbers'  => null,
+			'only'     => [],
+			'token'    => '',
+		];
+
+		$sources = $forms === null ? [ $original ] : array_column( $forms, 'text' );
+
+		if ( $forms !== null ) {
+			$item['numbers'] = array_column( $forms, 'number' );
+			$item['only']    = array_column( $forms, 'only' );
+			$item['token']   = (string) self::plural_count_token( $original );
+		}
+
+		foreach ( $sources as $source ) {
+			[ $masked, $phs ] = PlaceholderMasker::mask( $source );
+			$item['texts'][]  = $masked;
+			$item['phs'][]    = $phs;
+		}
+
+		$item['format'] = self::destination_format( $original, $item['texts'][0] );
+
+		return $item;
+	}
+
+	/**
+	 * Destination format for a string: `text` for tag-free sources, so the
+	 * text sanitiser keeps `&` and quotes literal; `html` for sources with
+	 * markup or entities, and for masked text a text sanitiser would alter
+	 * (percent-encoded octets).
+	 *
+	 * @param string $original Source text.
+	 * @param string $masked   Masked source text.
+	 * @return string 'text' or 'html'.
+	 */
+	private static function destination_format( string $original, string $masked ): string {
+		if ( str_contains( $original, '<' )
+			|| preg_match( '/&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);/', $original )
+			|| preg_match( '/%[0-9a-fA-F]{2}/', $masked )
+		) {
+			return 'html';
+		}
+
+		return 'text';
+	}
+
+	/**
+	 * The single count placeholder of a plural original, or null when it has
+	 * none or more than one printf placeholder.
+	 *
+	 * @param string $original Plural original.
+	 * @return string|null
+	 */
+	private static function plural_count_token( string $original ): ?string {
+		if ( preg_match_all( '/%(?:\d+\$)?[sdfgxXcouebE%]/', $original, $all ) !== 1 ) {
+			return null;
+		}
+
+		$token = (string) $all[0][0];
+
+		return preg_match( '/^%(?:\d+\$)?[ds]$/', $token ) ? $token : null;
+	}
+
+	/**
+	 * The texts a plural row is sent as for a locale, one per plural form
+	 * 1..N-1 with its sample count substituted, or null when the row is sent
+	 * as one text (not a plural row, fewer than three forms, or not exactly one
+	 * count placeholder).
+	 *
+	 * Public so the cost estimator counts exactly what is sent.
+	 *
+	 * @param string $original Source text.
+	 * @param string $context  Row context.
+	 * @param string $locale   Target locale or language slug.
+	 * @return array<int, array{text: string, number: int, only: bool}>|null
+	 */
+	public static function plural_form_texts( string $original, string $context, string $locale ): ?array {
+		if ( $context !== 'plural' && ! str_ends_with( $context, ' (plural)' ) ) {
+			return null;
+		}
+
+		$nplurals = PluralRules::nplurals( $locale );
+
+		if ( $nplurals < 3 ) {
+			return null;
+		}
+
+		$token = self::plural_count_token( $original );
+
+		if ( $token === null ) {
+			return null;
+		}
+
+		$at    = (int) strpos( $original, $token );
+		$texts = [];
+
+		for ( $form = 1; $form < $nplurals; $form++ ) {
+			$number = self::plural_sample( $locale, $form );
+
+			if ( $number < 0 ) {
+				return null;
+			}
+
+			$texts[] = [
+				'text'   => substr_replace( $original, (string) $number, $at, strlen( $token ) ),
+				'number' => $number,
+				'only'   => self::only_count_for_form( $locale, $form ),
+			];
+		}
+
+		return $texts;
+	}
+
+	/**
+	 * The smallest count that selects a plural form in a locale: 2..200
+	 * first, then 0 and 1. -1 when no count selects it.
+	 *
+	 * @param string $locale Locale or slug.
+	 * @param int    $form   Form index.
+	 * @return int
+	 */
+	private static function plural_sample( string $locale, int $form ): int {
+		/**
+		 * Sample count per "locale|form".
+		 *
+		 * @var array<string, int> $memo
+		 */
+		static $memo = [];
+
+		$key = $locale . '|' . $form;
+
+		if ( isset( $memo[ $key ] ) ) {
+			return $memo[ $key ];
+		}
+
+		foreach ( array_merge( range( 2, 200 ), [ 0, 1 ] ) as $n ) {
+			if ( PluralRules::form_index( $locale, $n ) === $form ) {
+				$memo[ $key ] = $n;
+
+				return $n;
+			}
+		}
+
+		$memo[ $key ] = -1;
+
+		return -1;
+	}
+
+	/**
+	 * Whether exactly one count selects a plural form in a locale (Arabic
+	 * forms 1 and 2: n = 1, n = 2). Such a form may name its count in words
+	 * with no number ("عنصران"), as gettext allows. Counts 0..1000 are
+	 * checked, which covers every rule's `n % 100` cycle.
+	 *
+	 * @param string $locale Locale or slug.
+	 * @param int    $form   Form index.
+	 * @return bool
+	 */
+	private static function only_count_for_form( string $locale, int $form ): bool {
+		/**
+		 * Answer per "locale|form".
+		 *
+		 * @var array<string, bool> $memo
+		 */
+		static $memo = [];
+
+		$key = $locale . '|' . $form;
+
+		if ( isset( $memo[ $key ] ) ) {
+			return $memo[ $key ];
+		}
+
+		$hits = 0;
+
+		for ( $n = 0; $n <= 1000 && $hits < 2; $n++ ) {
+			if ( PluralRules::form_index( $locale, $n ) === $form ) {
+				++$hits;
+			}
+		}
+
+		$memo[ $key ] = 1 === $hits;
+
+		return $memo[ $key ];
+	}
+
+	/**
+	 * Restore, check and save one item's provider answer.
+	 *
+	 * @param \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo       Group/link repository.
+	 * @param StringTranslationRepository                                $translation_repo Value repository.
+	 * @param array<string, mixed>                                       $item             From build_item().
+	 * @phpstan-param StringItem $item
+	 * @param string[]                                                   $outputs          Provider answers, parallel to the item's texts.
+	 * @param int                                                        $language_id      Target language id.
+	 * @return array{saved: bool, error: string, translation: string}
+	 */
+	private function persist_item(
+		\PerfLocale\Database\Repository\TranslationGroupRepository $group_repo,
+		StringTranslationRepository $translation_repo,
+		array $item,
+		array $outputs,
+		int $language_id
+	): array {
+		$string_id   = (int) $item['id'];
+		$original    = (string) $item['original'];
+		$forms       = [];
+		$forms_error = '';
+
+		$count = count( $item['texts'] );
+
+		for ( $i = 0; $i < $count; $i++ ) {
+			$out = (string) ( $outputs[ $i ] ?? '' );
+
+			if ( $out === '' ) {
+				if ( $i === 0 ) {
+					return [
+						'saved'       => false,
+						'error'       => sprintf(
+							/* translators: %d: string ID. */
+							__( 'Empty translation returned for string #%d', 'perflocale' ),
+							$string_id
+						),
+						'translation' => '',
+					];
+				}
+
+				break;
+			}
+
+			$text         = PlaceholderMasker::restore( $out, $item['phs'][ $i ] ?? [] );
+			$check_source = $original;
+
+			if ( is_array( $item['numbers'] ) ) {
+				$number = (int) $item['numbers'][ $i ];
+
+				if ( ! empty( $item['only'][ $i ] ) && 0 === self::count_occurrences( $text, $number ) ) {
+					// A form only one count selects, answered without the
+					// number: kept as it is; every other placeholder is still
+					// required.
+					$token        = (string) $item['token'];
+					$check_source = substr_replace( $original, '', (int) strpos( $original, $token ), strlen( $token ) );
+				} else {
+					$text = self::put_back_count( $text, $number, (string) $item['token'] );
+				}
+
+				if ( $text === null ) {
+					if ( $i === 0 ) {
+						return [
+							'saved'       => false,
+							'error'       => sprintf(
+								/* translators: 1: plural form number, 2: id of the row in the plugin's strings table. */
+								__( 'Plural form %1$d of string #%2$d could not be matched to its count; it was not saved.', 'perflocale' ),
+								$i + 1,
+								$string_id
+							),
+							'translation' => '',
+						];
+					}
+
+					$forms_error = sprintf(
+						/* translators: 1: plural form number, 2: id of the row in the plugin's strings table. */
+						__( 'Plural form %1$d of string #%2$d could not be matched to its count; it was not saved.', 'perflocale' ),
+						$i + 1,
+						$string_id
+					);
+					break;
+				}
+			}
+
+			// Integrity gate: reject translations that lost a placeholder.
+			// Better to mark the row failed than to ship a malformed gettext
+			// string to every visitor.
+			if ( ! PlaceholderMasker::preserves_placeholders( $check_source, $text ) ) {
+				if ( $i === 0 ) {
+					return [
+						'saved'       => false,
+						'error'       => sprintf(
+							/* translators: %d: string ID. */
+							__( 'Translation for string #%d dropped a placeholder; rejected.', 'perflocale' ),
+							$string_id
+						),
+						'translation' => '',
+					];
+				}
+
+				$forms_error = sprintf(
+					/* translators: %d: string ID. */
+					__( 'Translation for string #%d dropped a placeholder; rejected.', 'perflocale' ),
+					$string_id
+				);
+				break;
+			}
+
+			if ( $item['format'] === 'text' ) {
+				$text = self::keep_edge_whitespace( $original, $text );
+			}
+
+			$forms[] = $text;
+		}
+
+		// Persist the pair. save_translation() repairs a string whose
+		// group_id cannot legally carry a link BEFORE it writes
+		// anything, and writes the link before the value, so a row
+		// this job counts as translated is a row the front end can
+		// actually serve. Anything it could not complete comes back
+		// as an operator-facing reason and the row is counted failed
+		// — a job that spends money must not report an attempt as a
+		// success. See the method for the ordering rules.
+		$save_error = $this->save_translation( $group_repo, $translation_repo, $item['row'], $language_id, $forms[0] );
+
+		if ( $save_error !== '' ) {
+			return [
+				'saved'       => false,
+				'error'       => $save_error,
+				'translation' => '',
+			];
+		}
+
+		$error = $forms_error;
+
+		// Forms 2..N of a plural row. When a later form failed the row keeps
+		// its previous extra forms; form 1 is saved.
+		if ( is_array( $item['numbers'] ) && $error === '' && count( $forms ) > 1 ) {
+			if ( ! $translation_repo->set_extra_forms( $string_id, $language_id, array_slice( $forms, 1 ) ) ) {
+				$error = sprintf(
+					/* translators: %d: string ID. */
+					__( 'Failed to persist the plural forms of string #%d.', 'perflocale' ),
+					$string_id
+				);
+			}
+		}
+
+		return [
+			'saved'       => true,
+			'error'       => $error,
+			'translation' => $forms[0],
 		];
 	}
 
+	/**
+	 * Put the count placeholder back where the provider wrote the sample
+	 * count. Exactly one standalone occurrence of the number must exist.
+	 *
+	 * @param string $text   Restored translation.
+	 * @param int    $number Sample count that was sent.
+	 * @param string $token  Original placeholder.
+	 * @return string|null Null when the number is missing or ambiguous.
+	 */
+	private static function put_back_count( string $text, int $number, string $token ): ?string {
+		if ( self::count_occurrences( $text, $number ) !== 1 ) {
+			return null;
+		}
+
+		return (string) preg_replace_callback( self::count_pattern( $number ), static fn(): string => $token, $text, 1 );
+	}
+
+	/**
+	 * How many times a count stands alone in a text.
+	 *
+	 * @param string $text   Restored translation.
+	 * @param int    $number Sample count that was sent.
+	 * @return int
+	 */
+	private static function count_occurrences( string $text, int $number ): int {
+		return (int) preg_match_all( self::count_pattern( $number ), $text );
+	}
+
+	/**
+	 * Pattern for a count standing alone: not part of a longer number, a
+	 * decimal ("5.5") or a grouped number ("1,000"); sentence punctuation
+	 * after it ("5." / "5,") is allowed.
+	 *
+	 * @param int $number Sample count.
+	 * @return string
+	 */
+	private static function count_pattern( int $number ): string {
+		return '/(?<!\d)(?<!\d[.,])' . $number . '(?![.,]?\d)/';
+	}
+
+	/**
+	 * Keep the source's leading and trailing whitespace on a plain-text
+	 * translation (the text sanitiser trims both ends).
+	 *
+	 * @param string $source      Source text.
+	 * @param string $translation Translation.
+	 * @return string
+	 */
+	private static function keep_edge_whitespace( string $source, string $translation ): string {
+		if ( $translation === '' ) {
+			return $translation;
+		}
+
+		if ( preg_match( '/^\s+/u', $source, $lead ) && ! preg_match( '/^\s/u', $translation ) ) {
+			$translation = $lead[0] . $translation;
+		}
+
+		if ( preg_match( '/\s+$/u', $source, $trail ) && ! preg_match( '/\s$/u', $translation ) ) {
+			$translation .= $trail[0];
+		}
+
+		return $translation;
+	}
 	/**
 	 * Persist one machine-translated string, and make sure it can be SERVED.
 	 *
@@ -703,7 +1265,11 @@ final class BulkStringTranslateJob extends AbstractJob {
 		}
 
 		if ( ! $translation_repo->set( $string_id, $language_id, $translated_text ) ) {
-			return sprintf( 'Failed to persist translation for string #%d.', $string_id );
+			return sprintf(
+				/* translators: %d: string ID. */
+				__( 'Failed to persist translation for string #%d.', 'perflocale' ),
+				$string_id
+			);
 		}
 
 		return '';

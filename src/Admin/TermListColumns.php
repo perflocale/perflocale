@@ -238,6 +238,16 @@ final class TermListColumns {
 			return $clauses;
 		}
 
+		// A lookup of specific terms by id or slug is not a list query. Core
+		// validates a new term's parent and every id wp_set_object_terms()
+		// assigns with get_terms( include ), and checks slugs with
+		// get_terms( slug ). Hiding other languages' terms from those makes
+		// core refuse a live parent and drop assigned terms.
+		// TermQueryFilter skips the same queries.
+		if ( ! empty( $args['include'] ) || ! empty( $args['slug'] ) ) {
+			return $clauses;
+		}
+
 		$lang_slug = sanitize_key( $args['perflocale_admin_lang_filter'] );
 		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
 		$lang      = $lang_repo->find_by_slug( $lang_slug );

@@ -28,10 +28,14 @@ if ( ! defined( 'ABSPATH' ) ) {
  *     target_lang_ids: int[]     (required)
  *     include_meta:    bool      (default false)
  *     after_id:        int       (keyset cursor, default 0)
+ *     trigger:         string    ('cli_all' for a chain started by
+ *                                `wp perflocale translate --all --async`;
+ *                                absent otherwise)
  *   }
  *
  * Each execution resolves the next CHUNK_SIZE source IDs keyset-style
- * (WHERE ID > after_id ORDER BY ID), runs them through BulkTranslateJob's
+ * (WHERE ID > after_id ORDER BY ID; published posts that are not in a
+ * non-default language), runs them through BulkTranslateJob's
  * proven per-pair pipeline INLINE (same skip-existing / per-row edit-cap /
  * error semantics), then RE-ENQUEUES ITSELF with the advanced cursor. The job
  * completes when the selection runs dry.
@@ -40,10 +44,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  * pairs at ZERO provider cost — the skip-existing rule returns before the
  * provider is ever reached, so a re-run over an already-translated selection
  * makes no API calls at all — and the cursor bounds each execution's runtime
- * under the job lock TTL. Cancel is cooperative per chunk; canceling the
- * parent stops the chain (no further re-enqueue), and so does canceling any
- * still-queued chunk, since each chunk only enqueues the next one from inside
- * its own running execute().
+ * under the job lock TTL. Cancel is cooperative per chunk. Canceling a
+ * queued chunk stops the chain, since each chunk only enqueues the next one
+ * from inside its own running execute(). Canceling a running chunk stops it
+ * at its next progress tick, before it enqueues anything. A cancel that lands
+ * after the last tick, while the next chunk is being enqueued, is handled by
+ * the worker: it records the cancel and also cancels the chunk this execution
+ * queued, found through the `next_job` and `next_duplicate` result keys.
  */
 final class SiteTranslateJob extends AbstractJob {
 
@@ -156,6 +163,8 @@ final class SiteTranslateJob extends AbstractJob {
 	 * @param array<string, mixed> $args     Job args (see class docblock).
 	 * @param callable             $progress Progress callback (throws on cancel).
 	 * @return array<string, mixed>
+	 * @throws \PerfLocale\Background\JobCanceledException When the operator cancels or pauses mid-chunk.
+	 * @throws \RuntimeException When the keyset SELECT fails; the worker retries the chunk.
 	 */
 	public function execute( array $args, callable $progress ): array {
 		global $wpdb;
@@ -163,6 +172,7 @@ final class SiteTranslateJob extends AbstractJob {
 		$post_types = array_values( array_filter( array_map( 'sanitize_key', (array) ( $args['post_types'] ?? [ 'post', 'page' ] ) ) ) );
 		$lang_ids   = array_values( array_filter( array_map( 'intval', (array) ( $args['target_lang_ids'] ?? [] ) ) ) );
 		$after_id   = max( 0, (int) ( $args['after_id'] ?? 0 ) );
+		$trigger    = 'cli_all' === ( $args['trigger'] ?? null ) ? 'cli_all' : 'site_translate';
 
 		if ( $post_types === [] || $lang_ids === [] ) {
 			return [
@@ -170,7 +180,7 @@ final class SiteTranslateJob extends AbstractJob {
 				'skipped' => 0,
 				'failed'  => 0,
 				'done'    => true,
-				'error'   => 'Empty selection.',
+				'error'   => __( 'Empty selection.', 'perflocale' ),
 			];
 		}
 
@@ -185,23 +195,54 @@ final class SiteTranslateJob extends AbstractJob {
 		$fetch_limit = max( 1, min( self::CHUNK_SIZE, (int) ceil( $max_pairs / $per_source ) ) );
 
 		// Keyset page: strictly-increasing IDs so a re-run/retry never
-		// re-reads earlier pages. Publish-only mirrors the CLI --all rule.
+		// re-reads earlier pages. Publish-only, and sources only: a post whose
+		// language is not the default language is a translation (or an
+		// original written in that language) and is never a source, the same
+		// rule as the CLI --all selection. A post with no language row counts
+		// as default-language content. The NOT EXISTS probe uses the
+		// (type, object_id, language_id) unique key of translation_links.
+		$lang_repo    = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
+		$default      = $lang_repo instanceof \PerfLocale\Database\Repository\LanguageRepository ? $lang_repo->get_default() : null;
+		$default_vars = is_object( $default ) ? get_object_vars( $default ) : [];
+		$default_id   = is_numeric( $default_vars['id'] ?? null ) ? (int) $default_vars['id'] : 0;
+
+		$source_sql  = '';
+		$source_args = [];
+
+		if ( $default_id > 0 ) {
+			$source_sql  = ' AND NOT EXISTS ( SELECT 1 FROM %i pl_sl WHERE pl_sl.type = %s AND pl_sl.object_id = p.ID AND pl_sl.language_id <> %d )';
+			$source_args = [ \PerfLocale\Database\Schema::table( 'translation_links' ), \PerfLocale\Enum\ObjectType::Post->value, $default_id ];
+		}
+
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$ids = array_map(
 			'intval',
 			(array) $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT ID FROM {$wpdb->posts}
-					 WHERE post_type IN ({$tph}) AND post_status = 'publish' AND ID > %d
-					 ORDER BY ID ASC
+					"SELECT p.ID FROM {$wpdb->posts} p
+					 WHERE p.post_type IN ({$tph}) AND p.post_status = 'publish' AND p.ID > %d{$source_sql}
+					 ORDER BY p.ID ASC
 					 LIMIT %d",
-					array_merge( $post_types, [ $after_id, $fetch_limit ] )
+					array_merge( $post_types, [ $after_id ], $source_args, [ $fetch_limit ] )
 				)
 			)
 		);
 		// phpcs:enable
 
 		if ( $ids === [] ) {
+			// get_col() also answers [] when the SELECT failed (wpdb::query()
+			// flushes last_result first), so only an empty error channel means
+			// the selection ran dry. last_error belongs to the SELECT above:
+			// wpdb resets it at the start of every query. Throw OUTSIDE the try
+			// below, so the worker marks this chunk failed and retries it with
+			// the same after_id. The instanceof is PHPStan narrowing ($wpdb
+			// reads as mixed here).
+			$db_error = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
+
+			if ( $db_error !== '' ) {
+				throw new \RuntimeException( esc_html__( 'Could not read the next batch of posts from the database. Nothing was skipped; a retry resumes from the same point.', 'perflocale' ) );
+			}
+
 			// Selection ran dry — the chain is complete.
 			return [
 				'created' => 0,
@@ -258,6 +299,10 @@ final class SiteTranslateJob extends AbstractJob {
 			return $yield( $source_id, $done );
 		};
 
+		// The `trigger` names the path for a password-protected source
+		// (TranslationService::may_send_post()): 'cli_all' for a chain started by
+		// `wp perflocale translate --all --async`, else the automatic
+		// 'site_translate'.
 		try {
 			$chunk_result = ( new BulkTranslateJob() )->execute(
 				[
@@ -265,6 +310,7 @@ final class SiteTranslateJob extends AbstractJob {
 					'target_lang_ids'    => $lang_ids,
 					'include_meta'       => ! empty( $args['include_meta'] ),
 					'yield_after_source' => $track,
+					'trigger'            => $trigger,
 				],
 				$progress
 			);
@@ -351,37 +397,48 @@ final class SiteTranslateJob extends AbstractJob {
 		$service  = new \PerfLocale\MachineTranslation\TranslationService( $settings, \PerfLocale\Plugin::get_instance()->get( 'cache' ) );
 		if ( $service->would_exceed_limit( 1 ) ) {
 			return [
-				'created' => (int) ( $chunk_result['created'] ?? 0 ),
-				'skipped' => (int) ( $chunk_result['skipped'] ?? 0 ),
-				'failed'  => (int) ( $chunk_result['failed'] ?? 0 ),
-				'cursor'  => $cursor,
-				'done'    => true,
-				'error'   => __( 'Stopped: monthly machine-translation character limit reached. Re-run after raising the limit to resume from this cursor.', 'perflocale' ),
+				'created'       => (int) ( $chunk_result['created'] ?? 0 ),
+				'skipped'       => (int) ( $chunk_result['skipped'] ?? 0 ),
+				'failed'        => (int) ( $chunk_result['failed'] ?? 0 ),
+				'kept'          => (int) ( $chunk_result['kept'] ?? 0 ),
+				'first_warning' => (string) ( $chunk_result['first_warning'] ?? '' ),
+				'cursor'        => $cursor,
+				'done'          => true,
+				'error'         => __( 'Stopped: monthly machine-translation character limit reached. Re-run after raising the limit to resume from this cursor.', 'perflocale' ),
 			];
 		}
 
-		// Chain the next chunk. A canceled parent never reaches this point
-		// (the progress callback throws JobCanceledException inside execute()),
-		// so cancel stops the chain by construction. Dispatch failure is
-		// surfaced in the result rather than silently ending the chain.
-		$next = Dispatcher::dispatch(
-			$this,
-			[
-				'post_types'      => $post_types,
-				'target_lang_ids' => $lang_ids,
-				'include_meta'    => ! empty( $args['include_meta'] ),
-				'after_id'        => $cursor,
-			]
-		);
+		// Chain the next chunk. A cancel caught at a progress tick never
+		// reaches this point (the callback throws JobCanceledException), but
+		// one that lands after the last tick does: the worker then cancels
+		// the chunk queued here, using `next_job`. `next_duplicate` marks a
+		// dispatch that was folded into a job already in flight, which is not
+		// this chunk's to cancel. Dispatch failure is surfaced in the result
+		// rather than silently ending the chain.
+		$next_args = [
+			'post_types'      => $post_types,
+			'target_lang_ids' => $lang_ids,
+			'include_meta'    => ! empty( $args['include_meta'] ),
+			'after_id'        => $cursor,
+		];
+
+		if ( 'cli_all' === $trigger ) {
+			$next_args['trigger'] = 'cli_all';
+		}
+
+		$next = Dispatcher::dispatch( $this, $next_args );
 
 		return [
-			'created'  => (int) ( $chunk_result['created'] ?? 0 ),
-			'skipped'  => (int) ( $chunk_result['skipped'] ?? 0 ),
-			'failed'   => (int) ( $chunk_result['failed'] ?? 0 ),
-			'cursor'   => $cursor,
-			'done'     => false,
-			'next_job' => $next['job_id'] ?? null,
-			'next'     => $next['mode'] ?? 'unknown',
+			'created'        => (int) ( $chunk_result['created'] ?? 0 ),
+			'skipped'        => (int) ( $chunk_result['skipped'] ?? 0 ),
+			'failed'         => (int) ( $chunk_result['failed'] ?? 0 ),
+			'kept'           => (int) ( $chunk_result['kept'] ?? 0 ),
+			'first_warning'  => (string) ( $chunk_result['first_warning'] ?? '' ),
+			'cursor'         => $cursor,
+			'done'           => false,
+			'next_job'       => $next['job_id'] ?? null,
+			'next_duplicate' => ! empty( $next['duplicate'] ),
+			'next'           => $next['mode'] ?? 'unknown',
 		];
 	}
 }

@@ -242,6 +242,14 @@ final class GeoRedirect {
 			return;
 		}
 
+		// No automatic redirect when the language cookie can never be
+		// written: nothing would stop it from redirecting the visitor again
+		// on every default-language page. Config-derived, so it stays above
+		// nocache_headers() and the geo lookup below.
+		if ( $this->router->language_cookie_never_written() ) {
+			return;
+		}
+
 		// Pages the admin excluded from language routing must not be
 		// geo-redirected either (single-language campaign landing pages).
 		// URL-derived — stays above nocache_headers() so excluded pages
@@ -385,6 +393,16 @@ final class GeoRedirect {
 		$redirect_url = $converter->convert( $current_url, $language_slug );
 
 		if ( $redirect_url === '' || $redirect_url === $current_url ) {
+			return;
+		}
+
+		// A singular landing that would answer 404 or send the visitor back to
+		// the default language gets no redirect. This returns before the
+		// target-language cookie is written and before perflocale/geo/redirected
+		// fires. The default-language cookie LanguageRouter::detect_language()
+		// sets on this request still marks the visitor as returning, so later
+		// pages do not redirect them either.
+		if ( ! $this->router->first_visit_landing_serves( $language_slug ) ) {
 			return;
 		}
 
@@ -602,48 +620,6 @@ final class GeoRedirect {
 	 */
 	private function record_breaker_failure( string $provider_id ): void {
 		\PerfLocale\Concurrency\Breaker::record_failure( 'geo_' . $provider_id, 'fetch_empty' );
-	}
-
-	/**
-	 * Validate a wp_remote_get response and decode its JSON body.
-	 *
-	 * ⚠️ CURRENTLY UNREFERENCED — and the docblock this replaces claimed
-	 * otherwise. It said "centralising the response validation here closes that
-	 * gap across every provider", which closes nothing: the method has no
-	 * caller, and the only `json_decode()` in this file is the one inside it.
-	 * A reader could reasonably have assumed the protection below was in force.
-	 *
-	 * What it guarded was real: a 429 or 5xx from a GeoIP endpoint typically
-	 * returns an HTML error page, which `json_decode` parses as null, yielding
-	 * an empty country and silently breaking language detection for the
-	 * visitor's whole session. But the bundled providers that shared that
-	 * response shape were deleted in the 2026-07-31 simplification (hosts
-	 * 16 -> 4, features kept behind filter seams). The one surviving path,
-	 * `fetch_custom_provider()`, delegates entirely to a third-party
-	 * `fetch_callback` that performs its own request and returns a country-code
-	 * STRING — it never hands back a response for this to decode.
-	 *
-	 * Retained rather than deleted only to keep a release-time diff small; it
-	 * is unused and due for removal in a housekeeping pass. If a bundled
-	 * provider is ever reinstated, wire this in rather than re-deriving it.
-	 *
-	 * @param mixed $response wp_remote_get return value.
-	 * @return array<string, mixed>|null Decoded body or null on any failure.
-	 */
-	private function decode_json_response( $response ): ?array {
-		if ( is_wp_error( $response ) ) {
-			return null;
-		}
-
-		$code = wp_remote_retrieve_response_code( $response );
-
-		if ( $code < 200 || $code >= 300 ) {
-			return null;
-		}
-
-		$body = json_decode( wp_remote_retrieve_body( $response ), true );
-
-		return is_array( $body ) ? $body : null;
 	}
 
 	/**

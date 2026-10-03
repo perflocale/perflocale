@@ -353,6 +353,34 @@
 	font-size: 12px;
 }
 
+.perflocale-migration-card__checks {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.perflocale-migration-card__checks li {
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+	margin: 0 0 4px;
+}
+
+.perflocale-migration-card__checks .dashicons {
+	flex: none;
+	margin-block-start: 1px;
+}
+
+.perflocale-migration-card__checks .dashicons-yes {
+	color: #00a32a;
+}
+
+.perflocale-migration-card__checks .dashicons-warning {
+	color: #996800;
+}
+
 @media screen and (max-width: 782px) {
 	.perflocale-migration-cards {
 			grid-template-columns: 1fr;

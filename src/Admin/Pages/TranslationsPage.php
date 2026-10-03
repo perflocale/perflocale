@@ -75,7 +75,13 @@ final class TranslationsPage {
 			$resolved        = $lang_repo->find_by_slug( $lang_slug_filter );
 			$filter_language = $resolved ? (int) $resolved->id : 0;
 		}
-		$filter_status = isset( $_GET['status_filter'] ) ? sanitize_text_field( wp_unslash( $_GET['status_filter'] ) ) : '';
+		// One of the statuses the filter offers, or none. The all-language
+		// selector caches one result per status, and a status change of a
+		// translatable post deletes exactly those entries.
+		$filter_status_raw = isset( $_GET['status_filter'] ) ? sanitize_key( wp_unslash( $_GET['status_filter'] ) ) : '';
+		$filter_status     = $filter_status_raw !== ''
+			? ( TranslationStatus::tryFrom( $filter_status_raw )?->value ?? '' )
+			: '';
 		// Source / provenance filter (translation_links.source). Validated against
 		// SourceType::tryFrom so URL injection cannot smuggle arbitrary values
 		// into matches_filters().
@@ -132,6 +138,10 @@ final class TranslationsPage {
 		// query var so it never leaks to unrelated queries.
 		$this->register_source_only_filter( $lang_repo );
 
+		// Rows the current user may not read stay off the list and out of its
+		// count (run_list_query()). '' for a user who may read every row.
+		$unreadable_where = $this->unreadable_rows_where( $query_post_types );
+
 		// Push language + status filters down to SQL so WP_Query's found_posts
 		// reflects the filtered result size (prevents paginator advertising
 		// pages that are all filtered out post-query). When either filter is
@@ -143,17 +153,19 @@ final class TranslationsPage {
 		// surface area at the time.
 		$filter_active = ( $filter_language > 0 || $filter_status !== '' );
 
+		// The source-only filter registered above discards every object whose
+		// link is not the default language, so the ID resolution can be bound
+		// to that language up front instead of loading every language's rows
+		// into PHP and then throwing most of them away. 0 when the site has no
+		// default language — in which case that filter is not registered
+		// either, and the unbounded behaviour is still correct. The
+		// all-language status filter in matches_filters() skips this
+		// language's link the same way the SQL selector does.
+		$default_lang       = $lang_repo->get_default();
+		$source_language_id = ( $default_lang && ! empty( $default_lang->id ) ) ? (int) $default_lang->id : 0;
+
 		if ( $filter_active ) {
 			$active_language_ids = array_map( static fn( $l ) => (int) $l->id, $languages );
-
-			// The source-only filter registered above discards every object whose
-			// link is not the default language, so the ID resolution can be bound
-			// to that language up front instead of loading every language's rows
-			// into PHP and then throwing most of them away. 0 when the site has no
-			// default language — in which case that filter is not registered
-			// either, and the unbounded behaviour is still correct.
-			$default_lang       = $lang_repo->get_default();
-			$source_language_id = ( $default_lang && ! empty( $default_lang->id ) ) ? (int) $default_lang->id : 0;
 
 			$matching_ids = $this->resolve_filtered_object_ids(
 				$group_repo,
@@ -174,13 +186,13 @@ final class TranslationsPage {
 				$query_args['post__in'] = $matching_ids;
 				// Preserve ordering requested (modified DESC) instead of
 				// ordering by post__in sequence - that's the user intent.
-				$query       = new \WP_Query( $query_args );
+				$query       = $this->run_list_query( $query_args, $unreadable_where );
 				$posts       = $query->posts;
 				$total       = $query->found_posts;
 				$total_pages = (int) ceil( $total / $per_page );
 			}
 		} else {
-			$query       = new \WP_Query( $query_args );
+			$query       = $this->run_list_query( $query_args, $unreadable_where );
 			$posts       = $query->posts;
 			$total       = $query->found_posts;
 			$total_pages = (int) ceil( $total / $per_page );
@@ -191,8 +203,8 @@ final class TranslationsPage {
 			? $group_repo->get_translations_for_objects( $visible_ids, \PerfLocale\Enum\ObjectType::Post )
 			: [];
 
-		// Resolve effective status: link.status='empty' but the linked WP post
-		// is actually published or draft. Mirrors count_by_status() so the
+		// Resolve each link's effective status (TranslationStatus::effective(),
+		// the PHP twin of the SQL the status filter and the counts use) so the
 		// table cells and the status filter agree. Done once here at
 		// collection time, not per-row, to keep matches_filters()
 		// pure (no DB calls inside the filter loop). _prime_post_caches()
@@ -213,35 +225,17 @@ final class TranslationsPage {
 				_prime_post_caches( array_keys( $linked_ids ), false, false );
 			}
 
-			// Reconcile the stored status against the post's real status. Kept
-			// deliberately identical to the CASE in
-			// TranslationLinkRepository::count_status_matrix() — these two are
-			// the only readers that interpret a link status for display, and
-			// when they disagreed the Dashboard and this screen reported
-			// different numbers for the same site.
-			foreach ( $batch_map as $oid => $links ) {
+			// Reconcile the stored status against the post's real status with the
+			// same definition TranslationLinkRepository::effective_status_sql()
+			// gives the Dashboard, `wp perflocale status` and the status filter,
+			// so they all report the same status for the same link.
+			foreach ( $batch_map as $links ) {
 				foreach ( $links as $link ) {
-					$linked_post = get_post( (int) ( $link->object_id ?? 0 ) );
-					if ( ! $linked_post instanceof \WP_Post ) {
-						continue;
-					}
-
-					// Downward arm: a trashed or never-started translation is
-					// not a translation, whatever the stored status claims.
-					if ( in_array( $linked_post->post_status, [ 'trash', 'auto-draft' ], true ) ) {
-						$link->status = 'empty';
-						continue;
-					}
-
-					if ( ( $link->status ?? '' ) !== 'empty' ) {
-						continue;
-					}
-
-					if ( $linked_post->post_status === 'publish' ) {
-						$link->status = 'published';
-					} elseif ( $linked_post->post_status === 'draft' ) {
-						$link->status = 'draft';
-					}
+					$linked_post  = get_post( (int) ( $link->object_id ?? 0 ) );
+					$link->status = TranslationStatus::effective(
+						(string) ( $link->status ?? '' ),
+						$linked_post instanceof \WP_Post ? $linked_post->post_status : null
+					);
 				}
 			}
 		}
@@ -273,6 +267,10 @@ final class TranslationsPage {
 			$bulk_skipped = isset( $_GET['skipped'] ) ? absint( $_GET['skipped'] ) : 0;
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$bulk_failed = isset( $_GET['failed'] ) ? absint( $_GET['failed'] ) : 0;
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$bulk_no_access = isset( $_GET['no_access'] ) ? absint( $_GET['no_access'] ) : 0;
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$bulk_kept = isset( $_GET['kept'] ) ? absint( $_GET['kept'] ) : 0;
 
 			$mt_available = \PerfLocale\Admin\AdminController::bulk_mt_translate_available();
 
@@ -294,15 +292,17 @@ final class TranslationsPage {
 			<h1 class="wp-heading-inline"><?php echo esc_html__( 'Translations', 'perflocale' ); ?></h1>
 			<hr class="wp-header-end">
 
-			<?php \PerfLocale\Admin\PluginNav::render(); ?>
-
 			<?php
 			if ( $bulk_message === 'bulk_mt_done' ) :
 				$mt_first_error = get_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
 				if ( $mt_first_error ) {
 					delete_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
 				}
-				$notice_class = $bulk_failed > 0 ? 'notice-warning' : 'notice-success';
+				$mt_first_warning = get_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id() );
+				if ( $mt_first_warning ) {
+					delete_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id() );
+				}
+				$notice_class = ( $bulk_failed > 0 || $bulk_no_access > 0 || $bulk_kept > 0 ) ? 'notice-warning' : 'notice-success';
 				?>
 				<div class="notice <?php echo esc_attr( $notice_class ); ?> is-dismissible"><p>
 				<?php
@@ -313,8 +313,44 @@ final class TranslationsPage {
 						absint( $bulk_skipped ),
 						absint( $bulk_failed )
 					);
-				if ( $bulk_failed > 0 && $mt_first_error ) {
+				if ( $bulk_no_access > 0 ) {
+					echo ' ' . esc_html(
+						sprintf(
+							/* translators: %d: number of post × language pairs skipped because the user may not translate them. */
+							_n( '%d skipped because you are not allowed to translate it.', '%d skipped because you are not allowed to translate them.', $bulk_no_access, 'perflocale' ),
+							absint( $bulk_no_access )
+						)
+					);
+				}
+				if ( ( $bulk_failed > 0 || $bulk_no_access > 0 ) && $mt_first_error ) {
 					echo '<br><strong>' . esc_html__( 'First error:', 'perflocale' ) . '</strong> ' . esc_html( (string) $mt_first_error );
+				}
+				if ( $bulk_kept > 0 ) {
+					echo '<br>' . esc_html(
+						sprintf(
+							/* translators: %d: number of created translations whose content stayed in the source language. */
+							_n( '%d created translation kept the source-language content.', '%d created translations kept the source-language content.', $bulk_kept, 'perflocale' ),
+							absint( $bulk_kept )
+						)
+					);
+					if ( $mt_first_warning ) {
+						echo ' <strong>' . esc_html__( 'First warning:', 'perflocale' ) . '</strong> ' . esc_html( (string) $mt_first_warning );
+					}
+				}
+				?>
+				</p></div>
+			<?php elseif ( $bulk_message === 'bulk_mt_denied' ) : ?>
+				<?php
+				$_mt_denied = get_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
+				if ( $_mt_denied ) {
+					delete_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
+				}
+				?>
+				<div class="notice notice-warning is-dismissible"><p>
+				<?php
+				echo esc_html__( 'Bulk machine translation did not run.', 'perflocale' );
+				if ( $_mt_denied ) {
+					echo ' ' . esc_html( (string) $_mt_denied );
 				}
 				?>
 				</p></div>
@@ -392,22 +428,6 @@ final class TranslationsPage {
 				<div class="notice notice-warning is-dismissible"><p><?php echo esc_html__( 'Pick a bulk action and at least one post first.', 'perflocale' ); ?></p></div>
 			<?php elseif ( $bulk_message === 'bulk_unknown' ) : ?>
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Unknown bulk action.', 'perflocale' ); ?></p></div>
-				<?php
-			elseif ( $bulk_message === 'mt_review_done' ) :
-				// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only flash routing
-				$_op = isset( $_GET['op'] ) ? sanitize_key( wp_unslash( $_GET['op'] ) ) : '';
-				?>
-				<div class="notice notice-success is-dismissible"><p>
-				<?php
-					echo esc_html(
-						$_op === 'rescore'
-							? __( 'Translation queued for re-scoring on the next cron run.', 'perflocale' )
-							: __( 'Translation marked as reviewed. The badge will disappear after the page reload.', 'perflocale' )
-					);
-				?>
-				</p></div>
-			<?php elseif ( $bulk_message === 'mt_review_nochange' ) : ?>
-				<div class="notice notice-warning is-dismissible"><p><?php echo esc_html__( 'No score row matched the request — it may have already been cleared.', 'perflocale' ); ?></p></div>
 			<?php endif; ?>
 
 			<?php
@@ -473,6 +493,8 @@ final class TranslationsPage {
 				endif;
 			}
 			?>
+
+			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
 			<!-- Toolbar: search + count (matches Strings page style) -->
 			<div class="perflocale-str-toolbar">
@@ -673,7 +695,8 @@ final class TranslationsPage {
 							$filter_language,
 							$filter_status,
 							$active_language_ids_for_filter,
-							$filter_source
+							$filter_source,
+							$source_language_id
 						) ) {
 							continue;
 						}
@@ -783,14 +806,12 @@ final class TranslationsPage {
 	/**
 	 * Render a single language-column cell for a source post's row.
 	 *
-	 * Primary source of truth is `link.status` (the translation link
-	 * state - empty / draft / pending / published / needs_update). There's
-	 * one SELF-HEALING case: if the link says 'empty' but the linked post
-	 * actually exists and is published, the link row is stale placeholder
-	 * data from an older version. Fall through to "Published" in that
-	 * specific case so the table reflects reality.
+	 * The badge shows `link.status` as render() resolved it: the link's
+	 * effective status (TranslationStatus::effective() — empty / draft /
+	 * pending / published / needs_update, from the linked post's status with
+	 * a stored needs_update kept).
 	 *
-	 * A linked post that was deleted / trashed also downgrades to Empty.
+	 * A linked post that was deleted / trashed shows Empty.
 	 *
 	 * @param object|null $link translation_links row for this language (or null).
 	 * @param \WP_Post    $post The source post being rendered.
@@ -807,10 +828,8 @@ final class TranslationsPage {
 			$linked_post = get_post( (int) $link->object_id );
 
 			if ( $linked_post instanceof \WP_Post && $linked_post->post_status !== 'trash' ) {
-				// $link->status was resolved against post_status during
-				// batch collection (see display()) so an 'empty' link whose
-				// post is actually published / draft already shows the right
-				// label here.
+				// $link->status is the effective status resolved during batch
+				// collection in render().
 				$link_status = (string) ( $link->status ?? '' );
 				$status_enum = TranslationStatus::tryFrom( $link_status );
 
@@ -967,6 +986,114 @@ final class TranslationsPage {
 	}
 
 	/**
+	 * Run the screen's list query, with the condition from
+	 * unreadable_rows_where() appended to its WHERE clause, so the rows the
+	 * user may not read are neither listed nor counted in `found_posts`.
+	 *
+	 * The posts_where callback is attached for this one query only and acts
+	 * only on a query carrying `perflocale_only_source` (this screen's).
+	 *
+	 * @param array<string, mixed> $query_args       WP_Query arguments.
+	 * @param string               $unreadable_where Condition from unreadable_rows_where().
+	 * @return \WP_Query
+	 */
+	private function run_list_query( array $query_args, string $unreadable_where ): \WP_Query {
+		if ( $unreadable_where === '' ) {
+			return new \WP_Query( $query_args );
+		}
+
+		$append = static function ( string $where, \WP_Query $q ) use ( $unreadable_where ): string {
+			return $q->get( 'perflocale_only_source' ) ? $where . $unreadable_where : $where;
+		};
+
+		add_filter( 'posts_where', $append, 10, 2 );
+
+		try {
+			return new \WP_Query( $query_args );
+		} finally {
+			remove_filter( 'posts_where', $append, 10 );
+		}
+	}
+
+	/**
+	 * WHERE condition that leaves out the posts the current user may not
+	 * read, or '' when they may read every post of these types.
+	 *
+	 * Follows core's read_post mapping (map_meta_cap()) for a post another
+	 * user wrote in a status that is not public, per post type: a private
+	 * status needs read_private_posts; any other status needs
+	 * edit_others_posts, and `future` also edit_published_posts. Posts in a
+	 * public status and the user's own posts stay listed. Each capability is
+	 * checked once per post type, so this costs no query and no per-row
+	 * check, and a user who holds them all (an administrator; an editor for
+	 * posts and pages) gets ''. A post type registered without map_meta_cap
+	 * maps read_post to one capability for all its posts and is not filtered
+	 * here.
+	 *
+	 * @param array<int, string> $post_types Post types the list queries.
+	 * @return string `' AND NOT ( … )'` or ''.
+	 */
+	private function unreadable_rows_where( array $post_types ): string {
+		global $wpdb;
+
+		$private_statuses = [];
+		$other_statuses   = [];
+
+		foreach ( get_post_stati( [], 'objects' ) as $name => $status_object ) {
+			if ( ! empty( $status_object->public ) ) {
+				continue;
+			}
+
+			if ( ! empty( $status_object->private ) ) {
+				$private_statuses[] = (string) $name;
+			} else {
+				$other_statuses[] = (string) $name;
+			}
+		}
+
+		$user_id = get_current_user_id();
+		$clauses = [];
+
+		foreach ( $post_types as $post_type ) {
+			$type_object = get_post_type_object( (string) $post_type );
+
+			if ( ! $type_object || ! $type_object->map_meta_cap ) {
+				continue;
+			}
+
+			$hidden = current_user_can( $type_object->cap->read_private_posts ) ? [] : $private_statuses;
+
+			if ( ! current_user_can( $type_object->cap->edit_others_posts ) ) {
+				$hidden = array_merge( $hidden, $other_statuses );
+			} elseif ( in_array( 'future', $other_statuses, true ) && ! current_user_can( $type_object->cap->edit_published_posts ) ) {
+				$hidden[] = 'future';
+			}
+
+			if ( $hidden === [] ) {
+				continue;
+			}
+
+			$placeholders = implode( ',', array_fill( 0, count( $hidden ), '%s' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders -- $placeholders is a generated %s list bound to $hidden.
+			$clause = (string) $wpdb->prepare(
+				"( {$wpdb->posts}.post_type = %s AND {$wpdb->posts}.post_status IN ({$placeholders})",
+				(string) $post_type,
+				...$hidden
+			);
+			// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders
+
+			if ( $user_id > 0 ) {
+				$clause .= (string) $wpdb->prepare( " AND {$wpdb->posts}.post_author <> %d", $user_id );
+			}
+
+			$clauses[] = $clause . ' )';
+		}
+
+		return $clauses === [] ? '' : ' AND NOT ( ' . implode( ' OR ', $clauses ) . ' )';
+	}
+
+	/**
 	 * Register a scoped posts_where filter that hides non-default-language
 	 * translation rows when WP_Query is invoked with the
 	 * `perflocale_only_source` query var set.
@@ -980,13 +1107,12 @@ final class TranslationsPage {
 	 */
 	private function register_source_only_filter( LanguageRepository $lang_repo ): void {
 		// Keyed by blog, NOT a bare bool. The closure below captures this blog's
-		// $wpdb->posts, its two plugin table names and its default-language id.
-		// A bare `static $registered = false` meant the SECOND blog visited in a
-		// process returned early and kept blog 1's closure registered, so the
-		// Translations screen filtered against another blog's tables — measured
-		// on mutest.local: blog 2 alone rendered 11 rows, blog 1 then blog 2 in
-		// one process rendered 2, with a "IN/ALL/ANY subquery" error in
-		// $wpdb->last_error. Same shape as
+		// $wpdb->posts, its two plugin table names and its default-language id,
+		// so every blog visited in a process registers its own closure. With a
+		// single flag, a second blog would keep the first blog's closure and the
+		// Translations screen would filter against another blog's tables (too
+		// few rows, and an "IN/ALL/ANY subquery" error in $wpdb->last_error).
+		// Same shape as
 		// {@see \PerfLocale\Database\Repository\TranslationGroupRepository::eager_memo_key()}.
 		static $registered = [];
 
@@ -1380,6 +1506,10 @@ final class TranslationsPage {
 	 * @param string             $filter_status Status filter (empty = all).
 	 * @param array<int, int>    $active_language_ids All active language IDs.
 	 * @param string             $filter_source Source filter (empty = all).
+	 * @param int                $source_language_id Default language ID (0 = none):
+	 *                                               its link is the row itself, so
+	 *                                               the all-language status filter
+	 *                                               skips it.
 	 * @return bool True if the post matches all active filters.
 	 */
 
@@ -1388,7 +1518,8 @@ final class TranslationsPage {
 		int $filter_language,
 		string $filter_status,
 		array $active_language_ids = [],
-		string $filter_source = ''
+		string $filter_source = '',
+		int $source_language_id = 0
 	): bool {
 		// Source filter intersects with the other filters: a row passes iff
 		// at least one of its links matches both the source and the other
@@ -1441,6 +1572,10 @@ final class TranslationsPage {
 		}
 
 		foreach ( $translation_map as $link ) {
+			if ( $source_language_id > 0 && (int) ( $link->language_id ?? 0 ) === $source_language_id ) {
+				continue;
+			}
+
 			if ( $link->status === $filter_status ) {
 				return true;
 			}

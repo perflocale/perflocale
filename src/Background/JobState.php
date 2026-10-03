@@ -75,6 +75,13 @@ final class JobState {
 	public const STUCK_TIMEOUT = 6 * HOUR_IN_SECONDS;
 
 	/**
+	 * Seconds a `running` job must go without a status update before
+	 * {@see worker_gone()} considers it. Covers the moment between a
+	 * scheduled event starting and its worker taking the job lock.
+	 */
+	public const WORKER_GONE_GRACE = 300;
+
+	/**
 	 * Cap on the JSON-encoded `result` payload before truncation.
 	 */
 	public const MAX_RESULT_BYTES = 65536;
@@ -314,22 +321,123 @@ final class JobState {
 	}
 
 	/**
+	 * Whether the worker of a `running` job is gone.
+	 *
+	 * A worker takes the job's lock ({@see JobLock}) before it claims the
+	 * row, refreshes it from its progress callback and releases it in
+	 * `finally`, also when it pauses or leaves the job for a later run.
+	 * A worker killed without a shutdown (SIGKILL, out of memory, a PHP-FPM
+	 * restart) never releases it: the row stays `running` and the lock
+	 * row expires. So the worker is gone when the job has had no status
+	 * update for {@see WORKER_GONE_GRACE} seconds and:
+	 * - its lock row has expired, or
+	 * - it has no lock row (the daily lock sweep removed it) and nothing is
+	 *   scheduled to run it.
+	 *
+	 * Reads the lock row from the database, not the options cache.
+	 *
+	 * @param array<string, mixed> $state A row from {@see get()}.
+	 * @return bool
+	 */
+	public static function worker_gone( array $state ): bool {
+		$job_id = (string) ( $state['id'] ?? '' );
+
+		if ( 'running' !== (string) ( $state['status'] ?? '' ) || ! self::is_safe_id( $job_id ) ) {
+			return false;
+		}
+
+		if ( (int) ( $state['updated_at'] ?? 0 ) > time() - self::WORKER_GONE_GRACE ) {
+			return false;
+		}
+
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- A lock is read past the options cache, like JobLock's own compare-and-swap.
+		$stored  = (string) $wpdb->get_var(
+			$wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, JobLock::PREFIX . $job_id )
+		);
+		$expires = (int) strtok( $stored, '|' );
+
+		if ( $stored !== '' ) {
+			return $expires > 0 && $expires <= time();
+		}
+
+		try {
+			return ! JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->is_scheduled( $job_id );
+		} catch ( \Throwable $e ) {
+			return false;
+		}
+	}
+
+	/**
+	 * Mark a `running` job failed when its worker is gone ({@see worker_gone()}).
+	 *
+	 * The row becomes `failed` (the Jobs page offers Retry) and an
+	 * identical dispatch is no longer folded into it. The write only lands
+	 * while the row is still `running` without a newer status update.
+	 *
+	 * @param string $job_id UUID.
+	 * @return bool True when this call marked the job failed.
+	 */
+	public static function fail_if_worker_gone( string $job_id ): bool {
+		$state = self::get( $job_id );
+
+		if ( ! $state || ! self::worker_gone( $state ) ) {
+			return false;
+		}
+
+		global $wpdb;
+		$now = current_time( 'mysql', true );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$affected = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE %i
+			 SET status = 'failed',
+			     completed_at = %s,
+			     updated_at = %s,
+			     error = %s,
+			     version = version + 1
+			 WHERE uuid = %s AND status = 'running' AND updated_at <= %s",
+				Schema::table( 'jobs' ),
+				$now,
+				$now,
+				self::truncate_error( __( 'The worker stopped without finishing: its lock expired and nothing continued the job. The job was marked failed; run it again or retry it from the Jobs page.', 'perflocale' ) ),
+				$job_id,
+				gmdate( 'Y-m-d H:i:s', time() - self::WORKER_GONE_GRACE )
+			)
+		);
+
+		return 1 === (int) $affected;
+	}
+
+	/**
 	 * Update progress counters. Status-guarded so a tick can't resurrect
 	 * a terminal row.
+	 *
+	 * The percent shown is `processed / total`, or `$percent` when the job
+	 * gives one (a job whose counters cover its current stage only). It
+	 * stays below 100 until the job completes.
 	 *
 	 * @param string $job_id    UUID.
 	 * @param int    $processed Items processed.
 	 * @param int    $total     Total items (0 = indeterminate).
+	 * @param int    $percent   Overall percent, or -1 to compute it from the counters.
 	 * @return void
 	 */
-	public static function update_progress( string $job_id, int $processed, int $total ): void {
+	public static function update_progress( string $job_id, int $processed, int $total, int $percent = -1 ): void {
 		if ( ! self::is_safe_id( $job_id ) ) {
 			return;
 		}
 
 		$processed = max( 0, $processed );
 		$total     = max( 0, $total );
-		$progress  = ( $total > 0 ) ? (int) min( 99, floor( $processed * 100 / $total ) ) : 0;
+
+		if ( $percent >= 0 ) {
+			$progress = min( 99, $percent );
+		} else {
+			$progress = ( $total > 0 ) ? (int) min( 99, floor( $processed * 100 / $total ) ) : 0;
+		}
 
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
@@ -358,13 +466,18 @@ final class JobState {
 	/**
 	 * Mark a running job complete. Progress flips to 100, completed_at set.
 	 *
+	 * Returns whether THIS call moved the row running -> complete. False
+	 * means it did not: the write failed, or the row was no longer
+	 * `running` (canceled, already finished, failed by the watchdog, or
+	 * gone). The worker fires `perflocale/jobs/completed` only on true.
+	 *
 	 * @param string               $job_id UUID.
 	 * @param array<string, mixed> $result Worker output (truncated to MAX_RESULT_BYTES).
-	 * @return void
+	 * @return bool True when the row moved running -> complete.
 	 */
-	public static function mark_complete( string $job_id, array $result = [] ): void {
+	public static function mark_complete( string $job_id, array $result = [] ): bool {
 		if ( ! self::is_safe_id( $job_id ) ) {
-			return;
+			return false;
 		}
 
 		global $wpdb;
@@ -379,7 +492,7 @@ final class JobState {
 		// Only transitions from `running`. A row that was canceled mid-flight
 		// stays canceled — the worker's mark_complete is a no-op.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
-		$wpdb->query(
+		$affected = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE %i
 			 SET status = 'complete',
@@ -396,6 +509,50 @@ final class JobState {
 				$job_id
 			)
 		);
+
+		// `false` is a query error; 0 is "the row was not running".
+		return 1 === (int) $affected;
+	}
+
+	/**
+	 * Store a result on a job that ended without completing: a canceled job's
+	 * partial counts, or a failed run's counts. Complete and queued rows are
+	 * left alone (a retry resets the row, and mark_complete() owns the result
+	 * of a finished job).
+	 *
+	 * @param string               $job_id UUID.
+	 * @param array<string, mixed> $result Result payload (truncated like mark_complete()).
+	 * @return bool True when a row was updated.
+	 */
+	public static function record_result( string $job_id, array $result ): bool {
+		if ( ! self::is_safe_id( $job_id ) || $result === [] ) {
+			return false;
+		}
+
+		global $wpdb;
+		$table = Schema::table( 'jobs' );
+
+		$result_json = wp_json_encode( self::truncate_result( $result ) );
+		if ( $result_json === false ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$affected = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE %i
+			 SET result = %s,
+			     updated_at = %s,
+			     version = version + 1
+			 WHERE uuid = %s AND status IN ('canceled', 'running', 'failed')",
+				$table,
+				$result_json,
+				current_time( 'mysql', true ),
+				$job_id
+			)
+		);
+
+		return 1 === (int) $affected;
 	}
 
 	/**
@@ -442,11 +599,12 @@ final class JobState {
 	 * the runner's job ({@see JobRunnerInterface::cancel()}).
 	 *
 	 * @param string $job_id UUID.
-	 * @return void
+	 * @return bool True when this call moved the row to `canceled`. False
+	 *              when the write failed or the row was not queued/running.
 	 */
-	public static function cancel( string $job_id ): void {
+	public static function cancel( string $job_id ): bool {
 		if ( ! self::is_safe_id( $job_id ) ) {
-			return;
+			return false;
 		}
 
 		global $wpdb;
@@ -456,7 +614,7 @@ final class JobState {
 		// Only queued/running can be canceled. Already-terminal rows are
 		// idempotent no-ops.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
-		$wpdb->query(
+		$affected = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE %i
 			 SET status = 'canceled',
@@ -470,6 +628,50 @@ final class JobState {
 				$job_id
 			)
 		);
+
+		return 1 === (int) $affected;
+	}
+
+	/**
+	 * Fail a job that an operator retry reset to `queued` when its worker
+	 * event could not be scheduled, so the row is retryable again at once.
+	 *
+	 * Unlike {@see mark_failed()}, only a still-`queued` row is touched: a
+	 * row a worker has claimed in the meantime (from an event stored despite
+	 * the reported failure) keeps running and is left to that worker.
+	 *
+	 * @param string $job_id UUID.
+	 * @param string $error  Human-readable error message (truncated).
+	 * @return bool True when the row moved queued -> failed.
+	 */
+	public static function fail_queued( string $job_id, string $error ): bool {
+		if ( ! self::is_safe_id( $job_id ) ) {
+			return false;
+		}
+
+		global $wpdb;
+		$table = Schema::table( 'jobs' );
+		$now   = current_time( 'mysql', true );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$affected = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE %i
+			 SET status = 'failed',
+			     completed_at = %s,
+			     updated_at = %s,
+			     error = %s,
+			     version = version + 1
+			 WHERE uuid = %s AND status = 'queued'",
+				$table,
+				$now,
+				$now,
+				self::truncate_error( $error ),
+				$job_id
+			)
+		);
+
+		return 1 === (int) $affected;
 	}
 
 	/**
@@ -541,9 +743,12 @@ final class JobState {
 	 *
 	 * @param string $job_id  UUID.
 	 * @param string $message Log message (truncated to 500 chars).
+	 * @param string $key     Optional fixed key stored with the entry as
+	 *                        `k`, so code can recognise its own line in
+	 *                        whatever language the message was written.
 	 * @return void
 	 */
-	public static function append_log( string $job_id, string $message ): void {
+	public static function append_log( string $job_id, string $message, string $key = '' ): void {
 		if ( ! self::is_safe_id( $job_id ) ) {
 			return;
 		}
@@ -561,6 +766,10 @@ final class JobState {
 			// returns false on PHP 8 and dropped the message entirely.
 			'm' => mb_substr( $message, 0, 500 ),
 		];
+
+		if ( '' !== $key ) {
+			$entry['k'] = $key;
+		}
 
 		for ( $attempt = 0; $attempt < self::CAS_MAX_RETRIES; $attempt++ ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
@@ -633,11 +842,10 @@ final class JobState {
 	/**
 	 * Is one of OUR long-running jobs currently in flight?
 	 *
-	 * Used to scope the `action_scheduler_failure_period` filter. That filter is
-	 * store-wide — Action Scheduler passes the callback no action context — so
-	 * raising the failure window unconditionally would delay reclamation of
-	 * EVERY plugin's stuck actions, not just ours. Answering "no" here hands the
-	 * incoming value straight back, leaving other plugins on AS's own cadence.
+	 * Answers for any `running` row, whether its worker is alive or gone. The
+	 * `action_scheduler_failure_period` filter uses
+	 * {@see has_live_job_in_flight()}, which leaves out running rows whose
+	 * worker is gone; this method stays part of the public API.
 	 *
 	 * NOT MEMOISED, deliberately. This used to cache the answer in a
 	 * function-local static, on the reasoning that it "cannot meaningfully
@@ -660,10 +868,7 @@ final class JobState {
 	 * Keying the static by blog would fix half of it and leave the time half, so
 	 * the memo is simply gone. Measured cost of not having it: 0.0435 ms per
 	 * call (2,000 calls, `type=ref` on the `status_updated` covering index,
-	 * `Using index`, no row reads). The only caller is the
-	 * `action_scheduler_failure_period` filter, which runs during Action
-	 * Scheduler queue processing and never on a front-end page request. There is
-	 * nothing here worth caching.
+	 * `Using index`, no row reads). There is nothing here worth caching.
 	 *
 	 * @return bool True when at least one job row on the CURRENT blog is `running`.
 	 */
@@ -680,6 +885,99 @@ final class JobState {
 		);
 
 		return null !== $found;
+	}
+
+	/**
+	 * Is one of OUR jobs running with a live worker?
+	 *
+	 * Scopes the `action_scheduler_failure_period` filter. That filter is
+	 * store-wide — Action Scheduler passes the callback no action context — so
+	 * raising the failure window unconditionally would delay reclamation of
+	 * EVERY plugin's stuck actions, not just ours. Answering "no" here hands the
+	 * incoming value straight back, leaving other plugins on AS's own cadence.
+	 *
+	 * A `running` job counts while its worker is alive: its row had a status
+	 * update within {@see WORKER_GONE_GRACE} seconds, or its per-job lock row
+	 * ({@see JobLock}) has not expired. A job whose worker was killed stops
+	 * counting once its lock expires ({@see worker_gone()}), so Action
+	 * Scheduler fails the dead worker's action at its next queue run instead of
+	 * holding the queue for STUCK_TIMEOUT.
+	 *
+	 * Two reads and no JOIN, because the jobs table and wp_options can have
+	 * different collations: the 50 most recently updated running rows, then
+	 * their lock rows, whose expiry is compared here. Not memoised, for the
+	 * reasons given at {@see has_long_job_in_flight()}. It runs only inside that
+	 * filter, which only Action Scheduler's queue cleaner applies, never on a
+	 * front-end request. A failed read answers true: the longer failure period
+	 * is the safe side.
+	 *
+	 * @return bool True when a job on the CURRENT blog is running with a live worker.
+	 */
+	public static function has_live_job_in_flight(): bool {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return true;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Job state is not cacheable; the table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT uuid, updated_at FROM %i WHERE status = %s ORDER BY updated_at DESC LIMIT 50',
+				Schema::table( 'jobs' ),
+				'running'
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $rows ) || self::last_read_failed() ) {
+			return true;
+		}
+
+		// `Y-m-d H:i:s` UTC strings compare in time order.
+		$fresh_after = gmdate( 'Y-m-d H:i:s', time() - self::WORKER_GONE_GRACE );
+		$lock_names  = [];
+
+		foreach ( $rows as $row ) {
+			$updated = $row['updated_at'] ?? null;
+			$uuid    = $row['uuid'] ?? null;
+
+			if ( is_string( $updated ) && $updated > $fresh_after ) {
+				return true;
+			}
+
+			if ( is_string( $uuid ) ) {
+				$lock_names[] = JobLock::PREFIX . $uuid;
+			}
+		}
+
+		if ( [] === $lock_names ) {
+			return false;
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $lock_names ), '%s' ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders -- Lock rows are read past the options cache, like JobLock's own compare-and-swap; $placeholders is one %s per name.
+		$values = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_value FROM %i WHERE option_name IN ({$placeholders})",
+				array_merge( [ $wpdb->options ], $lock_names )
+			)
+		);
+
+		if ( self::last_read_failed() ) {
+			return true;
+		}
+
+		$now = time();
+
+		foreach ( $values as $value ) {
+			if ( is_string( $value ) && (int) strtok( $value, '|' ) > $now ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -788,6 +1086,11 @@ final class JobState {
 	 * inline. `error` is kept because the admin table surfaces it next to
 	 * the status, and it's a small VARCHAR(2000) anyway.
 	 *
+	 * Each row also carries `stage`: for a running job, the key of the last
+	 * stage its worker started (log line keyed `stage:<key>`, see
+	 * WorkerRegistry), else ''. Only running rows read their log, which
+	 * holds at most {@see MAX_LOG_ENTRIES} entries.
+	 *
 	 * Used by the polled REST endpoint and the JobsPage initial render.
 	 * Callers that need full data (Resumer, WP-CLI, GET /jobs/{id} detail
 	 * endpoint) keep using `list_active()`.
@@ -804,10 +1107,13 @@ final class JobState {
 			$wpdb->prepare(
 				'SELECT id, uuid, type, hook, engine, status, progress, total, processed,
 				        attempts, created_by, blog_id, version, created_at, started_at,
-				        completed_at, updated_at, error
+				        completed_at, updated_at, error,
+				        CASE WHEN status = %s THEN log ELSE %s END AS stage_log
 				 FROM %i
 				 ORDER BY updated_at DESC, id DESC
 				 LIMIT %d',
+				'running',
+				'',
 				$table,
 				$cap
 			),
@@ -816,6 +1122,9 @@ final class JobState {
 
 		$out = [];
 		foreach ( (array) $rows as $row ) {
+			$stage_log = (string) ( $row['stage_log'] ?? '' );
+			unset( $row['stage_log'] );
+
 			// Synthesize the omitted columns so hydrate()'s shape stays
 			// consistent — downstream consumers can rely on the same keys
 			// being present even when they hold empty placeholders.
@@ -824,9 +1133,38 @@ final class JobState {
 			$row['log']    = '';
 
 			$h               = self::hydrate( $row );
+			$h['stage']      = self::current_stage( $stage_log );
 			$out[ $h['id'] ] = $h;
 		}
 		return $out;
+	}
+
+	/**
+	 * The key of the last stage a job's log records, or ''.
+	 *
+	 * @param string $log_json The job's `log` column.
+	 * @return string
+	 */
+	private static function current_stage( string $log_json ): string {
+		if ( $log_json === '' ) {
+			return '';
+		}
+
+		$log = json_decode( $log_json, true );
+
+		if ( ! is_array( $log ) ) {
+			return '';
+		}
+
+		foreach ( array_reverse( $log ) as $entry ) {
+			$key = is_array( $entry ) && isset( $entry['k'] ) ? (string) $entry['k'] : '';
+
+			if ( str_starts_with( $key, 'stage:' ) ) {
+				return sanitize_key( substr( $key, 6 ) );
+			}
+		}
+
+		return '';
 	}
 
 	/**
@@ -897,11 +1235,12 @@ final class JobState {
 	 * cannot prove it owns is left alone for the age sweep — losing a file is
 	 * worse than keeping one a few days longer.
 	 *
-	 * @param string $job_id Job UUID.
+	 * @param string                    $job_id Job UUID.
+	 * @param array<string, mixed>|null $state  The job's row when the caller already read it (and has since deleted it); null reads it.
 	 * @return bool True when a file was removed.
 	 */
-	private static function delete_owned_artifact( string $job_id ): bool {
-		$state = self::get( $job_id );
+	private static function delete_owned_artifact( string $job_id, ?array $state = null ): bool {
+		$state = $state ?? self::get( $job_id );
 
 		if ( ! is_array( $state ) ) {
 			return false;
@@ -1001,9 +1340,23 @@ final class JobState {
 	 * Single indexed UPDATE thanks to `KEY created_by`. No per-row reads.
 	 *
 	 * @param int $user_id
-	 * @return int Number of rows affected.
+	 * @return int Number of rows affected; 0 when the UPDATE fails.
 	 */
 	public static function anonymize_for_user( int $user_id ): int {
+		return (int) self::try_anonymize_for_user( $user_id );
+	}
+
+	/**
+	 * {@see anonymize_for_user()}, but a failed UPDATE returns null instead
+	 * of 0, so the privacy eraser can tell "nothing to anonymise" from "could
+	 * not anonymise" and report the rows it left behind.
+	 *
+	 * @internal
+	 *
+	 * @param int $user_id User whose jobs lose their `created_by`.
+	 * @return int|null Number of rows affected, or null when the UPDATE failed.
+	 */
+	public static function try_anonymize_for_user( int $user_id ): ?int {
 		if ( $user_id <= 0 ) {
 			return 0;
 		}
@@ -1023,6 +1376,13 @@ final class JobState {
 			)
 		);
 
+		// wpdb returns false on a database error and also when a `query`
+		// filter empties the statement, which leaves last_error untouched,
+		// so the return value is the only reliable failure signal.
+		if ( false === $affected ) {
+			return null;
+		}
+
 		return max( 0, (int) $affected );
 	}
 
@@ -1033,6 +1393,8 @@ final class JobState {
 	 * Two indexed queries replace the option-store's full-index walk:
 	 *   - stuck-job scan: `status_updated` index, range scan
 	 *   - terminal pruning: `status_updated` index, range scan
+	 * Finished `data_export` rows are pruned one by one first, each with
+	 * the export file it owns ({@see gc_exports()}).
 	 *
 	 * @return int Rows removed.
 	 */
@@ -1110,9 +1472,16 @@ final class JobState {
 			}
 		}
 
+		// Finished exports first: their row is the only record of the export
+		// file, which the Jobs page offers for download while the row exists.
+		// Each row is deleted on its own, and only a row this call deleted has
+		// its file removed; a row that changed since the read stays, with its
+		// file.
+		$removed = self::gc_exports( $history_mysql );
+
 		// Terminal-row pruning.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
-		$removed = (int) $wpdb->query(
+		$removed += (int) $wpdb->query(
 			$wpdb->prepare(
 				"DELETE FROM %i
 			 WHERE status IN ('complete', 'failed', 'canceled') AND updated_at < %s",
@@ -1125,6 +1494,63 @@ final class JobState {
 		self::sweep_expired_locks();
 
 		\PerfLocale\Background\BackgroundEvents::record_run( 'perflocale_jobs_gc', $started );
+
+		return $removed;
+	}
+
+	/**
+	 * Delete finished export jobs older than the history cutoff, with their files.
+	 *
+	 * At most 500 rows per call; the bulk prune in {@see gc()} removes the
+	 * rest of the rows and the daily age sweep the rest of the files.
+	 *
+	 * @param string $cutoff GMT datetime; terminal rows last updated before it are deleted.
+	 * @return int Rows deleted.
+	 */
+	private static function gc_exports( string $cutoff ): int {
+		global $wpdb;
+		$table = Schema::table( 'jobs' );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$ids = (array) $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT uuid FROM %i
+			 WHERE type = %s AND status IN ('complete', 'failed', 'canceled') AND updated_at < %s
+			 LIMIT 500",
+				$table,
+				'data_export',
+				$cutoff
+			)
+		);
+
+		$removed = 0;
+
+		foreach ( $ids as $uuid ) {
+			$uuid  = (string) $uuid;
+			$state = self::is_safe_id( $uuid ) ? self::get_fresh( $uuid ) : null;
+
+			if ( ! is_array( $state ) ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+			$deleted = $wpdb->query(
+				$wpdb->prepare(
+					"DELETE FROM %i
+				 WHERE uuid = %s AND status IN ('complete', 'failed', 'canceled') AND updated_at < %s",
+					$table,
+					$uuid,
+					$cutoff
+				)
+			);
+
+			if ( 1 !== (int) $deleted ) {
+				continue;
+			}
+
+			++$removed;
+			self::delete_owned_artifact( $uuid, $state );
+		}
 
 		return $removed;
 	}
@@ -1237,6 +1663,25 @@ final class JobState {
 						$stale_h
 					)
 				);
+			}
+		}
+
+		// Running jobs whose worker is gone (see worker_gone()): found within
+		// an hour of their lock expiring instead of after STUCK_TIMEOUT.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		$running = (array) $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT uuid FROM %i
+			 WHERE status = 'running' AND updated_at <= %s
+			 LIMIT 500",
+				$table,
+				gmdate( 'Y-m-d H:i:s', $now - self::WORKER_GONE_GRACE )
+			)
+		);
+
+		foreach ( $running as $uuid ) {
+			if ( self::fail_if_worker_gone( (string) $uuid ) ) {
+				++$surfaced;
 			}
 		}
 
@@ -1360,6 +1805,12 @@ final class JobState {
 	 * predecessor — JobLock still uses options for its per-job + per-type
 	 * locks, and dead UUID rows accumulate without a sweep.
 	 *
+	 * A per-job lock row stays, expired or not, while its job row is
+	 * `running`: {@see worker_gone()} reads it to tell a killed worker from
+	 * one whose scheduled action is still in progress. The watchdog or the
+	 * Action Scheduler bridge fails such a job, and the next sweep removes
+	 * the row. Type locks are swept whatever the state of their jobs.
+	 *
 	 * @return int Number of stale locks removed.
 	 */
 	private static function sweep_expired_locks(): int {
@@ -1400,6 +1851,26 @@ final class JobState {
 				continue;
 			}
 
+			if ( JobLock::PREFIX === $prefix ) {
+				// Keep the lock rows of running jobs. When the running jobs
+				// cannot be read, no per-job row is swept in this run.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- The table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+				$running = $wpdb->get_col(
+					$wpdb->prepare( 'SELECT uuid FROM %i WHERE status = %s', Schema::table( 'jobs' ), 'running' )
+				);
+
+				if ( self::last_read_failed() ) {
+					continue;
+				}
+
+				$keep  = array_map( static fn( string $uuid ): string => JobLock::PREFIX . $uuid, array_filter( $running, 'is_string' ) );
+				$names = array_values( array_diff( $names, $keep ) );
+
+				if ( empty( $names ) ) {
+					continue;
+				}
+			}
+
 			$placeholders = implode( ',', array_fill( 0, count( $names ), '%s' ) );
 
 			// Re-assert at DELETE time the exact predicate that qualified these
@@ -1432,6 +1903,23 @@ final class JobState {
 		}
 
 		return $pruned;
+	}
+
+	/**
+	 * Whether the database read that just ran failed.
+	 *
+	 * On a query error wpdb returns an empty result, and it clears last_error
+	 * at the start of every query, so a non-empty last_error right after a
+	 * read belongs to that read.
+	 *
+	 * @phpstan-impure
+	 *
+	 * @return bool
+	 */
+	private static function last_read_failed(): bool {
+		global $wpdb;
+
+		return $wpdb instanceof \wpdb && '' !== $wpdb->last_error;
 	}
 
 	/**

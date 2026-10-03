@@ -102,19 +102,28 @@
 					// Apply the returned rates back into each language's
 					// rate input. Match each input's `name` attribute to
 					// the corresponding currency_code input so we know
-					// which row goes with which language.
-					if ( resp.data.rates ) {
+					// which row goes with which language. A row pinned as
+					// manual keeps its rate, and only a finite number above
+					// zero is written.
+					if ( resp.data.rates && typeof resp.data.rates === 'object' ) {
 						document.querySelectorAll( '.perflocale-rate-input' ).forEach( function ( input ) {
 							var name  = input.getAttribute( 'name' ) || '';
 							var match = name.match( /wc_currencies\[([^\]]+)\]\[exchange_rate\]/ );
 							if ( ! match ) { return; }
 
-							var slug      = match[ 1 ];
-							var codeInput = document.querySelector( 'input[name="wc_currencies[' + slug + '][currency_code]"]' );
+							var slug        = match[ 1 ];
+							var codeInput   = document.querySelector( 'input[name="wc_currencies[' + slug + '][currency_code]"]' );
+							var manualInput = document.querySelector( 'input[name="wc_currencies[' + slug + '][manual_rate]"]' );
 
-							if ( codeInput && resp.data.rates[ codeInput.value.toUpperCase() ] ) {
-								input.value = parseFloat( resp.data.rates[ codeInput.value.toUpperCase() ] ).toFixed( 6 );
-							}
+							if ( ! codeInput || ( manualInput && manualInput.checked ) ) { return; }
+
+							var code = codeInput.value.toUpperCase();
+							if ( ! Object.prototype.hasOwnProperty.call( resp.data.rates, code ) ) { return; }
+
+							var rate = resp.data.rates[ code ];
+							if ( typeof rate !== 'number' || ! isFinite( rate ) || rate <= 0 ) { return; }
+
+							input.value = rate.toFixed( 6 );
 						} );
 					}
 				} )
@@ -161,8 +170,22 @@
 			data.append( 'action', 'perflocale_create_wc_pages' );
 			data.append( '_nonce', d.createPagesNonce );
 
-			fetch( ajaxurl, { method: 'POST', body: data, credentials: 'same-origin' } )
-				.then( function ( r ) { return r.json(); } )
+			var send = function () {
+				return fetch( ajaxurl, { method: 'POST', body: data, credentials: 'same-origin' } )
+					.then( function ( r ) { return r.json(); } );
+			};
+
+			// While imported WPML, Polylang or TranslatePress data is missing,
+			// the tool answers with a question first; resend only on OK.
+			send()
+				.then( function ( resp ) {
+					if ( resp && ! resp.success && resp.data && resp.data.code === 'perflocale_unimported_source'
+						&& window.confirm( resp.data.message + '\n\n' + ( resp.data.confirm || '' ) ) ) {
+						data.append( 'continue_unimported', '1' );
+						return send();
+					}
+					return resp;
+				} )
 				.then( function ( resp ) {
 					clearInterval( pInterval );
 					if ( bar )     bar.style.width    = '100%';

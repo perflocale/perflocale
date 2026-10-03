@@ -209,6 +209,7 @@ final class BlockTemplateTranslator {
 
 		add_action( 'perflocale/language/detected', [ $this, 'attach' ], 20 );
 		add_action( 'perflocale/language/overridden', [ $this, 'relanguage' ], 20 );
+		add_action( 'perflocale/language/restored', [ $this, 'relanguage' ], 20 );
 	}
 
 	/**
@@ -442,26 +443,37 @@ final class BlockTemplateTranslator {
 		// `<header class="wp-block-template-part"></header>` — the entire
 		// header gone — and that is the DEFAULT state of a fresh translation.
 		// Re-verify against the post itself, exactly as the template branch
-		// does, which also closes any staleness between priming and use.
+		// does: type, status, content and slug all come from this live row,
+		// never from the map.
 		$translation = get_post( $map[ $slug ]['id'] );
 
 		// The empty-slug arm closes a latent hole independent of staleness: the
 		// prime SQL constrains `src.post_name <> ''` but never `tr.post_name`,
-		// so a translation with an empty slug would be written into attrs and
-		// resolve to nothing — and core renders '' for an unresolvable part,
-		// removing the whole block INCLUDING its wrapper, not merely emptying
-		// it (wp-includes/blocks/template-part.php). A blank header is the one
+		// and a write after priming can blank it as well, so a translation with
+		// an empty slug would be written into attrs and resolve to nothing —
+		// and core renders '' for an unresolvable part, removing the whole
+		// block INCLUDING its wrapper, not merely emptying it
+		// (wp-includes/blocks/template-part.php). A blank header is the one
 		// failure mode this feature must never produce.
 		if ( ! $translation instanceof \WP_Post
 			|| $translation->post_type !== 'wp_template_part'
 			|| $translation->post_status !== 'publish'
-			|| (string) $map[ $slug ]['slug'] === ''
+			|| (string) $translation->post_name === ''
 			|| trim( (string) $translation->post_content ) === ''
 		) {
 			return $parsed_block;
 		}
 
-		// ⚠️ THE ONE STALENESS CASE LEFT, AND WHY IT IS OFF BY DEFAULT.
+		// ⚠️ STALENESS THE LIVE ROW CANNOT SHOW, AND WHY ITS CHECK IS OFF BY
+		// DEFAULT.
+		//
+		// The map is a per-request memo. What the row itself can answer (type,
+		// status, content, slug) is read above; what it cannot — the translation
+		// link, a translation published after a cached miss, the theme term —
+		// stays as primed until reset_memo(). Code that mutates templates and
+		// renders them in the same request calls reset_memo() in between. Only
+		// the theme term can turn that into a blank; the others serve the
+		// source or a still-published translation.
 		//
 		// The map is primed by a query that requires the translation to carry
 		// the active theme's `wp_theme` term. Strip that term AFTER priming —
@@ -499,9 +511,11 @@ final class BlockTemplateTranslator {
 			}
 		}
 
-		// The translation's OWN post_name, read from the database — never a
-		// slug derived here, which could disagree with the row core will find.
-		$parsed_block['attrs']['slug'] = $map[ $slug ]['slug'];
+		// The translation's OWN post_name from the live row — not the primed
+		// snapshot, which a rename after priming would leave naming a row core
+		// can no longer find (the whole block then renders ''), and never a slug
+		// derived here, which could disagree with the row core will find.
+		$parsed_block['attrs']['slug'] = (string) $translation->post_name;
 
 		return $parsed_block;
 	}

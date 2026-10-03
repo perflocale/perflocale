@@ -47,7 +47,9 @@ final class WebhookController extends RestController {
 	public const DELIVERY_HOOK = 'perflocale_deliver_webhook';
 
 	/**
-	 * Cron hook used for webhook delivery retries (attempts 2+).
+	 * Cron hook for deliveries that carry their delivery id: retries
+	 * (attempts 2+), breaker deferrals, and deliveries scheduled one by one
+	 * because the coalesced queue write was refused (attempt 1).
 	 */
 	public const RETRY_HOOK = 'perflocale_retry_webhook';
 
@@ -374,25 +376,33 @@ final class WebhookController extends RestController {
 	 * targets are refused here. Sites that genuinely need internal delivery
 	 * can opt in via the filter.
 	 *
-	 * @param string $url        Raw URL.
-	 * @param bool   $filterable Whether to run the `perflocale/webhooks/url_safe`
+	 * @param string                  $url        Raw URL.
+	 * @param bool                    $filterable Whether to run the `perflocale/webhooks/url_safe`
 	 *   filter on the verdict. True for every caller-supplied URL; the AAAA
 	 *   re-entry below passes false so a site's filter is never handed a
 	 *   synthetic `https://[<ipv6>]/` URL nobody registered.
+	 * @param string|null             $reason     Out: why the URL was refused; '' when it is safe.
+	 * @param array<int, string>|null $addresses  Out: for a host name this check judged
+	 *   safe, the addresses it judged (the A answer, then each AAAA answer),
+	 *   which delivery connects to; empty for an IP literal, for a refused URL
+	 *   and for a verdict the url_safe filter reversed.
+	 * @param-out array<int, string> $addresses
 	 * @return bool True if safe to deliver to.
 	 */
-	private function is_url_safe( string $url, bool $filterable = true, ?string &$reason = null ): bool {
-		// Out-param rather than a richer return type: this method has two early
+	private function is_url_safe( string $url, bool $filterable = true, ?string &$reason = null, ?array &$addresses = null ): bool {
+		// Out-params rather than a richer return type: this method has two early
 		// `return false` exits and a filtered tail return, and widening the
 		// return of a ~250-line security-critical method is the narrow-type
-		// change that has already caused a fatal in this codebase once. Every
-		// existing caller passes two arguments or fewer and is unaffected.
+		// change that has already caused a fatal in this codebase once. A caller
+		// that passes fewer arguments is unaffected.
 		//
 		// The distinction that matters to callers is POLICY (this URL must never
 		// be delivered to) versus UNDETERMINED (the resolver could not answer
 		// right now). The delivery path retries the second and not the first.
-		$reason = '';
-		$parts  = wp_parse_url( $url );
+		$reason    = '';
+		$addresses = [];
+		$judged    = [];
+		$parts     = wp_parse_url( $url );
 
 		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
 			$reason = 'unparseable_url';
@@ -519,13 +529,14 @@ final class WebhookController extends RestController {
 			}
 		}
 
-		// IP literal - reject loopback, link-local, and RFC1918 ranges.
+		// IP literal - reject loopback, link-local, private, shared, reserved
+		// and multicast ranges.
 		$is_ip_literal = Helper::is_ip( $host_ip );
 
 		if ( $is_ip_literal ) {
-			// Helper::is_public_ipv4() judges both families; the fc00::/7 and
-			// fe80::/10 byte checks below are a second layer.
-			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
+			// Helper::is_public_outbound_address() judges both families; the
+			// fc00::/7 and fe80::/10 byte checks below are a second layer.
+			if ( ! Helper::is_public_outbound_address( $host_ip ) ) {
 				$safe   = false;
 				$reason = 'private_address';
 			}
@@ -580,13 +591,14 @@ final class WebhookController extends RestController {
 				// path treats it as retryable rather than destroying the event.
 				$reason = 'unresolvable';
 				$safe   = false;
-			} elseif ( ! Helper::is_public_ipv4( $resolved ) ) {
-				// Resolved to a private (RFC1918) or reserved IPv4 range.
+			} elseif ( ! Helper::is_public_outbound_address( $resolved ) ) {
+				// Resolved to a private (RFC1918), shared, reserved or
+				// multicast IPv4 range.
 				$reason = 'private_address';
 				$safe   = false;
 			} elseif ( str_starts_with( $resolved, '127.' ) ) {
-				// Loopback 127.0.0.0/8. Helper::is_public_ipv4() above already
-				// rejects it; this is a second layer.
+				// Loopback 127.0.0.0/8. Helper::is_public_outbound_address()
+				// above already rejects it; this is a second layer.
 				$reason = 'loopback_address';
 				$safe   = false;
 			}
@@ -599,7 +611,9 @@ final class WebhookController extends RestController {
 			// url_safe filter is not handed a URL nobody registered. An IP
 			// literal never reaches this branch, so the recursion is one level
 			// deep. Mirrors AbstractProvider::validate_url(); keep in sync.
-			foreach ( ( $safe ? self::resolve_aaaa( $host ) : [] ) as $ipv6 ) {
+			$aaaa = $safe ? self::resolve_aaaa( $host ) : [];
+
+			foreach ( $aaaa as $ipv6 ) {
 				// The inner call writes its reason into ITS OWN by-ref parameter,
 				// which is discarded here — so without this the outer $reason
 				// stayed empty and the tail below labelled it 'rejected', telling
@@ -613,6 +627,13 @@ final class WebhookController extends RestController {
 					$reason = '' !== $ipv6_reason ? $ipv6_reason : 'private_address';
 					break;
 				}
+			}
+
+			// Every answer above passed, so these are the addresses a delivery
+			// may connect to; the transport is pinned to them rather than to a
+			// second lookup of its own.
+			if ( $safe ) {
+				$judged = array_merge( [ $resolved ], $aaaa );
 			}
 		}
 
@@ -634,6 +655,11 @@ final class WebhookController extends RestController {
 
 		if ( $filtered ) {
 			$reason = '';
+
+			// A URL this check refused and the filter accepted (a site's
+			// opt-in to internal delivery) has no judged address to pin to,
+			// and is delivered through the transport's own lookup.
+			$addresses = $safe ? $judged : [];
 		} elseif ( $reason === '' ) {
 			// Only reachable when a site's own filter flipped the verdict — every
 			// check above now names its own reason, so an unset reason here means
@@ -784,7 +810,7 @@ final class WebhookController extends RestController {
 		$response = Lock::with(
 			'webhooks_write',
 			10,
-			function () use ( $id, $url, $events, $secret ): array {
+			function () use ( $id, $url, $events, $secret ): array|string {
 				// Force a fresh DB read inside the lock. Without a persistent
 				// object cache this process may hold a stale options copy from
 				// before a concurrent lock-holder's update_option(), and would
@@ -803,7 +829,12 @@ final class WebhookController extends RestController {
 				// autoload=false: webhook delivery runs in cron/hook context where
 				// the extra get_option() query is cheap, and HMAC secrets stored
 				// here should not sit in `alloptions` on every page load.
-				update_option( self::OPTION_KEY, $webhooks, false );
+				// A fresh uuid key always changes the value read above, so false
+				// is a refused write (a failed query or a pre_update_option
+				// veto), not a no-op.
+				if ( ! update_option( self::OPTION_KEY, $webhooks, false ) ) {
+					return 'write_failed';
+				}
 
 				return $webhooks[ $id ];
 			}
@@ -811,6 +842,11 @@ final class WebhookController extends RestController {
 
 		if ( $response === null ) {
 			return $this->error( 'lock_unavailable', __( 'Another webhook registration is in progress; please retry.', 'perflocale' ), 503 );
+		}
+
+		// Never hand out a secret for a webhook that was not stored.
+		if ( $response === 'write_failed' ) {
+			return $this->error( 'create_failed', __( 'The webhook could not be saved; nothing was registered.', 'perflocale' ), 500 );
 		}
 
 		// The secret is only returned once, at registration - the caller
@@ -869,7 +905,13 @@ final class WebhookController extends RestController {
 				// autoload=false: webhook delivery runs in cron/hook context where
 				// the extra get_option() query is cheap, and HMAC secrets stored
 				// here should not sit in `alloptions` on every page load.
-				update_option( self::OPTION_KEY, $webhooks, false );
+				// Removing a key that is present always changes the value, so
+				// false is a refused write, not a no-op. Do not re-read to
+				// confirm: get_option() reads a failed SELECT as a missing
+				// option and would report the webhook deleted.
+				if ( ! update_option( self::OPTION_KEY, $webhooks, false ) ) {
+					return 'write_failed';
+				}
 
 				return true;
 			}
@@ -881,6 +923,12 @@ final class WebhookController extends RestController {
 
 		if ( $result === 'not_found' ) {
 			return $this->error( 'not_found', __( 'Webhook not found.', 'perflocale' ), 404 );
+		}
+
+		// Checked before clear_failure(): a webhook that is still registered
+		// keeps its failure history.
+		if ( $result === 'write_failed' ) {
+			return $this->error( 'delete_failed', __( 'The webhook could not be deleted; it is still registered.', 'perflocale' ), 500 );
 		}
 
 		// Clear any pending retries for the deleted webhook.
@@ -971,13 +1019,21 @@ final class WebhookController extends RestController {
 	 * retrying the non-blocking acquire a bounded number of times so a
 	 * contended lock never causes the caller to drop deliveries. $mutator
 	 * receives the freshly-read queue and returns the new queue; persisting
-	 * (or deleting when empty) happens inside the lock. Returns true iff the
-	 * write actually happened.
+	 * (or deleting when empty) happens inside the lock.
+	 *
+	 * Returns true when the write was stored, false when the lock was taken
+	 * but the write was refused (a failed query or a pre_update_option veto),
+	 * and null when the lock could not be taken. A refused write is not
+	 * retried. Every caller changes the queue (fresh delivery ids in, a batch
+	 * out), so false is never a no-op, except delete_option() on an absent
+	 * queue: only an empty drain reaches that, and it has nothing to dispatch.
+	 * The write's own boolean is used rather than a re-read, because
+	 * get_option() reads a failed SELECT as a missing option.
 	 *
 	 * @param callable(array<int, array<int, mixed>>): array<int, array<int, mixed>> $mutator
-	 * @return bool
+	 * @return bool|null
 	 */
-	private static function run_under_queue_lock( callable $mutator ): bool {
+	private static function run_under_queue_lock( callable $mutator ): ?bool {
 		for ( $attempt = 0; $attempt < self::QUEUE_LOCK_TRIES; $attempt++ ) {
 			$ran = Lock::with(
 				'webhook_queue',
@@ -993,23 +1049,62 @@ final class WebhookController extends RestController {
 					$new = is_array( $new ) ? array_values( $new ) : [];
 
 					if ( $new === [] ) {
-						delete_option( self::QUEUE_OPTION );
-					} else {
-						update_option( self::QUEUE_OPTION, $new, false );
+						return delete_option( self::QUEUE_OPTION );
 					}
 
-					return true;
+					return update_option( self::QUEUE_OPTION, $new, false );
 				}
 			);
 
-			if ( true === $ran ) {
-				return true;
+			if ( null !== $ran ) {
+				return true === $ran;
 			}
 
 			usleep( self::QUEUE_LOCK_WAIT_US );
 		}
 
-		return false;
+		return null;
+	}
+
+	/**
+	 * Schedule deliveries whose queue write was refused one at a time, as
+	 * attempt 1 on RETRY_HOOK, so each keeps the delivery id minted for it.
+	 * A write reported as refused can still have committed (a connection
+	 * lost after the UPDATE); the queue then delivers the same id a second
+	 * time and the receiver de-duplicates it.
+	 *
+	 * Capped at DRAIN_BATCH: a refusal can repeat on every flush (a merged
+	 * queue larger than max_allowed_packet), and each event rewrites the
+	 * autoloaded `cron` option. DRAIN_BATCH also covers every re-append,
+	 * which never holds more than one batch. Stops at the first scheduler
+	 * refusal, which BackgroundEvents logs; a vetoed or failing scheduler
+	 * would refuse the rest the same way. One line reports the outcome,
+	 * whatever WP_DEBUG says, because the deliveries past the cap are lost.
+	 *
+	 * @param array<int, array<int, mixed>> $deliveries Queue-shaped delivery tuples.
+	 * @return void
+	 */
+	private static function schedule_unqueued( array $deliveries ): void {
+		$scheduled = 0;
+
+		foreach ( array_slice( $deliveries, 0, self::DRAIN_BATCH ) as $delivery ) {
+			if ( count( $delivery ) < 4 ) {
+				continue;
+			}
+
+			$args   = array_slice( array_values( $delivery ), 0, 4 );
+			$args[] = 1;
+			$args[] = $delivery[4] ?? '';
+
+			if ( ! BackgroundEvents::enqueue( self::RETRY_HOOK, $args ) ) {
+				break;
+			}
+
+			++$scheduled;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- A refused queue write loses the deliveries past the cap; that must never be silent.
+		error_log( sprintf( 'PerfLocale webhook: the delivery queue could not be saved; %1$d deliveries were scheduled individually and %2$d were dropped.', $scheduled, count( $deliveries ) - $scheduled ) );
 	}
 
 	/**
@@ -1117,12 +1212,21 @@ final class WebhookController extends RestController {
 			}
 		);
 
-		if ( ! $written ) {
+		if ( null === $written ) {
 			foreach ( $deliveries as $delivery ) {
 				if ( is_array( $delivery ) && count( $delivery ) >= 4 ) {
 					BackgroundEvents::enqueue( self::DELIVERY_HOOK, array_slice( array_values( $delivery ), 0, 4 ) );
 				}
 			}
+
+			return;
+		}
+
+		// The lock was taken but the queue write was refused. The refusal can
+		// repeat on every flush, so the per-delivery fallback here is capped;
+		// no drain is scheduled for a flush that stored nothing.
+		if ( false === $written ) {
+			self::schedule_unqueued( $deliveries );
 
 			return;
 		}
@@ -1164,7 +1268,11 @@ final class WebhookController extends RestController {
 			}
 		);
 
-		if ( ! $claimed || $batch === [] ) {
+		// A refused claim (false) still dispatches. When the write really was
+		// refused the batch is still queued and goes out again on a later tick
+		// under the same delivery ids; when it committed and only the report
+		// failed (a connection lost after the UPDATE), skipping would lose it.
+		if ( null === $claimed || $batch === [] ) {
 			return;
 		}
 
@@ -1187,8 +1295,10 @@ final class WebhookController extends RestController {
 				}
 			);
 
-			if ( $requeued && ! wp_next_scheduled( self::DRAIN_HOOK ) ) {
+			if ( true === $requeued && ! wp_next_scheduled( self::DRAIN_HOOK ) ) {
 				BackgroundEvents::enqueue( self::DRAIN_HOOK, [] );
+			} elseif ( false === $requeued ) {
+				self::schedule_unqueued( $pending );
 			}
 		};
 		register_shutdown_function( $reappend );
@@ -1340,9 +1450,11 @@ final class WebhookController extends RestController {
 		// a scheme we cannot deliver, a site filter saying no — is a statement
 		// about the URL, will be just as true in thirty seconds, and is
 		// recorded once and dropped.
+		$url           = (string) ( $webhook['url'] ?? '' );
 		$safety_reason = '';
+		$addresses     = [];
 
-		if ( ! $this->is_url_safe( (string) ( $webhook['url'] ?? '' ), true, $safety_reason ) ) {
+		if ( ! $this->is_url_safe( $url, true, $safety_reason, $addresses ) ) {
 			if ( $safety_reason === 'unresolvable' && $attempt < self::MAX_ATTEMPTS ) {
 				\PerfLocale\Concurrency\Breaker::record_failure( 'webhook_' . $webhook_id, 'transient' );
 
@@ -1486,22 +1598,27 @@ final class WebhookController extends RestController {
 		// `redirection => 0` is an SSRF guard: is_url_safe() validates the
 		// registered URL, not wherever a redirect points. `reject_unsafe_urls
 		// => true` adds defense in depth, rejecting private-address resolutions
-		// at transport time.
-		$response = wp_remote_post(
-			$webhook['url'],
+		// at transport time. For a host name the connection goes only to the
+		// addresses is_url_safe() judged (Helper::remote_request_pinned()), not
+		// to whatever a second lookup by the transport would answer.
+		$response = Helper::remote_request_pinned(
+			$url,
 			[
-				'headers'            => $headers,
-				'body'               => $payload,
-				'timeout'            => 10,
+				'method'              => 'POST',
+				'headers'             => $headers,
+				'body'                => $payload,
+				'timeout'             => 10,
 				// Only the status code is read from the response; without a cap
 				// a hostile/misbehaving receiver could stream hundreds of MB
 				// into the cron worker within the timeout window.
 				'limit_response_size' => KB_IN_BYTES,
-				'blocking'           => true,
-				'sslverify'          => true,
-				'redirection'        => 0,
-				'reject_unsafe_urls' => true,
-			]
+				'blocking'            => true,
+				'sslverify'           => true,
+				'redirection'         => 0,
+				'reject_unsafe_urls'  => true,
+			],
+			$addresses[0] ?? '',
+			array_slice( $addresses, 1 )
 		);
 
 		$success = ! is_wp_error( $response )
@@ -1635,7 +1752,10 @@ final class WebhookController extends RestController {
 		$logged = Lock::with(
 			'webhook_failure_log',
 			5,
-			function () use ( $webhook_id, $event, $timestamp, $error ): void {
+			// Returns true so the caller can tell a completed section from
+			// a lock miss: Lock::with() returns the callback's value, and
+			// null only when it never ran.
+			function () use ( $webhook_id, $event, $timestamp, $error ): bool {
 				$log = get_option( self::FAILURES_KEY, [] );
 
 				if ( ! is_array( $log ) ) {
@@ -1656,6 +1776,8 @@ final class WebhookController extends RestController {
 				}
 
 				update_option( self::FAILURES_KEY, $log, false );
+
+				return true;
 			}
 		);
 
@@ -1684,11 +1806,11 @@ final class WebhookController extends RestController {
 		$cleared = Lock::with(
 			'webhook_failure_log',
 			5,
-			function () use ( $webhook_id ): void {
+			function () use ( $webhook_id ): bool {
 				$log = get_option( self::FAILURES_KEY, [] );
 
 				if ( ! is_array( $log ) || empty( $log ) ) {
-					return;
+					return true;
 				}
 
 				$filtered = array_values(
@@ -1703,6 +1825,8 @@ final class WebhookController extends RestController {
 				if ( count( $filtered ) !== count( $log ) ) {
 					update_option( self::FAILURES_KEY, $filtered, false );
 				}
+
+				return true;
 			}
 		);
 		if ( null === $cleared ) {

@@ -40,6 +40,7 @@
 	var useEffect = wp.element.useEffect;
 	var __ = wp.i18n.__;
 	var sprintf = wp.i18n.sprintf;
+	var _n = wp.i18n._n;
 
 	// ---------------------------------------------------------------
 	// Config + helpers
@@ -93,7 +94,8 @@
 		deepl: 'DeepL',
 		google: 'Google',
 		microsoft: 'Microsoft',
-		libre: 'LibreTranslate',
+		libretranslate: 'LibreTranslate',
+		wp_ai_client: __( 'WordPress AI Client', 'perflocale' ),
 		external_agency: 'Agency'
 	};
 
@@ -297,13 +299,17 @@
 		// "no text to translate" notice instead of a write to nowhere. Inner-
 		// block translation is a separate, recursive concern.
 		//
-		// MUST stay in sync with BlockTranslateController::text_attr_chain()
-		// in src/Api/BlockTranslateController.php — both sides walk the same
-		// per-block chain server- and client-side. Drift = sibling fill-from-
-		// source picking different attributes between client hint and server
-		// resolution. tests/test-attr-chain-parity.php asserts the two match.
+		// MUST stay in sync with BlockAttributeSource::chain() in
+		// src/Translation/BlockAttributeSource.php — both sides walk the same
+		// per-block chain server- and client-side. Drift = "Fill in from
+		// source" reading different attributes from the source block than
+		// the editor writes.
+		//
+		// A quote's text is in its inner paragraph blocks; `citation` is its
+		// own. `value` is never written: the quote block turns a non-empty
+		// `value` into paragraphs that replace its inner blocks.
 		var per_block = {
-			'core/quote':         [ 'value' ],
+			'core/quote':         [ 'citation' ],
 			'core/pullquote':     [ 'value', 'citation' ],
 			'core/button':        [ 'text' ],
 			'core/details':       [ 'summary' ],
@@ -370,6 +376,45 @@
 		return '';
 	}
 
+	/**
+	 * Destination format of one text attribute: 'text' when the block type
+	 * stores it in an HTML attribute (image alt, title), 'html' for rich text
+	 * and for anything without a schema.
+	 *
+	 * @param {string} blockName
+	 * @param {string} attr
+	 * @return {string} 'text' | 'html'
+	 */
+	function attrFormat( blockName, attr ) {
+		var blockType = ( wp.blocks && typeof wp.blocks.getBlockType === 'function' )
+			? wp.blocks.getBlockType( blockName )
+			: null;
+		var def = blockType && blockType.attributes ? blockType.attributes[ attr ] : null;
+
+		return ( def && def.source === 'attribute' ) ? 'text' : 'html';
+	}
+
+	/**
+	 * Number of distinct blocks in a list of leaves (one block can carry
+	 * several leaves: an image's alt, caption and title).
+	 *
+	 * @param {Array<{clientId: string}>} leaves
+	 * @return {number}
+	 */
+	function countBlocks( leaves ) {
+		var seen = {};
+		var n = 0;
+
+		for ( var i = 0; i < leaves.length; i++ ) {
+			if ( leaves[ i ] && ! seen[ leaves[ i ].clientId ] ) {
+				seen[ leaves[ i ].clientId ] = true;
+				n++;
+			}
+		}
+
+		return n;
+	}
+
 	function getBlockText( block ) {
 		if ( ! block || ! block.attributes ) { return ''; }
 
@@ -416,9 +461,11 @@
 	 * Recursively walk a block tree and return every translatable leaf.
 	 *
 	 * The "leaf" model: each item in the returned array represents ONE
-	 * attribute write (clientId + attr + text). Container blocks like
-	 * `core/group` typically contribute zero leaves themselves but their
-	 * children contribute leaves at their own depth.
+	 * attribute write (clientId + attr + text). A block contributes one leaf
+	 * per populated text attribute (an image's alt, caption and title are
+	 * three leaves). Container blocks like `core/group` typically contribute
+	 * zero leaves themselves but their children contribute leaves at their
+	 * own depth.
 	 *
 	 * Used by:
 	 *  - 1.3: multi-block batch translate (when the user has multiple
@@ -427,16 +474,16 @@
 	 *    container's clientId and translate everything under it.
 	 *  - 2.2: "Translate entire post" - walk all top-level blocks.
 	 *
-	 * Honors the `perflocaleSkipTranslation` attribute: a parent block
-	 * marked as skipped still has its children walked (the user may want
-	 * the wrapper preserved but children translated). A LEAF block marked
-	 * as skipped is excluded from the result.
+	 * Honors the `perflocaleSkipTranslation` attribute: a marked block and
+	 * everything inside it are left out, the same rule whole-post machine
+	 * translation applies (BlockSkipFilter keeps a marked block's whole
+	 * subtree).
 	 *
 	 * Empty / whitespace-only text is filtered out so the batch only
 	 * carries meaningful content.
 	 *
 	 * @param {string|undefined} rootClientId - undefined → all top-level blocks
-	 * @return {Array<{clientId: string, blockName: string, text: string, writeAttr: string}>}
+	 * @return {Array<{clientId: string, blockName: string, attr: string, text: string, writeAttr: string, format: string}>}
 	 */
 	function collectTranslatableBlocks( rootClientId ) {
 		var blockSelect = wp.data.select( 'core/block-editor' );
@@ -448,21 +495,24 @@
 		function walk( block ) {
 			if ( ! block || ! block.name ) { return; }
 
-			var skipped = block.attributes && block.attributes[ SKIP_ATTR ] === true;
+			// A marked block protects itself and everything inside it.
+			if ( isSkipMarked( block.attributes ) ) { return; }
 
-			// Only include the block ITSELF as a leaf if it's not skipped
-			// AND is translatable (has discoverable text attributes). Inner
-			// blocks are walked unconditionally - the user may have skipped
-			// only the wrapper.
-			if ( ! skipped && isTranslatableBlock( block.name ) ) {
-				var text = getBlockText( block );
+			if ( isTranslatableBlock( block.name ) && block.attributes ) {
+				var chain = textAttrChain( block.name );
 
-				if ( text && typeof text === 'string' && text.trim() !== '' ) {
+				for ( var c = 0; c < chain.length; c++ ) {
+					var text = attrToString( block.attributes[ chain[ c ] ] );
+
+					if ( text.trim() === '' ) { continue; }
+
 					collected.push( {
 						clientId:  block.clientId,
 						blockName: block.name,
+						attr:      chain[ c ],
 						text:      text,
-						writeAttr: block._pftWriteAttr || ( textAttrChain( block.name )[0] || 'content' )
+						writeAttr: chain[ c ],
+						format:    attrFormat( block.name, chain[ c ] )
 					} );
 				}
 			}
@@ -495,13 +545,18 @@
 	 * each individual block change. Falls back to per-leaf dispatch when
 	 * the editor doesn't expose the transaction API (older WP versions).
 	 *
+	 * The leaves of one block are merged into ONE updateBlockAttributes call
+	 * (an image's alt and caption land together).
+	 *
 	 * @param {Array<{clientId: string, writeAttr: string}>} leaves - same shape collectTranslatableBlocks returns
 	 * @param {Array<string>} translations - parallel array; translations[i] applied to leaves[i]
+	 * @return {number} number of blocks written
 	 */
 	function applyBatchTranslations( leaves, translations ) {
 		var dispatch = wp.data.dispatch( 'core/block-editor' );
 		var select = wp.data.select( 'core/block-editor' );
-		var applied = 0;
+		var updates = {};
+		var order = [];
 
 		// __unstableMarkNextChangeAsNotPersistent / mergeUndoableChanges
 		// aren't part of the public API. Writes issued back-to-back in one
@@ -519,17 +574,64 @@
 			if ( translations[ i ] === '' ) { continue; }
 			if ( select && ! select.getBlock( leaves[ i ].clientId ) ) { continue; }
 
-			var update = {};
-			update[ leaves[ i ].writeAttr ] = translations[ i ];
-			dispatch.updateBlockAttributes( leaves[ i ].clientId, update );
-			applied++;
+			var id = leaves[ i ].clientId;
+
+			if ( ! updates[ id ] ) {
+				updates[ id ] = {};
+				order.push( id );
+			}
+
+			updates[ id ][ leaves[ i ].writeAttr ] = translations[ i ];
 		}
 
-		return applied;
+		for ( var j = 0; j < order.length; j++ ) {
+			dispatch.updateBlockAttributes( order[ j ], updates[ order[ j ] ] );
+		}
+
+		return order.length;
 	}
 
 	function isSkipMarked( attrs ) {
 		return !! ( attrs && attrs[ SKIP_ATTR ] === true );
+	}
+
+	/**
+	 * Whether a block, or any block it sits inside, is marked "Do not
+	 * translate".
+	 *
+	 * @param {string} clientId
+	 * @return {boolean}
+	 */
+	function isSkipMarkedInTree( clientId ) {
+		var blockSelect = wp.data.select( 'core/block-editor' );
+
+		if ( ! blockSelect ) { return false; }
+
+		var ids = [ clientId ];
+
+		if ( typeof blockSelect.getBlockParents === 'function' ) {
+			ids = ids.concat( blockSelect.getBlockParents( clientId ) || [] );
+		}
+
+		for ( var i = 0; i < ids.length; i++ ) {
+			var block = blockSelect.getBlock( ids[ i ] );
+
+			if ( block && isSkipMarked( block.attributes ) ) { return true; }
+		}
+
+		return false;
+	}
+
+	/**
+	 * Language the open content is written in: the edited post's language,
+	 * else the site's default language (content with no language row is
+	 * default-language content), never the admin's language switch unless
+	 * neither is known.
+	 *
+	 * @return {string}
+	 */
+	function editorSourceLang() {
+		return POST_SOURCE_LANG || SOURCE_LANG || CURRENT_LANG || ( LANGUAGES[0] && LANGUAGES[0].slug ) || 'en';
 	}
 
 	/**
@@ -605,13 +707,40 @@
 	}
 
 	/**
+	 * Keep only the attributes of a from-source answer that are text
+	 * attributes of this block type, as strings, never empty.
+	 *
+	 * @param {string} blockName
+	 * @param {Object} attributes - `attributes` map from the server
+	 * @return {Object} update for updateBlockAttributes (may be empty)
+	 */
+	function fromSourceUpdate( blockName, attributes ) {
+		var chain = textAttrChain( blockName );
+		var update = {};
+
+		if ( ! attributes || typeof attributes !== 'object' ) { return update; }
+
+		for ( var i = 0; i < chain.length; i++ ) {
+			var v = attributes[ chain[ i ] ];
+
+			if ( typeof v === 'string' && v !== '' ) {
+				update[ chain[ i ] ] = v;
+			}
+		}
+
+		return update;
+	}
+
+	/**
 	 * Sibling-aware fill: fetch the corresponding block from the source
-	 * post, MT-translate it from source-lang to current-post-lang, write
-	 * the result back to this block.
+	 * post, MT-translate its text attributes from source-lang to
+	 * current-post-lang, write each back to its own attribute.
 	 *
 	 * Used by the per-block toolbar action when IS_SIBLING is true. The
-	 * server resolves the source post from the post's translation group
-	 * and walks its block tree to the same position path.
+	 * server resolves the source post from the post's translation group,
+	 * walks its block tree to the same position path and reads each text
+	 * attribute from where the block type stores it. A source block marked
+	 * "Do not translate" (or inside a marked block) comes back verbatim.
 	 *
 	 * @param {string}        clientId
 	 * @param {function|null} onClose
@@ -631,30 +760,18 @@
 			return;
 		}
 
-		// Read the real block from the editor store so the write-attr hint
-		// resolves against the actual attributes (the toolbar's `props.attributes`
-		// is a shallow copy without the `_pftWriteAttr` non-enumerable hint).
-		// getBlockText() populates the hint as a side-effect.
 		var realBlock = wp.data.select( 'core/block-editor' ).getBlock( clientId );
 		if ( ! realBlock ) {
 			notice( __( 'Could not read the block from the editor.', 'perflocale' ), 'error' );
 			onClose && onClose();
 			return;
 		}
-		getBlockText( realBlock );
 
 		// targetLang = the post's own language (this is a sibling, so
 		// POST_SOURCE_LANG is the sibling's lang, NOT the source).
 		var targetLang = POST_SOURCE_LANG;
 
 		notice( i18n.translating || __( 'Translating…', 'perflocale' ), 'info' );
-
-		// Hint the server which attribute to read from the source block.
-		// The same chain runs server-side as a fallback, but passing the
-		// hint avoids picking the wrong attribute when both `caption` and
-		// `alt` are populated and the user clicked through to a specific
-		// edit affordance.
-		var hintAttr = realBlock._pftWriteAttr || '';
 
 		wp.apiFetch( {
 			path: '/perflocale/v1/block-translate/from-source',
@@ -663,48 +780,55 @@
 				target_post_id: TARGET_POST_ID,
 				block_path:     path,
 				target_lang:    targetLang,
-				source_attr:    hintAttr
+				// The editor's own chain for this block type, so a block
+				// extended through the perflocale.blockToolbar.textAttrs
+				// filter reads the same attributes on the server.
+				source_attrs:   textAttrChain( realBlock.name )
 			}
 		} )
 			.then( function ( response ) {
 				var data = ( response && response.data && typeof response.data === 'object' ) ? response.data : response;
+				var update = {};
 
-				if ( data && typeof data.translated === 'string' && data.translated !== '' ) {
-					// Non-empty check: the server rejects empty provider results,
-					// but never write '' over block content even if one slips
-					// through — the else branch below surfaces it as a failure.
-					// Prefer the server's resolved source_attr — it ran the same
-					// chain on the actual source block and knows which attribute
-					// the text was extracted from. Falls through to the local
-					// hint if missing (older server / edge cases).
-					var writeAttr = ( typeof data.source_attr === 'string' && data.source_attr !== '' && data.source_attr !== 'innerHTML' )
-						? data.source_attr
-						: ( realBlock._pftWriteAttr || ( textAttrChain( realBlock.name )[0] || 'content' ) );
-
-					var update = {};
-					update[ writeAttr ] = data.translated;
-					wp.data.dispatch( 'core/block-editor' ).updateBlockAttributes( clientId, update );
-
-					var srcLabel = '';
-					if ( data.source === 'tm' ) {
-						srcLabel = __( 'translation memory', 'perflocale' );
-					} else if ( typeof data.provider === 'string' && data.provider !== '' ) {
-						srcLabel = PROVIDER_LABELS[ data.provider ] || data.provider;
-					} else if ( providerLabel() ) {
-						srcLabel = providerLabel();
-					}
-
-					var fullToast = sprintf(
-						/* translators: %s: target language label e.g. "French (FR)" */
-						__( 'Filled in from source — %s', 'perflocale' ),
-						formatLangLabel( targetLang )
-					);
-					if ( srcLabel ) { fullToast += ' · ' + srcLabel; }
-
-					notice( fullToast, 'success' );
-				} else {
-					notice( __( 'Source-fill returned unexpected data.', 'perflocale' ), 'error' );
+				if ( data && data.attributes && typeof data.attributes === 'object' ) {
+					update = fromSourceUpdate( realBlock.name, data.attributes );
+				} else if ( data && typeof data.translated === 'string' && data.translated !== ''
+					&& typeof data.source_attr === 'string' && data.source_attr !== '' && data.source_attr !== 'innerHTML' ) {
+					// A server without the `attributes` map: one named attribute.
+					// An `innerHTML` answer is the block's whole markup and is
+					// never written into an attribute.
+					update[ data.source_attr ] = data.translated;
 				}
+
+				if ( Object.keys( update ).length === 0 ) {
+					notice( __( 'Source-fill returned unexpected data.', 'perflocale' ), 'error' );
+					return;
+				}
+
+				wp.data.dispatch( 'core/block-editor' ).updateBlockAttributes( clientId, update );
+
+				if ( data.source === 'kept' ) {
+					notice( __( 'Kept from the source: this block is marked "Do not translate".', 'perflocale' ), 'success' );
+					return;
+				}
+
+				var srcLabel = '';
+				if ( data.source === 'tm' ) {
+					srcLabel = __( 'translation memory', 'perflocale' );
+				} else if ( typeof data.provider === 'string' && data.provider !== '' ) {
+					srcLabel = PROVIDER_LABELS[ data.provider ] || data.provider;
+				} else if ( providerLabel() ) {
+					srcLabel = providerLabel();
+				}
+
+				var fullToast = sprintf(
+					/* translators: %s: target language label e.g. "French (FR)" */
+					__( 'Filled in from source — %s', 'perflocale' ),
+					formatLangLabel( targetLang )
+				);
+				if ( srcLabel ) { fullToast += ' · ' + srcLabel; }
+
+				notice( fullToast, 'success' );
 			} )
 			.catch( function ( err ) {
 				var msg = ( err && err.message ) || __( 'Source-fill failed.', 'perflocale' );
@@ -721,7 +845,7 @@
 		// Prefer the edited post's actual language over the admin router
 		// language - editing a BG sibling in an EN admin session must
 		// still send source_lang=bg.
-		var sourceLang = POST_SOURCE_LANG || CURRENT_LANG || ( LANGUAGES[0] && LANGUAGES[0].slug ) || 'en';
+		var sourceLang = editorSourceLang();
 
 		if ( sourceLang === targetLang ) {
 			notice( __( 'Source and target languages are the same.', 'perflocale' ), 'warning' );
@@ -742,7 +866,9 @@
 		wp.apiFetch( {
 			path: '/perflocale/v1/block-translate',
 			method: 'POST',
-			data: { text: text, source_lang: sourceLang, target_lang: targetLang }
+			// post_id: the post being edited, so the server can apply
+			// perflocale/mt/send_password_protected to it.
+			data: { text: text, source_lang: sourceLang, target_lang: targetLang, post_id: TARGET_POST_ID }
 		} )
 			.then( function ( response ) {
 				// BlockTranslateController emits the body via WP_REST_Response
@@ -858,7 +984,7 @@
 			return;
 		}
 
-		var sourceLang = POST_SOURCE_LANG || CURRENT_LANG || ( LANGUAGES[0] && LANGUAGES[0].slug ) || 'en';
+		var sourceLang = editorSourceLang();
 
 		if ( sourceLang === targetLang ) {
 			notice( __( 'Source and target languages are the same.', 'perflocale' ), 'warning' );
@@ -874,9 +1000,12 @@
 		mtBatchInFlight = true;
 
 		var chunks = chunkLeaves( leaves );
-		var total = leaves.length;
+		// Counts shown to the user are blocks, not leaves: an image with alt
+		// and caption is one block.
+		var total = countBlocks( leaves );
 		var appliedCount = 0;
 		var doneCount = 0;
+		var doneLeaves = 0;
 		var lastData = null;
 		var PROGRESS_ID = 'perflocale-batch-progress';
 
@@ -901,12 +1030,14 @@
 		chunks.forEach( function ( pass ) {
 			chain = chain.then( function () {
 				if ( chunks.length > 1 ) {
+					var passLast = countBlocks( leaves.slice( 0, doneLeaves + pass.length ) );
+
 					notice(
 						sprintf(
 							/* translators: 1: first block number in this pass, 2: last block number, 3: total blocks */
 							__( 'Translating blocks %1$d–%2$d of %3$d…', 'perflocale' ),
-							doneCount + 1,
-							doneCount + pass.length,
+							Math.min( doneCount + 1, passLast ),
+							passLast,
 							total
 						),
 						'info',
@@ -919,8 +1050,13 @@
 					method: 'POST',
 					data: {
 						texts: pass.map( function ( l ) { return l.text; } ),
+						// Plain-text attributes (alt, title) go through the
+						// text sanitiser so '&' stays '&'.
+						formats: pass.map( function ( l ) { return l.format === 'text' ? 'text' : 'html'; } ),
 						source_lang: sourceLang,
-						target_lang: targetLang
+						target_lang: targetLang,
+						// The post being edited (see translateWithMt()).
+						post_id: TARGET_POST_ID
 					}
 				} ).then( function ( response ) {
 					var data = ( response && response.data && typeof response.data === 'object' ) ? response.data : response;
@@ -939,7 +1075,8 @@
 					}
 
 					appliedCount += applyBatchTranslations( pass, data.translated );
-					doneCount += pass.length;
+					doneLeaves += pass.length;
+					doneCount = countBlocks( leaves.slice( 0, doneLeaves ) );
 					lastData = data;
 				} );
 			} );
@@ -1100,7 +1237,7 @@
 
 			// Hide whichever language we'll be translating FROM - it makes
 			// no sense to offer "Translate to <same>".
-			var effectiveSource = POST_SOURCE_LANG || CURRENT_LANG;
+			var effectiveSource = editorSourceLang();
 			var mtSubmenu = LANGUAGES.filter( function ( lang ) {
 				return lang.slug !== effectiveSource;
 			} );
@@ -1127,6 +1264,17 @@
 					if ( IS_SIBLING && SOURCE_POST_ID > 0 ) {
 						var sourceLangLabel = formatLangLabel( SOURCE_LANG );
 
+						// A block marked "Do not translate" is not filled from the
+						// source; a block inside a marked block gets a disabled
+						// item that says why.
+						if ( isSkipped ) {
+							return null;
+						}
+
+						if ( isSkipMarkedInTree( props.clientId ) ) {
+							return el( MenuGroup, null, mkInsideSkipItem() );
+						}
+
 						items.push( el( MenuItem, {
 							key: 'mt-from-source',
 							icon: 'translation',
@@ -1149,9 +1297,20 @@
 						//   - container blocks (group, columns, cover, quote with
 						//     inner content) → walks children, ONE batch round-trip
 						//   - blocks with multi-attribute text (image alt + caption)
-						//     → translates the longest, picked by getBlockText
+						//     → one leaf per populated attribute, one write
+						//
+						// A block marked "Do not translate", or inside a marked
+						// block, is not translated, as in the sibling branch.
+						if ( isSkipped ) {
+							return null;
+						}
+
+						if ( isSkipMarkedInTree( props.clientId ) ) {
+							return el( MenuGroup, null, mkInsideSkipItem() );
+						}
+
 						var translatableLeaves = collectTranslatableBlocks( props.clientId );
-						var leafCount = translatableLeaves.length;
+						var leafCount = countBlocks( translatableLeaves );
 						var leafSuffix = leafCount > 1
 							? ' · ' + sprintf(
 								/* translators: %d: number of inner blocks that will be translated */
@@ -1203,6 +1362,18 @@
 				}
 
 				return el( MenuGroup, null, items );
+			}
+
+			// Disabled item for a block inside a "Do not translate" block. It
+			// stays focusable (aria-disabled) so keyboard and screen-reader
+			// users reach the explanation.
+			function mkInsideSkipItem() {
+				return el( MenuItem, {
+					key: 'mt-inside-skip',
+					icon: 'translation',
+					disabled: true,
+					__experimentalIsFocusable: true
+				}, __( 'Not translated: inside a "Do not translate" block', 'perflocale' ) );
 			}
 
 			function mkToolsGroup( onClose ) {
@@ -1334,17 +1505,17 @@
 	addFilter( 'editor.BlockListBlock', 'perflocale/skip-visual', withSkipVisual );
 
 	/**
-	 * Sibling-aware post-level fill: walk every leaf collected from the
-	 * editor, look it up by position path in the source post, translate
-	 * the resulting source text into this sibling's language, and write
-	 * back to the same leaf. Used by the "Block translation" sidebar's
-	 * "Fill all from source" action when the post being edited is a
-	 * sibling of a source-language post.
+	 * Sibling-aware post-level fill: for every block collected from the
+	 * editor, look up the block at the same position path in the source
+	 * post, translate its text attributes into this sibling's language, and
+	 * write each back to its own attribute. Used by the "Block translation"
+	 * sidebar's "Fill all from source" action when the post being edited is
+	 * a sibling of a source-language post.
 	 *
-	 * Loops the per-leaf endpoint sequentially. A batch /from-source
-	 * endpoint would shave per-leaf round-trip overhead but introduces
-	 * partial-failure handling complexity; sequential is simpler and the
-	 * fully-cached path (TM hits everywhere) is fast enough in practice.
+	 * One request per block (the leaves of one block share it), run
+	 * sequentially. Counts are blocks. A block whose source is marked "Do
+	 * not translate" is filled with the source text verbatim and counted as
+	 * kept.
 	 *
 	 * @param {Array}         leaves - output of collectTranslatableBlocks
 	 * @param {function|null} onDone - invoked on completion (success or fail)
@@ -1363,26 +1534,47 @@
 		}
 
 		var targetLang = POST_SOURCE_LANG;
+		var blocks = [];
+		var seen = {};
+
+		for ( var l = 0; l < leaves.length; l++ ) {
+			if ( leaves[ l ] && ! seen[ leaves[ l ].clientId ] ) {
+				seen[ leaves[ l ].clientId ] = true;
+				blocks.push( leaves[ l ] );
+			}
+		}
 
 		notice(
 			sprintf(
 				/* translators: %d: number of blocks */
 				__( 'Filling %d blocks from source…', 'perflocale' ),
-				leaves.length
+				blocks.length
 			),
 			'info'
 		);
 
 		var success = 0;
 		var failed = 0;
+		var kept = 0;
 		var dispatch = wp.data.dispatch( 'core/block-editor' );
 		var blockSelect = wp.data.select( 'core/block-editor' );
 
 		function processNext( i ) {
-			if ( i >= leaves.length ) {
+			if ( i >= blocks.length ) {
 				var summary;
 
-				if ( failed === 0 ) {
+				if ( failed === 0 && kept > 0 ) {
+					summary = sprintf(
+						/* translators: %d: number of blocks filled from the source */
+						_n( 'Filled %d block from source;', 'Filled %d blocks from source;', success, 'perflocale' ),
+						success
+					) + ' ' + sprintf(
+						/* translators: %d: number of the filled blocks kept as they are in the source */
+						_n( '%d kept because it is marked "Do not translate".', '%d kept because they are marked "Do not translate".', kept, 'perflocale' ),
+						kept
+					);
+					notice( summary, 'success' );
+				} else if ( failed === 0 ) {
 					summary = sprintf(
 						/* translators: %d: number of blocks */
 						__( 'Filled %d blocks from source.', 'perflocale' ),
@@ -1410,7 +1602,7 @@
 				return;
 			}
 
-			var leaf = leaves[ i ];
+			var leaf = blocks[ i ];
 			var path = computeBlockPath( leaf.clientId );
 
 			if ( ! path ) {
@@ -1426,28 +1618,20 @@
 					target_post_id: TARGET_POST_ID,
 					block_path:     path,
 					target_lang:    targetLang,
-					source_attr:    leaf.writeAttr || ''
+					source_attrs:   textAttrChain( leaf.blockName )
 				}
 			} )
 				.then( function ( response ) {
 					var data = ( response && response.data && typeof response.data === 'object' ) ? response.data : response;
+					var update = ( data && data.attributes ) ? fromSourceUpdate( leaf.blockName, data.attributes ) : {};
 
-					if ( data && typeof data.translated === 'string' && data.translated !== '' ) {
-						// Prefer the server's resolved attr over the client's hint.
-						var writeAttr = ( typeof data.source_attr === 'string' && data.source_attr !== '' && data.source_attr !== 'innerHTML' )
-							? data.source_attr
-							: ( leaf.writeAttr || 'content' );
+					// Verify the block still exists in the editor (user may
+					// have removed blocks between collect and write).
+					if ( Object.keys( update ).length > 0 && blockSelect.getBlock( leaf.clientId ) ) {
+						dispatch.updateBlockAttributes( leaf.clientId, update );
+						success++;
 
-						// Verify the leaf still exists in the editor (user may
-						// have removed blocks between collect and write).
-						if ( blockSelect.getBlock( leaf.clientId ) ) {
-							var update = {};
-							update[ writeAttr ] = data.translated;
-							dispatch.updateBlockAttributes( leaf.clientId, update );
-							success++;
-						} else {
-							failed++;
-						}
+						if ( data.source === 'kept' ) { kept++; }
 					} else {
 						failed++;
 					}
@@ -1487,6 +1671,12 @@
 		 * @param {Array} leaves - output of collect()
 		 * @param {function|null} onDone
 		 */
-		fillAllFromSource: fillAllFromSource
+		fillAllFromSource: fillAllFromSource,
+
+		/**
+		 * @param {Array} leaves - output of collect()
+		 * @return {number} distinct blocks the leaves belong to
+		 */
+		countBlocks: countBlocks
 	};
 } )();

@@ -45,9 +45,15 @@ final class AddonUninstaller {
 	 *
 	 * @param string              $addon_id Addon identifier.
 	 * @param AddonInterface|null $addon Live addon instance if known, null if absent.
+	 * @param bool                $single_site_teardown True when ONE subsite is
+	 *     being deleted. The plan then leaves out the targets that are not
+	 *     that subsite's to delete: `site_options` live in wp_sitemeta and
+	 *     `user` meta in wp_usermeta, both shared by the whole network, where
+	 *     the addon is still running on every surviving site. Everything else
+	 *     is per-blog and goes with the blog.
 	 * @return PurgePlan
 	 */
-	public static function plan( string $addon_id, ?AddonInterface $addon = null ): PurgePlan {
+	public static function plan( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false ): PurgePlan {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
 			return PurgePlan::empty( $addon_id );
 		}
@@ -81,6 +87,14 @@ final class AddonUninstaller {
 				continue;
 			}
 			$full_tables[] = AddonSchemaManager::table_name( $addon_id, $short );
+		}
+
+		if ( $single_site_teardown ) {
+			$manifest['site_options'] = [];
+
+			if ( isset( $manifest['meta'] ) && is_array( $manifest['meta'] ) ) {
+				unset( $manifest['meta']['user'] );
+			}
 		}
 
 		$meta = [];
@@ -118,11 +132,17 @@ final class AddonUninstaller {
 	 *
 	 * @param string              $addon_id Addon identifier.
 	 * @param AddonInterface|null $addon Live addon instance if known, null if absent.
+	 * @param bool                $single_site_teardown True when ONE subsite is being
+	 *     deleted: the network-global targets are left out of the plan (see
+	 *     plan()), and so are the network-wide cache flushes.
 	 * @return PurgeResult
 	 */
-	public static function purge( string $addon_id, ?AddonInterface $addon = null ): PurgeResult {
+	public static function purge( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false ): PurgeResult {
+		// The teardown narrowing happens in the plan itself, not only in the
+		// deletes below, so the actions and the addon's own before_uninstall()
+		// are handed the plan that will actually run.
 		$t_start = microtime( true );
-		$plan    = self::plan( $addon_id, $addon );
+		$plan    = self::plan( $addon_id, $addon, $single_site_teardown );
 		$errors  = [];
 
 		/** @hook perflocale/addon/before_uninstall */
@@ -274,7 +294,13 @@ final class AddonUninstaller {
 		// get_option() return stale values from the cache even though the
 		// DB rows are gone. Targeted flushes (not a global wp_cache_flush()
 		// which nukes unrelated caches too).
-		if ( [] !== $plan->transient_prefixes || [] !== $plan->options ) {
+		//
+		// None of them when ONE subsite is being deleted. On Redis a group
+		// flush reaches every blog, so it would empty every surviving site's
+		// options and transients because one blog went — and there is no
+		// stale read to prevent: the dying blog's keys carry its id, and core
+		// drops its tables right after this.
+		if ( ! $single_site_teardown && ( [] !== $plan->transient_prefixes || [] !== $plan->options ) ) {
 			wp_cache_flush_group( 'options' );
 		}
 		// With a persistent object cache, transients live in the dedicated
@@ -283,7 +309,7 @@ final class AddonUninstaller {
 		// same-request get_transient() would still serve the cached value.
 		// Transients are disposable, so flushing those groups is safe and far
 		// narrower than a global wp_cache_flush().
-		if ( [] !== $plan->transient_prefixes && wp_using_ext_object_cache() ) {
+		if ( ! $single_site_teardown && [] !== $plan->transient_prefixes && wp_using_ext_object_cache() ) {
 			// Sentinel-verify the flush: some backends silently no-op
 			// wp_cache_flush_group() even when wp_cache_supports() claims
 			// support (e.g. Redis Object Cache with the Predis client), which
@@ -307,7 +333,7 @@ final class AddonUninstaller {
 			'term'    => 'term_meta',
 			'comment' => 'comment_meta',
 		] as $type => $group ) {
-			if ( isset( $meta_deleted[ $type ] ) && $meta_deleted[ $type ] > 0 ) {
+			if ( ! $single_site_teardown && isset( $meta_deleted[ $type ] ) && $meta_deleted[ $type ] > 0 ) {
 				wp_cache_flush_group( $group );
 			}
 		}

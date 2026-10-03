@@ -103,12 +103,15 @@ final class MachineTranslateController extends RestController {
 					'include_meta'    => [
 						'description' => __( 'Include MT-able meta characters (kind=posts).', 'perflocale' ),
 					],
+					'overwrite'       => [
+						'description' => __( 'Count strings that already have a translation too, as an Overwrite run sends them (kind=strings).', 'perflocale' ),
+					],
 				],
 			]
 		);
 
 		// Scope-orchestration endpoint: translate ONE object (post or term)
-		// including registered meta — the Content scope of the visual editor's
+		// including registered meta — the Content scope of a front-end
 		// "Translate page" flow. Skip-existing by default: an existing
 		// translation returns status=exists and the client must explicitly
 		// re-call with overwrite=true (translate_post OVERWRITES — the caller
@@ -242,7 +245,7 @@ final class MachineTranslateController extends RestController {
 		if ( $type === 'post' ) {
 			$ptm = new \PerfLocale\Translation\PostTranslationManager( $cache, $settings );
 
-			// The visual editor calls this from ANY language's page, so the
+			// A front-end editor calls this from ANY language's page, so the
 			// queried object may be a translation SIBLING. translate_post()
 			// always treats its input as default-language text — feeding it a
 			// sibling would send e.g. German text labeled as English (wrong-
@@ -279,6 +282,14 @@ final class MachineTranslateController extends RestController {
 				return $this->error( 'rest_forbidden', __( 'You cannot overwrite this translation.', 'perflocale' ), 403 );
 			}
 
+			// The post whose text is sent: a password-protected one is sent
+			// unless the perflocale/mt/send_password_protected filter refuses it.
+			$source = get_post( $id );
+
+			if ( $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, 'rest' ) ) {
+				return $this->error( 'password_protected', TranslationService::password_protected_skip_message(), 403 );
+			}
+
 			try {
 				// fast_fail: this is an interactive UI call — better a quick
 				// retryable error than a minutes-long retry loop.
@@ -313,11 +324,12 @@ final class MachineTranslateController extends RestController {
 
 		$ttm = new \PerfLocale\Translation\TermTranslationManager( $cache );
 
-		// Same sibling-resolution as the post path: the VE calls from any
-		// language's term archive, so the queried term may be a translation
-		// sibling. Resolve to the default-language term before reading
-		// name/description, or a non-default term would be sent to the
-		// provider labeled as the source language (wrong-direction garbage).
+		// Same sibling-resolution as the post path: a front-end editor calls
+		// from any language's term archive, so the queried term may be a
+		// translation sibling. Resolve to the default-language term before
+		// reading name/description, or a non-default term would be sent to
+		// the provider labeled as the source language (wrong-direction
+		// garbage).
 		if ( $default_row ) {
 			$default_sibling = $ttm->get_translation_id( $id, $default_row->slug );
 
@@ -467,7 +479,7 @@ final class MachineTranslateController extends RestController {
 
 		$string_ids = array_map( 'intval', (array) $request->get_param( 'string_ids' ) );
 
-		return $this->success( $estimator->estimate_strings( $string_ids, $target_lang_ids ) );
+		return $this->success( $estimator->estimate_strings( $string_ids, $target_lang_ids, in_array( $request->get_param( 'overwrite' ), [ true, 1, '1', 'true' ], true ) ) );
 	}
 
 	/**
@@ -525,6 +537,14 @@ final class MachineTranslateController extends RestController {
 			return $this->error( 'rest_forbidden', __( 'You cannot translate this post.', 'perflocale' ), 403 );
 		}
 
+		// A password-protected post is sent unless the
+		// perflocale/mt/send_password_protected filter refuses it.
+		$source = get_post( $post_id );
+
+		if ( $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, 'rest' ) ) {
+			return $this->error( 'password_protected', TranslationService::password_protected_skip_message(), 403 );
+		}
+
 		$plugin = \PerfLocale\Plugin::get_instance();
 
 		// Overwrite guard: translate_post() rewrites an EXISTING target-language
@@ -574,6 +594,10 @@ final class MachineTranslateController extends RestController {
 			$result = $service->translate_post( $post_id, $target_lang, $provider_id, true );
 
 			return $this->success( $result );
+		} catch ( \PerfLocale\MachineTranslation\SameLanguageException $e ) {
+			// A request error, not a server failure: the post is already in
+			// the target language.
+			return $this->error( 'same_language', $e->getMessage(), 400 );
 		} catch ( \Throwable $e ) {
 			return $this->error( 'translation_failed', $e->getMessage(), 500 );
 		}

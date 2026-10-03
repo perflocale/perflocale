@@ -31,6 +31,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  *     ($find_cache, $has_any_groups_memo, $eager_link_map_memo).
  *   - Autoloaded eager-link option rows that survive cross-process
  *     imports (perflocale_eager_links_post / _term / _has_any_groups).
+ *   - The has_any_groups object-cache key (no expiry, outside the
+ *     cache generations).
  *   - L2 cache groups via CacheManager::flush_all.
  *
  * Without this sequence, long-running CLI / cron workers continue to
@@ -67,6 +69,9 @@ final class MigrationCacheHelper {
 
 		delete_option( 'perflocale_has_any_groups' );
 		wp_cache_delete( 'perflocale_has_any_groups', 'options' );
+		// has_any_groups() pins its TRUE answer in the object cache with no
+		// expiry and outside the cache generations flush_all() bumps.
+		wp_cache_delete( 'has_any_groups', 'perflocale_trans' );
 
 		if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
 			$cache->flush_all();

@@ -147,6 +147,11 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
+		// A field a person empties stays empty: its clear is recorded in the
+		// post's seed-cleared marker, which machine translation and the seed
+		// honour.
+		\PerfLocale\Translation\ContentSync::track_seed_clears( $this->add_meta_keys( [], '' ) );
+
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so Rank Math's own og:locale already reflects the current language.
 

@@ -100,22 +100,94 @@ final class TermAssignmentFilter {
 			return;
 		}
 
-		$post_manager = new PostTranslationManager( $this->cache, $this->settings );
-		$post_lang    = $post_manager->detect_post_language( $object_id );
+		$post_lang_slug = $this->post_language_slug( $object_id );
 
-		if ( ! $post_lang || ! isset( $post_lang->slug ) ) {
+		if ( $post_lang_slug === null ) {
 			return;
 		}
-
-		$post_lang_slug = (string) $post_lang->slug;
-
-		$term_manager = new TermTranslationManager( $this->cache );
 
 		$current_ids = wp_get_object_terms( $object_id, $taxonomy, [ 'fields' => 'ids' ] );
 
 		if ( is_wp_error( $current_ids ) || empty( $current_ids ) ) {
 			return;
 		}
+
+		$this->normalize_taxonomy( $object_id, $taxonomy, array_map( 'intval', $current_ids ), $post_lang_slug );
+	}
+
+	/**
+	 * Normalize every translatable taxonomy of a post to the post's language.
+	 *
+	 * For a post that has just received its first language. Terms passed to
+	 * wp_insert_post() (tags_input, post_category, tax_input) are attached
+	 * before save_post assigns that language, so the set_object_terms pass
+	 * above had nothing to compare them with. One query reads the terms of
+	 * all those taxonomies.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return void
+	 */
+	public function normalize_post_terms( int $post_id ): void {
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post || isset( $this->in_progress[ $post_id ] ) ) {
+			return;
+		}
+
+		$taxonomies = array_values( array_intersect( get_object_taxonomies( $post->post_type ), $this->settings->get_translatable_taxonomies() ) );
+
+		$post_lang_slug = $taxonomies === [] ? null : $this->post_language_slug( $post_id );
+
+		if ( $post_lang_slug === null ) {
+			return;
+		}
+
+		$terms = wp_get_object_terms( $post_id, $taxonomies, [ 'fields' => 'all' ] );
+
+		if ( is_wp_error( $terms ) || empty( $terms ) ) {
+			return;
+		}
+
+		$by_taxonomy = [];
+
+		foreach ( $terms as $term ) {
+			$by_taxonomy[ $term->taxonomy ][] = (int) $term->term_id;
+		}
+
+		foreach ( $by_taxonomy as $taxonomy => $ids ) {
+			$this->normalize_taxonomy( $post_id, (string) $taxonomy, $ids, $post_lang_slug );
+		}
+	}
+
+	/**
+	 * Language slug of a post, or null when it has none yet.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return string|null
+	 */
+	private function post_language_slug( int $post_id ): ?string {
+		$post_manager = new PostTranslationManager( $this->cache, $this->settings );
+		$post_lang    = $post_manager->detect_post_language( $post_id );
+
+		if ( ! $post_lang || ! isset( $post_lang->slug ) ) {
+			return null;
+		}
+
+		return (string) $post_lang->slug;
+	}
+
+	/**
+	 * Swap a post's wrong-language terms in one taxonomy for their siblings
+	 * in the post's language.
+	 *
+	 * @param int             $object_id      Post ID.
+	 * @param string          $taxonomy       Translatable taxonomy slug.
+	 * @param array<int, int> $current_ids    Term IDs the post holds in it.
+	 * @param string          $post_lang_slug The post's language slug.
+	 * @return void
+	 */
+	private function normalize_taxonomy( int $object_id, string $taxonomy, array $current_ids, string $post_lang_slug ): void {
+		$term_manager = new TermTranslationManager( $this->cache );
 
 		$corrected = [];
 		$changed   = false;

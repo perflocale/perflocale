@@ -81,6 +81,20 @@ final class AddonRegistry {
 	private array $incompatible = [];
 
 	/**
+	 * Addons the `perflocale/addon/enabled` filter kept from booting in this
+	 * request, keyed by addon ID. True when the filter turned off an addon
+	 * that would otherwise boot; false when it only kept an addon in the
+	 * disabled list off. Either way the decision is final for the request,
+	 * so a later boot pass does not ask the filter again.
+	 *
+	 * Kept apart from $incompatible and from the quarantine counter: a site
+	 * choosing not to run an integration in some contexts is not a fault.
+	 *
+	 * @var array<string, bool>
+	 */
+	private array $filter_off = [];
+
+	/**
 	 * Bundled addon manifest - keyed by directory name.
 	 *
 	 * Each entry carries:
@@ -370,7 +384,7 @@ final class AddonRegistry {
 		// plugin is present), and nothing anywhere reported a problem. Nothing
 		// downstream could recover it either — boot_pending() only boots addons
 		// already registered, and on a real request it never runs at all, since
-		// Bootstrap hooks the whole boot on `init:0` (Bootstrap.php ~1982) and
+		// Bootstrap hooks the whole boot on init:0 (Bootstrap::init()) and
 		// discovery has already set $final_boot_done by then.
 		//
 		// WHAT IT BOUGHT. Measured on a multisite fixture with Redis over a unix
@@ -409,23 +423,6 @@ final class AddonRegistry {
 	}
 
 	/**
-	 * Current network-wide generation for the bootable cache. The transient
-	 * is per-blog; baking this generation into its payload lets one
-	 * update_site_option() bump invalidate every blog's copy without
-	 * enumerating blogs. Single-site has no cross-blog staleness problem,
-	 * so a constant keeps its reads free.
-	 *
-	 * @return int
-	 */
-	private static function bootable_generation(): int {
-		if ( ! is_multisite() ) {
-			return 0;
-		}
-
-		return (int) get_site_option( self::BOOTABLE_GEN_OPTION, 0 );
-	}
-
-	/**
 	 * Invalidate the bootable-addons cache. Hooked to plugin/theme
 	 * lifecycle events that could flip a compat closure's result. Safe to
 	 * call repeatedly — extra calls only force rebuilds, never staleness.
@@ -440,11 +437,10 @@ final class AddonRegistry {
 		delete_transient( self::BOOTABLE_TRANSIENT );
 
 		if ( is_multisite() ) {
-			// Lifecycle hooks fire in a single blog's context, but a
-			// network-wide plugin flip changes the compat result for every
-			// blog — bump the network generation so each blog's per-blog
-			// transient is discarded on its next read instead of lingering
-			// until the TTL lapses.
+			// Lifecycle hooks fire in a single blog's context. The network
+			// generation is bumped here; nothing reads it, because
+			// resolve_bootable_ids() computes the list on every request
+			// (see BOOTABLE_GEN_OPTION).
 			update_site_option(
 				self::BOOTABLE_GEN_OPTION,
 				(int) get_site_option( self::BOOTABLE_GEN_OPTION, 0 ) + 1
@@ -646,6 +642,19 @@ final class AddonRegistry {
 	}
 
 	/**
+	 * Record a `perflocale/addon/enabled` false result reached before the
+	 * registry booted (theme addons decide while the plugin file loads). The
+	 * boot loop then skips the addon without asking the filter again.
+	 *
+	 * @param string $id         Addon ID.
+	 * @param bool   $default_on Whether the addon would have booted without the filter.
+	 * @return void
+	 */
+	public function mark_filter_off( string $id, bool $default_on = true ): void {
+		$this->filter_off[ $id ] = $default_on;
+	}
+
+	/**
 	 * Boot all compatible addons.
 	 *
 	 * @return void
@@ -692,7 +701,7 @@ final class AddonRegistry {
 		$disabled = self::get_disabled();
 
 		foreach ( $this->addons as $id => $addon ) {
-			if ( isset( $this->booted[ $id ] ) ) {
+			if ( isset( $this->booted[ $id ] ) || isset( $this->filter_off[ $id ] ) ) {
 				continue;
 			}
 
@@ -711,7 +720,36 @@ final class AddonRegistry {
 			// the admin wrote the option but boot still honoured the
 			// addon, so `wp perflocale addon doctor` showed it BOTH
 			// booted AND disabled. Removed.
-			if ( in_array( $id, $disabled, true ) ) {
+			$default_on = ! in_array( $id, $disabled, true );
+
+			/**
+			 * Filter whether an addon boots in this request.
+			 *
+			 * Evaluated once per addon per request, when the registry boots
+			 * it (init:0 on a normal request). The Blocksy, Kadence and Neve
+			 * theme addons are decided earlier, while the PerfLocale plugin
+			 * file loads, so for them only a callback added by a must-use
+			 * plugin or a plugin loaded before PerfLocale takes effect.
+			 * Only request-level context is known then: admin or front end,
+			 * REST (Helper::is_rest_request()), WP-CLI, cron, AJAX and the
+			 * current blog. The language and the queried object are NOT known
+			 * yet, so a callback cannot key on them.
+			 *
+			 * False skips the boot for this request only. The addon is
+			 * reported as disabled by filter — not incompatible, not
+			 * quarantined — its failure counter is untouched, and the
+			 * disabled list behind the Addons page switch is not changed.
+			 * True boots an addon that list turns off. Quarantined addons
+			 * are skipped before this filter runs.
+			 *
+			 * @hook perflocale/addon/enabled
+			 * @param bool   $enabled  Default: false when the addon is in the disabled list, else true.
+			 * @param string $addon_id Addon ID.
+			 */
+			$enabled = (bool) apply_filters( 'perflocale/addon/enabled', $default_on, $id );
+
+			if ( ! $enabled ) {
+				$this->filter_off[ $id ] = $default_on;
 				continue;
 			}
 
@@ -858,9 +896,10 @@ final class AddonRegistry {
 	private const BOOTABLE_TRANSIENT = 'perflocale_bootable_addons';
 
 	/**
-	 * Site option holding the network-wide generation number embedded in
-	 * each blog's cached bootable payload (multisite only — see
-	 * {@see self::bootable_generation()} / {@see self::flush_bootable_cache()}).
+	 * Site option holding the network-wide generation number of the bootable
+	 * cache (multisite only). {@see self::flush_bootable_cache()} bumps it;
+	 * nothing reads it, because resolve_bootable_ids() computes the list on
+	 * every request (see BOOTABLE_TRANSIENT).
 	 */
 	private const BOOTABLE_GEN_OPTION = 'perflocale_bootable_gen';
 
@@ -1000,6 +1039,16 @@ final class AddonRegistry {
 	}
 
 	/**
+	 * Addons the `perflocale/addon/enabled` filter turned off for this
+	 * request. An addon the disabled list already turns off is not listed.
+	 *
+	 * @return array<string, bool>
+	 */
+	public function get_disabled_by_filter_ids(): array {
+		return array_filter( $this->filter_off );
+	}
+
+	/**
 	 * Option key storing the operator-controlled disabled-addon list.
 	 *
 	 * Format: indexed array of addon IDs. Empty array (the default) means
@@ -1057,9 +1106,10 @@ final class AddonRegistry {
 	 * Without this two concurrent set_disabled() calls (admin + CLI, or
 	 * two AJAX toggles in close succession) can race: both read the same
 	 * snapshot, both mutate, the second update_option clobbers the first
-	 * one's commit. Same pattern AddonSettings uses for the settings
-	 * option, on a separate lock name so toggling an addon doesn't block
-	 * settings saves.
+	 * one's commit. Same lock pattern AddonSettings uses for its option,
+	 * on a separate lock name so toggling an addon doesn't block settings
+	 * saves. The re-read inside the lock differs because this option is
+	 * autoloaded and AddonSettings' is not (see set_disabled()).
 	 */
 	private const DISABLED_LOCK_NAME = 'addon_disabled_write';
 
@@ -1075,17 +1125,25 @@ final class AddonRegistry {
 	 *   - the addon id is malformed (regex pattern from AddonSchemaManager)
 	 *   - the resulting serialised list would exceed
 	 *     {@see DISABLED_OPTION_MAX_BYTES}
-	 *   - the write lock could not be acquired within
-	 *     {@see DISABLED_LOCK_TTL} seconds (rare, lock contention)
+	 *   - the write lock is already held (rare, lock contention;
+	 *     Lock::with() does not wait)
+	 *   - the options write is refused (a pre_update_option filter handed
+	 *     back the stored value, or the database rejected the query)
+	 *
+	 * Asking for the state the addon is already in succeeds without a
+	 * write.
 	 *
 	 * Concurrency: the whole read-mutate-write is wrapped in
-	 * `Lock::with()` AND the read happens INSIDE the lock from the raw
-	 * option (bypassing in-memory + object caches) so two concurrent
-	 * callers can't lose either commit.
+	 * `Lock::with()` AND the read happens INSIDE the lock, after dropping
+	 * the cached `alloptions` blob and the per-key entry (on a persistent
+	 * object cache, the blog's shared entries), so two concurrent callers
+	 * can't lose either commit.
 	 *
 	 * @param string $id       Addon ID.
 	 * @param bool   $disabled Whether the addon should be skipped at boot.
-	 * @return bool True on commit; false on rejection (caller can surface).
+	 * @return bool True when the stored list holds the requested state
+	 *              (written now or already); false on rejection (caller can
+	 *              surface).
 	 */
 	public static function set_disabled( string $id, bool $disabled ): bool {
 		$id = trim( $id );
@@ -1105,10 +1163,17 @@ final class AddonRegistry {
 			self::DISABLED_LOCK_NAME,
 			self::DISABLED_LOCK_TTL,
 			static function () use ( $id, $disabled ): bool {
-				// Re-read the option inside the lock, bypassing caches —
-				// otherwise a concurrent commit between our outer read and
-				// our update_option could be silently lost.
+				// Re-read the option inside the lock — otherwise this request
+				// mutates the list it loaded at bootstrap and overwrites any
+				// commit another request made since. The option is
+				// autoloaded, so get_option() answers from this request's
+				// `alloptions` copy, loaded at bootstrap, and never consults
+				// the per-key cache entry. Dropping `alloptions` makes both
+				// this read and update_option()'s own old-value comparison
+				// see the committed row; the per-key delete covers a row
+				// stored with autoload off.
 				wp_cache_delete( self::DISABLED_OPTION, 'options' );
+				wp_cache_delete( 'alloptions', 'options' );
 				$current = (array) get_option( self::DISABLED_OPTION, [] );
 
 				// Normalise the same way get_disabled() does so we never
@@ -1122,6 +1187,7 @@ final class AddonRegistry {
 					}
 				}
 				$current = array_values( array_unique( $normalised ) );
+				$before  = $current;
 
 				if ( $disabled ) {
 					if ( ! in_array( $id, $current, true ) ) {
@@ -1151,13 +1217,25 @@ final class AddonRegistry {
 					return false;
 				}
 
-				update_option( self::DISABLED_OPTION, $current, true );
+				// update_option() returns false both for a value that is
+				// already stored and for a refused write. Only a refusal
+				// fails: when the mutation left the normalised list unchanged,
+				// the addon is already in the requested state, even if the
+				// write that would have dropped junk entries is refused.
+				if ( ! update_option( self::DISABLED_OPTION, $current, true ) && $current !== $before ) {
+					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+						error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected — the options write for "%s" was refused', $id ) );
+					}
+					return false;
+				}
 				return true;
 			}
 		);
 
-		// Lock::with() returns null when acquire timed out — surface as
-		// a transient failure so callers (admin handler / CLI) can react.
+		// Lock::with() returns null when the lock is already held (acquire()
+		// fails at once, no wait) — surface as a transient failure so
+		// callers (admin handler / CLI) can react.
 		if ( $result === null ) {
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
@@ -1193,7 +1271,9 @@ final class AddonRegistry {
 	 *
 	 * @param array<int, string> $ids Addon IDs to disable. Non-string /
 	 *                                 invalid / duplicate entries are dropped.
-	 * @return bool True on commit; false on cap overflow or lock contention.
+	 * @return bool True when the stored list equals the normalised one
+	 *              (written now or already); false on cap overflow, lock
+	 *              contention, or a refused options write.
 	 */
 	public static function set_disabled_list( array $ids ): bool {
 		$normalised = [];
@@ -1224,7 +1304,24 @@ final class AddonRegistry {
 			self::DISABLED_LOCK_NAME,
 			self::DISABLED_LOCK_TTL,
 			static function () use ( $normalised ): bool {
-				update_option( self::DISABLED_OPTION, $normalised, true );
+				// Compare against the committed row, not this request's
+				// bootstrap `alloptions` copy: update_option() skips the
+				// write when its own old-value read matches, so a stale copy
+				// would pass for a no-op. Same cache drop as set_disabled().
+				wp_cache_delete( self::DISABLED_OPTION, 'options' );
+				wp_cache_delete( 'alloptions', 'options' );
+				$stored = self::get_disabled();
+
+				// update_option() returns false both for a value that is
+				// already stored and for a refused write; only the second
+				// fails.
+				if ( ! update_option( self::DISABLED_OPTION, $normalised, true ) && $stored !== $normalised ) {
+					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected — the options write was refused' );
+					}
+					return false;
+				}
 				return true;
 			}
 		);
@@ -1270,8 +1367,10 @@ final class AddonRegistry {
 	 * don't get stuck with a generic init value.
 	 *
 	 * Errors during seeding are swallowed: a failed AddonSettings::set_addon
-	 * (size cap, lock contention) is logged via that class's own paths and
-	 * does not prevent the addon's boot from succeeding.
+	 * (size cap, lock contention, refused write) is logged via that class's
+	 * own paths, does not fire `perflocale/addon/seeded`, and does not
+	 * prevent the addon's boot from succeeding. The entry is still missing,
+	 * so the next boot tries again.
 	 *
 	 * @param AddonInterface $addon
 	 * @param string         $id

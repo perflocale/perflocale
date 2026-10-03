@@ -130,8 +130,10 @@ final class LocaleDateFormat {
 			];
 		}
 
-		$date = $lang && ! empty( $lang->date_format ) ? (string) $lang->date_format : '';
-		$time = $lang && ! empty( $lang->time_format ) ? (string) $lang->time_format : '';
+		// A stored format holding markup ('<') is not used: the site option
+		// applies instead.
+		$date = $lang && ! empty( $lang->date_format ) && ! str_contains( (string) $lang->date_format, '<' ) ? (string) $lang->date_format : '';
+		$time = $lang && ! empty( $lang->time_format ) && ! str_contains( (string) $lang->time_format, '<' ) ? (string) $lang->time_format : '';
 
 		// Apply the same `perflocale/date_format` / `perflocale/time_format`
 		// filters Helper exposes, so addons can override without touching DB.

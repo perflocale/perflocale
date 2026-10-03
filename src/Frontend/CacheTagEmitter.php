@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Frontend;
 
+use PerfLocale\Helper;
 use PerfLocale\Plugin;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -190,19 +191,20 @@ final class CacheTagEmitter {
 			return false;
 		}
 
-		foreach ( $excluded as $path ) {
-			$path = (string) $path;
+		// Excluded paths are site-relative, as the router matches them: on a
+		// subfolder install the home path is stripped first. The raw `home`
+		// option is read, not home_url(), which can carry a language prefix.
+		$home_path = '/' . trim( (string) wp_parse_url( (string) get_option( 'home' ), PHP_URL_PATH ), '/' );
 
-			// Prefix-match, not substring: `/wp-admin/` must not
-			// accidentally match a site's own `/my-wp-admin-guide/`
-			// page. Mirrors the router/UrlConverter behaviour so the
-			// two consumers of the same setting stay consistent.
-			if ( $path !== '' && str_starts_with( $uri, $path ) ) {
-				return true;
-			}
+		if ( '/' !== $home_path && ( $uri === $home_path || str_starts_with( $uri, $home_path . '/' ) ) ) {
+			$uri = (string) substr( $uri, strlen( $home_path ) );
+			$uri = str_starts_with( $uri, '/' ) ? $uri : '/' . $uri;
 		}
 
-		return false;
+		// The router's boundary-aware, decoding match: an excluded `/api`
+		// covers `/api/…` but not `/apifoo`, and a non-Latin excluded path
+		// matches the percent-encoded request path.
+		return Helper::path_matches_excluded( $uri, $excluded );
 	}
 
 	/**

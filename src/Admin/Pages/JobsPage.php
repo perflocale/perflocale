@@ -12,6 +12,7 @@ namespace PerfLocale\Admin\Pages;
 use PerfLocale\Background\BackgroundEvents;
 use PerfLocale\Background\JobRunnerFactory;
 use PerfLocale\Background\JobState;
+use PerfLocale\Migration\MigrationRunner;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -29,6 +30,11 @@ if ( ! defined( 'ABSPATH' ) ) {
  * users (`curl -u admin /wp-json/perflocale/v1/jobs`).
  */
 final class JobsPage {
+
+	/**
+	 * Job types whose result counts rows kept in the source language (`kept`, `first_warning`).
+	 */
+	private const KEPT_RESULT_TYPES = [ 'bulk_translate', 'site_translate' ];
 
 	/**
 	 * Enqueue stylesheet + auto-refresh script on the Jobs admin page only.
@@ -83,6 +89,10 @@ final class JobsPage {
 					'log'           => __( 'Log', 'perflocale' ),
 					/* translators: %1$s: failure detail (HTTP status code or error message) */
 					'requestFailed' => __( 'Failed: %1$s', 'perflocale' ),
+					'stageProgress' => self::stage_progress_format(),
+					/* translators: 1: overall progress in percent, 2: the current stage and its progress, e.g. "Posts: 120 of 500" */
+					'stageValue'    => __( '%1$s%% (%2$s)', 'perflocale' ),
+					'stages'        => MigrationRunner::stage_labels(),
 				],
 				'labels'      => [
 					'queued'   => __( 'Queued', 'perflocale' ),
@@ -105,7 +115,18 @@ final class JobsPage {
 		// renders inline only the small columns; the inspect-on-click
 		// modal calls GET /jobs/{id} which uses JobState::get() for full
 		// detail.
-		$jobs   = JobState::list_active_summary();
+		$jobs = JobState::list_active_summary();
+
+		// Only a supervisor sees every user's jobs; everyone else sees the
+		// jobs they dispatched, as in the REST list (JobsController).
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			$current_uid = get_current_user_id();
+			$jobs        = array_filter(
+				$jobs,
+				static fn( array $row ): bool => (int) ( $row['created_by'] ?? 0 ) === $current_uid
+			);
+		}
+
 		$engine = JobRunnerFactory::pick()->get_engine_name();
 		$as_url = '';
 
@@ -131,13 +152,14 @@ final class JobsPage {
 
 		?>
 		<div class="wrap perflocale-jobs">
+			<h1><?php esc_html_e( 'Background Jobs', 'perflocale' ); ?></h1>
+			<hr class="wp-header-end">
+
 			<?php if ( $scan_queued_notice !== '' ) : ?>
 				<div class="notice notice-success is-dismissible">
 					<p><?php echo esc_html( $scan_queued_notice ); ?></p>
 				</div>
 			<?php endif; ?>
-
-			<h1><?php esc_html_e( 'Background Jobs', 'perflocale' ); ?></h1>
 
 			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
@@ -231,11 +253,9 @@ final class JobsPage {
 		// the past, we flag the task as overdue. This is the canonical
 		// symptom of WP-Cron drift on low-traffic sites (cron only fires
 		// on traffic; daily events can run weekly).
-		// jobs_gc + jobs_watchdog are scheduled per-blog with a [blog_id]
-		// args tuple under AS so each blog has its own recurring action
-		// (the AS table is network-shared). The next_run probe needs to
-		// pass the same args or it would miss the schedule entirely on
-		// multisite.
+		// jobs_gc and jobs_watchdog are scheduled per blog with a [blog_id]
+		// args tuple. Action Scheduler matches args exactly, so the next_run
+		// probe passes the same args or it would miss the schedule.
 		$blog_arg = function_exists( 'get_current_blog_id' ) ? [ (int) get_current_blog_id() ] : [ 0 ];
 
 		$tasks = [
@@ -552,7 +572,11 @@ final class JobsPage {
 		$status     = (string) ( $row['status'] ?? 'unknown' );
 		$type       = (string) ( $row['type'] ?? '' );
 		$progress   = (int) ( $row['progress'] ?? 0 );
+		$progress   = max( 0, min( 100, $progress ) );
 		$updated_at = (int) ( $row['updated_at'] ?? 0 );
+		$stage_text = $status === 'running'
+			? self::stage_text( (string) ( $row['stage'] ?? '' ), (int) ( $row['processed'] ?? 0 ), (int) ( $row['total'] ?? 0 ) )
+			: '';
 
 		$status_labels = [
 			'queued'   => __( 'Queued', 'perflocale' ),
@@ -581,6 +605,17 @@ final class JobsPage {
 			}
 		}
 
+		// A finished machine-translation job reports the rows whose content
+		// stayed in the source language; only those job types read the result.
+		$kept          = 0;
+		$first_warning = '';
+		if ( $status === 'complete' && in_array( $type, self::KEPT_RESULT_TYPES, true ) ) {
+			$detail        = JobState::get( $job_id );
+			$result        = is_array( $detail ) ? (array) ( $detail['result'] ?? [] ) : [];
+			$kept          = max( 0, (int) ( $result['kept'] ?? 0 ) );
+			$first_warning = $kept > 0 ? trim( (string) ( $result['first_warning'] ?? '' ) ) : '';
+		}
+
 		?>
 		<tr data-perflocale-job-row="<?php echo esc_attr( $job_id ); ?>">
 			<td><code><?php echo esc_html( $type ); ?></code></td>
@@ -595,15 +630,36 @@ final class JobsPage {
 						<?php echo esc_html( $error_short ); ?>
 					</div>
 				<?php endif; ?>
+				<?php if ( $kept > 0 ) : ?>
+					<div class="perflocale-jobs-warning">
+						<?php
+						echo esc_html(
+							sprintf(
+								/* translators: %d: number of created translations whose content stayed in the source language. */
+								_n( '%d created translation kept the source-language content.', '%d created translations kept the source-language content.', $kept, 'perflocale' ),
+								$kept
+							)
+						);
+						?>
+						<?php if ( $first_warning !== '' ) : ?>
+							<strong><?php esc_html_e( 'First warning:', 'perflocale' ); ?></strong>
+							<?php echo esc_html( $first_warning ); ?>
+						<?php endif; ?>
+					</div>
+				<?php endif; ?>
 			</td>
 			<td data-perflocale-cell="progress">
 				<?php echo esc_html( (string) $progress ); ?>%
 				<div class="perflocale-jobs-progress" role="progressbar"
-					aria-valuenow="<?php echo esc_attr( (string) max( 0, min( 100, $progress ) ) ); ?>"
+					aria-valuenow="<?php echo esc_attr( (string) $progress ); ?>"
 					aria-valuemin="0" aria-valuemax="100"
+					<?php if ( $stage_text !== '' ) : ?>
+						aria-valuetext="<?php echo esc_attr( sprintf( /* translators: 1: overall progress in percent, 2: the current stage and its progress, e.g. "Posts: 120 of 500" */ __( '%1$s%% (%2$s)', 'perflocale' ), number_format_i18n( $progress ), $stage_text ) ); ?>"
+					<?php endif; ?>
 					aria-label="<?php esc_attr_e( 'Job progress', 'perflocale' ); ?>">
-					<span style="width: <?php echo esc_attr( (string) max( 0, min( 100, $progress ) ) ); ?>%"></span>
+					<span style="width: <?php echo esc_attr( (string) $progress ); ?>%"></span>
 				</div>
+				<div class="perflocale-jobs-stage" data-perflocale-cell="stage"><?php echo esc_html( $stage_text ); ?></div>
 			</td>
 			<td data-perflocale-cell="updated">
 				<?php
@@ -630,6 +686,43 @@ final class JobsPage {
 			</td>
 		</tr>
 		<?php
+	}
+
+	/**
+	 * The text of a running job's stage, e.g. "Posts: 120 of 500".
+	 *
+	 * @param string $stage     Stage key ('' when the job reports none).
+	 * @param int    $processed Items of the stage done.
+	 * @param int    $total     Items in the stage; 0 while not known.
+	 * @return string '' without a stage.
+	 */
+	private static function stage_text( string $stage, int $processed, int $total ): string {
+		if ( $stage === '' ) {
+			return '';
+		}
+
+		$label = MigrationRunner::stage_label( $stage );
+
+		if ( $total <= 0 ) {
+			return $label;
+		}
+
+		return sprintf(
+			self::stage_progress_format(),
+			$label,
+			number_format_i18n( max( 0, $processed ) ),
+			number_format_i18n( $total )
+		);
+	}
+
+	/**
+	 * The format of a stage's progress: stage label, items done, items in total.
+	 *
+	 * @return string
+	 */
+	private static function stage_progress_format(): string {
+		/* translators: 1: stage of a background job, e.g. "Posts", 2: items of the stage done, 3: items in the stage */
+		return __( '%1$s: %2$s of %3$s', 'perflocale' );
 	}
 
 	/**

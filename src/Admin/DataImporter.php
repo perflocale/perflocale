@@ -69,10 +69,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  * and on a copy of that site, and nowhere else. {@see self::import()}
  * refuses such a bundle when the envelope's recorded address is not this
  * site's, unless the operator confirms the copy relationship
- * (`$options['allow_foreign_ids']`). Settings and roles name nothing by id
- * and travel unconditionally; strings match on `original_hash` and travel
- * too, as long as the `languages` section their `language_id` points into
- * travels with them.
+ * (`$options['allow_foreign_ids']`). Settings and roles name nothing by id,
+ * so they never cause a refusal (see "Configuration" below for when they are
+ * applied); strings match on `original_hash` and travel too, as long as the
+ * `languages` section their `language_id` points into travels with them.
  *
  * In REPLACE mode the same refusal fires on a foreign bundle that merely
  * DECLARES its sections, because {@see self::tables_to_wipe()} plans the
@@ -92,6 +92,16 @@ if ( ! defined( 'ABSPATH' ) ) {
  * `perflocale/import/section/<name>` listener AFTER the gate, and nothing
  * here inspects its payload — whether those rows survive a move to another
  * site is the addon's question to answer.
+ *
+ * ## Configuration: Replace applies it, Merge never does
+ *
+ * The file's settings, add-on settings, disabled-add-on list and role grants
+ * (the `settings` and `roles` export sections) are applied in REPLACE mode
+ * only. A MERGE import adds rows and leaves this site's configuration as it
+ * is: each of those four parts the file carries is counted in `skipped` and
+ * named in the result's `not_applied`, with a `notice` for the operator. A
+ * file that carries only those sections owns no table, so a Replace import
+ * of it deletes no row.
  */
 final class DataImporter {
 
@@ -168,6 +178,8 @@ final class DataImporter {
 	 *
 	 * @param string               $file_path        Path to the JSON file.
 	 * @param bool                 $replace          Whether to replace all existing data (true) or merge (false).
+	 *                                               Only replace applies the file's settings,
+	 *                                               add-on settings, add-on list and roles.
 	 * @param bool                 $sanitize_strings Run the text columns of three tables through
 	 *                                               the sanitizers the plugin's own writers
 	 *                                               apply for a user without `unfiltered_html`:
@@ -194,10 +206,15 @@ final class DataImporter {
 	 *                                               gate below is skipped. Read with
 	 *                                               `! empty()`: a replayed job's args come
 	 *                                               back out of JSON as `1`, `'1'` or `true`.
-	 * @return array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool}
+	 * @return array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool, not_applied?: array<int, string>, notice?: string}
 	 *         `sanitized` counts stored string translation, language and
 	 *         translated-slug rows that `$sanitize_strings` changed, whether
 	 *         markup was removed or a value was only reformatted.
+	 *         `not_applied` and `notice` are present only after a merge import
+	 *         of a file that carries configuration: `not_applied` lists the
+	 *         parts left unapplied (`settings`, `addon_settings`,
+	 *         `disabled_addons`, `roles`, each also counted in `skipped`), and
+	 *         `notice` says so in a sentence for the operator.
 	 *         `refused` is present only when the site-identity gate stopped the
 	 *         import before its first write, so a caller can report a refusal
 	 *         that changed nothing as a failure rather than as a finished
@@ -370,15 +387,34 @@ final class DataImporter {
 			return $result;
 		}
 
+		// Merge never changes this site's configuration. Each configuration
+		// part the file carries is counted as skipped and named, and the four
+		// blocks below run in Replace mode only.
+		if ( ! $replace ) {
+			$not_applied = [];
+
+			foreach ( [ 'settings', 'addon_settings', 'disabled_addons', 'roles' ] as $config_part ) {
+				if ( isset( $data[ $config_part ] ) && is_array( $data[ $config_part ] ) ) {
+					$not_applied[] = $config_part;
+				}
+			}
+
+			if ( [] !== $not_applied ) {
+				$result['skipped']    += count( $not_applied );
+				$result['not_applied'] = $not_applied;
+				/* translators: "Merge" and "Replace" are the import modes on the Settings → Export & Import screen. */
+				$result['notice'] = __( 'Settings, add-on settings, the add-on list and roles in the file were not applied (Merge). Use Replace to apply them; a file with only those sections deletes no rows.', 'perflocale' );
+			}
+		}
+
 		// Undo ledger for everything this envelope writes OUTSIDE the table
-		// transaction. Settings, add-on settings, the disabled-add-on list and
-		// role grants all live in wp_options, and they are applied BEFORE the
-		// table import opens its transaction - so when the table import fails
-		// and rolls back, the tables returned to their pre-import state while
-		// those four kept the incoming bundle's values. The operator was left
-		// with the old data under the new settings and the new capability
-		// grants, and nothing said so. Each section pushes a closure that puts
-		// its own slice back; the catch below runs them in reverse.
+		// transaction. In Replace mode, settings, add-on settings, the
+		// disabled-add-on list and role grants all live in wp_options and are
+		// applied BEFORE the table import opens its transaction, so a table
+		// import that fails and rolls back would leave the old table data
+		// under the incoming settings and capability grants. Each section
+		// pushes a closure that puts its own slice back; the catch below runs
+		// them in reverse.
 		$undo = [];
 
 		// Import settings - route through the Settings class so values are
@@ -388,7 +424,7 @@ final class DataImporter {
 		// fresh instance would write wp_options correctly but leave the
 		// existing singleton's `$this->settings` array stale, so any code
 		// later in the same request would still see the pre-import values.
-		if ( isset( $data['settings'] ) && is_array( $data['settings'] ) ) {
+		if ( $replace && isset( $data['settings'] ) && is_array( $data['settings'] ) ) {
 			$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 
 			// Drop keys this build no longer knows BEFORE handing the array to
@@ -430,17 +466,18 @@ final class DataImporter {
 		// value up). Whole-option write so a stale prior import doesn't
 		// bleed through. Cache is cleared right after so AddonSettings::all()
 		// picks up the fresh option on next read.
-		if ( isset( $data['addon_settings'] ) && is_array( $data['addon_settings'] ) ) {
+		if ( $replace && isset( $data['addon_settings'] ) && is_array( $data['addon_settings'] ) ) {
 			$incoming = $data['addon_settings'];
 			$current  = (array) get_option( 'perflocale_addon_settings', [] );
 
 			// The exporter REDACTS credential-shaped keys (see
-			// DataExporter::CREDENTIAL_KEY_PATTERN), so an imported addon entry
-			// never carries its *_api_key / *_token / etc. Writing it verbatim
-			// would blank the target's live credentials — turning a settings
-			// restore into a "now re-enter every API key" incident. Preserve any
-			// credential key the target still has when the import omits it. In
-			// merge mode also keep addons the export didn't mention at all.
+			// DataExporter::CREDENTIAL_KEY_PATTERN) and password-type fields
+			// (DataExporter::password_setting_keys()), so an imported addon
+			// entry never carries its *_api_key / *_token / passwords. Writing
+			// it verbatim would blank the target's live credentials — turning a
+			// settings restore into a "now re-enter every API key" incident.
+			// Preserve any such key the target still has when the import omits
+			// it.
 			$merged = $current;
 
 			foreach ( $incoming as $addon => $entry ) {
@@ -450,14 +487,14 @@ final class DataImporter {
 				}
 
 				$existing_entry = ( isset( $current[ $addon ] ) && is_array( $current[ $addon ] ) ) ? $current[ $addon ] : [];
+				$password_keys  = $existing_entry !== [] ? DataExporter::password_setting_keys( (string) $addon ) : [];
 
-				// In merge mode the imported entry layers over the existing one;
-				// in replace mode the imported entry is authoritative except for
-				// the redacted credential keys restored below.
-				$base = $replace ? $entry : array_merge( $existing_entry, $entry );
+				// The imported entry is authoritative except for the redacted
+				// credential keys restored below.
+				$base = $entry;
 
 				foreach ( $existing_entry as $key => $value ) {
-					if ( ! array_key_exists( $key, $entry ) && preg_match( DataExporter::CREDENTIAL_KEY_PATTERN, (string) $key ) ) {
+					if ( ! array_key_exists( $key, $entry ) && ( preg_match( DataExporter::CREDENTIAL_KEY_PATTERN, (string) $key ) || in_array( (string) $key, $password_keys, true ) ) ) {
 						$base[ $key ] = $value;
 					}
 				}
@@ -465,11 +502,9 @@ final class DataImporter {
 				$merged[ $addon ] = $base;
 			}
 
-			// Replace mode is authoritative about WHICH addons exist: drop any
-			// the export didn't mention. Merge mode keeps target-only addons.
-			if ( $replace ) {
-				$merged = array_intersect_key( $merged, $incoming );
-			}
+			// Authoritative about WHICH addons exist too: drop any the export
+			// didn't mention.
+			$merged = array_intersect_key( $merged, $incoming );
 
 			$undo[] = static function () use ( $current ): void {
 				update_option( 'perflocale_addon_settings', $current, false );
@@ -487,7 +522,7 @@ final class DataImporter {
 		// merged with the target's existing disabled set). Routed through
 		// the registry so it gets the same id-validation, byte cap,
 		// write-lock, and bootable-cache flush as the admin/CLI toggles.
-		if ( isset( $data['disabled_addons'] ) && is_array( $data['disabled_addons'] ) ) {
+		if ( $replace && isset( $data['disabled_addons'] ) && is_array( $data['disabled_addons'] ) ) {
 			$previous_disabled = \PerfLocale\Addon\AddonRegistry::get_disabled();
 
 			$undo[] = static function () use ( $previous_disabled ): void {
@@ -502,7 +537,7 @@ final class DataImporter {
 		// data ensures any current_user_can() checks fired during import (very
 		// rare, but cache flushes and admin hooks can trigger them) see the
 		// imported permission shape, not the local one.
-		if ( isset( $data['roles'] ) && is_array( $data['roles'] ) ) {
+		if ( $replace && isset( $data['roles'] ) && is_array( $data['roles'] ) ) {
 			// One option holds every role and every capability for this site,
 			// so snapshotting it captures the Translator rebuild and each
 			// per-role grant in a single value. `role_key` is WP_Roles' own
@@ -555,60 +590,92 @@ final class DataImporter {
 			// PARTIALLY cleared.
 			$wipe_plan = $replace ? self::tables_to_wipe( $data ) : [];
 
-			if ( $replace ) {
-				// Atomic replace: the wipe AND the re-import run inside ONE
-				// transaction so a mid-restore failure rolls back instead of
-				// leaving the tables emptied or half-populated. DELETE (not
-				// TRUNCATE) because TRUNCATE is DDL and implicitly commits — it
-				// would silently end the transaction and re-open the data-loss
-				// window. IDs are preserved either way (replace keeps ids), so
-				// not resetting AUTO_INCREMENT is correct.
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->query( 'START TRANSACTION' );
+			// The wipe shares the import's try, so a statement that fails
+			// there reaches the same catch: ROLLBACK, then the undo ledger for
+			// the settings and roles written above.
+			try {
+				if ( $replace ) {
+					// Atomic replace: the wipe AND the re-import run inside ONE
+					// transaction so a mid-restore failure rolls back instead of
+					// leaving the tables emptied or half-populated. DELETE (not
+					// TRUNCATE) because TRUNCATE is DDL and implicitly commits — it
+					// would silently end the transaction and re-open the data-loss
+					// window. IDs are preserved either way (replace keeps ids), so
+					// not resetting AUTO_INCREMENT is correct.
+					//
+					// Each statement is checked against false only: wpdb returns 0
+					// for a transaction statement that succeeded and for a DELETE
+					// that found the table already empty. Without the transaction,
+					// every DELETE below would commit on its own.
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
+						self::log_db_error( 'START TRANSACTION', (string) $wpdb->last_error );
 
-				$was_suppressing = $wpdb->suppress_errors( true );
-
-				foreach ( $wipe_plan as $table_name => $type_scope ) {
-					// $full_table is Schema::table() mapped from a class-
-					// constant allow-list, never user input; sanitized to a
-					// bare identifier before interpolation since prepare()
-					// cannot bind a table name.
-					$full_table = Schema::sanitize_table( Schema::table( $table_name ) );
-
-					if ( $type_scope !== null ) {
-						// Shared polymorphic table: clear ONLY the slice the
-						// exported sections own, so "replace my strings"
-						// leaves every post and term group standing. The type
-						// is bound as a value, so the scope can never widen.
-						//
-						// Links pointing at the groups this drops live in
-						// a table the bundle does NOT own, so they are
-						// left dangling here and reaped after the commit
-						// — see reap_orphan_string_links().
-						// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifier (not a value): sanitized above; prepare() cannot bind identifiers.
-						$wpdb->query(
-							$wpdb->prepare(
-								'DELETE FROM %i WHERE type = %s',
-								$full_table,
-								$type_scope
-							)
-						);
-						continue;
+						throw new \RuntimeException( __( 'Replace import aborted: the database could not open a transaction; rolling back so no data is lost.', 'perflocale' ) );
 					}
 
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifier (not a value): sanitized above; prepare() cannot bind identifiers.
-					$wpdb->query(
-						$wpdb->prepare(
-							'DELETE FROM %i',
-							$full_table
-						)
-					);
+					$was_suppressing = $wpdb->suppress_errors( true );
+
+					// finally, not a trailing call: whatever leaves the loop, the
+					// connection's error reporting goes back to how it was found.
+					try {
+						foreach ( $wipe_plan as $table_name => $type_scope ) {
+							// $full_table is Schema::table() mapped from a class-
+							// constant allow-list, never user input; sanitized to a
+							// bare identifier before interpolation since prepare()
+							// cannot bind a table name.
+							$full_table = Schema::sanitize_table( Schema::table( $table_name ) );
+
+							if ( $type_scope !== null ) {
+								// Shared polymorphic table: clear ONLY the slice the
+								// exported sections own, so "replace my strings"
+								// leaves every post and term group standing. The type
+								// is bound as a value, so the scope can never widen.
+								//
+								// Links pointing at the groups this drops live in
+								// a table the bundle does NOT own, so they are
+								// left dangling here and reaped after the commit
+								// — see reap_orphan_string_links().
+								// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifier (not a value): sanitized above; prepare() cannot bind identifiers.
+								$wiped = $wpdb->query(
+									$wpdb->prepare(
+										'DELETE FROM %i WHERE type = %s',
+										$full_table,
+										$type_scope
+									)
+								);
+							} else {
+								// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifier (not a value): sanitized above; prepare() cannot bind identifiers.
+								$wiped = $wpdb->query(
+									$wpdb->prepare(
+										'DELETE FROM %i',
+										$full_table
+									)
+								);
+							}
+
+							// A table left uncleared turns the restore into a merge:
+							// the file's rows that collide skip as duplicates and the
+							// stale rows stay. A DELETE that ended the whole
+							// transaction (a deadlock) would also let the next one
+							// commit on its own, so stop at the first failure.
+							if ( false === $wiped ) {
+								self::log_db_error( 'clearing ' . $table_name, (string) $wpdb->last_error );
+
+								throw new \RuntimeException(
+									sprintf(
+										/* translators: %s: table name */
+										__( 'Replace import aborted: table "%s" could not be cleared; rolling back so no data is lost.', 'perflocale' ),
+										$table_name
+									)
+								);
+							}
+						}
+					} finally {
+						$wpdb->suppress_errors( $was_suppressing );
+					}
 				}
 
-				$wpdb->suppress_errors( $was_suppressing );
-			}
-
-			try {
 				foreach ( self::TABLES as $table_name ) {
 					if ( ! isset( $data['data'][ $table_name ] ) || ! is_array( $data['data'][ $table_name ] ) ) {
 						continue;
@@ -677,8 +744,8 @@ final class DataImporter {
 					if ( $replace && $table_result['failed'] > 0 ) {
 						throw new \RuntimeException(
 							sprintf(
-								/* translators: 1: table name, 2: failed row count, 3: total row count, 4: first database error */
-								'Replace import aborted: table "%1$s" could not insert %2$d of %3$d rows; rolling back so no data is lost. %4$s',
+								/* translators: 1: table name, 2: failed row count, 3: total row count, 4: the first row's error message */
+								__( 'Replace import aborted: table "%1$s" could not insert %2$d of %3$d rows; rolling back so no data is lost. %4$s', 'perflocale' ),
 								$table_name,
 								$table_result['failed'],
 								count( $rows ),
@@ -696,8 +763,8 @@ final class DataImporter {
 					if ( $replace && $table_result['imported'] === 0 && ! $scoped_wipe ) {
 						throw new \RuntimeException(
 							sprintf(
-								/* translators: 1: table name, 2: row count */
-								'Replace import aborted: table "%1$s" inserted 0 of %2$d rows. %3$s',
+								/* translators: 1: table name, 2: row count, 3: the first row's error message */
+								__( 'Replace import aborted: table "%1$s" inserted 0 of %2$d rows. %3$s', 'perflocale' ),
 								$table_name,
 								count( $rows ),
 								! empty( $table_result['errors'] ) ? (string) $table_result['errors'][0] : ''
@@ -707,8 +774,16 @@ final class DataImporter {
 				}
 
 				if ( $replace ) {
+					// A refused COMMIT usually means the server has already
+					// discarded the transaction. The catch's ROLLBACK covers one
+					// still open, and the undo ledger puts the settings and roles
+					// back to match the tables.
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					$wpdb->query( 'COMMIT' );
+					if ( false === $wpdb->query( 'COMMIT' ) ) {
+						self::log_db_error( 'COMMIT', (string) $wpdb->last_error );
+
+						throw new \RuntimeException( __( 'Replace import not confirmed: the database reported an error while saving it. Run the import again.', 'perflocale' ) );
+					}
 				}
 			} catch ( \Throwable $e ) {
 				if ( $replace ) {
@@ -880,15 +955,18 @@ final class DataImporter {
 		 * @since 1.0.0
 		 *
 		 * @param array{
-		 *     imported:  int,
-		 *     skipped:   int,
-		 *     errors:    array<int,string>,
-		 *     sanitized: int,
+		 *     imported:     int,
+		 *     skipped:      int,
+		 *     errors:       array<int,string>,
+		 *     sanitized:    int,
+		 *     not_applied?: array<int,string>,
+		 *     notice?:      string,
 		 * } $result The DataImporter result. `sanitized` counts stored
 		 *           string translation, language and translated-slug rows
 		 *           the sanitizers changed because the import ran at the
 		 *           trust level of a user without `unfiltered_html` (always
-		 *           0 for WP-CLI).
+		 *           0 for WP-CLI). `not_applied` and `notice` name the
+		 *           configuration a merge import left unapplied.
 		 * @param string $file_path Absolute path to the imported file.
 		 * @param bool   $replace   Whether the import ran in replace mode.
 		 */
@@ -1489,6 +1567,27 @@ final class DataImporter {
 	}
 
 	/**
+	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
+	 *
+	 * That text can carry table names with their prefix and the values of the
+	 * failed row. Import results and failed-job rows are shown to every user
+	 * with Jobs access, so the messages stored there say only that a database
+	 * error happened; the detail is here.
+	 *
+	 * @param string $where What was running, for the log line.
+	 * @param string $error The database error.
+	 * @return void
+	 */
+	private static function log_db_error( string $where, string $error ): void {
+		if ( $error === '' || ! defined( 'WP_DEBUG_LOG' ) || ! WP_DEBUG_LOG ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
+		error_log( 'PerfLocale DataImporter: database error while ' . $where . ' - ' . $error );
+	}
+
+	/**
 	 * Import a single table's data.
 	 *
 	 * @param string                          $table_name       Short table name.
@@ -1697,7 +1796,15 @@ final class DataImporter {
 					++$result['failed'];
 
 					if ( count( $result['errors'] ) < 20 ) {
-						$result['errors'][] = $last_error;
+						self::log_db_error( 'inserting into ' . $table_name . ( $old_id > 0 ? ' (export ID ' . $old_id . ')' : '' ), $last_error );
+
+						$result['errors'][] = $old_id > 0
+							? sprintf(
+								/* translators: %d: the row's ID in the export file. */
+								__( 'The row with export ID %d could not be saved because of a database error.', 'perflocale' ),
+								$old_id
+							)
+							: __( 'A row could not be saved because of a database error.', 'perflocale' );
 					}
 				}
 

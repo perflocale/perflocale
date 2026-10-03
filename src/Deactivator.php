@@ -30,15 +30,12 @@ if ( ! defined( 'ABSPATH' ) ) {
  * — which wp.org's automated uninstall-cleanup checks flag.
  *
  * Action Scheduler is NOT network-wide, despite being commonly described
- * that way — this file used to claim it and swept the AS queue once, outside
- * the loop. ActionScheduler_Abstract_Schema::get_full_table_name() builds its
+ * that way. ActionScheduler_Abstract_Schema::get_full_table_name() builds its
  * table names from `$wpdb->prefix`, not `$wpdb->base_prefix`, so every blog
  * owns its own wp_<id>_actionscheduler_* set. AS registers those names in
  * `$wpdb->tables`, which means switch_to_blog() re-points them and a group
- * sweep issued while switched in hits THAT blog's queue. Refuted on a live
- * 4-blog network: the single outside-the-loop sweep cleared the network
- * admin's blog and left every other blog's pending `perflocale` actions
- * scheduled. The sweep therefore lives in {@see deactivate_for_blog()}.
+ * sweep issued while switched in hits THAT blog's queue. The sweep therefore
+ * lives in {@see deactivate_for_blog()}.
  */
 final class Deactivator {
 
@@ -405,6 +402,8 @@ final class Deactivator {
 			\PerfLocale\WooCommerce\ExchangeRateSync::CRON_HOOK,
 			\PerfLocale\Concurrency\Lock::CLEANUP_HOOK,
 			\PerfLocale\Bootstrap::AUTO_TRANSLATE_CRON,
+			// Files-mode regeneration after a plugin update (one-shot).
+			\PerfLocale\Bootstrap::FILES_REGENERATE_HOOK,
 			// Webhook delivery + retry one-shots (scheduled with per-delivery args).
 			\PerfLocale\Api\WebhookController::DELIVERY_HOOK,
 			\PerfLocale\Api\WebhookController::RETRY_HOOK,

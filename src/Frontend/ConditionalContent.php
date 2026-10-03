@@ -353,7 +353,43 @@ final class ConditionalContent {
 		 */
 		$allowed = (array) apply_filters( 'perflocale/conditional_content/allowed_html', $allowed, $content );
 
-		return wp_kses( $content, $allowed );
+		// `xlink:href` is a URL attribute like `href`, but core does not list
+		// it in wp_kses_uri_attributes(), so wp_kses() would keep any protocol
+		// in it. Listed for this call, it keeps only the allowed protocols
+		// (a `#fragment` or an http(s) URL; not `javascript:`).
+		$uri_attributes = [ self::class, 'with_xlink_href' ];
+		$listed_here    = false === has_filter( 'wp_kses_uri_attributes', $uri_attributes );
+
+		if ( $listed_here ) {
+			add_filter( 'wp_kses_uri_attributes', $uri_attributes );
+		}
+
+		try {
+			return wp_kses( $content, $allowed );
+		} finally {
+			if ( $listed_here ) {
+				remove_filter( 'wp_kses_uri_attributes', $uri_attributes );
+			}
+		}
+	}
+
+	/**
+	 * `wp_kses_uri_attributes` while {@see self::kses_content()} runs: adds
+	 * `xlink:href`, so wp_kses() checks its protocol as it checks `href`'s.
+	 *
+	 * @internal
+	 *
+	 * @param mixed $attributes URI attribute names.
+	 * @return array<int, string>
+	 */
+	public static function with_xlink_href( mixed $attributes ): array {
+		$attributes = is_array( $attributes ) ? array_values( array_filter( $attributes, 'is_string' ) ) : [];
+
+		if ( ! in_array( 'xlink:href', $attributes, true ) ) {
+			$attributes[] = 'xlink:href';
+		}
+
+		return $attributes;
 	}
 
 	/**

@@ -389,22 +389,33 @@ final class MediaTranslationManager {
 	 * @return array<string, mixed>
 	 */
 	public function add_translation_fields( array $form_fields, \WP_Post $post ): array {
-		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
-		$languages = $lang_repo->get_active();
-		$default   = $lang_repo->get_default();
+		$lang_repo  = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
+		$languages  = $lang_repo->get_active();
+		$default    = $lang_repo->get_default();
+		$field_keys = self::field_keys( $languages );
 
 		foreach ( $languages as $lang ) {
 			if ( $default && $lang->slug === $default->slug ) {
 				continue;
 			}
 
-			$slug  = $lang->slug;
+			$slug = (string) $lang->slug;
+
+			if ( ! isset( $field_keys[ $slug ] ) ) {
+				continue;
+			}
+
+			$key   = $field_keys[ $slug ];
 			$label = strtoupper( $slug );
 
+			// Core prints each field's `label` as HTML and its key unescaped in
+			// the input's id, name and for attributes: the label is escaped
+			// here and the key comes from field_keys().
+
 			// Alt text per language.
-			$form_fields[ 'perflocale_alt_' . $slug ] = [
+			$form_fields[ 'perflocale_alt_' . $key ] = [
 				/* translators: %s: Language code */
-				'label' => sprintf( __( 'Alt Text (%s)', 'perflocale' ), $label ),
+				'label' => esc_html( sprintf( __( 'Alt Text (%s)', 'perflocale' ), $label ) ),
 				'input' => 'text',
 				'value' => get_post_meta( $post->ID, '_perflocale_alt_' . $slug, true ),
 				// Core prints `helps` as HTML, so it is escaped here.
@@ -413,19 +424,22 @@ final class MediaTranslationManager {
 			];
 
 			// Caption per language.
-			$form_fields[ 'perflocale_caption_' . $slug ] = [
+			$form_fields[ 'perflocale_caption_' . $key ] = [
 				/* translators: %s: Language code */
-				'label' => sprintf( __( 'Caption (%s)', 'perflocale' ), $label ),
+				'label' => esc_html( sprintf( __( 'Caption (%s)', 'perflocale' ), $label ) ),
 				'input' => 'text',
 				'value' => get_post_meta( $post->ID, '_perflocale_caption_' . $slug, true ),
 			];
 
-			// Description per language.
-			$form_fields[ 'perflocale_desc_' . $slug ] = [
+			// Description per language. Core prints a textarea `value` as-is
+			// (it escapes only text inputs), so it is escaped here.
+			$description = get_post_meta( $post->ID, '_perflocale_description_' . $slug, true );
+
+			$form_fields[ 'perflocale_desc_' . $key ] = [
 				/* translators: %s: Language code */
-				'label' => sprintf( __( 'Description (%s)', 'perflocale' ), $label ),
+				'label' => esc_html( sprintf( __( 'Description (%s)', 'perflocale' ), $label ) ),
 				'input' => 'textarea',
-				'value' => get_post_meta( $post->ID, '_perflocale_description_' . $slug, true ),
+				'value' => esc_textarea( is_scalar( $description ) ? (string) $description : '' ),
 			];
 		}
 
@@ -472,23 +486,52 @@ final class MediaTranslationManager {
 		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
 		$languages = $lang_repo->get_active();
 
-		foreach ( $languages as $lang ) {
-			$slug = $lang->slug;
-
-			if ( isset( $attachment[ 'perflocale_alt_' . $slug ] ) ) {
-				update_post_meta( $post_id, '_perflocale_alt_' . $slug, sanitize_text_field( $attachment[ 'perflocale_alt_' . $slug ] ) );
+		foreach ( self::field_keys( $languages ) as $slug => $key ) {
+			if ( isset( $attachment[ 'perflocale_alt_' . $key ] ) ) {
+				update_post_meta( $post_id, '_perflocale_alt_' . $slug, sanitize_text_field( $attachment[ 'perflocale_alt_' . $key ] ) );
 			}
 
-			if ( isset( $attachment[ 'perflocale_caption_' . $slug ] ) ) {
-				update_post_meta( $post_id, '_perflocale_caption_' . $slug, sanitize_text_field( $attachment[ 'perflocale_caption_' . $slug ] ) );
+			if ( isset( $attachment[ 'perflocale_caption_' . $key ] ) ) {
+				update_post_meta( $post_id, '_perflocale_caption_' . $slug, sanitize_text_field( $attachment[ 'perflocale_caption_' . $key ] ) );
 			}
 
-			if ( isset( $attachment[ 'perflocale_desc_' . $slug ] ) ) {
-				update_post_meta( $post_id, '_perflocale_description_' . $slug, sanitize_textarea_field( $attachment[ 'perflocale_desc_' . $slug ] ) );
+			if ( isset( $attachment[ 'perflocale_desc_' . $key ] ) ) {
+				update_post_meta( $post_id, '_perflocale_description_' . $slug, sanitize_textarea_field( $attachment[ 'perflocale_desc_' . $key ] ) );
 			}
 		}
 
 		return $post;
+	}
+
+	/**
+	 * Media-form field key suffix per language slug.
+	 *
+	 * The suffix is the slug through sanitize_key(), so it is safe in the
+	 * attributes core builds from the key. The stored meta keys keep the slug
+	 * itself. When two slugs give the same suffix, the first language keeps it
+	 * and the other gets no fields, so one posted value never reaches two
+	 * languages.
+	 *
+	 * @param array<int, object> $languages Language rows, in display order.
+	 * @return array<string, string> Slug => field key suffix.
+	 */
+	private static function field_keys( array $languages ): array {
+		$keys = [];
+		$used = [];
+
+		foreach ( $languages as $lang ) {
+			$slug = (string) ( $lang->slug ?? '' );
+			$key  = sanitize_key( $slug );
+
+			if ( $key === '' || isset( $keys[ $slug ] ) || isset( $used[ $key ] ) ) {
+				continue;
+			}
+
+			$keys[ $slug ] = $key;
+			$used[ $key ]  = true;
+		}
+
+		return $keys;
 	}
 
 	// -------------------------------------------------------------------------

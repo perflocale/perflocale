@@ -61,8 +61,14 @@
 			'</span>' +
 			'<span class="pl-fb-chip__pos"></span>' +
 			'<span class="pl-fb-chip__name"></span>' +
-			'<button type="button" class="pl-fb-chip__remove">×</button>' +
-			'<input type="hidden" name="language_fallbacks[' + rowSlug + '][]">';
+			'<button type="button" class="pl-fb-chip__remove">×</button>';
+		// The row's language code goes into the field name through the DOM API
+		// (auto-escaped), never through the innerHTML string above.
+		var input = document.createElement( 'input' );
+		input.type = 'hidden';
+		input.setAttribute( 'name', 'language_fallbacks[' + rowSlug + '][]' );
+		input.value = fbSlug;
+		el.appendChild( input );
 		el.querySelector( '.pl-fb-chip__name' ).textContent = flag + ' ' + name;
 		// Set the button label via the DOM API (auto-escaped) rather than
 		// interpolating the language name into the innerHTML attribute string.
@@ -75,7 +81,6 @@
 		upBtn.setAttribute( 'title', LABELS.moveUp );
 		downBtn.setAttribute( 'aria-label', LABELS.moveDown );
 		downBtn.setAttribute( 'title', LABELS.moveDown );
-		el.querySelector( 'input[type="hidden"]' ).value = fbSlug;
 		return el;
 	}
 

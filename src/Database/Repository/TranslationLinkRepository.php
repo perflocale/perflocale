@@ -71,6 +71,30 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	}
 
 	/**
+	 * SQL expression for the effective status of a link joined to its post.
+	 *
+	 * The SQL twin of {@see \PerfLocale\Enum\TranslationStatus::effective()}:
+	 * the same arms in the same order, so a filter, a count and a table cell
+	 * agree on every (stored status, post status) pair. A NULL post (no row
+	 * joined: a term or string link, or a missing post) matches none of the
+	 * post arms and keeps the stored value.
+	 *
+	 * @param literal-string $link_alias Alias of the translation_links table (a literal in the caller's SQL).
+	 * @param literal-string $post_alias Alias of the posts table, LEFT JOINed on object_id (a literal in the caller's SQL).
+	 * @return literal-string CASE expression.
+	 */
+	public static function effective_status_sql( string $link_alias, string $post_alias ): string {
+		return "CASE
+			WHEN {$post_alias}.post_status IN ( 'trash', 'auto-draft' ) THEN 'empty'
+			WHEN {$link_alias}.status = 'needs_update' THEN 'needs_update'
+			WHEN {$post_alias}.post_status = 'publish' THEN 'published'
+			WHEN {$post_alias}.post_status = 'draft' THEN 'draft'
+			WHEN {$post_alias}.post_status = 'pending' THEN 'pending'
+			ELSE {$link_alias}.status
+		END";
+	}
+
+	/**
 	 * Count translations by status for a given language.
 	 *
 	 * @param int    $language_id Language ID.
@@ -86,30 +110,15 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		$args  = [ $language_id ];
 		$join  = 'INNER JOIN %i g ON l.group_id = g.id';
 
-		// When a post-type filter is supplied we already INNER JOIN wp_posts;
-		// piggy-back on that join to resolve the link's effective status from
-		// the WP post_status when the link row is still the default 'empty'.
-		// This mirrors the runtime fix-up in TranslationsPage::collect_rows()
-		// at src/Admin/Pages/TranslationsPage.php:353 - the link table can
-		// drift behind the post status (older translations created before
-		// the publish-sync hook landed, or imports that bypassed it).
-		// LEFT JOIN wp_posts (gated to post-type links) so a link still at the
-		// default 'empty' status resolves its effective status from the WP
-		// post_status even with NO post-type filter. Without this the no-type
-		// path returned raw l.status and mis-counted published translations as
-		// 'empty', so `wp perflocale status` / the Dashboard disagreed with the
-		// per-type views. The `g.type = 'post'` half of the join condition is
-		// what keeps term links out: object_id is polymorphic and holds a
-		// term_id for term links, which collides freely with a post ID, so
-		// without that gate a term would borrow a same-numbered post's status.
-		// With it, term links never join a post row and keep their stored
-		// status via the ELSE branch.
+		// Post links count by their effective status (effective_status_sql()),
+		// the same value the Translations screen and the Dashboard show. The
+		// posts table is LEFT JOINed only for post-type links: object_id is
+		// polymorphic and holds a term_id for term links, which collides
+		// freely with a post ID, so without the `g.type = 'post'` gate a term
+		// would borrow a same-numbered post's status. Term and string links
+		// join no post row and keep their stored status.
 		$join       .= " LEFT JOIN {$posts_table} p ON l.object_id = p.ID AND g.type = 'post'";
-		$status_expr = "CASE
-			WHEN l.status = 'empty' AND p.post_status = 'publish' THEN 'published'
-			WHEN l.status = 'empty' AND p.post_status = 'draft' THEN 'draft'
-			ELSE l.status
-		END";
+		$status_expr = self::effective_status_sql( 'l', 'p' );
 
 		if ( $type !== '' ) {
 			// Narrow to one post type. p is NULL for term links, so the
@@ -154,11 +163,8 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	 * a single query — replaces an O(P×L) loop of per-cell
 	 * `count_by_status()` calls on the dashboard.
 	 *
-	 * The status expression mirrors `count_by_status()`'s post-status
-	 * fixup: when the link's stored status is 'empty' but the linked
-	 * post is publish/draft, the effective status takes the WP post's
-	 * status. Same fixup also lives in
-	 * `Admin/Pages/TranslationsPage::collect_rows()` so display matches.
+	 * Counts by effective status (effective_status_sql()), like
+	 * `count_by_status()` and the Translations screen.
 	 *
 	 * @param int[]    $language_ids Languages to count for.
 	 * @param string[] $post_types   Post types to count for.
@@ -199,28 +205,16 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		$pt_ph   = implode( ',', array_fill( 0, count( $pt_safe ), '%s' ) );
 
 		// The stored status is written when the link is created and is not
-		// maintained afterwards, so it is reconciled against the post's REAL
-		// status here. Both directions matter:
-		//
-		//   upward   — a link still reading 'empty' whose post is live really
-		//              is published (nothing writes the status on publish);
-		//   downward — a link reading 'published' whose post was TRASHED (or
-		//              left as an auto-draft) is not a translation any more.
-		//              Without this arm the dashboard counted trashed
-		//              translations toward "translated" and reported progress
-		//              the site does not have. Measured on a real site: 8
-		//              trashed + 3 auto-draft rows inflating the count.
-		//
-		// 'empty' is the correct landing bucket for the downward arm: the
-		// source post still needs a translation, which is exactly what 'empty'
-		// means everywhere else in the UI.
+		// maintained afterwards, so each link counts by its effective status:
+		// reconciled against the post's real status in both directions (a
+		// live post is published whatever the row says; a trashed or
+		// auto-draft post is not a translation, so it lands in 'empty', the
+		// bucket that means "still needs a translation"), with a stored
+		// 'needs_update' kept as the workflow flag.
+		$status_expr = self::effective_status_sql( 'l', 'p' );
+
 		$sql = "SELECT l.language_id AS lid, p.post_type AS pt,
-				CASE
-					WHEN p.post_status IN ( 'trash', 'auto-draft' ) THEN 'empty'
-					WHEN l.status = 'empty' AND p.post_status = 'publish' THEN 'published'
-					WHEN l.status = 'empty' AND p.post_status = 'draft' THEN 'draft'
-					ELSE l.status
-				END AS effective_status,
+				{$status_expr} AS effective_status,
 				COUNT(*) AS cnt
 			FROM %i l
 			INNER JOIN %i g ON l.group_id = g.id

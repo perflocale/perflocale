@@ -47,6 +47,13 @@ final class TermTranslationManager {
 	private const MAX_SLUG_SUFFIX = 999;
 
 	/**
+	 * Values of translation_links.source written by the importers.
+	 *
+	 * @var list<string>
+	 */
+	private const IMPORTED_SOURCES = [ 'imported_wpml', 'imported_polylang', 'imported_trp' ];
+
+	/**
 	 * @var TranslationGroupRepository
 	 */
 	private readonly TranslationGroupRepository $groups;
@@ -321,7 +328,12 @@ final class TermTranslationManager {
 		if ( $source_term->parent > 0 ) {
 			$parent_translation = $this->get_translation_id( $source_term->parent, $target_slug );
 
-			if ( $parent_translation !== null ) {
+			// A translation_links row can outlive its term (deleted while
+			// PerfLocale was not loaded, or by direct SQL), and wp_insert_term()
+			// refuses a parent that does not exist. A parent translation that is
+			// gone, or not in this taxonomy, is treated like one not created
+			// yet: the child goes in at the top level.
+			if ( $parent_translation !== null && get_term( $parent_translation, $taxonomy ) instanceof \WP_Term ) {
 				$args['parent'] = $parent_translation;
 			}
 		}
@@ -341,8 +353,40 @@ final class TermTranslationManager {
 		$result = wp_insert_term( wp_slash( $name ), $taxonomy, $slashed_args );
 
 		if ( is_wp_error( $result ) ) {
-			// Name collision - force-insert via wpdb to create a truly separate
-			// term. Raw $wpdb->insert does NOT unslash, so pass the ORIGINAL
+			$code = (string) $result->get_error_code();
+
+			// Two errors fall through to the raw insert, and both mean the
+			// explicit slug is already taken in this taxonomy:
+			// - term_exists: a same-name term at this level holds it;
+			// - db_insert_error with the slug taken: wp_unique_term_slug()
+			// appended the parent's slug or "-N" with no length check, and
+			// wpdb refused a slug longer than the column.
+			// Any other error (a pre_insert_term veto, a missing parent, a name
+			// that sanitizes to nothing, a failed insert of a free slug) is
+			// WordPress or a site filter refusing the term, and inserting it
+			// anyway would bypass that refusal. The bulk and post-copy callers
+			// only count or drop a false, hence the log.
+			$slug_overflow = 'db_insert_error' === $code && get_term_by( 'slug', $slug, $taxonomy ) instanceof \WP_Term;
+
+			if ( 'term_exists' !== $code && ! $slug_overflow ) {
+				if ( function_exists( 'error_log' ) ) {
+					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on a failure the bulk and post-copy paths do not report.
+					error_log(
+						sprintf(
+							'[perflocale] create_translation: wp_insert_term() refused the %s translation of term %d in taxonomy %s (%s)',
+							$target_slug,
+							$source_id,
+							$taxonomy,
+							$code
+						)
+					);
+				}
+
+				return false;
+			}
+
+			// Slug taken - force-insert via wpdb under the first free "-N"
+			// slug. Raw $wpdb->insert does NOT unslash, so pass the ORIGINAL
 			// unslashed $name / $args (never the slashed copy).
 			$new_term_id = $this->force_insert_term( $name, $taxonomy, $slug, $args );
 
@@ -766,7 +810,8 @@ final class TermTranslationManager {
 	 *
 	 * For each translation group, determines the base slug (from the
 	 * default-language term, stripping language suffixes) and records it
-	 * as the display slug for every term in the group.
+	 * as the display slug for every term in the group. Terms linked by an
+	 * importer keep their own slug and are skipped.
 	 *
 	 * Safe to call multiple times - set_slug() uses INSERT ... ON DUPLICATE KEY UPDATE.
 	 *
@@ -783,7 +828,7 @@ final class TermTranslationManager {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT g.id AS group_id, l.object_id AS term_id, l.language_id
+				"SELECT g.id AS group_id, l.object_id AS term_id, l.language_id, l.source
 				FROM %i g
 				INNER JOIN %i l ON l.group_id = g.id
 				WHERE g.type = 'term'
@@ -846,6 +891,14 @@ final class TermTranslationManager {
 			// always share the taxonomy in practice, but resolving per
 			// member keeps us correct if that invariant ever changes.
 			foreach ( $members as $m ) {
+				// A term linked by an importer keeps its own slug as its URL
+				// (each language had its own under the source plugin), so it
+				// gets no slug translation: writing the default member's slug
+				// would move its archive to another address.
+				if ( in_array( (string) $m->source, self::IMPORTED_SOURCES, true ) ) {
+					continue;
+				}
+
 				$term_obj = get_term( (int) $m->term_id );
 				$tax      = ( $term_obj instanceof \WP_Term ) ? $term_obj->taxonomy : '';
 
@@ -882,15 +935,16 @@ final class TermTranslationManager {
 	private function force_insert_term( string $name, string $taxonomy, string $slug, array $args ): int|false {
 		global $wpdb;
 
-		// Dedupe the slug before inserting. This fallback runs precisely when
-		// wp_insert_term() rejected with 'term_exists', and create_translation()
-		// always supplies an explicit slug — core only errors the slug-provided
-		// path when a term with that exact slug already exists. Inserting the
-		// same slug verbatim would leave two wp_terms rows sharing it (wp_terms
-		// has no unique slug index), and get_term_by('slug') / URL resolution
-		// would then deterministically resolve to the pre-existing term, leaving
-		// this new translation's archive unreachable. Walk to the first free
-		// "-N" suffix, mirroring wp_unique_term_slug()'s intent.
+		// Dedupe the slug before inserting. This fallback runs only when the
+		// explicit slug create_translation() supplies is already taken in this
+		// taxonomy: wp_insert_term() answered 'term_exists', or it answered
+		// 'db_insert_error' after suffixing that taken slug past the column
+		// width. Inserting the same slug verbatim would leave two wp_terms rows
+		// sharing it (wp_terms has no unique slug index), and
+		// get_term_by('slug') / URL resolution would then deterministically
+		// resolve to the pre-existing term, leaving this new translation's
+		// archive unreachable. Walk to the first free "-N" suffix, mirroring
+		// wp_unique_term_slug()'s intent.
 		//
 		// Both halves of that walk are load-bearing. get_term_by( 'slug', ... )
 		// hands the needle to WP_Term_Query, which sanitize_title()s it — so a

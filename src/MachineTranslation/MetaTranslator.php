@@ -10,7 +10,9 @@ declare( strict_types=1 );
 namespace PerfLocale\MachineTranslation;
 
 use PerfLocale\Settings;
+use PerfLocale\Translation\ContentSync;
 use PerfLocale\Translation\PlaceholderMasker;
+use PerfLocale\Translation\PostTranslationManager;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -33,7 +35,20 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   copy_post_meta). A translator-edited value is never overwritten, which
  *   also makes every re-run idempotent and re-run-safe at ZERO provider cost:
  *   an owned or unchanged value is dropped from the batch before the provider
- *   is reached, so it is never re-billed.
+ *   is reached, so it is never re-billed. A key with several rows is not one
+ *   value and is skipped, and so is a key listed in the translation's
+ *   seed-cleared marker (a field a person emptied there stays empty). A key
+ *   the registry lists for the source but not for this translation (an
+ *   addon found its row laid out differently there) is counted as skipped.
+ * - The rule is applied to a snapshot taken before the provider call. After
+ *   it, the rows are re-read past the object cache in one query, and a key
+ *   whose rows changed during the wait is skipped: that edit owns the field.
+ *   The write replaces only the snapshot (a unique add when the key was
+ *   absent, a prev_value compare-and-swap otherwise), and a write that did
+ *   not land counts as failed, never as translated.
+ * - Keys matching the sensitive-meta patterns (the same list that keeps them
+ *   out of a new translation's copied meta) are dropped from the registry,
+ *   whichever addon registered them.
  * - MIRROR keys (builder layout JSON — source-owned, overwritten on every
  *   sync) are excluded at runtime, not just by list curation.
  * - Placeholder tokens (%s, {var}, %%sitename%%-style SEO template tags via
@@ -82,13 +97,16 @@ final class MetaTranslator {
 	/**
 	 * Resolve the MT-able meta keys for a post via the curated registry.
 	 *
-	 * @param string $post_type Post type.
-	 * @param int    $post_id   Source post ID (0 = type-level resolution, used
-	 *                          by the cost estimator; addons may expand
-	 *                          per-post keys like repeater rows when > 0).
+	 * @param string $post_type      Post type.
+	 * @param int    $post_id        Source post ID (0 = type-level resolution,
+	 *                               used by the cost estimator; addons may
+	 *                               expand per-post keys like repeater rows
+	 *                               when > 0).
+	 * @param int    $translation_id Translation post ID the values are written
+	 *                               to (0 when unknown).
 	 * @return string[]
 	 */
-	public function get_mt_meta_keys( string $post_type, int $post_id = 0 ): array {
+	public function get_mt_meta_keys( string $post_type, int $post_id = 0, int $translation_id = 0 ): array {
 		/**
 		 * The curated machine-translatable meta-key registry.
 		 *
@@ -100,16 +118,24 @@ final class MetaTranslator {
 		 *
 		 * @hook perflocale/mt/translatable_meta_keys
 		 *
-		 * @param string[] $keys      Meta keys to machine-translate.
-		 * @param string   $post_type Post type being translated.
-		 * @param int      $post_id   Source post ID (0 for type-level queries).
+		 * @param string[] $keys           Meta keys to machine-translate.
+		 * @param string   $post_type      Post type being translated.
+		 * @param int      $post_id        Source post ID (0 for type-level queries).
+		 * @param int      $translation_id Translation post ID the values are
+		 *                                 written to (0 when unknown).
 		 */
-		$keys = (array) apply_filters( 'perflocale/mt/translatable_meta_keys', [], $post_type, $post_id );
+		$keys = (array) apply_filters( 'perflocale/mt/translatable_meta_keys', [], $post_type, $post_id, $translation_id );
 
 		// Strings only: ints/floats/bools from a sloppy filter would otherwise
 		// become junk meta keys ('123', '1'), and an array entry would emit an
 		// Array-to-string warning.
 		$keys = array_values( array_unique( array_filter( $keys, static fn( $k ): bool => is_string( $k ) && trim( $k ) !== '' ) ) );
+
+		if ( $keys !== [] ) {
+			// A credential-named key is never sent to a provider or overwritten.
+			$patterns = PostTranslationManager::sensitive_meta_patterns();
+			$keys     = array_values( array_filter( $keys, static fn( string $k ): bool => ! PostTranslationManager::is_sensitive_meta_key( $k, $patterns ) ) );
+		}
 
 		if ( $keys === [] ) {
 			return [];
@@ -151,18 +177,34 @@ final class MetaTranslator {
 			return $result;
 		}
 
-		$keys = $this->get_mt_meta_keys( $post_type, $source_id );
+		$keys = $this->get_mt_meta_keys( $post_type, $source_id, $translation_id );
+
+		// A key listed for the source but not for this translation (an addon
+		// found its row laid out differently there) is skipped, not dropped
+		// unseen.
+		$result['skipped'] += count( array_diff( $this->get_mt_meta_keys( $post_type, $source_id ), $keys ) );
 
 		if ( $keys === [] ) {
 			return $result;
 		}
 
+		// Keys a person emptied on this translation (its seed-cleared marker).
+		$cleared = ContentSync::seed_cleared_keys( $translation_id );
+
 		// Collect the translatable (key, source value) pairs under the
 		// ownership rule. Only single-value string meta qualifies — array or
 		// serialized values are structural by definition here.
 		$to_translate = [];
+		$target_rows  = [];
 
 		foreach ( $keys as $key ) {
+			if ( isset( $cleared[ $key ] ) ) {
+				// Emptied by a person on this translation: stays empty until
+				// someone types a value there.
+				++$result['skipped'];
+				continue;
+			}
+
 			$source_val = get_post_meta( $source_id, $key, true );
 
 			if ( ! is_string( $source_val ) || trim( $source_val ) === '' ) {
@@ -172,13 +214,19 @@ final class MetaTranslator {
 
 			$target_val = get_post_meta( $translation_id, $key, true );
 
-			if ( is_string( $target_val ) && $target_val !== '' && $target_val !== $source_val ) {
-				// Translator-owned value — never overwrite.
+			// Every row the key has on the target, from the same primed cache:
+			// the snapshot the write below may replace ([] when absent).
+			$rows = array_values( (array) get_metadata_raw( 'post', $translation_id, $key, false ) );
+
+			if ( count( $rows ) > 1 || ( is_string( $target_val ) && $target_val !== '' && $target_val !== $source_val ) ) {
+				// Translator-owned value, or several rows rather than one
+				// value — never overwrite.
 				++$result['skipped'];
 				continue;
 			}
 
 			$to_translate[ $key ] = $source_val;
+			$target_rows[ $key ]  = $rows;
 		}
 
 		if ( $to_translate === [] ) {
@@ -190,15 +238,35 @@ final class MetaTranslator {
 			return $result;
 		}
 
-		// Monthly-cap check for the whole meta batch (translate_post's own cap
-		// check covers only title/content/excerpt). Fail soft: record + skip.
-		$estimated = 0;
-		foreach ( $to_translate as $v ) {
-			$estimated += mb_strlen( $v );
+		// Mask placeholders per value (SEO template tags like %%sitename%%,
+		// printf tokens, {brace} vars) so the provider can't mangle them.
+		// A value with no letter outside its placeholders ("%%title%% %%sep%%
+		// %%sitename%%") has nothing to translate: it is copied as it is and
+		// never sent.
+		$masked_by_key = [];
+		$verbatim      = [];
+		foreach ( $to_translate as $key => $val ) {
+			// mask() returns [masked_text, placeholders].
+			$masked_by_key[ $key ] = PlaceholderMasker::mask( $val );
+
+			if ( ! self::has_translatable_letter( $masked_by_key[ $key ][0], count( $masked_by_key[ $key ][1] ) ) ) {
+				$verbatim[ $key ] = true;
+			}
 		}
 
-		if ( $this->service->would_exceed_limit( $estimated ) ) {
-			$result['failed']   = count( $to_translate );
+		// Monthly-cap check for the values that will be sent (translate_post's
+		// own cap check covers only title/content/excerpt). Fail soft: record
+		// + skip.
+		$estimated = 0;
+		foreach ( $to_translate as $key => $v ) {
+			if ( ! isset( $verbatim[ $key ] ) ) {
+				$estimated += mb_strlen( $v );
+			}
+		}
+
+		if ( $estimated > 0 && $this->service->would_exceed_limit( $estimated ) ) {
+			$result['failed']   = count( $to_translate ) - count( $verbatim );
+			$result['skipped'] += count( $verbatim );
 			$msg                = __( 'Meta fields skipped: monthly machine-translation character limit reached.', 'perflocale' );
 			$result['errors'][] = $msg;
 			$this->record_errors( $translation_id, [ $msg ] );
@@ -207,14 +275,6 @@ final class MetaTranslator {
 			do_action( 'perflocale/mt/meta_translate_failed', $source_id, $translation_id, array_keys( $to_translate ), $msg );
 
 			return $result;
-		}
-
-		// Mask placeholders per value (SEO template tags like %%sitename%%,
-		// printf tokens, {brace} vars) so the provider can't mangle them.
-		$masked_by_key = [];
-		foreach ( $to_translate as $key => $val ) {
-			// mask() returns [masked_text, placeholders].
-			$masked_by_key[ $key ] = PlaceholderMasker::mask( $val );
 		}
 
 		$ordered_keys = array_keys( $masked_by_key );
@@ -227,6 +287,10 @@ final class MetaTranslator {
 		// a key is only routed to text when an addon affirmatively declares it.
 		$keys_by_format = [];
 		foreach ( $ordered_keys as $key ) {
+			if ( isset( $verbatim[ $key ] ) ) {
+				continue;
+			}
+
 			/**
 			 * Filter the machine-translation destination format for a meta key.
 			 *
@@ -239,8 +303,9 @@ final class MetaTranslator {
 			 * @param string $format    'html' (default) or 'text'.
 			 * @param string $key       Meta key.
 			 * @param string $post_type Source post type.
+			 * @param int    $source_id Source post ID.
 			 */
-			$fmt = apply_filters( 'perflocale/mt/meta_key_format', 'html', $key, $post_type );
+			$fmt = apply_filters( 'perflocale/mt/meta_key_format', 'html', $key, $post_type, $source_id );
 			$fmt = ( 'text' === $fmt ) ? 'text' : 'html';
 
 			$keys_by_format[ $fmt ][] = $key;
@@ -268,7 +333,8 @@ final class MetaTranslator {
 				}
 			}
 		} catch ( \Throwable $e ) {
-			$result['failed']   = count( $to_translate );
+			$result['failed']   = count( $to_translate ) - count( $verbatim );
+			$result['skipped'] += count( $verbatim );
 			$result['errors'][] = $e->getMessage();
 			$this->record_errors( $translation_id, [ $e->getMessage() ] );
 
@@ -278,9 +344,51 @@ final class MetaTranslator {
 			return $result;
 		}
 
-		$errors = [];
+		$errors  = [];
+		$written = [];
 
-		foreach ( $ordered_keys as $i => $key ) {
+		// The provider wait can run to minutes (retries, Retry-After). Someone
+		// may have saved one of these fields meanwhile, from a request whose
+		// write this process's object cache never saw, so the rows are read
+		// past the cache, once for the whole batch.
+		$current = $this->read_rows( $translation_id, $ordered_keys );
+
+		foreach ( $ordered_keys as $i => $ordered_key ) {
+			// A numeric key such as "2024" is an int array key here.
+			$key = (string) $ordered_key;
+
+			if ( null === $current ) {
+				++$result['failed'];
+				$errors[] = sprintf( 'Meta key "%s" could not be re-checked before saving; existing value kept.', $key );
+				continue;
+			}
+
+			$snapshot = array_map( 'maybe_serialize', $target_rows[ $key ] );
+
+			if ( ( $current[ $key ] ?? [] ) !== $snapshot ) {
+				// Changed during the provider wait: that edit owns the field.
+				++$result['skipped'];
+				continue;
+			}
+
+			if ( isset( $verbatim[ $ordered_key ] ) ) {
+				// Placeholders only: the source value as it is.
+				$state = $this->write( $translation_id, $key, $to_translate[ $ordered_key ], $target_rows[ $ordered_key ], $snapshot );
+
+				if ( 'failed' === $state ) {
+					++$result['failed'];
+					$errors[] = sprintf( 'Meta key "%s" could not be saved; existing value kept.', $key );
+					continue;
+				}
+
+				if ( 'written' === $state ) {
+					$written[] = $key;
+				}
+
+				++$result['skipped'];
+				continue;
+			}
+
 			$out = isset( $translated[ $i ] ) ? (string) $translated[ $i ] : '';
 
 			if ( trim( $out ) === '' ) {
@@ -299,11 +407,39 @@ final class MetaTranslator {
 				continue;
 			}
 
-			// wp_slash: update_post_meta unslashes internally (documented
-			// backslash-corruption class without it).
-			update_post_meta( $translation_id, $key, wp_slash( $restored ) );
-			++$result['translated'];
+			$state = $this->write( $translation_id, $key, $restored, $target_rows[ $key ], $snapshot );
 
+			if ( 'conflict' === $state ) {
+				++$result['skipped'];
+				continue;
+			}
+
+			if ( 'failed' === $state ) {
+				++$result['failed'];
+				$errors[] = sprintf( 'Meta key "%s" could not be saved; existing value kept.', $key );
+				continue;
+			}
+
+			if ( 'written' === $state ) {
+				$written[] = $key;
+			}
+
+			++$result['translated'];
+		}
+
+		if ( $written !== [] ) {
+			/**
+			 * Fires after machine translation changed meta values on a
+			 * translation, before any failure for the same run is reported.
+			 * Keys whose value was already the translation are not listed.
+			 *
+			 * @hook perflocale/mt/meta_translated
+			 *
+			 * @param int      $translation_id Translation post ID (the post written to).
+			 * @param string[] $written_keys   Meta keys whose value was written.
+			 * @param int      $source_id      Source post ID.
+			 */
+			do_action( 'perflocale/mt/meta_translated', $translation_id, $written, $source_id );
 		}
 
 		if ( $errors === [] && $result['failed'] === 0 ) {
@@ -334,6 +470,43 @@ final class MetaTranslator {
 	}
 
 	/**
+	 * Whether masked text keeps a letter once its placeholder sentinels are
+	 * removed, i.e. whether a provider has anything to translate in it.
+	 *
+	 * @param string $masked Text returned by PlaceholderMasker::mask().
+	 * @param int    $count  Number of placeholders mask() replaced.
+	 * @return bool
+	 */
+	private static function has_translatable_letter( string $masked, int $count ): bool {
+		for ( $n = 0; $n < $count; $n++ ) {
+			$masked = str_replace( '[[PFL_PH_' . $n . ']]', '', $masked );
+		}
+
+		// Text that is not valid UTF-8 (preg_match() false) is sent as before.
+		return 0 !== preg_match( '/\p{L}/u', $masked );
+	}
+
+	/**
+	 * Add lines to a translation's machine-translation failure breadcrumb,
+	 * after the ones already there (for MT writers outside this class, such
+	 * as the WooCommerce variation texts).
+	 *
+	 * @param int      $post_id Translation post ID.
+	 * @param string[] $errors  Error strings.
+	 * @return void
+	 */
+	public static function record_meta_errors( int $post_id, array $errors ): void {
+		if ( $post_id <= 0 || $errors === [] ) {
+			return;
+		}
+
+		$existing = get_post_meta( $post_id, self::ERRORS_META_KEY, true );
+		$lines    = array_merge( is_array( $existing ) ? array_filter( $existing, 'is_string' ) : [], array_map( 'strval', $errors ) );
+
+		update_post_meta( $post_id, self::ERRORS_META_KEY, wp_slash( array_values( array_unique( array_map( 'sanitize_text_field', $lines ) ) ) ) );
+	}
+
+	/**
 	 * Persist the failure breadcrumb on the translation post.
 	 *
 	 * @param int      $translation_id Translation post ID.
@@ -342,5 +515,116 @@ final class MetaTranslator {
 	 */
 	private function record_errors( int $translation_id, array $errors ): void {
 		update_post_meta( $translation_id, self::ERRORS_META_KEY, wp_slash( array_map( 'sanitize_text_field', $errors ) ) );
+	}
+
+	/**
+	 * Write one translated value over exactly the rows the snapshot saw.
+	 *
+	 * @param int               $post_id  Translation post ID.
+	 * @param string            $key      Meta key.
+	 * @param string            $value    Translated value (unslashed).
+	 * @param array<int, mixed> $rows     The key's rows at the snapshot ([] = absent).
+	 * @param array<int, mixed> $snapshot The same rows in stored (serialized) form.
+	 * @return string 'written', 'unchanged' (the key already holds the value),
+	 *                'conflict' (someone else wrote the key first) or 'failed'.
+	 */
+	private function write( int $post_id, string $key, string $value, array $rows, array $snapshot ): string {
+		// wp_slash: the meta API unslashes internally (documented
+		// backslash-corruption class without it).
+		if ( $rows === [] ) {
+			// Absent at the snapshot: add only while it is still absent.
+			$done = false !== add_post_meta( $post_id, $key, wp_slash( $value ), true );
+		} elseif ( $rows[0] === $value ) {
+			return 'unchanged';
+		} else {
+			// A non-empty $prev_value makes core's UPDATE conditional on it; core
+			// ignores an empty() one, so a '' or '0' snapshot relies on the
+			// re-read alone. The raw snapshot value: core never unslashes
+			// $prev_value.
+			$done = false !== update_post_meta( $post_id, $key, wp_slash( $value ), empty( $rows[0] ) ? '' : $rows[0] );
+		}
+
+		return $done ? 'written' : $this->settle_refused( $post_id, $key, $value, $snapshot );
+	}
+
+	/**
+	 * Why a write did not land. Core returns false both for a refused write
+	 * (a short-circuit filter, a failed INSERT/UPDATE, a lost compare-and-swap)
+	 * and for a value the key already holds.
+	 *
+	 * The cached rows settle the already-holds case without a query: core
+	 * compared against that same cache. The table is read only when the cache
+	 * disagrees, because core leaves the cache as it was when its write changed
+	 * no row. Not wp_cache_delete() + get_post_meta(): when the database is
+	 * refusing reads too, that reload caches an EMPTY meta set for the post.
+	 *
+	 * @param int               $post_id  Translation post ID.
+	 * @param string            $key      Meta key.
+	 * @param string            $value    Translated value (unslashed).
+	 * @param array<int, mixed> $snapshot The key's rows at the snapshot, stored form.
+	 * @return string 'written', 'unchanged', 'conflict' or 'failed'.
+	 */
+	private function settle_refused( int $post_id, string $key, string $value, array $snapshot ): string {
+		// The value core compared against and would have stored.
+		$expected = maybe_serialize( sanitize_meta( $key, $value, 'post', (string) get_object_subtype( 'post', $post_id ) ) );
+		$cached   = array_map( 'maybe_serialize', array_values( (array) get_metadata_raw( 'post', $post_id, $key, false ) ) );
+
+		if ( $cached === [ $expected ] ) {
+			return 'unchanged';
+		}
+
+		$now = $this->read_rows( $post_id, [ $key ] );
+
+		if ( null === $now ) {
+			return 'failed';
+		}
+
+		$now = $now[ $key ] ?? [];
+
+		if ( $now === [ $expected ] ) {
+			// The row holds the value and the cache does not: the invalidation
+			// core performs after an UPDATE that changed a row.
+			wp_cache_delete( $post_id, 'post_meta' );
+
+			return 'written';
+		}
+
+		return $now === $snapshot ? 'failed' : 'conflict';
+	}
+
+	/**
+	 * The keys' current rows on a post, read from the table, never the cache.
+	 *
+	 * @param int                $post_id Post ID.
+	 * @param array<int, string> $keys    Meta keys (non-empty; int entries are numeric keys).
+	 * @return array<string, array<int, string|null>>|null Raw meta_value rows per key in
+	 *                                                      meta_id order; null when the read failed.
+	 */
+	private function read_rows( int $post_id, array $keys ): ?array {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return null;
+		}
+
+		$keys = array_map( 'strval', array_values( $keys ) );
+		$in   = implode( ', ', array_fill( 0, count( $keys ), '%s' ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Must see current rows, not the post_meta cache; $in is one %s per key.
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT meta_key, meta_value FROM %i WHERE post_id = %d AND meta_key IN ({$in}) ORDER BY meta_id ASC", array_merge( [ $wpdb->postmeta, $post_id ], $keys ) ), ARRAY_A );
+
+		// get_results() returns an empty array for a failed query too.
+		if ( ! is_array( $rows ) || '' !== $wpdb->last_error ) {
+			return null;
+		}
+
+		$out = [];
+		foreach ( $rows as $row ) {
+			if ( is_string( $row['meta_key'] ?? null ) ) {
+				$out[ $row['meta_key'] ][] = is_string( $row['meta_value'] ?? null ) ? $row['meta_value'] : null;
+			}
+		}
+
+		return $out;
 	}
 }

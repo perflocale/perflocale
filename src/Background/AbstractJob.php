@@ -76,13 +76,18 @@ abstract class AbstractJob {
 	 *   - Bounded in memory: process in chunks; don't load everything
 	 *     into a single in-memory array on large workloads.
 	 *
-	 * The progress callback signature is `function(int $processed, int $total): void`.
-	 * Workers should call it periodically — every 1 second or every 50
-	 * items, whichever first. Callers may pass a no-op for the sync path.
+	 * The progress callback signature is
+	 * `function(int $processed, int $total, array $detail = []): void`.
+	 * `$detail` is optional and may carry `stage` (a key logged once per
+	 * stage), `label` (the stage's display name) and `percent` (the overall
+	 * percent, used in place of processed / total). Workers should call it
+	 * periodically — every 1 second or every 50 items, whichever first.
+	 * Callers may pass a no-op for the sync path.
 	 *
 	 * @param array<string, mixed> $args     Worker args.
-	 * @param callable             $progress `function(int, int): void`. Use this
-	 *                                       to report `(processed, total)`. The
+	 * @param callable             $progress `function(int, int, array): void`. Use
+	 *                                       this to report `(processed, total)`
+	 *                                       and an optional detail array. The
 	 *                                       sync path may pass a no-op.
 	 * @return array<string, mixed> Result payload (small structured data; large
 	 *                              outputs are truncated by JobState).
@@ -150,6 +155,24 @@ abstract class AbstractJob {
 	 */
 	public function get_lock_ttl(): int {
 		return JobLock::DEFAULT_TTL;
+	}
+
+	/**
+	 * Whether the worker may run this job in slices.
+	 *
+	 * When this returns true, {@see WorkerRegistry} passes execute() its args
+	 * with `__perflocale_slice` set to `[ 'resume' => <the result stored on
+	 * the row, or []> ]`. execute() may then stop early and return its result
+	 * so far with `__perflocale_continue => true`: the worker stores that
+	 * result on the row, releases the locks and schedules the same job again,
+	 * which resumes from it. The row stays `running`, and the completion hook
+	 * fires once, after the last slice. A run that does not come from the
+	 * worker (inline dispatch, a job calling another job) never gets the key.
+	 *
+	 * @return bool
+	 */
+	public function supports_continuation(): bool {
+		return false;
 	}
 
 	/**

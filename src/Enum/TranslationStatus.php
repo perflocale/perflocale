@@ -28,10 +28,14 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   - Draft        — referenced via the enum in the Polylang/WPML
  *                    importers and via raw `'draft'` string literals
  *                    elsewhere.
- *   - Pending      — referenced via raw `'pending'` literals only; the
- *                    case stays so the enum remains the canonical schema
- *                    definition. Review state — populated when an editor sends a
- *                    translation to review without publishing.
+ *   - Pending      — never stored by the plugin; effective() derives it
+ *                    from a linked post in `pending` (Pending Review).
+ *
+ * The stored value is written when a link is created and is not maintained
+ * afterwards; only `needs_update` carries information the linked post does
+ * not. Every reader that shows or counts a status for posts derives it with
+ * effective() in PHP or TranslationLinkRepository::effective_status_sql() in
+ * SQL, and the two MUST agree.
  *
  * Both Draft and Pending have full match() arms in label()/color() below
  * so the admin UI renders correctly for any row carrying either value.
@@ -47,8 +51,8 @@ enum TranslationStatus: string {
 
 	/**
 	 * Submitted to a reviewer / editor — awaiting approval before
-	 * publish (e.g. the Visual Editor review flow). Referenced from
-	 * raw `'pending'` SQL.
+	 * publish: the linked post is in `pending` (Pending Review).
+	 * Derived by effective(); not stored by the plugin.
 	 */
 	case Pending = 'pending';
 
@@ -71,6 +75,42 @@ enum TranslationStatus: string {
 	 * translation but hasn't started writing one.
 	 */
 	case Empty = 'empty';
+
+	/**
+	 * Effective status of a post link: the stored status reconciled with the
+	 * linked post's status. First match wins:
+	 *
+	 *   1. post in `trash` or `auto-draft`  → `empty` (not a translation);
+	 *   2. stored `needs_update`            → `needs_update` (workflow flag);
+	 *   3. post `publish`                   → `published`;
+	 *   4. post `draft`                     → `draft`;
+	 *   5. post `pending`                   → `pending`;
+	 *   6. otherwise (future, private, custom statuses, no post, term and
+	 *      string links)                    → the stored value.
+	 *
+	 * SQL twin: TranslationLinkRepository::effective_status_sql(). The two
+	 * must return the same value for every (stored, post status) pair.
+	 *
+	 * @param string      $stored      Stored `translation_links.status`.
+	 * @param string|null $post_status Linked post's `post_status`, or null when there is no post.
+	 * @return string
+	 */
+	public static function effective( string $stored, ?string $post_status ): string {
+		if ( $post_status === 'trash' || $post_status === 'auto-draft' ) {
+			return self::Empty->value;
+		}
+
+		if ( $stored === self::NeedsUpdate->value ) {
+			return self::NeedsUpdate->value;
+		}
+
+		return match ( $post_status ) {
+			'publish' => self::Published->value,
+			'draft'   => self::Draft->value,
+			'pending' => self::Pending->value,
+			default   => $stored,
+		};
+	}
 
 	/**
 	 * Get human-readable label.

@@ -10,7 +10,8 @@ declare( strict_types=1 );
 namespace PerfLocale\Background\Jobs;
 
 use PerfLocale\Background\AbstractJob;
-use PerfLocale\Migration\WpmlImporter;
+use PerfLocale\Migration\MigrationLock;
+use PerfLocale\Migration\MigrationRunner;
 use PerfLocale\Plugin;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -24,8 +25,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  * being run multiple times (idempotent — re-running picks up where it
  * left off via existing translation-group lookups). The job layer adds:
  *
- *   - Crash recovery: lock TTL refreshes per batch, worker resumes.
- *   - Visibility: status / progress under *PerfLocale → Jobs*.
+ *   - Crash recovery: the importer's heartbeat reports progress after each
+ *     batch, which keeps the job's locks and status fresh; a killed worker's
+ *     lock expires within {@see get_lock_ttl()} and the job is then marked
+ *     failed ({@see \PerfLocale\Background\JobState::worker_gone()}).
+ *   - Visibility: status, the stage and its items done / in total, and the
+ *     overall progress under *PerfLocale → Jobs*
+ *     ({@see MigrationRunner::job_reporter()}).
  *   - Retry: failed runs auto-retry up to 5 attempts.
  *
  * Args shape: none (the importer reads from `wp_icl_translations` and
@@ -57,56 +63,57 @@ final class WpmlMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * The WPML migration runs as a single monolithic call to the importer
-	 * with no granular progress emission; it can legitimately take 30+
-	 * minutes on big sites. Bump TTL to 4 hours so a second worker can't
-	 * reclaim and re-run the (non-idempotent) replace operations.
+	 * The importer reports progress after every batch (at most every 30
+	 * seconds), and each report refreshes the lock, so the lock only has to
+	 * outlive the longest gap between two batches: the same lifetime as the
+	 * import lock's heartbeat.
 	 */
 	public function get_lock_ttl(): int {
-		return 4 * HOUR_IN_SECONDS;
+		return MigrationLock::HEARTBEAT_TTL;
 	}
 
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Count rows in WPML's `wp_icl_translations` to estimate cost.
-	 * Returns 0 when WPML data isn't present — skips async in that case
-	 * (the importer would no-op anyway).
+	 * The rows the import reads: WPML's `icl_translations` plus its string
+	 * translations (`icl_string_translations`). A site with few posts and a
+	 * big string table still runs in the background. Returns 0 when WPML
+	 * data isn't present (the importer would no-op anyway).
 	 */
 	protected function args_size( array $args ): int {
 		global $wpdb;
-		$table = $wpdb->prefix . 'icl_translations';
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-		$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
 
-		if ( ! $exists ) {
-			return 0;
+		$size = 0;
+
+		foreach ( [ 'icl_translations', 'icl_string_translations' ] as $name ) {
+			$table = $wpdb->prefix . $name;
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One-off count before an admin-triggered import.
+			if ( ! $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One-off count before an admin-triggered import.
+			$size += (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
 		}
 
-		// $table is the wpdb-prefixed `icl_translations` table name built
-		// above — class-controlled string, no user input.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		return (int) $wpdb->get_var(
-			$wpdb->prepare(
-				'SELECT COUNT(*) FROM %i',
-				$table
-			)
-		);
+		return $size;
 	}
 
-	/** {@inheritDoc} */
+	/**
+	 * {@inheritDoc}
+	 *
+	 * Runs inside the shared import lock ({@see MigrationRunner}). When
+	 * another import holds it, the exception is left to the worker, which
+	 * retries the job later; the admin's inline run shows its message. A
+	 * refused import is returned as a failed run with its reason. Each
+	 * import heartbeat goes to {@see MigrationRunner::job_reporter()}.
+	 */
 	public function execute( array $args, callable $progress ): array {
 		$progress( 0, 1 );
 
-		$importer = new WpmlImporter( Plugin::get_instance()->get( 'cache' ) );
-		$result   = $importer->import();
+		$result = MigrationRunner::import( 'wpml', Plugin::get_instance()->get( 'cache' ), null, MigrationRunner::job_reporter( $progress ) );
 
-		// Flush every cache that could be holding pre-import state.
-		// See MigrationCacheHelper for the full sequence + rationale.
-		\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
-
-		$progress( 1, 1 );
-
-		return is_array( $result ) ? $result : [];
+		return MigrationRunner::job_result( $result );
 	}
 }

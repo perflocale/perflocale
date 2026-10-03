@@ -139,6 +139,61 @@ final class MigrationSourceMapRepository {
 	}
 
 	/**
+	 * Source keys of one migration type that map onto a group.
+	 *
+	 * Read through the `group_id` index; at most `$limit` keys.
+	 *
+	 * @param string $migration_type Importer identifier.
+	 * @param int    $group_id       translation_groups.id.
+	 * @param int    $limit          Maximum keys returned.
+	 * @return list<string>
+	 */
+	public function keys_for_group( string $migration_type, int $group_id, int $limit = 10 ): array {
+		if ( $migration_type === '' || $group_id <= 0 ) {
+			return [];
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		$keys = $this->wpdb->get_col(
+			$this->wpdb->prepare(
+				'SELECT source_key FROM %i WHERE group_id = %d AND migration_type = %s ORDER BY id ASC LIMIT %d',
+				$this->table(),
+				$group_id,
+				$migration_type,
+				max( 1, $limit )
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return array_values( array_map( static fn( $key ): string => is_scalar( $key ) ? (string) $key : '', (array) $keys ) );
+	}
+
+	/**
+	 * Remove one `(type, key)` mapping.
+	 *
+	 * @param string $migration_type Importer identifier.
+	 * @param string $source_key     Per-importer natural key.
+	 * @return bool True when the query ran.
+	 */
+	public function delete_key( string $migration_type, string $source_key ): bool {
+		if ( $migration_type === '' || $source_key === '' ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$deleted = $this->wpdb->delete(
+			$this->table(),
+			[
+				'migration_type' => $migration_type,
+				'source_key'     => $source_key,
+			],
+			[ '%s', '%s' ]
+		);
+
+		return $deleted !== false;
+	}
+
+	/**
 	 * Clear every mapping for one migration type. Used by the operator-
 	 * driven `--force-restart` flow when they want a clean re-import
 	 * (e.g. after intentionally restoring a backup to a known-good state).

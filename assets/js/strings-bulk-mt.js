@@ -12,7 +12,8 @@
  *
  * Response shape from /strings/machine-translate:
  *   - async run:  { mode: 'async', job_id: '…', threshold: N, work_size: N }
- *   - inline run: { mode: 'sync',  result: { translated, skipped, failed, … } }
+ *   - inline run: { mode: 'sync',  result: { translated, skipped, failed, capped, first_error, … } }
+ *   - refused:    non-2xx with { mode: 'denied'|'error'|'sync', error: '…' } or a WP_Error { message }
  *
  * On async we hand off to the Jobs admin page so the user gets a live
  * progress bar. On sync we surface a toast and offer a manual reload so
@@ -258,7 +259,10 @@
 			} );
 		} ).then( function ( wrap ) {
 			if ( ! wrap.ok ) {
-				var msg = ( wrap.json && wrap.json.message ) ? wrap.json.message : ( i18n.genericError || 'Error' );
+				// WP_Error bodies carry `message`; a denied or failed dispatch
+				// carries its reason in `error`.
+				var body = wrap.json || {};
+				var msg  = body.message || body.error || i18n.genericError || 'Error';
 				setStatus( msg, 'error' );
 				setBusy( false );
 				return;
@@ -271,7 +275,8 @@
 				// Hand off to Jobs page so the user sees live progress —
 				// unless it would destroy typed-but-unsaved translations.
 				if ( hasDirtyEdits() ) {
-					setStatus( ( i18n.queued || 'Queued.' ) + ' ' + ( i18n.dirtyStay || 'Job started — your unsaved edits were kept; save them, then check the Jobs page.' ), 'success' );
+					// Staying on the page: the "Redirecting…" text would be wrong.
+					setStatus( i18n.dirtyStay || 'Job started — your unsaved edits were kept; save them, then check the Jobs page.', 'success' );
 					// The user stays on the page to save; release the busy
 					// state so a second batch can be dispatched. setBusy(false)
 					// only re-enables the buttons — the status text survives.
@@ -288,10 +293,23 @@
 			var translated = parseInt( r.translated || 0, 10 );
 			var skipped    = parseInt( r.skipped || 0, 10 );
 			var failed     = parseInt( r.failed || 0, 10 );
+			var capped     = parseInt( r.capped || 0, 10 );
+			var firstError = r.first_error ? String( r.first_error ) : '';
 			var head       = format( i18n.syncDone || '%1$d translated, %2$d skipped, %3$d failed.', [ translated, skipped, failed ] );
 			var reload     = ' ' + ( i18n.syncDoneReload || '' );
+			var detail     = '';
 
-			setStatus( head + reload, failed > 0 ? 'warn' : 'success' );
+			// The reason matters most when the run did nothing: a failure, or
+			// a selection with nothing left to translate.
+			if ( firstError && ( failed > 0 || translated === 0 ) ) {
+				detail += ' ' + ( failed > 0 ? ( i18n.firstError || 'First error:' ) + ' ' : '' ) + firstError;
+			}
+
+			if ( capped > 0 ) {
+				detail += ' ' + format( i18n.cappedLeft || 'Still missing a translation: %1$d. Run it again to continue.', [ capped ] );
+			}
+
+			setStatus( head + detail + reload, failed > 0 ? 'warn' : 'success' );
 			setBusy( false );
 
 			if ( translated > 0 ) {
@@ -322,8 +340,8 @@
 		var ids = collectSelectedIds();
 		if ( ids.length === 0 ) { setStatus( i18n.pickStrings, 'error' ); return; }
 
-		var work = ids.length * targets.length;
-		if ( work > 5000 ) { setStatus( i18n.maxExceeded, 'error' ); return; }
+		// The server caps a run at 5,000 strings, whatever the number of languages.
+		if ( ids.length > 5000 ) { setStatus( i18n.maxExceeded, 'error' ); return; }
 
 		var prompt = format( i18n.confirmSelected || '', [ ids.length, collectTargetNames().join( ', ' ) ] );
 		if ( ! window.confirm( prompt ) ) { return; }

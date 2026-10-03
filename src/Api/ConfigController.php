@@ -59,7 +59,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Response is aggressively cacheable: hosts can hold it on their own
  * edge for an hour while we respect a 5-minute browser cache, plus a
  * 1-day stale-while-revalidate window. ETag + If-None-Match → 304
- * revalidation is implemented so edges can refresh cheaply.
+ * revalidation is implemented so edges can refresh cheaply. A restricted
+ * endpoint (permission filter hooked), and any response to a logged-in
+ * caller, is sent `Cache-Control: private, no-store` instead.
  */
 final class ConfigController extends RestController {
 
@@ -185,16 +187,34 @@ final class ConfigController extends RestController {
 		if ( is_string( $if_none_match ) && trim( $if_none_match ) === $etag ) {
 			$response = new \WP_REST_Response( null, 304 );
 			$response->header( 'ETag', $etag );
-			$response->header( 'Cache-Control', 'public, max-age=300, s-maxage=3600, stale-while-revalidate=86400' );
+			$response->header( 'Cache-Control', $this->cache_control() );
 
 			return $response;
 		}
 
 		$response = new \WP_REST_Response( $payload, 200 );
 		$response->header( 'ETag', $etag );
-		$response->header( 'Cache-Control', 'public, max-age=300, s-maxage=3600, stale-while-revalidate=86400' );
+		$response->header( 'Cache-Control', $this->cache_control() );
 
 		return $response;
+	}
+
+	/**
+	 * Cache-Control value for a config response.
+	 *
+	 * Shared caches may store the response only while the route is public:
+	 * when the permission filter is hooked, or the caller is logged in (a
+	 * route restricted by other means answers only them), a stored copy could
+	 * be served to a client the gate would refuse.
+	 *
+	 * @return string
+	 */
+	private function cache_control(): string {
+		if ( is_user_logged_in() || has_filter( 'perflocale/edge_worker/config_permission_callback' ) ) {
+			return 'private, no-store';
+		}
+
+		return 'public, max-age=300, s-maxage=3600, stale-while-revalidate=86400';
 	}
 
 	/**

@@ -38,7 +38,9 @@
 
 	var cfg            = window.perflocaleBlockTranslateSidebar || {};
 	var LANGUAGES      = cfg.languages || [];
-	var SOURCE         = cfg.postSourceLang || cfg.currentLang || ( LANGUAGES[ 0 ] && LANGUAGES[ 0 ].slug ) || '';
+	// The edited post's language; content with no language row is
+	// default-language content (sourceLang is the default language slug).
+	var SOURCE         = cfg.postSourceLang || cfg.sourceLang || cfg.currentLang || ( LANGUAGES[ 0 ] && LANGUAGES[ 0 ].slug ) || '';
 	var MT_READY       = !! cfg.mtReady;
 	var MT_SETTINGS_URL = cfg.mtSettingsUrl || '';
 	var IS_SIBLING     = !! cfg.isSibling;
@@ -49,7 +51,8 @@
 		deepl: 'DeepL',
 		google: 'Google',
 		microsoft: 'Microsoft',
-		libre: 'LibreTranslate',
+		libretranslate: 'LibreTranslate',
+		wp_ai_client: __( 'WordPress AI Client', 'perflocale' ),
 		external_agency: 'Agency'
 	};
 
@@ -68,6 +71,13 @@
 			}
 		}
 		return slug;
+	}
+
+	// Leaves are attributes; the confirm dialogs count blocks.
+	function blockCount( leaves ) {
+		return ( window.perflocaleBlockTranslate && typeof window.perflocaleBlockTranslate.countBlocks === 'function' )
+			? window.perflocaleBlockTranslate.countBlocks( leaves )
+			: leaves.length;
 	}
 
 	function ensureApiReady() {
@@ -138,7 +148,7 @@
 				var confirmMsg = sprintf(
 					/* translators: 1: number of blocks, 2: source language name */
 					__( 'Fill in %1$d blocks from the %2$s source post? Each block will be looked up by position and translated into this sibling. Use Undo to revert; save when satisfied.', 'perflocale' ),
-					leaves.length,
+					blockCount( leaves ),
 					langName( SIBLING_SOURCE_LANG )
 				);
 
@@ -213,7 +223,7 @@
 			var confirmMsg = sprintf(
 				/* translators: 1: number of blocks, 2: target language tag (BCP 47, e.g. en-GB) */
 				__( 'Translate %1$d blocks in this post to %2$s? Translations will be applied in the open editor; use Undo to revert. Save the post when satisfied.', 'perflocale' ),
-				leaves.length,
+				blockCount( leaves ),
 				targetTag
 			);
 

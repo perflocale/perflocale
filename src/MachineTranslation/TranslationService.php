@@ -239,6 +239,10 @@ final class TranslationService {
 	 * predicate lets the editor hide the Translate buttons until the
 	 * selected provider can actually run.
 	 *
+	 * For the WordPress AI Client, "configured" only means the API exists; ready
+	 * also needs a connected AI provider that can generate text
+	 * ({@see WpAiClientProvider::is_ready_for_text()}).
+	 *
 	 * @return bool
 	 */
 	public function is_active_provider_ready(): bool {
@@ -248,7 +252,41 @@ final class TranslationService {
 			return false;
 		}
 
-		return $this->providers[ $id ]->is_configured();
+		$provider = $this->providers[ $id ];
+
+		if ( ! $provider->is_configured() ) {
+			return false;
+		}
+
+		return $provider instanceof WpAiClientProvider ? $provider->is_ready_for_text() : true;
+	}
+
+	/**
+	 * Where a "set up machine translation" link sends a site whose selected
+	 * provider is not ready.
+	 *
+	 * With the WordPress AI Client selected, what is missing is a connected
+	 * AI provider, so the link goes to core's Settings → Connectors screen
+	 * when that screen exists. Every other case gets `$fallback`.
+	 *
+	 * @param string $fallback PerfLocale settings URL for every other case.
+	 * @return string
+	 */
+	public function setup_url( string $fallback ): string {
+		if ( 'wp_ai_client' === $this->settings->get_mt_provider() && self::connectors_screen_exists() ) {
+			return admin_url( 'options-connectors.php' );
+		}
+
+		return $fallback;
+	}
+
+	/**
+	 * Whether core's Settings → Connectors screen exists (WordPress 7.0+).
+	 *
+	 * @return bool
+	 */
+	public static function connectors_screen_exists(): bool {
+		return file_exists( ABSPATH . 'wp-admin/options-connectors.php' );
 	}
 
 	/**
@@ -548,6 +586,15 @@ final class TranslationService {
 			$source_lang = $default ? (string) $default->slug : 'en';
 		}
 
+		// A post is never translated into its own language: the result would
+		// be written back over the post itself. Checked here so every caller
+		// (REST, abilities, WP-CLI, jobs) is covered.
+		if ( strtolower( trim( $source_lang ) ) === strtolower( trim( $target_lang ) ) ) {
+			throw new SameLanguageException(
+				esc_html__( 'Source and target languages match; nothing to translate.', 'perflocale' )
+			);
+		}
+
 		/** @hook perflocale/machine_translation/before Fires before machine translation. */
 		do_action( 'perflocale/machine_translation/before', $post_id, $provider->get_id() );
 
@@ -635,6 +682,12 @@ final class TranslationService {
 			 */
 			$pre_filter = $translated;
 			$translated = apply_filters( 'perflocale/mt/post_translate', $translated, [ $post->post_title, $post->post_content, $post->post_excerpt ], $target_lang, $provider->get_id() );
+
+			// The provider lost a "Do not translate" placeholder, so
+			// BlockSkipFilter put the source content back in place of the
+			// translation. Reported to the caller, and on an existing
+			// translation its content is kept (below).
+			$content_kept_source = \PerfLocale\Translation\BlockSkipFilter::consume_kept_source( [ $post->post_title, $post->post_content, $post->post_excerpt ] );
 
 			// Validate the POSITIONAL shape, not just is_array(): a string-keyed
 			// or short array passes is_array() but then $translated[1] ?? ''
@@ -724,7 +777,24 @@ final class TranslationService {
 				$result['warnings'][] = __( 'The provider returned no translated content; the existing content was kept.', 'perflocale' );
 			}
 
+			if ( $content_kept_source ) {
+				$result['content_kept_source'] = true;
+				$result['warnings'][]          = __( 'A "Do not translate" section was lost in machine translation, so the content was kept unchanged.', 'perflocale' );
+			}
+
 			if ( $translated_id ) {
+				// The content in hand is the untranslated source. An existing
+				// translation keeps the content it has instead of having the
+				// source written over it; an empty one receives the source, as
+				// a new translation does.
+				if ( $content_kept_source ) {
+					$existing_content = get_post_field( 'post_content', (int) $translated_id, 'raw' );
+
+					if ( is_string( $existing_content ) && '' !== trim( $existing_content ) ) {
+						$emptied['content'] = 'post_content';
+					}
+				}
+
 				// Machine-readable field list (not user-facing text) so CLI and
 				// REST callers can name exactly which values were preserved.
 				if ( $emptied !== [] ) {
@@ -871,6 +941,112 @@ final class TranslationService {
 		}
 
 		return ( $current_usage + max( 0, $estimated_chars ) ) > $limit;
+	}
+
+	/**
+	 * Whether a machine-translation path sends a password-protected post when
+	 * nothing hooks `perflocale/mt/send_password_protected`, by trigger: the
+	 * one place the default is decided. A path sends by default only when a
+	 * person chose that specific post; automatic runs and runs over every
+	 * post do not. A trigger not listed does not send.
+	 *
+	 *   - 'auto_publish'   auto-translate on first publish
+	 *   - 'auto_create'    auto-translate when a translation is created
+	 *   - 'site_translate' the site-wide job (Translations screen, REST site_wide)
+	 *   - 'bulk'           bulk action on posts selected on the Translations
+	 *                      screen (inline or as a background job)
+	 *   - 'cli_ids'        `wp perflocale translate <id>` or --post-ids
+	 *   - 'cli_all'        `wp perflocale translate --all`, in this process or
+	 *                      as the --async background chain
+	 *   - 'rest'           POST /machine-translate, /machine-translate/object
+	 *                      and the bulk-translate route with post_ids
+	 *   - 'ability'        the perflocale/translate-post ability
+	 *   - 'editor'         the block editor's "Fill in from source" and the
+	 *                      block toolbar's translate on the edited post
+	 */
+	private const SEND_PROTECTED_BY_DEFAULT = [
+		'auto_publish'   => false,
+		'auto_create'    => false,
+		'site_translate' => false,
+		'bulk'           => true,
+		'cli_ids'        => true,
+		'cli_all'        => false,
+		'rest'           => true,
+		'ability'        => true,
+		'editor'         => true,
+	];
+
+	/**
+	 * Whether a path sends a password-protected post by default (see
+	 * SEND_PROTECTED_BY_DEFAULT).
+	 *
+	 * @param string $trigger The path's trigger.
+	 * @return bool
+	 */
+	public static function sends_protected_by_default( string $trigger ): bool {
+		return self::SEND_PROTECTED_BY_DEFAULT[ $trigger ] ?? false;
+	}
+
+	/**
+	 * Whether a machine-translation path sends this post's text to the
+	 * provider. A post without a password is sent. For a password-protected
+	 * one the `perflocale/mt/send_password_protected` filter decides, starting
+	 * from the path's default (sends_protected_by_default()).
+	 *
+	 * @param \WP_Post $post    The post whose text would be sent.
+	 * @param string   $trigger The path (a key of SEND_PROTECTED_BY_DEFAULT).
+	 * @return bool
+	 */
+	public static function may_send_post( \WP_Post $post, string $trigger ): bool {
+		if ( '' === (string) $post->post_password ) {
+			return true;
+		}
+
+		/**
+		 * Whether a machine-translation path sends a password-protected post's
+		 * text to the provider.
+		 *
+		 * Asked by every path that sends a post's title, content or excerpt,
+		 * only for a post that has a password. A path that is refused skips the
+		 * post and reports it as it reports any skipped item. Triggers and
+		 * their default (TranslationService::SEND_PROTECTED_BY_DEFAULT):
+		 *
+		 *   - 'auto_publish'   auto-translate on first publish. Default false.
+		 *   - 'auto_create'    auto-translate when a translation is created
+		 *                      (the Create action). Default false.
+		 *   - 'site_translate' the site-wide job (Translations screen, REST
+		 *                      site_wide). Default false.
+		 *   - 'bulk'           bulk action on posts selected on the Translations
+		 *                      screen. Default true.
+		 *   - 'cli_ids'        `wp perflocale translate <id>` or --post-ids.
+		 *                      Default true.
+		 *   - 'cli_all'        `wp perflocale translate --all`, also --async.
+		 *                      Default false.
+		 *   - 'rest'           POST /machine-translate, /machine-translate/object
+		 *                      and the bulk-translate route with post_ids.
+		 *                      Default true.
+		 *   - 'ability'        the perflocale/translate-post ability. Default true.
+		 *   - 'editor'         the block editor's "Fill in from source" and the
+		 *                      block toolbar's translate on the edited post.
+		 *                      Default true.
+		 *
+		 * @hook  perflocale/mt/send_password_protected
+		 * @since 1.0.7
+		 *
+		 * @param bool     $send    Whether to send the post: the trigger's default.
+		 * @param \WP_Post $post    The password-protected post.
+		 * @param string   $trigger One of the triggers above.
+		 */
+		return (bool) apply_filters( 'perflocale/mt/send_password_protected', self::sends_protected_by_default( $trigger ), $post, $trigger );
+	}
+
+	/**
+	 * The message a path shows when it skips a password-protected post.
+	 *
+	 * @return string
+	 */
+	public static function password_protected_skip_message(): string {
+		return __( 'This post is password-protected and was not sent for machine translation.', 'perflocale' );
 	}
 
 	/**

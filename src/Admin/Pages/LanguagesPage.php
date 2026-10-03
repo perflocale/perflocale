@@ -70,7 +70,7 @@ final class LanguagesPage {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only preview; the nonce gate below is belt-and-braces, the destructive step re-verifies its own nonce in AdminController.
 		$nonce = isset( $_GET['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) ) : '';
 
-		if ( ! $language || ! wp_verify_nonce( $nonce, 'perflocale_delete_language' ) || ! current_user_can( 'manage_options' ) ) {
+		if ( ! $language || ! wp_verify_nonce( $nonce, 'perflocale_delete_language' ) || ! current_user_can( 'perflocale_manage_languages' ) ) {
 			$this->render_list();
 			return;
 		}
@@ -80,8 +80,10 @@ final class LanguagesPage {
 			return;
 		}
 
-		$counts = $this->repo->count_cascade( (int) $language->id );
-		$total  = array_sum( $counts );
+		$counts   = $this->repo->count_cascade( (int) $language->id );
+		$total    = array_sum( $counts );
+		$blockers = $this->repo->delete_blockers( (int) $language->id );
+		$blocked  = ! is_array( $blockers ) || $blockers['posts'] !== [];
 
 		$labels = [
 			'translation_links'   => __( 'Translation links (posts/terms unlinked from their translation groups — the posts themselves are NOT deleted)', 'perflocale' ),
@@ -92,6 +94,7 @@ final class LanguagesPage {
 		?>
 		<div class="wrap">
 			<h1><?php echo esc_html__( 'Delete Language', 'perflocale' ); ?></h1>
+			<hr class="wp-header-end">
 
 			<div class="notice notice-warning">
 				<p>
@@ -109,6 +112,8 @@ final class LanguagesPage {
 				</p>
 				<p><?php echo esc_html( $this->routing_loss_warning( $language, true ) ); ?></p>
 			</div>
+
+			<?php $this->render_delete_blockers( $language, $blockers ); ?>
 
 			<table class="widefat striped" style="max-width: 760px;">
 				<caption class="screen-reader-text"><?php echo esc_html__( 'Rows that will be permanently deleted', 'perflocale' ); ?></caption>
@@ -135,15 +140,16 @@ final class LanguagesPage {
 			</table>
 
 			<p style="margin-top: 16px;">
+				<?php if ( ! $blocked ) : ?>
 				<a href="
-				<?php
-				echo esc_url(
-					wp_nonce_url(
-						admin_url( 'admin.php?page=perflocale-languages&action=confirm-delete&language_id=' . absint( $language->id ) ),
-						'perflocale_delete_language'
-					)
-				);
-				?>
+					<?php
+					echo esc_url(
+						wp_nonce_url(
+							admin_url( 'admin.php?page=perflocale-languages&action=confirm-delete&language_id=' . absint( $language->id ) ),
+							'perflocale_delete_language'
+						)
+					);
+					?>
 				"
 				class="button button-primary button-link-delete"
 				data-perflocale-confirm="<?php echo esc_attr__( 'Permanently delete this language and every row listed? This cannot be undone.', 'perflocale' ); ?>">
@@ -155,12 +161,124 @@ final class LanguagesPage {
 					);
 					?>
 				</a>
+				<?php endif; ?>
 				<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-languages' ) ); ?>" class="button" style="margin-left: 8px;">
 					<?php echo esc_html__( 'Cancel', 'perflocale' ); ?>
 				</a>
 			</p>
 		</div>
 		<?php
+	}
+
+	/**
+	 * Explain what stops a delete, and what the delete would unlink anyway.
+	 *
+	 * Posts block the delete (LanguageRepository::delete_blockers()). A post type
+	 * links to its list filtered to this language when that list opens and
+	 * filters (blocker_list_url()), so the operator can move the posts to the
+	 * Trash; any other type is named with its count as plain text. Deactivating
+	 * is offered as the alternative: an inactive language keeps its links.
+	 * Terms, media, and block theme templates and template parts are listed as
+	 * information only.
+	 *
+	 * @param object                                                                              $language Language row.
+	 * @param array{posts: array<string, int>, attachments: int, terms: int, templates: int}|null $blockers delete_blockers() result.
+	 * @return void
+	 */
+	private function render_delete_blockers( object $language, ?array $blockers ): void {
+		if ( null === $blockers ) {
+			echo '<div class="notice notice-error"><p>' . esc_html__(
+				'The content of this language could not be checked, so it cannot be deleted right now. Reload this page to try again.',
+				'perflocale'
+			) . '</p></div>';
+			return;
+		}
+
+		if ( $blockers['posts'] !== [] ) {
+			$edit_url     = admin_url( 'admin.php?page=perflocale-languages&action=edit&language_id=' . absint( $language->id ) );
+			$translatable = Plugin::get_instance()->get( 'settings' )->get_translatable_post_types();
+			?>
+			<div class="notice notice-error">
+				<p><strong><?php echo esc_html__( 'This language cannot be deleted while it still has content:', 'perflocale' ); ?></strong></p>
+				<ul class="ul-disc">
+					<?php foreach ( $blockers['posts'] as $type => $count ) : ?>
+						<li>
+							<?php
+							$summary  = Helper::post_type_counts_summary( [ $type => $count ] );
+							$list_url = $this->blocker_list_url( (string) $type, (string) $language->slug, $translatable );
+							?>
+							<?php if ( $list_url !== '' ) : ?>
+								<a href="<?php echo esc_url( $list_url ); ?>">
+									<?php echo esc_html( $summary ); ?>
+								</a>
+							<?php else : ?>
+								<?php echo esc_html( $summary ); ?>
+							<?php endif; ?>
+						</li>
+					<?php endforeach; ?>
+				</ul>
+				<p>
+					<?php echo esc_html__( 'Move these to the Trash first, or deactivate the language instead: an inactive language keeps its translations linked, so shared stock and SKUs keep working.', 'perflocale' ); ?>
+					<a href="<?php echo esc_url( $edit_url ); ?>"><?php echo esc_html__( 'Edit language', 'perflocale' ); ?></a>
+				</p>
+			</div>
+			<?php
+		}
+
+		if ( $blockers['terms'] > 0 || $blockers['attachments'] > 0 ) {
+			echo '<p>' . esc_html(
+				sprintf(
+					/* translators: 1: number of terms, 2: number of media items. */
+					__( 'The delete also unlinks %1$s terms and %2$s media items from their translations. They are kept, and they do not block the delete.', 'perflocale' ),
+					number_format_i18n( $blockers['terms'] ),
+					number_format_i18n( $blockers['attachments'] )
+				)
+			) . '</p>';
+		}
+
+		if ( $blockers['templates'] > 0 ) {
+			echo '<p>' . esc_html(
+				sprintf(
+					/* translators: %s: number of block theme templates and template parts. */
+					_n(
+						'The delete also unlinks %s block theme template or template part from its translations. It is kept, and it does not block the delete.',
+						'The delete also unlinks %s block theme templates and template parts from their translations. They are kept, and they do not block the delete.',
+						$blockers['templates'],
+						'perflocale'
+					),
+					number_format_i18n( $blockers['templates'] )
+				)
+			) . '</p>';
+		}
+	}
+
+	/**
+	 * The post list a blocking post type links to, filtered to the language.
+	 *
+	 * '' when that list would not open or not filter: core's edit.php refuses a
+	 * type that is not registered or has no admin screen (show_ui false), and
+	 * PostListColumns applies the perflocale_lang filter to translatable types
+	 * only, so any other type would open an unfiltered list of every language.
+	 *
+	 * @param string             $type         Post type.
+	 * @param string             $lang_slug    Language slug.
+	 * @param array<int, string> $translatable Translatable post types.
+	 * @return string
+	 */
+	private function blocker_list_url( string $type, string $lang_slug, array $translatable ): string {
+		$type_object = get_post_type_object( $type );
+
+		if ( ! $type_object instanceof \WP_Post_Type || ! $type_object->show_ui || ! in_array( $type, $translatable, true ) ) {
+			return '';
+		}
+
+		return add_query_arg(
+			[
+				'post_type'       => $type,
+				'perflocale_lang' => $lang_slug,
+			],
+			admin_url( 'edit.php' )
+		);
 	}
 
 	/**
@@ -290,10 +408,10 @@ final class LanguagesPage {
 			</a>
 			<hr class="wp-header-end" style="margin-bottom: 16px;">
 
-			<?php \PerfLocale\Admin\PluginNav::render(); ?>
-
 			<?php $this->render_admin_notice( $message ); ?>
 			<?php $this->render_bare_default_notice( $all_languages ); ?>
+
+			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
 			<?php if ( empty( $all_languages ) ) : ?>
 				<div class="perflocale-lang-empty">
@@ -581,9 +699,9 @@ final class LanguagesPage {
 			<h1 class="wp-heading-inline"><?php echo esc_html( $title ); ?></h1>
 			<hr class="wp-header-end">
 
-			<?php \PerfLocale\Admin\PluginNav::render(); ?>
-
 			<?php $this->render_admin_notice( $message ); ?>
+
+			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
 			<div class="perflocale-lang-form-wrap">
 				<?php if ( ! $is_edit && ! empty( $predefined ) ) : ?>
@@ -979,6 +1097,28 @@ final class LanguagesPage {
 				),
 				[ 'code' => [] ]
 			) . '</p></div>';
+			return;
+		}
+
+		// A delete refused because the language still has posts
+		// (LanguageRepository::delete_blockers()). The preview screen lists them.
+		if ( $message === 'delete_blocked' ) {
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only notice; the preview link carries its own nonce.
+			$language_id = isset( $_GET['language_id'] ) ? absint( $_GET['language_id'] ) : 0;
+			$preview_url = $language_id > 0
+				? wp_nonce_url( admin_url( 'admin.php?page=perflocale-languages&action=delete&language_id=' . $language_id ), 'perflocale_delete_language' )
+				: '';
+
+			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__(
+				'The language was not deleted because it still has content. Move its posts to the Trash first, or deactivate the language instead: an inactive language keeps its translations linked.',
+				'perflocale'
+			);
+
+			if ( $preview_url !== '' ) {
+				echo ' <a href="' . esc_url( $preview_url ) . '">' . esc_html__( 'See what it still has', 'perflocale' ) . '</a>';
+			}
+
+			echo '</p></div>';
 			return;
 		}
 

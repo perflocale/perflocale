@@ -38,8 +38,11 @@ final class Activator {
 	 *                                     dbDelta failure on a tiny subsite
 	 *                                     doesn't kill a network-admin
 	 *                                     site-creation request mid-flight.
-	 * @return bool True on success; false on table-creation failure when
-	 *              `$fatal_on_missing_table` is false.
+	 * @return bool True on success. False when a required table is missing
+	 *              (non-fatal mode only; fatal mode wp_die()s), or when the
+	 *              site still has no language after the seed. Every later
+	 *              step still runs in that second case, so the caller decides
+	 *              what to refuse.
 	 */
 	public static function activate( bool $fatal_on_missing_table = true ): bool {
 		// Suppress any output from dbDelta() during table creation.
@@ -122,7 +125,7 @@ final class Activator {
 		update_option( 'perflocale_version', PERFLOCALE_VERSION, true );
 
 		// Seed default language (English) if no languages exist yet.
-		self::seed_default_language();
+		$seeded = self::seed_default_language();
 
 		// Install the Translator role and grant the perflocale_* caps to
 		// administrators + editors right now, while we have a request.
@@ -132,6 +135,10 @@ final class Activator {
 		// the role caps existed. The admin_init handler stays in place
 		// as the upgrade / self-heal path; install_caps() is idempotent.
 		TranslatorRole::install_caps();
+
+		// WooCommerce's Shop Manager gets perflocale_translate once per site;
+		// after a deactivation this puts back what remove_roles() took off.
+		TranslatorRole::install_shop_manager_caps();
 
 		// Put the site title and tagline on the Strings screen straight away.
 		// maybe_update() cannot do it for a FRESH install because activation
@@ -169,6 +176,9 @@ final class Activator {
 		// per-request there).
 		add_option( 'perflocale_disabled_addons', [], '', true );
 		add_option( 'perflocale_flush_rules', 1, '', true );
+		// Retire the stored variation maps a persistent object cache may
+		// still hold from an earlier activation (InventorySync).
+		delete_transient( \PerfLocale\WooCommerce\InventorySync::STORED_MAP_EPOCH );
 		self::set_autoload( 'perflocale_settings', 'yes' );
 		self::set_autoload( 'perflocale_webhooks', 'no' );
 		self::set_autoload( 'perflocale_addon_failures', 'yes' );
@@ -229,15 +239,15 @@ final class Activator {
 		/** @hook perflocale/activated Fires after the plugin is activated. */
 		do_action( 'perflocale/activated', PERFLOCALE_VERSION );
 
-		return true;
+		return $seeded;
 	}
 
 	/**
 	 * Insert the default English language if the languages table is empty.
 	 *
-	 * @return void
+	 * @return bool True when the table holds at least one language afterwards.
 	 */
-	private static function seed_default_language(): void {
+	private static function seed_default_language(): bool {
 		global $wpdb;
 
 		$table = Schema::table( 'languages' );
@@ -252,7 +262,7 @@ final class Activator {
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
 		if ( $count > 0 ) {
-			return;
+			return true;
 		}
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -280,8 +290,20 @@ final class Activator {
 		// admin gets no signal at all about why.
 		if ( false === $inserted ) {
 			$reason = (string) $wpdb->last_error;
+
+			// Judge by what the table holds, not by the INSERT: a second
+			// activation of the same site at the same moment inserts the
+			// row first, and ours then fails on the unique slug key with
+			// the site correctly seeded.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Activation only, failure path only.
+			$after = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
+
+			if ( $after > 0 ) {
+				return true;
+			}
+
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			error_log( 'PerfLocale Activator: failed to seed default English language. wpdb error: ' . $reason );
+			error_log( sprintf( 'PerfLocale Activator: failed to seed default English language on blog %d. wpdb error: %s', (int) get_current_blog_id(), $reason ) );
 			// Re-raise as a notice via the WP activation-error mechanism
 			// when called from `register_activation_hook`. The constant
 			// is set by core during the activation request.
@@ -303,7 +325,11 @@ final class Activator {
 					}
 				);
 			}
+
+			return false;
 		}
+
+		return true;
 	}
 
 	/**

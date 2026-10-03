@@ -221,6 +221,8 @@ final class SiteHealth {
 		// caches so a just-completed change shows fresh figures. Fires only on
 		// admin / background string writes, never on a frontend request.
 		add_action( 'perflocale/strings/changed', [ $this, 'flush_counts_cache' ] );
+
+		add_action( 'admin_notices', [ $this, 'render_leftover_notice' ] );
 	}
 
 	// -------------------------------------------------------------------------
@@ -272,6 +274,10 @@ final class SiteHealth {
 			'perflocale_conflicting'       => [
 				'label' => __( 'PerfLocale plugin conflicts', 'perflocale' ),
 				'test'  => [ $this, 'test_conflicting_plugin' ],
+			],
+			'perflocale_leftover_plugins'   => [
+				'label' => __( 'WPML add-ons are still active', 'perflocale' ),
+				'test'  => [ $this, 'test_leftover_plugins' ],
 			],
 			'perflocale_addon_quarantine'  => [
 				'label' => __( 'PerfLocale addon health', 'perflocale' ),
@@ -623,8 +629,15 @@ final class SiteHealth {
 				$id,
 				__( 'Language hostnames resolve to sites in this network', 'perflocale' ),
 				sprintf(
-					/* translators: 1: URL mode label, 2: number of hostnames checked, 3: comma-separated list of hostnames */
-					esc_html__( 'PerfLocale is in %1$s URL mode and all %2$d language hostname(s) it generates resolve to a site registered in this network: %3$s. Requests for translated URLs reach WordPress instead of the "site does not exist" screen.', 'perflocale' ),
+					esc_html(
+						/* translators: 1: URL mode label, 2: number of hostnames checked, 3: comma-separated list of hostnames */
+						_n(
+							'PerfLocale is in %1$s URL mode and the %2$d language hostname it generates resolves to a site registered in this network: %3$s. Requests for translated URLs reach WordPress instead of the "site does not exist" screen.',
+							'PerfLocale is in %1$s URL mode and all %2$d language hostnames it generates resolve to a site registered in this network: %3$s. Requests for translated URLs reach WordPress instead of the "site does not exist" screen.',
+							count( $probes ),
+							'perflocale'
+						)
+					),
 					'<code>' . esc_html( $mode ) . '</code>',
 					count( $probes ),
 					implode( ', ', $listed )
@@ -673,8 +686,15 @@ final class SiteHealth {
 		}
 
 		return ' ' . sprintf(
-			/* translators: %d: number of language hostnames left unchecked */
-			esc_html__( '%d further language hostname(s) were not checked, so this test stays cheap enough to run on every scheduled health check.', 'perflocale' ),
+			esc_html(
+				/* translators: %d: number of language hostnames left unchecked */
+				_n(
+					'%d further language hostname was not checked, so this test stays cheap enough to run on every scheduled health check.',
+					'%d further language hostnames were not checked, so this test stays cheap enough to run on every scheduled health check.',
+					$unchecked,
+					'perflocale'
+				)
+			),
 			$unchecked
 		);
 	}
@@ -929,6 +949,97 @@ final class SiteHealth {
 			__( 'No conflicting multilingual plugins detected', 'perflocale' ),
 			__( 'PerfLocale is the only multilingual plugin active. Routing and translation filtering run without contention.', 'perflocale' )
 		);
+	}
+
+	/**
+	 * WooCommerce Multilingual or WPML String Translation left active.
+	 *
+	 * @return array<mixed>
+	 */
+	public function test_leftover_plugins(): array {
+		$active = LeftoverPluginCheck::active();
+
+		if ( $active === [] ) {
+			return $this->pass(
+				'perflocale_leftover_plugins',
+				__( 'No WPML add-ons are active', 'perflocale' ),
+				esc_html__( 'WooCommerce Multilingual and WPML String Translation are not active.', 'perflocale' )
+			);
+		}
+
+		$desc    = '';
+		$actions = '';
+
+		foreach ( $active as $name => $file ) {
+			$desc .= '<p>' . esc_html( LeftoverPluginCheck::describe( $name ) ) . '</p>';
+			$url   = LeftoverPluginCheck::deactivate_url( $name, $file );
+
+			if ( $url !== '' ) {
+				$actions .= $this->leftover_button( $name, $url );
+			}
+		}
+
+		return $this->recommended(
+			'perflocale_leftover_plugins',
+			__( 'WPML add-ons are still active', 'perflocale' ),
+			$desc,
+			$actions
+		);
+	}
+
+	/**
+	 * Notice for leftover WPML add-ons, on PerfLocale's screens and the
+	 * Plugins screen, for users who can activate plugins.
+	 *
+	 * @return void
+	 */
+	public function render_leftover_notice(): void {
+		if ( ! current_user_can( 'activate_plugins' ) || ! function_exists( 'get_current_screen' ) ) {
+			return;
+		}
+
+		$screen = get_current_screen();
+		$id     = $screen !== null ? (string) $screen->id : '';
+
+		if ( $id !== 'plugins' && ! str_contains( $id, 'perflocale' ) ) {
+			return;
+		}
+
+		$active = LeftoverPluginCheck::active();
+
+		if ( $active === [] ) {
+			return;
+		}
+
+		echo '<div class="notice notice-warning"><p><strong>' . esc_html__( 'WPML add-ons are still active', 'perflocale' ) . '</strong></p>';
+
+		foreach ( $active as $name => $file ) {
+			echo '<p>' . esc_html( LeftoverPluginCheck::describe( $name ) ) . '</p>';
+			$url = LeftoverPluginCheck::deactivate_url( $name, $file );
+
+			if ( $url !== '' ) {
+				echo '<p>' . $this->leftover_button( $name, $url ) . '</p>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Built from escaped parts in leftover_button().
+			}
+		}
+
+		echo '</div>';
+	}
+
+	/**
+	 * "Deactivate <plugin>" link to core's Plugins action.
+	 *
+	 * @param string $name Plugin display name.
+	 * @param string $url  Nonced deactivate URL.
+	 * @return string
+	 */
+	private function leftover_button( string $name, string $url ): string {
+		return '<a class="button" href="' . esc_url( $url ) . '">' . esc_html(
+			sprintf(
+				/* translators: %s: plugin name, e.g. "WooCommerce Multilingual" */
+				__( 'Deactivate %s', 'perflocale' ),
+				$name
+			)
+		) . '</a>';
 	}
 
 	/**
@@ -1587,8 +1698,9 @@ final class SiteHealth {
 	 *  - **Files mode, no string translations in DB**: nothing to compile,
 	 *    pass with an explanatory note (this fixes the historical false-
 	 *    positive where a fresh install always saw "regenerate" forever).
-	 *  - **Files mode, translations exist but no compiled file**:
-	 *    recommended; expose the regenerate link.
+	 *  - **Files mode, an active non-default language has translations the
+	 *    generator compiles but no file for its locale**: recommended; name
+	 *    the languages and expose the regenerate link.
 	 *  - **Files mode, files exist but the newest translation is newer
 	 *    than the oldest file**: recommended (stale); expose the link.
 	 *
@@ -1644,15 +1756,16 @@ final class SiteHealth {
 		// Counting string_translations rows alone would include orphans the
 		// generator skips, leaving the "regenerate → 0 files" notice stuck.
 		//
-		// Two 4-table JOIN COUNTs plus a full COUNT(*) is heavy on large sites,
-		// so cache the trio on a short TTL (busted on settings-updated and
+		// Two 4-table JOINs plus a full COUNT(*) is heavy on large sites, so
+		// cache the results on a short TTL (busted on settings-updated and
 		// strings-changed) instead of re-running them on every Status load.
 		$cached = get_transient( self::FILES_TRANSIENT );
 
-		if ( is_array( $cached ) && isset( $cached['compilable'], $cached['total_st'], $cached['newest'] ) ) {
+		if ( is_array( $cached ) && isset( $cached['compilable'], $cached['total_st'], $cached['newest'], $cached['per_language'] ) && is_array( $cached['per_language'] ) ) {
 			$compilable_translations = (int) $cached['compilable'];
 			$total_st_rows           = (int) $cached['total_st'];
 			$newest_translation      = (int) $cached['newest'];
+			$per_language            = $cached['per_language'];
 		} else {
 			global $wpdb;
 			$strings_table = \PerfLocale\Database\Schema::table( 'strings' );
@@ -1664,20 +1777,37 @@ final class SiteHealth {
 
 			// Compilable: at least one fully-joinable row the generator would
 			// emit. Note we DO require st.translation <> '' because the
-			// generator skips empty values.
-			$compilable_translations = (int) $wpdb->get_var(
+			// generator skips empty values. Grouped per language and by
+			// whether the domain is internal (a leading "_"), which the
+			// generator never writes a file for: the total counts every row
+			// (the orphan diagnostic compares it with all of
+			// string_translations), the per-language counts only the rows
+			// that produce a file.
+			$compiled_rows = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT COUNT(*) FROM %i s
+					"SELECT l.language_id AS lid, LEFT( s.domain, 1 ) = '_' AS is_internal, COUNT(*) AS cnt FROM %i s
 					INNER JOIN %i g ON g.id = s.group_id AND g.type = 'string'
 					INNER JOIN %i l ON l.group_id = s.group_id
 					INNER JOIN %i st ON st.string_id = s.id AND st.language_id = l.language_id
-					WHERE st.translation <> ''",
+					WHERE st.translation <> ''
+					GROUP BY l.language_id, is_internal",
 					$strings_table,
 					$groups_table,
 					$links_table,
 					$st_table
 				)
 			);
+
+			$compilable_translations = 0;
+			$per_language            = [];
+
+			foreach ( (array) $compiled_rows as $compiled_row ) {
+				$compilable_translations += (int) $compiled_row->cnt;
+
+				if ( ! (int) $compiled_row->is_internal ) {
+					$per_language[ (int) $compiled_row->lid ] = (int) $compiled_row->cnt;
+				}
+			}
 
 			// Total rows in `string_translations`. The difference between this
 			// and `compilable_translations` is the orphan count — surfaced as a
@@ -1709,9 +1839,10 @@ final class SiteHealth {
 			set_transient(
 				self::FILES_TRANSIENT,
 				[
-					'compilable' => $compilable_translations,
-					'total_st'   => $total_st_rows,
-					'newest'     => $newest_translation,
+					'compilable'   => $compilable_translations,
+					'total_st'     => $total_st_rows,
+					'newest'       => $newest_translation,
+					'per_language' => $per_language,
 				],
 				self::COUNTS_TTL
 			);
@@ -1737,8 +1868,15 @@ final class SiteHealth {
 					'perflocale_translation_files',
 					__( 'Some translations need to be re-linked', 'perflocale' ),
 					sprintf(
-						/* translators: %d: number of stranded translations */
-						esc_html__( '%d saved translation(s) are not connected to the file-generation pipeline, so the compiled files cannot be produced yet. Click "Regenerate translation files" - it will reconnect them and write the files in one step.', 'perflocale' ),
+						esc_html(
+							/* translators: %d: number of stranded translations */
+							_n(
+								'%d saved translation is not connected to the file-generation pipeline, so the compiled files cannot be produced yet. Click "Regenerate translation files" - it will reconnect them and write the files in one step.',
+								'%d saved translations are not connected to the file-generation pipeline, so the compiled files cannot be produced yet. Click "Regenerate translation files" - it will reconnect them and write the files in one step.',
+								$orphan_count,
+								'perflocale'
+							)
+						),
 						$orphan_count
 					),
 					$regen_link
@@ -1751,12 +1889,41 @@ final class SiteHealth {
 			);
 		}
 
-		// Case 2: translations exist but no .l10n.php files on disk.
-		if ( $translations_exist && $file_count === 0 ) {
+		// Case 2: an active non-default language has translations the
+		// generator compiles, but no file on disk carries its locale. The
+		// default language is never compiled (it serves source strings), so
+		// it is not checked.
+		$missing = [];
+
+		foreach ( (array) $plugin->get( 'lang_repo' )->get_active() as $language ) {
+			if ( ! is_object( $language ) || ! empty( $language->is_default ) || empty( $language->locale ) ) {
+				continue;
+			}
+
+			if ( (int) ( $per_language[ (int) $language->id ] ?? 0 ) <= 0 ) {
+				continue;
+			}
+
+			$suffix = '-' . sanitize_file_name( (string) $language->locale ) . '.l10n.php';
+
+			foreach ( is_array( $files ) ? $files : [] as $file ) {
+				if ( str_ends_with( (string) $file, $suffix ) ) {
+					continue 2;
+				}
+			}
+
+			$missing[] = sprintf( '%1$s (%2$s)', (string) $language->name, (string) $language->locale );
+		}
+
+		if ( $missing !== [] ) {
 			return $this->recommended(
 				'perflocale_translation_files',
-				__( 'Compiled translation files are missing', 'perflocale' ),
-				__( 'String translations exist in the database but no compiled `.l10n.php` files were found. Files normally regenerate automatically when a translation is saved - this may indicate a file-permission problem on the uploads directory.', 'perflocale' ),
+				sprintf(
+					/* translators: %s: comma-separated list of languages, each as "Name (locale)". */
+					__( 'Compiled translation files are missing for: %s', 'perflocale' ),
+					implode( ', ', $missing )
+				),
+				esc_html__( 'String translations exist for these languages, but no compiled `.l10n.php` file was found for their locale, so visitors see these strings untranslated. Regenerate the translation files; if they stay missing, check that the uploads directory is writable.', 'perflocale' ),
 				$regen_link
 			);
 		}
@@ -1768,8 +1935,15 @@ final class SiteHealth {
 				'perflocale_translation_files',
 				__( 'Translation files are stale', 'perflocale' ),
 				sprintf(
-					/* translators: 1: count, 2: newest translation absolute time, 3: oldest file absolute time */
-					esc_html__( '%1$d compiled file(s) on disk, but the newest translation row (%2$s) is newer than the oldest file (%3$s). Regenerate so the file cache reflects the current DB state.', 'perflocale' ),
+					esc_html(
+						/* translators: 1: count, 2: newest translation absolute time, 3: oldest file absolute time */
+						_n(
+							'%1$d compiled file on disk, but the newest translation row (%2$s) is newer than the oldest file (%3$s). Regenerate so the file cache reflects the current DB state.',
+							'%1$d compiled files on disk, but the newest translation row (%2$s) is newer than the oldest file (%3$s). Regenerate so the file cache reflects the current DB state.',
+							$file_count,
+							'perflocale'
+						)
+					),
 					$file_count,
 					esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T', $newest_translation ) ),
 					esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T', $oldest_file ) )
@@ -1783,8 +1957,15 @@ final class SiteHealth {
 			'perflocale_translation_files',
 			__( 'Translation files are present', 'perflocale' ),
 			sprintf(
-				/* translators: 1: file count, 2: filesystem path */
-				esc_html__( '%1$d compiled `.l10n.php` file(s) at %2$s.', 'perflocale' ),
+				esc_html(
+					/* translators: 1: file count, 2: filesystem path */
+					_n(
+						'%1$d compiled `.l10n.php` file at %2$s.',
+						'%1$d compiled `.l10n.php` files at %2$s.',
+						$file_count,
+						'perflocale'
+					)
+				),
 				$file_count,
 				'<code>' . esc_html( str_replace( ABSPATH, '', $files_dir ) ) . '</code>'
 			)
@@ -2078,6 +2259,24 @@ final class SiteHealth {
 				$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $plugin->get( 'cache' ) );
 
 				if ( ! $mt_service->is_active_provider_ready() ) {
+					// The WordPress AI Client has no credential of its own: it
+					// needs a connected AI provider, set under Settings → Connectors.
+					if ( 'wp_ai_client' === $provider ) {
+						$connect = esc_html__( 'Connect an AI provider under Settings → Connectors.', 'perflocale' );
+
+						return $this->critical(
+							'perflocale_mt_reachability',
+							__( 'Machine translation is on but the provider cannot run', 'perflocale' ),
+							sprintf(
+								'<p>%1$s</p><p>%2$s</p>',
+								esc_html__( 'Machine translation is enabled and set to the WordPress AI Client, but no connected AI provider can generate text, so every translation request fails before it is sent.', 'perflocale' ),
+								\PerfLocale\MachineTranslation\TranslationService::connectors_screen_exists()
+									? '<a href="' . esc_url( admin_url( 'options-connectors.php' ) ) . '">' . $connect . '</a>'
+									: $connect
+							)
+						);
+					}
+
 					return $this->critical(
 						'perflocale_mt_reachability',
 						__( 'Machine translation is on but the provider cannot run', 'perflocale' ),

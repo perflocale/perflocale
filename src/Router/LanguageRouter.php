@@ -341,6 +341,14 @@ final class LanguageRouter {
 			add_action( 'template_redirect', [ $this, 'maybe_redirect_renamed_query_slug' ], 2 );
 		}
 
+		// Host-routed modes serve each language on its own host, so every
+		// wp_safe_redirect() (core, WooCommerce, SEO plugins) to another
+		// language's page must accept that host. Subdirectory and query modes
+		// stay on one host and register nothing.
+		if ( in_array( $this->settings->get_url_mode(), [ 'domain', 'subdomain' ], true ) ) {
+			add_filter( 'allowed_redirect_hosts', [ $this, 'filter_allowed_redirect_hosts' ] );
+		}
+
 		// Invalidate data-derived static caches when languages mutate
 		// mid-request (programmatic add / rename / delete / default
 		// change via WP-CLI, REST, or admin AJAX). Without this, URL
@@ -908,11 +916,14 @@ final class LanguageRouter {
 	/**
 	 * Whether the current request path matches a configured excluded path.
 	 *
-	 * Same site-relative derivation + raw prefix loop as the
-	 * default-to-prefix canonical redirect, so the excluded-paths setting
-	 * means the same thing in every flow that consults it. URL-derived
-	 * (no cookies/headers), so callers may bail on it BEFORE
-	 * nocache_headers() and keep excluded pages fully cacheable.
+	 * Same site-relative derivation and the same boundary-aware, decoding
+	 * Helper::path_matches_excluded() as the default-to-prefix canonical
+	 * redirect, URL routing and the CDN cache tags, so the excluded-paths
+	 * setting means the same thing in every PHP flow that consults it. The edge
+	 * worker template (assets/js/edge-helper.js) keeps its own plain prefix
+	 * match on the encoded path. URL-derived (no cookies/headers), so callers
+	 * may bail on it BEFORE nocache_headers() and keep excluded pages fully
+	 * cacheable.
 	 *
 	 * @return bool
 	 */
@@ -947,15 +958,30 @@ final class LanguageRouter {
 			$relative = $path;
 		}
 
-		foreach ( $excluded_paths as $excluded ) {
-			$excluded = (string) $excluded;
+		return Helper::path_matches_excluded( $relative, $excluded_paths );
+	}
 
-			if ( $excluded !== '' && str_starts_with( $relative, $excluded ) ) {
-				return true;
-			}
-		}
-
-		return false;
+	/**
+	 * Whether the language cookie can never be written on this site.
+	 *
+	 * True in cookieless mode (`disable_language_cookie`) while nothing hooks
+	 * `perflocale/language_cookie/enabled`: the same test with which
+	 * set_language_cookie() refuses every write. The cookie is what marks a
+	 * returning visitor for the first-visit redirects (browser language,
+	 * GeoIP, edge hint). Without it every default-language URL would redirect
+	 * the same visitor again, so the default language could not be opened,
+	 * and those redirects do not run while this is true.
+	 *
+	 * Setting- and code-derived (one settings read, one has_filter()), so the
+	 * redirects ask it with their URL and config gates, above
+	 * nocache_headers(): default-language entry pages of a cookieless site
+	 * stay cacheable.
+	 *
+	 * @return bool
+	 */
+	public function language_cookie_never_written(): bool {
+		return (bool) $this->settings->get( 'disable_language_cookie', false )
+			&& ! has_filter( 'perflocale/language_cookie/enabled' );
 	}
 
 	/**
@@ -964,6 +990,7 @@ final class LanguageRouter {
 	 * Runs on template_redirect after detect_language() has already resolved
 	 * the current language from the URL. Only triggers when:
 	 * - Browser redirect setting is enabled
+	 * - The language cookie can be written (see language_cookie_never_written())
 	 * - No language cookie exists (first visit)
 	 * - Current page is the default language (no explicit prefix)
 	 * - Browser prefers a different active language
@@ -998,6 +1025,14 @@ final class LanguageRouter {
 		}
 
 		if ( ! $this->settings->get( 'redirect_browser_lang' ) ) {
+			return;
+		}
+
+		// No automatic redirect when the language cookie can never be
+		// written: nothing would stop it from redirecting the visitor again
+		// on every default-language page. Config-derived, so it stays above
+		// nocache_headers() below.
+		if ( $this->language_cookie_never_written() ) {
 			return;
 		}
 
@@ -1094,6 +1129,15 @@ final class LanguageRouter {
 			return;
 		}
 
+		// A singular landing that would answer 404 or send the visitor back to
+		// the default language gets no redirect. This returns before the
+		// target-language cookie is written. The default-language cookie
+		// detect_language() sets on this request still marks the visitor as
+		// returning, so later pages do not redirect them either.
+		if ( ! $this->first_visit_landing_serves( $browser_slug ) ) {
+			return;
+		}
+
 		// Set cookie before redirect so the visitor is not redirected again.
 		$this->set_language_cookie( $browser_slug );
 
@@ -1127,6 +1171,7 @@ final class LanguageRouter {
 	 *
 	 * Same gating as `maybe_redirect_browser()`:
 	 *   - GET/HEAD only (302 drops bodies)
+	 *   - The language cookie can be written (see language_cookie_never_written())
 	 *   - First-time visitors (no language cookie set yet)
 	 *   - Loop-fuse via `perflocale_redirected=1` sentinel
 	 *   - Bot/crawler exclusion (let SEO crawlers see default content)
@@ -1164,6 +1209,12 @@ final class LanguageRouter {
 			! (bool) $this->settings->get( 'redirect_edge_hint_enabled' )
 			|| ! $this->settings->edge_integration_enabled()
 		) {
+			return;
+		}
+
+		// No automatic redirect when the language cookie can never be
+		// written (see maybe_redirect_browser()).
+		if ( $this->language_cookie_never_written() ) {
 			return;
 		}
 
@@ -1238,6 +1289,13 @@ final class LanguageRouter {
 			return;
 		}
 
+		// No redirect, and no target-language cookie, to a singular landing
+		// that would answer 404 or send the visitor back (see
+		// maybe_redirect_browser()).
+		if ( ! $this->first_visit_landing_serves( $edge_slug ) ) {
+			return;
+		}
+
 		// Cookie + sentinel before redirect (prevents re-fire on cookie-blocked browsers).
 		$this->set_language_cookie( $edge_slug );
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
@@ -1250,6 +1308,113 @@ final class LanguageRouter {
 		nocache_headers();
 		wp_safe_redirect( $redirect_url, 302 );
 		exit;
+	}
+
+	/**
+	 * Whether a first-visit redirect to this language lands on content.
+	 *
+	 * The browser-language, edge-hint and GeoIP redirects send a first-time
+	 * visitor to the current URL in another language. On a singular post that
+	 * landing applies the missing-translation rules, so it can answer 404
+	 * (show_404) or send the visitor back to the default language
+	 * (redirect_default). PostQueryFilter::serves_in_language() answers
+	 * whether it serves content: the post's translation, a fallback chain
+	 * language, or the post itself under show_default. Every request that is
+	 * not a singular post answers true.
+	 *
+	 * The three redirects ask this after the target URL is built and before
+	 * the target-language cookie is written, so it runs only on a request
+	 * that is about to redirect, and a visitor who gets no redirect gets no
+	 * target-language cookie. detect_language() has already set the
+	 * default-language cookie on that request, which marks the visitor as
+	 * returning: later pages do not redirect them either.
+	 *
+	 * @param string $slug Language slug the visitor would be redirected to.
+	 * @return bool
+	 */
+	public function first_visit_landing_serves( string $slug ): bool {
+		if ( ! is_singular() ) {
+			return true;
+		}
+
+		$post = get_queried_object();
+
+		if ( ! $post instanceof \WP_Post ) {
+			return true;
+		}
+
+		$language = $this->get_language_slug_map()[ $slug ] ?? null;
+		$plugin   = \PerfLocale\Plugin::get_instance();
+
+		if ( ! is_object( $language ) || ! $plugin->has( 'post_query_filter' ) ) {
+			return true;
+		}
+
+		$filter = $plugin->get( 'post_query_filter' );
+
+		if ( ! $filter instanceof \PerfLocale\Translation\PostQueryFilter ) {
+			return true;
+		}
+
+		return $filter->serves_in_language( $post, $language );
+	}
+
+	/**
+	 * Add every language's host to the hosts wp_safe_redirect() accepts.
+	 *
+	 * Domain mode adds the configured domain of each routed language, subdomain
+	 * mode adds `<slug>.<site host>` for each non-default language, and both add
+	 * the site's own host from the `home` option: on a language host,
+	 * home_url() can carry that language's host, so core's own entry may not
+	 * be the default language's host. Only hosts this site routes are added.
+	 *
+	 * Hooked to `allowed_redirect_hosts`, in domain and subdomain URL mode only.
+	 *
+	 * @param mixed $hosts Allowed host names.
+	 * @return mixed The list with the language hosts added; a non-array is returned unchanged.
+	 */
+	public function filter_allowed_redirect_hosts( $hosts ) {
+		if ( ! is_array( $hosts ) ) {
+			return $hosts;
+		}
+
+		$url_mode  = $this->settings->get_url_mode();
+		$base_host = self::normalize_host( (string) ( wp_parse_url( (string) get_option( 'home' ), PHP_URL_HOST ) ?? '' ) );
+		$slug_map  = $this->get_language_slug_map();
+		$add       = $base_host !== '' ? [ $base_host ] : [];
+
+		if ( $url_mode === 'domain' ) {
+			foreach ( $this->settings->get_language_domains() as $slug => $domain ) {
+				$domain = trim( (string) $domain );
+
+				if ( ! isset( $slug_map[ $slug ] ) || $domain === '' ) {
+					continue;
+				}
+
+				// A stored value may carry a scheme, a path or a port.
+				$host = (string) wp_parse_url( str_contains( $domain, '//' ) ? $domain : '//' . $domain, PHP_URL_HOST );
+
+				if ( $host === '' ) {
+					continue;
+				}
+
+				// Core compares the target host case-sensitively; add the host
+				// as a converted URL spells it and in its normalised form.
+				$add[] = $host;
+				$add[] = self::normalize_host( $host );
+			}
+		} elseif ( $url_mode === 'subdomain' && $base_host !== '' ) {
+			$default      = $this->get_default_language();
+			$default_slug = $default !== null ? (string) $default->slug : '';
+
+			foreach ( array_keys( $slug_map ) as $slug ) {
+				if ( (string) $slug !== $default_slug ) {
+					$add[] = $slug . '.' . $base_host;
+				}
+			}
+		}
+
+		return array_values( array_unique( array_merge( $hosts, array_filter( $add ) ) ) );
 	}
 
 	/**
@@ -1334,51 +1499,8 @@ final class LanguageRouter {
 			$slug = $this->detect_slug_from_request_uri( $slug_map );
 		}
 
-		// WooCommerce Store API (block cart/checkout): the client posts to
-		// the UNPREFIXED /wp-json/wc/store/... base regardless of the page
-		// language, so falling back to the default served German shoppers
-		// English coupon/stock/checkout errors and cart fragments. The
-		// visitor's validated language cookie is the right signal here —
-		// Store API responses are per-cart and uncacheable, so cookie
-		// variance is safe.
-		//
-		// NOT on a path-prefixed blog in subdirectory mode. This branch assumes
-		// the Store API base sits at the site root (`/wp-json/wc/store/...`).
-		// On a SUBDIRECTORY multisite child the site root already carries a path
-		// segment (`/sub/wp-json/wc/store/...`), and resolving a non-default
-		// language from the cookie there left the request inconsistent with
-		// subdirectory-mode path expectations: every Store API call returned an
-		// HTML 404 instead of JSON. Verified on mutest-subdir blog 2 — no cookie
-		// and an `en` (default) cookie both returned 200, `de`/`es`/`fr` all
-		// returned 404, the same route with the language IN the path returned
-		// 200, and a non-Store REST route with the same cookie returned 200.
-		//
-		// Skipping the branch there means such a shopper gets Store API strings
-		// in the DEFAULT language rather than a broken endpoint. That is a
-		// deliberate trade: an English error message is a nuisance, a 404 cart
-		// is a broken checkout. Single-site, subdomain and per-domain shapes, and
-		// the network's own root blog, are untouched and keep the localisation.
-		$blog_path = '/';
-
-		if ( is_multisite() && isset( $GLOBALS['current_blog']->path ) ) {
-			$blog_path = (string) $GLOBALS['current_blog']->path;
-		}
-
-		$store_api_prefix_safe = ( $url_mode !== 'subdirectory' || '/' === $blog_path );
-
-		if ( $slug === null && $store_api_prefix_safe && isset( $_COOKIE['perflocale_lang'] ) ) {
-			$request_path = (string) wp_parse_url(
-				esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '' ) ) ),
-				PHP_URL_PATH
-			);
-
-			if ( str_contains( $request_path, '/wc/store/' ) ) {
-				$cookie_slug = sanitize_key( wp_unslash( (string) $_COOKIE['perflocale_lang'] ) );
-
-				if ( isset( $slug_map[ $cookie_slug ] ) ) {
-					$slug = $cookie_slug;
-				}
-			}
+		if ( $slug === null ) {
+			$slug = $this->detect_store_api_cookie_language( $slug_map, $url_mode );
 		}
 
 		// Fallback to default when no prefix was found. In subdomain/domain
@@ -1397,6 +1519,149 @@ final class LanguageRouter {
 		if ( $slug !== null && isset( $slug_map[ $slug ] ) ) {
 			self::$current_language = $slug_map[ $slug ];
 		}
+	}
+
+	/**
+	 * Language of a WooCommerce Store API request whose URL carries none.
+	 *
+	 * The block cart and checkout post to the UNPREFIXED /wp-json/wc/store/...
+	 * base regardless of the page language, so falling back to the default
+	 * served German shoppers English coupon/stock/checkout errors and cart
+	 * fragments. The visitor's validated language cookie is the right signal
+	 * here.
+	 *
+	 * Only the cart and checkout routes are private to one cart: WooCommerce
+	 * sends `Cache-Control: no-store` on those itself. The catalogue routes
+	 * (products, categories, attributes, collection data, reviews) send no cache
+	 * headers at all, so on this unprefixed base their body follows the cookie
+	 * while the URL stays the same. A GET or HEAD whose non-default language came
+	 * from the cookie is therefore marked uncacheable through core's
+	 * `rest_send_nocache_headers` gate, which WP_REST_Server::serve_request()
+	 * consults only when it actually serves a REST response. A default-language
+	 * cookie gives the same body as no cookie, so it stays cacheable. Sites whose
+	 * cache honours `Vary` can also opt in to `Vary: Cookie` on the non-cart
+	 * Store API responses; see vary_store_api_response_on_cookie().
+	 *
+	 * NOT on a path-prefixed blog in subdirectory mode. This branch assumes
+	 * the Store API base sits at the site root (`/wp-json/wc/store/...`).
+	 * On a SUBDIRECTORY multisite child the site root already carries a path
+	 * segment (`/sub/wp-json/wc/store/...`), and resolving a non-default
+	 * language from the cookie there left the request inconsistent with
+	 * subdirectory-mode path expectations: every Store API call returned an
+	 * HTML 404 instead of JSON. Verified on blog 2 of a test network — no cookie
+	 * and an `en` (default) cookie both returned 200, `de`/`es`/`fr` all
+	 * returned 404, the same route with the language IN the path returned
+	 * 200, and a non-Store REST route with the same cookie returned 200.
+	 *
+	 * Skipping the branch there means such a shopper gets Store API strings
+	 * in the DEFAULT language rather than a broken endpoint. That is a
+	 * deliberate trade: an English error message is a nuisance, a 404 cart
+	 * is a broken checkout. Single-site, subdomain and per-domain shapes, and
+	 * the network's own root blog, are untouched and keep the localisation.
+	 *
+	 * Cost on a request whose URL carries no language: one add_filter(); with a
+	 * language cookie, the URL parse this branch always made plus one memoised
+	 * default-language read. No query and no option read.
+	 *
+	 * @param array<string, object> $slug_map Language slug map.
+	 * @param string                $url_mode Configured URL mode.
+	 * @return string|null Cookie language slug, or null when the branch does not apply.
+	 */
+	private function detect_store_api_cookie_language( array $slug_map, string $url_mode ): ?string {
+		$blog_path = '/';
+
+		if ( is_multisite() && isset( $GLOBALS['current_blog']->path ) ) {
+			$blog_path = (string) $GLOBALS['current_blog']->path;
+		}
+
+		if ( $url_mode === 'subdirectory' && '/' !== $blog_path ) {
+			return null;
+		}
+
+		// A Store API response on this request may follow the cookie. The
+		// callback runs only when a REST response is served and checks the route
+		// there, so a page view pays for the registration alone.
+		add_filter( 'rest_pre_serve_request', [ $this, 'vary_store_api_response_on_cookie' ], 20, 3 );
+
+		if ( ! isset( $_COOKIE['perflocale_lang'] ) ) {
+			return null;
+		}
+
+		$request_path = (string) wp_parse_url(
+			esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '' ) ) ),
+			PHP_URL_PATH
+		);
+
+		if ( ! str_contains( $request_path, '/wc/store/' ) ) {
+			return null;
+		}
+
+		$cookie_slug = sanitize_key( wp_unslash( (string) $_COOKIE['perflocale_lang'] ) );
+
+		if ( isset( $slug_map[ $cookie_slug ] ) ) {
+			$method = isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
+
+			if ( ( 'GET' === $method || 'HEAD' === $method ) && ! $this->slug_is_default( $cookie_slug ) ) {
+				add_filter( 'rest_send_nocache_headers', '__return_true' );
+			}
+
+			return $cookie_slug;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Send `Vary: Cookie` on a Store API response that may follow the language
+	 * cookie, when the site opts in.
+	 *
+	 * Registered by detect_store_api_cookie_language() only on a request whose
+	 * URL carries no language. Off by default: the non-default-cookie responses
+	 * are already uncacheable, and `Vary: Cookie` lowers the hit rate of every
+	 * cookie-bearing visitor on a cache that honours it (Cloudflare ignores it).
+	 * Turning it on also covers the reverse direction a no-store header cannot:
+	 * a cached default-language catalogue response served to a visitor whose
+	 * cookie asks for another language. Runs after WooCommerce's own CORS
+	 * callback, which REPLACES any earlier `Vary` header, and appends rather
+	 * than replaces so `Vary: Origin` survives. Responses that already carry
+	 * `Cache-Control: no-store` (the cart and checkout routes) are skipped.
+	 *
+	 * @param mixed $served  Whether the request has already been served.
+	 * @param mixed $result  Response about to be sent.
+	 * @param mixed $request Request being served.
+	 * @return mixed $served, unchanged.
+	 */
+	public function vary_store_api_response_on_cookie( mixed $served, mixed $result = null, mixed $request = null ): mixed {
+		if ( $served || ! $request instanceof \WP_REST_Request || ! str_starts_with( $request->get_route(), '/wc/store/' ) ) {
+			return $served;
+		}
+
+		if ( $result instanceof \WP_HTTP_Response ) {
+			foreach ( $result->get_headers() as $name => $value ) {
+				if ( is_string( $value ) && 'cache-control' === strtolower( (string) $name ) && str_contains( strtolower( $value ), 'no-store' ) ) {
+					return $served;
+				}
+			}
+		}
+
+		/**
+		 * Whether to send `Vary: Cookie` on WooCommerce Store API responses
+		 * whose language may come from the `perflocale_lang` cookie (the
+		 * unprefixed /wp-json/wc/store/ base). Off by default. Turn it on only
+		 * when your page or edge cache honours `Vary`; otherwise bypass that
+		 * path in the cache or key it on the `perflocale_lang` cookie.
+		 *
+		 * @hook perflocale/router/store_api_vary_cookie
+		 * @param bool             $vary    Whether to send the header. Default false.
+		 * @param \WP_REST_Request $request Store API request being served.
+		 */
+		if ( ! (bool) apply_filters( 'perflocale/router/store_api_vary_cookie', false, $request ) || headers_sent() ) {
+			return $served;
+		}
+
+		header( 'Vary: Cookie', false );
+
+		return $served;
 	}
 
 	/**
@@ -2184,8 +2449,15 @@ final class LanguageRouter {
 		// redirect paths honour). PerfLocale routes by URL, so language
 		// detection still works without the cookie - only "remember my
 		// language" on non-prefixed URLs is lost.
+		//
+		// Cookieless mode is only the default of the
+		// perflocale/language_cookie/enabled filter asked just before the
+		// write below. With nothing hooked there, it still returns here,
+		// before any other work.
+		$cookie_enabled = ! (bool) $this->settings->get( 'disable_language_cookie', false );
+
 		if (
-			(bool) $this->settings->get( 'disable_language_cookie', false )
+			( ! $cookie_enabled && ! has_filter( 'perflocale/language_cookie/enabled' ) )
 			|| ! (bool) apply_filters( 'perflocale/privacy/consent_given', true )
 		) {
 			return;
@@ -2342,6 +2614,30 @@ final class LanguageRouter {
 			if ( (bool) apply_filters( 'perflocale/cookie/skip_redundant_write', true, $slug ) ) {
 				return;
 			}
+		}
+
+		/**
+		 * Whether to write the language-preference cookie. Asked only when
+		 * the cookie is about to be written, so a request that writes nothing
+		 * never reaches it: bots, a consent filter returning false, headers
+		 * already sent, an unknown slug, a visitor who already holds this
+		 * value, no active reader, or a skipped redundant write. It cannot
+		 * force a write in any of those cases, and its answer does not change
+		 * whether a visitor is redirected.
+		 *
+		 * The filter wins over the cookieless-mode setting in both
+		 * directions: true writes the cookie even in cookieless mode, false
+		 * blocks it while the setting allows it. Use it for per-request
+		 * decisions, e.g. a consent plugin's preference category. In
+		 * cookieless mode the first-visit redirects run only while something
+		 * hooks this filter, because only then can the cookie be written.
+		 *
+		 * @hook perflocale/language_cookie/enabled
+		 * @param bool   $enabled Whether to write the cookie. Default true, false when the setting disables it.
+		 * @param string $slug    Language slug about to be written.
+		 */
+		if ( ! (bool) apply_filters( 'perflocale/language_cookie/enabled', $cookie_enabled, $slug ) ) {
+			return;
 		}
 
 		/** @hook perflocale/cookie_lifetime Filter the language cookie lifetime in days. */
@@ -2875,11 +3171,26 @@ final class LanguageRouter {
 		}
 
 		if ( 'restore' === $context ) {
+			$leaving_slug = self::$current_language?->slug ?? '';
+
 			self::restore_blog_frame( $new );
 
 			// Always drop the path-prefix lookup: it's derived from the prior
 			// blog's slug_map and has no mapping back to a per-blog frame.
 			self::$path_prefix_map = null;
+
+			// Services that resolved against the language in effect on the
+			// blog being left re-read the one put back.
+			if ( ( self::$current_language?->slug ?? '' ) !== $leaving_slug ) {
+				/**
+				 * Fires when restore_current_blog() puts back a current language
+				 * other than the one in effect on the blog being left.
+				 *
+				 * @hook perflocale/language/restored
+				 */
+				do_action( 'perflocale/language/restored' );
+			}
+
 			return;
 		}
 

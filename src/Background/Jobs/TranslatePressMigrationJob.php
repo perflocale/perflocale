@@ -10,7 +10,8 @@ declare( strict_types=1 );
 namespace PerfLocale\Background\Jobs;
 
 use PerfLocale\Background\AbstractJob;
-use PerfLocale\Migration\TranslatePressImporter;
+use PerfLocale\Migration\MigrationLock;
+use PerfLocale\Migration\MigrationRunner;
 use PerfLocale\Plugin;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -48,11 +49,17 @@ final class TranslatePressMigrationJob extends AbstractJob {
 	}
 
 	/**
-	 * TranslatePress migration runs as a single monolithic importer call;
-	 * lift the lock TTL so the lock doesn't expire mid-flight on big sites.
+	 * {@inheritDoc}
+	 *
+	 * The importer reports progress after every batch, and a report at
+	 * least every 30 seconds refreshes the lock, so the lock only has to
+	 * outlive the longest gap between two batches: the same lifetime as the
+	 * import lock's heartbeat. A killed worker's job is then found within
+	 * minutes ({@see \PerfLocale\Background\JobState::worker_gone()}) and a
+	 * new import can start.
 	 */
 	public function get_lock_ttl(): int {
-		return 4 * HOUR_IN_SECONDS;
+		return MigrationLock::HEARTBEAT_TTL;
 	}
 
 	/**
@@ -82,18 +89,21 @@ final class TranslatePressMigrationJob extends AbstractJob {
 		);
 	}
 
-	/** {@inheritDoc} */
+	/**
+	 * {@inheritDoc}
+	 *
+	 * Runs inside the shared import lock ({@see MigrationRunner}). When
+	 * another import holds it, the exception is left to the worker, which
+	 * retries the job later; the admin's inline run shows its message. A
+	 * refused import, and one that did not finish (a TranslatePress read or
+	 * a write failed), is returned as a failed run with its reason. Each
+	 * import heartbeat goes to {@see MigrationRunner::job_reporter()}.
+	 */
 	public function execute( array $args, callable $progress ): array {
 		$progress( 0, 1 );
 
-		$importer = new TranslatePressImporter( Plugin::get_instance()->get( 'cache' ) );
-		$result   = $importer->import();
+		$result = MigrationRunner::import( 'translatepress', Plugin::get_instance()->get( 'cache' ), null, MigrationRunner::job_reporter( $progress ) );
 
-		// See MigrationCacheHelper for the full sequence + rationale.
-		\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
-
-		$progress( 1, 1 );
-
-		return is_array( $result ) ? $result : [];
+		return MigrationRunner::job_result( $result );
 	}
 }

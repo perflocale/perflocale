@@ -72,6 +72,21 @@ final class StringScanner {
 	private ?string $exclusion_regex = null;
 
 	/**
+	 * Whether the most recent scan() read everything it walked.
+	 *
+	 * @var bool
+	 */
+	private bool $last_scan_complete = true;
+
+	/**
+	 * Batches of the most recent scan() whose stored strings could not be
+	 * re-marked as seen.
+	 *
+	 * @var int
+	 */
+	private int $last_scan_unmarked_batches = 0;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param CacheManager $cache Cache manager.
@@ -91,7 +106,12 @@ final class StringScanner {
 	 * @return array{found: int, inserted: int}
 	 */
 	public function scan( string $directory, string $domain = '', int $batch_size = 500 ): array {
+		$this->last_scan_complete         = true;
+		$this->last_scan_unmarked_batches = 0;
+
 		if ( ! is_dir( $directory ) || ! is_readable( $directory ) ) {
+			$this->last_scan_complete = false;
+
 			return [
 				'found'    => 0,
 				'inserted' => 0,
@@ -166,6 +186,25 @@ final class StringScanner {
 				$filepath = $file->getRealPath();
 
 				if ( $filepath === false ) {
+					// A dangling symlink has no code behind it. Any other path
+					// that does not resolve sits in a directory PHP can list
+					// but not enter, so the strings in it were not read -
+					// unless the file is excluded anyway. With no realpath to
+					// test, the exclusion list is matched against the path
+					// below the requested directory instead. The two differ
+					// only under a symlinked folder, where this path carries
+					// the link's name and the realpath its target's.
+					$pathname = (string) $file->getPathname();
+
+					if ( ! is_link( $pathname ) ) {
+						$base       = rtrim( $directory, '/\\' );
+						$unresolved = str_starts_with( $pathname, $base ) ? substr( $pathname, strlen( $base ) ) : $pathname;
+
+						if ( '' === $exclusion_regex || ! preg_match( $exclusion_regex, '/' . ltrim( $unresolved, '/' ) ) ) {
+							$this->last_scan_complete = false;
+						}
+					}
+
 					continue;
 				}
 
@@ -199,12 +238,20 @@ final class StringScanner {
 					$batch[] = $string;
 
 					if ( count( $batch ) >= $batch_size ) {
-						$inserted += $this->repo->bulk_insert( $batch );
+						$inserted += $this->repo->bulk_insert( $batch, $marked );
 						$batch     = [];
+
+						if ( ! $marked ) {
+							++$this->last_scan_unmarked_batches;
+						}
 					}
 				}
 			}
 		} catch ( \UnexpectedValueException $e ) {
+			// A directory that cannot be opened ends the walk of the WHOLE
+			// target, not only that directory.
+			$this->last_scan_complete = false;
+
 			// Directory permission errors - log and continue.
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				error_log( 'PerfLocale scanner: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
@@ -212,13 +259,48 @@ final class StringScanner {
 		}
 
 		if ( ! empty( $batch ) ) {
-			$inserted += $this->repo->bulk_insert( $batch );
+			$inserted += $this->repo->bulk_insert( $batch, $marked );
+
+			if ( ! $marked ) {
+				++$this->last_scan_unmarked_batches;
+			}
 		}
 
 		return [
 			'found'    => $found,
 			'inserted' => $inserted,
 		];
+	}
+
+	/**
+	 * Whether the most recent scan() read every directory and PHP file it
+	 * walked.
+	 *
+	 * False when the target itself, a directory below it, or a PHP file in it
+	 * could not be read: the strings in the unread part were not re-marked as
+	 * seen, so the run is no liveness signal for them. Size-capped files,
+	 * files matched by the exclusion list and dangling symlinks do not count;
+	 * they are skipped the same way on every scan. A directory that cannot be
+	 * opened counts even inside an excluded folder such as vendor/ or
+	 * node_modules/: exclusions are matched per file, and the walk of the
+	 * whole target stops at that directory.
+	 *
+	 * @return bool
+	 */
+	public function last_scan_complete(): bool {
+		return $this->last_scan_complete;
+	}
+
+	/**
+	 * Number of batches in the most recent scan() whose already-stored
+	 * strings could not be re-marked as seen because a database query failed.
+	 * Those rows kept their old last_seen_at, so the run is no liveness signal
+	 * for them either.
+	 *
+	 * @return int
+	 */
+	public function last_scan_unmarked_batches(): int {
+		return $this->last_scan_unmarked_batches;
 	}
 
 	/**
@@ -230,12 +312,20 @@ final class StringScanner {
 	 */
 	public function scan_file( string $filepath, string $domain = '' ): array {
 		if ( ! is_readable( $filepath ) ) {
+			$this->last_scan_complete = false;
+
 			return [];
 		}
 
 		$content = file_get_contents( $filepath ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
 
-		if ( $content === false || $content === '' ) {
+		if ( $content === false ) {
+			$this->last_scan_complete = false;
+
+			return [];
+		}
+
+		if ( $content === '' ) {
 			return [];
 		}
 

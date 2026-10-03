@@ -14,10 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * MetaBox integration for PerfLocale.
  *
- * Detects ALL MetaBox field types and registers translatable fields for
- * content sync across translations. Handles groups, cloneable fields,
- * and nested structures recursively. Translates reference field IDs
- * (post, taxonomy_advanced) on the frontend.
+ * Registers the translatable top-level fields that store post meta
+ * (text types, cloneable fields and whole groups) for content sync across
+ * translations. Translates reference field IDs (post, taxonomy_advanced),
+ * including those nested in groups, on the frontend.
  *
  * Compatible with MetaBox standalone and MetaBox AIO.
  */
@@ -124,6 +124,25 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
+		// Meta Box DELETES the row when a field is saved empty, so a cleared
+		// field and a never-set one look the same to ContentSync's seed-only
+		// rule, which would refill it on the next save of the source. Record
+		// the clear where the host still knows it: the editor and Frontend
+		// Submission save, rwmb_set_meta(), and the MB REST API. Only a
+		// person's clear is recorded: rwmb_before_save_post fires after a
+		// Meta Box form passed its nonce check and marks its post as edited.
+		add_filter( 'rwmb_after_save_field', [ $this, 'record_clear_on_save' ], 10, 5 );
+		add_action( 'rwmb_flush_data', [ $this, 'record_clear_on_set' ], 10, 2 );
+		add_action( 'rwmb_before_save_post', [ \PerfLocale\Translation\ContentSync::class, 'open_person_edit' ], 10, 1 );
+		add_filter( 'rwmb_rest_value', [ $this, 'record_clear_on_rest' ], PHP_INT_MAX, 4 );
+
+		// The value of a password field is not copied into a new translation,
+		// nor is a password sub-field of a group, also when a source save
+		// seeds the group into an existing translation.
+		add_filter( 'perflocale/translation/excluded_meta_keys', [ $this, 'exclude_password_fields' ], 10, 2 );
+		add_action( 'perflocale/translation/created', [ $this, 'drop_group_password_values' ], 5, 2 );
+		add_filter( 'perflocale/sync/seed_meta_value', [ $this, 'seed_without_password_sub_fields' ], 10, 3 );
+
 		// Translate reference fields on the frontend only.
 		if ( ! is_admin() ) {
 			add_filter( 'rwmb_get_value', [ $this, 'translate_field_value' ], 10, 4 );
@@ -155,10 +174,184 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
+	 * `perflocale/translation/excluded_meta_keys`: the values of the source
+	 * post type's Meta Box password fields stay out of a new translation.
+	 *
+	 * A password field is a password by its type, whatever its ID, so the
+	 * credential-name patterns of the meta copy do not catch it. Covers the
+	 * top-level fields that store their value as a post meta row (the field
+	 * ID); a field inside a group is part of the group's one row, which
+	 * drop_group_password_values() rewrites without it. Runs only when a
+	 * translation is created.
+	 *
+	 * @param array<int, string> $excluded  Meta keys that are not copied.
+	 * @param int                $source_id Post the translation is copied from.
+	 * @return array<int, string>
+	 */
+	public function exclude_password_fields( array $excluded, int $source_id ): array {
+		$post_type = $source_id > 0 ? get_post_type( $source_id ) : false;
+
+		if ( ! is_string( $post_type ) || ! function_exists( 'rwmb_get_object_fields' ) ) {
+			return $excluded;
+		}
+
+		foreach ( $this->get_fields_for_post_type( $post_type ) as $field ) {
+			if ( is_array( $field ) && 'password' === ( $field['type'] ?? '' ) && ! empty( $field['id'] ) && self::is_post_meta_storage( $field ) ) {
+				$excluded[] = (string) $field['id'];
+			}
+		}
+
+		return $excluded;
+	}
+
+	/**
+	 * `perflocale/translation/created`: the password sub-fields of the new
+	 * translation's Meta Box groups are taken out of the copied values.
+	 *
+	 * A group is one post meta row holding all its sub-fields (one row per
+	 * clone when the clones are stored as separate rows), so
+	 * exclude_password_fields() cannot leave a password sub-field out of the
+	 * copy. Each copied row of a group that has a password sub-field, in the
+	 * group itself, a nested group or a clone, is written again without it;
+	 * every other value stays as copied. Rows without one are not written.
+	 *
+	 * @param int|mixed    $new_id New translation's ID.
+	 * @param string|mixed $type   Object type, 'post' or 'term'.
+	 * @return void
+	 */
+	public function drop_group_password_values( mixed $new_id = 0, mixed $type = '' ): void {
+		if ( 'post' !== $type || ! is_numeric( $new_id ) || (int) $new_id <= 0 || ! function_exists( 'rwmb_get_object_fields' ) ) {
+			return;
+		}
+
+		$post_id   = (int) $new_id;
+		$post_type = get_post_type( $post_id );
+
+		if ( ! is_string( $post_type ) ) {
+			return;
+		}
+
+		foreach ( $this->get_fields_for_post_type( $post_type ) as $field ) {
+			if ( ! is_array( $field ) || 'group' !== ( $field['type'] ?? '' ) || empty( $field['id'] ) || ! self::is_post_meta_storage( $field ) || ! self::has_password_sub_field( $field ) ) {
+				continue;
+			}
+
+			$key = (string) $field['id'];
+
+			foreach ( (array) get_post_meta( $post_id, $key, false ) as $row ) {
+				$kept = self::without_password_sub_fields( $row, $field );
+
+				if ( $kept !== $row ) {
+					// The previous value picks the row; the new one is slashed
+					// because update_post_meta() unslashes it.
+					update_post_meta( $post_id, $key, \PerfLocale\Helper::deep_slash( $kept ), $row );
+				}
+			}
+		}
+	}
+
+	/**
+	 * `perflocale/sync/seed_meta_value`: a seeded row of a Meta Box group is
+	 * copied without its password sub-fields.
+	 *
+	 * A translation that has no row for a group (created before the source's
+	 * group was filled, or before the group was added) gets the source's
+	 * rows on the next save of the source. Each row of a post-meta group
+	 * with a password sub-field is seeded as drop_group_password_values()
+	 * leaves a new translation's copy; every other row is returned as it is.
+	 *
+	 * @param mixed $value     Row as read from the source.
+	 * @param mixed $key       Meta key.
+	 * @param mixed $target_id Translation that receives the row.
+	 * @return mixed
+	 */
+	public function seed_without_password_sub_fields( mixed $value, mixed $key = '', mixed $target_id = 0 ): mixed {
+		if ( ! is_array( $value ) || ! is_string( $key ) || '' === $key || ! is_numeric( $target_id ) || ! function_exists( 'rwmb_get_object_fields' ) ) {
+			return $value;
+		}
+
+		$post_type = get_post_type( (int) $target_id );
+
+		if ( ! is_string( $post_type ) ) {
+			return $value;
+		}
+
+		foreach ( $this->get_fields_for_post_type( $post_type ) as $field ) {
+			if ( is_array( $field ) && 'group' === ( $field['type'] ?? '' ) && $key === (string) ( $field['id'] ?? '' ) && self::is_post_meta_storage( $field ) && self::has_password_sub_field( $field ) ) {
+				return self::without_password_sub_fields( $value, $field );
+			}
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Whether a group field has a password sub-field, at any depth.
+	 *
+	 * @param array<string, mixed> $group Group field settings.
+	 * @return bool
+	 */
+	private static function has_password_sub_field( array $group ): bool {
+		foreach ( (array) ( $group['fields'] ?? [] ) as $sub ) {
+			if ( ! is_array( $sub ) ) {
+				continue;
+			}
+
+			if ( 'password' === ( $sub['type'] ?? '' ) || ( 'group' === ( $sub['type'] ?? '' ) && self::has_password_sub_field( $sub ) ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * A group's stored value without its password sub-fields.
+	 *
+	 * A list is the group's clones, each a value of its own; a map holds one
+	 * value per sub-field ID. Nested groups are walked the same way.
+	 *
+	 * @param mixed                $value Stored group value.
+	 * @param array<string, mixed> $group Group field settings.
+	 * @return mixed
+	 */
+	private static function without_password_sub_fields( mixed $value, array $group ): mixed {
+		if ( ! is_array( $value ) ) {
+			return $value;
+		}
+
+		// A list of clones. ($value === array_values($value) is the list check
+		// equivalent to array_is_list(), which Plugin Check maps to WP 6.5.)
+		if ( $value === array_values( $value ) ) {
+			foreach ( $value as $index => $clone ) {
+				$value[ $index ] = self::without_password_sub_fields( $clone, $group );
+			}
+
+			return $value;
+		}
+
+		foreach ( (array) ( $group['fields'] ?? [] ) as $sub ) {
+			$sub_id = is_array( $sub ) ? (string) ( $sub['id'] ?? '' ) : '';
+
+			if ( $sub_id === '' || ! array_key_exists( $sub_id, $value ) ) {
+				continue;
+			}
+
+			if ( 'password' === ( $sub['type'] ?? '' ) ) {
+				unset( $value[ $sub_id ] );
+			} elseif ( 'group' === ( $sub['type'] ?? '' ) ) {
+				$value[ $sub_id ] = self::without_password_sub_fields( $value[ $sub_id ], $sub );
+			}
+		}
+
+		return $value;
+	}
+
+	/**
 	 * Detect all translatable MetaBox fields for a post type.
 	 *
-	 * Walks registered field groups to find text-type fields, including
-	 * those nested inside groups.
+	 * Registers the top-level text-type and group fields that store post
+	 * meta; see collect_translatable_fields().
 	 *
 	 * @param array<int, string> $keys Existing translatable meta keys.
 	 * @param string             $post_type Post type being queried.
@@ -219,7 +412,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 			// clone_as_multiple is set; the multi-row variant would have the
 			// translated row-0 value collapse onto every row, so keep clones
 			// out of MT entirely.
-			if ( is_array( $field ) && ! empty( $field['clone'] ) ) {
+			if ( ! is_array( $field ) || ! empty( $field['clone'] ) || ! self::is_post_meta_storage( $field ) ) {
 				continue;
 			}
 
@@ -271,7 +464,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 
 		if ( function_exists( 'rwmb_get_object_fields' ) ) {
 			foreach ( (array) $this->get_fields_for_post_type( $post_type ) as $field ) {
-				if ( ! is_array( $field ) || ! empty( $field['clone'] ) ) {
+				if ( ! is_array( $field ) || ! empty( $field['clone'] ) || ! self::is_post_meta_storage( $field ) ) {
 					continue;
 				}
 
@@ -283,6 +476,130 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 				}
 			}
 		}
+
+		if ( count( $cache[ $blog ] ?? [] ) >= 32 ) {
+			unset( $cache[ $blog ] );
+		}
+
+		$cache[ $blog ][ $post_type ] = $set;
+
+		return $set;
+	}
+
+	/**
+	 * `rwmb_after_save_field`: record an empty save of a field that held a
+	 * value, and forget it once the field holds a value again. Any other save
+	 * (unchanged, edited, still empty) returns after two comparisons.
+	 *
+	 * @param mixed $passthru  Filter value, returned unchanged.
+	 * @param mixed $field     Field settings.
+	 * @param mixed $new_value Value just saved.
+	 * @param mixed $old_value Value before the save.
+	 * @param mixed $object_id Object ID.
+	 * @return mixed
+	 */
+	public function record_clear_on_save( mixed $passthru = null, mixed $field = null, mixed $new_value = null, mixed $old_value = null, mixed $object_id = 0 ): mixed {
+		// Meta Box's own emptiness rule (RWMB_Helpers_Value::is_valid_for_field):
+		// only '' and [] delete the row; '0' is a value.
+		$had = '' !== $old_value && [] !== $old_value && null !== $old_value;
+		$has = '' !== $new_value && [] !== $new_value && null !== $new_value;
+
+		if ( $had !== $has && is_array( $field ) && ! empty( $field['save_field'] ) && is_numeric( $object_id ) ) {
+			$post_id = (int) $object_id;
+			$key     = $this->tracked_key( $post_id, $field );
+
+			if ( $key !== '' ) {
+				\PerfLocale\Translation\ContentSync::record_seed_clear( $post_id, $key, ! $has );
+			}
+		}
+
+		return $passthru;
+	}
+
+	/**
+	 * `rwmb_flush_data`, fired by rwmb_set_meta(): no old or new value is
+	 * passed, so the stored rows decide. An empty set is recorded only while
+	 * a person edits the post (ContentSync::record_seed_clear()).
+	 *
+	 * @param mixed $object_id Object ID.
+	 * @param mixed $field     Field settings.
+	 * @return void
+	 */
+	public function record_clear_on_set( mixed $object_id = 0, mixed $field = null ): void {
+		if ( ! is_numeric( $object_id ) || ! is_array( $field ) || empty( $field['save_field'] ) ) {
+			return;
+		}
+
+		$post_id = (int) $object_id;
+		$key     = $this->tracked_key( $post_id, $field );
+
+		if ( $key !== '' ) {
+			\PerfLocale\Translation\ContentSync::record_seed_clear( $post_id, $key, get_post_meta( $post_id, $key, false ) === [] );
+		}
+	}
+
+	/**
+	 * `rwmb_rest_value` (MB REST API): the last filter before that extension
+	 * saves a field, and it fires neither of the hooks above.
+	 *
+	 * @param mixed $new_value Value about to be saved, returned unchanged.
+	 * @param mixed $field     Field settings.
+	 * @param mixed $old_value Value before the save.
+	 * @param mixed $object_id Object ID.
+	 * @return mixed
+	 */
+	public function record_clear_on_rest( mixed $new_value = null, mixed $field = null, mixed $old_value = null, mixed $object_id = 0 ): mixed {
+		$this->record_clear_on_save( null, $field, $new_value, $old_value, $object_id );
+
+		return $new_value;
+	}
+
+	/**
+	 * The meta key ContentSync would seed for this field on this post, or ''
+	 * when it would not: post-meta storage only, a translatable post type,
+	 * and a key this addon registers for it.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param array<string, mixed> $field   Field settings.
+	 * @return string
+	 */
+	private function tracked_key( int $post_id, array $field ): string {
+		if ( $post_id <= 0 || empty( $field['id'] ) || ! self::is_post_meta_storage( $field ) ) {
+			return '';
+		}
+
+		$plugin    = \PerfLocale\Plugin::get_instance();
+		$post_type = get_post_type( $post_id );
+
+		if ( ! is_string( $post_type ) || ! $plugin->has( 'settings' )
+			|| ! in_array( $post_type, $plugin->get( 'settings' )->get_translatable_post_types(), true ) ) {
+			return '';
+		}
+
+		$key = (string) $field['id'];
+
+		return isset( $this->seed_key_set( $post_type )[ $key ] ) ? $key : '';
+	}
+
+	/**
+	 * The keys add_meta_keys() registers for a post type, as a set. Built once
+	 * per request; blog-keyed for multisite; bounded like plaintext_mt_key_set().
+	 *
+	 * @param string $post_type Post type.
+	 * @return array<string, bool>
+	 */
+	private function seed_key_set( string $post_type ): array {
+		static $cache = [];
+
+		$blog = get_current_blog_id();
+
+		if ( isset( $cache[ $blog ][ $post_type ] ) ) {
+			return $cache[ $blog ][ $post_type ];
+		}
+
+		$set = function_exists( 'rwmb_get_object_fields' )
+			? array_fill_keys( array_map( 'strval', $this->collect_translatable_fields( $this->get_fields_for_post_type( $post_type ) ) ), true )
+			: [];
 
 		if ( count( $cache[ $blog ] ?? [] ) >= 32 ) {
 			unset( $cache[ $blog ] );
@@ -364,10 +681,27 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Recursively collect translatable field meta keys.
+	 * Whether a field stores its value as the post's own meta row.
 	 *
-	 * Walks field definitions and registers meta keys for text-type fields,
-	 * including those nested inside group fields.
+	 * Meta Box can route a box to a custom table (MB Custom Table) or another
+	 * storage; those values never reach wp_postmeta, so post-meta copy, seed and
+	 * machine translation cannot see them, and a postmeta row that happens to
+	 * share the field ID is unrelated data. A field without a storage object
+	 * uses Meta Box's post-meta default.
+	 *
+	 * @param array<string, mixed> $field Field settings.
+	 * @return bool
+	 */
+	private static function is_post_meta_storage( array $field ): bool {
+		return ! isset( $field['storage'] ) || $field['storage'] instanceof \RWMB_Post_Storage;
+	}
+
+	/**
+	 * Collect the top-level translatable field meta keys.
+	 *
+	 * Registers text-type fields and group fields that store post meta. A
+	 * group is one meta row holding every sub-field, so its child IDs are not
+	 * meta keys of their own and are never registered.
 	 *
 	 * @param array<string, array<string, mixed>> $fields MetaBox field definitions.
 	 * @return array<int, string>
@@ -376,31 +710,20 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 		$keys = [];
 
 		foreach ( $fields as $field ) {
-			if ( ! is_array( $field ) || empty( $field['id'] ) || empty( $field['type'] ) ) {
+			if ( ! is_array( $field ) || empty( $field['id'] ) || empty( $field['type'] ) || ! self::is_post_meta_storage( $field ) ) {
 				continue;
 			}
 
 			$type     = $field['type'];
 			$field_id = $field['id'];
 
-			// Text-type fields: register meta key directly.
 			if ( in_array( $type, self::TEXT_TYPES, true ) || in_array( $type, self::SERIALIZED_TEXT_TYPES, true ) ) {
 				$keys[] = $field_id;
 				continue;
 			}
 
-			// Group fields: register the group meta key and recurse.
 			if ( $type === 'group' && ! empty( $field['fields'] ) && is_array( $field['fields'] ) ) {
 				$keys[] = $field_id;
-
-				// Check if group has translatable sub-fields (for reference).
-				$sub_keys = $this->collect_translatable_fields( $field['fields'] );
-
-				if ( ! empty( $sub_keys ) ) {
-					$keys = array_merge( $keys, $sub_keys );
-				}
-
-				continue;
 			}
 		}
 

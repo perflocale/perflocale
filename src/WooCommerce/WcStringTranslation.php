@@ -29,8 +29,37 @@ if ( ! defined( 'ABSPATH' ) ) {
  * 1. `perflocale/woocommerce/translate_string` filter (developer override).
  * 2. WordPress `gettext` filter - StringTranslation service handles it if the
  * string has been registered in the String Translation admin panel.
+ *
+ * WooCommerce sanitizes the gateway title and the shipping rate label before
+ * these hooks run, so a translation found through `gettext` is passed through
+ * the same sanitizer before it takes the original's place
+ * ({@see self::sanitize_for_slot()}).
  */
 final class WcStringTranslation {
+
+	/**
+	 * Markup a translated payment gateway title may keep: the rules
+	 * WooCommerce applies to the gateway's own title in
+	 * WC_Payment_Gateway::get_title() (HtmlSanitizer::LOW_HTML_BALANCED_TAGS_NO_LINKS).
+	 *
+	 * @var array<string, array<string, true>>
+	 */
+	private const GATEWAY_TITLE_HTML = [
+		'br'   => [],
+		'img'  => [
+			'alt'   => true,
+			'class' => true,
+			'src'   => true,
+			'title' => true,
+		],
+		'p'    => [
+			'class' => true,
+		],
+		'span' => [
+			'class' => true,
+			'title' => true,
+		],
+	];
 
 	/**
 	 * @var LanguageRouter
@@ -125,9 +154,36 @@ final class WcStringTranslation {
 		$translated = (string) apply_filters( 'gettext', $text, $text, 'woocommerce' ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress core 'gettext' filter.
 
 		if ( $translated !== $text ) {
-			return $translated;
+			return $this->sanitize_for_slot( $translated );
 		}
 
 		return $text;
+	}
+
+	/**
+	 * Pass a translation through the sanitizer WooCommerce applies to the
+	 * value of the hook that is running.
+	 *
+	 * - `woocommerce_gateway_title`: WooCommerce's gateway title rules
+	 *   (balanced tags; br, img, p and span only, no links).
+	 * - `woocommerce_shipping_rate_label`: plain text, as WooCommerce's own
+	 *   `sanitize_text_field` filter on that hook makes the label.
+	 * - `woocommerce_cart_shipping_method_full_label`: plain text. The value
+	 *   is that label plus the price markup WooCommerce appends; a
+	 *   translation of it is label text.
+	 *
+	 * Any other hook (the gateway description, whose stored translations are
+	 * already filtered with wp_kses_post, as WooCommerce filters the
+	 * description) and a direct call keep the translation as found.
+	 *
+	 * @param string $translated Translation found for the original text.
+	 * @return string
+	 */
+	private function sanitize_for_slot( string $translated ): string {
+		return match ( current_filter() ) {
+			'woocommerce_gateway_title' => wp_kses( force_balance_tags( $translated ), self::GATEWAY_TITLE_HTML ),
+			'woocommerce_shipping_rate_label', 'woocommerce_cart_shipping_method_full_label' => sanitize_text_field( $translated ),
+			default => $translated,
+		};
 	}
 }

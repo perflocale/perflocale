@@ -327,31 +327,36 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( 'Cannot delete the default language.' );
 		}
 
-		// Count translations using this language.
-		global $wpdb;
+		// A language that still has posts is refused
+		// (LanguageRepository::delete_blockers() explains why), before the
+		// confirmation prompt.
+		$blockers = $repo instanceof LanguageRepository ? $repo->delete_blockers( (int) $lang->id ) : null;
 
-		// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table name bound through the %i identifier placeholder.
+		if ( null === $blockers ) {
+			\WP_CLI::error( "Could not check the content of language '{$slug}'; nothing was changed." );
+			return;
+		}
 
-		$links_table = Schema::table( 'translation_links' );
+		if ( $blockers['posts'] !== [] ) {
+			\WP_CLI::error(
+				"Language '{$slug}' still has content (" . \PerfLocale\Helper::post_type_counts_summary( $blockers['posts'] ) . '). ' .
+				'Move those posts to the Trash first, or deactivate the language instead ' .
+				'(Languages screen, or REST PATCH is_active=false): an inactive language keeps its translations linked.'
+			);
+		}
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$count = (int) $wpdb->get_var(
-			$wpdb->prepare(
-				'SELECT COUNT(*) FROM %i WHERE language_id = %d',
-				$links_table,
-				(int) $lang->id
-			)
-		);
-
-		// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-		if ( $count > 0 ) {
-			\WP_CLI::warning( "{$count} translation links use this language. They will be orphaned." );
+		if ( $blockers['terms'] > 0 || $blockers['attachments'] > 0 || $blockers['templates'] > 0 ) {
+			\WP_CLI::warning( "{$blockers['terms']} term(s), {$blockers['attachments']} media item(s) and {$blockers['templates']} block theme template(s) or template part(s) use this language. They will be unlinked from their translations." );
 		}
 
 		\WP_CLI::confirm( "Delete language '{$slug}' ({$lang->name})?", $assoc_args );
 
-		$repo->delete( (int) $lang->id );
+		// delete() runs its cascade in one transaction and returns false after a
+		// ROLLBACK: the language and every row it owns are still there.
+		if ( ! $repo->delete( (int) $lang->id ) ) {
+			\WP_CLI::error( 'The language could not be deleted; nothing was changed.' );
+		}
+
 		\WP_CLI::success( "Language '{$slug}' deleted." );
 	}
 
@@ -377,7 +382,8 @@ final class PerfLocaleCommand {
 	 * : Post type for bulk translation. Default: post.
 	 *
 	 * [--all]
-	 * : Translate all posts of the given post type.
+	 * : Translate all published posts of the given post type that are in the
+	 * default language or have no language yet.
 	 *
 	 * [--post-ids=<ids>]
 	 * : Comma-separated list of post IDs.
@@ -389,8 +395,8 @@ final class PerfLocaleCommand {
 	 * : Estimate characters/cost for the selection; nothing is translated.
 	 *
 	 * [--async]
-	 * : With --all, dispatch the chunked background chain instead of looping
-	 * in-process. Track it under PerfLocale → Jobs.
+	 * : Only with --all: dispatch the chunked background chain instead of
+	 * looping in-process. Track it under PerfLocale → Jobs.
 	 *
 	 * [--include-meta]
 	 * : Also machine-translate registered meta fields (SEO titles etc.).
@@ -420,6 +426,14 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( 'Machine translation is not enabled. Enable it in Settings → Addons → Machine Translation.' );
 		}
 
+		// --async exists only for --all. Accepting it elsewhere and running in
+		// the foreground would do the opposite of what was asked.
+		if ( isset( $assoc_args['async'] ) && ! isset( $assoc_args['all'] ) ) {
+			\WP_CLI::error( '--async works only with --all. Run the command without --async to translate these posts now.' );
+		}
+
+		$include_meta = isset( $assoc_args['include-meta'] );
+
 		// --dry-run: character/cost estimate only, nothing dispatched, no spend.
 		if ( isset( $assoc_args['dry-run'] ) ) {
 			$this->translate_dry_run( $args, $assoc_args, $target_lang, $settings );
@@ -444,6 +458,7 @@ final class PerfLocaleCommand {
 					'target_lang_ids' => [ (int) $lang->id ],
 					'include_meta'    => isset( $assoc_args['include-meta'] ),
 					'after_id'        => 0,
+					'trigger'         => 'cli_all',
 				]
 			);
 
@@ -457,7 +472,7 @@ final class PerfLocaleCommand {
 
 		// Single post mode.
 		if ( ! empty( $args[0] ) ) {
-			$this->translate_single( absint( $args[0] ), $target_lang, $provider, $settings, $cache );
+			$this->translate_single( absint( $args[0] ), $target_lang, $provider, $settings, $cache, $include_meta );
 			return;
 		}
 
@@ -489,6 +504,8 @@ final class PerfLocaleCommand {
 				$post_ids       = array_merge( $post_ids, $batch );
 				$got_full_batch = ( count( $batch ) === 500 );
 			} while ( $got_full_batch );
+
+			$post_ids = $this->default_language_sources( $post_ids );
 		}
 
 		if ( empty( $post_ids ) ) {
@@ -497,7 +514,9 @@ final class PerfLocaleCommand {
 
 		wp_raise_memory_limit( 'admin' );
 
+		// The trigger: posts named on the command line, or every post of the type.
 		$skip_existing = isset( $assoc_args['skip-existing'] );
+		$trigger       = isset( $assoc_args['post-ids'] ) ? 'cli_ids' : 'cli_all';
 		$manager       = new PostTranslationManager( $cache, $settings );
 		$service       = new TranslationService( $settings, $cache );
 		$progress      = \WP_CLI\Utils\make_progress_bar( "Translating to {$target_lang}", count( $post_ids ) );
@@ -542,19 +561,30 @@ final class PerfLocaleCommand {
 				break;
 			}
 
-			if ( $skip_existing ) {
-				$existing = $manager->get_translation_id( $pid, $target_lang );
+			$skip = $skip_existing && $manager->get_translation_id( $pid, $target_lang ) !== null;
 
-				if ( $existing !== null ) {
-					++$skipped;
-					$progress->tick();
-					continue;
-				}
+			// A password-protected post is sent when the
+			// perflocale/mt/send_password_protected filter allows it.
+			if ( ! $skip ) {
+				$source = get_post( $pid );
+				$skip   = $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, $trigger );
+			}
+
+			if ( $skip ) {
+				++$skipped;
+				$progress->tick();
+				continue;
 			}
 
 			try {
-				$service->translate_post( $pid, $target_lang, $provider );
+				$result = $service->translate_post( $pid, $target_lang, $provider, false, $include_meta );
 				++$translated;
+
+				foreach ( (array) ( $result['warnings'] ?? [] ) as $warning ) {
+					if ( is_string( $warning ) ) {
+						\WP_CLI::warning( "Post {$pid}: " . $warning );
+					}
+				}
 			} catch ( \Throwable $e ) {
 				\WP_CLI::warning( "Post {$pid}: " . $e->getMessage() );
 				++$failed;
@@ -627,6 +657,7 @@ final class PerfLocaleCommand {
 			$post_type = sanitize_key( $assoc_args['post-type'] ?? 'post' );
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$post_ids = array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = 'publish'", $post_type ) ) );
+			$post_ids = $this->default_language_sources( $post_ids );
 		}
 
 		if ( $post_ids === [] ) {
@@ -648,9 +679,16 @@ final class PerfLocaleCommand {
 		\WP_CLI::success( 'Dry run complete — nothing was translated.' );
 	}
 
-	private function translate_single( int $post_id, string $target_lang, string $provider, $settings, CacheManager $cache ): void {
+	private function translate_single( int $post_id, string $target_lang, string $provider, $settings, CacheManager $cache, bool $include_meta = false ): void {
 		if ( $post_id === 0 ) {
 			\WP_CLI::error( 'Invalid post ID.' );
+		}
+
+		$source = get_post( $post_id );
+
+		if ( $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, 'cli_ids' ) ) {
+			\WP_CLI::warning( "Post {$post_id}: " . TranslationService::password_protected_skip_message() );
+			return;
 		}
 
 		$service = new TranslationService( $settings, $cache );
@@ -658,12 +696,66 @@ final class PerfLocaleCommand {
 		try {
 			\WP_CLI::log( "Translating post {$post_id} to {$target_lang}..." );
 
-			$result = $service->translate_post( $post_id, $target_lang, $provider );
+			$result = $service->translate_post( $post_id, $target_lang, $provider, false, $include_meta );
+
+			foreach ( (array) ( $result['warnings'] ?? [] ) as $warning ) {
+				if ( is_string( $warning ) ) {
+					\WP_CLI::warning( $warning );
+				}
+			}
 
 			\WP_CLI::success( sprintf( 'Translated! New post ID: %d', $result['post_id'] ) );
 		} catch ( \Throwable $e ) {
 			\WP_CLI::error( 'Translation failed: ' . $e->getMessage() );
 		}
+	}
+
+	/**
+	 * Narrow a post id list to the site's source content: posts in the
+	 * default language, and posts with no language yet (treated as default
+	 * content everywhere else in the plugin). A post in another language is a
+	 * translation, or an original written in that language; --all translates
+	 * from the default language only.
+	 *
+	 * @param int[] $post_ids Candidate post ids.
+	 * @return list<int> The ids to translate, in their original order.
+	 */
+	private function default_language_sources( array $post_ids ): array {
+		global $wpdb;
+
+		$post_ids  = array_values( array_unique( array_filter( array_map( 'intval', $post_ids ) ) ) );
+		$lang_repo = $this->plugin->get( 'lang_repo' );
+		$default   = $lang_repo instanceof LanguageRepository ? $lang_repo->get_default() : null;
+
+		$default_id = is_object( $default ) && isset( $default->id ) && is_numeric( $default->id ) ? (int) $default->id : 0;
+
+		if ( $post_ids === [] || $default_id <= 0 || ! $wpdb instanceof \wpdb ) {
+			return $post_ids;
+		}
+
+		$links_table = Schema::table( 'translation_links' );
+		$other       = [];
+
+		foreach ( array_chunk( $post_ids, 1000 ) as $chunk ) {
+			$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- %d list built from array_fill; table bound through %i.
+			$rows = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT object_id FROM %i WHERE type = %s AND language_id <> %d AND object_id IN ({$placeholders})",
+					array_merge( [ $links_table, 'post', $default_id ], $chunk )
+				)
+			);
+			// phpcs:enable
+
+			foreach ( (array) $rows as $id ) {
+				if ( is_numeric( $id ) ) {
+					$other[ (int) $id ] = true;
+				}
+			}
+		}
+
+		return array_values( array_filter( $post_ids, static fn( int $id ): bool => ! isset( $other[ $id ] ) ) );
 	}
 
 	// =========================================================================
@@ -938,7 +1030,9 @@ final class PerfLocaleCommand {
 		$groups_table = Schema::table( 'translation_groups' );
 		$slugs_table  = Schema::table( 'slug_translations' );
 
-		// Find terms in translation groups that lack slug translations.
+		// Find terms in translation groups that lack slug translations. Terms
+		// linked by an importer are left out: each keeps its own slug as its
+		// URL and needs no slug translation (`slugs backfill` skips them too).
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table names from Schema::table() are safe constants.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$missing = $wpdb->get_var(
@@ -947,10 +1041,14 @@ final class PerfLocaleCommand {
 				FROM %i l
 				INNER JOIN %i g ON g.id = l.group_id AND g.type = 'term'
 				LEFT JOIN %i st ON st.object_id = l.object_id AND st.object_type = 'term' AND st.language_id = l.language_id
-				WHERE st.id IS NULL",
+				WHERE st.id IS NULL
+				AND l.source NOT IN ( %s, %s, %s )",
 				$links_table,
 				$groups_table,
-				$slugs_table
+				$slugs_table,
+				\PerfLocale\Enum\SourceType::ImportedWpml->value,
+				\PerfLocale\Enum\SourceType::ImportedPolylang->value,
+				\PerfLocale\Enum\SourceType::ImportedTrp->value
 			)
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -1063,7 +1161,10 @@ final class PerfLocaleCommand {
 	 * : Input file path (PerfLocale export JSON).
 	 *
 	 * [--mode=<mode>]
-	 * : Import mode: merge (default) or replace.
+	 * : Import mode: merge (default) or replace. Merge adds the file's rows and
+	 *   leaves this site's settings, add-on settings, add-on list and roles as
+	 *   they are. Replace clears this site's rows for every section the file
+	 *   declares, then loads the file and applies its configuration.
 	 * ---
 	 * default: merge
 	 * options:
@@ -1120,15 +1221,32 @@ final class PerfLocaleCommand {
 		\WP_CLI::log( "Importing from {$file} (mode: {$mode})..." );
 
 		$importer = new \PerfLocale\Admin\DataImporter();
-		$result   = $importer->import(
-			$file,
-			$replace,
-			false,
-			// Shell access is the trust level here, so the flag is the whole
-			// confirmation: the same "this site is a copy, the IDs match"
-			// statement the admin form's checkbox makes.
-			[ 'allow_foreign_ids' => ! empty( $assoc_args['force'] ) ]
-		);
+
+		// import() stops a replace import that the database refuses part-way
+		// with a \RuntimeException, after its own rollback. WP-CLI catches
+		// nothing itself, so report it as a command error (exit 1) rather
+		// than a PHP fatal. Errors and logic exceptions stay uncaught, with
+		// their file and line.
+		try {
+			$result = $importer->import(
+				$file,
+				$replace,
+				false,
+				// Shell access is the trust level here, so the flag is the whole
+				// confirmation: the same "this site is a copy, the IDs match"
+				// statement the admin form's checkbox makes.
+				[ 'allow_foreign_ids' => ! empty( $assoc_args['force'] ) ]
+			);
+		} catch ( \RuntimeException $e ) {
+			\WP_CLI::error( 'Import failed: ' . $e->getMessage() );
+			return;
+		}
+
+		// A warning, not a log line: a script that expects the file's settings
+		// or role grants to change needs to see that merge left them alone.
+		if ( ! empty( $result['not_applied'] ) ) {
+			\WP_CLI::warning( $this->merge_not_applied_message() );
+		}
 
 		if ( ! empty( $result['errors'] ) ) {
 			foreach ( $result['errors'] as $error ) {
@@ -1158,6 +1276,16 @@ final class PerfLocaleCommand {
 				$result['skipped'] ?? 0
 			)
 		);
+	}
+
+	/**
+	 * The warning `import` and `network-import` print when a merge left the
+	 * file's configuration unapplied.
+	 *
+	 * @return string
+	 */
+	private function merge_not_applied_message(): string {
+		return 'Settings, add-on settings, the add-on list and roles in the file were not applied: merge mode keeps this site\'s configuration. Run the import with --mode=replace to apply them (a file that carries only those sections deletes no rows).';
 	}
 
 
@@ -1332,7 +1460,9 @@ final class PerfLocaleCommand {
 	 * : Input file path (network-export JSON).
 	 *
 	 * [--mode=<mode>]
-	 * : merge or replace. Default: merge.
+	 * : merge or replace. Default: merge. Merge leaves each site's settings,
+	 *   add-on settings, add-on list and roles as they are; replace applies the
+	 *   slice's.
 	 * ---
 	 * default: merge
 	 * options:
@@ -1501,7 +1631,20 @@ final class PerfLocaleCommand {
 				// identical check above, or the operator forced past it, so
 				// re-running it inside import() could only contradict the
 				// decision the operator already made.
-				$result = $importer->import( $tmp, $replace, false, [ 'allow_foreign_ids' => $forced ] );
+				//
+				// import() throws a \RuntimeException for a slice the database
+				// refuses part-way, after rolling that slice back. Each slice is
+				// its own transaction, so count it, drop its staged file and go
+				// on to the next site. The finally still restores the blog on
+				// `continue`.
+				try {
+					$result = $importer->import( $tmp, $replace, false, [ 'allow_foreign_ids' => $forced ] );
+				} catch ( \RuntimeException $e ) {
+					wp_delete_file( $tmp );
+					\WP_CLI::warning( "Site {$source_site_id}: " . $e->getMessage() );
+					++$total_errors;
+					continue;
+				}
 				wp_delete_file( $tmp );
 
 				$total_imported += (int) ( $result['imported'] ?? 0 );
@@ -1509,6 +1652,10 @@ final class PerfLocaleCommand {
 
 				foreach ( $result['errors'] ?? [] as $err ) {
 					\WP_CLI::warning( "Site {$source_site_id}: {$err}" );
+				}
+
+				if ( ! empty( $result['not_applied'] ) ) {
+					\WP_CLI::warning( "Site {$source_site_id}: " . $this->merge_not_applied_message() );
 				}
 
 				\WP_CLI::log(
@@ -1529,9 +1676,11 @@ final class PerfLocaleCommand {
 
 		if ( $total_errors > 0 ) {
 			// Per-site slices that were deliberately skipped (missing blog,
-			// absent `export` key) are logged as warnings and are NOT counted
-			// in $total_errors - only real per-row import failures are, so a
-			// non-zero count always means data did not land.
+			// absent `export` key, a slice that could not be staged) are
+			// logged as warnings and are NOT counted in $total_errors. What is
+			// counted: real per-row import failures, a slice whose recorded
+			// address does not match its target, and a slice whose import
+			// aborted. A non-zero count always means data did not land.
 			\WP_CLI::error( "Network import finished with {$total_errors} error(s). Imported across sites: {$total_imported}." );
 		}
 
@@ -1580,7 +1729,7 @@ final class PerfLocaleCommand {
 		$bytes  = \PerfLocale\Admin\PoSync::export_to_file( $file, $lang, $domain, $report );
 
 		if ( $bytes === false ) {
-			\WP_CLI::error( "PO export failed (unknown lang slug or write error): {$file}" );
+			\WP_CLI::error( "PO export failed (unknown lang slug, database read error or write error): {$file}" );
 		}
 
 		// Both conditions leave the .po itself valid, so they are warnings, not
@@ -1752,7 +1901,8 @@ final class PerfLocaleCommand {
 			if ( $force_restart ) {
 				\WP_CLI::log( '(--force-restart would also clear the source-map for this importer.)' );
 			}
-			\WP_CLI::success( ucfirst( $source ) . ' data detected and ready to import. Run without --dry-run to proceed.' );
+
+			$this->migrate_dry_run( $source, $importer );
 			return;
 		}
 
@@ -1763,37 +1913,54 @@ final class PerfLocaleCommand {
 		// reusing the mapping from a prior (now-restored-over) run. The
 		// CLI source string for TranslatePress is 'translatepress' but
 		// the migration_type stored in the source_map is 'trp' — see
-		// TranslatePressImporter::import().
-		if ( $force_restart ) {
-			$migration_type = $source === 'translatepress' ? 'trp' : $source;
-			$source_map     = new \PerfLocale\Database\Repository\MigrationSourceMapRepository();
-			$cleared        = $source_map->delete_for_type( $migration_type );
-			\WP_CLI::log( sprintf( '--force-restart: cleared %d source-map row(s) for %s.', $cleared, $source ) );
+		// TranslatePressImporter::import(). It runs inside the import lock:
+		// clearing the map under a running import would orphan its groups.
+		$before = null;
 
-			// TranslatePress also keeps a per-post resume checkpoint; without
-			// clearing it, a post-restore re-import silently skips every source
-			// post at/below the stale cursor (the source-map clear is not enough).
-			if ( $source === 'translatepress' ) {
-				delete_option( \PerfLocale\Migration\TranslatePressImporter::POST_CHECKPOINT_OPTION );
-				\WP_CLI::log( '--force-restart: cleared TranslatePress post checkpoint.' );
-			}
+		if ( $force_restart ) {
+			$before = static function () use ( $source ): void {
+				$migration_type = $source === 'translatepress' ? 'trp' : $source;
+				$source_map     = new \PerfLocale\Database\Repository\MigrationSourceMapRepository();
+				$cleared        = $source_map->delete_for_type( $migration_type );
+				\WP_CLI::log( sprintf( '--force-restart: cleared %d source-map row(s) for %s.', $cleared, $source ) );
+
+				// TranslatePress also keeps a per-post resume checkpoint; without
+				// clearing it, a post-restore re-import silently skips every source
+				// post at/below the stale cursor (the source-map clear is not enough).
+				if ( $source === 'translatepress' ) {
+					delete_option( \PerfLocale\Migration\TranslatePressImporter::POST_CHECKPOINT_OPTION );
+					\WP_CLI::log( '--force-restart: cleared TranslatePress post checkpoint.' );
+				}
+			};
 		}
 
 		\WP_CLI::log( "Migrating from {$source}..." );
 
-		$result = $importer->import();
+		// The runner holds the import lock (one import at a time, whatever
+		// the path or the source), runs the import, and — unless the import
+		// was refused — flushes every cache the admin migration jobs flush,
+		// including the files-mode .l10n.php bundles.
+		$result = [];
 
-		// Same post-import flush the admin migration jobs run: purges every
-		// stale cache/eager-map AND — in files mode (the default) —
-		// regenerates the .l10n.php bundles. Without it, CLI-migrated
-		// string translations sat in the DB while the frontend kept serving
-		// the pre-migration files until an unrelated regeneration.
-		\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
+		try {
+			$result = \PerfLocale\Migration\MigrationRunner::import( $source, $cache, $before );
+		} catch ( \PerfLocale\Migration\MigrationLockedException $e ) {
+			\WP_CLI::error( wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
+		}
 
 		if ( ! empty( $result['errors'] ) ) {
 			foreach ( $result['errors'] as $error ) {
 				\WP_CLI::warning( $error );
 			}
+		}
+
+		// Rows the WPML import left out, per reason, with examples.
+		foreach ( \PerfLocale\Migration\WpmlImporter::skipped_lines( $result ) as $line ) {
+			\WP_CLI::warning( $line );
+		}
+
+		if ( ! empty( $result['blocked'] ) ) {
+			\WP_CLI::error( 'The import was refused and nothing was imported. Fix the problems above, then run it again (--dry-run shows the check).' );
 		}
 
 		$parts = [];
@@ -1816,7 +1983,70 @@ final class PerfLocaleCommand {
 
 		$summary = ! empty( $parts ) ? implode( ', ', $parts ) : '0 items';
 
+		// Part of the source data was not imported (a read or a write failed):
+		// what was imported is kept, and the run fails so scripts see it.
+		if ( ! empty( $result['incomplete'] ) ) {
+			\WP_CLI::log( "Imported: {$summary}." );
+			\WP_CLI::error( 'The import did not finish: some data could not be read or written (see the warnings above). What it imported is kept. Run it again to import the rest.' );
+		}
+
 		\WP_CLI::success( "Migration complete. Imported: {$summary}." );
+	}
+
+	/**
+	 * Print what an import would find and whether it would run.
+	 *
+	 * One row per source language: its code, locale, items and the
+	 * PerfLocale language it maps to. Then each problem, and an exit code:
+	 * 0 when the import would run, 1 when it would be refused. Writes nothing
+	 * and takes no lock.
+	 *
+	 * @param string $source   wpml, polylang or translatepress.
+	 * @param object $importer The source's importer.
+	 * @return void
+	 */
+	private function migrate_dry_run( string $source, object $importer ): void {
+		if ( $importer instanceof \PerfLocale\Migration\WpmlImporter ) {
+			$pre     = $importer->preflight();
+			$default = (string) ( $pre['wpml']['default'] ?? '' );
+			$locales = (array) ( $pre['wpml']['locales'] ?? [] );
+			$content = (array) ( $pre['wpml']['content'] ?? [] );
+		} else {
+			$languages = $this->plugin->get( 'lang_repo' );
+			$pre       = $source === 'polylang'
+				? \PerfLocale\Migration\SourcePreflight::polylang( $languages )
+				: \PerfLocale\Migration\SourcePreflight::translatepress( $languages );
+			$default   = (string) $pre['default'];
+			$locales   = (array) $pre['locales'];
+			$content   = (array) $pre['content'];
+		}
+
+		$rows = [];
+
+		foreach ( (array) $pre['map'] as $code => $slug ) {
+			$code   = (string) $code;
+			$rows[] = [
+				'code'       => $code,
+				'locale'     => (string) ( $locales[ $code ] ?? '' ),
+				'items'      => (int) ( $content[ $code ] ?? 0 ),
+				'perflocale' => $slug === null ? '' : (string) $slug,
+				'status'     => $slug === null ? 'no match' : ( $code === $default ? 'default' : 'ok' ),
+			];
+		}
+
+		if ( $rows !== [] ) {
+			\WP_CLI\Utils\format_items( 'table', $rows, [ 'code', 'locale', 'items', 'perflocale', 'status' ] );
+		}
+
+		foreach ( (array) $pre['problems'] as $problem ) {
+			\WP_CLI::warning( ( $problem['level'] === 'error' ? 'Error: ' : '' ) . $problem['message'] );
+		}
+
+		if ( ! empty( $pre['blocking'] ) ) {
+			\WP_CLI::error( ucfirst( $source ) . ' data detected, but the import would be refused. Fix the errors above, then run it again.' );
+		}
+
+		\WP_CLI::success( ucfirst( $source ) . ' data detected and ready to import. Run without --dry-run to proceed.' );
 	}
 
 	// =========================================================================
@@ -2326,7 +2556,7 @@ final class PerfLocaleCommand {
 	 *
 	 *     # Manual maintenance
 	 *     wp perflocale jobs gc        # Run garbage collection now
-	 *     wp perflocale jobs resume    # Re-enqueue queued/running jobs (post-reactivation recovery)
+	 *     wp perflocale jobs resume    # Re-enqueue queued/running jobs (post-reactivation recovery; skips running jobs whose worker lock is still held)
 	 *
 	 * @param array<int, string>    $args
 	 * @param array<string, string> $assoc_args
@@ -2500,8 +2730,23 @@ final class PerfLocaleCommand {
 			return;
 		}
 
+		// Record the cancel before removing the event or the locks: same
+		// order and reasoning as the REST cancel endpoint.
+		if ( ! \PerfLocale\Background\JobState::cancel( $job_id ) ) {
+			$latest = \PerfLocale\Background\JobState::get( $job_id );
+			$status = $latest ? (string) $latest['status'] : '';
+
+			if ( 'canceled' !== $status ) {
+				if ( \PerfLocale\Background\JobState::is_terminal( $status ) ) {
+					\WP_CLI::warning( "Job is in status '{$status}' — only queued/running jobs can be canceled." );
+					return;
+				}
+
+				\WP_CLI::error( "Could not cancel job {$job_id}: the database refused the status change. Nothing was changed." );
+			}
+		}
+
 		\PerfLocale\Background\JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $job_id );
-		\PerfLocale\Background\JobState::cancel( $job_id );
 
 		// Release the per-job + per-type locks immediately. Otherwise the
 		// per-type lock (TTL 30 min) blocks every same-type dispatch with
@@ -2555,11 +2800,22 @@ final class PerfLocaleCommand {
 		// schedule_recording_engine) — after an engine switch, cancel/
 		// is_scheduled probes would otherwise target the wrong store.
 		$runner = \PerfLocale\Background\JobRunnerFactory::pick();
-		$runner->enqueue(
-			(string) $state['hook'],
-			$worker_args,
-			$job_id
-		);
+		try {
+			$runner->enqueue(
+				(string) $state['hook'],
+				$worker_args,
+				$job_id
+			);
+		} catch ( \Throwable $e ) {
+			// Same compensation as the REST retry endpoint.
+			$message = sprintf(
+				/* translators: %s is the runner's error message. */
+				__( 'Failed to enqueue background job: %s', 'perflocale' ),
+				\PerfLocale\Util\PathRedactor::redact( $e->getMessage() )
+			);
+			\PerfLocale\Background\JobState::fail_queued( $job_id, $message );
+			\WP_CLI::error( "Could not retry job {$job_id}. {$message}" );
+		}
 		\PerfLocale\Background\JobState::set_engine( $job_id, $runner->get_engine_name() );
 
 		\WP_CLI::success( "Retried job {$job_id}" );
@@ -2630,6 +2886,13 @@ final class PerfLocaleCommand {
 	 * Manually trigger the post-reactivation resume sweep. Useful when the
 	 * `perflocale_resume_jobs` cron event was lost (e.g. WP-Cron disabled
 	 * + no external trigger between activate and the operator noticing).
+	 *
+	 * A `running` job whose worker lock is still held is skipped, because
+	 * the lock may belong to a live worker; the sweep schedules one
+	 * follow-up sweep for after the earliest such lock expires. Run this
+	 * again after the lock's expiry (30 minutes by default, 2 hours for
+	 * exports and string scans, 4 hours for imports and migrations) if a
+	 * job is still stuck, or cancel and retry it.
 	 *
 	 * @return void
 	 */

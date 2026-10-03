@@ -40,6 +40,14 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	private static array $find_cache = [];
 
 	/**
+	 * How many times this process has dropped cached group or link data
+	 * after a change (see link_changes()).
+	 *
+	 * @var int
+	 */
+	private static int $link_changes = 0;
+
+	/**
 	 * Soft cap on $find_cache. When exceeded, the oldest 25% of entries
 	 * are evicted FIFO. Same heuristic as UrlConverter::cap_cache().
 	 */
@@ -113,6 +121,28 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @var bool
 	 */
 	private static bool $eager_link_map_suspended = false;
+
+	/**
+	 * Seconds after this process deleted a blog's cached all-language status
+	 * selections during which another status change in the same process does
+	 * not delete them again (forget_status_selectors()).
+	 */
+	private const STATUS_SELECTORS_FORGET_SECONDS = 2.0;
+
+	/**
+	 * When this process last deleted a blog's cached all-language status
+	 * selections (microtime( true ), see forget_status_selectors()), keyed by
+	 * blog id. A request or job that changes the status of many posts deletes
+	 * those entries once per STATUS_SELECTORS_FORGET_SECONDS instead of once
+	 * per post, and a long-running process (WP-CLI, cron, Action Scheduler)
+	 * still deletes them again on a later change. Reading a selection in this
+	 * process removes the blog's entry. Not part of reset_static_caches():
+	 * that runs on every `switch_blog`, which would bring back one delete per
+	 * post where a host switches to the same blog on each save.
+	 *
+	 * @var array<int, float>
+	 */
+	private static array $status_selectors_forgotten_at = [];
 
 	/**
 	 * Suspend eager-link-map reads/rebuilds for the duration of a bulk
@@ -326,10 +356,24 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @return void
 	 */
 	public static function reset_static_caches(): void {
+		++self::$link_changes;
 		self::$find_cache           = [];
 		self::$has_any_groups_memo  = null;
 		self::$eager_link_map_memo  = [];
 		self::$is_string_group_memo = [];
+	}
+
+	/**
+	 * How many times this process has dropped cached group or link data after
+	 * a change: a group or link written or removed (invalidate_group_cache(),
+	 * invalidate_find_cache(), invalidate_eager_link_map()) or every static
+	 * cache reset (reset_static_caches()). Per-request memos built from group
+	 * membership compare it to the value they were built at.
+	 *
+	 * @return int
+	 */
+	public static function link_changes(): int {
+		return self::$link_changes;
 	}
 
 	/**
@@ -375,6 +419,103 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		return null;
+	}
+
+	/**
+	 * The object that holds one language in a group, read from the database.
+	 *
+	 * Uncached, for importers that must see the links they wrote earlier in
+	 * the same request. One lookup on the `group_lang` unique key.
+	 *
+	 * @param int $group_id    Group ID.
+	 * @param int $language_id Language ID.
+	 * @return int Object ID, or 0 when no object holds that language.
+	 */
+	public function object_in_group_language( int $group_id, int $language_id ): int {
+		// Deliberately uncached: the importer reads its own writes.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		$object_id = $this->wpdb->get_var(
+			$this->wpdb->prepare(
+				'SELECT object_id FROM %i WHERE group_id = %d AND language_id = %d LIMIT 1',
+				$this->links_table(),
+				$group_id,
+				$language_id
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return (int) $object_id;
+	}
+
+	/**
+	 * Look up the translation groups of many objects in one query and keep
+	 * each answer where find_for_object() reads it first. Same match as
+	 * find_for_object(); ids it already knows are skipped. Returns false, and
+	 * keeps nothing, when the query fails.
+	 *
+	 * @param array<int, int> $object_ids Object ids.
+	 * @param ObjectType      $type       Object type.
+	 * @return bool
+	 */
+	public function prime_find_for_objects( array $object_ids, ObjectType $type ): bool {
+		$missing = [];
+
+		foreach ( $object_ids as $object_id ) {
+			$object_id = (int) $object_id;
+
+			if ( $object_id > 0 && ! array_key_exists( self::find_cache_key( $type->value, $object_id ), self::$find_cache ) ) {
+				$missing[ $object_id ] = true;
+			}
+		}
+
+		if ( [] === $missing ) {
+			return true;
+		}
+
+		$found = [];
+
+		foreach ( array_chunk( array_keys( $missing ), 500 ) as $chunk ) {
+			$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge(), which WPCS cannot count; the %i table names lead, then the values in placeholder order.
+			$rows = $this->wpdb->get_results(
+				$this->wpdb->prepare(
+					"SELECT l.object_id AS pfl_object_id, g.* FROM %i g
+					INNER JOIN %i l ON g.id = l.group_id
+					WHERE g.type = %s AND l.object_id IN ($placeholders)",
+					array_merge( [ $this->groups_table(), $this->links_table(), $type->value ], $chunk )
+				)
+			);
+			// phpcs:enable
+
+			if ( '' !== (string) $this->wpdb->last_error || ! is_array( $rows ) ) {
+				return false;
+			}
+
+			foreach ( $rows as $row ) {
+				if ( ! isset( $row->pfl_object_id ) || ! is_numeric( $row->pfl_object_id ) ) {
+					continue;
+				}
+
+				$object_id = (int) $row->pfl_object_id;
+
+				if ( ! array_key_exists( $object_id, $found ) ) {
+					unset( $row->pfl_object_id );
+					$found[ $object_id ] = $row;
+				}
+			}
+		}
+
+		foreach ( array_keys( $missing ) as $object_id ) {
+			if ( count( self::$find_cache ) >= self::FIND_CACHE_CAP ) {
+				$evict            = (int) ( self::FIND_CACHE_CAP / 4 );
+				self::$find_cache = array_slice( self::$find_cache, $evict, null, true );
+			}
+
+			self::$find_cache[ self::find_cache_key( $type->value, $object_id ) ] = $found[ $object_id ] ?? null;
+		}
+
+		return true;
 	}
 
 	/**
@@ -586,6 +727,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// external object cache transients aren't in wp_options, so the peek
 		// would return zero rows — skip it and let Step 3 + the object-cache-
 		// aware get_translations() fill path handle priming.
+		$stale_timeout_keys = [];
+
 		if ( wp_using_ext_object_cache() ) {
 			$missing = $after_l1;
 		} else {
@@ -674,6 +817,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 					continue;
 				}
 
+				// A value row that reaches this point has a timeout twin in the
+				// past: it is recomputed below like a missing one. set_many()
+				// writes no twin, so it deletes this one after the write; left
+				// in place, the twin keeps the rewritten row "expired" and every
+				// later request recomputes and rewrites it. When the Step 3
+				// read fails, the twin is kept (see $read_failed).
+				if ( $has_value ) {
+					$stale_timeout_keys[] = $cache_key;
+				}
+
 				$missing[] = $id;
 			}
 		}
@@ -710,6 +863,14 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			)
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		// Read before any other statement: wpdb resets last_error on every
+		// query. A failed read also leaves $rows empty, so every requested key
+		// is written below as "no translations"; with the read failed, the
+		// expired timeout rows Step 2 found are kept, and those keys are
+		// recomputed on the next request instead of serving that empty list
+		// with no expiry.
+		$read_failed = '' !== (string) $this->wpdb->last_error || ! is_array( $rows );
 
 		// Group the flat link rows by source_id: every member of a group sees
 		// the same sibling list, so cache that list under EVERY member's key in
@@ -792,7 +953,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		if ( $to_write !== [] ) {
-			$this->cache->set_many( $to_write, HOUR_IN_SECONDS, 'perflocale_trans' );
+			$this->cache->set_many( $to_write, HOUR_IN_SECONDS, 'perflocale_trans', $read_failed ? [] : $stale_timeout_keys );
 		}
 
 		// We just resolved at least one group, so prove the site is no
@@ -1056,16 +1217,26 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		$byte_cap = (int) apply_filters( 'perflocale/cache/eager_map_byte_cap', self::EAGER_LINK_MAP_BYTE_CAP, $type );
 
 		// Cold build. Cheap size check first so we don't pull 100k+
-		// rows on a site that will never fit in alloptions anyway.
+		// rows on a site that will never fit in alloptions anyway. It counts
+		// at most $row_cap + 1 rows: the decisions below only need to tell 0,
+		// 1..$row_cap and "more than $row_cap" apart, and each of those comes
+		// out the same as from a full count. A site over the cap therefore
+		// reads $row_cap + 1 link rows here, not all of them.
+		$count_limit = $row_cap < PHP_INT_MAX ? max( 0, $row_cap ) + 1 : PHP_INT_MAX;
+
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders -- Replacements arrive via array_merge(), which WPCS cannot count.
 		$count_raw = $this->wpdb->get_var(
 			$this->wpdb->prepare(
-				'SELECT COUNT(*) FROM %i l
-				 INNER JOIN %i g ON l.group_id = g.id
-				 WHERE g.type = %s',
+				'SELECT COUNT(*) FROM (
+					SELECT 1 FROM %i l
+					INNER JOIN %i g ON l.group_id = g.id
+					WHERE g.type = %s
+					LIMIT %d
+				) bounded_links',
 				$this->links_table(),
 				$this->groups_table(),
-				$type->value
+				$type->value,
+				$count_limit
 			)
 		);
 
@@ -1214,6 +1385,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @return void
 	 */
 	public function invalidate_eager_link_map( ?ObjectType $type = null ): void {
+		++self::$link_changes;
+
 		$types = $type ? [ $type->value ] : [ 'post', 'term', 'string', 'post_type', 'taxonomy' ];
 
 		foreach ( $types as $t ) {
@@ -1356,12 +1529,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * paginator-vs-filter mismatch).
 	 *
 	 * When $status is 'empty', returns object IDs whose group is MISSING a link
-	 * in the target language.
+	 * in the target language. Any other status matches the target-language
+	 * link's effective status (TranslationLinkRepository::effective_status_sql()
+	 * for posts), the value the screen's cells show.
 	 *
 	 * @param ObjectType $type Object type (e.g. Post).
 	 * @param int        $language_id Target language ID.
 	 * @param string     $status Optional status filter ('' = any, 'empty'
 	 *     = missing the language entirely).
+	 * @param int        $source_language_id Default language ID (0 = none): binds
+	 *     the returned row to the group's default-language member.
 	 * @return array<int, int> Source object IDs.
 	 */
 	public function find_source_object_ids_by_language_status(
@@ -1407,20 +1584,27 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// The outer object_id filter is "any object in that group", which is the source set
 		// (the translations-page lists source-or-any rows; the render then dedupes visually).
 		if ( $status !== '' ) {
+			// t is the group's target-language link (UNIQUE group_lang) and p
+			// its post (PRIMARY), so the status compares one effective value
+			// per group. The type authority is groups.type: old rows can carry
+			// an empty links.type.
+			[ $post_join, $post_args, $status_match ] = $this->status_match_parts( $type, $status );
+
 			$rows = $this->wpdb->get_col(
 				$this->wpdb->prepare(
 					'SELECT DISTINCT l.object_id
 					FROM %i l
 					INNER JOIN %i g ON l.group_id = g.id
+					INNER JOIN %i t ON t.group_id = l.group_id AND t.language_id = %d'
+					. $post_join . '
 					WHERE g.type = %s' . $src_sql . '
-					AND l.group_id IN (
-						SELECT group_id FROM %i
-						WHERE language_id = %d AND status = %s
-					)',
+					AND ' . $status_match,
 					array_merge(
-						[ $this->links_table(), $this->groups_table(), $type->value ],
+						[ $this->links_table(), $this->groups_table(), $this->links_table(), $language_id ],
+						$post_args,
+						[ $type->value ],
 						$src_args,
-						[ $this->links_table(), $language_id, $status ]
+						[ $status ]
 					)
 				)
 			);
@@ -1449,12 +1633,19 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Find source object IDs whose translation group includes ANY link at
-	 * the given status (no language constraint). Used for the "show all posts
+	 * Find source object IDs whose translation group includes ANY translation
+	 * at the given status (no language constraint). Used for the "show all posts
 	 * whose any-language translation is at status X" filter.
+	 *
+	 * The status is each link's effective status
+	 * (TranslationLinkRepository::effective_status_sql() for posts). With a
+	 * default language, only the other members count: the row is the
+	 * default-language member, and its own status is the source's, not a
+	 * translation's.
 	 *
 	 * @param ObjectType $type Object type.
 	 * @param string     $status Status value (non-empty, non-'empty').
+	 * @param int        $source_language_id Default language ID (0 = none).
 	 * @return array<int, int>
 	 */
 	public function find_source_object_ids_by_status_any_language(
@@ -1470,65 +1661,172 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return [];
 		}
 
-		// For post-type translations, accept rows where the link is still
-		// the default 'empty' but the underlying WP post is actually at
-		// the requested status (publish / draft). Mirrors count_by_status()
-		// and the in-PHP resolution in TranslationsPage::display() so all
-		// three views agree on which posts match a given status filter.
-		$post_status_match = null;
-		if ( $type === ObjectType::Post ) {
-			if ( $status === 'published' ) {
-				$post_status_match = 'publish';
-			} elseif ( $status === 'draft' ) {
-				$post_status_match = 'draft';
+		// Cached for a short window like find_source_object_ids_missing_any_language():
+		// the effective status reads every translation's post, which measured
+		// about 100 ms at 12k post groups. A status change of a translatable
+		// post deletes the cached results (on_post_status_transition()). One
+		// process deletes them at most once every two seconds per blog
+		// (forget_status_selectors()), so a selection another request fills
+		// within those two seconds can miss a change made in them for up to a
+		// minute. A link write does not delete them, so a translation linked,
+		// unlinked or flagged can take up to a minute to show here; the
+		// screen's matches_filters() re-checks every listed row with the
+		// current status.
+		$cache_key = self::status_selector_key( $type, $status, $source_language_id );
+
+		// This process holds a selection again (computed, or read from a
+		// layer another request filled): a later status change must delete it.
+		unset( self::$status_selectors_forgotten_at[ get_current_blog_id() ] );
+
+		return (array) $this->cache->get(
+			$cache_key,
+			function () use ( $type, $status, $source_language_id, $src_sql, $src_args ): array {
+				// t walks the group's other members (the source exclusion), p is
+				// each member's post (PRIMARY).
+				$exclude_sql = $source_language_id > 0 ? ' AND t.language_id <> l.language_id' : '';
+
+				[ $post_join, $post_args, $status_match ] = $this->status_match_parts( $type, $status );
+
+				// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders -- Replacements arrive via array_merge(), which WPCS cannot count.
+				$rows = $this->wpdb->get_col(
+					$this->wpdb->prepare(
+						'SELECT DISTINCT l.object_id
+						FROM %i l
+						INNER JOIN %i g ON l.group_id = g.id
+						INNER JOIN %i t ON t.group_id = l.group_id' . $exclude_sql
+						. $post_join . '
+						WHERE g.type = %s' . $src_sql . '
+						AND ' . $status_match,
+						array_merge(
+							[ $this->links_table(), $this->groups_table(), $this->links_table() ],
+							$post_args,
+							[ $type->value ],
+							$src_args,
+							[ $status ]
+						)
+					)
+				);
+				// phpcs:enable
+
+				return array_map( 'intval', (array) $rows );
+			},
+			MINUTE_IN_SECONDS,
+			'perflocale_trans'
+		);
+	}
+
+	/**
+	 * Cache key of one all-language status selection.
+	 *
+	 * @param ObjectType $type               Object type.
+	 * @param string     $status             Status filter value.
+	 * @param int        $source_language_id Default language ID (0 = none).
+	 * @return string
+	 */
+	private static function status_selector_key( ObjectType $type, string $status, int $source_language_id ): string {
+		return sprintf( 'status_any_lang_%s_%s_%d', $type->value, md5( $status ), $source_language_id );
+	}
+
+	/**
+	 * `transition_post_status` handler: a translatable post that changed
+	 * status can change which sources the all-language status filter selects,
+	 * so the cached selections are deleted (forget_status_selectors()).
+	 *
+	 * Registered by CacheManager::register_hooks() on write requests only.
+	 * A save that keeps the status, a post type that is not translatable and
+	 * a new post's auto-draft do nothing.
+	 *
+	 * @param string        $new_status New post status.
+	 * @param string        $old_status Previous post status.
+	 * @param \WP_Post|null $post       The post.
+	 * @return void
+	 */
+	public static function on_post_status_transition( $new_status, $old_status, $post = null ): void {
+		if ( ! $post instanceof \WP_Post || $new_status === $old_status ) {
+			return;
+		}
+
+		if ( 'new' === $old_status && 'auto-draft' === $new_status ) {
+			return;
+		}
+
+		try {
+			$plugin = \PerfLocale\Plugin::get_instance();
+
+			if ( ! $plugin->has( 'settings' ) || ! $plugin->has( 'group_repo' ) || ! $plugin->has( 'lang_repo' ) ) {
+				return;
+			}
+
+			if ( ! in_array( $post->post_type, $plugin->settings()->get_translatable_post_types(), true ) ) {
+				return;
+			}
+
+			$default = $plugin->lang_repo()->get_default();
+
+			$plugin->group_repo()->forget_status_selectors( ( $default && ! empty( $default->id ) ) ? (int) $default->id : 0 );
+		} catch ( \Throwable $e ) {
+			// A missing container or table must never block a status change.
+			unset( $e );
+		}
+	}
+
+	/**
+	 * Delete the cached all-language status selections of post groups for
+	 * one default language: one entry per status the Translations screen
+	 * offers ('empty' is never cached), from every cache layer. Skipped when
+	 * this process deleted them for the blog less than
+	 * STATUS_SELECTORS_FORGET_SECONDS ago and has not read a selection since
+	 * ($status_selectors_forgotten_at).
+	 *
+	 * @param int $source_language_id Default language ID (0 = none), as the screen passes it.
+	 * @return void
+	 */
+	public function forget_status_selectors( int $source_language_id ): void {
+		$blog_id = get_current_blog_id();
+
+		if ( isset( self::$status_selectors_forgotten_at[ $blog_id ] )
+			&& microtime( true ) - self::$status_selectors_forgotten_at[ $blog_id ] < self::STATUS_SELECTORS_FORGET_SECONDS
+		) {
+			return;
+		}
+
+		$keys = [];
+
+		foreach ( \PerfLocale\Enum\TranslationStatus::cases() as $status ) {
+			if ( \PerfLocale\Enum\TranslationStatus::Empty !== $status ) {
+				$keys[] = self::status_selector_key( ObjectType::Post, $status->value, $source_language_id );
 			}
 		}
 
-		$posts_table = $this->wpdb->posts;
+		$this->cache->delete_many( $keys, 'perflocale_trans' );
 
-		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders -- Replacements arrive via array_merge(), which WPCS cannot count.
-		if ( $post_status_match !== null ) {
-			$rows = $this->wpdb->get_col(
-				$this->wpdb->prepare(
-					"SELECT DISTINCT l.object_id
-					FROM %i l
-					INNER JOIN %i g ON l.group_id = g.id
-					WHERE g.type = %s" . $src_sql . "
-					AND l.group_id IN (
-						SELECT l2.group_id
-						FROM %i l2
-						LEFT JOIN %i p ON l2.object_id = p.ID
-						WHERE l2.status = %s
-							OR ( l2.status = 'empty' AND p.post_status = %s )
-					)",
-					array_merge(
-						[ $this->links_table(), $this->groups_table(), $type->value ],
-						$src_args,
-						[ $this->links_table(), $posts_table, $status, $post_status_match ]
-					)
-				)
-			);
-		} else {
-			$rows = $this->wpdb->get_col(
-				$this->wpdb->prepare(
-					'SELECT DISTINCT l.object_id
-					FROM %i l
-					INNER JOIN %i g ON l.group_id = g.id
-					WHERE g.type = %s' . $src_sql . '
-					AND l.group_id IN (
-						SELECT group_id FROM %i WHERE status = %s
-					)',
-					array_merge(
-						[ $this->links_table(), $this->groups_table(), $type->value ],
-						$src_args,
-						[ $this->links_table(), $status ]
-					)
-				)
-			);
+		self::$status_selectors_forgotten_at[ $blog_id ] = microtime( true );
+	}
+
+	/**
+	 * Join and status predicate of the member `t` for the status selectors.
+	 *
+	 * Post links LEFT JOIN their post as `p` and compare the effective status;
+	 * other object types have no post row and compare the stored status. An
+	 * effective `needs_update` implies a stored one, so that status also
+	 * binds the stored column and only the flagged links' posts are read.
+	 *
+	 * @param ObjectType $type   Object type.
+	 * @param string     $status Status filter value.
+	 * @return array{0: literal-string, 1: array<int, string>, 2: literal-string} Join SQL
+	 *     (with a %i placeholder), its replacement values, and the predicate (one %s: the status).
+	 */
+	private function status_match_parts( ObjectType $type, string $status ): array {
+		if ( $type !== ObjectType::Post ) {
+			return [ '', [], 't.status = %s' ];
 		}
-		// phpcs:enable
 
-		return array_map( 'intval', (array) $rows );
+		return [
+			' LEFT JOIN %i p ON p.ID = t.object_id',
+			[ $this->wpdb->posts ],
+			TranslationLinkRepository::effective_status_sql( 't', 'p' ) . ' = %s'
+				. ( $status === 'needs_update' ? " AND t.status = 'needs_update'" : '' ),
+		];
 	}
 
 	/**
@@ -1881,7 +2179,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		$needs_own_transaction = ! self::$in_transaction;
 
 		if ( $needs_own_transaction ) {
-			$this->wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// Without a transaction a failure after the group INSERT would leave
+			// an empty group behind (and link_object() below would run its
+			// DELETE with nothing to roll back): write nothing.
+			if ( false === $this->wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				return false;
+			}
+
 			self::$in_transaction = true;
 		}
 
@@ -2115,7 +2419,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		$needs_own_transaction = ! self::$in_transaction;
 
 		if ( $needs_own_transaction ) {
-			$this->wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// The DELETEs below are only safe inside a transaction: without one,
+			// a failed INSERT leaves the object with no link at all. Write
+			// nothing when the transaction cannot start.
+			if ( false === $this->wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				return false;
+			}
+
 			self::$in_transaction = true;
 		}
 
@@ -2220,7 +2530,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 			// See the snapshot block above for why NotPrepared stays disabled.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders -- Replacements arrive via array_merge(), which WPCS cannot count.
-			$remaining = (int) $this->wpdb->get_var(
+			$remaining = $this->wpdb->get_var(
 				$this->wpdb->prepare(
 					'SELECT COUNT(*) FROM %i WHERE group_id = %d',
 					$this->links_table(),
@@ -2229,7 +2539,22 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders
 
-			if ( $remaining > 0 ) {
+			// COUNT(*) always answers one row, so NULL or an error means the
+			// statement failed, and `(int) null` is 0: the group would be
+			// deleted while its siblings still link to it. Roll back and fail,
+			// as the failed group DELETE below does. Keeping the group and
+			// committing is not safe either: after a lost connection the
+			// server has already rolled the move back.
+			if ( null === $remaining || '' !== $this->wpdb->last_error ) {
+				if ( $needs_own_transaction ) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					$this->wpdb->query( 'ROLLBACK' );
+					self::$in_transaction = false;
+				}
+				return false;
+			}
+
+			if ( (int) $remaining > 0 ) {
 				// Group survives (still has other siblings), but its cached
 				// member list - and those siblings' find_for_object() entries -
 				// still include the object we just moved out. Refresh it below
@@ -2600,6 +2925,24 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			// switcher, and resolution until an unrelated link CRUD rebuilt it.
 			$this->invalidate_eager_link_map( $type );
 
+			// Every object of the group caches the group's links, statuses
+			// included, so the siblings' caches are dropped too.
+			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, identifier bound with %i.
+			$group_id = (int) $this->wpdb->get_var(
+				$this->wpdb->prepare(
+					'SELECT group_id FROM %i WHERE object_id = %d AND language_id = %d AND type = %s LIMIT 1',
+					$this->links_table(),
+					$object_id,
+					$language_id,
+					$type->value
+				)
+			);
+			// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			if ( $group_id > 0 ) {
+				$this->invalidate_group_cache( $group_id );
+			}
+
 			/** @hook perflocale/translation/status_changed Fires after a translation status changes. */
 			do_action( 'perflocale/translation/status_changed', $object_id, $status, $language_id );
 		}
@@ -2650,12 +2993,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		if ( $result !== false ) {
 			$this->invalidate_group_cache( (int) $link->group_id );
 
+			// The group's links no longer include this object, so its own
+			// cached group has to be dropped by name.
+			$this->cache->flush_object( $object_id, $type );
+			unset( self::$find_cache[ self::find_cache_key( $type, $object_id ) ] );
+
 			// If that was the last link in the group, garbage-collect the
-			// now-empty group. Otherwise it becomes a widow row - the kind
-			// that accumulated historically before this fix. String-type
-			// groups keep their own lifecycle; skip them.
+			// now-empty group, so it does not stay behind as a group row with
+			// no links. String-type groups keep their own lifecycle; skip them.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$remaining = (int) $this->wpdb->get_var(
+			$remaining = $this->wpdb->get_var(
 				$this->wpdb->prepare(
 					'SELECT COUNT(*) FROM %i WHERE group_id = %d',
 					$this->links_table(),
@@ -2663,7 +3010,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				)
 			);
 
-			if ( $remaining === 0 && ( $link->type ?? $type ) !== 'string' ) {
+			// COUNT(*) always answers one row, so NULL or an error means the
+			// statement failed, and `(int) null` is 0. An unknown count keeps
+			// the group, because its siblings may still link to it;
+			// gc_empty_groups() removes it later if it really is empty.
+			$count_known = null !== $remaining && '' === $this->wpdb->last_error;
+
+			if ( $count_known && 0 === (int) $remaining && ( $link->type ?? $type ) !== 'string' ) {
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$this->wpdb->delete(
 					$this->groups_table(),
@@ -2692,8 +3045,15 @@ final class TranslationGroupRepository implements RepositoryInterface {
 					$this->wpdb->prepare( 'SELECT EXISTS( SELECT 1 FROM %i LIMIT 1 )', $this->groups_table() )
 				);
 
-				if ( 0 === $any_left && '1' === get_option( 'perflocale_has_any_groups', '' ) ) {
-					update_option( 'perflocale_has_any_groups', '', true );
+				if ( 0 === $any_left ) {
+					if ( '1' === get_option( 'perflocale_has_any_groups', '' ) ) {
+						update_option( 'perflocale_has_any_groups', '', true );
+					}
+
+					// The request-scoped and object-cache copies of the TRUE
+					// answer go too; the object-cache key has no expiry.
+					$this->cache->set_static( 'has_any_groups', null, 'perflocale_trans' );
+					wp_cache_delete( 'has_any_groups', 'perflocale_trans' );
 				}
 			}
 		}
@@ -2781,13 +3141,12 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	/**
 	 * Garbage-collect translation_groups rows whose links are all gone.
 	 *
-	 * Runtime cleanup is in place in unlink_by_object_id() and the
-	 * language-cascade delete path, so newly-deleted posts/terms/languages
-	 * never leak group rows. This static helper exists to mop up
-	 * HISTORICAL orphans accumulated by pre-fix versions of the plugin
-	 * (the original schema didn't have the cleanup at all), and as a
-	 * defensive safety net for any future write path that bypasses the
-	 * standard delete helpers. Called from the daily perflocale_jobs_gc
+	 * The delete helpers, unlink_by_object_id() and the language-cascade
+	 * delete path, remove a group when its last link goes. This sweep
+	 * removes the non-string groups that still have no links: a group
+	 * unlink_by_object_id() kept because its link count could not be read,
+	 * orphan rows already in the table, and rows left by any write path that
+	 * bypasses the delete helpers. Called from the daily perflocale_jobs_gc
 	 * cron handler.
 	 *
 	 * Skips 'string'-type groups because string translations use a
@@ -2872,6 +3231,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @return void
 	 */
 	public function invalidate_group_cache( int $group_id ): void {
+		++self::$link_changes;
+
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$links = $this->wpdb->get_results(
@@ -2932,6 +3293,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @return void
 	 */
 	public function invalidate_find_cache( int $object_id, ObjectType $type ): void {
+		++self::$link_changes;
+
 		$find_key = self::find_cache_key( $type->value, $object_id );
 		unset( self::$find_cache[ $find_key ] );
 	}
@@ -3004,5 +3367,145 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders
 
 		return max( 0, (int) $widows ) + max( 0, (int) $orphan_strings );
+	}
+
+	/**
+	 * Link many strings to their groups, one statement per 200 links.
+	 *
+	 * The bulk form of upsert_link() for string groups: the same
+	 * `INSERT … ON DUPLICATE KEY UPDATE` of object_id, status and source,
+	 * then one read of the batch's links to confirm that each group now links
+	 * its string in that language. A link the multi-row write could not place
+	 * (the object_lang key held a stale row of another group) goes through
+	 * upsert_link(), which clears that row and writes again. The caches of
+	 * every group touched are invalidated once, and
+	 * `perflocale/translation/linked` fires for each link written.
+	 *
+	 * @param array<int, array{0: int, 1: int, 2: int}> $links  group_id, string_id, language_id.
+	 * @param \PerfLocale\Enum\SourceType               $source Source written on each link.
+	 * @param string                                    $status Status written on each link.
+	 * @return int Links that could not be written.
+	 */
+	public function upsert_string_links( array $links, \PerfLocale\Enum\SourceType $source, string $status = 'translated' ): int {
+		$links = array_values( array_filter( $links, static fn( array $l ): bool => (int) $l[0] > 0 && (int) $l[1] > 0 && (int) $l[2] > 0 ) );
+
+		if ( $links === [] ) {
+			return 0;
+		}
+
+		$safe_status = sanitize_key( $status );
+		$failed      = 0;
+		$group_ids   = [];
+
+		foreach ( array_chunk( $links, 200 ) as $chunk ) {
+			$values = implode( ',', array_fill( 0, count( $chunk ), "(%d, %d, %d, 'string', %s, %s)" ) );
+			$args   = [ $this->links_table() ];
+
+			foreach ( $chunk as $l ) {
+				$args[] = (int) $l[0];
+				$args[] = (int) $l[1];
+				$args[] = (int) $l[2];
+				$args[] = $safe_status;
+				$args[] = $source->value;
+			}
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $values is a generated placeholder list bound to $args.
+			$this->wpdb->query(
+				$this->wpdb->prepare(
+					"INSERT INTO %i (group_id, object_id, language_id, type, status, source)
+					VALUES {$values}
+					ON DUPLICATE KEY UPDATE
+						object_id = VALUES(object_id),
+						status = VALUES(status),
+						source = VALUES(source)",
+					$args
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			$ids          = array_values( array_unique( array_map( static fn( array $l ): int => (int) $l[0], $chunk ) ) );
+			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $placeholders is a generated %d list bound to $ids.
+			$rows = $this->wpdb->get_results(
+				$this->wpdb->prepare(
+					"SELECT group_id, language_id, object_id FROM %i WHERE group_id IN ({$placeholders})",
+					array_merge( [ $this->links_table() ], $ids )
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			$now = [];
+
+			foreach ( (array) $rows as $row ) {
+				$now[ (int) $row->group_id ][ (int) $row->language_id ] = (int) $row->object_id;
+			}
+
+			foreach ( $chunk as [ $group_id, $string_id, $language_id ] ) {
+				$group_id    = (int) $group_id;
+				$string_id   = (int) $string_id;
+				$language_id = (int) $language_id;
+
+				if ( ( $now[ $group_id ][ $language_id ] ?? 0 ) !== $string_id ) {
+					if ( $this->upsert_link( $group_id, $string_id, $language_id, $safe_status, $source ) === false ) {
+						++$failed;
+					}
+
+					continue;
+				}
+
+				$group_ids[ $group_id ] = true;
+
+				/** This action is documented in upsert_link(). */
+				do_action( 'perflocale/translation/linked', $group_id, $string_id, $language_id );
+			}
+		}
+
+		$this->invalidate_groups_cache( array_keys( $group_ids ) );
+
+		return $failed;
+	}
+
+	/**
+	 * Invalidate the caches of many groups with one read of their links.
+	 *
+	 * The batch form of invalidate_group_cache().
+	 *
+	 * @param int[] $group_ids Group ids.
+	 * @return void
+	 */
+	private function invalidate_groups_cache( array $group_ids ): void {
+		if ( $group_ids === [] ) {
+			return;
+		}
+
+		$dirty_types = [];
+
+		foreach ( array_chunk( $group_ids, 500 ) as $chunk ) {
+			$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $placeholders is a generated %d list bound to $chunk.
+			$rows = $this->wpdb->get_results(
+				$this->wpdb->prepare(
+					"SELECT l.object_id, g.type FROM %i l
+					INNER JOIN %i g ON l.group_id = g.id
+					WHERE l.group_id IN ({$placeholders})",
+					array_merge( [ $this->links_table(), $this->groups_table() ], $chunk )
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			foreach ( (array) $rows as $link ) {
+				$this->cache->flush_object( (int) $link->object_id, (string) $link->type );
+				unset( self::$find_cache[ self::find_cache_key( (string) $link->type, (int) $link->object_id ) ] );
+				$dirty_types[ (string) $link->type ] = true;
+			}
+		}
+
+		foreach ( array_keys( $dirty_types ) as $type_value ) {
+			unset( self::$eager_link_map_memo[ self::eager_memo_key( $type_value ) ] );
+			delete_option( 'perflocale_eager_links_' . $type_value );
+			wp_cache_delete( 'perflocale_eager_links_' . $type_value, 'options' );
+		}
 	}
 }

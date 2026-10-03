@@ -105,7 +105,7 @@ final class PoSync {
 	public static function export_to_file( string $path, string $lang_slug, string $domain = '', array &$report = [] ) {
 		self::load_pomo();
 
-		// Assigned on EVERY exit path, including the two failures below, so a
+		// Assigned on EVERY exit path, including every failure below, so a
 		// caller can read it without checking the return value first.
 		$report = [
 			'emitted'        => 0,
@@ -204,6 +204,16 @@ final class PoSync {
 				)
 			);
 			// phpcs:enable
+
+			// A failed page is not the last page, but wpdb::get_results() returns
+			// [] for both, so the loop would end here and write a truncated file
+			// as a success. wpdb::query() clears last_error before every
+			// statement, so a non-empty value belongs to this SELECT. It is read
+			// before any other query runs, because the duplicate count below
+			// clears it, and before the write, so a file already at $path stays.
+			if ( '' !== (string) $wpdb->last_error ) {
+				return false;
+			}
 
 			foreach ( $rows as $row ) {
 				$cursor = (int) $row->id;
@@ -311,6 +321,25 @@ final class PoSync {
 		}
 
 		return strlen( $out );
+	}
+
+	/**
+	 * Write a database error to the debug log (only when WP_DEBUG_LOG is on).
+	 *
+	 * The import result, which the admin notice and the REST answer show, carries
+	 * a short message instead: the server's text can name tables and row values.
+	 *
+	 * @param string $where What the import was doing.
+	 * @param string $error The database error.
+	 * @return void
+	 */
+	private static function log_db_error( string $where, string $error ): void {
+		if ( $error === '' || ! defined( 'WP_DEBUG_LOG' ) || ! WP_DEBUG_LOG ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
+		error_log( '[PerfLocale] PO import: database error while ' . $where . ' - ' . $error );
 	}
 
 	/**
@@ -468,48 +497,76 @@ final class PoSync {
 			return $result;
 		}
 
-		// import_from_file() returns TRUE for a file it could not read a single
-		// usable entry out of, and in replace mode the code below then deletes
-		// every string translation and every translated link for the target
-		// language, commits, and imports nothing: total data loss from a file the
-		// operator was told was fine.
-		//
-		// Three distinct triggers, and an earlier version of this guard caught
-		// only the first:
-		//
-		//  1. A file that parses to zero entries. A header-only PO — what Poedit
-		//     writes before anything is translated — does this.
-		//  2. A file that is not valid UTF-8. Core's PO::unpoify runs a /u regex,
-		//     so a Latin-1 or Windows-1252 save loses the entries that contain a
-		//     high byte while the method still reports success.
-		//  3. A file whose entries all carry an EMPTY translation, which is what
-		//     an ASCII msgid with a Latin-1 msgstr produces: one entry, nothing
-		//     in it. Counting entries was not enough.
-		//
-		// So: reject the payload outright unless it is valid UTF-8, and then
-		// require at least one entry that would actually write something.
+		/*
+		 * import_from_file() returns TRUE for a file it could not read a single
+		 * usable entry out of, and in replace mode the code below then deletes
+		 * every string translation and every translated link for the target
+		 * language, commits, and imports nothing: total data loss from a file the
+		 * operator was told was fine.
+		 *
+		 * Four distinct triggers:
+		 *
+		 *  1. A file that parses to zero entries. A header-only PO — what Poedit
+		 *     writes before anything is translated — does this.
+		 *  2. A file that is not valid UTF-8. Core's PO::unpoify runs a /u regex,
+		 *     so a Latin-1 or Windows-1252 save loses the entries that contain a
+		 *     high byte while the method still reports success.
+		 *  3. A file whose entries all carry an EMPTY translation, which is what
+		 *     an ASCII msgid with a Latin-1 msgstr produces: one entry, nothing
+		 *     in it. Counting entries was not enough.
+		 *  4. A file whose only translations sit where the entry loop never
+		 *     writes from: on entries marked fuzzy, or in a plural form with no
+		 *     row of its own (msgstr[2+], or msgstr[1] under an empty
+		 *     msgid_plural).
+		 *
+		 * So: reject the payload outright unless it is valid UTF-8, and then
+		 * require at least one entry that would actually write something.
+		 */
 		if ( ! self::is_valid_utf8( (string) file_get_contents( $path ) ) ) {
 			$result['errors'][] = __( 'The PO file is not valid UTF-8. Re-save it as UTF-8 and try again — importing it as-is would discard the entries it cannot read.', 'perflocale' );
 			return $result;
 		}
 
+		// "Would write" is the entry loop's own test, in its order: a translation
+		// on row 0 or 1 (extra plural forms ride on row 1 and never write alone),
+		// then no fuzzy flag. Any looser test passes trigger 4 through to a
+		// replace that deletes and writes nothing.
 		$has_entries = false;
+		$saw_fuzzy   = false;
 
 		foreach ( (array) $po->entries as $po_entry ) {
 			if ( ! $po_entry instanceof \Translation_Entry || (string) $po_entry->singular === '' ) {
 				continue;
 			}
 
-			foreach ( (array) $po_entry->translations as $po_translation ) {
-				if ( (string) $po_translation !== '' ) {
-					$has_entries = true;
-					break 2;
-				}
+			$po_forms = self::entry_to_forms(
+				$po_entry,
+				(string) $po_entry->singular,
+				$po_entry->context !== null ? (string) $po_entry->context : '',
+				self::extract_domain( (string) ( $po_entry->extracted_comments ?? '' ) )
+			);
+
+			if ( ! self::forms_have_translation( $po_forms ) ) {
+				continue;
 			}
+
+			if ( in_array( 'fuzzy', (array) $po_entry->flags, true ) ) {
+				$saw_fuzzy = true;
+				continue;
+			}
+
+			$has_entries = true;
+			break;
 		}
 
+		// A file that reaches the fuzzy message can also hold translations that
+		// sit only in extra plural forms (msgstr[2+], or msgstr[1] under an
+		// empty msgid_plural), which never write on their own, so the message
+		// names both kinds.
 		if ( ! $has_entries ) {
-			$result['errors'][] = __( 'The PO file contains no translatable entries. If it was exported from another tool, check that it is saved as UTF-8.', 'perflocale' );
+			$result['errors'][] = $saw_fuzzy
+				? __( 'Nothing was imported: every translation in the PO file is either marked fuzzy (needs review) or an extra plural form that is not imported on its own, and fuzzy translations are never imported. Review the fuzzy translations in your translation tool, then import again.', 'perflocale' )
+				: __( 'The PO file contains no translatable entries. If it was exported from another tool, check that it is saved as UTF-8.', 'perflocale' );
 			return $result;
 		}
 
@@ -554,11 +611,17 @@ final class PoSync {
 			// pre-import state instead of leaving a language's translations
 			// deleted-but-only-partially-restored. InnoDB auto-rolls-back an
 			// open transaction when the connection tears down on a fatal.
+			// Checked against false only: the statement returns 0 on success.
+			// Without the transaction, the DELETEs below would commit on their own.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
-			$wpdb->query( 'START TRANSACTION' );
+			if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
+				$result['errors'][] = __( 'Replace import did not start: the database could not open a transaction, so nothing was changed.', 'perflocale' );
+
+				return $result;
+			}
 
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-			$wpdb->query(
+			$wiped = false !== $wpdb->query(
 				$wpdb->prepare(
 					'DELETE FROM %i WHERE language_id = %d',
 					$st_table,
@@ -574,7 +637,9 @@ final class PoSync {
 			// replace.
 			$groups_table_r = Schema::sanitize_table( Schema::table( 'translation_groups' ) );
 			$links_table_r  = Schema::sanitize_table( Schema::table( 'translation_links' ) );
-			$wpdb->query(
+
+			// Runs only when the first DELETE succeeded.
+			$wiped = $wiped && false !== $wpdb->query(
 				$wpdb->prepare(
 					"DELETE l FROM %i l
 					 INNER JOIN %i g ON g.id = l.group_id AND g.type = 'string'
@@ -585,6 +650,23 @@ final class PoSync {
 				)
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			// Zero deleted rows is a valid wipe (a language with nothing stored
+			// yet); only false is a failure. Stop here rather than import on top:
+			// after a deadlock the server has already ended the transaction, and
+			// every later statement would commit on its own. Nothing was read
+			// inside the transaction, so there is no cache to flush.
+			if ( ! $wiped ) {
+				// Read before the ROLLBACK, which clears it.
+				self::log_db_error( 'removing the existing translations', (string) $wpdb->last_error );
+
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
+				$wpdb->query( 'ROLLBACK' );
+
+				$result['errors'][] = __( 'Replace import rolled back: the database could not remove the existing translations, so nothing was changed.', 'perflocale' );
+
+				return $result;
+			}
 		}
 
 		// A replace has already DELETEd every translation for this language a
@@ -936,11 +1018,11 @@ final class PoSync {
 						}
 					} else {
 						++$result['skipped'];
+						self::log_db_error( 'saving a translation', (string) $wpdb->last_error );
 						$result['errors'][] = sprintf(
-							/* translators: 1: msgid, 2: DB error */
-							__( '%1$s: %2$s', 'perflocale' ),
-							mb_substr( $singular, 0, 60 ),
-							(string) $wpdb->last_error
+							/* translators: %s: the source string (msgid), shortened to 60 characters */
+							__( '%s: the database refused this translation.', 'perflocale' ),
+							mb_substr( $singular, 0, 60 )
 						);
 
 						// In replace mode the old value for this string is already
@@ -982,9 +1064,35 @@ final class PoSync {
 			throw $e;
 		}
 
-		if ( $replace ) {
+		// A refused COMMIT usually means the server has already discarded the
+		// transaction; the ROLLBACK covers one that is still open. Checked
+		// against false only: the statement returns 0 on success. The message
+		// does not claim nothing changed, because a connection lost during the
+		// COMMIT can hide one that landed; re-running a replace is safe.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
+		if ( $replace && false === $wpdb->query( 'COMMIT' ) ) {
+			// Read before the ROLLBACK, which clears it.
+			self::log_db_error( 'committing a replace import', (string) $wpdb->last_error );
+
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
-			$wpdb->query( 'COMMIT' );
+			$wpdb->query( 'ROLLBACK' );
+
+			// First, so the admin notice, which shows three messages, cannot
+			// hide it behind per-entry ones.
+			array_unshift(
+				$result['errors'],
+				__( 'Replace import not confirmed: the database reported an error while saving it. Check this language\'s translations and run the import again.', 'perflocale' )
+			);
+			$result['imported']  = 0;
+			$result['inserted']  = 0;
+			$result['updated']   = 0;
+			$result['unchanged'] = 0;
+
+			// Same reason as the rolled-back upsert above: the aborted pass
+			// deleted and re-read rows.
+			self::flush_language_caches( $lang );
+
+			return $result;
 		}
 
 		// Make the import visible immediately on BOTH serving paths (same

@@ -454,11 +454,14 @@ final class Assets {
 							'confirmFiltered' => __( 'MT-translate %1$d filtered strings into %2$s? This may take a while.', 'perflocale' ),
 							/* translators: 1: total string count, 2: comma-separated language names */
 							'confirmAll'      => __( 'MT-translate every string in the table (%1$d total) into %2$s? This will dispatch a background job and may incur provider costs.', 'perflocale' ),
-							'maxExceeded'     => __( 'Selection exceeds the per-dispatch cap (5,000 strings × languages). Narrow the filter or split the run.', 'perflocale' ),
+							'maxExceeded'     => __( 'Selection exceeds the per-dispatch cap (5,000 strings per run). Narrow the filter or split the run.', 'perflocale' ),
 							'queued'          => __( 'Bulk MT job queued. Redirecting to Jobs page…', 'perflocale' ),
 							/* translators: 1: translated count, 2: skipped count, 3: failed count */
 							'syncDone'        => __( 'Done. %1$d translated, %2$d skipped, %3$d failed.', 'perflocale' ),
 							'syncDoneReload'  => __( 'Reload to see the new translations in the table.', 'perflocale' ),
+							'firstError'      => __( 'First error:', 'perflocale' ),
+							/* translators: %1$d: number of strings the run did not reach because of the per-run cap. */
+							'cappedLeft'      => __( 'Still missing a translation: %1$d. Run it again to continue.', 'perflocale' ),
 							'dirtyStay'       => __( 'Job started — your unsaved edits were kept; save them, then check the Jobs page.', 'perflocale' ),
 							'genericError'    => __( 'Something went wrong while dispatching the MT job.', 'perflocale' ),
 							'dispatching'     => __( 'Dispatching…', 'perflocale' ),

@@ -335,7 +335,7 @@ final class EditorSidebar {
 				'postSourceLang' => $post_source_lang,
 				'mtReady'        => $mt_ready,
 				'mtProvider'     => $mt_provider,
-				'mtSettingsUrl'  => admin_url( 'admin.php?page=perflocale-settings&tab=translation' ),
+				'mtSettingsUrl'  => $mt_ready ? admin_url( 'admin.php?page=perflocale-settings&tab=translation' ) : $this->mt_setup_url( admin_url( 'admin.php?page=perflocale-settings&tab=translation' ) ),
 				'isSibling'      => $is_sibling,
 				'sourceLang'     => $default_lang_slug,
 				'sourcePostId'   => $source_post_id_for_sibling,
@@ -395,5 +395,26 @@ final class EditorSidebar {
 		// the editor's Translate buttons aligned with what a click can
 		// actually do at request time. See TranslationService docblock.
 		return $service->is_active_provider_ready();
+	}
+
+	/**
+	 * Setup link for a site whose selected provider is not ready.
+	 *
+	 * @param string $fallback PerfLocale settings URL.
+	 * @return string
+	 */
+	private function mt_setup_url( string $fallback ): string {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'cache' ) ) {
+			return $fallback;
+		}
+
+		$service = new \PerfLocale\MachineTranslation\TranslationService(
+			$plugin->get( 'settings' ),
+			$plugin->get( 'cache' )
+		);
+
+		return $service->setup_url( $fallback );
 	}
 }

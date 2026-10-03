@@ -20,20 +20,21 @@ if ( ! defined( 'ABSPATH' ) ) {
  * every innerBlock - aside during machine translation and restore it verbatim
  * afterwards. Nothing inside it reaches the provider on this path.
  *
- * "On this path" is the whole-post pipeline only. The editor's block-level
- * REST routes do not run through these filters and apply their own rules: the
- * "translate this section / entire post" batches walk into a marked CONTAINER
- * on purpose - marking a wrapper there means "keep the wrapper", not "keep
- * everything under it", and only a marked LEAF is left out of the batch -
- * while "Fill in from <lang> source" reads the block at the same position in
- * the SOURCE post and translates it.
+ * "On this path" is the whole-post pipeline. The editor's block-level REST
+ * routes do not run through these filters but follow the same rule: the
+ * "translate this section / entire post" batches leave a marked block and
+ * everything inside it out (block-toolbar.js collectTranslatableBlocks()), and
+ * "Fill in from <lang> source" returns a source block that is marked, or sits
+ * inside a marked block, verbatim with no provider call
+ * ({@see BlockAttributeSource::path_is_skip_marked()}).
  *
  * Works across every MT callsite that flows through `TranslationService::translate_post`
  * because it hooks the existing `perflocale/mt/pre_translate` +
- * `perflocale/mt/post_translate` filters. The one thing that call site does for
- * this class is call {@see self::discard_stash()} in its `finally`, so a
- * provider failure between the two filters cannot leave the held-aside content
- * behind.
+ * `perflocale/mt/post_translate` filters. That call site does two things for
+ * this class: it asks {@see self::consume_kept_source()} whether the restore
+ * had to keep the source content (so the result can say so), and it calls
+ * {@see self::discard_stash()} in its `finally`, so a provider failure between
+ * the two filters cannot leave the held-aside content behind.
  */
 final class BlockSkipFilter {
 
@@ -68,6 +69,16 @@ final class BlockSkipFilter {
 	 * @var array<string, array<int, array<string, string>>>
 	 */
 	private static array $stash = [];
+
+	/**
+	 * Runs whose restore found a placeholder missing and put the source
+	 * content back, keyed like {@see self::$stash}. Read and cleared by
+	 * {@see self::consume_kept_source()}; also cleared by
+	 * {@see self::discard_stash()}.
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $kept_source = [];
 
 	/**
 	 * Register hooks.
@@ -184,6 +195,10 @@ final class BlockSkipFilter {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent content-loss point.
 				error_log( 'PerfLocale BlockSkipFilter: the machine-translation provider did not return every "do not translate" placeholder; keeping the source content for this post.' );
 
+				// Reported to the caller through consume_kept_source(), so the
+				// run is not presented as a plain success.
+				self::$kept_source[ $key ] = true;
+
 				$translated[1] = (string) $original[1];
 
 				return $translated;
@@ -217,11 +232,36 @@ final class BlockSkipFilter {
 	 * @return void
 	 */
 	public static function discard_stash( array $texts ): void {
-		if ( self::$stash === [] ) {
+		if ( self::$stash === [] && self::$kept_source === [] ) {
 			return;
 		}
 
-		unset( self::$stash[ self::stash_key( $texts ) ] );
+		$key = self::stash_key( $texts );
+
+		unset( self::$stash[ $key ], self::$kept_source[ $key ] );
+	}
+
+	/**
+	 * Whether the restore for this run had to keep the source content because
+	 * the provider lost a "do not translate" placeholder. Reading clears it.
+	 *
+	 * Keyed like {@see self::discard_stash()}, from the raw
+	 * [title, content, excerpt] triple the run started from.
+	 *
+	 * @param array<int, string> $texts Raw [title, content, excerpt] triple the run started from.
+	 * @return bool
+	 */
+	public static function consume_kept_source( array $texts ): bool {
+		if ( self::$kept_source === [] ) {
+			return false;
+		}
+
+		$key  = self::stash_key( $texts );
+		$kept = isset( self::$kept_source[ $key ] );
+
+		unset( self::$kept_source[ $key ] );
+
+		return $kept;
 	}
 
 	/**

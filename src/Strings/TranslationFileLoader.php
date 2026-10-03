@@ -46,6 +46,15 @@ final class TranslationFileLoader {
 	private bool $loaded = false;
 
 	/**
+	 * Whether a loaded domain is served through the gettext filters. Option
+	 * strings (OptionStrings::DOMAIN) are read through get_translation()
+	 * directly, so a locale whose only file is theirs needs no gettext filter.
+	 *
+	 * @var bool
+	 */
+	private bool $gettext_domains = false;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param LanguageRouter $router Language router.
@@ -87,13 +96,14 @@ final class TranslationFileLoader {
 			return;
 		}
 
-		// Load translations FIRST - if there's nothing to serve, skip the
-		// gettext filter registration entirely. gettext fires on every
-		// `__()` call (easily thousands per page), so avoiding the 4
-		// callbacks when the user has no translation files is a real win.
+		// Load translations FIRST - if there's nothing gettext can serve,
+		// skip the gettext filter registration entirely. gettext fires on
+		// every `__()` call (easily thousands per page), so avoiding the 4
+		// callbacks when the user has no translation files (or only option
+		// strings, read without gettext) is a real win.
 		$this->load_translations();
 
-		if ( empty( $this->translations ) ) {
+		if ( empty( $this->translations ) || ! $this->gettext_domains ) {
 			return;
 		}
 
@@ -390,6 +400,18 @@ final class TranslationFileLoader {
 					$this->loaded       = true;
 					$this->translations = $data['map'];
 
+					// The manifest lists one per-domain file for every domain
+					// the bundle holds, so it names the domains without a walk
+					// over the map.
+					foreach ( $manifest as $name ) {
+						if ( is_string( $name ) && $name !== $combined_name && str_ends_with( $name, $suffix )
+							&& self::is_gettext_domain( substr( $name, 0, -strlen( $suffix ) ) )
+						) {
+							$this->gettext_domains = true;
+							break;
+						}
+					}
+
 					return;
 				}
 			}
@@ -472,6 +494,8 @@ final class TranslationFileLoader {
 				continue;
 			}
 
+			$gettext_domain = self::is_gettext_domain( $domain );
+
 			foreach ( $data['messages'] as $original => $translated ) {
 				if ( ! is_string( $translated ) || $translated === '' ) {
 					continue;
@@ -489,8 +513,22 @@ final class TranslationFileLoader {
 				}
 
 				$this->translations[ self::map_key( $domain, $context, strval( $original ) ) ] = $translated;
+
+				if ( $gettext_domain ) {
+					$this->gettext_domains = true;
+				}
 			}
 		}
+	}
+
+	/**
+	 * Whether a domain's strings are served through the gettext filters.
+	 *
+	 * @param string $domain Text domain.
+	 * @return bool
+	 */
+	private static function is_gettext_domain( string $domain ): bool {
+		return $domain !== \PerfLocale\Frontend\OptionStrings::DOMAIN;
 	}
 
 	/**
@@ -515,8 +553,9 @@ final class TranslationFileLoader {
 	 * @return void
 	 */
 	public function reset_for_blog_switch(): void {
-		$this->translations = [];
-		$this->loaded       = false;
+		$this->translations    = [];
+		$this->loaded          = false;
+		$this->gettext_domains = false;
 	}
 
 }

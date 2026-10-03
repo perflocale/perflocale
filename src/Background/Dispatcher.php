@@ -53,7 +53,7 @@ final class Dispatcher {
 	 *
 	 * @param AbstractJob          $job  Job descriptor.
 	 * @param array<string, mixed> $args Worker args.
-	 * @return array{mode: string, job_id?: string, duplicate?: bool, result?: array<string,mixed>, error?: string}
+	 * @return array{mode: string, job_id?: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string, result?: array<string,mixed>, error?: string}
 	 */
 	public static function dispatch( AbstractJob $job, array $args ): array {
 		// Capability check on the dispatch side. The worker hook re-runs
@@ -119,7 +119,12 @@ final class Dispatcher {
 	 *
 	 * @param AbstractJob          $job  Job descriptor.
 	 * @param array<string, mixed> $args Worker args.
-	 * @return array{mode: string, job_id: string, duplicate?: bool}|array{mode: string, error: string}
+	 * An identical job still queued or running on this blog is returned
+	 * instead (`duplicate`, with its `status` and `updated_at`), unless its
+	 * worker is gone ({@see JobState::fail_if_worker_gone()}): then that job
+	 * is marked failed and the new one's result names it in `replaced`.
+	 *
+	 * @return array{mode: string, job_id: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string}|array{mode: string, error: string}
 	 */
 	/**
 	 * Maximum serialised size of `$args` accepted by an async dispatch.
@@ -200,47 +205,72 @@ final class Dispatcher {
 		 * @param string      $type    Job type slug.
 		 * @param array       $args    Worker args.
 		 */
-		if ( (bool) apply_filters( 'perflocale/jobs/deduplicate_admission', true, $job->get_type(), $args ) ) {
-			$in_flight = JobState::find_active_duplicate( $job->get_type(), $args );
+		$dedupe = (bool) apply_filters( 'perflocale/jobs/deduplicate_admission', true, $job->get_type(), $args );
 
-			if ( $in_flight !== null ) {
-				JobState::append_log(
-					$in_flight,
-					__( 'An identical dispatch arrived while this job was still in flight; it was folded into this job instead of starting a second one.', 'perflocale' )
-				);
+		// Check-then-insert under a short admission lock, so two identical
+		// dispatches in the same second (a double click, two administrators)
+		// cannot both miss each other's row.
+		$admission = $dedupe ? self::acquire_admission( $job->get_type(), $args ) : '';
+		$replaced  = '';
 
-				return [
-					'mode'      => 'async',
-					'job_id'    => $in_flight,
-					'duplicate' => true,
-				];
+		try {
+			if ( $dedupe ) {
+				$in_flight = JobState::find_active_duplicate( $job->get_type(), $args );
+
+				// A twin whose worker was killed is failed, not joined: joining it
+				// would report "queued" for work nothing will ever run.
+				if ( $in_flight !== null && JobState::fail_if_worker_gone( $in_flight ) ) {
+					$replaced  = $in_flight;
+					$in_flight = null;
+				}
+
+				if ( $in_flight !== null ) {
+					JobState::append_log(
+						$in_flight,
+						__( 'An identical dispatch arrived while this job was still in flight; it was folded into this job instead of starting a second one.', 'perflocale' )
+					);
+
+					$twin = JobState::get( $in_flight );
+
+					return [
+						'mode'       => 'async',
+						'job_id'     => $in_flight,
+						'duplicate'  => true,
+						'status'     => (string) ( $twin['status'] ?? 'queued' ),
+						'updated_at' => (int) ( $twin['updated_at'] ?? 0 ),
+					];
+				}
 			}
-		}
 
-		$runner = JobRunnerFactory::pick();
-		$hook   = self::worker_hook( $job->get_type() );
+			$runner = JobRunnerFactory::pick();
+			$hook   = self::worker_hook( $job->get_type() );
 
-		// JobState::create uses an atomic INSERT IGNORE against the jobs
-		// table's UNIQUE uuid key and returns
-		// false on the astronomically rare UUID collision. Retry up to
-		// three times with fresh UUIDs before giving up — collisions
-		// indicate either a broken entropy source or someone re-creating
-		// the same job_id manually, both of which should surface as a
-		// hard error rather than silently re-using an unrelated row.
-		$job_id  = '';
-		$created = false;
-		for ( $attempt = 0; $attempt < 3; $attempt++ ) {
-			$job_id = wp_generate_uuid4();
-			if ( JobState::create(
-				$job_id,
-				$job->get_type(),
-				$args,
-				(int) get_current_user_id(),
-				$hook,
-				$runner->get_engine_name()
-			) ) {
-				$created = true;
-				break;
+			// JobState::create uses an atomic INSERT IGNORE against the jobs
+			// table's UNIQUE uuid key and returns
+			// false on the astronomically rare UUID collision. Retry up to
+			// three times with fresh UUIDs before giving up — collisions
+			// indicate either a broken entropy source or someone re-creating
+			// the same job_id manually, both of which should surface as a
+			// hard error rather than silently re-using an unrelated row.
+			$job_id  = '';
+			$created = false;
+			for ( $attempt = 0; $attempt < 3; $attempt++ ) {
+				$job_id = wp_generate_uuid4();
+				if ( JobState::create(
+					$job_id,
+					$job->get_type(),
+					$args,
+					(int) get_current_user_id(),
+					$hook,
+					$runner->get_engine_name()
+				) ) {
+					$created = true;
+					break;
+				}
+			}
+		} finally {
+			if ( $admission !== '' ) {
+				JobLock::release_type( $admission );
 			}
 		}
 
@@ -303,10 +333,53 @@ final class Dispatcher {
 		 */
 		do_action( 'perflocale/jobs/enqueued', $job_id, $job->get_type(), $runner->get_engine_name(), $args );
 
+		if ( $replaced !== '' ) {
+			JobState::append_log(
+				$job_id,
+				sprintf(
+					/* translators: %s: id of the earlier job */
+					__( 'An identical job (%s) had stopped without finishing; it was marked failed and this job replaces it.', 'perflocale' ),
+					$replaced
+				)
+			);
+
+			return [
+				'mode'     => 'async',
+				'job_id'   => $job_id,
+				'replaced' => $replaced,
+			];
+		}
+
 		return [
 			'mode'   => 'async',
 			'job_id' => $job_id,
 		];
+	}
+
+	/**
+	 * Take the short lock that makes admission of one operation atomic.
+	 *
+	 * Keyed by type, args and blog, so only identical dispatches wait on
+	 * each other. Waits up to five seconds for a holder to finish; a holder
+	 * that died frees it after 30 seconds. Without the lock the dispatch
+	 * goes ahead unserialised.
+	 *
+	 * @param string       $type Job type slug.
+	 * @param array<mixed> $args Worker args.
+	 * @return string The JobLock type key to release, or '' when not taken.
+	 */
+	private static function acquire_admission( string $type, array $args ): string {
+		$key = 'admit_' . md5( $type . '|' . (int) get_current_blog_id() . '|' . (string) wp_json_encode( $args ) );
+
+		for ( $attempt = 0; $attempt < 25; $attempt++ ) {
+			if ( JobLock::acquire_type( $key, 30 ) ) {
+				return $key;
+			}
+
+			usleep( 200000 );
+		}
+
+		return '';
 	}
 
 	/**

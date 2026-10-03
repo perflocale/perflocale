@@ -34,6 +34,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * perflocale()->switcher( $args ) - Language switcher HTML.
  * perflocale()->translations( $post_id ) - [slug => post_id] map.
  * perflocale()->is_language( $slug ) - Check if current language matches.
+ * perflocale()->is_addon_active( $id ) - Did the addon boot in this request?
  *
  * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
  */
@@ -233,8 +234,9 @@ final class Helper {
 	 * Imposing a language fires `perflocale/language/overridden`, and these
 	 * rebuild on it: the string services (so `__()` resolves in the imposed
 	 * language), the site title and tagline, synced-pattern and navigation
-	 * references, UrlConverter's per-language memos, and this class's own
-	 * language memo.
+	 * references, UrlConverter's per-language memos, ACF's formatted field
+	 * values (so reference fields resolve the imposed language's siblings),
+	 * and this class's own language memo.
 	 *
 	 * ⚠️ Two things deliberately do NOT change, and callers should not expect
 	 * them to:
@@ -865,6 +867,36 @@ final class Helper {
 	}
 
 	/**
+	 * Whether an addon booted in this request.
+	 *
+	 * False before the addon registry has booted (init:0), and for an addon
+	 * that is not installed, disabled, quarantined, incompatible, or turned
+	 * off for this request by the `perflocale/addon/enabled` filter.
+	 *
+	 *   perflocale()->is_addon_active( 'woocommerce' );   // bool
+	 *
+	 * @param string $addon_id Addon ID.
+	 * @return bool
+	 */
+	public function is_addon_active( string $addon_id ): bool {
+		if ( $addon_id === '' ) {
+			return false;
+		}
+
+		try {
+			$plugin = Plugin::get_instance();
+			if ( ! $plugin->has( Plugin::SERVICE_ADDONS ) ) {
+				return false;
+			}
+			$registry = $plugin->addon_registry();
+		} catch ( \Throwable $e ) {
+			return false;
+		}
+
+		return $registry->is_booted( $addon_id );
+	}
+
+	/**
 	 * Locale-aware number formatting. Uses PHP's intl NumberFormatter
 	 * when available so output matches the user's regional conventions
 	 * (1,234.56 in en-US, 1.234,56 in de-DE, 1 234,56 in fr-FR, etc.).
@@ -1422,6 +1454,27 @@ final class Helper {
 	}
 
 	/**
+	 * One line naming post counts by post type, e.g. "Products: 20, Posts: 4".
+	 *
+	 * Uses each registered type's plural label; an unregistered type falls back
+	 * to its slug. Plain text: escape at the point of output.
+	 *
+	 * @param array<string, int> $counts Post type => count.
+	 * @return string
+	 */
+	public static function post_type_counts_summary( array $counts ): string {
+		$parts = [];
+
+		foreach ( $counts as $type => $count ) {
+			$object  = get_post_type_object( (string) $type );
+			$label   = ( $object instanceof \WP_Post_Type && is_string( $object->labels->name ?? null ) ) ? $object->labels->name : (string) $type;
+			$parts[] = sprintf( '%s: %s', $label, number_format_i18n( (int) $count ) );
+		}
+
+		return implode( ', ', $parts );
+	}
+
+	/**
 	 * Shorten an already-sanitised slug to `$length` characters without ever
 	 * cutting inside a percent-escape.
 	 *
@@ -1811,6 +1864,271 @@ final class Helper {
 		}
 
 		return true;
+	}
+
+	/**
+	 * True when an outbound request may connect to `$ip`.
+	 *
+	 * The address check of the webhook and machine-translation URL guards
+	 * ({@see \PerfLocale\Api\WebhookController::is_url_safe()},
+	 * {@see \PerfLocale\MachineTranslation\AbstractProvider::validate_url()}).
+	 * It accepts only what {@see is_public_ipv4()} accepts, and also refuses the
+	 * IANA special-purpose blocks that are not globally reachable:
+	 *
+	 * - IPv4: the shared address space 100.64.0.0/10 (carrier-grade NAT, also
+	 *   used by Tailscale), 192.0.0.0/24, 192.88.99.0/24, the benchmarking block
+	 *   198.18.0.0/15, the documentation blocks 192.0.2.0/24, 198.51.100.0/24
+	 *   and 203.0.113.0/24, and multicast 224.0.0.0/4. With is_public_ipv4()
+	 *   this is the set current WordPress core refuses in
+	 *   wp_http_validate_url(), so the verdict does not depend on the core
+	 *   version.
+	 * - IPv6 forms that carry an IPv4 address: NAT64 64:ff9b::/96 and 6to4
+	 *   2002::/16 are judged by the IPv4 address they carry, so a DNS64 or 6to4
+	 *   host with a public IPv4 address passes.
+	 * - IPv6 blocks refused outright: IPv4-compatible ::/96, IPv4-translated
+	 *   ::ffff:0:0:0/96, local-use NAT64 64:ff9b:1::/48, Teredo 2001::/32,
+	 *   ORCHID 2001:10::/28 and 2001:20::/28, documentation 2001:db8::/32 and
+	 *   3fff::/20, discard-only 100::/64, site-local fec0::/10 and multicast
+	 *   ff00::/8.
+	 *
+	 * IPv4-mapped addresses (::ffff:0:0/96) are refused, as in is_public_ipv4();
+	 * the callers unwrap them to the IPv4 address first. A machine-translation
+	 * endpoint on an internal network is reached through the
+	 * `perflocale/mt/trusted_hosts` filter, not through this check.
+	 *
+	 * @param string $ip Candidate address.
+	 */
+	public static function is_public_outbound_address( string $ip ): bool {
+		if ( ! self::is_public_ipv4( $ip ) ) {
+			return false;
+		}
+
+		$bin = inet_pton( $ip );
+
+		if ( $bin === false ) {
+			return false;
+		}
+
+		if ( strlen( $bin ) === 4 ) {
+			$a = ord( $bin[0] );
+			$b = ord( $bin[1] );
+			$c = ord( $bin[2] );
+
+			// Shared address space (carrier-grade NAT), 100.64.0.0/10.
+			if ( $a === 100 && ( $b & 0xC0 ) === 64 ) {
+				return false;
+			}
+
+			// IETF protocol assignments 192.0.0.0/24, documentation
+			// 192.0.2.0/24 and the 6to4 relay anycast block 192.88.99.0/24.
+			if ( $a === 192 && ( ( $b === 0 && ( $c === 0 || $c === 2 ) ) || ( $b === 88 && $c === 99 ) ) ) {
+				return false;
+			}
+
+			// Benchmarking 198.18.0.0/15 and documentation 198.51.100.0/24.
+			if ( $a === 198 && ( ( $b & 0xFE ) === 18 || ( $b === 51 && $c === 100 ) ) ) {
+				return false;
+			}
+
+			// Documentation 203.0.113.0/24.
+			if ( $a === 203 && $b === 0 && $c === 113 ) {
+				return false;
+			}
+
+			// Multicast 224.0.0.0/4.
+			if ( ( $a & 0xF0 ) === 224 ) {
+				return false;
+			}
+
+			return true;
+		}
+
+		// NAT64 well-known prefix 64:ff9b::/96: the IPv4 address is in the
+		// last four bytes.
+		if ( substr( $bin, 0, 12 ) === "\x00\x64\xFF\x9B" . str_repeat( "\x00", 8 ) ) {
+			$embedded = inet_ntop( substr( $bin, 12, 4 ) );
+
+			return false !== $embedded && self::is_public_outbound_address( $embedded );
+		}
+
+		// 6to4 2002::/16: the IPv4 address is in bytes 2 to 5.
+		if ( substr( $bin, 0, 2 ) === "\x20\x02" ) {
+			$embedded = inet_ntop( substr( $bin, 2, 4 ) );
+
+			return false !== $embedded && self::is_public_outbound_address( $embedded );
+		}
+
+		// IPv4-compatible ::/96 (which also holds :: and ::1).
+		if ( substr( $bin, 0, 12 ) === str_repeat( "\x00", 12 ) ) {
+			return false;
+		}
+
+		// IPv4-translated ::ffff:0:0:0/96.
+		if ( substr( $bin, 0, 12 ) === str_repeat( "\x00", 8 ) . "\xFF\xFF\x00\x00" ) {
+			return false;
+		}
+
+		// Local-use NAT64 64:ff9b:1::/48.
+		if ( substr( $bin, 0, 6 ) === "\x00\x64\xFF\x9B\x00\x01" ) {
+			return false;
+		}
+
+		// Teredo 2001::/32, ORCHID 2001:10::/28, ORCHIDv2 2001:20::/28 and
+		// documentation 2001:db8::/32.
+		if ( substr( $bin, 0, 2 ) === "\x20\x01" ) {
+			$third  = ord( $bin[2] );
+			$fourth = ord( $bin[3] );
+
+			if ( $third === 0x00 && ( $fourth === 0x00 || ( $fourth & 0xF0 ) === 0x10 || ( $fourth & 0xF0 ) === 0x20 ) ) {
+				return false;
+			}
+
+			if ( $third === 0x0D && $fourth === 0xB8 ) {
+				return false;
+			}
+		}
+
+		// Documentation 3fff::/20.
+		if ( substr( $bin, 0, 2 ) === "\x3F\xFF" && ( ord( $bin[2] ) & 0xF0 ) === 0x00 ) {
+			return false;
+		}
+
+		// Discard-only 100::/64.
+		if ( substr( $bin, 0, 8 ) === "\x01\x00" . str_repeat( "\x00", 6 ) ) {
+			return false;
+		}
+
+		$first = ord( $bin[0] );
+
+		// Site-local fec0::/10.
+		if ( $first === 0xFE && ( ord( $bin[1] ) & 0xC0 ) === 0xC0 ) {
+			return false;
+		}
+
+		// Multicast ff00::/8.
+		if ( $first === 0xFF ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Run wp_remote_request() with the connection pinned to addresses the
+	 * caller has already judged.
+	 *
+	 * The transport looks a host name up again when it connects, and that
+	 * answer can differ from the one the caller judged. The pin makes it use
+	 * `$ip`, and the addresses in `$more`, instead:
+	 *
+	 * - cURL: a CURLOPT_RESOLVE entry "host:port:ip[,more]", so cURL connects
+	 *   to those addresses without a lookup of its own and chooses among them
+	 *   as it would among the answers of its own lookup (a dual-stack host
+	 *   stays reachable over IPv6). The URL, the Host header, SNI and the
+	 *   certificate check keep the host name. cURL reads more than one
+	 *   address per entry from 7.59.0 on; an older cURL ignores such an
+	 *   entry, and the request then connects as it would unpinned.
+	 * - fsockopen (a host without cURL), plain http: the socket is opened to
+	 *   `$ip`. For https a rewritten socket would break SNI, so the host is
+	 *   looked up again at that point and the request is stopped when the
+	 *   answer fails {@see is_public_outbound_address()}.
+	 *
+	 * The entry only matches this URL's host and port, and both callbacks are
+	 * removed when the request returns. Nothing is pinned when `$ip` is empty
+	 * or not an IP address, or when a proxy handles the URL (the proxy looks
+	 * the host up).
+	 *
+	 * @param string       $url  Request URL.
+	 * @param array<mixed> $args wp_remote_request() arguments.
+	 * @param string       $ip   Address to connect to; '' for none.
+	 * @param array<mixed> $more Further judged addresses of the same host
+	 *                           (its IPv6 addresses), listed after `$ip`.
+	 *                           An entry that is not an IP address is skipped.
+	 * @return array<string, mixed>|\WP_Error wp_remote_request()'s result.
+	 */
+	public static function remote_request_pinned( string $url, array $args, string $ip, array $more = [] ): array|\WP_Error {
+		$pins = self::connection_pins( $url, $ip, $more );
+
+		foreach ( $pins as $hook => $pin ) {
+			add_action( $hook, $pin, 10, 1 );
+		}
+
+		try {
+			return wp_remote_request( $url, $args );
+		} finally {
+			foreach ( $pins as $hook => $pin ) {
+				remove_action( $hook, $pin, 10 );
+			}
+		}
+	}
+
+	/**
+	 * The two transport callbacks {@see remote_request_pinned()} hooks for one
+	 * request, keyed by hook name; empty when nothing is pinned.
+	 *
+	 * @param string       $url  Request URL.
+	 * @param string       $ip   Address to connect to; '' for none.
+	 * @param array<mixed> $more Further judged addresses, listed after `$ip`.
+	 * @return array<string, \Closure>
+	 */
+	private static function connection_pins( string $url, string $ip, array $more = [] ): array {
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+
+		if ( '' === $ip || ! is_string( $host ) || '' === $host || ! self::is_ip( $ip ) ) {
+			return [];
+		}
+
+		$proxy = new \WP_HTTP_Proxy();
+
+		if ( $proxy->is_enabled() && $proxy->send_through_proxy( $url ) ) {
+			return [];
+		}
+
+		$host    = strtolower( $host );
+		$https   = 'https' === strtolower( (string) wp_parse_url( $url, PHP_URL_SCHEME ) );
+		$port    = (int) wp_parse_url( $url, PHP_URL_PORT );
+		$port    = $port > 0 ? $port : ( $https ? 443 : 80 );
+		$address = self::is_ipv6( $ip ) ? '[' . $ip . ']' : $ip;
+		$list    = [ $address ];
+
+		foreach ( $more as $other ) {
+			if ( is_string( $other ) && self::is_ip( $other ) ) {
+				$list[] = self::is_ipv6( $other ) ? '[' . $other . ']' : $other;
+			}
+		}
+
+		$entry = $host . ':' . $port . ':' . implode( ',', array_unique( $list ) );
+
+		return [
+			'http_api_curl'                    => static function ( $handle ) use ( $entry ): void {
+				if ( $handle instanceof \CurlHandle ) {
+					// phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_setopt -- one option on the handle WP_Http created for this wp_remote_request().
+					curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] );
+				}
+			},
+			'requests-fsockopen.remote_socket' => static function ( &$remote_socket ) use ( $host, $port, $address, $https ): void {
+				if ( ! is_string( $remote_socket ) ) {
+					return;
+				}
+
+				$socket = strtolower( $remote_socket );
+
+				if ( ! $https && 'tcp://' . $host . ':' . $port === $socket ) {
+					$remote_socket = 'tcp://' . $address . ':' . $port;
+
+					return;
+				}
+
+				if ( $https && 'ssl://' . $host . ':' . $port === $socket && ! self::is_public_outbound_address( gethostbyname( $host ) ) ) {
+					// Requests sets its connect error handler right before this
+					// hook and restores it after the connect, which the
+					// exception skips; restore it here.
+					restore_error_handler();
+
+					throw new \WpOrg\Requests\Exception( 'The host resolves to a non-public address.', 'perflocale_pin' );
+				}
+			},
+		];
 	}
 
 	/**
@@ -2804,7 +3122,8 @@ final class Helper {
 	 * Resolve the date format for a given language with sensible fallbacks.
 	 *
 	 * Lookup order:
-	 *   1. The language row's `date_format` column (admin override).
+	 *   1. The language row's `date_format` column (admin override), unless
+	 *      it holds markup ('<').
 	 *   2. The site's global `get_option( 'date_format' )` (WP default).
 	 *
 	 * Pass `null` (the default) to use the current language. The result
@@ -2825,7 +3144,8 @@ final class Helper {
 	public static function date_format_for_language( $lang = null ): string {
 		$resolved = self::resolve_language_arg( $lang );
 		$override = $resolved && ! empty( $resolved->date_format ) ? (string) $resolved->date_format : '';
-		$format   = $override !== '' ? $override : (string) get_option( 'date_format', 'F j, Y' );
+		// A stored format holding markup ('<') is not used: the site option applies.
+		$format = $override !== '' && ! str_contains( $override, '<' ) ? $override : (string) get_option( 'date_format', 'F j, Y' );
 
 		/**
 		 * Filter the resolved date format for a language.
@@ -2847,7 +3167,8 @@ final class Helper {
 	public static function time_format_for_language( $lang = null ): string {
 		$resolved = self::resolve_language_arg( $lang );
 		$override = $resolved && ! empty( $resolved->time_format ) ? (string) $resolved->time_format : '';
-		$format   = $override !== '' ? $override : (string) get_option( 'time_format', 'g:i a' );
+		// A stored format holding markup ('<') is not used: the site option applies.
+		$format = $override !== '' && ! str_contains( $override, '<' ) ? $override : (string) get_option( 'time_format', 'g:i a' );
 
 		/**
 		 * Filter the resolved time format for a language.
@@ -2994,7 +3315,7 @@ final class Helper {
 	 * dozen registration sites: iterate the registered styles, and for
 	 * every `perflocale*` handle whose `-rtl.css` twin exists on disk, set
 	 * the core `rtl => replace` extra — WP then swaps `.css` for
-	 * `-rtl.css` at print time. Covers the visual-editor addon's handles
+	 * `-rtl.css` at print time. Covers add-on handles
 	 * too (same prefix, same URL→path mapping).
 	 *
 	 * Two independent notions of "this page is RTL" meet here and they can

@@ -21,8 +21,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * plus one combined per-locale bundle pre-keyed for TranslationFileLoader's
  * O(1) fast path.
  *
- * Files are written to wp-content/uploads/perflocale/translations/ and loaded
- * by TranslationFileLoader on the frontend via WP_Translation_Controller.
+ * Files are written to wp-content/uploads/perflocale/translations/;
+ * TranslationFileLoader includes them and serves their strings through the
+ * gettext filters.
  */
 final class TranslationFileGenerator {
 
@@ -67,6 +68,14 @@ final class TranslationFileGenerator {
 	private readonly CacheManager $cache;
 
 	/**
+	 * Locales whose source translations could not be read during the last
+	 * generate_all() run. Their files were left as they were.
+	 *
+	 * @var string[]
+	 */
+	private array $read_failed_locales = [];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param CacheManager $cache Cache manager.
@@ -102,6 +111,8 @@ final class TranslationFileGenerator {
 	 *             failed — see write_l10n_file().
 	 */
 	public function generate_all( ?array $only_language_ids = null ): int {
+		$this->read_failed_locales = [];
+
 		$this->ensure_directory();
 
 		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
@@ -149,7 +160,31 @@ final class TranslationFileGenerator {
 		$this->repair_orphaned_translations();
 
 		// Fetch all translated strings grouped by domain and language.
-		$all_translations = $this->fetch_all_translations( $languages );
+		$failed_language_ids = [];
+		$all_translations    = $this->fetch_all_translations( $languages, $failed_language_ids );
+
+		// A language whose source read failed has an unknown target state, not
+		// an empty one. It is removed from this run: its combined bundle and
+		// per-domain files stay on disk and in the manifest exactly as they
+		// were (Step 3 treats them as out of scope), and the failure is
+		// reported. Healthy languages in the same run are regenerated.
+		if ( $failed_language_ids !== [] ) {
+			$healthy = [];
+
+			foreach ( $languages as $language ) {
+				if ( in_array( (int) $language->id, $failed_language_ids, true ) ) {
+					$failed_locale               = (string) $language->locale;
+					$this->read_failed_locales[] = $failed_locale;
+					unset( $all_translations[ $failed_locale ] );
+					$this->report_read_failure( $failed_locale );
+					continue;
+				}
+
+				$healthy[] = $language;
+			}
+
+			$languages = $healthy;
+		}
 
 		// Step 1: compute the full target state (path => content) without
 		// touching disk. Strings whose `messages` array is empty don't
@@ -267,9 +302,13 @@ final class TranslationFileGenerator {
 		// On a language-scoped run, files belonging to OTHER languages are
 		// out of scope: $target only covers the subset, so deleting
 		// everything not in it would wipe every other language's bundles.
+		// A run with a failed source read is scoped to its healthy languages
+		// the same way, so the failed languages' files are kept; files of
+		// deleted languages and default-locale leftovers are then reclaimed
+		// by the next run without a read failure.
 		$subset_suffixes = null;
 
-		if ( $only_language_ids !== null ) {
+		if ( $only_language_ids !== null || $this->read_failed_locales !== [] ) {
 			$subset_suffixes = array_map(
 				static fn( $lang ): string => '-' . sanitize_file_name( (string) $lang->locale ) . '.l10n.php',
 				$languages
@@ -348,6 +387,16 @@ final class TranslationFileGenerator {
 		update_option( self::MANIFEST_OPTION, $manifest, true );
 
 		return $count;
+	}
+
+	/**
+	 * Locales whose source translations could not be read during the last
+	 * generate_all() run. Their existing files were kept unchanged.
+	 *
+	 * @return string[]
+	 */
+	public function get_read_failed_locales(): array {
+		return $this->read_failed_locales;
 	}
 
 	/**
@@ -693,10 +742,15 @@ final class TranslationFileGenerator {
 	/**
 	 * Fetch all string translations grouped by locale and domain.
 	 *
-	 * @param array<int, object> $languages Active languages.
+	 * A language whose reads fail is left out of the result and its id is
+	 * added to $failed_language_ids, so a database error is never mistaken
+	 * for a language without translations (see last_read_failed()).
+	 *
+	 * @param array<int, object> $languages           Active languages.
+	 * @param int[]              $failed_language_ids Receives the ids of languages whose reads failed.
 	 * @return array<string, array<string, array<string, string>>> [locale => [domain => [original => translation]]].
 	 */
-	private function fetch_all_translations( array $languages ): array {
+	private function fetch_all_translations( array $languages, array &$failed_language_ids ): array {
 		// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter
 		global $wpdb;
 
@@ -732,7 +786,12 @@ final class TranslationFileGenerator {
 				)
 			);
 
-			if ( ! is_array( $rows ) || empty( $rows ) ) {
+			if ( ! is_array( $rows ) || $this->last_read_failed() ) {
+				$failed_language_ids[] = $language_id;
+				continue;
+			}
+
+			if ( $rows === [] ) {
 				continue;
 			}
 
@@ -742,9 +801,20 @@ final class TranslationFileGenerator {
 			// against wp_options via CONCAT-joins before.
 			$string_ids = array_map( static fn( $row ): int => (int) $row->string_id, $rows );
 			$tr_map     = $translations_repo->get_map( $string_ids, $language_id );
+
+			if ( $this->last_read_failed() ) {
+				$failed_language_ids[] = $language_id;
+				continue;
+			}
+
 			// Plural forms 2..N (Polish/Russian/Arabic) for the rows that
 			// have them — usually empty.
 			$extra_map = $translations_repo->get_extra_forms_map( $string_ids, $language_id );
+
+			if ( $this->last_read_failed() ) {
+				$failed_language_ids[] = $language_id;
+				continue;
+			}
 
 			// Group by domain.
 			foreach ( $rows as $row ) {
@@ -755,7 +825,7 @@ final class TranslationFileGenerator {
 				}
 
 				// Skip internal, output-buffer-served domains (a leading "_",
-				// e.g. the Visual Editor's "_pfl_dyn"). These are never resolved
+				// such as "_pfl_dyn"). These are never resolved
 				// through __()/gettext — only via that addon's own DB-sourced
 				// maps — so writing a .l10n.php for them just leaks a dead file
 				// and makes the gettext filters register on languages that have
@@ -785,6 +855,23 @@ final class TranslationFileGenerator {
 
 		// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
 		return $result;
+	}
+
+	/**
+	 * Whether the database read that just ran failed.
+	 *
+	 * On a query error wpdb returns an empty result, and it clears last_error
+	 * at the start of every query, so a non-empty last_error right after a
+	 * read belongs to that read.
+	 *
+	 * @phpstan-impure
+	 *
+	 * @return bool
+	 */
+	private function last_read_failed(): bool {
+		global $wpdb;
+
+		return $wpdb instanceof \wpdb && $wpdb->last_error !== '';
 	}
 
 	/**
@@ -883,7 +970,9 @@ final class TranslationFileGenerator {
 		 * @hook perflocale/strings/file_write_failed
 		 *
 		 * @param string $path   Absolute path the write targeted.
-		 * @param string $reason Failure reason: 'no_filesystem', 'put_contents' or 'move'.
+		 * @param string $reason Failure reason: 'no_filesystem', 'put_contents' or 'move'. 'source_read_failed'
+		 *                       when the language's translations could not be read from the database; $path is
+		 *                       then the language's combined bundle, and its existing files were kept.
 		 */
 		do_action( 'perflocale/strings/file_write_failed', $path, $reason );
 
@@ -893,5 +982,27 @@ final class TranslationFileGenerator {
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Debug-only diagnostic on a write-failure path.
 		error_log( 'PerfLocale: failed to write translation file (' . $reason . '): ' . $path );
+	}
+
+	/**
+	 * Report a language whose source translations could not be read.
+	 *
+	 * Fires the same action as a write failure, with the language's combined
+	 * bundle path and the reason `source_read_failed`, plus a log line gated
+	 * behind WP_DEBUG. The language's existing files are left in place.
+	 *
+	 * @param string $locale Locale whose read failed.
+	 * @return void
+	 */
+	private function report_read_failure( string $locale ): void {
+		/** This action is documented in src/Strings/TranslationFileGenerator.php */
+		do_action( 'perflocale/strings/file_write_failed', $this->compute_combined_path( $locale ), 'source_read_failed' );
+
+		if ( ! defined( 'WP_DEBUG' ) || ! WP_DEBUG ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Debug-only diagnostic on a read-failure path.
+		error_log( 'PerfLocale: could not read string translations for ' . $locale . '; its translation files were kept.' );
 	}
 }

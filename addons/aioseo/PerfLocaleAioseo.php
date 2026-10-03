@@ -144,6 +144,11 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
+		// A field a person empties stays empty: its clear is recorded in the
+		// post's seed-cleared marker, which machine translation and the seed
+		// honour.
+		\PerfLocale\Translation\ContentSync::track_seed_clears( $this->add_meta_keys( [], '' ) );
+
 		// AIOSEO renders from its own `aioseo_posts` table, not from the
 		// `_aioseo_*` post-meta mirror that PerfLocale translates, so a
 		// translation post (which has no row there) would fall back to

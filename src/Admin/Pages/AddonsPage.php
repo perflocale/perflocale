@@ -327,6 +327,8 @@ final class AddonsPage {
 		$incompatible_ids   = ( $registry !== null && method_exists( $registry, 'get_incompatible_ids' ) )
 			? $registry->get_incompatible_ids()
 			: [];
+		// Addons a `perflocale/addon/enabled` callback turned off for this request.
+		$filter_off_ids = $registry instanceof \PerfLocale\Addon\AddonRegistry ? $registry->get_disabled_by_filter_ids() : [];
 
 		// phpcs:disable WordPress.Security.NonceVerification.Recommended
 		$active_cat    = isset( $_GET['category'] ) ? sanitize_key( $_GET['category'] ) : 'all';
@@ -377,6 +379,15 @@ final class AddonsPage {
 			// they're always installed (they're part of the plugin).
 			$is_builtin = in_array( $addon_id, $builtin_feature_ids, true );
 
+			// A `perflocale/addon/enabled` callback can boot an addon the list
+			// turns off; the card then reads Active, like any running addon,
+			// while its switch still shows the stored choice.
+			if ( $is_disabled && $registry instanceof \PerfLocale\Addon\AddonRegistry && $registry->is_booted( $addon_id ) ) {
+				$addon_statuses[ $addon_id ] = 'active';
+				++$active_count;
+				continue;
+			}
+
 			if ( $is_disabled ) {
 				$addon_statuses[ $addon_id ] = 'disabled';
 				++$disabled_count;
@@ -390,14 +401,15 @@ final class AddonsPage {
 			// `check()` answers "is the host plugin present?", which stays true
 			// while the addon is quarantined after repeated boot failures, or
 			// skipped because it needs a newer PerfLocale, or because its own
-			// is_compatible() said no. The card said Active, the quarantine
-			// banner on the same screen said otherwise, and the operator had no
-			// way to tell which was true. Counted as installed-not-active, which
-			// is what it is.
+			// is_compatible() said no, or because a site filter turned it off for
+			// this request. The card said Active, the quarantine banner on the
+			// same screen said otherwise, and the operator had no way to tell
+			// which was true. Counted as installed-not-active, which is what it is.
 			if (
 				in_array( $addon_id, (array) $quarantined_ids, true )
 				|| isset( $version_mismatches[ $addon_id ] )
 				|| isset( $incompatible_ids[ $addon_id ] )
+				|| isset( $filter_off_ids[ $addon_id ] )
 			) {
 				$addon_statuses[ $addon_id ] = 'blocked';
 				++$installed_count;
@@ -448,8 +460,6 @@ final class AddonsPage {
 		<div class="wrap perflocale-dashboard">
 			<h1 class="wp-heading-inline"><?php echo esc_html__( 'Addons', 'perflocale' ); ?></h1>
 			<hr class="wp-header-end">
-
-			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
 			<?php
 			// phpcs:disable WordPress.Security.NonceVerification.Recommended
@@ -539,6 +549,8 @@ final class AddonsPage {
 					</ul>
 				</div>
 			<?php endif; ?>
+
+			<?php \PerfLocale\Admin\PluginNav::render(); ?>
 
 			<!-- Summary -->
 			<div class="perflocale-dash-stats" style="grid-template-columns: repeat(3, 1fr); margin-top: 20px;">
@@ -691,11 +703,15 @@ final class AddonsPage {
 					$is_active    = ( $addon_status === 'active' );
 					$is_disabled  = ( $addon_status === 'disabled' );
 					$is_installed = ( $addon_status === 'installed' );
+					// The switch follows the stored disabled list, which also
+					// holds an addon a filter booted anyway.
+					$is_switched_off = $is_disabled || in_array( $addon_id, $disabled_ids, true );
 
 					if ( $addon_status === 'blocked' ) {
 						// Installed, host plugin present, but the registry did not
-						// boot it — quarantined, version-gated, or self-declared
-						// incompatible. "Not running" rather than "Active".
+						// boot it — quarantined, version-gated, self-declared
+						// incompatible, or turned off by a site filter. "Not
+						// running" rather than "Active".
 						$status_class = 'perflocale-addon-card__status--inactive';
 						$status_label = __( 'Not running', 'perflocale' );
 					} elseif ( $is_disabled ) {
@@ -811,14 +827,18 @@ final class AddonsPage {
 								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display:flex;align-items:center;gap:8px;margin:0;">
 									<input type="hidden" name="action" value="perflocale_toggle_addon">
 									<input type="hidden" name="addon_id" value="<?php echo esc_attr( $addon_id ); ?>">
-									<input type="hidden" name="disable" value="<?php echo $is_disabled ? '0' : '1'; ?>">
+									<input type="hidden" name="disable" value="<?php echo $is_switched_off ? '0' : '1'; ?>">
 									<?php wp_nonce_field( 'perflocale_toggle_addon_' . $addon_id ); ?>
 									<button type="submit" class="button button-small">
-										<?php echo $is_disabled ? esc_html__( 'Enable', 'perflocale' ) : esc_html__( 'Disable', 'perflocale' ); ?>
+										<?php echo $is_switched_off ? esc_html__( 'Enable', 'perflocale' ) : esc_html__( 'Disable', 'perflocale' ); ?>
 									</button>
 									<?php if ( $is_disabled && $addon_instance !== null ) : ?>
 										<span class="description" style="font-size:11px;color:var(--perflocale-gray-text);">
 											<?php echo esc_html__( 'Skipped at boot until re-enabled.', 'perflocale' ); ?>
+										</span>
+									<?php elseif ( $is_active && $is_switched_off && $addon_instance !== null ) : ?>
+										<span class="description" style="font-size:11px;color:var(--perflocale-gray-text);">
+											<?php echo esc_html__( 'Turned on by a site filter; the stored setting is Off.', 'perflocale' ); ?>
 										</span>
 									<?php endif; ?>
 								</form>

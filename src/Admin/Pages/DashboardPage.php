@@ -101,8 +101,7 @@ final class DashboardPage {
 		?>
 		<div class="wrap perflocale-dashboard">
 			<h1><?php echo esc_html__( 'PerfLocale Dashboard', 'perflocale' ); ?></h1>
-
-			<?php PluginNav::render(); ?>
+			<hr class="wp-header-end">
 
 			<?php if ( $notice === 'cache_cleared' ) : ?>
 				<div class="notice notice-success is-dismissible">
@@ -126,6 +125,12 @@ final class DashboardPage {
 						?>
 					</p>
 				</div>
+			<?php endif; ?>
+
+			<?php PluginNav::render(); ?>
+
+			<?php if ( empty( $languages ) ) : ?>
+		</div>
 				<?php
 				return;
 			endif;

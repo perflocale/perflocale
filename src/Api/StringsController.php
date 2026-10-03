@@ -96,7 +96,7 @@ final class StringsController extends RestController {
 			[
 				'methods'             => \WP_REST_Server::CREATABLE,
 				'callback'            => [ $this, 'machine_translate_strings' ],
-				'permission_callback' => [ $this, 'mt_permissions_check' ],
+				'permission_callback' => [ $this, 'bulk_mt_permissions_check' ],
 				// Only the unambiguous scalar params are declared. `overwrite` is
 				// deliberately left undeclared: the handler treats ONLY '1'
 				// (string) or true (bool) as "overwrite", so a REST
@@ -303,5 +303,26 @@ final class StringsController extends RestController {
 		$result = $scanner->scan( $path, $domain );
 
 		return $this->success( $result );
+	}
+
+	/**
+	 * Permission gate for bulk string machine translation: a run can
+	 * overwrite every string translation on the site, so it needs
+	 * `perflocale_manage_translations` (as post bulk machine translation
+	 * does) as well as `perflocale_use_mt`.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return bool|\WP_Error
+	 */
+	public function bulk_mt_permissions_check( \WP_REST_Request $request ): bool|\WP_Error {
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				__( 'You do not have permission to perform this action.', 'perflocale' ),
+				[ 'status' => rest_authorization_required_code() ]
+			);
+		}
+
+		return $this->mt_permissions_check( $request );
 	}
 }

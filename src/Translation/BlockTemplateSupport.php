@@ -9,6 +9,9 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Translation;
 
+use PerfLocale\Database\Repository\TranslationGroupRepository;
+use PerfLocale\Enum\ObjectType;
+use PerfLocale\Enum\TranslationStatus;
 use PerfLocale\Helper;
 use WP_Post;
 
@@ -119,6 +122,13 @@ final class BlockTemplateSupport {
 	 * strongly preferred; the anchored fallback exists only for callers that
 	 * cannot resolve it, and still requires the marker to be a SUFFIX.
 	 *
+	 * The marker and language may be followed by `-<digits>` and nothing else
+	 * (`header-pfl-de-2`). Core gives a template translation that suffix when
+	 * it is published while another row of the same theme holds
+	 * `header-pfl-de`: drafts skip `wp_unique_post_slug()`, publishing does
+	 * not. Such a row is still a translation, and listed it would show a
+	 * second "Header (de)" beside the source.
+	 *
 	 * @param string            $slug        Post name.
 	 * @param array<int,string> $lang_slugs  Active language slugs. Empty = fall
 	 *                                       back to the anchored pattern.
@@ -130,10 +140,15 @@ final class BlockTemplateSupport {
 		}
 
 		if ( $lang_slugs !== [] ) {
-			foreach ( $lang_slugs as $lang ) {
-				$lang = sanitize_key( (string) $lang );
+			// The slug without its trailing `-<digits>`, or '' when it has none.
+			$trimmed    = rtrim( $slug, '0123456789' );
+			$unnumbered = ( $trimmed !== $slug && str_ends_with( $trimmed, '-' ) ) ? substr( $trimmed, 0, -1 ) : '';
 
-				if ( $lang !== '' && str_ends_with( $slug, self::SLUG_MARKER . $lang ) ) {
+			foreach ( $lang_slugs as $lang ) {
+				$lang   = sanitize_key( (string) $lang );
+				$suffix = self::SLUG_MARKER . $lang;
+
+				if ( $lang !== '' && ( str_ends_with( $slug, $suffix ) || ( $unnumbered !== '' && str_ends_with( $unnumbered, $suffix ) ) ) ) {
 					return true;
 				}
 			}
@@ -250,6 +265,10 @@ final class BlockTemplateSupport {
 	 * template is worse than none — publish one and the language loses its header and
 	 * footer.
 	 *
+	 * A language whose translation of this template was left behind by "Reset to
+	 * theme default" gets that translation back instead of a new copy
+	 * ({@see self::relink_orphan()}).
+	 *
 	 * ⚠️ ONLY THE SOURCE FANS OUT. A saved German template must not mint an English
 	 * one, or the group would grow a second "original". The recursion guard is belt
 	 * and braces on top of that: creating a translation fires `save_post` for the new
@@ -329,10 +348,13 @@ final class BlockTemplateSupport {
 		// `tax_input` block) well before it fires `save_post`. A programmatic insert
 		// that sets the term afterwards simply fans out on its NEXT save, by which
 		// time the term is there and correct.
-		if ( ! is_array( get_the_terms( $post_id, 'wp_theme' ) ) ) {
+		$themes = get_the_terms( $post_id, 'wp_theme' );
+
+		if ( ! is_array( $themes ) ) {
 			return;
 		}
 
+		$theme     = reset( $themes );
 		$lang_repo = $plugin->get( 'lang_repo' );
 		$default   = $lang_repo->get_default();
 
@@ -366,6 +388,10 @@ final class BlockTemplateSupport {
 					continue;
 				}
 
+				if ( $theme instanceof \WP_Term && $this->relink_orphan( $post, $theme, $slug, (int) $lang->id, (int) $default->id ) ) {
+					continue;
+				}
+
 				$manager->create_translation( $post_id, $slug, true );
 			}
 		} catch ( \Throwable $e ) {
@@ -378,6 +404,103 @@ final class BlockTemplateSupport {
 		} finally {
 			$running = false;
 		}
+	}
+
+	/**
+	 * Move this language's orphaned translation of the template into the
+	 * source's group, instead of seeding a second copy.
+	 *
+	 * ⭐ WHY. "Reset to theme default" in the Site Editor deletes the source row
+	 * for good (the template controller's `source=theme` path calls
+	 * `wp_delete_post( $id, true )`), and only the source's own link goes with
+	 * it. Its translations stay behind with their slugs, terms and content, in a
+	 * group with no default-language member, which
+	 * {@see \PerfLocale\Frontend\BlockTemplateTranslator} never serves. When the
+	 * template is customised again, core inserts a NEW source row. A seeded copy
+	 * would leave the finished translation unreachable and give two rows the
+	 * same `…-pfl-de` slug: core renames the copy to `…-pfl-de-2` when it is
+	 * published, and the Site Editor's next save of "Header (de)" goes into the
+	 * orphan.
+	 *
+	 * The orphan must match on everything that makes it this template's
+	 * translation:
+	 *   - the same post type, and `post_name` = translation_slug( source, lang );
+	 *   - the source's `wp_theme` term: block themes share default slugs (Twenty
+	 *     Twenty-Four and Twenty Twenty-Five collide on eight), so the slug alone
+	 *     would take another theme's translation;
+	 *   - not trashed, an auto-draft or a revision;
+	 *   - linked in this language, in a group with NO default-language member,
+	 *     so the translation of a source that still exists is never taken.
+	 * When several rows match, a published one wins, then the newest.
+	 *
+	 * The orphan keeps its post status and is flagged needs_update: it
+	 * translates the previous customisation, and a published one is served
+	 * again at once. link_object() moves it out of its old group and removes
+	 * that group once it is empty.
+	 *
+	 * One indexed SELECT, run only for a language the source's group lacks.
+	 *
+	 * @param WP_Post  $source     The template being saved (default language).
+	 * @param \WP_Term $theme      The source's wp_theme term.
+	 * @param string   $lang_slug  Target language slug.
+	 * @param int      $lang_id    Target language ID.
+	 * @param int      $default_id Default language ID.
+	 * @return bool True when an orphan was found; the caller then seeds no copy.
+	 */
+	private function relink_orphan( WP_Post $source, \WP_Term $theme, string $lang_slug, int $lang_id, int $default_id ): bool {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( $source->post_name === '' || ! $plugin->has( 'group_repo' ) ) {
+			return false;
+		}
+
+		global $wpdb;
+
+		$links = $wpdb->prefix . 'perflocale_translation_links';
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$orphan_id = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT p.ID
+				 FROM %i p
+				 INNER JOIN %i tr ON tr.object_id = p.ID AND tr.term_taxonomy_id = %d
+				 INNER JOIN %i l ON l.object_id = p.ID AND l.type = 'post' AND l.language_id = %d
+				 WHERE p.post_type = %s
+				   AND p.post_name = %s
+				   AND p.post_status NOT IN ( 'trash', 'auto-draft', 'inherit' )
+				   AND NOT EXISTS ( SELECT 1 FROM %i d WHERE d.group_id = l.group_id AND d.language_id = %d )
+				 ORDER BY ( p.post_status = 'publish' ) DESC, p.ID DESC
+				 LIMIT 1",
+				$wpdb->posts,
+				$wpdb->term_relationships,
+				(int) $theme->term_taxonomy_id,
+				$links,
+				$lang_id,
+				$source->post_type,
+				self::translation_slug( $source->post_name, $lang_slug ),
+				$links,
+				$default_id
+			)
+		);
+
+		if ( $orphan_id <= 0 ) {
+			return false;
+		}
+
+		$groups = $plugin->get( 'group_repo' );
+
+		// A found orphan is never shadowed by a seeded copy, which would take its
+		// slug. When the move cannot happen the language stays missing, and the
+		// next save of the template tries again.
+		if ( $groups instanceof TranslationGroupRepository ) {
+			$group = $groups->find_for_object( $source->ID, ObjectType::Post );
+
+			if ( $group !== null ) {
+				$groups->link_object( (int) $group->id, $orphan_id, $lang_id, TranslationStatus::NeedsUpdate->value );
+			}
+		}
+
+		return true;
 	}
 
 	/**

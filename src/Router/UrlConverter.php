@@ -130,6 +130,7 @@ final class UrlConverter {
 		self::$skip_url_modification_memo    = null;
 		self::$url_config_memo               = null;
 		self::$home_host                     = null;
+		self::$home_authority                = null;
 		self::$lang_map                      = null;
 		self::$home_path                     = null;
 		self::$home_trimmed                  = null;
@@ -373,6 +374,16 @@ final class UrlConverter {
 	 * @var string|null
 	 */
 	private static ?string $home_host = null;
+
+	/**
+	 * Per-request memo of the home URL's host[:port] for domain mode, where
+	 * apply_domain() serves an unmapped default language on it. Class-static
+	 * so reset_static_caches() clears it on switch_blog — the home host
+	 * differs per blog on multisite.
+	 *
+	 * @var string|null
+	 */
+	private static ?string $home_authority = null;
 
 	/**
 	 * Per-request slug => language-object map used by convert(). Class-static
@@ -1082,6 +1093,19 @@ final class UrlConverter {
 	 * to the canonical translated-slug URL. Applies to all translatable
 	 * taxonomies: categories, tags, product categories, attributes, etc.
 	 *
+	 * Only the term base of the request path identifies the term. A feed of
+	 * the archive (`/feed/`, `/feed/atom/`) and page 2 or later
+	 * (`/page/3/`) add a suffix after that base: a request whose base is
+	 * already the canonical one is left alone, and a request on the
+	 * database slug keeps its suffix in the redirect, so it lands on the
+	 * same page or feed under the translated slug.
+	 *
+	 * In query URL mode the canonical URL carries the language in its own
+	 * query string (`?lang=fr`). The request's query arguments are merged
+	 * into it, so the target has a single query string in which the
+	 * canonical's values win. In the path and host modes the canonical has
+	 * no query string and the request's query string is appended verbatim.
+	 *
 	 * @return void
 	 */
 	public function redirect_term_to_translated_slug(): void {
@@ -1149,13 +1173,80 @@ final class UrlConverter {
 			return; // Already at canonical URL.
 		}
 
-		// Preserve the query string so UTM/tracking/preview params survive
-		// the slug-translation canonical redirect.
-		if ( $qpos !== false ) {
-			$canonical .= substr( $request_uri, $qpos );
+		// Feed and pagination suffix. It is recognised only on the requests
+		// core itself treats as a feed or as page 2+ (the conditions
+		// redirect_canonical() uses), so a term slugged `feed` or `atom` is
+		// never cut on its own archive, `?paged=N` and `/embed/` requests get
+		// the plain redirect, and `/page/1/` redirects to the page-1 URL. The
+		// patterns come from $wp_rewrite, so feeds added with add_feed() and a
+		// changed pagination base match too. Both paths are untrailingslashed
+		// above, so the patterns anchor on the end.
+		global $wp_rewrite;
+
+		$suffix         = '';
+		$suffix_pattern = '';
+
+		if ( $wp_rewrite instanceof \WP_Rewrite ) {
+			$paged = get_query_var( 'paged' );
+
+			if ( is_feed() && ! empty( $wp_rewrite->feeds ) ) {
+				$feeds          = implode( '|', array_map( static fn( $feed ): string => preg_quote( (string) $feed, '#' ), (array) $wp_rewrite->feeds ) );
+				$suffix_pattern = '/(?:' . preg_quote( (string) $wp_rewrite->feed_base, '#' ) . '/)?(?:' . $feeds . ')';
+			} elseif ( is_numeric( $paged ) && (int) $paged > 1 ) {
+				$suffix_pattern = '/' . preg_quote( (string) $wp_rewrite->pagination_base, '#' ) . '/?\d+';
+			}
 		}
 
-		wp_safe_redirect( $canonical, 301 );
+		if ( $suffix_pattern !== '' ) {
+			// A feed or page 2+ of the canonical URL. The rest of the path
+			// after the canonical base is matched as a whole: a term whose
+			// slug is `feed` keeps its own `/feed/feed/` feed.
+			if ( str_starts_with( $request_path, $canonical_path . '/' )
+				&& preg_match( '#^' . $suffix_pattern . '$#', substr( $request_path, strlen( $canonical_path ) ) ) === 1
+			) {
+				return;
+			}
+
+			if ( preg_match( '#' . $suffix_pattern . '$#', $request_path, $suffix_match ) === 1 ) {
+				$suffix = $suffix_match[0];
+			}
+		}
+
+		// The target is the canonical URL plus the request's suffix, in the
+		// canonical's trailing-slash style. Loop-proof: the target's base is
+		// $canonical_path, so the next request returns above.
+		$query_pos       = strpos( $canonical, '?' );
+		$target          = $query_pos !== false ? substr( $canonical, 0, $query_pos ) : $canonical;
+		$canonical_query = $query_pos !== false ? substr( $canonical, $query_pos + 1 ) : '';
+
+		if ( $suffix !== '' ) {
+			$target = str_ends_with( $target, '/' ) ? untrailingslashit( $target ) . $suffix . '/' : $target . $suffix;
+		}
+
+		if ( $canonical_query === '' ) {
+			// Preserve the query string so UTM/tracking/preview params survive
+			// the slug-translation canonical redirect. Appended verbatim.
+			if ( $qpos !== false ) {
+				$target .= substr( $request_uri, $qpos );
+			}
+		} else {
+			// Query URL mode. Appending the request's query string would add a
+			// second `?` (`?lang=fr?lang=fr`), whose `lang` value no language
+			// matches, so the visitor would get the default language. Every
+			// key the canonical sets is removed from the request's arguments,
+			// then the canonical's arguments are added: one query string, and
+			// the canonical's language wins.
+			$canonical_args = [];
+			wp_parse_str( $canonical_query, $canonical_args );
+
+			$request_query = $qpos !== false ? substr( $request_uri, $qpos ) : '';
+			$target        = add_query_arg(
+				urlencode_deep( $canonical_args ),
+				$target . remove_query_arg( array_map( 'strval', array_keys( $canonical_args ) ), $request_query )
+			);
+		}
+
+		wp_safe_redirect( $target, 301 );
 		exit;
 	}
 
@@ -1858,6 +1949,16 @@ final class UrlConverter {
 					}
 				}
 
+				// A rewrite endpoint on the page (WooCommerce's
+				// /my-account/orders/) is part of the address in every language.
+				$endpoint = $this->current_endpoint();
+
+				if ( $endpoint !== null ) {
+					foreach ( $urls as $slug => $url ) {
+						$urls[ $slug ] = $this->append_endpoint( $url, $endpoint );
+					}
+				}
+
 				$cached_by_blog[ $blog_key ] = $urls;
 				return $urls;
 			}
@@ -1917,12 +2018,110 @@ final class UrlConverter {
 		// For archives, home, search, etc. - generate URLs for all languages.
 		$current = $this->get_current_url();
 
+		// A term archive without links whose link is a query string (a
+		// taxonomy without pretty permalinks, or Plain permalinks): the term
+		// is identified by that query string, which get_current_url() drops.
+		// Its server-built link keeps it; pretty links keep the request URL.
+		if ( ( is_tax() || is_category() || is_tag() ) && get_queried_object() instanceof \WP_Term ) {
+			$term_link = get_term_link( get_queried_object() );
+
+			if ( is_string( $term_link ) && str_contains( $term_link, '?' ) ) {
+				$current = $term_link;
+			}
+		}
+
 		foreach ( $languages as $lang ) {
 			$urls[ $lang->slug ] = $this->convert( $current, $lang->slug );
 		}
 
 		$cached_by_blog[ $blog_key ] = $urls;
 		return $urls;
+	}
+
+	/**
+	 * The rewrite endpoint the main query was routed through, if any.
+	 *
+	 * An endpoint's query var is public, so a query string (`?orders=1`) sets
+	 * it on any URL. With pretty permalinks the var therefore counts only
+	 * when the matched rewrite rule carries it; with plain permalinks, where
+	 * endpoints are query vars, only on a page.
+	 *
+	 * @return array{var: string, name: string, value: string}|null Query var,
+	 *         endpoint slug and value (`view-order` / `123`), or null.
+	 */
+	public function current_endpoint(): ?array {
+		global $wp_rewrite, $wp_query, $wp;
+
+		if ( ! $wp_rewrite instanceof \WP_Rewrite || ! $wp_query instanceof \WP_Query || empty( $wp_rewrite->endpoints ) ) {
+			return null;
+		}
+
+		$pretty  = $wp_rewrite->using_permalinks();
+		$matched = [];
+
+		if ( $pretty ) {
+			// matched_query is unset until parse_request() matched a rule.
+			$rule_query = $wp instanceof \WP ? (string) $wp->matched_query : '';
+
+			if ( $rule_query === '' ) {
+				return null;
+			}
+
+			parse_str( $rule_query, $matched );
+		} elseif ( ! $wp_query->is_page() ) {
+			return null;
+		}
+
+		foreach ( (array) $wp_rewrite->endpoints as $endpoint ) {
+			$name = (string) ( $endpoint[1] ?? '' );
+			$var  = (string) ( $endpoint[2] ?? '' );
+
+			if ( $name === '' || $var === '' || ! isset( $wp_query->query[ $var ] ) || ! is_scalar( $wp_query->query[ $var ] ) ) {
+				continue;
+			}
+
+			if ( $pretty && ! array_key_exists( $var, $matched ) ) {
+				continue;
+			}
+
+			$segments = array_filter(
+				explode( '/', (string) $wp_query->query[ $var ] ),
+				static fn( string $segment ): bool => $segment !== ''
+			);
+
+			return [
+				'var'   => $var,
+				'name'  => $name,
+				'value' => implode( '/', array_map( static fn( string $segment ): string => rawurlencode( rawurldecode( $segment ) ), $segments ) ),
+			];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Add a rewrite endpoint to a page URL, as WooCommerce's wc_get_endpoint_url() builds it.
+	 *
+	 * @param string                                          $url      Page URL.
+	 * @param array{var: string, name: string, value: string} $endpoint From current_endpoint().
+	 * @return string
+	 */
+	private function append_endpoint( string $url, array $endpoint ): string {
+		if ( (string) get_option( 'permalink_structure' ) === '' ) {
+			return add_query_arg( $endpoint['var'], $endpoint['value'], $url );
+		}
+
+		$query = '';
+		$qpos  = strpos( $url, '?' );
+
+		if ( $qpos !== false ) {
+			$query = substr( $url, $qpos );
+			$url   = substr( $url, 0, $qpos );
+		}
+
+		$path = $endpoint['value'] === '' ? $endpoint['name'] : $endpoint['name'] . '/' . $endpoint['value'];
+
+		return user_trailingslashit( trailingslashit( $url ) . $path ) . $query;
 	}
 
 	/**
@@ -2098,6 +2297,13 @@ final class UrlConverter {
 	/**
 	 * Apply per-language domain to a URL (e.g., example.com → example.fr).
 	 *
+	 * The default language without a domain of its own is served on the
+	 * site's own host (the `home` option), as in subdomain mode. On a
+	 * language domain, home_url() already carries that language's host, so
+	 * a default-language link has to be moved back to the home host rather
+	 * than left where it was built. A non-default language without a domain
+	 * has no host that serves it, and its URLs are returned unchanged.
+	 *
 	 * @param string $url URL to modify.
 	 * @param object $language Language object.
 	 * @return string URL with language domain.
@@ -2106,7 +2312,26 @@ final class UrlConverter {
 		$target_domain = $this->settings->get_language_domain( $language->slug );
 
 		if ( empty( $target_domain ) ) {
-			return $url;
+			$target_domain = self::$home_authority ?? $this->home_authority();
+
+			// A link already on the home host stays there, whatever its
+			// language: two anchored prefix checks, no parse. Every
+			// default-language link built on the home host returns here. The
+			// check is anchored at the start of the URL: the home address can
+			// also appear in a query value of a link on another host.
+			if (
+				$target_domain === ''
+				|| str_starts_with( $url, 'https://' . $target_domain . '/' )
+				|| str_starts_with( $url, 'http://' . $target_domain . '/' )
+			) {
+				return $url;
+			}
+
+			$default = $this->router->get_default_language();
+
+			if ( $default === null || $language->slug !== $default->slug ) {
+				return $url;
+			}
 		}
 
 		$parsed = wp_parse_url( $url );
@@ -2125,6 +2350,33 @@ final class UrlConverter {
 		}
 
 		return $url;
+	}
+
+	/**
+	 * Host, with its port when it has one, of the site's own home URL.
+	 *
+	 * Read with this class's home_url filter suppressed, so it is the stored
+	 * `home` value and never the current language's host. Memoised in a
+	 * class static that reset_static_caches() clears on switch_blog, because
+	 * each blog of a network has its own home host.
+	 *
+	 * @return string Authority such as `example.com` or `example.com:8443`, or '' when home has no host.
+	 */
+	private function home_authority(): string {
+		if ( self::$home_authority === null ) {
+			$this->filtering = true;
+			try {
+				$home = wp_parse_url( home_url() );
+			} finally {
+				$this->filtering = false;
+			}
+
+			$host = is_array( $home ) ? (string) ( $home['host'] ?? '' ) : '';
+
+			self::$home_authority = $host === '' ? '' : $host . ( isset( $home['port'] ) ? ':' . (int) $home['port'] : '' );
+		}
+
+		return self::$home_authority;
 	}
 
 	/**
@@ -2699,9 +2951,16 @@ final class UrlConverter {
 		);
 		// phpcs:enable
 
+		// A failed SELECT proves nothing about which pairs are untranslated.
+		// Seed nothing, so each read runs its own lookup instead of taking a
+		// null sentinel for "no translation".
+		if ( ! is_array( $rows ) || '' !== $wpdb->last_error ) {
+			return;
+		}
+
 		$found = [];
 
-		foreach ( (array) $rows as $row ) {
+		foreach ( $rows as $row ) {
 			$found[ (int) $row->object_id . ':' . (int) $row->language_id ] = (string) $row->slug;
 		}
 

@@ -34,6 +34,31 @@
 	transition: width 0.2s ease;
 }
 
+/* The running stage under the bar, e.g. "Posts: 120 of 500". */
+.perflocale-jobs-stage {
+	margin-top: 4px;
+	font-size: 12px;
+	color: #50575e;
+	line-height: 1.4;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+.perflocale-jobs-stage:empty {
+	display: none;
+}
+
+/* A finished job's warning under its status (content kept in the source language). */
+.perflocale-jobs-warning {
+	margin-top: 4px;
+	max-width: 380px;
+	font-size: 11px;
+	line-height: 1.4;
+	color: #6e4a00;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
 /* Expandable detail row (lazily fetched via /jobs/{id}). */
 .perflocale-jobs-detail-row > td {
 	background: #f6f7f7;

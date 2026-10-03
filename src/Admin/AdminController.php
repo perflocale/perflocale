@@ -209,14 +209,18 @@ final class AdminController {
 			// the run should be ≤ before.
 			$repaired_after = $generator->count_repairable_orphans();
 			$repaired       = max( 0, $repaired_before - $repaired_after );
+			// Languages whose translations could not be read kept their
+			// existing files; the notice reports them instead of a plain count.
+			$read_failed = count( $generator->get_read_failed_locales() );
 
 			wp_safe_redirect(
 				add_query_arg(
 					[
-						'page'            => 'perflocale-settings',
-						'tab'             => 'performance',
-						'files_generated' => $count,
-						'repaired'        => $repaired,
+						'page'              => 'perflocale-settings',
+						'tab'               => 'performance',
+						'files_generated'   => $count,
+						'repaired'          => $repaired,
+						'files_read_failed' => $read_failed,
 					],
 					admin_url( 'admin.php' )
 				)
@@ -586,6 +590,30 @@ final class AdminController {
 	}
 
 	/**
+	 * Why an admin-started migration did not run, or '' when it ran.
+	 *
+	 * The inline run reports an exception (another import holds the lock) as
+	 * `error`; an import the language check refused comes back `blocked`
+	 * with its reasons first in `errors`. Nothing was written in either case.
+	 *
+	 * @param array<string, mixed> $dispatched Dispatcher::dispatch() result.
+	 * @return string
+	 */
+	private static function migration_refusal( array $dispatched ): string {
+		if ( ! empty( $dispatched['error'] ) ) {
+			return wp_specialchars_decode( (string) $dispatched['error'], ENT_QUOTES );
+		}
+
+		$r = (array) ( $dispatched['result'] ?? [] );
+
+		if ( empty( $r['blocked'] ) ) {
+			return '';
+		}
+
+		return implode( ' ', array_slice( array_map( 'strval', (array) ( $r['errors'] ?? [] ) ), 0, 2 ) );
+	}
+
+	/**
 	 * Handle export, import, and migration actions.
 	 *
 	 * @return void
@@ -859,15 +887,19 @@ final class AdminController {
 				);
 			}
 
+			// A merge import leaves the file's configuration unapplied; the
+			// importer's notice says so and points to Replace.
+			$not_applied_note = isset( $r['notice'] ) && is_string( $r['notice'] ) && '' !== $r['notice'] ? ' ' . $r['notice'] : '';
+
 			// rawurlencode(): the message is translated text and may carry the
 			// file's own error text, and an unencoded `&`, `#` or `+` would cut
 			// or alter it in the query string.
 			if ( ! empty( $r['errors'] ) ) {
-				$msg = implode( '; ', array_slice( $r['errors'], 0, 3 ) ) . $sanitized_note;
+				$msg = implode( '; ', array_slice( $r['errors'], 0, 3 ) ) . $sanitized_note . $not_applied_note;
 				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $msg ), $redirect_url ) );
 			} else {
 				/* translators: %1$d: imported count, %2$d: skipped count */
-				$msg = sprintf( __( 'Import complete. %1$d items imported, %2$d skipped.', 'perflocale' ), (int) ( $r['imported'] ?? 0 ), (int) ( $r['skipped'] ?? 0 ) ) . $sanitized_note;
+				$msg = sprintf( __( 'Import complete. %1$d items imported, %2$d skipped.', 'perflocale' ), (int) ( $r['imported'] ?? 0 ), (int) ( $r['skipped'] ?? 0 ) ) . $sanitized_note . $not_applied_note;
 				wp_safe_redirect( add_query_arg( 'import_result', rawurlencode( $msg ), $redirect_url ) );
 			}
 
@@ -894,13 +926,32 @@ final class AdminController {
 			);
 
 			if ( $result['mode'] === 'async' ) {
-				wp_safe_redirect(
-					add_query_arg(
-						'import_result',
-						__( 'WPML migration queued. Track progress under PerfLocale → Jobs.', 'perflocale' ),
-						admin_url( 'admin.php?page=perflocale-jobs' )
-					)
-				);
+				$last_progress = (int) ( $result['updated_at'] ?? 0 );
+
+				if ( ! empty( $result['duplicate'] ) && ( $result['status'] ?? '' ) === 'running' ) {
+					$queued_msg = sprintf(
+						/* translators: %s: time since the import last reported progress, e.g. "3 mins" */
+						__( 'A WPML import is already running (last progress %s ago); no second import was started. Track its progress under PerfLocale → Jobs.', 'perflocale' ),
+						human_time_diff( $last_progress > 0 ? $last_progress : time() )
+					);
+				} elseif ( ! empty( $result['duplicate'] ) ) {
+					$queued_msg = __( 'A WPML import is already queued; no second import was started. Track its progress under PerfLocale → Jobs.', 'perflocale' );
+				} elseif ( ! empty( $result['replaced'] ) ) {
+					$queued_msg = __( 'The previous WPML import stopped without finishing and was marked failed. A new WPML import was queued. Track its progress under PerfLocale → Jobs.', 'perflocale' );
+				} else {
+					$queued_msg = __( 'WPML migration queued. Track progress under PerfLocale → Jobs.', 'perflocale' );
+				}
+
+				// The Jobs page shows this one-shot notice (same transient as the string scan's).
+				set_transient( 'perflocale_scan_queued_notice_' . get_current_user_id(), (string) $queued_msg, 60 );
+				wp_safe_redirect( admin_url( 'admin.php?page=perflocale-jobs' ) );
+				exit;
+			}
+
+			$refused = self::migration_refusal( $result );
+
+			if ( $refused !== '' ) {
+				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $refused ), $redirect_url ) );
 				exit;
 			}
 
@@ -921,7 +972,13 @@ final class AdminController {
 				);
 			}
 
-			wp_safe_redirect( add_query_arg( 'import_result', $msg, $redirect_url ) );
+			$skipped_lines = \PerfLocale\Migration\WpmlImporter::skipped_lines( $r );
+
+			if ( $skipped_lines !== [] ) {
+				$msg .= ' ' . implode( ' ', $skipped_lines );
+			}
+
+			wp_safe_redirect( add_query_arg( 'import_result', rawurlencode( $msg ), $redirect_url ) );
 			exit;
 		}
 
@@ -948,6 +1005,13 @@ final class AdminController {
 						admin_url( 'admin.php?page=perflocale-jobs' )
 					)
 				);
+				exit;
+			}
+
+			$refused = self::migration_refusal( $result );
+
+			if ( $refused !== '' ) {
+				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $refused ), $redirect_url ) );
 				exit;
 			}
 
@@ -997,7 +1061,24 @@ final class AdminController {
 				exit;
 			}
 
-			$r   = $result['result'] ?? [];
+			$refused = self::migration_refusal( $result );
+
+			if ( $refused !== '' ) {
+				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $refused ), $redirect_url ) );
+				exit;
+			}
+
+			$r = $result['result'] ?? [];
+
+			// An import that did not finish is reported as the failure the job
+			// and the CLI report, with the notice that says to run it again.
+			if ( ! empty( $r['run_failed'] ) ) {
+				$reason = $r['first_error'] ?? '';
+
+				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( is_string( $reason ) ? $reason : '' ), $redirect_url ) );
+				exit;
+			}
+
 			$msg = sprintf(
 				/* translators: %1$d: number of posts imported, %2$d: number of strings imported, %3$d: number of slugs imported */
 				__( 'TranslatePress import complete. %1$d posts, %2$d strings, %3$d slugs imported.', 'perflocale' ),
@@ -1041,7 +1122,7 @@ final class AdminController {
 				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 			}
 
-			if ( ! current_user_can( 'manage_options' ) ) {
+			if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
 				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
 			}
 
@@ -1119,7 +1200,7 @@ final class AdminController {
 				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 			}
 
-			if ( ! current_user_can( 'manage_options' ) ) {
+			if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
 				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
 			}
 
@@ -1136,7 +1217,29 @@ final class AdminController {
 			// missing-row / is-default cases used to fall through to the POST
 			// handler below and re-render the screen with nothing removed and
 			// nothing said; a stale bookmark of a delete URL reaches both.
-			$deleted = ( $language && ! $language->is_default )
+			$deletable = $language && ! $language->is_default;
+
+			// A language that still has posts is refused (LanguageRepository::
+			// delete_blockers() explains why). Checked again here, not only on
+			// the preview screen: content can be added between the two requests.
+			// A failed count refuses too, as a failed delete.
+			$blockers = $deletable ? $repo->delete_blockers( $lang_id ) : null;
+
+			if ( $deletable && is_array( $blockers ) && $blockers['posts'] !== [] ) {
+				wp_safe_redirect(
+					add_query_arg(
+						[
+							'page'        => 'perflocale-languages',
+							'message'     => 'delete_blocked',
+							'language_id' => $lang_id,
+						],
+						admin_url( 'admin.php' )
+					)
+				);
+				exit;
+			}
+
+			$deleted = ( $deletable && is_array( $blockers ) )
 				? $repo->delete( $lang_id )
 				: false;
 
@@ -1163,7 +1266,7 @@ final class AdminController {
 			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 		}
 
-		if ( ! current_user_can( 'manage_options' ) ) {
+		if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
 		}
 
@@ -1699,7 +1802,7 @@ final class AdminController {
 			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 		}
 
-		if ( ! current_user_can( 'perflocale_translate' ) ) {
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
 		}
 
@@ -1709,8 +1812,7 @@ final class AdminController {
 		// strips EVERY tag (taking the %s placeholder inside the attribute with
 		// it) and deletes %xx sequences, silently corrupting any HTML-bearing
 		// translation on save. wp_kses_post preserves post-safe markup and the
-		// placeholders while still stripping <script>/on* — the right trust
-		// level for the low-privilege Translator role that holds this cap.
+		// placeholders while still stripping <script>/on*.
 		$translations = isset( $_POST['perflocale_str_trans'] ) ? map_deep( wp_unslash( $_POST['perflocale_str_trans'] ), 'wp_kses_post' ) : []; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
 		if ( ! is_array( $translations ) ) {
@@ -2023,7 +2125,7 @@ final class AdminController {
 			// languages this save actually touched (a one-string save was
 			// re-fetching EVERY language's full translation set). The
 			// all-language cache-delete loop above deliberately stays broad:
-			// the VE gettext bridge depends on it (do not narrow).
+			// an add-on's gettext bridge depends on it (do not narrow).
 			if ( $this->settings->get( 'string_translation_mode' ) === 'files' ) {
 				$generator = new \PerfLocale\Strings\TranslationFileGenerator( $cache );
 				$generator->generate_all( $touched_lang_ids === [] ? null : array_keys( $touched_lang_ids ) );
@@ -2032,9 +2134,9 @@ final class AdminController {
 			/**
 			 * Fires after string translations are saved from the admin
 			 * Strings screen. Lets addons that derive state from the
-			 * `strings`/`string_translations` tables (e.g. the Visual
-			 * Editor's per-language bundles) invalidate it — core itself
-			 * only knows about its own gettext caches.
+			 * `strings`/`string_translations` tables (per-language string
+			 * bundles, for example) invalidate it — core itself only knows
+			 * about its own gettext caches.
 			 *
 			 * @hook perflocale/strings/changed
 			 *
@@ -2390,11 +2492,21 @@ final class AdminController {
 					exit;
 				}
 
+				// Refused (permission, monthly budget, a should_dispatch veto),
+				// not enqueued, or stopped by an error before any row: say why,
+				// as the site-wide panel does, instead of reporting "0 created".
+				if ( in_array( $result['mode'], [ 'denied', 'error' ], true ) || isset( $result['error'] ) ) {
+					set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), (string) ( $result['error'] ?? __( 'Dispatch failed.', 'perflocale' ) ), 5 * MINUTE_IN_SECONDS );
+					$redirect( 'bulk_mt_denied' );
+				}
+
 				$r           = is_array( $result['result'] ?? null ) ? $result['result'] : [];
 				$created     = (int) ( $r['created'] ?? 0 );
 				$skipped     = (int) ( $r['skipped'] ?? 0 );
 				$failed      = (int) ( $r['failed'] ?? 0 );
 				$first_error = (string) ( $r['first_error'] ?? '' );
+				$no_access   = min( $skipped, max( 0, (int) ( $r['skipped_permission'] ?? 0 ) ) );
+				$kept        = min( $created, max( 0, (int) ( $r['kept'] ?? 0 ) ) );
 
 				// Stash the first error message in a per-user transient so
 				// the redirect URL stays clean (error text can contain odd
@@ -2404,12 +2516,21 @@ final class AdminController {
 					set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), $first_error, 5 * MINUTE_IN_SECONDS );
 				}
 
+				// Same for the first "Do not translate" kept-source warning.
+				$first_warning = (string) ( $r['first_warning'] ?? '' );
+
+				if ( $kept > 0 && $first_warning !== '' ) {
+					set_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id(), $first_warning, 5 * MINUTE_IN_SECONDS );
+				}
+
 				$redirect(
 					'bulk_mt_done',
 					[
-						'created' => $created,
-						'skipped' => $skipped,
-						'failed'  => $failed,
+						'created'   => $created,
+						'skipped'   => $skipped - $no_access,
+						'no_access' => $no_access,
+						'failed'    => $failed,
+						'kept'      => $kept,
 					]
 				);
 				break;
@@ -2441,9 +2562,9 @@ final class AdminController {
 				// question for the checkboxes feeding this handler. The group
 				// row is the authority on what a group holds;
 				// translation_links.type is a denormalised copy that rows
-				// written before that column existed carry EMPTY (mutest's
-				// three subsites still hold 15 such rows today, every one of
-				// them inside a post/term group), and a `links.type` predicate
+				// written before that column existed carry EMPTY (the three
+				// subsites of a multisite test network held 15 such rows, every
+				// one of them inside a post/term group), and a `links.type` predicate
 				// silently matches none of them.
 				//
 				// COUNT(DISTINCT t.id), not COUNT(*): the s-side join yields
@@ -2466,8 +2587,8 @@ final class AdminController {
 				// the honest number is the rows the scope matched, all of which
 				// carry needs_update by the time the redirect lands.
 				//
-				// Every table is index-driven (verified with EXPLAIN on
-				// test.local's 6,815 links): s resolves through the
+				// Every table is index-driven (verified with EXPLAIN on a
+				// test site's 6,815 links): s resolves through the
 				// object_lookup (object_id, language_id) KEY, g is a PRIMARY
 				// KEY lookup, t rides the group_lang (group_id, language_id)
 				// UNIQUE key.
@@ -3017,10 +3138,13 @@ final class AdminController {
 		// on the source, which every machine-translation route checks before
 		// translating a post: a host type core cannot answer for (WPForms,
 		// whose post_content is the form definition as JSON) gets the copied
-		// stub instead, the same result REST create gives. admit() counts the
-		// request when it allows it, so it is asked last, only when MT would
-		// otherwise run. A refusal falls through to the stub, as a provider
-		// failure does.
+		// stub instead, the same result REST create gives. A password-protected
+		// source is sent only when the perflocale/mt/send_password_protected
+		// filter allows it. admit() counts the request when it allows it, so
+		// it is asked last, only when MT would otherwise run. A refusal falls
+		// through to the stub, as a provider failure does.
+		$source_post = get_post( $source_id );
+
 		if (
 			$copy_from > 0
 			&& $existing === null
@@ -3029,6 +3153,8 @@ final class AdminController {
 			&& $mt_in_scope
 			&& current_user_can( 'perflocale_use_mt' )
 			&& current_user_can( 'edit_post', $source_id )
+			&& $source_post instanceof \WP_Post
+			&& \PerfLocale\MachineTranslation\TranslationService::may_send_post( $source_post, 'auto_create' )
 			&& null === \PerfLocale\Translation\MtRateLimiter::admit( get_current_user_id() )
 		) {
 			try {

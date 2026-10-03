@@ -77,11 +77,50 @@ final class AddonSchemaManager {
 			return true;
 		}
 
-		// Apply (idempotent) dbDelta for the declared schema.
+		// Apply (idempotent) dbDelta for the declared schema, then ask the
+		// server which declared tables exist.
+		$read_error = '';
+
 		try {
-			self::apply_schema( $addon_id, $addon->get_schema() );
+			$schema = $addon->get_schema();
+			self::apply_schema( $addon_id, $schema );
+			$missing = self::missing_tables( $addon_id, $schema, $read_error );
 		} catch ( \Throwable $e ) {
 			AddonMigrationErrors::record( $addon_id, 'schema', $target, $e->getMessage() );
+			return false;
+		}
+
+		// The record, which the admin views and `wp perflocale addon errors`
+		// show, carries no server text (it can name tables and values); the
+		// server's error goes to the debug log when WP_DEBUG_LOG is on.
+		if ( null === $missing ) {
+			if ( '' !== $read_error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
+				error_log( '[PerfLocale] Addon ' . $addon_id . ': database error while listing its tables - ' . $read_error );
+			}
+
+			AddonMigrationErrors::record(
+				$addon_id,
+				'schema',
+				$target,
+				'Could not list the addon tables to verify them. Version not recorded; will retry.'
+			);
+			return false;
+		}
+
+		// dbDelta() discards each statement's result and returns what it
+		// meant to do, so a CREATE the server rejected (an error in the body,
+		// a name over the identifier limit, missing grants) reads as success.
+		// A typical migrate_to(1) has nothing to do, so without this check the
+		// version would be recorded over a table that does not exist, and the
+		// at-target exit above would never retry it.
+		if ( [] !== $missing ) {
+			AddonMigrationErrors::record(
+				$addon_id,
+				'schema',
+				$target,
+				'Table(s) not created: ' . implode( ', ', $missing ) . '. Version not recorded; will retry.'
+			);
 			return false;
 		}
 
@@ -171,12 +210,76 @@ final class AddonSchemaManager {
 	}
 
 	/**
+	 * Declared tables the server does not have.
+	 *
+	 * One catalog scan over the addon's own prefix, compared in PHP and
+	 * case-insensitively: lower_case_table_names=1 reports names folded to
+	 * lower case, and the prefix can contain capitals. Called only while a
+	 * migration is pending, after apply_schema() has validated every short
+	 * name.
+	 *
+	 * @param string                $addon_id   Addon identifier.
+	 * @param array<string, string> $schema     Short-name => CREATE TABLE body.
+	 * @param string                $read_error Set to the database error when
+	 *                                          the table list cannot be read.
+	 * @return string[]|null Full names of the declared tables that do not
+	 *                       exist, or null when the table list cannot be read.
+	 */
+	private static function missing_tables( string $addon_id, array $schema, string &$read_error ): ?array {
+		$read_error = '';
+
+		if ( [] === $schema ) {
+			return [];
+		}
+
+		global $wpdb;
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+
+		$prefix = self::addon_table_prefix( $addon_id );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Schema post-condition on the pending-migration path only; a cached answer would defeat it.
+		$found = $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' ) );
+
+		// wpdb clears last_error at the start of every query, so a non-empty
+		// one belongs to this SHOW. An empty list from a failed read would
+		// report every table as not created.
+		if ( '' !== $wpdb->last_error ) {
+			$read_error = (string) $wpdb->last_error;
+			return null;
+		}
+
+		$have = [];
+
+		foreach ( $found as $name ) {
+			if ( is_string( $name ) ) {
+				$have[ strtolower( $name ) ] = true;
+			}
+		}
+
+		$missing = [];
+
+		foreach ( array_keys( $schema ) as $short_name ) {
+			$full_name = self::table_name( $addon_id, (string) $short_name );
+
+			if ( ! isset( $have[ strtolower( $full_name ) ] ) ) {
+				$missing[] = $full_name;
+			}
+		}
+
+		return $missing;
+	}
+
+	/**
 	 * Compute the full (prefixed) table name for an addon's short name.
 	 *
 	 * Returns the SANITIZED identifier so every caller agrees on the real
 	 * table name. CREATE TABLE already runs the name through sanitize_table()
 	 * (prepare() cannot bind identifiers), which strips characters like the
-	 * hyphen in addon ids such as "visual-editor". Without sanitizing here too,
+	 * hyphen in addon ids such as "my-addon". Without sanitizing here too,
 	 * DROP/count/exists would look for the un-stripped name and never match the
 	 * table that was actually created — leaking orphan tables on uninstall.
 	 *

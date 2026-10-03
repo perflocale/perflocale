@@ -295,6 +295,7 @@ final class StringScanJob extends AbstractJob {
 		$processed      = 0;
 		$total_found    = 0;
 		$total_inserted = 0;
+		$total_unmarked = 0;
 
 		$progress( 0, max( 1, $total ) );
 
@@ -313,6 +314,14 @@ final class StringScanJob extends AbstractJob {
 			$r               = $scanner->scan( $dir, $domain, $batch_size );
 			$total_found    += (int) ( $r['found'] ?? 0 );
 			$total_inserted += (int) ( $r['inserted'] ?? 0 );
+			$total_unmarked += $scanner->last_scan_unmarked_batches();
+
+			// Part of the target could not be read. Its unseen strings kept
+			// their old last_seen_at, so it counts against full coverage the
+			// same way a path-guard skip does.
+			if ( ! $scanner->last_scan_complete() ) {
+				$skipped[] = $dir;
+			}
 
 			++$processed;
 			$progress( $processed, $total );
@@ -328,14 +337,27 @@ final class StringScanJob extends AbstractJob {
 		// the operator never scans). Unix epoch = timezone-free comparison.
 		//
 		// Only arm it when coverage was ACTUALLY complete. A target rejected
-		// by the path guard (symlinked plugin dir, relocated wp-content) never
-		// re-marked its strings' last_seen_at, so arming the marker would let
-		// the 90-day GC delete strings — and their translations — that are
-		// still very much in use. Leaving the marker untouched keeps the GC
-		// disarmed, which fails safe.
-		if ( $skipped === [] && $domain === '' ) {
+		// by the path guard (symlinked plugin dir, relocated wp-content), or
+		// one the scanner could not read in full, never re-marked its strings'
+		// last_seen_at, so arming the marker would let the 90-day GC delete
+		// strings — and their translations — that are still very much in use.
+		// The same holds when a database error kept a batch of already-stored
+		// strings from being re-marked as seen. Leaving the marker untouched
+		// means this run neither arms nor extends the GC window; a marker from
+		// an earlier complete scan still applies until it ages out.
+		if ( $total_unmarked > 0 ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a partial scan.
+			error_log(
+				sprintf(
+					'[PerfLocale] String scan could not re-mark %d batch(es) of stored strings as seen because of a database error, so this scan does not re-arm the stale-string GC. Run the scan again.',
+					$total_unmarked
+				)
+			);
+		}
+
+		if ( $skipped === [] && $total_unmarked === 0 && $domain === '' ) {
 			update_option( 'perflocale_strings_last_full_scan', time(), false );
-		} elseif ( $skipped === [] ) {
+		} elseif ( $skipped === [] && $domain !== '' ) {
 			// Every target was readable, but the run was filtered to ONE text
 			// domain, so it only re-stamped last_seen_at for that domain's rows;
 			// every other domain's strings look untouched to the GC. Arming the
@@ -348,15 +370,15 @@ final class StringScanJob extends AbstractJob {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a filtered scan.
 			error_log(
 				sprintf(
-					'[PerfLocale] String scan was filtered to text domain "%s"; it carries no liveness signal for other domains, so the stale-string GC stays disarmed.',
+					'[PerfLocale] String scan was filtered to text domain "%s"; it carries no liveness signal for other domains, so this scan does not re-arm the stale-string GC.',
 					$domain
 				)
 			);
-		} else {
+		} elseif ( $skipped !== [] ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a partial scan.
 			error_log(
 				sprintf(
-					'[PerfLocale] String scan covered %d/%d targets; %d unreadable path(s) skipped, so the stale-string GC stays disarmed: %s',
+					'[PerfLocale] String scan read %d/%d targets in full; %d were skipped or only partly read, so this scan does not re-arm the stale-string GC: %s',
 					$total - count( $skipped ),
 					$total,
 					count( $skipped ),
@@ -370,22 +392,25 @@ final class StringScanJob extends AbstractJob {
 		$string_repo = new StringRepository( $cache );
 		$db_total    = $string_repo->count();
 
-		// `targets` is what was actually SCANNED, not what was selected. A
-		// target the path guard rejected contributed no strings, so counting
-		// it here made the stored result claim coverage the run did not have —
-		// the same shape as the disarmed-GC marker above, which is already
-		// conditioned on $skipped. `skipped_targets` (and a bounded sample of
-		// the paths) is the operator's only in-UI signal: the error_log line
-		// is unreachable on most managed hosts, and the Jobs → Details panel
-		// renders this array.
+		// `targets` is what was actually SCANNED in full, not what was
+		// selected. A target the path guard rejected, or one only partly
+		// read, did not re-mark all of its strings, so counting it here would
+		// make the stored result claim coverage the run did not have — the
+		// same shape as the GC marker above, which is conditioned on
+		// $skipped. `skipped_targets` (and a bounded sample of the paths) is
+		// the operator's only in-UI signal: the error_log line is unreachable
+		// on most managed hosts, and the Jobs → Details panel renders this
+		// array. `unmarked_batches` counts the batches a database error kept
+		// from being re-marked as seen.
 		$result = [
-			'found'           => $total_found,
-			'inserted'        => $total_inserted,
-			'scan_new'        => $total_inserted,
-			'scan_total'      => $db_total,
-			'targets'         => $total - count( $skipped ),
-			'targets_total'   => $total,
-			'skipped_targets' => count( $skipped ),
+			'found'            => $total_found,
+			'inserted'         => $total_inserted,
+			'scan_new'         => $total_inserted,
+			'scan_total'       => $db_total,
+			'targets'          => $total - count( $skipped ),
+			'targets_total'    => $total,
+			'skipped_targets'  => count( $skipped ),
+			'unmarked_batches' => $total_unmarked,
 		];
 
 		if ( $skipped !== [] ) {
@@ -406,8 +431,8 @@ final class StringScanJob extends AbstractJob {
 				array_slice( $skipped, 0, 5 )
 			);
 			$result['first_error']   = sprintf(
-				/* translators: 1: number of unreadable targets, 2: total number of targets. */
-				__( 'Partial scan: %1$d of %2$d targets could not be read, so the stale-string cleanup stays disabled. Check that every plugin/theme directory resolves inside wp-content.', 'perflocale' ),
+				/* translators: 1: number of targets that could not be fully read, 2: total number of targets. */
+				__( 'Partial scan: %1$d of %2$d targets could not be fully read, so this scan does not count as a full scan for the stale-string cleanup. Check that every plugin/theme directory resolves inside wp-content and that PHP can read all of its folders and files.', 'perflocale' ),
 				count( $skipped ),
 				$total
 			);

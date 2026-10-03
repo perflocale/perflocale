@@ -310,6 +310,18 @@ final class PostTranslationManager {
 	}
 
 	/**
+	 * Whether this process is inside a translation create right now (post or
+	 * term). The new object's copied meta, image and terms are written from
+	 * the group's source, so nothing written during the create is a change
+	 * for other members to follow.
+	 *
+	 * @return bool
+	 */
+	public static function is_creating(): bool {
+		return self::$creation_locks_held !== [];
+	}
+
+	/**
 	 * Wait for a creation lock held by another process, then run the create
 	 * under it.
 	 *
@@ -477,15 +489,20 @@ final class PostTranslationManager {
 			default => 'draft', // 'empty' also creates a draft - the translation status tracks "empty" separately.
 		};
 
-		// Create the new post with content from the resolved source.
+		// Create the new post with content from the resolved source. The
+		// source's password comes along whether or not the content does: the
+		// translation is the same page in another language, so the password
+		// that protects the source protects the translation too, also once a
+		// translator fills in an empty one.
 		$new_post_data = [
-			'post_type'    => $content_source->post_type,
-			'post_status'  => $post_status,
-			'post_author'  => $content_source->post_author,
-			'post_title'   => $content_source->post_title,
-			'post_name'    => $content_source->post_name,
-			'post_content' => $copy_content ? $content_source->post_content : '',
-			'post_excerpt' => $copy_content ? $content_source->post_excerpt : '',
+			'post_type'     => $content_source->post_type,
+			'post_status'   => $post_status,
+			'post_author'   => $content_source->post_author,
+			'post_title'    => $content_source->post_title,
+			'post_name'     => $content_source->post_name,
+			'post_content'  => $copy_content ? $content_source->post_content : '',
+			'post_excerpt'  => $copy_content ? $content_source->post_excerpt : '',
+			'post_password' => $content_source->post_password,
 		];
 
 		// Hierarchical types: attach the new translation to the PARENT'S
@@ -573,77 +590,133 @@ final class PostTranslationManager {
 			$this->groups->invalidate_group_cache( (int) $source_group->id );
 		}
 
-		// Copy meta, featured image, and taxonomy terms from the content
-		// source. Failures here don't roll back the link (a translation with
-		// missing meta is re-syncable; a rolled-back link loses the
-		// translator's work) but aren't swallowed either. Each step has its own
-		// try/catch so one failure doesn't skip the rest; collected failures
-		// persist to `_perflocale_meta_copy_errors` (MetaBox shows + clears the
-		// notice) and fire `perflocale/translation/meta_copy_failed` for
-		// integrators.
+		$this->finish_new_translation( $content_source, $new_post_id, $target_slug, $source_id );
+
+		return $new_post_id;
+	}
+
+	/**
+	 * Give a translation an importer inserted and linked what create_translation()
+	 * gives its own translations: the content source's meta, featured image and
+	 * taxonomy terms (term translations are created as needed), then the
+	 * `perflocale/translation/created` action, which is where the WooCommerce
+	 * addon gives a product translation its product type and variations.
+	 *
+	 * The content source is resolved as create_translation() resolves it: the
+	 * group's default-language member. Everything is written as part of a
+	 * translation create ({@see self::is_creating()} is true), so sync listeners
+	 * take it for the new post's starting state, not for an edit to pass on.
+	 *
+	 * @param int    $new_post_id Translation post, already linked in the source's group.
+	 * @param int    $source_id   Post it translates.
+	 * @param string $target_slug Language slug of the translation.
+	 * @return bool False when the source post is gone; nothing is copied then.
+	 */
+	public function complete_imported_translation( int $new_post_id, int $source_id, string $target_slug ): bool {
+		$content_source = $this->resolve_source_post( $source_id );
+
+		if ( ! $content_source instanceof \WP_Post || ! get_post( $new_post_id ) instanceof \WP_Post ) {
+			return false;
+		}
+
+		$held_key = get_current_blog_id() . ':import_xlat_post_' . $new_post_id;
+
+		self::$creation_locks_held[ $held_key ] = true;
+
+		try {
+			$this->finish_new_translation( $content_source, $new_post_id, $target_slug, $source_id );
+		} finally {
+			unset( self::$creation_locks_held[ $held_key ] );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Copy meta, featured image and taxonomy terms from the content source to a
+	 * new, linked translation, then fire `perflocale/translation/created`.
+	 *
+	 * Failures here don't roll back the link (a translation with missing meta
+	 * is re-syncable; a rolled-back link loses the translator's work) but
+	 * aren't swallowed either. Each step has its own try/catch so one failure
+	 * doesn't skip the rest; collected failures persist to
+	 * `_perflocale_meta_copy_errors` (MetaBox shows + clears the notice) and
+	 * fire `perflocale/translation/meta_copy_failed` for integrators.
+	 *
+	 * @param \WP_Post $content_source Post the meta, image and terms come from.
+	 * @param int      $new_post_id    New translation post ID.
+	 * @param string   $target_slug    Target language slug.
+	 * @param int      $source_id      Post the translation was created from.
+	 * @return void
+	 */
+	private function finish_new_translation( \WP_Post $content_source, int $new_post_id, string $target_slug, int $source_id ): void {
 		$copy_errors = [];
 
 		try {
-			$this->copy_post_meta( $content_source->ID, $new_post_id ); } catch ( \Throwable $e ) {
+			$this->copy_post_meta( $content_source->ID, $new_post_id );
+		} catch ( \Throwable $e ) {
 			$copy_errors[] = [
 				'step'    => 'post_meta',
 				'message' => $e->getMessage(),
-			]; }
+			];
+		}
 
-			try {
-				$this->copy_featured_image( $content_source->ID, $new_post_id ); } catch ( \Throwable $e ) {
-						$copy_errors[] = [
-							'step'    => 'featured_image',
-							'message' => $e->getMessage(),
-						]; }
+		try {
+			$this->copy_featured_image( $content_source->ID, $new_post_id, $target_slug );
+		} catch ( \Throwable $e ) {
+			$copy_errors[] = [
+				'step'    => 'featured_image',
+				'message' => $e->getMessage(),
+			];
+		}
 
-				try {
-					$this->copy_taxonomy_terms( $content_source->ID, $new_post_id, $target_slug ); } catch ( \Throwable $e ) {
-						$copy_errors[] = [
-							'step'    => 'taxonomy_terms',
-							'message' => $e->getMessage(),
-						]; }
+		try {
+			$this->copy_taxonomy_terms( $content_source->ID, $new_post_id, $target_slug );
+		} catch ( \Throwable $e ) {
+			$copy_errors[] = [
+				'step'    => 'taxonomy_terms',
+				'message' => $e->getMessage(),
+			];
+		}
 
-					if ( ! empty( $copy_errors ) ) {
-						update_post_meta( $new_post_id, '_perflocale_meta_copy_errors', wp_slash( $copy_errors ) );
+		if ( ! empty( $copy_errors ) ) {
+			update_post_meta( $new_post_id, '_perflocale_meta_copy_errors', wp_slash( $copy_errors ) );
 
-						if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-							foreach ( $copy_errors as $err ) {
-								// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- intentional debug logging
-								error_log( 'PerfLocale: copy_' . $err['step'] . ' failed during create_translation for post ' . $new_post_id . ': ' . $err['message'] );
-							}
-						}
+			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+				foreach ( $copy_errors as $err ) {
+					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- intentional debug logging
+					error_log( 'PerfLocale: copy_' . $err['step'] . ' failed during create_translation for post ' . $new_post_id . ': ' . $err['message'] );
+				}
+			}
 
-						/**
-						 * Fires when one or more copy_* steps failed during translation
-						 * creation. The translation post + link are still created;
-						 * this signal exists so integrators can surface the failure
-						 * to the operator (Slack alert, email, error tracker, etc.).
-						 *
-						 * @hook  perflocale/translation/meta_copy_failed
-						 * @since 1.0.0
-						 *
-						 * @param int                                                  $new_post_id Newly-created translation post ID.
-						 * @param int                                                  $source_id   Source post ID the translation was created from.
-						 * @param string                                               $target_slug Target language slug.
-						 * @param array<int, array{step: string, message: string}>     $errors      One entry per failed copy step.
-						 */
-						do_action( 'perflocale/translation/meta_copy_failed', $new_post_id, $content_source->ID, $target_slug, $copy_errors );
-					}
+			/**
+			 * Fires when one or more copy_* steps failed during translation
+			 * creation. The translation post + link are still created;
+			 * this signal exists so integrators can surface the failure
+			 * to the operator (Slack alert, email, error tracker, etc.).
+			 *
+			 * @hook  perflocale/translation/meta_copy_failed
+			 * @since 1.0.0
+			 *
+			 * @param int                                                  $new_post_id Newly-created translation post ID.
+			 * @param int                                                  $source_id   Source post ID the translation was created from.
+			 * @param string                                               $target_slug Target language slug.
+			 * @param array<int, array{step: string, message: string}>     $errors      One entry per failed copy step.
+			 */
+			do_action( 'perflocale/translation/meta_copy_failed', $new_post_id, $content_source->ID, $target_slug, $copy_errors );
+		}
 
-					/**
-					 * Fires after a translation post is created.
-					 *
-					 * @hook perflocale/translation/created
-					 *
-					 * @param int $new_id Newly-created post ID.
-					 * @param string $type Object type ('post' or 'term').
-					 * @param string $target_slug Target language slug.
-					 * @param int $source_id Source post ID the translation was created from.
-					 */
-					do_action( 'perflocale/translation/created', $new_post_id, 'post', $target_slug, $source_id );
-
-					return $new_post_id;
+		/**
+		 * Fires after a translation post is created.
+		 *
+		 * @hook perflocale/translation/created
+		 *
+		 * @param int $new_id Newly-created post ID.
+		 * @param string $type Object type ('post' or 'term').
+		 * @param string $target_slug Target language slug.
+		 * @param int $source_id Source post ID the translation was created from.
+		 */
+		do_action( 'perflocale/translation/created', $new_post_id, 'post', $target_slug, $source_id );
 	}
 
 	/**
@@ -723,6 +796,91 @@ final class PostTranslationManager {
 	}
 
 	/**
+	 * Key segments that mark a meta key as a credential or secret (see
+	 * is_sensitive_meta_key()). Such keys are never copied to a translation,
+	 * seeded onto one, or sent to a machine translation provider.
+	 */
+	private const SENSITIVE_META_PATTERNS = [
+		'_password',
+		'_secret',
+		'_token',
+		'_api_key',
+		'_apikey',
+		'stripe',
+		'paypal',
+		'_credentials',
+		'_encrypted',
+		'_auth',
+	];
+
+	/**
+	 * The sensitive meta-key patterns in force for the current site.
+	 *
+	 * Runs the filter on every call rather than memoising: the answer can
+	 * differ per blog, and callers ask once per operation, not per key.
+	 * Entries that are not strings are dropped.
+	 *
+	 * @return array<int, string>
+	 */
+	public static function sensitive_meta_patterns(): array {
+		/** @hook perflocale/translation/dangerous_meta_patterns Filter patterns for meta keys that should never be copied. */
+		$patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', self::SENSITIVE_META_PATTERNS );
+
+		if ( ! is_array( $patterns ) ) {
+			return [];
+		}
+
+		return array_values( array_filter( $patterns, 'is_string' ) );
+	}
+
+	/**
+	 * Whether a meta key matches one of the sensitive patterns, ignoring case.
+	 *
+	 * A built-in pattern matches whole segments of the key: it starts at the
+	 * key's start, after a character that is not a letter or digit (a
+	 * pattern's leading `_` is that character) or where a lower-case letter
+	 * is followed by an upper-case one, and ends at the key's end or at such
+	 * a boundary. Plural `s`, digits and glued credential words (`key`,
+	 * `token`, `secret`, `hash`, `salt`, `code`, `id`, and the `auth`
+	 * compounds `authorize`, `authorization` and `authentication`) may come
+	 * between, one after another. So `_auth` matches `api_auth`,
+	 * `_auth_token`, `_authkey`, `_authTokenHash` and `_authcodehash`, and
+	 * `stripe` matches `stripeSecretKey`, not `book_author`, `_authority` or
+	 * `pinstripe_color`; every key it matches also holds the pattern as a
+	 * substring. Any other pattern, such as one added through the filter,
+	 * matches anywhere in the key.
+	 *
+	 * @param string       $key      Meta key.
+	 * @param array<mixed> $patterns Patterns from sensitive_meta_patterns();
+	 *                               entries that are not strings are ignored.
+	 * @return bool
+	 */
+	public static function is_sensitive_meta_key( string $key, array $patterns ): bool {
+		foreach ( $patterns as $pattern ) {
+			if ( ! is_string( $pattern ) ) {
+				continue;
+			}
+
+			if ( in_array( strtolower( $pattern ), self::SENSITIVE_META_PATTERNS, true ) ) {
+				// The pattern and the glued words ignore case, the boundaries
+				// do not. Each glued alternative consumes its own text (one
+				// digit, not a run), so the repeated group cannot backtrack
+				// exponentially on a long key.
+				$left  = preg_match( '/^[a-z0-9]/i', $pattern ) ? '(?:(?<![a-zA-Z0-9])|(?<=[a-z])(?=[A-Z]))' : '';
+				$right = preg_match( '/[a-z0-9]$/i', $pattern ) ? '(?i:s|[0-9]|key|token|secret|hash|salt|code|id|oriz(?:e|ation)|entication)*(?:(?![a-zA-Z0-9])|(?<=[a-z])(?=[A-Z]))' : '';
+
+				if ( preg_match( '/' . $left . '(?i:' . preg_quote( $pattern, '/' ) . ')' . $right . '/', $key ) ) {
+					return true;
+				}
+			} elseif ( stripos( $key, $pattern ) !== false ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * Copy post meta from source to target, excluding internal WP keys.
 	 *
 	 * @param int $source_id Source post ID.
@@ -747,28 +905,15 @@ final class PostTranslationManager {
 			// Per-source copy-failure bookkeeping — copying it would surface a
 			// stale failure notice on a freshly-created translation.
 			'_perflocale_meta_copy_errors',
+			// Keys the copy source's owner emptied. The new translation has not
+			// emptied anything, so it must still receive later seeds.
+			ContentSync::SEED_CLEARED_META,
 		];
 
 		/** @hook perflocale/translation/excluded_meta_keys Filter meta keys excluded from copying. */
 		$excluded = apply_filters( 'perflocale/translation/excluded_meta_keys', $excluded, $source_id );
 
-		// Patterns that indicate sensitive/credential meta keys.
-		// These are NEVER copied to prevent leaking secrets to translators.
-		$dangerous_patterns = [
-			'_password',
-			'_secret',
-			'_token',
-			'_api_key',
-			'_apikey',
-			'stripe',
-			'paypal',
-			'_credentials',
-			'_encrypted',
-			'_auth',
-		];
-
-		/** @hook perflocale/translation/dangerous_meta_patterns Filter patterns for meta keys that should never be copied. */
-		$dangerous_patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', $dangerous_patterns );
+		$dangerous_patterns = self::sensitive_meta_patterns();
 
 		foreach ( $all_meta as $key => $values ) {
 			if ( in_array( $key, $excluded, true ) || str_starts_with( $key, '_wp_trash' ) ) {
@@ -787,16 +932,7 @@ final class PostTranslationManager {
 			}
 
 			// Skip keys matching dangerous patterns (credentials, tokens, secrets).
-			$is_dangerous = false;
-
-			foreach ( $dangerous_patterns as $pattern ) {
-				if ( stripos( $key, $pattern ) !== false ) {
-					$is_dangerous = true;
-					break;
-				}
-			}
-
-			if ( $is_dangerous ) {
+			if ( self::is_sensitive_meta_key( (string) $key, $dangerous_patterns ) ) {
 				continue;
 			}
 
@@ -835,16 +971,44 @@ final class PostTranslationManager {
 	/**
 	 * Copy featured image from source to target.
 	 *
-	 * @param int $source_id Source post ID.
-	 * @param int $target_id Target post ID.
+	 * @param int    $source_id   Source post ID.
+	 * @param int    $target_id   Target post ID.
+	 * @param string $target_slug Target language slug.
 	 * @return void
 	 */
-	private function copy_featured_image( int $source_id, int $target_id ): void {
+	private function copy_featured_image( int $source_id, int $target_id, string $target_slug ): void {
 		$thumbnail_id = get_post_thumbnail_id( $source_id );
 
 		if ( $thumbnail_id ) {
-			set_post_thumbnail( $target_id, $thumbnail_id );
+			set_post_thumbnail( $target_id, $this->attachment_in_language( (int) $thumbnail_id, $target_slug ) );
 		}
+	}
+
+	/**
+	 * The copy of an attachment that belongs to a language, when the site has one.
+	 *
+	 * Media is translated in place (per-language alt text and captions on the
+	 * one attachment), but a site migrated from a plugin that duplicated media
+	 * per language keeps those copies linked in a translation group, each with
+	 * its own alt text and caption. A featured image copied or synced to a
+	 * translation then takes that language's copy.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $lang_slug     Language slug.
+	 * @return int The language's copy, or $attachment_id when it has none.
+	 */
+	public function attachment_in_language( int $attachment_id, string $lang_slug ): int {
+		if ( $attachment_id <= 0 || $lang_slug === '' ) {
+			return $attachment_id;
+		}
+
+		$copy_id = $this->get_translations( $attachment_id )[ $lang_slug ] ?? 0;
+
+		if ( $copy_id > 0 && $copy_id !== $attachment_id && get_post_type( $copy_id ) === 'attachment' ) {
+			return (int) $copy_id;
+		}
+
+		return $attachment_id;
 	}
 
 	/**
@@ -971,10 +1135,10 @@ final class PostTranslationManager {
 		// No group exists yet. Two admins translating the same untranslated
 		// source within a second both read $group===null and create separate
 		// groups (translation_groups has no UNIQUE on (type, object_id)), so
-		// serialise this path with the token-guarded Lock. Its option_name
-		// prefix (`perflocale_link_lock_%`) is kept stable for ops greps, and
-		// its CAS reclaim + token-guarded release avoid the TOCTOU races a
-		// plain add_option lock has.
+		// serialise this path with the token-guarded Lock (option
+		// perflocale_lock_link_post_first_group_<source id>). Its CAS reclaim
+		// and token-guarded release avoid the TOCTOU races a plain add_option
+		// lock has.
 		$lock_name = 'link_post_first_group_' . $source_id;
 
 		$lock_result = \PerfLocale\Concurrency\Lock::with(
@@ -1207,6 +1371,27 @@ final class PostTranslationManager {
 		}
 	}
 
+	/**
+	 * Swap a post's wrong-language terms for their siblings in its current
+	 * language, when the term swap service is loaded in this request.
+	 *
+	 * @param int $post_id Post whose language changed.
+	 * @return void
+	 */
+	private function normalize_terms_to_language( int $post_id ): void {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'term_assignment_filter' ) ) {
+			return;
+		}
+
+		$filter = $plugin->get( 'term_assignment_filter' );
+
+		if ( $filter instanceof TermAssignmentFilter ) {
+			$filter->normalize_post_terms( $post_id );
+		}
+	}
+
 	public function set_post_language( int $post_id, string $lang_slug ): bool {
 		$lang = $this->languages->find_by_slug( $lang_slug );
 
@@ -1317,6 +1502,19 @@ final class PostTranslationManager {
 			// transition_post_status, so bump found_rows explicitly.
 			$this->maybe_flush_found_rows( $post_id );
 
+			// Terms attached under the previous language follow the post to
+			// its new one (a post created with terms is labelled with the
+			// default language first, and its terms swapped to match).
+			if ( $updated === 1 ) {
+				$this->normalize_terms_to_language( $post_id );
+
+				// Cached WP_Query results are keyed by their SQL and the posts
+				// last_changed stamp; the language constraint in that SQL is
+				// unchanged, so without a new stamp the post stays in its old
+				// language's cached lists.
+				wp_cache_set_posts_last_changed();
+			}
+
 			return true;
 		}
 
@@ -1339,6 +1537,9 @@ final class PostTranslationManager {
 			// a language-filtered archive — bump found_rows (no
 			// transition_post_status fires on this REST/CLI path).
 			$this->maybe_flush_found_rows( $post_id );
+
+			// The post joins its language's cached WP_Query lists.
+			wp_cache_set_posts_last_changed();
 		}
 
 		return $group_id !== false;

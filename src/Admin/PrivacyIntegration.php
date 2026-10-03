@@ -41,6 +41,13 @@ final class PrivacyIntegration {
 	private const SLUG = 'perflocale';
 
 	/**
+	 * Background-job rows per exporter page. WordPress asks for page N+1
+	 * while `done` is false, so this bounds one AJAX request, not the
+	 * export.
+	 */
+	private const EXPORT_JOBS_PER_PAGE = 200;
+
+	/**
 	 * Per-user meta keys PerfLocale stores. Used by both the exporter (to
 	 * surface them to the data subject) and the eraser (to delete them).
 	 *
@@ -123,9 +130,10 @@ final class PrivacyIntegration {
 
 	/**
 	 * Return the user's PerfLocale admin-UI preferences and the background
-	 * jobs they dispatched, in the shape WordPress expects. Everything fits
-	 * in a single page (fixed key set + GC-pruned jobs table), so the first
-	 * page always returns `done => true`.
+	 * jobs they dispatched, in the shape WordPress expects. The preferences
+	 * are a fixed key set sent on page 1; the jobs are paged by
+	 * EXPORT_JOBS_PER_PAGE, and `done` stays false while a page comes back
+	 * full.
 	 *
 	 * @param string $email_address Subject's email.
 	 * @param int    $page          Pagination cursor, 1-based; supplied by WP.
@@ -144,9 +152,12 @@ final class PrivacyIntegration {
 		global $wpdb;
 
 		$data = [];
+		$page = max( 1, $page );
 
-		// Everything is a fixed, small set — emit on page 1 only.
-		if ( max( 1, $page ) === 1 ) {
+		// The preferences are a fixed, small set — emit on page 1 only.
+		// WordPress merges items that share an item_id, so repeating them on
+		// later pages would duplicate their fields in the export.
+		if ( 1 === $page ) {
 			$meta_fields = [];
 
 			foreach ( self::USER_META_KEYS as $meta_key ) {
@@ -170,49 +181,59 @@ final class PrivacyIntegration {
 					'data'        => $meta_fields,
 				];
 			}
-
-			// Background jobs this user dispatched — the eraser zeroes
-			// `created_by` on these rows, so the access request must surface
-			// them too. The jobs table is pruned by the daily GC, so the row
-			// set is naturally small; LIMIT is a safety valve, not pagination.
-			$jobs_table = Schema::table( 'jobs' );
-
-			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $jobs_table is Schema::table('jobs'), bound as a %i identifier.
-			$job_rows = (array) $wpdb->get_results(
-				$wpdb->prepare(
-					'SELECT uuid, type, status, created_at FROM %i WHERE created_by = %d ORDER BY id ASC LIMIT 200',
-					$jobs_table,
-					(int) $user->ID
-				)
-			);
-			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-			foreach ( $job_rows as $job ) {
-				$data[] = [
-					'group_id'    => 'perflocale-jobs',
-					'group_label' => __( 'PerfLocale Background Jobs', 'perflocale' ),
-					'item_id'     => 'perflocale-job-' . (string) ( $job->uuid ?? '' ),
-					'data'        => [
-						[
-							'name'  => __( 'Job type', 'perflocale' ),
-							'value' => (string) ( $job->type ?? '' ),
-						],
-						[
-							'name'  => __( 'Status', 'perflocale' ),
-							'value' => (string) ( $job->status ?? '' ),
-						],
-						[
-							'name'  => __( 'Dispatched at', 'perflocale' ),
-							'value' => (string) ( $job->created_at ?? '' ),
-						],
-					],
-				];
-			}
 		}
 
+		// Background jobs this user dispatched — the eraser zeroes
+		// `created_by` on these rows, so the access request must surface
+		// them too. A chained job (a site-wide machine translation, for one)
+		// writes a row per chunk, so one user can own more rows than a page
+		// holds. WordPress passes only a page number, so pages are
+		// OFFSET-based, like core's comments exporter: each exported row
+		// deleted before the next request (the daily GC, a job deleted from
+		// the Jobs screen or WP-CLI) makes that page skip one later row, and
+		// running the export again includes it. An erasure zeroes every row
+		// in one statement, so it leaves nothing to skip.
+		$jobs_table = Schema::table( 'jobs' );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $jobs_table is Schema::table('jobs'), bound as a %i identifier.
+		$job_rows = (array) $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT uuid, type, status, created_at FROM %i WHERE created_by = %d ORDER BY id ASC LIMIT %d OFFSET %d',
+				$jobs_table,
+				(int) $user->ID,
+				self::EXPORT_JOBS_PER_PAGE,
+				( $page - 1 ) * self::EXPORT_JOBS_PER_PAGE
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		foreach ( $job_rows as $job ) {
+			$data[] = [
+				'group_id'    => 'perflocale-jobs',
+				'group_label' => __( 'PerfLocale Background Jobs', 'perflocale' ),
+				'item_id'     => 'perflocale-job-' . (string) ( $job->uuid ?? '' ),
+				'data'        => [
+					[
+						'name'  => __( 'Job type', 'perflocale' ),
+						'value' => (string) ( $job->type ?? '' ),
+					],
+					[
+						'name'  => __( 'Status', 'perflocale' ),
+						'value' => (string) ( $job->status ?? '' ),
+					],
+					[
+						'name'  => __( 'Dispatched at', 'perflocale' ),
+						'value' => (string) ( $job->created_at ?? '' ),
+					],
+				],
+			];
+		}
+
+		// A short page is the last one; a full page may have more behind it
+		// (at worst, one empty page follows).
 		return [
 			'data' => $data,
-			'done' => true,
+			'done' => count( $job_rows ) < self::EXPORT_JOBS_PER_PAGE,
 		];
 	}
 
@@ -247,11 +268,14 @@ final class PrivacyIntegration {
 		// 1. Anonymise queued / running / recently-finished background jobs
 		// dispatched by this user. JobState options carry `created_by` —
 		// zeroing it makes pending runs fail their cap re-validation, which
-		// is the right behavior for an erased user.
-		$jobs_anonymised = \PerfLocale\Background\JobState::anonymize_for_user( (int) $user->ID );
+		// is the right behavior for an erased user. Null means the UPDATE
+		// failed and the rows still carry the user's ID.
+		$jobs_result     = \PerfLocale\Background\JobState::try_anonymize_for_user( (int) $user->ID );
+		$jobs_failed     = null === $jobs_result;
+		$jobs_anonymised = (int) $jobs_result;
 
 		// 2. Delete every PerfLocale user-meta entry — these are pure UI
-		// state, no shared-history concern.
+		// state, no shared-history concern. Runs even when step 1 failed.
 		$meta_deleted = 0;
 
 		foreach ( self::USER_META_KEYS as $meta_key ) {
@@ -262,6 +286,9 @@ final class PrivacyIntegration {
 
 		$messages = [];
 
+		if ( $jobs_failed ) {
+			$messages[] = __( 'PerfLocale could not update its background-job records, so they may still contain your user ID. Run the erasure again.', 'perflocale' );
+		}
 
 		if ( $jobs_anonymised > 0 ) {
 			$messages[] = sprintf(
@@ -289,14 +316,21 @@ final class PrivacyIntegration {
 			);
 		}
 
-		// Returned as INTEGER counts. WP's privacy controller does
-		// `(int) $response['items_removed']` so the integer form maps
-		// cleanly to the per-page aggregation and the admin UI's totals.
+		// Returned as integer counts. Core only checks that both keys
+		// exist, and privacy-tools.js only whether each value is truthy.
 		// Removals: user-meta entries + job-row anonymisations (the
-		// stored value is gone after each). Nothing is retained.
+		// stored value is gone after each). A failed job UPDATE is
+		// reported as one retained item (the row count is unknown). Core
+		// then shows the admin a one-time "not erased" warning beside the
+		// request, but once the last eraser is done it still marks the
+		// request completed and emails the data subject that the erasure
+		// is complete. `done` stays true: privacy-tools.js requests the
+		// next page at once, with no delay and no limit, so `done` = false
+		// would loop forever on a lasting failure (a missing table, a
+		// `query` filter that blocks the statement).
 		return [
 			'items_removed'  => $meta_deleted + $jobs_anonymised,
-			'items_retained' => 0,
+			'items_retained' => $jobs_failed ? 1 : 0,
 			'messages'       => $messages,
 			'done'           => true,
 		];
@@ -310,7 +344,7 @@ final class PrivacyIntegration {
 	 * first/last name — only included when no other user on the site shares
 	 * the value). Skips anything < 4 chars throughout.
 	 *
-	 * Public: the Visual Editor addon reuses the exact same pattern set for
+	 * Public: an add-on reuses the exact same pattern set for
 	 * its own dynamic-string scrub, so the two erasure flows can never
 	 * disagree about what counts as the subject's identifier.
 	 *
@@ -449,6 +483,43 @@ final class PrivacyIntegration {
 	}
 
 	/**
+	 * Who receives machine-translation content, as escaped HTML for the policy
+	 * text: the selected provider's label, not its id. The WordPress AI Client
+	 * sends content to whichever AI provider is connected under Settings →
+	 * Connectors, so that is what the text names.
+	 *
+	 * @param string $provider Selected provider id.
+	 * @return string
+	 */
+	private function mt_provider_recipient( string $provider ): string {
+		if ( $provider === '' ) {
+			return esc_html__( 'the configured machine-translation provider', 'perflocale' );
+		}
+
+		if ( $provider === 'wp_ai_client' ) {
+			return esc_html__( 'the AI provider connected under Settings → Connectors', 'perflocale' );
+		}
+
+		$label  = $provider;
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( $plugin->has( 'cache' ) ) {
+			try {
+				$service   = new \PerfLocale\MachineTranslation\TranslationService( $this->settings, $plugin->get( 'cache' ) );
+				$providers = $service->get_providers();
+
+				if ( isset( $providers[ $provider ] ) && $providers[ $provider ]->get_name() !== '' ) {
+					$label = $providers[ $provider ]->get_name();
+				}
+			} catch ( \Throwable $e ) {
+				unset( $e );
+			}
+		}
+
+		return '<strong>' . esc_html( $label ) . '</strong>';
+	}
+
+	/**
 	 * Build the HTML policy-text string the admin sees on Settings &rarr;
 	 * Privacy &rarr; Policy Guide. Split out of {@see add_privacy_policy_content()}
 	 * so the assembly can be inspected by tests + by callers that want to
@@ -511,9 +582,7 @@ final class PrivacyIntegration {
 				. '<p>' . sprintf(
 					/* translators: %s: configured machine-translation provider name */
 					esc_html__( 'Site administrators may send post, page, or string content to %s for machine translation. This is triggered by site staff, not by end visitors, and sends the content to the provider&rsquo;s API for the sole purpose of returning a translated version. Visit your provider&rsquo;s data-processing documentation for details on their retention and processing guarantees.', 'perflocale' ),
-					$provider !== ''
-						? '<strong>' . esc_html( $provider ) . '</strong>'
-						: esc_html__( 'the configured machine-translation provider', 'perflocale' )
+					$this->mt_provider_recipient( $provider )
 				) . '</p>'
 				. '<p>' . esc_html__(
 					'Text you send for machine translation is transmitted to the provider you configured and is not retained by PerfLocale beyond the translated result saved on the post.',

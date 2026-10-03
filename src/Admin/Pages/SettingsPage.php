@@ -157,6 +157,7 @@ final class SettingsPage {
 		?>
 		<div class="wrap perflocale-settings">
 			<h1><?php echo esc_html__( 'PerfLocale Settings', 'perflocale' ); ?></h1>
+			<hr class="wp-header-end">
 
 			<?php if ( $message === 'true' ) : ?>
 				<div class="notice notice-success is-dismissible">
@@ -267,17 +268,28 @@ final class SettingsPage {
 			$files_generated = isset( $_GET['files_generated'] ) ? absint( $_GET['files_generated'] ) : -1;
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$repaired = isset( $_GET['repaired'] ) ? absint( $_GET['repaired'] ) : 0;
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$files_read_failed = isset( $_GET['files_read_failed'] ) ? absint( $_GET['files_read_failed'] ) : 0;
 
 			if ( $files_generated >= 0 ) :
 				?>
-				<div class="notice notice-success is-dismissible">
+				<div class="notice <?php echo esc_attr( $files_read_failed > 0 ? 'notice-error' : 'notice-success' ); ?> is-dismissible">
 					<p>
 						<?php
-						printf(
-							/* translators: %d: number of files generated */
-							esc_html__( 'Translation files regenerated successfully. %d file(s) generated.', 'perflocale' ),
-							absint( $files_generated )
-						);
+						if ( $files_read_failed > 0 ) {
+							printf(
+								/* translators: 1: number of files generated, 2: number of languages whose translations could not be read */
+								esc_html__( 'Translation files were not fully regenerated. %1$d file(s) generated. The translations of %2$d language(s) could not be read from the database, so their existing translation files were kept. Try again, and check the database if this repeats.', 'perflocale' ),
+								absint( $files_generated ),
+								absint( $files_read_failed )
+							);
+						} else {
+							printf(
+								/* translators: %d: number of files generated */
+								esc_html__( 'Translation files regenerated successfully. %d file(s) generated.', 'perflocale' ),
+								absint( $files_generated )
+							);
+						}
 
 						if ( $repaired > 0 ) {
 							echo ' ';
@@ -291,6 +303,12 @@ final class SettingsPage {
 					</p>
 				</div>
 			<?php endif; ?>
+
+			<?php
+			if ( $active_tab === 'export-import' ) {
+				$this->render_import_notices();
+			}
+			?>
 
 			<nav class="nav-tab-wrapper" style="position: sticky; top: 32px; background: #f0f0f1; z-index: 10; display: flex; align-items: flex-end;">
 				<div class="perflocale-settings-tabs__items" style="flex: 1 1 auto; display: flex; align-items: flex-end;">
@@ -368,9 +386,11 @@ final class SettingsPage {
 	 *   - Each language's value is split on commas, uppercased, and only
 	 *     `[A-Z]{2}` codes are kept. Anything else (emoji, HTML, IDN,
 	 *     longer strings) is dropped silently.
-	 *   - Slugs not in the active-language list are dropped.
+	 *   - Posted slugs not in the active-language list are dropped.
 	 *   - Empty rows produce no entry (caller's `?? ''` keeps the UI
 	 *     consistent without bloating the saved option).
+	 *   - Stored rows of languages that are not active have no row on the
+	 *     form and are kept (see merge_language_map()).
 	 *
 	 * Returned shape: `[ slug => "AA,BB,CC" ]` — same shape the existing
 	 * runtime expects.
@@ -380,7 +400,7 @@ final class SettingsPage {
 	 */
 	private function sanitize_geo_country_map( $input ): array {
 		if ( ! is_array( $input ) ) {
-			return [];
+			$input = [];
 		}
 
 		$cache        = \PerfLocale\Plugin::get_instance()->get( 'cache' );
@@ -426,10 +446,172 @@ final class SettingsPage {
 				}
 			}
 
-			$out[ $slug ] = implode( ',', array_keys( $codes ) );
+			if ( $codes !== [] ) {
+				$out[ $slug ] = implode( ',', array_keys( $codes ) );
+			}
+		}
+
+		return self::merge_language_map( array_filter( (array) $this->settings->get( 'geo_country_map', [] ), 'is_string' ), $out, array_keys( $active_slugs ) );
+	}
+
+	/**
+	 * Merge a posted per-language map onto the stored one.
+	 *
+	 * The URL & Routing tab renders one row per ACTIVE language, so the post
+	 * says nothing about any other language. Entries of the rendered languages
+	 * come from the post: a row posted blank, or not posted, is removed.
+	 * Entries of any other language (one deactivated for now) are kept as
+	 * stored. The stored key order is kept, so a save that changes nothing
+	 * writes the same array back.
+	 *
+	 * @template T
+	 * @param array<int|string, T> $stored   Stored map.
+	 * @param array<int|string, T> $posted   Sanitized posted map without blank rows.
+	 * @param array<int, string>   $rendered Slugs that have a row on the form.
+	 * @return array<string, T>
+	 */
+	private static function merge_language_map( array $stored, array $posted, array $rendered ): array {
+		$out = [];
+
+		foreach ( $stored as $slug => $value ) {
+			$slug = (string) $slug;
+
+			if ( isset( $posted[ $slug ] ) ) {
+				$out[ $slug ] = $posted[ $slug ];
+			} elseif ( ! in_array( $slug, $rendered, true ) ) {
+				$out[ $slug ] = $value;
+			}
+		}
+
+		foreach ( $posted as $slug => $value ) {
+			if ( ! array_key_exists( (string) $slug, $out ) ) {
+				$out[ (string) $slug ] = $value;
+			}
 		}
 
 		return $out;
+	}
+
+	/**
+	 * A stored string setting, for a field the tab does not always render.
+	 *
+	 * @param string $key      Settings key.
+	 * @param string $fallback Value when nothing usable is stored.
+	 * @return string
+	 */
+	private function stored_string( string $key, string $fallback ): string {
+		$value = $this->settings->get( $key, $fallback );
+
+		return is_scalar( $value ) ? (string) $value : $fallback;
+	}
+
+	/**
+	 * The redirect priority order to store from a URL & Routing save.
+	 *
+	 * The form renders chips only for the redirect methods that are on (all
+	 * three as hidden inputs when exactly one is on, none when none is), in the
+	 * order get_redirect_priority_order() returns. An order posted exactly as
+	 * rendered keeps the stored value; a reordered one is written back into the
+	 * positions its methods hold, so a method without a chip keeps its place.
+	 *
+	 * @param array<int, string>|null $posted Sanitized posted order, or null when none was posted.
+	 * @return array<int, string>
+	 */
+	private function merge_redirect_priority_order( ?array $posted ): array {
+		$stored = array_values( array_filter( (array) $this->settings->get( 'redirect_priority_order' ), 'is_string' ) );
+
+		if ( $posted === null ) {
+			return $stored;
+		}
+
+		$effective = array_values( array_filter( (array) $this->settings->get_redirect_priority_order(), 'is_string' ) );
+		$posted    = array_values( array_intersect( array_unique( $posted ), $effective ) );
+		$rendered  = array_values( array_intersect( $effective, $posted ) );
+
+		if ( $posted === $rendered ) {
+			return $stored;
+		}
+
+		$queue = $posted;
+		$out   = [];
+
+		foreach ( $effective as $method ) {
+			$out[] = in_array( $method, $posted, true ) ? (string) array_shift( $queue ) : $method;
+		}
+
+		return $out;
+	}
+
+	/**
+	 * A checkbox list to store from a save.
+	 *
+	 * Entries that have a checkbox on the form come from the post. A stored
+	 * entry without one (a post type or taxonomy the tab does not offer or that
+	 * is not registered right now, a menu location of another theme) is kept.
+	 * The Translation tab also ticks every entry that is translatable right
+	 * now, including those an addon adds through
+	 * `perflocale/translatable_post_types` or `perflocale/translatable_taxonomies`.
+	 * Writing those into the stored list would keep them translatable after the
+	 * addon is turned off, so a ticked entry the filter added is not stored (one
+	 * the stored list already holds stays). The stored order is kept.
+	 *
+	 * @param array<int|string, mixed> $posted    Sanitized posted list.
+	 * @param array<int|string, mixed> $stored    Stored list.
+	 * @param array<int|string, mixed> $effective Filtered list the form was rendered from.
+	 * @param array<int, string>       $rendered  Entries that have a checkbox on the form.
+	 * @return array<int, string>
+	 */
+	private static function merge_checkbox_list( array $posted, array $stored, array $effective, array $rendered ): array {
+		$stored = array_values( array_filter( $stored, static fn( $name ): bool => is_string( $name ) && $name !== '' ) );
+		$added  = array_diff( array_filter( $effective, 'is_string' ), $stored );
+		$kept   = array_values( array_diff( array_filter( $posted, 'is_string' ), $added ) );
+		$out    = [];
+
+		foreach ( $stored as $name ) {
+			if ( in_array( $name, $kept, true ) || ! in_array( $name, $rendered, true ) ) {
+				$out[] = $name;
+			}
+		}
+
+		foreach ( $kept as $name ) {
+			if ( ! in_array( $name, $out, true ) ) {
+				$out[] = $name;
+			}
+		}
+
+		return array_values( array_unique( $out ) );
+	}
+
+	/**
+	 * Keep a fallback chain's targets that have no chip on the form.
+	 *
+	 * The chain editor shows a chip only for an ACTIVE target language, so a
+	 * stored target that is not active right now is never posted. It goes
+	 * back into its row at its stored position.
+	 *
+	 * @param array<string, array<int, string>> $posted   Posted rows without empty ones.
+	 * @param array<int|string, mixed>          $stored   Stored fallback map.
+	 * @param array<int, string>                $rendered Slugs that have a row on the form.
+	 * @return array<string, array<int, string>>
+	 */
+	private static function keep_unrendered_fallback_targets( array $posted, array $stored, array $rendered ): array {
+		foreach ( $rendered as $slug ) {
+			$row = $posted[ $slug ] ?? [];
+
+			foreach ( array_values( (array) ( $stored[ $slug ] ?? [] ) ) as $position => $target ) {
+				if ( ! is_string( $target ) || $target === '' || in_array( $target, $rendered, true ) || in_array( $target, $row, true ) ) {
+					continue;
+				}
+
+				array_splice( $row, min( $position, count( $row ) ), 0, [ $target ] );
+			}
+
+			if ( $row !== [] ) {
+				$posted[ $slug ] = $row;
+			}
+		}
+
+		return $posted;
 	}
 
 	/**
@@ -491,6 +673,18 @@ final class SettingsPage {
 		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Nonce verified above.
 		$values = [];
 
+		// Languages that have a row in the URL & Routing tab's per-language
+		// tables; stored entries of any other language are kept.
+		$rendered_slugs = [];
+
+		if ( $tab === 'url-routing' ) {
+			$rendered_slugs = array_values( array_filter( wp_list_pluck( \PerfLocale\Plugin::get_instance()->lang_repo()->get_active(), 'slug' ), 'is_string' ) );
+		}
+
+		// The fallback chain editor renders only with two or more active
+		// languages; with fewer, nothing is posted and the stored map is kept.
+		$fallback_rows = count( $rendered_slugs ) > 1 ? $rendered_slugs : [];
+
 		match ( $tab ) {
 			'url-routing' => $values = [
 				'url_mode'                   => isset( $_POST['url_mode'] ) && in_array( $_POST['url_mode'], [ 'subdirectory', 'subdomain', 'domain', 'query' ], true ) ? sanitize_key( wp_unslash( $_POST['url_mode'] ) ) : 'subdirectory',
@@ -498,40 +692,57 @@ final class SettingsPage {
 				'hide_default_prefix'        => isset( $_POST['hide_default_prefix'] ),
 				'redirect_browser_lang'      => isset( $_POST['redirect_browser_lang'] ),
 				'redirect_geo_enabled'       => isset( $_POST['redirect_geo_enabled'] ),
-				'geo_provider'               => isset( $_POST['geo_provider'] ) ? sanitize_key( wp_unslash( $_POST['geo_provider'] ) ) : '',
+				// The provider select renders only when a provider is registered;
+				// without one, keep the stored id.
+				'geo_provider'               => isset( $_POST['geo_provider'] ) ? sanitize_key( wp_unslash( $_POST['geo_provider'] ) ) : $this->stored_string( 'geo_provider', '' ),
 				'geo_cache_hours'            => isset( $_POST['geo_cache_hours'] ) ? absint( $_POST['geo_cache_hours'] ) : 24,
 				'geo_country_map'            => $this->sanitize_geo_country_map( $_POST['geo_country_map'] ?? [] ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized,WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- sanitize_geo_country_map handles unslash + per-key sanitisation.
 				'missing_translation_action' => isset( $_POST['missing_translation_action'] ) && in_array( $_POST['missing_translation_action'], [ 'show_default', 'show_404', 'redirect_default' ], true ) ? sanitize_key( wp_unslash( $_POST['missing_translation_action'] ) ) : 'show_default',
-				'language_fallbacks'         => isset( $_POST['language_fallbacks'] ) && is_array( $_POST['language_fallbacks'] )
-					? ( static function ( array $raw ): array {
-						$out = [];
+				'language_fallbacks'         => self::merge_language_map(
+					array_filter( (array) $this->settings->get( 'language_fallbacks', [] ), 'is_array' ),
+					self::keep_unrendered_fallback_targets(
+						isset( $_POST['language_fallbacks'] ) && is_array( $_POST['language_fallbacks'] )
+						? ( static function ( array $raw ): array {
+							$out = [];
 
-						foreach ( $raw as $slug => $row ) {
-							// Keys are language slugs and arrive from the POST
-							// body too — sanitize them, not just the row values.
-							// Settings::sanitize_language_fallbacks() re-checks
-							// on write; this keeps intake clean as well.
-							$slug = sanitize_key( (string) $slug );
+							foreach ( $raw as $slug => $row ) {
+								// Keys are language slugs and arrive from the POST
+								// body too — sanitize them, not just the row values.
+								// Settings::sanitize_language_fallbacks() re-checks
+								// on write; this keeps intake clean as well.
+								$slug = sanitize_key( (string) $slug );
 
-							if ( $slug === '' ) {
-								continue;
+								if ( $slug === '' ) {
+									continue;
+								}
+
+								$row = array_values( array_filter( array_map( 'sanitize_key', (array) $row ) ) );
+
+								if ( $row !== [] ) {
+									$out[ $slug ] = $row;
+								}
 							}
 
-							$out[ $slug ] = array_values( array_filter( array_map( 'sanitize_key', (array) $row ) ) );
-						}
-
-						return $out;
-					// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- keys and every row entry are sanitize_key'd inside the closure above.
-					} )( wp_unslash( (array) $_POST['language_fallbacks'] ) )
-					: [],
+							return $out;
+						// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- keys and every row entry are sanitize_key'd inside the closure above.
+						} )( wp_unslash( (array) $_POST['language_fallbacks'] ) )
+						: [],
+						(array) $this->settings->get( 'language_fallbacks', [] ),
+						$fallback_rows
+					),
+					$fallback_rows
+				),
 				'cookie_lifetime'            => isset( $_POST['cookie_lifetime'] ) ? absint( $_POST['cookie_lifetime'] ) : 365,
 				'disable_language_cookie'    => isset( $_POST['disable_language_cookie'] ),
 				'excluded_paths'             => isset( $_POST['excluded_paths'] ) ? array_map( 'sanitize_text_field', array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( wp_unslash( $_POST['excluded_paths'] ) ) ) ) ) ) : [],
 				// Normalize each entry to a bare lowercase host: strip any scheme,
 				// path/trailing slash, and case so apply_domain()'s host-equality
 				// check and ://host string-replace work (a stored "https://De.X/"
-				// would otherwise never match the request host "de.x").
-				'language_domains'           => isset( $_POST['language_domains'] )
+				// would otherwise never match the request host "de.x"). A blank
+				// row is not stored.
+				'language_domains'           => self::merge_language_map(
+					array_filter( (array) $this->settings->get( 'language_domains', [] ), 'is_string' ),
+					isset( $_POST['language_domains'] )
 					? ( static function ( array $raw ): array {
 						$out = [];
 
@@ -546,14 +757,19 @@ final class SettingsPage {
 
 							$v    = is_string( $v ) ? sanitize_text_field( wp_unslash( $v ) ) : '';
 							$host = wp_parse_url( str_contains( $v, '//' ) ? $v : '//' . $v, PHP_URL_HOST );
+							$host = strtolower( (string) ( $host ?: $v ) );
 
-							$out[ $slug ] = strtolower( (string) ( $host ?: $v ) );
+							if ( $host !== '' ) {
+								$out[ $slug ] = $host;
+							}
 						}
 
 						return $out;
 					// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized, WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- keys sanitize_key'd and each value sanitized + host-normalized inside the closure above.
 					} )( (array) $_POST['language_domains'] )
 					: [],
+					$rendered_slugs
+				),
 				// Rendered only inside `if ( edge_integration_enabled() )`, so on a
 				// save with the edge worker off the checkbox was never printed and
 				// isset() reads false — clearing a setting the operator could not
@@ -563,14 +779,30 @@ final class SettingsPage {
 					: (bool) $this->settings->get( 'redirect_edge_hint_enabled' ),
 				// Redirect-priority chip order. Sanitisation also lives in
 				// Settings::get_redirect_priority_order() (drops unknowns,
-				// dedupes, backfills missing methods) so this can stay simple.
-				'redirect_priority_order'    => isset( $_POST['redirect_priority_order'] )
-					? array_values( array_filter( array_map( 'sanitize_key', (array) wp_unslash( $_POST['redirect_priority_order'] ) ) ) )
-					: [],
+				// dedupes, backfills missing methods).
+				'redirect_priority_order'    => $this->merge_redirect_priority_order(
+					isset( $_POST['redirect_priority_order'] )
+						? array_values( array_filter( array_map( 'sanitize_key', (array) wp_unslash( $_POST['redirect_priority_order'] ) ) ) )
+						: null
+				),
 			],
 			'translation' => $values         = [
-				'translatable_post_types'    => self::pair_block_template_types( isset( $_POST['translatable_post_types'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_post_types'] ) : [] ),
-				'translatable_taxonomies'    => isset( $_POST['translatable_taxonomies'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_taxonomies'] ) : [],
+				// The tab never offers `attachment` (translation_tab_post_types()),
+				// so it counts as rendered and unticked: a stored one is not kept.
+				'translatable_post_types'    => self::pair_block_template_types(
+					self::merge_checkbox_list(
+						isset( $_POST['translatable_post_types'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_post_types'] ) : [],
+						(array) $this->settings->get( 'translatable_post_types', [] ),
+						$this->settings->get_translatable_post_types(),
+						array_merge( [ 'attachment' ], ...array_map( 'array_keys', $this->translation_tab_post_types() ) )
+					)
+				),
+				'translatable_taxonomies'    => self::merge_checkbox_list(
+					isset( $_POST['translatable_taxonomies'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_taxonomies'] ) : [],
+					(array) $this->settings->get( 'translatable_taxonomies', [] ),
+					$this->settings->get_translatable_taxonomies(),
+					array_map( 'strval', array_keys( get_taxonomies( [ 'public' => true ] ) ) )
+				),
 				'default_translation_status' => isset( $_POST['default_translation_status'] ) ? sanitize_text_field( wp_unslash( $_POST['default_translation_status'] ) ) : 'empty',
 				'auto_create_stubs'          => isset( $_POST['auto_create_stubs'] ),
 				'sync_fields'                => $this->merge_sync_fields(),
@@ -660,7 +892,8 @@ final class SettingsPage {
 				'switcher_layout'            => isset( $_POST['switcher_layout'] ) && in_array( $_POST['switcher_layout'], [ 'horizontal', 'vertical' ], true ) ? sanitize_key( wp_unslash( $_POST['switcher_layout'] ) ) : 'horizontal',
 				'switcher_name_format'       => isset( $_POST['switcher_name_format'] ) && in_array( $_POST['switcher_name_format'], [ 'native', 'english', 'both', 'slug' ], true ) ? sanitize_key( wp_unslash( $_POST['switcher_name_format'] ) ) : 'native',
 				'switcher_class'             => isset( $_POST['switcher_class'] ) ? sanitize_text_field( wp_unslash( $_POST['switcher_class'] ) ) : '',
-				'switcher_flag_style'        => isset( $_POST['switcher_flag_style'] ) ? sanitize_text_field( wp_unslash( $_POST['switcher_flag_style'] ) ) : 'rectangular',
+				// No control on this tab: keep the stored value unless one is posted.
+				'switcher_flag_style'        => isset( $_POST['switcher_flag_style'] ) ? sanitize_text_field( wp_unslash( $_POST['switcher_flag_style'] ) ) : $this->stored_string( 'switcher_flag_style', 'rectangular' ),
 				'switcher_show_untranslated' => isset( $_POST['switcher_show_untranslated'] ),
 				'switcher_hide_current'      => isset( $_POST['switcher_hide_current'] ),
 				'switcher_untranslated_link' => isset( $_POST['switcher_untranslated_link'] ) ? sanitize_text_field( wp_unslash( $_POST['switcher_untranslated_link'] ) ) : 'homepage',
@@ -675,11 +908,18 @@ final class SettingsPage {
 				// would lowercase them so the array_intersect never matched,
 				// silently dropping the operator's choice. The intersect is
 				// the whole security check; no extra sanitizer is needed.
-				'switcher_menu_locations'    => array_values(
-					array_intersect(
-						array_map( 'strval', (array) wp_unslash( $_POST['switcher_menu_locations'] ?? [] ) ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Whitelisted verbatim against registered keys below.
-						array_keys( get_registered_nav_menus() )
-					)
+				// Stored locations the active theme does not register have no
+				// checkbox and are kept for when that theme is active again.
+				'switcher_menu_locations'    => self::merge_checkbox_list(
+					array_values(
+						array_intersect(
+							array_map( 'strval', (array) wp_unslash( $_POST['switcher_menu_locations'] ?? [] ) ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Whitelisted verbatim against registered keys below.
+							array_keys( get_registered_nav_menus() )
+						)
+					),
+					(array) $this->settings->get( 'switcher_menu_locations', [] ),
+					[],
+					array_map( 'strval', array_keys( get_registered_nav_menus() ) )
 				),
 				'admin_bar_switcher'         => isset( $_POST['admin_bar_switcher'] ),
 			],
@@ -710,7 +950,7 @@ final class SettingsPage {
 				'background_thresholds'   => $this->extract_background_thresholds(),
 				'background_paused'       => isset( $_POST['background_paused'] ),
 			],
-			'advanced' => $values      = [
+			'advanced' => $values    = [
 				'edge_integration_enabled' => isset( $_POST['edge_integration_enabled'] ),
 				'cdn_cache_tags_enabled'   => isset( $_POST['cdn_cache_tags_enabled'] ),
 				'delete_data_on_uninstall' => isset( $_POST['delete_data_on_uninstall'] ),
@@ -718,14 +958,20 @@ final class SettingsPage {
 				'abilities_enabled'        => isset( $_POST['abilities_enabled'] ),
 				'abilities_write_enabled'  => isset( $_POST['abilities_write_enabled'] ),
 			],
-			'woocommerce' => $values   = [
+			'woocommerce' => $values = [
 				'wc_email_translation'      => isset( $_POST['wc_email_translation'] ),
 				'wc_sync_stock'             => isset( $_POST['wc_sync_stock'] ),
 				'wc_sync_prices'            => isset( $_POST['wc_sync_prices'] ),
 				'wc_currency_per_lang'      => isset( $_POST['wc_currency_per_lang'] ),
-				'wc_currencies'             => class_exists( 'PerfLocaleWooCommerce' ) ? \PerfLocaleWooCommerce::sanitize_currencies_post() : [],
+				// The currency table is hidden while per-language currency is
+				// off, so its rendered defaults are not stored then.
+				'wc_currencies'             => ! isset( $_POST['wc_currency_per_lang'] )
+					? (array) $this->settings->get( 'wc_currencies', [] )
+					: ( class_exists( 'PerfLocaleWooCommerce' ) ? \PerfLocaleWooCommerce::sanitize_currencies_post() : [] ),
 				'wc_exchange_rate_auto'     => isset( $_POST['wc_exchange_rate_auto'] ),
-				'wc_exchange_rate_provider' => isset( $_POST['wc_exchange_rate_provider'] ) ? sanitize_key( wp_unslash( $_POST['wc_exchange_rate_provider'] ) ) : '',
+				// The provider select renders only when a provider is registered;
+				// without one, keep the stored id.
+				'wc_exchange_rate_provider' => isset( $_POST['wc_exchange_rate_provider'] ) ? sanitize_key( wp_unslash( $_POST['wc_exchange_rate_provider'] ) ) : $this->stored_string( 'wc_exchange_rate_provider', '' ),
 				'wc_exchange_rate_interval' => isset( $_POST['wc_exchange_rate_interval'] ) ? sanitize_key( wp_unslash( $_POST['wc_exchange_rate_interval'] ) ) : 'daily',
 			],
 			'export-import' => $values = [], // Export/import handled separately via admin_init.
@@ -1166,21 +1412,6 @@ final class SettingsPage {
 		$cookie_lifetime       = (int) $this->settings->get( 'cookie_lifetime' );
 		$excluded_paths        = $this->settings->get_excluded_paths();
 
-		// Inline script: URL mode toggle (domain config show/hide).
-		wp_add_inline_script(
-			'perflocale-admin',
-			'( function() {' .
-				'var radios = document.querySelectorAll( \'input[name="url_mode"]\' );' .
-				'var config = document.getElementById( \'perflocale-domain-config\' );' .
-				'if ( ! radios.length || ! config ) return;' .
-				'radios.forEach( function( radio ) {' .
-					'radio.addEventListener( \'change\', function() {' .
-						'config.style.display = ( this.value === \'subdomain\' || this.value === \'domain\' ) ? \'\' : \'none\';' .
-					'} );' .
-				'} );' .
-			'} )();'
-		);
-
 		// Inline script: GeoIP provider toggle.
 		wp_add_inline_script(
 			'perflocale-admin',
@@ -1231,15 +1462,20 @@ final class SettingsPage {
 				</fieldset>
 
 				<?php
-				// Domain configuration table - shown for subdomain and domain modes.
+				// Per-language domain table - shown in domain mode only: subdomain
+				// mode builds each language's host from its slug and reads no
+				// entry of it. Rendered (hidden) in every mode, so a save keeps
+				// the stored domains and switching back to domain mode loses
+				// none. assets/js/admin-settings.js shows and hides it when the
+				// URL mode radio changes.
 				$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository( \PerfLocale\Plugin::get_instance()->get( 'cache' ) );
 				$all_langs = $lang_repo->get_active();
 				$domains   = $this->settings->get_language_domains();
 				$base_host = wp_parse_url( home_url(), PHP_URL_HOST ) ?: 'example.com';
 				?>
-				<div id="perflocale-domain-config" style="margin-top:12px;<?php echo esc_attr( $url_mode !== 'subdomain' && $url_mode !== 'domain' ? 'display:none;' : '' ); ?>">
+				<div id="perflocale-domain-config" style="margin-top:12px;<?php echo esc_attr( $url_mode !== 'domain' ? 'display:none;' : '' ); ?>">
 					<p class="description" style="margin-bottom:8px;">
-						<?php echo esc_html__( 'Configure the domain or subdomain for each language. DNS must be pointed to this server.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Configure the domain for each language. DNS must be pointed to this server.', 'perflocale' ); ?>
 					</p>
 					<table class="widefat fixed" style="max-width:500px;">
 						<caption class="screen-reader-text"><?php echo esc_html__( 'Per-language domain mapping.', 'perflocale' ); ?></caption>
@@ -1254,18 +1490,13 @@ final class SettingsPage {
 							foreach ( $all_langs as $lang ) :
 								$flag    = \PerfLocale\Helper::get_flag_emoji( $lang );
 								$default = $domains[ $lang->slug ] ?? '';
-
-								// For subdomain mode, suggest slug.basehost as placeholder.
-								$placeholder = $url_mode === 'subdomain'
-									? $lang->slug . '.' . $base_host
-									: $base_host;
 								?>
 								<tr>
 									<td style="padding-left:8px;"><?php echo esc_html( $flag . ' ' . ( $lang->native_name ?: $lang->name ) ); ?></td>
 									<td>
 										<input type="text" name="language_domains[<?php echo esc_attr( $lang->slug ); ?>]"
 											value="<?php echo esc_attr( $default ); ?>"
-											placeholder="<?php echo esc_attr( $placeholder ); ?>"
+											placeholder="<?php echo esc_attr( $base_host ); ?>"
 											class="regular-text" style="width:100%;">
 									</td>
 								</tr>
@@ -1433,6 +1664,19 @@ final class SettingsPage {
 					</p>
 				<?php else : ?>
 					<select id="perflocale-geo-provider" name="geo_provider">
+						<?php
+						// A stored id that no provider registers right now (its plugin is
+						// off, or it was renamed) gets its own option, so saving the tab
+						// unchanged keeps it instead of posting the first registered one.
+						if ( '' !== $geo_provider && ! isset( $geo_providers[ $geo_provider ] ) ) :
+							?>
+							<option value="<?php echo esc_attr( $geo_provider ); ?>" selected="selected">
+								<?php
+								/* translators: %s: provider id stored in the settings. */
+								echo esc_html( sprintf( __( '%s (not registered)', 'perflocale' ), $geo_provider ) );
+								?>
+							</option>
+						<?php endif; ?>
 						<?php foreach ( $geo_providers as $pid => $pdef ) : ?>
 							<option value="<?php echo esc_attr( $pid ); ?>" <?php selected( $geo_provider, $pid ); ?>><?php echo esc_html( (string) ( $pdef['name'] ?? $pid ) ); ?></option>
 						<?php endforeach; ?>
@@ -1585,8 +1829,11 @@ final class SettingsPage {
 <div class="pl-fb-editor" data-max="<?php echo esc_attr( (string) $max_fb ); ?>">
 					<?php
 					foreach ( $all_langs as $lang ) :
+						// Chips are for active targets only, so only those count
+						// toward the cap. A stored target that is not active stays
+						// stored (keep_unrendered_fallback_targets()).
 						$flag        = \PerfLocale\Helper::get_flag_emoji( $lang );
-						$current_row = array_values( array_filter( (array) ( $fallbacks[ $lang->slug ] ?? [] ), static fn( $s ) => $s !== '' && $s !== $lang->slug ) );
+						$current_row = array_values( array_filter( (array) ( $fallbacks[ $lang->slug ] ?? [] ), static fn( $s ) => $s !== '' && $s !== $lang->slug && isset( $lang_by_slug[ $s ] ) ) );
 						$current_row = array_slice( $current_row, 0, $max_fb );
 						?>
 						<div class="pl-fb-row" data-slug="<?php echo esc_attr( $lang->slug ); ?>">
@@ -1666,7 +1913,7 @@ final class SettingsPage {
 					<input type="checkbox" name="disable_language_cookie" value="1" <?php checked( (bool) $this->settings->get( 'disable_language_cookie' ) ); ?>>
 					<?php echo esc_html__( 'Cookieless mode — never set the language-preference cookie (perflocale_lang).', 'perflocale' ); ?>
 				</label>
-				<p class="description"><?php echo esc_html__( 'For strict GDPR / cookie-consent setups. Language routing keeps working (it is URL-based); you only lose "remember my language" on non-prefixed URLs and the redirect "don\'t ask again" memory. A consent plugin can also gate the cookie via the perflocale/privacy/consent_given filter.', 'perflocale' ); ?></p>
+				<p class="description"><?php echo esc_html__( 'For strict GDPR / cookie-consent setups. Language routing keeps working (it is URL-based); you lose "remember my language" on non-prefixed URLs, and the automatic first-visit redirects (browser language, GeoIP, edge hint) do not run, because without the cookie they would redirect the visitor again on every page. A consent plugin can also gate the cookie via the perflocale/privacy/consent_given filter.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 		<tr>
@@ -1730,8 +1977,8 @@ final class SettingsPage {
 	private static function pair_block_template_types( array $types ): array {
 		$has_any = array_intersect( [ 'wp_template', 'wp_template_part' ], $types ) !== [];
 
-		$types = array_values( array_diff( $types, [ 'wp_template', 'wp_template_part' ] ) );
-
+		// Add the missing one of the pair after the rest, and leave every other
+		// entry where it is, so an unchanged list is written back unchanged.
 		if ( $has_any ) {
 			$types[] = 'wp_template';
 			$types[] = 'wp_template_part';
@@ -1741,18 +1988,12 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Render the Translation tab fields.
+	 * The post types the Translation tab shows a checkbox for: the public ones
+	 * except `attachment`, and the curated non-public ones.
 	 *
-	 * @return void
+	 * @return array{0: array<string, \WP_Post_Type>, 1: array<string, \WP_Post_Type>} Public types, then non-public types.
 	 */
-	private function render_translation_tab(): void {
-		$translatable_pts  = $this->settings->get_translatable_post_types();
-		$translatable_taxs = $this->settings->get_translatable_taxonomies();
-		$default_status    = (string) $this->settings->get( 'default_translation_status' );
-		$auto_stubs        = (bool) $this->settings->get( 'auto_create_stubs' );
-		$sync_fields       = (array) $this->settings->get( 'sync_fields' );
-		$translate_slugs   = $this->settings->translate_slugs_enabled();
-
+	private function translation_tab_post_types(): array {
 		$all_post_types = get_post_types( [ 'public' => true ], 'objects' );
 
 		// ⚠️ `attachment` is public, so it lands in that list — but PerfLocale
@@ -1766,7 +2007,6 @@ final class SettingsPage {
 		// language-scoping every front-end attachment query as a side effect.
 		// Removing it takes no feature away: media translation is unaffected.
 		unset( $all_post_types['attachment'] );
-		$all_taxonomies = get_taxonomies( [ 'public' => true ], 'objects' );
 
 		// Non-public post types PerfLocale can actually translate.
 		//
@@ -1818,6 +2058,25 @@ final class SettingsPage {
 			}
 		}
 
+		return [ $all_post_types, $non_public_types ];
+	}
+
+	/**
+	 * Render the Translation tab fields.
+	 *
+	 * @return void
+	 */
+	private function render_translation_tab(): void {
+		$translatable_pts  = $this->settings->get_translatable_post_types();
+		$translatable_taxs = $this->settings->get_translatable_taxonomies();
+		$default_status    = (string) $this->settings->get( 'default_translation_status' );
+		$auto_stubs        = (bool) $this->settings->get( 'auto_create_stubs' );
+		$sync_fields       = (array) $this->settings->get( 'sync_fields' );
+		$translate_slugs   = $this->settings->translate_slugs_enabled();
+
+		[ $all_post_types, $non_public_types ] = $this->translation_tab_post_types();
+		$all_taxonomies                        = get_taxonomies( [ 'public' => true ], 'objects' );
+
 		$available_sync_fields = [
 			'featured_image' => __( 'Featured Image', 'perflocale' ),
 			'menu_order'     => __( 'Menu Order', 'perflocale' ),
@@ -1857,13 +2116,26 @@ final class SettingsPage {
 			'before'
 		);
 
+		// Shared request helper of the bulk tools below (window.perflocaleBulkFetch).
+		// The tools call it only from their click handlers, so it is defined
+		// before any call wherever the footer prints it.
+		wp_enqueue_script(
+			'perflocale-admin-bulk-fetch',
+			PERFLOCALE_URL . 'assets/js/admin-bulk-fetch.js',
+			[],
+			PERFLOCALE_VERSION,
+			true
+		);
+
 		wp_add_inline_script(
 			'perflocale-admin',
 			'(function(){' .
 				'var btn = document.getElementById(\'perflocale-create-tax-translations\');' .
 				'if ( ! btn ) return;' .
 				'var d = perflocaleTranslationData;' .
+				'var esc = function( s ) { return String( s ).replace( /&/g, \'&amp;\' ).replace( /</g, \'&lt;\' ).replace( />/g, \'&gt;\' ).replace( /"/g, \'&quot;\' ).replace( /\'/g, \'&#39;\' ); };' .
 				'btn.addEventListener(\'click\', function() {' .
+					'var st = {};' .
 					'var progress = document.getElementById(\'perflocale-tax-progress\');' .
 					'var bar = document.getElementById(\'perflocale-tax-bar\');' .
 					'var status = document.getElementById(\'perflocale-tax-status\');' .
@@ -1888,8 +2160,7 @@ final class SettingsPage {
 					'data.append(\'_nonce\', d.taxNonce);' .
 					'data.append(\'tax_index\', cursorTax);' .
 					'data.append(\'term_offset\', cursorOffset);' .
-					'fetch(ajaxurl, { method: \'POST\', body: data, credentials: \'same-origin\' })' .
-						'.then(function(r) { return r.json(); })' .
+					'perflocaleBulkFetch(data, st)' .
 						'.then(function(resp) {' .
 							'clearInterval(pInterval);' .
 							'if ( bar ) bar.style.width = \'100%\';' .
@@ -1898,7 +2169,7 @@ final class SettingsPage {
 							'if ( ! resp.success ) {' .
 								'if ( bar ) bar.style.background = \'#d63638\';' .
 								'if ( status ) status.textContent = d.i18nFailed;' .
-								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + (resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
+								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc(resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
 								'return;' .
 							'}' .
 							'if ( resp.data && resp.data.more ) {' .
@@ -1916,13 +2187,13 @@ final class SettingsPage {
 							'var details = resp.data.taxonomy_details;' .
 							'if ( details && details.length ) {' .
 								'var html = \'<table class="widefat striped" style="max-width:420px;margin-top:6px;">\';' .
-								'html += \'<thead><tr><th style="padding:6px 8px;">\' + d.i18nTaxonomy + \'</th>\';' .
-								'html += \'<th style="padding:6px 8px;text-align:center;">\' + d.i18nCreated + \'</th>\';' .
-								'html += \'<th style="padding:6px 8px;text-align:center;">\' + d.i18nExisted + \'</th></tr></thead><tbody>\';' .
+								'html += \'<thead><tr><th style="padding:6px 8px;">\' + esc(d.i18nTaxonomy) + \'</th>\';' .
+								'html += \'<th style="padding:6px 8px;text-align:center;">\' + esc(d.i18nCreated) + \'</th>\';' .
+								'html += \'<th style="padding:6px 8px;text-align:center;">\' + esc(d.i18nExisted) + \'</th></tr></thead><tbody>\';' .
 								'details.forEach(function(row) {' .
-									'html += \'<tr><td style="padding:4px 8px;">\' + row.taxonomy + \'</td>\';' .
-									'html += \'<td style="padding:4px 8px;text-align:center;color:#00a32a;font-weight:500;">\' + row.created + \'</td>\';' .
-									'html += \'<td style="padding:4px 8px;text-align:center;color:#6b7280;">\' + row.skipped + \'</td></tr>\';' .
+									'html += \'<tr><td style="padding:4px 8px;">\' + esc(row.taxonomy) + \'</td>\';' .
+									'html += \'<td style="padding:4px 8px;text-align:center;color:#00a32a;font-weight:500;">\' + esc(row.created) + \'</td>\';' .
+									'html += \'<td style="padding:4px 8px;text-align:center;color:#6b7280;">\' + esc(row.skipped) + \'</td></tr>\';' .
 								'});' .
 								'html += \'</tbody></table>\';' .
 								'if ( result ) result.innerHTML = html;' .
@@ -1950,7 +2221,9 @@ final class SettingsPage {
 				'var btn = document.getElementById(\'perflocale-assign-post-langs\');' .
 				'if ( ! btn ) return;' .
 				'var d = perflocaleTranslationData;' .
+				'var esc = function( s ) { return String( s ).replace( /&/g, \'&amp;\' ).replace( /</g, \'&lt;\' ).replace( />/g, \'&gt;\' ).replace( /"/g, \'&quot;\' ).replace( /\'/g, \'&#39;\' ); };' .
 				'btn.addEventListener(\'click\', function() {' .
+					'var st = {};' .
 					'var progress = document.getElementById(\'perflocale-postlang-progress\');' .
 					'var bar = document.getElementById(\'perflocale-postlang-bar\');' .
 					'var status = document.getElementById(\'perflocale-postlang-status\');' .
@@ -1972,8 +2245,7 @@ final class SettingsPage {
 					'var data = new FormData();' .
 					'data.append(\'action\', \'perflocale_assign_post_languages\');' .
 					'data.append(\'_nonce\', d.postLangNonce);' .
-					'fetch(ajaxurl, { method: \'POST\', body: data, credentials: \'same-origin\' })' .
-						'.then(function(r) { return r.json(); })' .
+					'perflocaleBulkFetch(data, st)' .
 						'.then(function(resp) {' .
 							'clearInterval(pInterval);' .
 							'if ( bar ) bar.style.width = \'100%\';' .
@@ -1982,7 +2254,7 @@ final class SettingsPage {
 							'if ( ! resp.success ) {' .
 								'if ( bar ) bar.style.background = \'#d63638\';' .
 								'if ( status ) status.textContent = d.i18nFailed;' .
-								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + (resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
+								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc(resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
 								'return;' .
 							'}' .
 								'if ( resp.data && resp.data.remaining > 0 ) {' .
@@ -1999,11 +2271,11 @@ final class SettingsPage {
 							'var details = resp.data.post_type_details;' .
 							'if ( details && details.length ) {' .
 								'var html = \'<table class="widefat striped" style="max-width:420px;margin-top:6px;">\';' .
-								'html += \'<thead><tr><th style="padding:6px 8px;">\' + d.i18nPostType + \'</th>\';' .
-								'html += \'<th style="padding:6px 8px;text-align:center;">\' + d.i18nAssigned + \'</th></tr></thead><tbody>\';' .
+								'html += \'<thead><tr><th style="padding:6px 8px;">\' + esc(d.i18nPostType) + \'</th>\';' .
+								'html += \'<th style="padding:6px 8px;text-align:center;">\' + esc(d.i18nAssigned) + \'</th></tr></thead><tbody>\';' .
 								'details.forEach(function(row) {' .
-									'html += \'<tr><td style="padding:4px 8px;">\' + row.post_type + \'</td>\';' .
-									'html += \'<td style="padding:4px 8px;text-align:center;color:#00a32a;font-weight:500;">\' + row.assigned + \'</td></tr>\';' .
+									'html += \'<tr><td style="padding:4px 8px;">\' + esc(row.post_type) + \'</td>\';' .
+									'html += \'<td style="padding:4px 8px;text-align:center;color:#00a32a;font-weight:500;">\' + esc(row.assigned) + \'</td></tr>\';' .
 								'});' .
 								'html += \'</tbody></table>\';' .
 								'if ( result ) result.innerHTML = html;' .
@@ -2028,19 +2300,20 @@ final class SettingsPage {
 				'var btn = document.getElementById(\'perflocale-generate-translations\');' .
 				'if ( ! btn ) return;' .
 				'var d = perflocaleTranslationData;' .
+				'var esc = function( s ) { return String( s ).replace( /&/g, \'&amp;\' ).replace( /</g, \'&lt;\' ).replace( />/g, \'&gt;\' ).replace( /"/g, \'&quot;\' ).replace( /\'/g, \'&#39;\' ); };' .
 				'var wrap = document.getElementById(\'perflocale-gentr-progress\');' .
 				'var bar = document.getElementById(\'perflocale-gentr-bar\');' .
 				'var status = document.getElementById(\'perflocale-gentr-status\');' .
 				'var percent = document.getElementById(\'perflocale-gentr-percent\');' .
 				'var result = document.getElementById(\'perflocale-gentr-result\');' .
 				'btn.addEventListener(\'click\', function() {' .
-					'var cursorType = 0, cursorOffset = 0, pInterval = null, pct = 0;' .
+					'var cursorType = 0, cursorOffset = 0, pInterval = null, pct = 0, st = {};' .
 					'var post = function( extra ) {' .
 						'var data = new FormData();' .
 						'data.append(\'action\', \'perflocale_generate_missing_translations\');' .
 						'data.append(\'_nonce\', d.genTrNonce);' .
 						'Object.keys(extra).forEach(function(k){ data.append(k, extra[k]); });' .
-						'return fetch(ajaxurl, { method: \'POST\', body: data, credentials: \'same-origin\' }).then(function(r){ return r.json(); });' .
+						'return perflocaleBulkFetch(data, st);' .
 					'};' .
 					// ⭐ COUNT FIRST. This creates posts; the operator sees the
 					// scale and agrees to it before anything is written.
@@ -2048,8 +2321,8 @@ final class SettingsPage {
 					'if ( result ) result.innerHTML = \'\';' .
 					'post({ mode: \'count\' }).then(function(resp){' .
 						'btn.disabled = false;' .
-						'if ( ! resp.success ) { if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + ((resp.data && resp.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
-						'if ( ! resp.data.max ) { if ( result ) result.innerHTML = \'<p style="margin:0;">\' + resp.data.message + \'</p>\'; return; }' .
+						'if ( ! resp.success ) { if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc((resp.data && resp.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
+						'if ( ! resp.data.max ) { if ( result ) result.innerHTML = \'<p style="margin:0;">\' + esc(resp.data.message) + \'</p>\'; return; }' .
 						'if ( ! window.confirm( resp.data.message ) ) { return; }' .
 						'btn.disabled = true;' .
 						'if ( wrap ) wrap.style.display = \'block\';' .
@@ -2058,7 +2331,7 @@ final class SettingsPage {
 						'pInterval = setInterval(function(){ pct = Math.min(pct + Math.random() * 10, 90); if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
 						'var run = function() {' .
 							'post({ type_index: cursorType, post_offset: cursorOffset }).then(function(r2){' .
-								'if ( ! r2.success ) { clearInterval(pInterval); btn.disabled = false; if ( bar ) bar.style.background = \'#d63638\'; if ( status ) status.textContent = d.i18nFailed; if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + ((r2.data && r2.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
+								'if ( ! r2.success ) { clearInterval(pInterval); btn.disabled = false; if ( bar ) bar.style.background = \'#d63638\'; if ( status ) status.textContent = d.i18nFailed; if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc((r2.data && r2.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
 								'if ( r2.data.more ) { cursorType = r2.data.type_index; cursorOffset = r2.data.post_offset; if ( status ) status.textContent = r2.data.message; run(); return; }' .
 								'clearInterval(pInterval);' .
 								'if ( bar ) { bar.style.width = \'100%\'; bar.style.background = \'#00a32a\'; }' .
@@ -2128,6 +2401,19 @@ final class SettingsPage {
 				<?php endif; ?>
 			</td>
 		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Translatable Taxonomies', 'perflocale' ); ?></th>
+			<td>
+				<fieldset>
+					<?php foreach ( $all_taxonomies as $tax ) : ?>
+						<label>
+							<input type="checkbox" name="translatable_taxonomies[]" value="<?php echo esc_attr( $tax->name ); ?>" <?php checked( in_array( $tax->name, $translatable_taxs, true ) ); ?>>
+							<?php echo esc_html( $tax->labels->name ); ?> <code>(<?php echo esc_html( $tax->name ); ?>)</code>
+						</label><br>
+					<?php endforeach; ?>
+				</fieldset>
+			</td>
+		</tr>
 		<?php
 		// ⭐ ITS OWN ROW, NOT BURIED UNDER "Advanced content types".
 		//
@@ -2163,19 +2449,6 @@ final class SettingsPage {
 			</td>
 		</tr>
 		<?php endif; ?>
-		<tr>
-			<th scope="row"><?php echo esc_html__( 'Translatable Taxonomies', 'perflocale' ); ?></th>
-			<td>
-				<fieldset>
-					<?php foreach ( $all_taxonomies as $tax ) : ?>
-						<label>
-							<input type="checkbox" name="translatable_taxonomies[]" value="<?php echo esc_attr( $tax->name ); ?>" <?php checked( in_array( $tax->name, $translatable_taxs, true ) ); ?>>
-							<?php echo esc_html( $tax->labels->name ); ?> <code>(<?php echo esc_html( $tax->name ); ?>)</code>
-						</label><br>
-					<?php endforeach; ?>
-				</fieldset>
-			</td>
-		</tr>
 		<tr>
 			<th scope="row">
 				<label for="perflocale-default-status"><?php echo esc_html__( 'Default Translation Status', 'perflocale' ); ?></label>
@@ -2243,6 +2516,36 @@ final class SettingsPage {
 		<tr>
 			<td colspan="2"><h3 style="margin:16px 0 4px;"><?php echo esc_html__( 'Bulk Translation', 'perflocale' ); ?></h3></td>
 		</tr>
+		<?php $unimported = \PerfLocale\Migration\MigrationState::unimported_sources(); ?>
+		<?php if ( $unimported !== [] ) : ?>
+			<tr>
+				<td colspan="2">
+					<div class="notice notice-warning inline">
+						<p>
+							<?php
+							echo esc_html(
+								sprintf(
+									/* translators: %s: source plugin name(s), e.g. "WPML" or "WPML and Polylang" */
+									__( '%s translations were found that have not been imported yet. Import them first (Settings → Export & Import). The tools below, run before the import, give those translations the default language and create duplicate drafts.', 'perflocale' ),
+									\PerfLocale\Migration\MigrationState::source_names( $unimported )
+								)
+							);
+							?>
+						</p>
+					</div>
+				</td>
+			</tr>
+		<?php endif; ?>
+		<?php $incomplete = $unimported === [] ? \PerfLocale\Migration\MigrationState::incomplete_sources() : []; ?>
+		<?php if ( $incomplete !== [] ) : ?>
+			<tr>
+				<td colspan="2">
+					<div class="notice notice-warning inline">
+						<p><?php echo esc_html( \PerfLocale\Migration\MigrationState::incomplete_message( $incomplete ) ); ?></p>
+					</div>
+				</td>
+			</tr>
+		<?php endif; ?>
 		<tr>
 			<th scope="row"><?php echo esc_html__( 'Taxonomy Translations', 'perflocale' ); ?></th>
 			<td>
@@ -2400,6 +2703,16 @@ final class SettingsPage {
 					<span style="color:#c3c4c7;"> · </span>
 					<a href="https://perflocale.com/docs/api-key-constants/" target="_blank" rel="noopener"><?php echo esc_html__( 'Keep API keys out of the database instead', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
+				<?php
+				// The WordPress AI Client takes its provider and key from core's
+				// Connectors screen, which exists only on WordPress versions that
+				// ship it.
+				if ( 'wp_ai_client' === $mt_provider && file_exists( ABSPATH . 'wp-admin/options-connectors.php' ) ) :
+					?>
+					<p class="description">
+						<a href="<?php echo esc_url( admin_url( 'options-connectors.php' ) ); ?>"><?php echo esc_html__( 'Connect an AI provider under Settings → Connectors.', 'perflocale' ); ?></a>
+					</p>
+				<?php endif; ?>
 			</td>
 		</tr>
 		<tr>
@@ -2457,7 +2770,7 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Show the bulk MT-translate toolbar on the Strings admin page.', 'perflocale' ); ?>
 				</label>
 				<p class="description">
-					<?php echo esc_html__( 'Lets translators MT-translate selected, filtered, or every string in a single dispatch (up to 5,000 string × target pairs per run). Disable to keep MT available for per-row edits only — useful when controlling provider costs.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Lets translators MT-translate selected, filtered, or every string in a single dispatch (up to 5,000 strings per run). Disable to keep MT available for per-row edits only — useful when controlling provider costs.', 'perflocale' ); ?>
 				</p>
 			</td>
 		</tr>
@@ -3445,6 +3758,105 @@ final class SettingsPage {
 	}
 
 	/**
+	 * Render the import outcome the Export & Import handlers redirect back
+	 * with. Printed in the page's notice area, above the tab strip, where
+	 * WordPress's admin script would otherwise move it after first paint.
+	 *
+	 * @return void
+	 */
+	private function render_import_notices(): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$import_result = isset( $_GET['import_result'] ) ? sanitize_text_field( wp_unslash( $_GET['import_result'] ) ) : '';
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$import_error = isset( $_GET['import_error'] ) ? sanitize_text_field( wp_unslash( $_GET['import_error'] ) ) : '';
+		?>
+
+		<?php if ( $import_result !== '' ) : ?>
+			<div class="notice notice-success" style="margin:16px 0 8px;"><p><?php echo esc_html( $import_result ); ?></p></div>
+		<?php endif; ?>
+
+		<?php if ( $import_error !== '' ) : ?>
+			<div class="notice notice-error" style="margin:16px 0 8px;"><p><?php echo esc_html( $import_error ); ?></p></div>
+		<?php endif; ?>
+		<?php
+	}
+
+	/**
+	 * WPML's default language and languages, against PerfLocale's.
+	 *
+	 * Reads WPML's settings option and its locale tables only (no content
+	 * scan), so the tab stays cheap; the import runs the full check.
+	 *
+	 * @param \PerfLocale\Cache\CacheManager $cache Cache manager.
+	 * @return void
+	 */
+	private function render_wpml_language_check( \PerfLocale\Cache\CacheManager $cache ): void {
+		$reader   = new \PerfLocale\Migration\WpmlSettingsReader();
+		$settings = $reader->settings();
+
+		if ( ! $settings['found'] || $settings['default'] === '' ) {
+			return;
+		}
+
+		$importer  = new \PerfLocale\Migration\WpmlImporter( $cache );
+		$locales   = $reader->locales();
+		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
+		$pl_def    = $lang_repo instanceof \PerfLocale\Database\Repository\LanguageRepository ? $lang_repo->get_default() : null;
+		$pl_slug   = $pl_def !== null ? (string) $pl_def->slug : '';
+		$label     = static fn( string $code ): string => isset( $locales[ $code ] ) ? $code . ' (' . $locales[ $code ] . ')' : $code;
+		$missing   = [];
+
+		foreach ( array_unique( array_merge( [ $settings['default'] ], $settings['active'] ) ) as $code ) {
+			if ( $importer->language_for_code( (string) $code ) === null ) {
+				$missing[] = $label( (string) $code );
+			}
+		}
+
+		$default_ok = $importer->language_for_code( $settings['default'] ) === $pl_slug;
+		?>
+		<ul class="perflocale-migration-card__checks">
+			<li>
+				<span class="dashicons <?php echo esc_attr( $default_ok ? 'dashicons-yes' : 'dashicons-warning' ); ?>" aria-hidden="true"></span>
+				<?php
+				echo esc_html(
+					sprintf(
+						/* translators: 1: WPML default language, e.g. "fr (fr_FR)", 2: PerfLocale default language slug */
+						__( 'WPML\'s default language: %1$s. PerfLocale\'s default language: %2$s.', 'perflocale' ),
+						$label( $settings['default'] ),
+						$pl_slug
+					)
+				);
+				echo ' ';
+				echo esc_html(
+					$default_ok
+						? __( 'They match.', 'perflocale' )
+						: sprintf(
+							/* translators: %s: WPML default language, e.g. "fr (fr_FR)" */
+							__( 'They differ: make %s the default language under PerfLocale → Languages before the import.', 'perflocale' ),
+							$label( $settings['default'] )
+						)
+				);
+				?>
+			</li>
+			<li>
+				<span class="dashicons <?php echo esc_attr( $missing === [] ? 'dashicons-yes' : 'dashicons-warning' ); ?>" aria-hidden="true"></span>
+				<?php
+				echo esc_html(
+					$missing === []
+						? __( 'Every WPML language has a matching PerfLocale language.', 'perflocale' )
+						: sprintf(
+							/* translators: %s: comma-separated WPML languages, e.g. "bg (bg_BG)" */
+							__( 'Missing in PerfLocale: %s. Add these languages under PerfLocale → Languages before the import.', 'perflocale' ),
+							implode( ', ', $missing )
+						)
+				);
+				?>
+			</li>
+		</ul>
+		<?php
+	}
+
+	/**
 	 * Render the Export & Import tab.
 	 *
 	 * @return void
@@ -3457,11 +3869,6 @@ final class SettingsPage {
 		$polylang_available       = ( new \PerfLocale\Migration\PolylangImporter( $cache ) )->can_import();
 		$translatepress_available = ( new \PerfLocale\Migration\TranslatePressImporter( $cache ) )->can_import();
 		$sections                 = \PerfLocale\Admin\DataExporter::SECTIONS;
-
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$import_result = isset( $_GET['import_result'] ) ? sanitize_text_field( wp_unslash( $_GET['import_result'] ) ) : '';
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$import_error = isset( $_GET['import_error'] ) ? sanitize_text_field( wp_unslash( $_GET['import_error'] ) ) : '';
 
 		// The ceiling an operator will actually hit, named on the import form
 		// so the limit is visible BEFORE a doomed upload rather than only after
@@ -3498,14 +3905,6 @@ final class SettingsPage {
 		);
 
 		?>
-
-		<?php if ( $import_result !== '' ) : ?>
-			<div class="notice notice-success" style="margin:16px 0 8px;"><p><?php echo esc_html( $import_result ); ?></p></div>
-		<?php endif; ?>
-
-		<?php if ( $import_error !== '' ) : ?>
-			<div class="notice notice-error" style="margin:16px 0 8px;"><p><?php echo esc_html( $import_error ); ?></p></div>
-		<?php endif; ?>
 
 		<table class="form-table" role="presentation">
 
@@ -3573,7 +3972,7 @@ final class SettingsPage {
 						<legend class="screen-reader-text"><?php echo esc_html__( 'Import Mode', 'perflocale' ); ?></legend>
 						<label style="display:block;margin-bottom:4px;">
 							<input type="radio" name="perflocale_import_mode" value="merge" checked>
-							<strong><?php echo esc_html__( 'Merge', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'add imported data alongside existing data', 'perflocale' ); ?>
+							<strong><?php echo esc_html__( 'Merge', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'add imported rows alongside existing data; this site\'s settings, add-on settings, add-on list and roles stay as they are', 'perflocale' ); ?>
 						</label>
 						<label style="display:block;">
 							<input type="radio" name="perflocale_import_mode" value="replace">
@@ -3582,7 +3981,7 @@ final class SettingsPage {
 					</fieldset>
 
 					<p class="description" style="margin-top:0;">
-						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale tables before loading, so anything the uploaded bundle does not carry is gone; Merge only adds.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale tables before loading, so anything the uploaded bundle does not carry is gone, and applies the file\'s settings, add-on settings, add-on list and roles. Merge only adds rows and never changes this site\'s configuration.', 'perflocale' ); ?>
 						<a href="https://perflocale.com/docs/export-import/#merge-vs-replace" target="_blank" rel="noopener"><?php echo esc_html__( 'Merge vs Replace — what Replace clears', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 					<p class="description" style="margin-top:0;">
@@ -3647,6 +4046,7 @@ final class SettingsPage {
 									?>
 								</form>
 								<p class="perflocale-migration-card__found"><?php echo esc_html__( 'WPML data found', 'perflocale' ); ?></p>
+								<?php $this->render_wpml_language_check( $cache ); ?>
 							</div>
 						<?php endif; ?>
 						<?php if ( $polylang_available ) : ?>

@@ -19,7 +19,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Intercepts gettext calls (__(), _e(), etc.) and serves translations
- * from the database via wp_options.
+ * from the plugin's string tables (perflocale_strings +
+ * perflocale_string_translations).
  *
  * Uses lazy loading: translations are loaded on the first gettext call
  * (after language detection has completed on parse_request), not on
@@ -43,6 +44,15 @@ final class StringTranslation {
 	 * 64-hex sha256 original_hash.
 	 */
 	private const EXTRA_FORMS_KEY = "\0pfl_extra_forms";
+
+	/**
+	 * Reserved key holding whether the map has a row a gettext filter can
+	 * serve ('1') or not ('0'). Rows of OptionStrings' domain are read through get_translation()
+	 * directly, so a map holding only those (a site title translation) needs
+	 * no gettext filter. A map without the key (cached before the key
+	 * existed) counts as having gettext rows.
+	 */
+	private const GETTEXT_ROWS_KEY = "\0pfl_gettext_rows";
 
 	/**
 	 * Preloaded translations: [hash => translated_text_string].
@@ -116,11 +126,13 @@ final class StringTranslation {
 		}
 
 		// Preload first - if there are no DB translations for this language,
-		// skip registering the gettext filters entirely. This avoids adding
-		// overhead to every __() call (300-800 per page) when no translations exist.
+		// or only rows that are read without gettext (option strings), skip
+		// registering the gettext filters entirely. This avoids adding
+		// overhead to every __() call (300-800 per page) when gettext has
+		// nothing to serve.
 		$this->preload_translations();
 
-		if ( ! empty( $this->translations ) ) {
+		if ( $this->has_gettext_rows() ) {
 			add_filter( 'gettext', [ $this, 'translate_string' ], 10, 3 );
 			add_filter( 'gettext_with_context', [ $this, 'translate_string_with_context' ], 10, 4 );
 			add_filter( 'ngettext', [ $this, 'translate_plural_string' ], 10, 5 );
@@ -194,13 +206,14 @@ final class StringTranslation {
 					)
 				);
 
-				$map   = [];
-				$extra = [];
+				$map     = [];
+				$extra   = [];
+				$gettext = false;
 
 				if ( is_array( $results ) ) {
 					foreach ( $results as $row ) {
 						// Skip internal, output-buffer-served domains (a leading
-						// "_", e.g. the Visual Editor's "_pfl_dyn") — not gettext-
+						// "_", such as "_pfl_dyn") — not gettext-
 						// resolved, so they must not populate the map (which would
 						// register the gettext filters on otherwise-untranslated
 						// languages).
@@ -209,6 +222,7 @@ final class StringTranslation {
 						}
 
 						$map[ $row->original_hash ] = $row->translated_text;
+						$gettext                    = $gettext || self::is_gettext_domain( (string) $row->domain );
 
 						// Plural forms 2..N (Polish/Russian/Arabic) live in the
 						// plural-context row's extra_forms JSON — NULL for every
@@ -231,6 +245,10 @@ final class StringTranslation {
 				// resolve to "no extra forms".
 				if ( $extra !== [] ) {
 					$map[ self::EXTRA_FORMS_KEY ] = $extra;
+				}
+
+				if ( $map !== [] ) {
+					$map[ self::GETTEXT_ROWS_KEY ] = $gettext ? '1' : '0';
 				}
 
 				// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -324,19 +342,22 @@ final class StringTranslation {
 						)
 					);
 
-					$map   = [];
-					$extra = [];
+					$map     = [];
+					$extra   = [];
+					$gettext = false;
 
 					if ( is_array( $results ) ) {
 						foreach ( $results as $row ) {
 							// Skip internal, output-buffer-served domains (a
-							// leading "_", e.g. the Visual Editor's "_pfl_dyn") —
+							// leading "_", such as "_pfl_dyn") —
 							// they're not gettext-resolved, so they must not
 							// populate the map (which would register the gettext
 							// filters on otherwise-untranslated languages).
 							if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
 								continue;
 							}
+
+							$gettext = $gettext || self::is_gettext_domain( (string) $row->domain );
 
 							if ( isset( $row->extra_forms ) && $row->extra_forms !== null && $row->extra_forms !== '' ) {
 								$decoded = json_decode( (string) $row->extra_forms, true );
@@ -352,6 +373,10 @@ final class StringTranslation {
 
 					if ( $extra !== [] ) {
 						$map[ self::EXTRA_FORMS_KEY ] = $extra;
+					}
+
+					if ( $map !== [] ) {
+						$map[ self::GETTEXT_ROWS_KEY ] = $gettext ? '1' : '0';
 					}
 
 					// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -373,6 +398,10 @@ final class StringTranslation {
 				$fallback_extra = $fallback_translations[ self::EXTRA_FORMS_KEY ] ?? [];
 				unset( $fallback_translations[ self::EXTRA_FORMS_KEY ] );
 
+				// Either map having gettext rows means the merged one has.
+				$gettext_rows = $this->has_gettext_rows() || '0' !== ( $fallback_translations[ self::GETTEXT_ROWS_KEY ] ?? '1' );
+				unset( $fallback_translations[ self::GETTEXT_ROWS_KEY ] );
+
 				// A fallback's extra forms may only ride along when the WHOLE
 				// row comes from the fallback (the primary map lacks the hash,
 				// evaluated BEFORE the merge below fills it). If the primary
@@ -392,6 +421,8 @@ final class StringTranslation {
 
 				$this->translations += $fallback_translations;
 
+				$this->translations[ self::GETTEXT_ROWS_KEY ] = $gettext_rows ? '1' : '0';
+
 				if ( $adoptable_extra !== [] ) {
 					$primary_extra = $this->translations[ self::EXTRA_FORMS_KEY ] ?? [];
 					// `+` keeps the primary hash's forms and fills only the
@@ -400,6 +431,29 @@ final class StringTranslation {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Whether rows of this text domain are served through the gettext filters.
+	 *
+	 * @param string $domain Text domain.
+	 * @return bool
+	 */
+	private static function is_gettext_domain( string $domain ): bool {
+		return $domain !== \PerfLocale\Frontend\OptionStrings::DOMAIN;
+	}
+
+	/**
+	 * Whether the loaded map holds a row the gettext filters can serve.
+	 *
+	 * @return bool
+	 */
+	private function has_gettext_rows(): bool {
+		if ( $this->translations === [] ) {
+			return false;
+		}
+
+		return '0' !== ( $this->translations[ self::GETTEXT_ROWS_KEY ] ?? '1' );
 	}
 
 	/**

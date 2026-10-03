@@ -196,8 +196,9 @@ final class AddonSettings {
 	 * @param string $addon_id
 	 * @param string $key
 	 * @param mixed  $value
-	 * @return bool True on success; false if rejected (bad id, too large,
-	 *              lock contention).
+	 * @return bool True on success (including an unchanged value); false if
+	 *              rejected (bad id, too large, write refused, lock
+	 *              contention).
 	 */
 	public static function set( string $addon_id, string $key, $value ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -224,7 +225,9 @@ final class AddonSettings {
 	 *
 	 * @param string               $addon_id
 	 * @param array<string, mixed> $values
-	 * @return bool True on success; false if rejected.
+	 * @return bool True on success (including unchanged values); false if
+	 *              rejected (bad id, too large, write refused, lock
+	 *              contention).
 	 */
 	public static function set_addon( string $addon_id, array $values ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -247,7 +250,8 @@ final class AddonSettings {
 	 *
 	 * @param string $addon_id
 	 * @return bool True on success (including the no-op case); false if
-	 *              the id is malformed.
+	 *              the id is malformed, the write was refused, or the lock
+	 *              was held.
 	 */
 	public static function forget( string $addon_id ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -268,8 +272,11 @@ final class AddonSettings {
 	 * Coerce a raw POST value into the type declared by the field. Centralised
 	 * so the admin form handler doesn't have to special-case each type.
 	 *
-	 * @param array<string, mixed> $field Field definition from get_settings_fields().
-	 * @param mixed                $raw   Raw POST value (always string or array of strings).
+	 * @param array<string, mixed> $field     Field definition from get_settings_fields().
+	 * @param mixed                $raw       Raw POST value (always string or array of strings).
+	 * @param string               $addon_id  Addon the field belongs to; a 'password' field
+	 *                                        needs it to keep its stored value.
+	 * @param string               $field_key The field's key in get_settings_fields().
 	 * @return mixed
 	 */
 	public static function sanitize_field( array $field, $raw, string $addon_id = '', string $field_key = '' ) {
@@ -284,6 +291,17 @@ final class AddonSettings {
 
 			case 'textarea':
 				return is_string( $raw ) ? sanitize_textarea_field( wp_unslash( $raw ) ) : '';
+
+			case 'password':
+				// The form renders a password field empty, so an empty submission
+				// keeps the stored value (the field's default when none is stored).
+				$value = is_string( $raw ) ? sanitize_text_field( wp_unslash( $raw ) ) : '';
+
+				if ( $value === '' && $addon_id !== '' && $field_key !== '' ) {
+					return self::get( $addon_id, $field_key, $field['default'] ?? '' );
+				}
+
+				return $value;
 
 			case 'select':
 				$options = (array) ( $field['options'] ?? [] );
@@ -449,6 +467,10 @@ final class AddonSettings {
 	 * checks/unchecks driver fields (via the enqueued
 	 * `perflocale-addon-conditional-fields` script).
 	 *
+	 * A `password` field never prints its stored value: it renders empty, with
+	 * a masked placeholder when a value is stored, and an empty submission keeps
+	 * that value ({@see sanitize_field()}).
+	 *
 	 * @param string                              $addon_id
 	 * @param array<string, array<string, mixed>> $editable_fields
 	 * @param array<string, mixed>                $values     Currently stored values.
@@ -539,7 +561,7 @@ final class AddonSettings {
 									<?php endforeach; ?>
 								</select>
 							<?php elseif ( $field_type === 'password' ) : ?>
-								<input type="password" id="<?php echo esc_attr( $input_id ); ?>" name="<?php echo esc_attr( $input_name ); ?>" data-perflocale-field-name="<?php echo esc_attr( $field_key ); ?>" value="<?php echo esc_attr( (string) $field_value ); ?>" class="regular-text" autocomplete="off">
+								<input type="password" id="<?php echo esc_attr( $input_id ); ?>" name="<?php echo esc_attr( $input_name ); ?>" data-perflocale-field-name="<?php echo esc_attr( $field_key ); ?>" value="" placeholder="<?php echo esc_attr( isset( $values[ $field_key ] ) && is_scalar( $values[ $field_key ] ) && (string) $values[ $field_key ] !== '' ? str_repeat( '*', 20 ) : '' ); ?>" class="regular-text" autocomplete="off">
 							<?php else : ?>
 								<input type="text" id="<?php echo esc_attr( $input_id ); ?>" name="<?php echo esc_attr( $input_name ); ?>" data-perflocale-field-name="<?php echo esc_attr( $field_key ); ?>" value="<?php echo esc_attr( (string) $field_value ); ?>" class="regular-text">
 							<?php endif; ?>
@@ -593,7 +615,9 @@ final class AddonSettings {
 	 * @param callable $mutator   Takes the current array, returns the new one.
 	 * @param string   $addon_id  The addon whose entry is being mutated; used
 	 *                            for the size-cap check + the rejection log line.
-	 * @return bool True if the write committed; false if rejected.
+	 * @return bool True if the write committed or the stored value already
+	 *              matched; false if rejected (size cap, refused write, lock
+	 *              contention).
 	 */
 	private static function persist_with_mutator( callable $mutator, string $addon_id ): bool {
 		$result = Lock::with(
@@ -658,14 +682,26 @@ final class AddonSettings {
 				// cheaper than carrying the full option in alloptions on every
 				// request whether read or not. AddonSettings::all() memoises
 				// the result statically, so reads after the first are free.
-				update_option( self::OPTION, $next, false );
+				//
+				// update_option() returns false both for a value that is
+				// already stored and for a refused write (a pre_update_option
+				// filter handed back the stored value, or the query failed).
+				// An unchanged array is a no-op and counts as saved; a changed
+				// one that did not commit is a refusal. The memo is dropped
+				// then, so this request's reads come from the stored row.
+				if ( ! update_option( self::OPTION, $next, false ) && maybe_serialize( $next ) !== maybe_serialize( $current ) ) {
+					self::$cache = null;
+					self::log_rejection( 'persist', $addon_id, 'write_refused' );
+					return false;
+				}
 				self::$cache = $next;
 
 				/**
 				 * Fires inside the storage lock, immediately after the
-				 * autoloaded option commits. Same reentrancy caveat as
-				 * before_save — listeners must not call AddonSettings
-				 * writers synchronously.
+				 * option commits, or after a save that changed nothing.
+				 * Not fired when the write was refused. Same reentrancy
+				 * caveat as before_save — listeners must not call
+				 * AddonSettings writers synchronously.
 				 *
 				 * @hook perflocale/addon/settings/after_save
 				 * @param string               $addon_id  Addon id that was saved.

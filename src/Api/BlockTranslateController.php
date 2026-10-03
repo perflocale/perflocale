@@ -12,6 +12,7 @@ namespace PerfLocale\Api;
 use PerfLocale\Concurrency\Lock;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
+use PerfLocale\Translation\BlockAttributeSource;
 use PerfLocale\Translation\MtRateLimiter;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -106,10 +107,15 @@ final class BlockTranslateController extends RestController {
 						'required' => true,
 						'type'     => 'string',
 					],
-					// Optional: which attribute to extract from the source
-					// block. Server will fall through a chain (content / text /
-					// value / caption / summary / alt / title / placeholder)
-					// when omitted, picking the longest-text candidate.
+					// Optional: the attribute names to read from the source
+					// block (the editor's own attribute chain for the block
+					// type). Omitted = every text attribute of the block type.
+					'source_attrs'   => [
+						'type'    => 'array',
+						'items'   => [ 'type' => 'string' ],
+						'default' => [],
+					],
+					// Optional single-name form of `source_attrs`.
 					'source_attr'    => [
 						'type'    => 'string',
 						'default' => '',
@@ -143,6 +149,17 @@ final class BlockTranslateController extends RestController {
 						'items'   => [ 'type' => 'string' ],
 						'default' => [],
 					],
+					// Batch path: destination format of each entry, parallel to
+					// `texts`. `text` for plain-text attributes (image alt,
+					// title), `html` for rich text. Omitted = every entry html.
+					'formats'     => [
+						'type'    => 'array',
+						'items'   => [
+							'type' => 'string',
+							'enum' => [ 'html', 'text' ],
+						],
+						'default' => [],
+					],
 					'source_lang' => [
 						'required' => true,
 						'type'     => 'string',
@@ -154,6 +171,11 @@ final class BlockTranslateController extends RestController {
 					'provider'    => [
 						'type'    => 'string',
 						'default' => '',
+					],
+					// Optional: the post being edited, whose text this is.
+					'post_id'     => [
+						'type'    => 'integer',
+						'default' => 0,
 					],
 				],
 			]
@@ -221,8 +243,36 @@ final class BlockTranslateController extends RestController {
 			}
 		}
 
+		$formats = [];
+
+		if ( $is_batch ) {
+			$formats_param = $request->get_param( 'formats' );
+
+			if ( is_array( $formats_param ) && $formats_param !== [] ) {
+				$formats = array_values( array_filter( $formats_param, 'is_string' ) );
+
+				if ( count( $formats ) !== count( $texts ) || array_diff( $formats, [ BlockAttributeSource::FORMAT_HTML, BlockAttributeSource::FORMAT_TEXT ] ) !== [] ) {
+					return $this->error( 'invalid_formats', __( 'Every entry in `formats` must be "html" or "text", one per entry in `texts`.', 'perflocale' ), 400 );
+				}
+			}
+		}
+
 		if ( $source_lang === '' || $target_lang === '' ) {
 			return $this->error( 'missing_params', __( 'source_lang and target_lang are required.', 'perflocale' ), 400 );
+		}
+
+		// The editor names the post being edited. A password-protected one is
+		// sent unless the perflocale/mt/send_password_protected filter refuses
+		// it; a post the user cannot edit is not looked at.
+		$post_id_param = $request->get_param( 'post_id' );
+		$post_id       = is_numeric( $post_id_param ) ? absint( $post_id_param ) : 0;
+
+		if ( $post_id > 0 && current_user_can( 'edit_post', $post_id ) ) {
+			$edited = get_post( $post_id );
+
+			if ( $edited instanceof \WP_Post && ! TranslationService::may_send_post( $edited, 'editor' ) ) {
+				return $this->error( 'password_protected', TranslationService::password_protected_skip_message(), 403 );
+			}
 		}
 
 		// Validate both lang codes against active languages up front so an
@@ -394,14 +444,16 @@ final class BlockTranslateController extends RestController {
 		try {
 			if ( $is_batch ) {
 				// translate_batch_texts wraps Provider::translate_batch with
-				// per-entry glossary + sanitize_mt_html so the response is
-				// safe to write to block attributes without further escaping.
-				$batch_result = $service->translate_batch_texts(
+				// per-entry filters and the sanitiser of each entry's format
+				// (sanitize_mt_html for html, the text sanitiser for text), so
+				// the response is safe to write to block attributes as is.
+				$batch_result = $this->translate_by_format(
+					$service,
 					array_values( $texts ),
+					$formats,
 					$source_lang,
 					$target_lang,
-					$provider_id,
-					true
+					$provider_id
 				);
 			} else {
 				$translated = $service->translate_text( $text, $source_lang, $target_lang, $provider_id, true );
@@ -454,36 +506,6 @@ final class BlockTranslateController extends RestController {
 		$hit = apply_filters( 'perflocale/mt/pre_translate_lookup', null, $text, $source_lang, $target_lang );
 
 		return is_string( $hit ) && $hit !== '' ? $hit : null;
-	}
-
-	/**
-	 * Server-side text-attribute chain. Mirrors the JS `textAttrChain`
-	 * priority order so server-side block walks pick the same attribute
-	 * the client would have picked. Used by `translate_from_source` to
-	 * extract text from the source post's corresponding block.
-	 *
-	 * MUST stay in sync with `textAttrChain()` in
-	 * assets/js/block-toolbar.js — both sides walk the same per-block
-	 * chain server- and client-side. Drift = sibling fill-from-source
-	 * picking different attributes between client hint and server
-	 * resolution. tests/test-attr-chain-parity.php asserts the two match.
-	 *
-	 * @return string[] Attribute names in priority order.
-	 */
-	private function text_attr_chain( string $block_name ): array {
-		$per_block = [
-			'core/quote'        => [ 'value' ],
-			'core/pullquote'    => [ 'value', 'citation' ],
-			'core/button'       => [ 'text' ],
-			'core/details'      => [ 'summary' ],
-			'core/image'        => [ 'caption', 'alt', 'title' ],
-			'core/embed'        => [ 'caption' ],
-			'core/audio'        => [ 'caption' ],
-			'core/video'        => [ 'caption' ],
-			'core/post-excerpt' => [ 'excerpt' ],
-		];
-
-		return $per_block[ $block_name ] ?? [ 'content', 'text', 'value' ];
 	}
 
 	/**
@@ -548,55 +570,6 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	 * Extract the longest text candidate from a parsed block.
-	 *
-	 * Tries the per-block attribute chain first; falls back to the block's
-	 * inner HTML for blocks (like core/paragraph) where the persisted text
-	 * lives in the rendered HTML rather than an attribute.
-	 *
-	 * Returns [ $text, $attr ] where $attr is the attribute name the value
-	 * was read from, or 'innerHTML' for the HTML fallback. Empty string
-	 * for both when the block has no text.
-	 *
-	 * @return array{0: string, 1: string}
-	 */
-	private function extract_block_text( array $block, string $hint_attr = '' ): array {
-		$attrs = isset( $block['attrs'] ) && is_array( $block['attrs'] ) ? $block['attrs'] : [];
-
-		// Caller hint wins when it points to a non-empty value.
-		if ( $hint_attr !== '' && isset( $attrs[ $hint_attr ] ) && is_string( $attrs[ $hint_attr ] ) && $attrs[ $hint_attr ] !== '' ) {
-			return [ $attrs[ $hint_attr ], $hint_attr ];
-		}
-
-		$chain     = $this->text_attr_chain( (string) ( $block['blockName'] ?? '' ) );
-		$best      = '';
-		$best_attr = '';
-
-		foreach ( $chain as $attr ) {
-			$v = $attrs[ $attr ] ?? null;
-
-			if ( is_string( $v ) && strlen( $v ) > strlen( $best ) ) {
-				$best      = $v;
-				$best_attr = $attr;
-			}
-		}
-
-		// Fallback to innerHTML when no attribute carried text. core/paragraph
-		// and core/heading store their content in innerHTML on the server side
-		// (Gutenberg's serializer puts the text between block delimiters).
-		if ( $best === '' ) {
-			$inner         = (string) ( $block['innerHTML'] ?? '' );
-			$inner_trimmed = trim( $inner );
-
-			if ( $inner_trimmed !== '' ) {
-				return [ $inner_trimmed, 'innerHTML' ];
-			}
-		}
-
-		return [ $best, $best_attr ];
-	}
-
-	/**
 	 * Translate the corresponding block in this post's SOURCE sibling and
 	 * return the translation in the target post's language.
 	 *
@@ -604,6 +577,17 @@ final class BlockTranslateController extends RestController {
 	 * "Fill in from source" on a paragraph → endpoint fetches the EN source
 	 * post's same-position paragraph → translates EN to FR → returns the FR
 	 * text for the JS to write back.
+	 *
+	 * Each text attribute of the source block is read from where its block
+	 * type stores it ({@see BlockAttributeSource}) and returned under its own
+	 * name in `attributes`, so the editor writes the paragraph's text into
+	 * `content` and an image's alt, caption and title into their own
+	 * attributes. `translated` / `source_attr` carry the first of them.
+	 *
+	 * A source block marked "Do not translate", or inside a marked block, is
+	 * returned verbatim (`source` = `kept`) with no provider call, no
+	 * translation-memory lookup and no rate-limit slot, the same rule
+	 * whole-post machine translation applies.
 	 *
 	 * Validation:
 	 *  - Caller has `edit_post` for `target_post_id`
@@ -615,14 +599,28 @@ final class BlockTranslateController extends RestController {
 	 * Errors:
 	 *  - 403 `cannot_edit_post` (auth), 404 `no_source_sibling` /
 	 *    `block_not_found_in_source`, 422 `empty_source_text` for the
-	 *    "block has no text" case (rare in practice).
+	 *    "block has no text" case, 422 `unreadable_source_block` when the
+	 *    block type stores its text behind a selector this reader cannot
+	 *    evaluate.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function translate_from_source( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
 		$target_post_id = (int) $request->get_param( 'target_post_id' );
 		$block_path     = (array) $request->get_param( 'block_path' );
 		$target_lang    = sanitize_key( (string) $request->get_param( 'target_lang' ) );
-		$source_attr    = sanitize_key( (string) $request->get_param( 'source_attr' ) );
 		$provider_id    = sanitize_key( (string) $request->get_param( 'provider' ) );
+
+		// Attribute names are camelCase (fileName, downloadButtonText), so they
+		// are validated by BlockAttributeSource, not lower-cased by sanitize_key().
+		$source_attrs = array_values( array_filter( (array) $request->get_param( 'source_attrs' ), 'is_string' ) );
+		$source_attr  = (string) $request->get_param( 'source_attr' );
+		$legacy_hint  = $source_attrs === [] && $source_attr !== '';
+
+		if ( $legacy_hint ) {
+			$source_attrs = [ $source_attr ];
+		}
 
 		if ( $target_post_id <= 0 || $target_lang === '' ) {
 			return $this->error( 'missing_params', __( 'target_post_id and target_lang are required.', 'perflocale' ), 400 );
@@ -675,6 +673,12 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'is_source', __( 'Target post IS the source post; use /block-translate to translate in place.', 'perflocale' ), 400 );
 		}
 
+		// The source's text is sent: a password-protected source is sent
+		// unless the perflocale/mt/send_password_protected filter refuses it.
+		if ( ! TranslationService::may_send_post( $source_post, 'editor' ) ) {
+			return $this->error( 'password_protected', TranslationService::password_protected_skip_message(), 403 );
+		}
+
 		// Resolve the source post's language slug for the MT call.
 		$lang_repo    = new \PerfLocale\Database\Repository\LanguageRepository( $plugin->get( 'cache' ) );
 		$default_lang = $lang_repo->get_default();
@@ -707,22 +711,73 @@ final class BlockTranslateController extends RestController {
 			);
 		}
 
-		// Extract the source block's text. Caller may pass `source_attr` to
-		// pin to a specific attribute (when the JS already knows which one
-		// it needs); otherwise the chain heuristic picks.
-		[ $source_text, $picked_attr ] = $this->extract_block_text( $matched_block, $source_attr );
+		$read = BlockAttributeSource::read( $matched_block, $source_attrs );
 
-		if ( $source_text === '' ) {
+		// The single-name hint names a preference, not a restriction: an
+		// empty hinted attribute falls through to the block type's chain.
+		if ( $legacy_hint && $read['values'] === [] ) {
+			$read = BlockAttributeSource::read( $matched_block );
+		}
+
+		$values   = $read['values'];
+		$provider = $provider_id !== '' ? $provider_id : (string) $plugin->get( 'settings' )->get_mt_provider();
+
+		if ( $values === [] ) {
+			if ( $read['skipped'] !== [] ) {
+				return $this->error( 'unreadable_source_block', __( 'The source block\'s text could not be read for this block type.', 'perflocale' ), 422 );
+			}
+
 			return $this->error( 'empty_source_text', __( 'The corresponding source block has no text to translate.', 'perflocale' ), 422 );
 		}
 
-		if ( mb_strlen( $source_text ) > self::MAX_INPUT_LENGTH ) {
+		$base = [
+			'source_attr'    => (string) array_key_first( $values ),
+			'formats'        => $read['formats'],
+			'skipped_attrs'  => $read['skipped'],
+			'provider'       => $provider,
+			'source_post_id' => (int) $source_post->ID,
+		];
+
+		// "Do not translate" on the source block or any block above it: the
+		// target gets the source text verbatim, as whole-post MT keeps it.
+		if ( BlockAttributeSource::path_is_skip_marked( $source_blocks, $block_path ) ) {
+			return $this->success(
+				$base + [
+					'translated'  => (string) reset( $values ),
+					'attributes'  => $values,
+					'source'      => 'kept',
+					'kept_reason' => 'do_not_translate',
+				]
+			);
+		}
+
+		$total_chars = 0;
+
+		foreach ( $values as $value ) {
+			$chars = mb_strlen( $value );
+
+			if ( $chars > self::MAX_INPUT_LENGTH ) {
+				return $this->error(
+					'text_too_long',
+					sprintf(
+						/* translators: %d: max characters */
+						__( 'Source block exceeds the per-translate length cap (%d characters).', 'perflocale' ),
+						self::MAX_INPUT_LENGTH
+					),
+					413
+				);
+			}
+
+			$total_chars += $chars;
+		}
+
+		if ( $total_chars > self::MAX_INPUT_LENGTH * 4 ) {
 			return $this->error(
-				'text_too_long',
+				'batch_too_long',
 				sprintf(
-					/* translators: %d: max characters */
-					__( 'Source block exceeds the per-translate length cap (%d characters).', 'perflocale' ),
-					self::MAX_INPUT_LENGTH
+					/* translators: %d: total max characters across the whole batch */
+					__( 'Batch total exceeds the aggregate length cap (%d characters). Split into smaller batches.', 'perflocale' ),
+					self::MAX_INPUT_LENGTH * 4
 				),
 				413
 			);
@@ -734,44 +789,96 @@ final class BlockTranslateController extends RestController {
 			return $limited;
 		}
 
-		// TM pre-flight — same toggle/filter as the regular
-		// translate path. This is a logical extension: when the user clicks
-		// "Fill from source" on a phrase that's been translated before,
-		// don't waste MT quota.
-		$tm_hit = $this->maybe_tm_lookup( $source_text, $source_lang, $target_lang );
+		// TM pre-flight per value — same filter as the regular translate
+		// path: a phrase translated before costs no MT quota.
+		$translated = [];
+		$pending    = [];
 
-		if ( $tm_hit !== null ) {
-			return $this->success(
-				[
-					'translated'     => $tm_hit,
-					'provider'       => $provider_id !== '' ? $provider_id : $plugin->get( 'settings' )->get_mt_provider(),
-					'source'         => 'tm',
-					'source_attr'    => $picked_attr,
-					'source_post_id' => (int) $source_post->ID,
-				]
+		foreach ( $values as $name => $value ) {
+			$tm_hit = $this->maybe_tm_lookup( $value, $source_lang, $target_lang );
+
+			if ( $tm_hit !== null ) {
+				$translated[ $name ] = $tm_hit;
+			} else {
+				$pending[ $name ] = $value;
+			}
+		}
+
+		if ( $pending !== [] ) {
+			$service = new TranslationService(
+				$plugin->get( 'settings' ),
+				$plugin->get( 'cache' )
 			);
+
+			$names   = array_keys( $pending );
+			$formats = array_map( static fn( string $name ): string => (string) ( $read['formats'][ $name ] ?? BlockAttributeSource::FORMAT_HTML ), $names );
+
+			try {
+				$results = $this->translate_by_format( $service, array_values( $pending ), $formats, $source_lang, $target_lang, $provider_id );
+			} catch ( \Throwable $e ) {
+				return $this->error( 'translation_failed', $e->getMessage(), 500 );
+			}
+
+			foreach ( $names as $i => $name ) {
+				// An empty result is a provider failure for that value; never
+				// hand the editor an empty string to write over its text.
+				if ( isset( $results[ $i ] ) && $results[ $i ] !== '' ) {
+					$translated[ $name ] = $results[ $i ];
+				}
+			}
 		}
 
-		$service = new TranslationService(
-			$plugin->get( 'settings' ),
-			$plugin->get( 'cache' )
-		);
+		// Chain order, whichever path produced each value.
+		$attributes = array_intersect_key( array_replace( $values, $translated ), $translated );
 
-		try {
-			$translated = $service->translate_text( $source_text, $source_lang, $target_lang, $provider_id, true );
-		} catch ( \Throwable $e ) {
-			return $this->error( 'translation_failed', $e->getMessage(), 500 );
+		if ( $attributes === [] ) {
+			return $this->error( 'translation_failed', __( 'The translation provider returned an empty result; aborting so existing content is not overwritten.', 'perflocale' ), 500 );
 		}
+
+		$base['source_attr'] = (string) array_key_first( $attributes );
 
 		return $this->success(
-			[
-				'translated'     => $translated,
-				'provider'       => $provider_id !== '' ? $provider_id : $plugin->get( 'settings' )->get_mt_provider(),
-				'source'         => 'mt',
-				'source_attr'    => $picked_attr,
-				'source_post_id' => (int) $source_post->ID,
+			$base + [
+				'translated' => (string) reset( $attributes ),
+				'attributes' => $attributes,
+				'source'     => $pending === [] ? 'tm' : 'mt',
 			]
 		);
+	}
+
+	/**
+	 * Translate a batch whose entries have different destination formats: one
+	 * TranslationService call per format, results back in input order.
+	 *
+	 * @param TranslationService $service     Service.
+	 * @param string[]           $texts       Entries, 0..n-1.
+	 * @param string[]           $formats     Parallel formats (`html` | `text`); missing = `html`.
+	 * @param string             $source_lang Source language.
+	 * @param string             $target_lang Target language.
+	 * @param string             $provider_id Provider id or '' for the configured one.
+	 * @return string[] Translations, 0..n-1.
+	 */
+	private function translate_by_format( TranslationService $service, array $texts, array $formats, string $source_lang, string $target_lang, string $provider_id ): array {
+		$groups = [];
+
+		foreach ( $texts as $i => $text ) {
+			$format                  = ( $formats[ $i ] ?? '' ) === BlockAttributeSource::FORMAT_TEXT ? BlockAttributeSource::FORMAT_TEXT : BlockAttributeSource::FORMAT_HTML;
+			$groups[ $format ][ $i ] = (string) $text;
+		}
+
+		$out = array_fill( 0, count( $texts ), '' );
+
+		foreach ( $groups as $format => $entries ) {
+			$result = $service->translate_batch_texts( array_values( $entries ), $source_lang, $target_lang, $provider_id, true, $format );
+			$j      = 0;
+
+			foreach ( array_keys( $entries ) as $i ) {
+				$out[ $i ] = (string) ( $result[ $j ] ?? '' );
+				++$j;
+			}
+		}
+
+		return $out;
 	}
 
 	/**

@@ -16,6 +16,7 @@ use PerfLocale\Helper;
 use PerfLocale\Router\LanguageRouter;
 use PerfLocale\Router\UrlConverter;
 use PerfLocale\Settings;
+use PerfLocale\Translation\PostQueryFilter;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -212,10 +213,14 @@ final class HreflangTags {
 	 * @return mixed Pinned canonical, or the input unchanged.
 	 */
 	public function filter_seo_plugin_canonical( $canonical_url ) {
-		// Core's guard is post-only (get_canonical_url never fires for
-		// archives), so mirror that scope rather than widening it here.
-		if ( ! is_string( $canonical_url ) || $canonical_url === '' || ! is_singular() ) {
+		if ( ! is_string( $canonical_url ) || $canonical_url === '' ) {
 			return $canonical_url;
+		}
+
+		// Core prints no archive canonical, so term archives and the posts
+		// page are pinned only here.
+		if ( ! is_singular() ) {
+			return $this->pin_archive_fallback_canonical( $canonical_url );
 		}
 
 		$post = get_queried_object();
@@ -278,6 +283,87 @@ final class HreflangTags {
 		}
 
 		return $this->filter_fallback_canonical( $canonical_url, $post );
+	}
+
+	/**
+	 * Pin an SEO plugin's canonical on a term archive or the posts page shown
+	 * as a fallback.
+	 *
+	 * An untranslated term's archive, or an untranslated posts page, renders
+	 * under every language prefix, and the SEO plugin makes each of those
+	 * URLs self-canonical. The canonical is converted to the object's own
+	 * language (its link language, or the default when it has no links) when
+	 * the current language is not that language and has no translation of
+	 * it. As for singulars, only the plugin's own default value is touched:
+	 * the term link or the posts page permalink. Terms of a taxonomy that is
+	 * not translatable are shared by every language and are left alone.
+	 *
+	 * @param string $canonical_url Canonical URL the SEO plugin computed.
+	 * @return string Pinned canonical, or the input unchanged.
+	 */
+	private function pin_archive_fallback_canonical( string $canonical_url ): string {
+		$offered = urldecode( untrailingslashit( $canonical_url ) );
+
+		if ( is_home() && ! is_front_page() ) {
+			$page = get_post( (int) get_option( 'page_for_posts' ) );
+			$link = $page instanceof \WP_Post ? get_permalink( $page ) : false;
+
+			if ( ! is_string( $link ) || $offered !== urldecode( untrailingslashit( $link ) ) ) {
+				return $canonical_url;
+			}
+
+			$pinned = $this->filter_fallback_canonical( $canonical_url, $page );
+
+			return is_string( $pinned ) ? $pinned : $canonical_url;
+		}
+
+		if ( ! ( is_category() || is_tag() || is_tax() ) ) {
+			return $canonical_url;
+		}
+
+		$term = get_queried_object();
+
+		if ( ! $term instanceof \WP_Term || ! in_array( $term->taxonomy, $this->settings->get_translatable_taxonomies(), true ) ) {
+			return $canonical_url;
+		}
+
+		$link          = get_term_link( $term );
+		$current       = $this->router->get_current_language();
+		$cache_manager = $this->cache();
+
+		if ( ! is_string( $link ) || $offered !== urldecode( untrailingslashit( $link ) ) || ! $current || ! $cache_manager instanceof CacheManager ) {
+			return $canonical_url;
+		}
+
+		$own         = '';
+		$has_current = false;
+
+		foreach ( ( new TranslationGroupRepository( $cache_manager ) )->get_translations( (int) $term->term_id, ObjectType::Term ) as $link_row ) {
+			if ( empty( $link_row->language_slug ) ) {
+				continue;
+			}
+
+			if ( (int) $link_row->object_id === (int) $term->term_id ) {
+				$own = (string) $link_row->language_slug;
+			}
+
+			if ( (string) $link_row->language_slug === (string) $current->slug ) {
+				$has_current = true;
+			}
+		}
+
+		if ( $own === '' ) {
+			$default = $this->router->get_default_language();
+			$own     = $default ? (string) $default->slug : '';
+		}
+
+		if ( $own === '' || $own === (string) $current->slug || $has_current ) {
+			return $canonical_url;
+		}
+
+		$pinned = (string) $this->url_converter->convert( $canonical_url, $own );
+
+		return $pinned !== '' ? $pinned : $canonical_url;
 	}
 
 	/**
@@ -492,22 +578,36 @@ final class HreflangTags {
 			return null;
 		}
 
+		// Page N of a listing with extra query vars (?year=, a shop filter)
+		// shares its bucket with the plain page N, but its set is built
+		// without the page-existence check; it is not stored.
+		if ( $this->is_filtered_listing_page() ) {
+			return null;
+		}
+
 		$lang_id = $this->router->get_current_language_id();
 		$paged   = max( 1, (int) get_query_var( 'paged', 1 ) );
 
 		if ( is_singular() ) {
 			$post_id = (int) get_queried_object_id();
 
-			if ( $post_id <= 0 ) {
+			// A page reached through a rewrite endpoint (/my-account/orders/)
+			// has its own alternates; they are built per request.
+			if ( $post_id <= 0 || $this->url_converter->current_endpoint() !== null ) {
 				return null;
 			}
 
 			return 'perflocale_hreflang_s_' . $post_id . '_' . $lang_id;
 		}
 
+		if ( is_home() && ! is_front_page() ) {
+			// The posts page advertises only the languages it has a published
+			// sibling in, so its set differs from the front page's.
+			return 'perflocale_hreflang_hp_' . $lang_id . '_' . $paged;
+		}
+
 		if ( is_front_page() || is_home() ) {
-			// Front page + blog-posts page share the same hreflang set
-			// (language root URLs). One cache bucket per language + page.
+			// Language root URLs. One cache bucket per language + page.
 			return 'perflocale_hreflang_h_' . $lang_id . '_' . $paged;
 		}
 
@@ -672,6 +772,20 @@ final class HreflangTags {
 
 		$urls    = $this->url_converter->get_translations_for_current_page();
 		$default = $this->router->get_default_language();
+		$urls    = $this->restrict_archive_alternates( $urls, $default );
+
+		// A singular with no language version is either a post without a
+		// translation link, which is default-language content, or one with no
+		// published sibling at all.
+		if ( $urls === [] && $default !== null && is_singular() ) {
+			$urls = $this->unlinked_post_alternates( $default );
+		}
+
+		// A term of a taxonomy PerfLocale does not translate has no language
+		// versions to point at.
+		if ( $urls === null ) {
+			return $cached;
+		}
 
 		// Per-post hreflang opt-out (Helper::SEO_EXCLUDE_META): on singular
 		// requests, drop flagged siblings from the alternate set — and when
@@ -742,7 +856,11 @@ final class HreflangTags {
 				$current_url = $this->current_request_url();
 			}
 
-			foreach ( $languages as $lang ) {
+			// convert() hands back a URL it cannot parse unchanged; nothing
+			// built from such a URL becomes an alternate.
+			$fill = wp_parse_url( $current_url ) !== false ? $languages : [];
+
+			foreach ( $fill as $lang ) {
 				if ( isset( $urls[ $lang->slug ] ) || isset( $excluded_slugs[ $lang->slug ] ) ) {
 					continue;
 				}
@@ -768,6 +886,8 @@ final class HreflangTags {
 				}
 			}
 		}
+
+		$urls = $this->drop_missing_listing_pages( $urls, $languages );
 
 		foreach ( $languages as $lang ) {
 			if ( ! isset( $urls[ $lang->slug ] ) ) {
@@ -846,6 +966,248 @@ final class HreflangTags {
 	}
 
 	/**
+	 * Keep only the languages a term archive or the posts page exists in.
+	 *
+	 * These archives get their alternates from UrlConverter's generic branch
+	 * whenever the object has no translation links, and that branch builds a
+	 * URL for every active language. Those URLs only render the object as a
+	 * fallback. A term archive keeps the languages its term is linked in; an
+	 * unlinked term is default-language content and keeps the default only.
+	 * The posts page keeps the languages in which it has a published sibling
+	 * (the default only when it has no links). A term of a taxonomy that is
+	 * not translatable gets no alternates at all. Singulars and every other
+	 * archive are returned unchanged.
+	 *
+	 * @param array<string, string> $urls             Language slug => URL.
+	 * @param object|null           $default_language Default language.
+	 * @return array<string, string>|null Restricted map, or null for a term of
+	 *                                    a taxonomy that is not translatable.
+	 */
+	private function restrict_archive_alternates( array $urls, ?object $default_language ): ?array {
+		$object_id   = 0;
+		$object_type = null;
+
+		if ( is_category() || is_tag() || is_tax() ) {
+			$term = get_queried_object();
+
+			if ( ! $term instanceof \WP_Term ) {
+				return $urls;
+			}
+
+			if ( ! in_array( $term->taxonomy, $this->settings->get_translatable_taxonomies(), true ) ) {
+				return null;
+			}
+
+			$object_id   = (int) $term->term_id;
+			$object_type = ObjectType::Term;
+		} elseif ( is_home() && ! is_front_page() ) {
+			$object_id   = (int) get_option( 'page_for_posts' );
+			$object_type = ObjectType::Post;
+		}
+
+		$cache_manager = $this->cache();
+
+		if ( $object_id <= 0 || $object_type === null || ! $cache_manager instanceof CacheManager ) {
+			return $urls;
+		}
+
+		$exists = [];
+
+		foreach ( ( new TranslationGroupRepository( $cache_manager ) )->get_translations( $object_id, $object_type ) as $link ) {
+			if ( empty( $link->language_slug ) ) {
+				continue;
+			}
+
+			if ( $object_type === ObjectType::Post && get_post_status( (int) $link->object_id ) !== 'publish' ) {
+				continue;
+			}
+
+			$exists[ (string) $link->language_slug ] = true;
+		}
+
+		if ( $exists === [] && $default_language && ! empty( $default_language->slug ) ) {
+			$exists[ (string) $default_language->slug ] = true;
+		}
+
+		return array_intersect_key( $urls, $exists );
+	}
+
+	/**
+	 * Drop the alternates of page N of a listing for languages whose listing is shorter.
+	 *
+	 * Page N of a paginated listing (blog, shop, post type or date archive)
+	 * is advertised in every language as that language's page N, and a
+	 * language with fewer items answers that URL with a 404. On page 2 and
+	 * later, each other language is kept when this page of the listing has
+	 * rows in it. A listing PerfLocale leaves without a language condition
+	 * (none of its post types is translatable, or the
+	 * perflocale/query/include_all_languages filter opted it out) has the same
+	 * rows in every language: its page N is answered by this page's own rows,
+	 * with no query. PostQueryFilter::listing_page_exists() answers from the main
+	 * query's own clauses and the found-rows count cache; when it cannot, one
+	 * ids-only copy of the main query per language checks the page. The result
+	 * is cached with the rest of the alternate set. Term archives are left
+	 * alone: their alternates are the translated terms' own links. A request
+	 * with query vars the cache key does not hold is not checked: its vars
+	 * (a date, a shop filter) would decide the set of the plain page N.
+	 *
+	 * @param array<array-key, string> $urls      Alternate URL per language slug.
+	 * @param array<int, object>       $languages Active languages.
+	 * @return array<array-key, string>
+	 */
+	private function drop_missing_listing_pages( array $urls, array $languages ): array {
+		global $wp_query;
+
+		if (
+			(int) get_query_var( 'paged' ) < 2
+			|| ! $wp_query instanceof \WP_Query
+			|| is_singular()
+			|| is_category()
+			|| is_tag()
+			|| is_tax()
+			|| is_search()
+			|| $this->is_filtered_listing_page()
+		) {
+			return $urls;
+		}
+
+		$current = (string) $this->router->get_current_slug();
+		$targets = [];
+
+		foreach ( $languages as $lang ) {
+			$slug = (string) $lang->slug;
+
+			if ( $slug === $current || ! isset( $urls[ $slug ] ) || (int) ( $lang->id ?? 0 ) <= 0 ) {
+				continue;
+			}
+
+			$targets[ $slug ] = (int) $lang->id;
+		}
+
+		if ( [] === $targets ) {
+			return $urls;
+		}
+
+		// A listing without a language condition has the same rows in every
+		// language, so page N exists in each language when it has rows here.
+		if ( PostQueryFilter::is_unscoped_main_listing( $wp_query ) ) {
+			return [] !== (array) $wp_query->posts ? $urls : array_diff_key( $urls, $targets );
+		}
+
+		$exists = PostQueryFilter::listing_page_exists( $wp_query, array_values( $targets ) );
+
+		foreach ( $targets as $slug => $language_id ) {
+			if ( is_array( $exists ) ) {
+				$has_page = $exists[ $language_id ] ?? true;
+			} else {
+				$probe    = new \WP_Query(
+					array_merge(
+						$wp_query->query_vars,
+						[
+							'perflocale_language_id' => $language_id,
+							'perflocale_optimize_found_rows' => false,
+							'fields'                 => 'ids',
+							'no_found_rows'          => true,
+							'cache_results'          => false,
+							'update_post_meta_cache' => false,
+							'update_post_term_cache' => false,
+							'lazy_load_term_meta'    => false,
+						]
+					)
+				);
+				$has_page = [] !== $probe->posts;
+			}
+
+			if ( ! $has_page ) {
+				unset( $urls[ $slug ] );
+			}
+		}
+
+		return $urls;
+	}
+
+	/**
+	 * True on page 2 or later of a listing whose request carries query vars
+	 * that build_cache_key() does not hold.
+	 *
+	 * Such vars (`?year=` on a post type archive, a shop's layered-nav
+	 * filter) narrow the main query, so page-existence probes built from it
+	 * would describe the filtered listing, not the plain page N whose URLs
+	 * the alternates are. Only the request's keys are read.
+	 *
+	 * @return bool
+	 */
+	private function is_filtered_listing_page(): bool {
+		$paged = get_query_var( 'paged' );
+
+		if ( ! is_numeric( $paged ) || (int) $paged < 2 || is_singular() || is_category() || is_tag() || is_tax() || is_search() ) {
+			return false;
+		}
+
+		$allowed = [ 'paged', 'post_type', UrlConverter::query_var() ];
+
+		if ( ! is_post_type_archive() && ! is_home() ) {
+			if ( is_date() ) {
+				array_push( $allowed, 'year', 'monthnum', 'day' );
+			} elseif ( is_author() ) {
+				$allowed[] = 'author';
+			}
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.NonceVerification.Missing -- Only the keys are read, to decide whether the alternate set may be cached.
+		$keys = array_merge( array_keys( $_GET ), array_keys( $_POST ) );
+
+		return array_diff( array_map( 'strval', $keys ), $allowed ) !== [];
+	}
+
+	/**
+	 * The one language version of a queried post that has no translation link.
+	 *
+	 * Such a post is default-language content, so its default-language URL is
+	 * its self and x-default alternate. A linked post, an unpublished one and
+	 * a post of a type PerfLocale does not translate get none.
+	 *
+	 * @param object $default_language Default-language object.
+	 * @return array<string, string> Default-language slug => URL, or [].
+	 */
+	private function unlinked_post_alternates( object $default_language ): array {
+		$post = get_queried_object();
+
+		if (
+			! $post instanceof \WP_Post
+			|| $post->post_status !== 'publish'
+			|| ! in_array( $post->post_type, $this->settings->get_translatable_post_types(), true )
+		) {
+			return [];
+		}
+
+		$cache_manager = $this->cache();
+
+		if ( ! $cache_manager instanceof CacheManager ) {
+			return [];
+		}
+
+		$repo = new TranslationGroupRepository( $cache_manager );
+
+		foreach ( $repo->get_translations( (int) $post->ID, ObjectType::Post ) as $link ) {
+			if ( (int) ( $link->object_id ?? 0 ) === (int) $post->ID ) {
+				return [];
+			}
+		}
+
+		$permalink = (string) get_permalink( $post );
+
+		if ( $permalink === '' ) {
+			return [];
+		}
+
+		// The permalink of an unlinked post carries the visitor's language.
+		$url = $this->url_converter->convert( $permalink, (string) $default_language->slug );
+
+		return $url !== '' ? [ (string) $default_language->slug => $url ] : [];
+	}
+
+	/**
 	 * Convert a WordPress locale to an hreflang value.
 	 *
 	 * Routes through {@see \PerfLocale\Helper::format_locale_as_bcp47()} so
@@ -884,6 +1246,11 @@ final class HreflangTags {
 	 * `<link rel="alternate" href>` set served to EVERY subsequent visitor
 	 * of the same page, because the cache key and the payload would differ.
 	 *
+	 * The host is the site address's, never the request's Host header, for
+	 * the same reason: convert() rebuilds a URL on the site address only when
+	 * it can parse it, and hands back unchanged a URL it cannot (a Host with
+	 * a port above 65535, for one), which would then be cached for everyone.
+	 *
 	 * @return string
 	 */
 	private function current_request_url(): string {
@@ -895,6 +1262,14 @@ final class HreflangTags {
 			return home_url( '/' );
 		}
 
+		$home = wp_parse_url( home_url() );
+
+		if ( ! is_array( $home ) || empty( $home['host'] ) ) {
+			return home_url( '/' );
+		}
+
+		$authority = (string) $home['host'] . ( isset( $home['port'] ) ? ':' . (int) $home['port'] : '' );
+
 		// Drop query + fragment — cache key doesn't include them, so leaving
 		// them in the URL would let the first request's query string poison
 		// the cached alternates for every subsequent visitor of this page.
@@ -903,7 +1278,7 @@ final class HreflangTags {
 			$uri = substr( $uri, 0, $qpos );
 		}
 
-		return $scheme . '://' . $host . $uri;
+		return $scheme . '://' . $authority . $uri;
 	}
 
 	/**

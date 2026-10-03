@@ -59,13 +59,20 @@ final class DataExporter {
 	];
 
 	/**
-	 * Suffix pattern identifying credential-shaped setting keys. Shared by the
+	 * Pattern identifying credential-shaped setting keys. Shared by the
 	 * exporter (which redacts these so secrets never travel in a backup) and
 	 * the importer (which preserves the target's existing value for a key the
 	 * export redacted, so restoring a backup doesn't blank live credentials).
 	 * Keeping it in one place stops the two sides from drifting.
+	 *
+	 * Matched without regard to case, anywhere in the key: `_api_key`,
+	 * `_apikey`, `_secret`, `_password`, `_credential(s)`, `_encrypted`, the
+	 * credential names PostTranslationManager keeps out of a translation's
+	 * meta. `_token` and `_auth` match only as a whole name part (followed by
+	 * `_` or the end), so `max_tokens` and `show_author` are not credentials.
+	 * `_key` matches at the end only.
 	 */
-	public const CREDENTIAL_KEY_PATTERN = '/(?:_api_key|_token|_key|_secret|_password)$/';
+	public const CREDENTIAL_KEY_PATTERN = '/_api_?key|_secret|_password|_credentials?|_encrypted|_token(?:_|$)|_auth(?:_|$)|_key$/i';
 
 	/**
 	 * Available export sections with labels and associated tables.
@@ -507,9 +514,10 @@ final class DataExporter {
 	/**
 	 * Strip every setting whose key looks like a credential from the export.
 	 *
-	 * Covers all *_api_key / *_token / *_key / *_secret / *_password settings
-	 * via suffix match so future additions are redacted by default. Exports
-	 * are commonly shared as backups - credentials must never travel.
+	 * Covers every key {@see self::CREDENTIAL_KEY_PATTERN} matches (API keys,
+	 * tokens, secrets, passwords, credentials, ...) by name, so future
+	 * additions are redacted by default. Exports are commonly shared as
+	 * backups - credentials must never travel.
 	 *
 	 * Two rules:
 	 *
@@ -517,7 +525,7 @@ final class DataExporter {
 	 *    nests it.
 	 * 2. It looks at VALUES, not only keys, for `scheme://user:pass@host`
 	 *    userinfo. `mt_libre_url` / `mt_agency_url` are ordinary URL settings
-	 *    matching no credential suffix, and `esc_url_raw()` keeps both the
+	 *    matching no credential name, and `esc_url_raw()` keeps both the
 	 *    `:` and the `@`.
 	 *
 	 * Both cases OMIT the key rather than rewriting the value, and that is
@@ -597,8 +605,10 @@ final class DataExporter {
 	/**
 	 * Strip credential-shaped fields out of every addon's settings entry.
 	 *
-	 * Shape: `[ addon_id => [ field_key => value, ... ] ]`. Walks each
-	 * inner entry through the same suffix list as redact_credentials() so
+	 * Shape: `[ addon_id => [ field_key => value, ... ] ]`. A field the
+	 * add-on's settings schema declares as a password is left out whatever
+	 * its key ({@see self::password_setting_keys()}). Each inner entry is
+	 * then walked through the same key pattern as redact_credentials() so
 	 * an addon's `*_api_key` / `*_token` / etc. never ride along on a
 	 * staging → prod export. Per-addon credentials stay on the exporting
 	 * site; operators re-enter them on import.
@@ -620,9 +630,50 @@ final class DataExporter {
 			if ( ! is_array( $entry ) ) {
 				continue;
 			}
+			foreach ( self::password_setting_keys( (string) $addon_id ) as $password_key ) {
+				unset( $entry[ $password_key ] );
+			}
 			$addon_settings[ $addon_id ] = self::redact_credentials( $entry );
 		}
 		return $addon_settings;
+	}
+
+	/**
+	 * The keys of an add-on's settings fields whose type is password.
+	 *
+	 * Read from the settings schema (get_settings_fields()) of the add-on as
+	 * registered in this request; an add-on that is not registered, or whose
+	 * schema throws, has none, and its keys are judged by name alone.
+	 * DataImporter keeps the target's value for such a key when an import
+	 * leaves it out, as it does for a credential-named key.
+	 *
+	 * @param string $addon_id Add-on ID.
+	 * @return array<int, string>
+	 */
+	public static function password_setting_keys( string $addon_id ): array {
+		$plugin   = \PerfLocale\Plugin::get_instance();
+		$registry = $plugin->has( 'addon_registry' ) ? $plugin->get( 'addon_registry' ) : null;
+		$addon    = $registry instanceof \PerfLocale\Addon\AddonRegistry ? ( $registry->get_addons()[ $addon_id ] ?? null ) : null;
+
+		if ( ! $addon instanceof \PerfLocale\Addon\AddonInterface ) {
+			return [];
+		}
+
+		try {
+			$fields = $addon->get_settings_fields();
+		} catch ( \Throwable $e ) {
+			return [];
+		}
+
+		$keys = [];
+
+		foreach ( $fields as $key => $field ) {
+			if ( 'password' === ( $field['type'] ?? '' ) ) {
+				$keys[] = $key;
+			}
+		}
+
+		return $keys;
 	}
 
 	/**
@@ -860,9 +911,8 @@ final class DataExporter {
 			// conceptually the same surface from an operator POV: cloning
 			// staging → prod should pick up addon-level config too, not
 			// silently drop it. Each addon's entry is redacted with the
-			// same _api_key / _token / _key / _secret / _password rules
-			// as the main settings — any addon's secrets stay on the
-			// exporting site.
+			// same CREDENTIAL_KEY_PATTERN as the main settings — any
+			// addon's secrets stay on the exporting site.
 			$addon_settings = get_option( 'perflocale_addon_settings', [] );
 
 			if ( is_array( $addon_settings ) ) {

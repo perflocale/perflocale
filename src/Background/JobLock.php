@@ -346,12 +346,23 @@ final class JobLock {
 	 * @return bool
 	 */
 	public static function is_held( string $job_id ): bool {
+		return self::expires_at( $job_id ) > time();
+	}
+
+	/**
+	 * Unix time at which the job's lock expires, whether or not it already
+	 * has. Inspection only, like {@see is_held()}.
+	 *
+	 * @param string $job_id Job identifier.
+	 * @return int Expiry timestamp, or 0 when there is no lock or its value
+	 *             cannot be parsed.
+	 */
+	public static function expires_at( string $job_id ): int {
 		if ( ! JobState::is_safe_id( $job_id ) ) {
-			return false;
+			return 0;
 		}
 
-		$stored = (string) get_option( self::PREFIX . $job_id, '' );
-		return self::parse_expiry( $stored ) > time();
+		return self::parse_expiry( (string) get_option( self::PREFIX . $job_id, '' ) );
 	}
 
 	/**
@@ -494,13 +505,14 @@ final class JobLock {
 	 *
 	 * @param string $type Job type slug.
 	 * @param int    $ttl  New TTL in seconds.
-	 * @return void
+	 * @return bool False when the lock is gone or another holder has it (this
+	 *              process lost it); true when this process still holds it.
 	 */
-	public static function refresh_type( string $type, int $ttl = self::DEFAULT_TTL ): void {
+	public static function refresh_type( string $type, int $ttl = self::DEFAULT_TTL ): bool {
 		$type = self::sanitize_type( $type );
 
 		if ( $type === '' ) {
-			return;
+			return false;
 		}
 
 		$key         = self::TYPE_PREFIX . $type;
@@ -512,20 +524,20 @@ final class JobLock {
 			// ownerless overwrite below would stamp our token over the worker
 			// that now holds it and break the max_concurrent=1 guarantee for
 			// this whole job type.
-			return;
+			return false;
 		}
 
 		if ( $owned_value === null ) {
 			// No prior acquire in this request (static reset between AS
 			// batches): best-effort overwrite, matching refresh()'s fallback.
 			update_option( $key, self::format_value( time() + max( 30, $ttl ), self::generate_token() ), false );
-			return;
+			return true;
 		}
 
 		global $wpdb;
 
 		if ( ! $wpdb instanceof \wpdb ) {
-			return;
+			return false;
 		}
 
 		$token     = self::parse_token( $owned_value );
@@ -545,7 +557,7 @@ final class JobLock {
 			self::$owned[ $owned_key ] = $new_value;
 			wp_cache_delete( $key, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
-			return;
+			return true;
 		}
 
 		// 0 affected can be a no-op UPDATE, not a lost lock: the startup
@@ -558,7 +570,7 @@ final class JobLock {
 		// deferring every same-type job with "worker busy" for up to 30 min.
 		if ( self::current_value( $key ) === $new_value ) {
 			self::$owned[ $owned_key ] = $new_value;
-			return;
+			return true;
 		}
 
 		// Lost ownership of the type lock — drop our stale record so we don't
@@ -566,6 +578,8 @@ final class JobLock {
 		// LOST so the ownerless overwrite above stays disabled for this key.
 		unset( self::$owned[ $owned_key ] );
 		self::$lost[ $owned_key ] = true;
+
+		return false;
 	}
 
 	/**

@@ -56,8 +56,12 @@ final class PluginNav {
 	];
 
 	/**
-	 * Render the strip. Call directly under the page's header row
-	 * (after the `wp-header-end` marker where the page has one).
+	 * Render the strip. Page order: h1 and its header-row buttons, exactly
+	 * one `<hr class="wp-header-end">`, the page's own notices, then this
+	 * strip. WordPress's admin script moves every notice that is not
+	 * `.inline` to directly after the first marker, so a notice printed
+	 * below the strip would jump above it after first paint, and a second
+	 * marker would show every notice twice.
 	 *
 	 * @return void
 	 */

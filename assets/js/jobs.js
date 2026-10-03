@@ -42,6 +42,35 @@
 		});
 	};
 
+	// Fill a translated format: %1$s, %2$s, ... from args, and %% as %.
+	var format = function (fmt, args) {
+		return String(fmt).replace(/%(?:(\d+)\$s|%)/g, function (m, n) {
+			return n ? String(args[n - 1] === undefined ? '' : args[n - 1]) : '%';
+		});
+	};
+
+	var formatNumber = function (n) {
+		var num = Math.max(0, parseInt(n, 10) || 0);
+		try {
+			return num.toLocaleString(document.documentElement.lang || undefined);
+		} catch (e) {
+			return String(num);
+		}
+	};
+
+	// A running job's stage, e.g. "Posts: 120 of 500"; '' without a stage.
+	var stageText = function (stage, processed, total) {
+		if (!stage) {
+			return '';
+		}
+		var stages = i18n.stages || {};
+		var label = stages[stage] || stage;
+		if (!(parseInt(total, 10) > 0)) {
+			return label;
+		}
+		return format(t('stageProgress', '%1$s: %2$s of %3$s'), [label, formatNumber(processed), formatNumber(total)]);
+	};
+
 	var humanDelta = function (ts) {
 		if (!ts) {
 			return '';
@@ -138,6 +167,21 @@
 							var bar = progressCell.querySelector('.perflocale-jobs-progress span');
 							if (bar) {
 								bar.style.width = pct + '%';
+							}
+
+							// The stage line, when the poll reports one: its
+							// text, and the progressbar's accessible value.
+							var stageCell = progressCell.querySelector('[data-perflocale-cell="stage"]');
+							if (stageCell && typeof j.stage === 'string') {
+								var text = status === 'running' ? stageText(j.stage, j.processed, j.total) : '';
+								stageCell.textContent = text;
+								if (track) {
+									if (text) {
+										track.setAttribute('aria-valuetext', format(t('stageValue', '%1$s%% (%2$s)'), [formatNumber(pct), text]));
+									} else {
+										track.removeAttribute('aria-valuetext');
+									}
+								}
 							}
 						}
 

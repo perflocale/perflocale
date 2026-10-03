@@ -84,6 +84,15 @@ final class ExchangeRateSync {
 	private readonly Settings $settings;
 
 	/**
+	 * Rates the last sync_rates() call of this instance accepted and stored:
+	 * currency code => rate. The manual "Sync Now" reply carries these, never
+	 * the provider's raw reply.
+	 *
+	 * @var array<string, float>
+	 */
+	private array $accepted_rates = [];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings $settings Plugin settings.
@@ -404,6 +413,8 @@ final class ExchangeRateSync {
 	 * @return array<string, float> Fetched rates (currency_code => rate), empty on failure.
 	 */
 	public function sync_rates(): array {
+		$this->accepted_rates = [];
+
 		// Bail out if the plugin is being uninstalled - the WC/options
 		// state we touch may be partially dropped.
 		if ( \PerfLocale\Plugin::is_uninstalling() ) {
@@ -704,6 +715,7 @@ final class ExchangeRateSync {
 		// would be dead work now that we persist only to RATES_OPTION.
 		$rate_overrides = [];
 		$rejected       = [];
+		$accepted       = [];
 
 		foreach ( $currencies as $slug => $config ) {
 			$code = $config['currency_code'] ?? '';
@@ -744,6 +756,7 @@ final class ExchangeRateSync {
 			}
 
 			$rate_overrides[ $slug ] = round( $value, 6 );
+			$accepted[ $code ]       = $rate_overrides[ $slug ];
 		}
 
 		if ( $rejected !== [] ) {
@@ -816,6 +829,8 @@ final class ExchangeRateSync {
 
 			/** @hook perflocale/woocommerce/exchange_rates_synced Fires after rates are saved. */
 			do_action( 'perflocale/woocommerce/exchange_rates_synced', $rates, $base_currency, $provider_id );
+
+			$this->accepted_rates = $accepted;
 		}
 
 		// Record completion + duration for the Jobs admin observability
@@ -855,42 +870,47 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Cross-calculate rates when the API returns a fixed base (e.g., USD or EUR).
+	 * Remove credentials from sync error text before it is stored or logged.
 	 *
-	 * Converts: rate_from_api_base / rate_of_store_base = rate relative to store base.
+	 * Provider exceptions and provider-supplied values are third-party text,
+	 * and a request URL in them can carry the API key. The key configured for
+	 * the selected provider is replaced wherever it appears, as typed and
+	 * URL-encoded; SecretMasker then redacts other credential-shaped runs.
 	 *
-	 * @param array<string, float> $all_rates All rates from the API (relative to API base).
-	 * @param string               $base Store's base currency.
-	 * @param array<int, string>   $targets Target currency codes.
-	 * @return array<string, float>
+	 * @param string $message Error text.
+	 * @return string
 	 */
-	private function cross_calculate( array $all_rates, string $base, array $targets ): array {
-		// If the base is the same as the API base, no conversion needed.
-		$base_rate = $all_rates[ $base ] ?? null;
+	private function redact_secrets( string $message ): string {
+		$providers   = $this->get_providers();
+		$provider_id = (string) $this->settings->get( 'wc_exchange_rate_provider', '' );
+		$key_setting = (string) ( $providers[ $provider_id ]['key_setting'] ?? '' );
+		$api_key     = $key_setting !== '' ? (string) $this->settings->get( $key_setting, '' ) : '';
+		$trimmed     = trim( $api_key );
 
-		if ( $base_rate === null || $base_rate <= 0 ) {
-			// Store base not in API response - cannot cross-calculate.
-			return [];
+		if ( $trimmed !== '' ) {
+			$forms = array_unique( [ $api_key, $trimmed, rawurlencode( $trimmed ) ] );
+
+			// Longest first, so a form that contains another is replaced whole.
+			usort( $forms, static fn( string $a, string $b ): int => strlen( $b ) <=> strlen( $a ) );
+
+			$message = str_replace( $forms, '[REDACTED]', $message );
 		}
 
-		$rates = [];
-
-		foreach ( $targets as $code ) {
-			if ( isset( $all_rates[ $code ] ) && $all_rates[ $code ] > 0 ) {
-				$rates[ $code ] = $all_rates[ $code ] / $base_rate;
-			}
-		}
-
-		return $rates;
+		return \PerfLocale\Util\SecretMasker::mask( $message );
 	}
 
 	/**
 	 * Log a sync error (debug mode only).
 	 *
+	 * The message is stored and logged with credentials removed
+	 * (redact_secrets()).
+	 *
 	 * @param string $message Error message.
 	 * @return void
 	 */
 	private function log_sync_error( string $message ): void {
+		$message = $this->redact_secrets( $message );
+
 		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 			error_log( 'PerfLocale Exchange Rate Sync: ' . $message ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
@@ -971,9 +991,11 @@ final class ExchangeRateSync {
 
 		$last_sync = get_option( self::LAST_SYNC_OPTION, [] );
 
+		// The settings screen writes these into its rate inputs, so only the
+		// rates this sync accepted and stored go back, never a rejected value.
 		wp_send_json_success(
 			[
-				'rates'     => $rates,
+				'rates'     => $this->accepted_rates,
 				'timestamp' => $last_sync['timestamp'] ?? time(),
 				'message'   => __( 'Exchange rates updated successfully.', 'perflocale' ),
 			]

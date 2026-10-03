@@ -491,6 +491,33 @@ final class LanguagesController extends RestController {
 			return $this->error( 'cannot_delete_default', __( 'Cannot delete the default language.', 'perflocale' ) );
 		}
 
+		// A language that still has posts is refused with 409 and the counts
+		// (LanguageRepository::delete_blockers() explains why). A failed count
+		// is reported as a failed delete: nothing was changed.
+		$blockers = $repo->delete_blockers( (int) $language->id );
+
+		if ( null === $blockers ) {
+			return $this->error(
+				'delete_failed',
+				__( 'The language could not be deleted; nothing was changed.', 'perflocale' ),
+				500
+			);
+		}
+
+		if ( $blockers['posts'] !== [] ) {
+			return new \WP_Error(
+				'language_has_content',
+				__( 'The language still has content. Move its posts to the Trash first, or deactivate the language instead (is_active false): an inactive language keeps its translations linked.', 'perflocale' ),
+				[
+					'status'      => 409,
+					'posts'       => $blockers['posts'],
+					'attachments' => $blockers['attachments'],
+					'terms'       => $blockers['terms'],
+					'templates'   => $blockers['templates'],
+				]
+			);
+		}
+
 		// delete() runs its cascade in a transaction and returns false after a
 		// ROLLBACK — the language and every one of its links are still there.
 		// Reporting `{"deleted": true}` with HTTP 200 over that told every REST

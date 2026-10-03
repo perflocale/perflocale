@@ -22,6 +22,23 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 
 	/**
+	 * Oxygen's post meta keys, in both stored spellings.
+	 *
+	 * Oxygen 4.8.3+ writes every `ct_*` key through oxy_get_meta_prefix(), which
+	 * stores it as `_ct_*`; earlier versions, and a site whose migration has not
+	 * run or was reverted with Oxygen's own unprefix tool, keep `ct_*`. Each
+	 * logical key is listed as stored-now first, legacy second.
+	 *
+	 * @var array<string, array<int, string>>
+	 */
+	private const META_KEYS = [
+		'builder_json'       => [ '_ct_builder_json', 'ct_builder_json' ],
+		'builder_shortcodes' => [ '_ct_builder_shortcodes', 'ct_builder_shortcodes' ],
+		'page_settings'      => [ '_ct_page_settings', 'ct_page_settings' ],
+		'other_template'     => [ '_ct_other_template', 'ct_other_template' ],
+	];
+
+	/**
 	 * {@inheritDoc}
 	 */
 	public function get_id(): string {
@@ -63,10 +80,11 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		// Register Oxygen meta keys as translatable.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
 		// ⚠️ Only the TEXT-FREE keys mirror — see add_mirror_keys(). The builder
-		// documents (ct_builder_json / ct_builder_shortcodes) are NOT on that
-		// list: a mirror is bidirectional, so mirroring a document holding the
-		// user's words destroys translated text in both directions.
-		// ct_other_template is excluded for a separate reason — it stores a
+		// documents (`_ct_builder_json` / `_ct_builder_shortcodes`, legacy
+		// `ct_*` spellings too) are NOT on that list: a mirror is
+		// bidirectional, so mirroring a document holding the user's words
+		// destroys translated text in both directions.
+		// The other-template key is excluded for a separate reason — it stores a
 		// per-page template POST ID, so mirroring would pin every sibling to the
 		// source-language template.
 		add_filter( 'perflocale/sync/mirror_meta_keys', [ $this, 'add_mirror_keys' ], 10, 2 );
@@ -91,7 +109,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		// Language-scoping that query is catastrophic, because Oxygen has no
 		// "no template matched" fallback: `$is_template` stays false and the
 		// page renders with NO header, footer or layout at all. Measured on
-		// test.local with two published templates (one linked `en`, one `de`):
+		// a test site with two published templates (one linked `en`, one `de`):
 		//   /      => [1102638]      (en)
 		//   /de/   => [1102639]      (de)
 		//   /es/   => []   -> ct_get_archives_template() === false -> NO LAYOUT
@@ -125,7 +143,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		// correctly, it is browsed by language — so on a non-default language
 		// that query returned only that language's pages and the source's block
 		// type was never registered. An unregistered dynamic block renders as
-		// NOTHING, so the page body silently emptied. Measured on test.local
+		// NOTHING, so the page body silently emptied. Measured on a test site
 		// with the plugin activated: `/` registered
 		// `oxygen-vsb/ovsb-zzfullpageblock`, `/de/` registered ZERO blocks.
 		//
@@ -160,10 +178,11 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	public function add_meta_keys( array $keys, string $post_type ): array {
-		$keys[] = 'ct_builder_json';
-		$keys[] = 'ct_builder_shortcodes';
-		$keys[] = 'ct_page_settings';
-		$keys[] = 'ct_other_template';
+		foreach ( self::META_KEYS as $spellings ) {
+			foreach ( $spellings as $key ) {
+				$keys[] = $key;
+			}
+		}
 		// 'ct_options' is not post meta — it's a JSON attribute inside ct_*
 		// shortcodes — so it never had anything to sync.
 
@@ -190,16 +209,19 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 * cost is that later structural edits no longer propagate; keeping a
 	 * translator's words is worth more than automatic layout parity.
 	 *
-	 * What remains is page-level presentation with no user-visible text in it.
-	 * `ct_other_template` is still excluded for its own separate reason: it is a
-	 * per-page template ID that must not be pinned to the source language.
+	 * What remains is page-level presentation with no user-visible text in it,
+	 * in both stored spellings (see META_KEYS). The other-template key is still
+	 * excluded for its own separate reason: it is a per-page template ID that
+	 * must not be pinned to the source language.
 	 *
 	 * @param array<int, string> $keys Meta keys.
 	 * @param string             $post_type Post type.
 	 * @return array<int, string>
 	 */
 	public function add_mirror_keys( array $keys, string $post_type ): array {
-		$keys[] = 'ct_page_settings';
+		foreach ( self::META_KEYS['page_settings'] as $key ) {
+			$keys[] = $key;
+		}
 
 		return $keys;
 	}
@@ -223,7 +245,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 * @return void
 	 */
 	public function invalidate_css_cache( int $source_id, int $target_id, array $mirror_keys ): void {
-		$oxygen_keys = [ 'ct_builder_json', 'ct_builder_shortcodes', 'ct_page_settings' ];
+		$oxygen_keys = array_merge( self::META_KEYS['builder_json'], self::META_KEYS['builder_shortcodes'], self::META_KEYS['page_settings'] );
 
 		if ( array_intersect( $oxygen_keys, $mirror_keys ) === [] ) {
 			return;

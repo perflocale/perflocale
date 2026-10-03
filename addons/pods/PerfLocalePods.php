@@ -121,6 +121,9 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
+		// The value of a password field is not copied into a new translation.
+		add_filter( 'perflocale/translation/excluded_meta_keys', [ $this, 'exclude_password_fields' ], 10, 2 );
+
 		// Translate pick (relationship) fields on the frontend only.
 		if ( ! is_admin() ) {
 			add_filter( 'pods_pods_field', [ $this, 'translate_field_value' ], 10, 4 );
@@ -149,6 +152,47 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 */
 	public function get_settings_fields(): array {
 		return [];
+	}
+
+	/**
+	 * `perflocale/translation/excluded_meta_keys`: the values of the source
+	 * post type's Pods password fields stay out of a new translation.
+	 *
+	 * A password field is a password by its type, whatever its name, so the
+	 * credential-name patterns of the meta copy do not catch it. Pods stores
+	 * a field of a meta-based pod as the post meta row of the field's name.
+	 * Runs only when a translation is created.
+	 *
+	 * @param array<int, string> $excluded  Meta keys that are not copied.
+	 * @param int                $source_id Post the translation is copied from.
+	 * @return array<int, string>
+	 */
+	public function exclude_password_fields( array $excluded, int $source_id ): array {
+		$post_type = $source_id > 0 ? get_post_type( $source_id ) : false;
+
+		if ( ! is_string( $post_type ) || ! function_exists( 'pods_api' ) ) {
+			return $excluded;
+		}
+
+		$pod = $this->get_pod_config( $post_type );
+
+		if ( ! $pod || ! in_array( $pod->get_arg( 'type' ), self::SUPPORTED_POD_TYPES, true ) ) {
+			return $excluded;
+		}
+
+		foreach ( (array) $pod->get_fields() as $field ) {
+			if ( ! is_object( $field ) || ! method_exists( $field, 'get_arg' ) ) {
+				continue;
+			}
+
+			$name = (string) $field->get_arg( 'name' );
+
+			if ( '' !== $name && 'password' === (string) $field->get_arg( 'type' ) ) {
+				$excluded[] = $name;
+			}
+		}
+
+		return $excluded;
 	}
 
 	/**

@@ -30,6 +30,20 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class PolylangImporter {
 
+	use ImportHeartbeat;
+
+	/**
+	 * The import's stages, in the order it runs them ({@see ImportHeartbeat}).
+	 */
+	private const PROGRESS_STAGES = [ 'posts', 'terms', 'single_posts', 'single_terms', 'site' ];
+
+	/**
+	 * The stage whose items the translation-set loops count: key, items done, items in total.
+	 *
+	 * @var array{0: string, 1: int, 2: int}
+	 */
+	private array $item_progress = [ '', 0, 0 ];
+
 	/**
 	 * @var \wpdb
 	 */
@@ -60,6 +74,13 @@ final class PolylangImporter {
 	 * @var array<string, int>
 	 */
 	private array $language_map = [];
+
+	/**
+	 * Source reads that failed during this run; import() adds them to the errors.
+	 *
+	 * @var list<string>
+	 */
+	private array $read_errors = [];
 
 	/**
 	 * Translation-link writes this run asked for and did not get.
@@ -104,24 +125,26 @@ final class PolylangImporter {
 	/**
 	 * Run the full Polylang import.
 	 *
-	 * @return array{posts: int, terms: int, errors: array<int, string>}
+	 * @return array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>}
 	 */
 	public function import(): array {
 		$result = [
-			'posts'  => 0,
-			'terms'  => 0,
-			'errors' => [],
+			'posts'   => 0,
+			'terms'   => 0,
+			'menus'   => 0,
+			'strings' => 0,
+			'errors'  => [],
 		];
 
 		if ( ! $this->can_import() ) {
-			$result['errors'][] = 'Polylang language taxonomy not found.';
+			$result['errors'][] = __( 'Polylang language taxonomy not found.', 'perflocale' );
 			return $result;
 		}
 
 		$this->build_language_map( $result );
 
 		if ( empty( $this->language_map ) ) {
-			$result['errors'][] = 'No matching languages found between Polylang and PerfLocale.';
+			$result['errors'][] = __( 'No matching languages found between Polylang and PerfLocale.', 'perflocale' );
 			return $result;
 		}
 
@@ -138,15 +161,93 @@ final class PolylangImporter {
 		$result['posts'] += $this->import_single_language_objects( 'language', ObjectType::Post, $result );
 		$result['terms'] += $this->import_single_language_objects( 'term_language', ObjectType::Term, $result );
 
+		// What Polylang keeps beside its groups: menus per language, string
+		// translations, which types it translated, and per-language prices.
+		$this->beat( 'site', 0, 4 );
+		$site_data       = new PolylangSiteData( $this->wpdb, $this->languages, $this->language_map, \Closure::fromCallable( [ $this, 'beat' ] ) );
+		$settings        = \PerfLocale\Plugin::get_instance()->get( 'settings' );
+		$result['menus'] = $site_data->import_menus( $result['errors'] );
+		$this->beat( 'site', 1, 4 );
+		$result['strings'] = $site_data->import_strings( $result['errors'] );
+		$this->beat( 'site', 2, 4 );
+
+		$site_data->import_translatable_types( $settings, $result['errors'] );
+		$this->beat( 'site', 3, 4 );
+		$site_data->keep_prices_per_language( $settings, $result['errors'] );
+		$this->beat( 'site', 4, 4 );
+
 		if ( $this->link_failures > 0 ) {
 			$result['errors'][] = sprintf(
 				/* translators: %d: number of failed translation-link writes */
-				__( 'Polylang import: %d translation link(s) could not be written — those translations are not connected to their group; re-run the import to retry them.', 'perflocale' ),
+				_n( 'Polylang import: %d translation link could not be written — that translation is not connected to its group; re-run the import to retry it.', 'Polylang import: %d translation links could not be written — those translations are not connected to their group; re-run the import to retry them.', $this->link_failures, 'perflocale' ),
 				$this->link_failures
 			);
 		}
 
+		foreach ( $this->read_errors as $read_error ) {
+			$result['errors'][] = $read_error;
+		}
+
 		return $result;
+	}
+
+	/**
+	 * The error left by the source read that just ran, or '' when it worked.
+	 *
+	 * A failed get_col()/get_results() returns [] exactly as an empty result
+	 * does; only last_error tells them apart, and the next query resets it,
+	 * so call this straight after the read.
+	 *
+	 * @phpstan-impure
+	 *
+	 * @return string
+	 */
+	private function read_error(): string {
+		return $this->wpdb->last_error;
+	}
+
+	/**
+	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
+	 *
+	 * That text can carry table names with their prefix and row values.
+	 * Migration results and job rows are shown to every user with Jobs
+	 * access, so the messages stored there say only that a database error
+	 * happened; the detail is here.
+	 *
+	 * @param string $where What was running, for the log line.
+	 * @param string $error The database error.
+	 * @return void
+	 */
+	private static function log_db_error( string $where, string $error ): void {
+		if ( $error === '' || ! defined( 'WP_DEBUG_LOG' ) || ! WP_DEBUG_LOG ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
+		error_log( '[PerfLocale] Polylang import: database error while ' . $where . ' - ' . $error );
+	}
+
+	/**
+	 * Record a failed source read; import() adds it to the errors.
+	 *
+	 * @param ObjectType $type  What the read was loading.
+	 * @param string     $error The database error.
+	 * @return void
+	 */
+	private function record_read_error( ObjectType $type, string $error ): void {
+		self::log_db_error( ObjectType::Post === $type ? 'reading post data' : 'reading term data', $error );
+
+		$this->read_errors[] = ObjectType::Post === $type
+			? sprintf(
+				/* translators: %s: source plugin name */
+				__( 'Some %s post data could not be read because of a database error and was not imported. Re-run the import.', 'perflocale' ),
+				'Polylang'
+			)
+			: sprintf(
+				/* translators: %s: source plugin name */
+				__( 'Some %s term data could not be read because of a database error and was not imported. Re-run the import.', 'perflocale' ),
+				'Polylang'
+			);
 	}
 
 	/**
@@ -172,7 +273,7 @@ final class PolylangImporter {
 	/**
 	 * Build a mapping from Polylang language slugs to PerfLocale language IDs.
 	 *
-	 * @param array{posts: int, terms: int, errors: array<int, string>} $result Import result (passed by reference for errors).
+	 * @param array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>} $result Import result (passed by reference for errors).
 	 * @return void
 	 */
 	private function build_language_map( array &$result ): void {
@@ -253,7 +354,8 @@ final class PolylangImporter {
 				$this->language_map[ $pll_slug ] = $matched_id;
 			} else {
 				$result['errors'][] = sprintf(
-					'No PerfLocale language match for Polylang slug "%s" (locale "%s").',
+					/* translators: 1: Polylang language slug, 2: its locale */
+					__( 'No PerfLocale language match for Polylang slug "%1$s" (locale "%2$s").', 'perflocale' ),
 					$pll_slug,
 					$pll_locale
 				);
@@ -307,7 +409,7 @@ final class PolylangImporter {
 	 * Polylang stores translation groups as serialized arrays in
 	 * term meta under the `post_translations` taxonomy.
 	 *
-	 * @param array{posts: int, terms: int, errors: array<int, string>} $result Import result (passed by reference for errors).
+	 * @param array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>} $result Import result (passed by reference for errors).
 	 * @return int Number of posts imported.
 	 */
 	private function import_post_translations( array &$result ): int {
@@ -330,6 +432,13 @@ final class PolylangImporter {
 			)
 		);
 
+		$read_error = $this->read_error();
+
+		if ( $read_error !== '' ) {
+			$this->record_read_error( ObjectType::Post, $read_error );
+			return 0;
+		}
+
 		if ( empty( $term_ids ) ) {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			return 0;
@@ -337,6 +446,9 @@ final class PolylangImporter {
 
 		$batch_size = self::resolve_batch_size();
 		$batches    = array_chunk( array_map( 'intval', $term_ids ), $batch_size );
+
+		$this->item_progress = [ 'posts', 0, count( $term_ids ) ];
+		$this->beat( 'posts', 0, count( $term_ids ) );
 
 		foreach ( $batches as $batch ) {
 			// $placeholders is a generated '%d,%d,...' string sized to the
@@ -357,6 +469,14 @@ final class PolylangImporter {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
+			// Skip only this batch: the ones after it still import.
+			$read_error = $this->read_error();
+
+			if ( $read_error !== '' ) {
+				$this->record_read_error( ObjectType::Post, $read_error );
+				continue;
+			}
+
 			if ( ! is_array( $translation_terms ) ) {
 				continue;
 			}
@@ -366,6 +486,8 @@ final class PolylangImporter {
 			// SAVEQUERIES log only; persistent cache untouched).
 			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 		}
+
+		$this->beat( 'posts', count( $term_ids ), count( $term_ids ) );
 		return $imported;
 	}
 
@@ -433,6 +555,9 @@ final class PolylangImporter {
 		}
 
 		foreach ( $translation_terms as $term ) {
+			// Before each item: the report counts the items finished before it.
+			$this->beat( $this->item_progress[0], $this->item_progress[1]++, $this->item_progress[2] );
+
 			// allowed_classes=false blocks object instantiation: this row is
 			// user-written data, so no object is created from it.
 			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false is the exact mitigation the rule warns about; @ suppresses the unsupported-class notice that the unserialize() options already neutralise.
@@ -535,7 +660,11 @@ final class PolylangImporter {
 				);
 
 				if ( $new_group_id === false ) {
-					$result['errors'][] = sprintf( 'Failed to create group for Polylang post translation term %d.', (int) $term->term_id );
+					$result['errors'][] = sprintf(
+						/* translators: %d: term ID of Polylang's post translation set */
+						__( 'Failed to create group for Polylang post translation term %d.', 'perflocale' ),
+						(int) $term->term_id
+					);
 					continue;
 				}
 
@@ -595,7 +724,7 @@ final class PolylangImporter {
 	/**
 	 * Import term translations from Polylang's term_translations taxonomy.
 	 *
-	 * @param array{posts: int, terms: int, errors: array<int, string>} $result Import result (passed by reference for errors).
+	 * @param array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>} $result Import result (passed by reference for errors).
 	 * @return int Number of terms imported.
 	 */
 	private function import_term_translations( array &$result ): int {
@@ -611,6 +740,13 @@ final class PolylangImporter {
 			)
 		);
 
+		$read_error = $this->read_error();
+
+		if ( $read_error !== '' ) {
+			$this->record_read_error( ObjectType::Term, $read_error );
+			return 0;
+		}
+
 		if ( empty( $term_ids ) ) {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			return 0;
@@ -618,6 +754,9 @@ final class PolylangImporter {
 
 		$batch_size = self::resolve_batch_size();
 		$batches    = array_chunk( array_map( 'intval', $term_ids ), $batch_size );
+
+		$this->item_progress = [ 'terms', 0, count( $term_ids ) ];
+		$this->beat( 'terms', 0, count( $term_ids ) );
 
 		foreach ( $batches as $batch ) {
 			// $placeholders is a generated '%d,%d,...' string sized to the
@@ -638,6 +777,13 @@ final class PolylangImporter {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
+			$read_error = $this->read_error();
+
+			if ( $read_error !== '' ) {
+				$this->record_read_error( ObjectType::Term, $read_error );
+				continue;
+			}
+
 			if ( ! is_array( $translation_terms ) ) {
 				continue;
 			}
@@ -647,6 +793,8 @@ final class PolylangImporter {
 			// SAVEQUERIES log only; persistent cache untouched).
 			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 		}
+
+		$this->beat( 'terms', count( $term_ids ), count( $term_ids ) );
 		return $imported;
 	}
 
@@ -661,6 +809,9 @@ final class PolylangImporter {
 		$imported = 0;
 
 		foreach ( $translation_terms as $term ) {
+			// Before each item: the report counts the items finished before it.
+			$this->beat( $this->item_progress[0], $this->item_progress[1]++, $this->item_progress[2] );
+
 			// allowed_classes=false blocks object instantiation: this row is
 			// user-written data, so no object is created from it.
 			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false is the exact mitigation the rule warns about; @ suppresses the unsupported-class notice that the unserialize() options already neutralise.
@@ -742,7 +893,11 @@ final class PolylangImporter {
 				);
 
 				if ( $new_group_id === false ) {
-					$result['errors'][] = sprintf( 'Failed to create group for Polylang term translation term %d.', (int) $term->term_id );
+					$result['errors'][] = sprintf(
+						/* translators: %d: term ID of Polylang's term translation set */
+						__( 'Failed to create group for Polylang term translation term %d.', 'perflocale' ),
+						(int) $term->term_id
+					);
 					continue;
 				}
 
@@ -826,11 +981,23 @@ final class PolylangImporter {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
+		$read_error = $this->read_error();
+
+		if ( $read_error !== '' ) {
+			$this->record_read_error( $type, $read_error );
+			return 0;
+		}
+
 		if ( ! is_array( $lang_terms ) ) {
 			return 0;
 		}
 
 		$batch_size = self::resolve_batch_size();
+		$stage      = $type === ObjectType::Post ? 'single_posts' : 'single_terms';
+		$done       = 0;
+		$total      = 0;
+
+		$this->beat( $stage, 0, 0 );
 
 		foreach ( $lang_terms as $lang_term ) {
 			// 'term_language' term slugs carry a 'pll_' prefix; strip it so
@@ -864,6 +1031,15 @@ final class PolylangImporter {
 					)
 				);
 				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+				// The keyset cursor cannot move past a page it never read, so
+				// this language ends here; the other languages still import.
+				$read_error = $this->read_error();
+
+				if ( $read_error !== '' ) {
+					$this->record_read_error( $type, $read_error );
+					break;
+				}
 
 				if ( empty( $object_ids ) ) {
 					break;
@@ -953,8 +1129,11 @@ final class PolylangImporter {
 
 					if ( $new_group_id === false ) {
 						$result['errors'][] = sprintf(
-							'Failed to create single-language group for Polylang %s %d.',
-							$type->value,
+							$type === ObjectType::Post
+								/* translators: %d: post ID */
+								? __( 'Failed to create single-language group for Polylang post %d.', 'perflocale' )
+								/* translators: %d: term ID */
+								: __( 'Failed to create single-language group for Polylang term %d.', 'perflocale' ),
 							$object_id
 						);
 						continue;
@@ -966,10 +1145,56 @@ final class PolylangImporter {
 				// Bound worker memory on huge legacy sites (runtime cache +
 				// SAVEQUERIES log only; persistent cache untouched).
 				\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+
+				$done += count( $object_ids );
+
+				if ( $total === 0 && count( $object_ids ) === $batch_size && $this->reports_progress() ) {
+					$total = $this->count_single_language_objects( $lang_terms, $default_lang_id );
+				}
+
+				$this->beat( $stage, $done, $total );
 			} while ( count( $object_ids ) === $batch_size );
 		}
 
+		$this->beat( $stage, $done, $done );
+
 		return $imported;
+	}
+
+	/**
+	 * Objects in the non-default languages, for the single-language stage's progress.
+	 *
+	 * @param array<int, object> $lang_terms      Rows of the language taxonomy (term_taxonomy_id, slug).
+	 * @param int                $default_lang_id PerfLocale default language ID.
+	 * @return int
+	 */
+	private function count_single_language_objects( array $lang_terms, int $default_lang_id ): int {
+		$tt_ids = [];
+
+		foreach ( $lang_terms as $lang_term ) {
+			$slug    = sanitize_text_field( (string) $lang_term->slug );
+			$slug    = str_starts_with( $slug, 'pll_' ) ? substr( $slug, 4 ) : $slug;
+			$lang_id = $this->language_map[ $slug ] ?? null;
+
+			if ( $lang_id !== null && $lang_id !== $default_lang_id ) {
+				$tt_ids[] = (int) $lang_term->term_taxonomy_id;
+			}
+		}
+
+		if ( $tt_ids === [] ) {
+			return 0;
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- One count for the import's progress; the IN() list is generated placeholders, every value bound.
+		$count = (int) $this->wpdb->get_var(
+			$this->wpdb->prepare(
+				'SELECT COUNT(*) FROM %i WHERE term_taxonomy_id IN (' . implode( ',', array_fill( 0, count( $tt_ids ), '%d' ) ) . ')',
+				array_merge( [ $this->wpdb->term_relationships ], $tt_ids )
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders
+
+		return $count;
 	}
 
 	/**

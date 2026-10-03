@@ -29,6 +29,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class AbilitiesRegistrar {
 
 	/**
+	 * Longest URL, in characters, the convert-url ability accepts.
+	 */
+	private const CONVERT_URL_MAX_LENGTH = 2048;
+
+	/**
 	 * Plugin instance.
 	 *
 	 * @var Plugin
@@ -514,6 +519,7 @@ final class AbilitiesRegistrar {
 					'properties' => [
 						'url'             => [
 							'type'        => 'string',
+							'maxLength'   => self::CONVERT_URL_MAX_LENGTH,
 							'description' => 'The URL to convert.',
 						],
 						'target_language' => [
@@ -538,6 +544,13 @@ final class AbilitiesRegistrar {
 
 					if ( $url === '' || $slug === '' ) {
 						return new \WP_Error( 'missing_params', __( 'URL and target_language are required.', 'perflocale' ) );
+					}
+
+					// The schema's maxLength is enforced by the Abilities API before
+					// this runs; this check holds when that validation is filtered
+					// away (wp_ability_validate_input).
+					if ( is_string( $url ) && mb_strlen( $url ) > self::CONVERT_URL_MAX_LENGTH ) {
+						return new \WP_Error( 'url_too_long', __( 'The URL is too long.', 'perflocale' ), [ 'status' => 400 ] );
 					}
 
 					if ( ! $this->plugin->has( 'url_converter' ) ) {
@@ -756,6 +769,14 @@ final class AbilitiesRegistrar {
 							__( 'You do not have permission to translate this post.', 'perflocale' ),
 							[ 'status' => 403 ]
 						);
+					}
+
+					// A password-protected post is sent unless the
+					// perflocale/mt/send_password_protected filter refuses it;
+					// checked where MachineTranslateController::translate()
+					// checks it.
+					if ( ! MachineTranslation\TranslationService::may_send_post( $post, 'ability' ) ) {
+						return new \WP_Error( 'password_protected', MachineTranslation\TranslationService::password_protected_skip_message(), [ 'status' => 403 ] );
 					}
 
 					// Remaining MachineTranslateController::translate() gates: the

@@ -153,8 +153,11 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * @throws \PerfLocale\Concurrency\BreakerOpenException When the circuit breaker for this provider is open.
 	 */
 	protected function make_request( string $url, array $args, int $retries = 3, bool $fast_fail = false ): array {
-		// SSRF protection: block requests to internal/private networks.
-		$this->validate_url( $url );
+		// SSRF protection: block requests to internal/private networks. For a
+		// host name the check returns the address it judged, and each attempt
+		// connects to that address (Helper::remote_request_pinned()) rather
+		// than to whatever a second lookup by the transport answers.
+		$pinned_ip = $this->validate_url( $url );
 
 		// Circuit breaker: if a recent spate of failures tripped the
 		// breaker for this provider, throw immediately so callers can
@@ -264,7 +267,14 @@ abstract class AbstractProvider implements ProviderInterface {
 		$failure_reason = '';
 
 		for ( $attempt = 1; $attempt <= $retries; $attempt++ ) {
-			$response = wp_remote_request( $url, $args );
+			// A retry judges the host again. After a transport error the cached
+			// DNS answers are dropped (below), so an address that changed is
+			// looked up and judged before it is used.
+			if ( $attempt > 1 ) {
+				$pinned_ip = $this->validate_url( $url );
+			}
+
+			$response = Helper::remote_request_pinned( $url, $args, $pinned_ip );
 
 			if ( is_wp_error( $response ) ) {
 				// A WP_Error from the transport layer is not automatically
@@ -276,6 +286,12 @@ abstract class AbstractProvider implements ProviderInterface {
 				// the Jobs page renders. Mask it exactly like a response body.
 				$last_error     = self::mask_credentials( $response->get_error_message() );
 				$failure_reason = 'transient';
+
+				// The host may have moved: drop its cached DNS answers so the
+				// next attempt, and the next call, look it up again.
+				if ( '' !== $pinned_ip ) {
+					self::forget_dns( $url );
+				}
 
 				if ( $attempt < $retries ) {
 					// Exponential backoff: 1s, 2s, 4s.
@@ -477,11 +493,13 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * Blocks requests to localhost, private IP ranges, and cloud metadata endpoints.
 	 *
 	 * @param string $url URL to validate.
-	 * @return void
+	 * @return string For a host name, the IPv4 address it resolved to and that
+	 *   was judged here (the request is pinned to it); '' for a host on
+	 *   perflocale/mt/trusted_hosts and for an IP literal.
 	 *
 	 * @throws \RuntimeException If URL targets an internal network.
 	 */
-	private function validate_url( string $url ): void {
+	private function validate_url( string $url ): string {
 		$parsed = wp_parse_url( $url );
 		$host   = $parsed['host'] ?? '';
 
@@ -505,9 +523,11 @@ abstract class AbstractProvider implements ProviderInterface {
 		// gates and the DNS resolution — is skipped for a listed entry. Be
 		// precise about that when reading it as a security boundary: a match
 		// here returns, so an IP LITERAL added to the list is not re-checked
-		// against the private-range gates either. That is deliberate (it is the
-		// only way to point the plugin at a self-hosted provider on a LAN), but
-		// it means the list is a full bypass, not a fast path with a safety net.
+		// against the private-range gates either. That is deliberate: the list
+		// is the way to reach a self-hosted provider on an internal network (a
+		// private LAN range, or the shared 100.64.0.0/10 range that Tailscale
+		// and carrier-grade NAT use), and the refusal message says so. It means
+		// the list is a full bypass, not a fast path with a safety net.
 		/**
 		 * Filter the hostnames that skip DNS validation in the SSRF check.
 		 *
@@ -515,7 +535,9 @@ abstract class AbstractProvider implements ProviderInterface {
 		 * an OpenAI- or Anthropic- backed translator add-on) so their
 		 * outbound calls don't hit the slow `gethostbyname()` path, or to
 		 * reach a self-hosted provider (LibreTranslate) on an internal
-		 * address the private-IP gate would otherwise refuse.
+		 * network (a private LAN range, or the shared 100.64.0.0/10 range
+		 * that Tailscale and carrier-grade NAT use), which the private-IP
+		 * gate refuses. This filter is the way to reach such a provider.
 		 *
 		 * Treat an entry here as a full SSRF exemption for that host: the
 		 * private-IP and DNS gates do NOT run for it, whether it is a
@@ -530,7 +552,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		$trusted = array_map( 'strtolower', array_filter( $trusted, 'is_string' ) );
 
 		if ( in_array( $host_lc, $trusted, true ) ) {
-			return;
+			return '';
 		}
 
 		// wp_parse_url() returns IPv6 hosts wrapped in brackets per RFC 3986
@@ -566,10 +588,10 @@ abstract class AbstractProvider implements ProviderInterface {
 		// If the host is already an IP literal, skip DNS entirely - this is
 		// both faster and avoids a potential hang on misconfigured resolvers.
 		if ( Helper::is_ip( $host_ip ) ) {
-			// Helper::is_public_ipv4() judges both families; the fc00::/7 and
-			// fe80::/10 byte checks below are a second layer.
-			if ( ! Helper::is_public_ipv4( $host_ip ) ) {
-				throw new \RuntimeException( 'Provider URL targets a private or reserved IP address.' );
+			// Helper::is_public_outbound_address() judges both families; the
+			// fc00::/7 and fe80::/10 byte checks below are a second layer.
+			if ( ! Helper::is_public_outbound_address( $host_ip ) ) {
+				throw new \RuntimeException( 'Provider URL targets a private or reserved IP address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 			}
 
 			// IPv6 unique-local (fc00::/7) and link-local (fe80::/10), both
@@ -594,7 +616,7 @@ abstract class AbstractProvider implements ProviderInterface {
 				}
 			}
 
-			return;
+			return '';
 		}
 
 		// Cache DNS lookups for a few minutes. gethostbyname() has no timeout
@@ -614,16 +636,17 @@ abstract class AbstractProvider implements ProviderInterface {
 		// returns the input unchanged on resolution failure and does not
 		// canonicalise hex or octal IPv4 literals, so require a real resolution
 		// to a public IP.
-		if ( $ip === $host || ! Helper::is_ip( $ip ) ) {
+		if ( ! is_string( $ip ) || $ip === $host || ! Helper::is_ip( $ip ) ) {
 			throw new \RuntimeException( 'Provider URL could not be resolved to a verifiable public IP.' );
 		}
 
-		if ( ! Helper::is_public_ipv4( $ip ) ) {
-			throw new \RuntimeException( 'Provider URL resolves to a private or reserved IP address.' );
+		if ( ! Helper::is_public_outbound_address( $ip ) ) {
+			throw new \RuntimeException( 'Provider URL resolves to a private or reserved IP address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 		}
 
-		// Loopback 127.0.0.0/8. Helper::is_public_ipv4() above already rejects
-		// it; this second layer matches WebhookController::is_url_safe().
+		// Loopback 127.0.0.0/8. Helper::is_public_outbound_address() above
+		// already rejects it; this second layer matches
+		// WebhookController::is_url_safe().
 		if ( str_starts_with( $ip, '127.' ) ) {
 			throw new \RuntimeException( 'Provider URL resolves to a loopback address.' );
 		}
@@ -643,9 +666,28 @@ abstract class AbstractProvider implements ProviderInterface {
 			try {
 				$this->validate_url( 'https://[' . $ipv6 . ']/' );
 			} catch ( \RuntimeException ) {
-				throw new \RuntimeException( 'Provider URL resolves to a private or reserved IPv6 address.' );
+				throw new \RuntimeException( 'Provider URL resolves to a private or reserved IPv6 address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 			}
 		}
+
+		return $ip;
+	}
+
+	/**
+	 * Drop the cached DNS answers {@see validate_url()} keeps for a URL's host.
+	 *
+	 * @param string $url Provider URL.
+	 * @return void
+	 */
+	private static function forget_dns( string $url ): void {
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+
+		if ( ! is_string( $host ) || '' === $host ) {
+			return;
+		}
+
+		delete_transient( 'perflocale_dns_' . md5( $host ) );
+		delete_transient( 'perflocale_dns6_' . md5( $host ) );
 	}
 
 	/**

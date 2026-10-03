@@ -29,6 +29,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Defaults to `perflocale_translate` (the broadest read perm); cancel /
  * retry / delete additionally require the dispatching user to be the
  * current user OR the current user to have `perflocale_manage_translations`.
+ * A retry also requires the capability of the job's type and, when someone
+ * other than the dispatcher retries, every right the dispatcher holds: the
+ * worker runs the job as the dispatcher.
  */
 final class JobsController extends RestController {
 
@@ -144,7 +147,7 @@ final class JobsController extends RestController {
 		$current_uid = (int) get_current_user_id();
 
 		// list_active_summary() omits args/result/log — this endpoint only
-		// reads 5 small fields per row, so pulling the LONGTEXT columns
+		// reads a few small fields per row, so pulling the LONGTEXT columns
 		// every 5 s on the polling client is pure wasted bytes-on-wire.
 		foreach ( JobState::list_active_summary() as $job_id => $row ) {
 			// Non-supervisors only see jobs they dispatched. `created_by` is
@@ -160,6 +163,9 @@ final class JobsController extends RestController {
 				'type'       => (string) ( $row['type'] ?? '' ),
 				'status'     => (string) ( $row['status'] ?? '' ),
 				'progress'   => (int) ( $row['progress'] ?? 0 ),
+				'stage'      => (string) ( $row['stage'] ?? '' ),
+				'processed'  => (int) ( $row['processed'] ?? 0 ),
+				'total'      => (int) ( $row['total'] ?? 0 ),
 				'updated_at' => (int) ( $row['updated_at'] ?? 0 ),
 			];
 		}
@@ -220,8 +226,33 @@ final class JobsController extends RestController {
 			);
 		}
 
+		// Record the cancel BEFORE removing the worker event or the locks. If
+		// the write does not land, nothing else is touched: the job keeps its
+		// event and its worker keeps its lock. An event that fires after the
+		// write finds a canceled row and stands down.
+		if ( ! JobState::cancel( $id ) ) {
+			$latest = JobState::get( $id );
+			$status = $latest ? (string) $latest['status'] : '';
+
+			// A concurrent cancel already landed: finish the cleanup below.
+			if ( 'canceled' !== $status ) {
+				if ( JobState::is_terminal( $status ) ) {
+					return new \WP_Error(
+						'rest_invalid_state',
+						__( 'Job is already in a terminal state and cannot be canceled.', 'perflocale' ),
+						[ 'status' => 409 ]
+					);
+				}
+
+				return new \WP_Error(
+					'perflocale_job_cancel_failed',
+					__( 'Could not cancel the job: the database refused the status change. Nothing was changed; try again.', 'perflocale' ),
+					[ 'status' => 500 ]
+				);
+			}
+		}
+
 		JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $id );
-		JobState::cancel( $id );
 
 		// Release the locks held by the (now-canceled) worker. The per-JOB
 		// lock is keyed by this job id, so it is dropped unconditionally even
@@ -231,7 +262,7 @@ final class JobsController extends RestController {
 		// workers run at once, so it is only released when this request owns
 		// it. Otherwise it clears when the canceled worker notices the
 		// cancellation in its `finally`, or when its TTL
-		// (JobLock::DEFAULT_TTL, 10 min) lapses. Both calls are idempotent.
+		// (JobLock::DEFAULT_TTL, 30 min) lapses. Both calls are idempotent.
 		\PerfLocale\Background\JobLock::release( $id );
 		\PerfLocale\Background\JobLock::release_type( (string) $state['type'] );
 
@@ -267,28 +298,48 @@ final class JobsController extends RestController {
 		// been revoked since the original dispatch. The worker performs
 		// the same check and marks failed if it fails, but doing it here
 		// gives the operator immediate REST-level feedback instead of a
-		// "queued → failed" round trip via the runner.
-		$type    = (string) $state['type'];
-		$factory = \PerfLocale\Background\WorkerRegistry::factory_for_type( $type );
+		// "queued → failed" round trip via the runner. The retrying user
+		// must hold the same capability on this site.
+		$type       = (string) $state['type'];
+		$created_by = (int) ( $state['created_by'] ?? 0 );
+		$factory    = \PerfLocale\Background\WorkerRegistry::factory_for_type( $type );
 		if ( is_callable( $factory ) ) {
 			try {
-				$probe_job  = $factory();
-				$created_by = (int) ( $state['created_by'] ?? 0 );
-				if ( $probe_job instanceof \PerfLocale\Background\AbstractJob
-					&& $created_by > 0
-					&& ! user_can( $created_by, $probe_job->get_required_capability() )
-				) {
-					return new \WP_Error(
-						'rest_forbidden',
-						__( 'Original dispatcher no longer holds the capability for this job.', 'perflocale' ),
-						[ 'status' => 403 ]
-					);
+				$probe_job = $factory();
+				if ( $probe_job instanceof \PerfLocale\Background\AbstractJob ) {
+					$required_cap = $probe_job->get_required_capability();
+
+					if ( $created_by > 0 && ! user_can( $created_by, $required_cap ) ) {
+						return new \WP_Error(
+							'rest_forbidden',
+							__( 'Original dispatcher no longer holds the capability for this job.', 'perflocale' ),
+							[ 'status' => 403 ]
+						);
+					}
+
+					if ( ! current_user_can( $required_cap ) ) {
+						return new \WP_Error(
+							'rest_forbidden',
+							__( 'You do not have permission to run this job.', 'perflocale' ),
+							[ 'status' => 403 ]
+						);
+					}
 				}
 			} catch ( \Throwable $e ) {
 				// Factory blew up; let the worker handle it and mark failed.
-				// Falls through to the enqueue below.
+				// Falls through to the rights check and the enqueue below.
 				unset( $e );
 			}
+		}
+
+		// The worker runs the job as its dispatcher, so a retry by another
+		// user must not hand the job rights that user does not hold.
+		if ( ! $this->holds_dispatcher_rights( $created_by ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				__( 'This job runs with the permissions of the user who started it, and that user has permissions you do not have. Start the job again yourself instead.', 'perflocale' ),
+				[ 'status' => 403 ]
+			);
 		}
 
 		// Re-inject the blog-id sentinel so the worker can switch_to_blog
@@ -314,11 +365,26 @@ final class JobsController extends RestController {
 		// is_scheduled probes would otherwise target the WRONG store and
 		// silently misfire.
 		$runner = JobRunnerFactory::pick();
-		$runner->enqueue(
-			(string) $state['hook'],
-			$worker_args,
-			$id
-		);
+		try {
+			$runner->enqueue(
+				(string) $state['hook'],
+				$worker_args,
+				$id
+			);
+		} catch ( \Throwable $e ) {
+			// The row is `queued` with no worker event behind it. Put it back
+			// to `failed` (retryable at once) rather than leave it for the
+			// watchdog. Never delete it (it is the operator's history) and
+			// never re-enqueue here.
+			$message = sprintf(
+				/* translators: %s is the runner's error message. */
+				__( 'Failed to enqueue background job: %s', 'perflocale' ),
+				\PerfLocale\Util\PathRedactor::redact( $e->getMessage() )
+			);
+			JobState::fail_queued( $id, $message );
+
+			return new \WP_Error( 'perflocale_job_enqueue_failed', $message, [ 'status' => 500 ] );
+		}
 		JobState::set_engine( $id, $runner->get_engine_name() );
 
 		$fresh = JobState::get( $id );
@@ -479,6 +545,58 @@ final class JobsController extends RestController {
 	 */
 	private function user_can_read( array $state ): bool {
 		return $this->user_can_mutate( $state );
+	}
+
+	/**
+	 * Whether the current user holds every right of a job's dispatcher on
+	 * this site.
+	 *
+	 * The worker runs a job as its dispatcher (`created_by`). A user who
+	 * retries someone else's job may do so only when that identity gives the
+	 * job nothing the retrying user lacks: on a network, super admin rights
+	 * need a super admin; everywhere, each capability the dispatcher holds
+	 * must be held by the retrying user. Role names are not compared (an
+	 * administrator does not hold the `editor` role capability), and a
+	 * capability the dispatcher holds in the role but not in effect (a site
+	 * administrator's `unfiltered_html` on a network) is skipped. A job with
+	 * no dispatcher, or one whose dispatcher no longer exists, runs as nobody:
+	 * the worker refuses it.
+	 *
+	 * @param int $created_by The job's dispatcher.
+	 * @return bool
+	 */
+	private function holds_dispatcher_rights( int $created_by ): bool {
+		$current = (int) get_current_user_id();
+
+		if ( $created_by <= 0 || $created_by === $current ) {
+			return true;
+		}
+
+		$dispatcher = get_userdata( $created_by );
+
+		if ( ! $dispatcher instanceof \WP_User ) {
+			return true;
+		}
+
+		if ( is_multisite() && is_super_admin( $created_by ) && ! is_super_admin( $current ) ) {
+			return false;
+		}
+
+		$roles = wp_roles();
+
+		foreach ( (array) $dispatcher->allcaps as $cap => $granted ) {
+			$cap = (string) $cap;
+
+			if ( ! $granted || is_numeric( $cap ) || $roles->is_role( $cap ) || current_user_can( $cap ) ) {
+				continue;
+			}
+
+			if ( $dispatcher->has_cap( $cap ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**

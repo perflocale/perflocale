@@ -140,6 +140,31 @@ function perflocale_get_permalink( int|WP_Post|null $post_id, string $lang_slug 
 		return '';
 	}
 
+	// The translation in that language has its own address (its own slug,
+	// and the language root for a front page translation). Converting the
+	// source URL would put the source slug under the target prefix, a URL
+	// that only reaches the translation through a fallback redirect.
+	$post        = get_post( $post_id );
+	$groups      = $plugin->has( 'group_repo' ) ? $plugin->get( 'group_repo' ) : null;
+	$translation = 0;
+
+	if ( $post instanceof WP_Post && $groups instanceof PerfLocale\Database\Repository\TranslationGroupRepository ) {
+		foreach ( $groups->get_translations( (int) $post->ID, PerfLocale\Enum\ObjectType::Post ) as $member ) {
+			if ( isset( $member->language_slug ) && (string) $member->language_slug === $lang_slug ) {
+				$translation = (int) $member->object_id;
+				break;
+			}
+		}
+	}
+
+	if ( $post instanceof WP_Post && $translation > 0 && $translation !== (int) $post->ID && is_post_publicly_viewable( $translation ) ) {
+		$own = get_permalink( $translation );
+
+		if ( $own ) {
+			return $own;
+		}
+	}
+
 	return $plugin->get( 'url_converter' )->convert( $permalink, $lang_slug );
 }
 
@@ -170,6 +195,29 @@ function perflocale_get_term_link( int|WP_Term $term_id, string $lang_slug ): st
 
 	if ( is_wp_error( $link ) ) {
 		return '';
+	}
+
+	// As in perflocale_get_permalink(): the translated term's own link
+	// carries its own slug.
+	$term        = $term_id instanceof WP_Term ? $term_id : get_term( $term_id );
+	$groups      = $plugin->has( 'group_repo' ) ? $plugin->get( 'group_repo' ) : null;
+	$translation = 0;
+
+	if ( $term instanceof WP_Term && $groups instanceof PerfLocale\Database\Repository\TranslationGroupRepository ) {
+		foreach ( $groups->get_translations( (int) $term->term_id, PerfLocale\Enum\ObjectType::Term ) as $member ) {
+			if ( isset( $member->language_slug ) && (string) $member->language_slug === $lang_slug ) {
+				$translation = (int) $member->object_id;
+				break;
+			}
+		}
+	}
+
+	if ( $term instanceof WP_Term && $translation > 0 && $translation !== (int) $term->term_id ) {
+		$own = get_term_link( $translation, $term->taxonomy );
+
+		if ( is_string( $own ) && $own !== '' ) {
+			return $own;
+		}
 	}
 
 	return $plugin->get( 'url_converter' )->convert( $link, $lang_slug );

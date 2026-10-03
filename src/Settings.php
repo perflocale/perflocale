@@ -218,9 +218,9 @@ final class Settings {
 		// Content-Language HTTP header - W3C standard, safe to send.
 		'content_language_header'        => true,
 
-		// data-nosnippet around default-language fallback content so Google
-		// doesn't show default-lang snippets under non-default-lang URLs.
-		// Only takes effect when missing_translation_action = show_default.
+		// data-nosnippet: wraps the content whenever the rendered singular
+		// post's language differs from the URL's language — in practice the
+		// show_default branch of missing_translation_action.
 		'fallback_nosnippet'             => true,
 
 		// Speculation Rules API - prerender the visitor's target translation
@@ -637,24 +637,33 @@ final class Settings {
 		$sanitized = $this->sanitize( $values );
 
 		// Lock the read-modify-write so two concurrent saves (admin + admin, or
-		// admin + REST) don't both read the pre-write blob and have the second
-		// writer clobber keys the first changed. 10s TTL covers the
-		// read+sanitize+write; on lock-acquire failure (another save mid-flight)
-		// we retry once before giving up.
+		// admin + CLI) don't both merge onto the pre-write blob and have the
+		// second writer clobber keys the first changed. 10s TTL covers the
+		// read+merge+write. If another save holds the lock, update() returns
+		// false without writing.
 		$result = \PerfLocale\Concurrency\Lock::with(
 			'settings_update',
 			10,
 			function () use ( $sanitized ): array {
-				// Inside the critical section, force a fresh DB read. Without
-				// this, an earlier get() in the same request will have populated
-				// $this->settings, and load() returns the in-memory copy that
-				// pre-dates any concurrent writer that committed while we were
-				// acquiring the lock — exactly the lost-update race the lock
-				// is meant to prevent. wp_cache_delete on the options group
-				// also busts WP's alloptions/options cache so get_option below
-				// hits the DB.
+				// Inside the critical section, force a fresh DB read, so the
+				// merge starts from what a concurrent writer committed after
+				// this request loaded its options at bootstrap.
+				// reset_cache() drops this object's memo. The option is
+				// autoloaded, so get_option() answers from this request's
+				// `alloptions` copy, loaded at bootstrap, and never consults
+				// the per-key cache entry. Dropping `alloptions` makes both
+				// load() and update_option()'s own old-value comparison see
+				// the committed row; the per-key delete covers a row stored
+				// with autoload off. The reload costs one autoload query in
+				// the saving request (admin, CLI or a background import
+				// worker), never on a front-end read. With a persistent
+				// object cache the delete also evicts the blog's shared
+				// `alloptions` entry, which load() re-adds at once; every
+				// save already evicts it twice through the cache-generation
+				// bumps.
 				$this->reset_cache();
 				wp_cache_delete( self::OPTION_KEY, 'options' );
+				wp_cache_delete( 'alloptions', 'options' );
 
 				$current = $this->load();
 				$merged  = array_merge( $current, $sanitized );
@@ -662,8 +671,8 @@ final class Settings {
 				// autoload='yes' - the ~4 KB blob is read on nearly every request
 				// (frontend language routing, hreflang, URL rewriting) so paying for
 				// it inside the bundled alloptions fetch is strictly cheaper than a
-				// second DB round-trip. Previous iterations opted out, citing memory;
-				// at this payload size that concern is not measurable.
+				// second DB round-trip. The memory cost of carrying it in alloptions
+				// is not measurable at this payload size.
 				$saved = update_option( self::OPTION_KEY, $merged, true );
 
 				// Update the in-memory cache only on a successful write — else
@@ -942,6 +951,9 @@ final class Settings {
 	private function sanitize_wc_currencies( array $raw ): array {
 		$out = [];
 
+		// The stored rows: a refused rate keeps the stored rate of its row.
+		$stored = (array) $this->get( 'wc_currencies', [] );
+
 		foreach ( $raw as $slug => $data ) {
 			$slug = sanitize_key( (string) $slug );
 
@@ -974,7 +986,8 @@ final class Settings {
 
 			$out[ $slug ] = [
 				'currency_code' => $code,
-				'exchange_rate' => max( 0.0001, (float) ( $data['exchange_rate'] ?? 1.0 ) ),
+				// Not a finite number above zero: refused (rate_to_store()).
+				'exchange_rate' => \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $stored[ $slug ] ?? null, $code ),
 				// Pin this currency's rate against auto-sync. Without persisting
 				// this flag the manual-rate override in MultiCurrency /
 				// ExchangeRateSync was dead — auto-sync always won.

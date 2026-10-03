@@ -174,7 +174,7 @@ final class AddonCommand {
 	 * ## EXAMPLES
 	 *
 	 * wp perflocale addon info testad
-	 * wp perflocale addon info visual-editor --format=json
+	 * wp perflocale addon info woocommerce --format=json
 	 *
 	 * @param array<int, string>    $args Positional args.
 	 * @param array<string, string> $assoc_args Named args.

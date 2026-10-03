@@ -231,6 +231,7 @@ final class OptionStrings {
 		$this->attached = true;
 
 		add_action( 'perflocale/language/overridden', [ $this, 'relanguage' ], 20 );
+		add_action( 'perflocale/language/restored', [ $this, 'relanguage' ], 20 );
 	}
 
 	/**
@@ -478,10 +479,33 @@ final class OptionStrings {
 	/**
 	 * Register the current source text so it appears on the Strings screen.
 	 *
+	 * ⚠️ The read filters may be attached here: update_option() on a translated
+	 * front-end request after language detection (a form handler on
+	 * `template_redirect`, a shortcode) fires this with them in place, and
+	 * get_option() would then hand the registration the translation instead of
+	 * the text just stored — registering it as the new source and moving every
+	 * translation onto it. Detach them for the read and put back exactly the
+	 * ones that were attached.
+	 *
 	 * @return void
 	 */
 	public function register_sources(): void {
-		self::register_source_strings();
+		$detached = [];
+
+		foreach ( array_keys( self::OPTIONS ) as $option ) {
+			if ( false !== has_filter( 'option_' . $option, [ $this, 'filter_option' ] ) ) {
+				remove_filter( 'option_' . $option, [ $this, 'filter_option' ], 10 );
+				$detached[] = $option;
+			}
+		}
+
+		try {
+			self::register_source_strings();
+		} finally {
+			foreach ( $detached as $option ) {
+				add_filter( 'option_' . $option, [ $this, 'filter_option' ], 10, 2 );
+			}
+		}
 	}
 
 	/**
@@ -511,10 +535,10 @@ final class OptionStrings {
 		$repo = new StringRepository( $plugin->get( 'cache' ) );
 
 		foreach ( array_keys( self::OPTIONS ) as $option ) {
-			// Read raw. On activation no read filter can be attached yet, and on
-			// the update path the guards have already refused to attach one — but
-			// reading through get_option() unconditionally would be a latent
-			// source-corruption bug the day either of those changes.
+			// Must read raw. On activation and upgrade no read filter is attached
+			// yet; the instance entry point, register_sources(), detaches its own
+			// before calling this. Any new caller that can run after language
+			// detection has to do the same.
 			$raw = (string) get_option( $option, '' );
 
 			if ( '' === $raw ) {
