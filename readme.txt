@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.7.1
+Stable tag: 1.0.7.1.1
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -207,6 +207,9 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
+= 1.0.7.1.1 =
+* Block editor: saving a post or page no longer ends in an error, and the "View Post" link appears again after publishing.
+
 = 1.0.7.1 =
 * Security hardening.
 * Faster cart and checkout on stores whose language copies share stock.
@@ -232,6 +235,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.7.1.1 =
+Fixes an error after every save in the block editor.
 
 = 1.0.7.1 =
 Security hardening. Faster cart and checkout on stores whose language copies share stock, Sync Fields that keeps the original's publish date, Create in the Site Editor's Translations panel, and a Site Health check for missing language packs.

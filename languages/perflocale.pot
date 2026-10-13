@@ -2,14 +2,14 @@
 # This file is distributed under the GPL v2 or later.
 msgid ""
 msgstr ""
-"Project-Id-Version: PerfLocale 1.0.7.1\n"
+"Project-Id-Version: PerfLocale 1.0.7.1.1\n"
 "Report-Msgid-Bugs-To: https://wordpress.org/support/plugin/perflocale\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-10-10T06:50:51+00:00\n"
+"POT-Creation-Date: 2026-10-13T09:31:15+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: perflocale\n"
@@ -1176,11 +1176,11 @@ msgstr ""
 msgid "PerfLocale could not seed the default English language. Database error: %s"
 msgstr ""
 
-#: src/Addon/AddonMigrationErrors.php:241
+#: src/Addon/AddonMigrationErrors.php:248
 msgid "PerfLocale: addon migration / uninstall issues"
 msgstr ""
 
-#: src/Addon/AddonMigrationErrors.php:253
+#: src/Addon/AddonMigrationErrors.php:260
 msgid "Clear via WP CLI: wp perflocale addon errors --clear"
 msgstr ""
 
@@ -1319,7 +1319,7 @@ msgstr ""
 #: src/Admin/AdminController.php:4065
 #: src/Admin/QuarantineNotice.php:132
 #: src/Bootstrap.php:3876
-#: src/WooCommerce/ExchangeRateSync.php:1045
+#: src/WooCommerce/ExchangeRateSync.php:1073
 msgid "Insufficient permissions."
 msgstr ""
 
@@ -1388,7 +1388,7 @@ msgid "The upload failed for an unrecognized reason (PHP upload error %d). Try a
 msgstr ""
 
 #: src/Admin/AdminController.php:605
-#: src/WooCommerce/ExchangeRateSync.php:319
+#: src/WooCommerce/ExchangeRateSync.php:337
 msgid "PerfLocale:"
 msgstr ""
 
@@ -1686,7 +1686,7 @@ msgstr ""
 #: src/Admin/AdminController.php:4009
 #: src/Admin/AdminController.php:4016
 #: src/Admin/Pages/JobsPage.php:76
-#: src/WooCommerce/ExchangeRateSync.php:297
+#: src/WooCommerce/ExchangeRateSync.php:315
 msgid "ago"
 msgstr ""
 
@@ -2196,7 +2196,7 @@ msgstr ""
 
 #. translators: %d: number of translations.
 #: src/Admin/MetaBox.php:529
-#: assets/js/editor-sidebar.js:392
+#: assets/js/editor-sidebar.js:397
 #, php-format,js-format
 msgid "Sync Fields were not copied to %d translation that you cannot edit."
 msgid_plural "Sync Fields were not copied to %d translations that you cannot edit."
@@ -6729,7 +6729,7 @@ msgstr ""
 
 #: src/Admin/SiteHealth.php:1724
 #: src/Admin/SiteHealth.php:3398
-#: src/WooCommerce/ExchangeRateSync.php:298
+#: src/WooCommerce/ExchangeRateSync.php:316
 msgid "never"
 msgstr ""
 
@@ -9978,52 +9978,52 @@ msgid "Machine translation rate-limit check is busy. Retry shortly."
 msgstr ""
 
 #. translators: %s: Human-readable time since last sync, or "never".
-#: src/WooCommerce/ExchangeRateSync.php:308
+#: src/WooCommerce/ExchangeRateSync.php:326
 #, php-format
 msgid "Exchange rates have not been updated recently (last sync: %s). Check that WP-Cron is running, or sync manually from the Currencies settings."
 msgstr ""
 
 #. translators: %s: Human-readable time since last sync, or "never".
-#: src/WooCommerce/ExchangeRateSync.php:313
+#: src/WooCommerce/ExchangeRateSync.php:331
 #, php-format
 msgid "Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %s). Register a provider with the perflocale/woocommerce/exchange_rate_providers filter, supply rates directly with perflocale/woocommerce/exchange_rates_fetched, or turn auto-sync off in the Currencies settings."
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:343
+#: src/WooCommerce/ExchangeRateSync.php:361
 msgid "Every 2 Hours"
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:347
+#: src/WooCommerce/ExchangeRateSync.php:365
 msgid "Every 4 Hours"
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:351
+#: src/WooCommerce/ExchangeRateSync.php:369
 msgid "Every 6 Hours"
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:355
+#: src/WooCommerce/ExchangeRateSync.php:373
 msgid "Every 8 Hours"
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:359
+#: src/WooCommerce/ExchangeRateSync.php:377
 msgid "Every 12 Hours"
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:363
+#: src/WooCommerce/ExchangeRateSync.php:381
 msgid "Once Monthly"
 msgstr ""
 
 #. translators: %s: comma-separated list of currency=value pairs that were rejected.
-#: src/WooCommerce/ExchangeRateSync.php:840
+#: src/WooCommerce/ExchangeRateSync.php:868
 #, php-format
 msgid "Ignored invalid exchange rates (must be a positive number): %s"
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:1055
+#: src/WooCommerce/ExchangeRateSync.php:1083
 msgid "No rates returned. Check your provider settings and API key."
 msgstr ""
 
-#: src/WooCommerce/ExchangeRateSync.php:1068
+#: src/WooCommerce/ExchangeRateSync.php:1096
 msgid "Exchange rates updated successfully."
 msgstr ""
 

@@ -378,9 +378,14 @@
 			return;
 		}
 
-		var saving = editor.isSavingPost() && ! editor.isAutosavingPost();
+		var saving   = editor.isSavingPost() && ! editor.isAutosavingPost();
+		var finished = wasSaving && ! saving;
 
-		if ( wasSaving && ! saving && editor.didPostSaveRequestSucceed() ) {
+		// Recorded before any dispatch: a dispatch runs every subscriber
+		// again at once, this one included.
+		wasSaving = saving;
+
+		if ( finished && editor.didPostSaveRequestSucceed() ) {
 			var skipped = parseInt( editor.getCurrentPost().perflocale_sync_skipped, 10 ) || 0;
 			var notices = wp.data.dispatch( 'core/notices' );
 
@@ -394,11 +399,11 @@
 					),
 					{ id: 'perflocale-sync-skipped', isDismissible: true }
 				);
-			} else {
+			} else if ( wp.data.select( 'core/notices' ).getNotices().some( function( notice ) {
+				return notice.id === 'perflocale-sync-skipped';
+			} ) ) {
 				notices.removeNotice( 'perflocale-sync-skipped' );
 			}
 		}
-
-		wasSaving = saving;
 	} );
 } )();
