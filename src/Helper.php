@@ -36,7 +36,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * perflocale()->is_language( $slug ) - Check if current language matches.
  * perflocale()->is_addon_active( $id ) - Did the addon boot in this request?
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class Helper {
 
@@ -53,10 +53,10 @@ final class Helper {
 	 * switch_blog hook (multisite) and on language admin events that
 	 * could change which language wins. Saves N container-lookups when
 	 * themes call perflocale()->locale() / slug() / native_name() etc.
-	 * inside a template loop — each downstream getter routes through
+	 * inside a template loop - each downstream getter routes through
 	 * current_language() and would otherwise re-walk the DI every call.
 	 *
-	 * Three states: unset (never queried), false (queried and got null —
+	 * Three states: unset (never queried), false (queried and got null -
 	 * distinguishes "no current language" from "haven't asked yet"),
 	 * object (the language).
 	 *
@@ -129,7 +129,7 @@ final class Helper {
 	/**
 	 * Whether a post is flagged out of hreflang / sitemap alternates.
 	 *
-	 * Membership check against the per-blog flagged-id set — see
+	 * Membership check against the per-blog flagged-id set - see
 	 * seo_excluded_post_ids() for the loading strategy.
 	 *
 	 * @param int $post_id Post ID.
@@ -144,8 +144,8 @@ final class Helper {
 	 *
 	 * One indexed postmeta query per request (meta_key index), memoised
 	 * per blog. Consumers run inside sitemap/hreflang rendering where the
-	 * per-sibling alternative — get_post_meta() on ids the sitemap prime
-	 * deliberately does NOT meta-prime — would cost a query per sibling.
+	 * per-sibling alternative - get_post_meta() on ids the sitemap prime
+	 * deliberately does NOT meta-prime - would cost a query per sibling.
 	 * Same-request writes to the flag are invisible to the memo; the flag
 	 * is only toggled on admin save requests, which never render hreflang
 	 * or sitemaps.
@@ -184,7 +184,7 @@ final class Helper {
 	/**
 	 * Get the current language object.
 	 *
-	 * Memoised per request — the underlying router lookup is cheap, but
+	 * Memoised per request - the underlying router lookup is cheap, but
 	 * locale() / slug() / name() / native_name() / display_name() / flag()
 	 * all route through here, and a template loop calling several of
 	 * those per item would otherwise re-walk the DI container hundreds
@@ -248,7 +248,7 @@ final class Helper {
 	 *     translated, by {@see \PerfLocale\Frontend\BlockTemplateTranslator},
 	 *     but only when an operator has marked those types translatable. A
 	 *     window does follow it: the resolver re-languages on
-	 *     `perflocale/language/overridden`. It is still front-end only — the
+	 *     `perflocale/language/overridden`. It is still front-end only - the
 	 *     Site Editor always sees and saves the SOURCE.
 	 *
 	 * ⚠️ COST. Each actual language CHANGE rebuilds the per-language string map.
@@ -633,7 +633,7 @@ final class Helper {
 	 * switcher and hreflang tags use, so a custom switcher built with
 	 * this method stays in lock-step with the rest of the plugin. On
 	 * singular pages where the target language has no translation,
-	 * returns an empty string — callers can fall through to
+	 * returns an empty string - callers can fall through to
 	 * `perflocale()->home_url( $lang_slug )` or render an "untranslated"
 	 * UI as they prefer.
 	 *
@@ -686,7 +686,7 @@ final class Helper {
 	 *
 	 * Languages without a translation on the current singular page are
 	 * still included with `is_translated => false` and an empty `url`
-	 * — themes that want the bundled switcher's hide-untranslated
+	 * - themes that want the bundled switcher's hide-untranslated
 	 * behaviour can filter on that flag.
 	 *
 	 * @return array<int, array{
@@ -766,7 +766,7 @@ final class Helper {
 	}
 
 	/**
-	 * Batch version of {@see translations()} — resolve translations for
+	 * Batch version of {@see translations()} - resolve translations for
 	 * many posts in a single round-trip. Returns a map keyed by source
 	 * post id, with the same `[language_slug => post_id]` shape as
 	 * `translations()` for each entry.
@@ -778,7 +778,7 @@ final class Helper {
 	 * to the batch path on the underlying repository.
 	 *
 	 * Posts that have no translations (or whose entry can't be resolved
-	 * — invalid id, post type isn't translatable) get an empty array
+	 * - invalid id, post type isn't translatable) get an empty array
 	 * for that key, never a missing key, so callers can iterate without
 	 * isset() guards:
 	 *
@@ -837,7 +837,7 @@ final class Helper {
 	 *   perflocale()->is_translatable( 'category', 'taxonomy' )   // bool
 	 *
 	 * Returns false when the plugin's settings service isn't reachable
-	 * (early-boot, mid-deactivation) — same conservative default the
+	 * (early-boot, mid-deactivation) - same conservative default the
 	 * rest of the Helper API uses.
 	 *
 	 * @param string $name Post type slug OR taxonomy slug.
@@ -902,7 +902,7 @@ final class Helper {
 	 * (1,234.56 in en-US, 1.234,56 in de-DE, 1 234,56 in fr-FR, etc.).
 	 *
 	 * Without intl it uses WordPress's own separators for the REQUESTED
-	 * language — see {@see self::number_format_for_locale()}, which exists
+	 * language - see {@see self::number_format_for_locale()}, which exists
 	 * because plain {@see number_format_i18n()} punctuates for the locale the
 	 * request is running in and so ignored `$lang_slug` entirely. That path
 	 * needs the target locale's language pack installed; with no pack
@@ -966,7 +966,7 @@ final class Helper {
 	 * ⭐ WHY THIS EXISTS
 	 *   `number_format_i18n()` reads `$wp_locale`, which describes the locale
 	 *   the request is currently running in. On the intl-less path that made
-	 *   `format_number( 1234.5, 'de' )` return "1,234.5" on an English site —
+	 *   `format_number( 1234.5, 'de' )` return "1,234.5" on an English site -
 	 *   English punctuation on a number the caller explicitly asked for in
 	 *   German. The requested language was not formatted differently, it was
 	 *   IGNORED. Measured on WP 7.1 / PHP 8.4 with intl stripped via
@@ -974,7 +974,7 @@ final class Helper {
 	 *   "1,234.5" / "1.234,5" / "1 234,5".
 	 *
 	 * ⚡ WHY IT IS SHAPED LIKE THIS
-	 *   The common call — `format_number( $x )`, no language — asks for the
+	 *   The common call - `format_number( $x )`, no language - asks for the
 	 *   locale the request is already in, so it takes the first branch and is
 	 *   byte-for-byte the old code path: one `number_format_i18n()`, no switch,
 	 *   no memo lookup cost worth measuring, and the `number_format_i18n`
@@ -988,7 +988,7 @@ final class Helper {
 	 *   multisite network, so the memo is NOT blog-affine and needs no blog key.
 	 *
 	 * ⚠️ `switch_to_locale()` returns false both when the switch failed AND
-	 *   when the locale was already active — in neither case did it push onto
+	 *   when the locale was already active - in neither case did it push onto
 	 *   the stack, so restoring on a false return would pop somebody else's
 	 *   locale.
 	 *
@@ -1032,7 +1032,7 @@ final class Helper {
 		$formatted = number_format( $value, $decimals, $separators[0], $separators[1] );
 
 		// Fire core's filter so a site that customises number punctuation keeps
-		// doing so on this path too — this method stands in for
+		// doing so on this path too - this method stands in for
 		// number_format_i18n(), so it must honour the same contract.
 		return (string) apply_filters( 'number_format_i18n', $formatted, $value, $decimals ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress core 'number_format_i18n' filter; this method stands in for number_format_i18n() on the cross-locale path, so dropping it would make format_number( $x ) and format_number( $x, 'de' ) disagree on a site that customises number punctuation.
 	}
@@ -1077,7 +1077,7 @@ final class Helper {
 			}
 		}
 
-		// Conservative fallback when intl isn't loaded — code + amount,
+		// Conservative fallback when intl isn't loaded - code + amount,
 		// no symbol guessing (we'd be wrong as often as right). The AMOUNT is
 		// still punctuated for the requested locale; see
 		// number_format_for_locale() for why number_format_i18n() alone was
@@ -1116,7 +1116,7 @@ final class Helper {
 	}
 
 	/**
-	 * Whether the current request is a REST API request — usable at BOOT time.
+	 * Whether the current request is a REST API request - usable at BOOT time.
 	 *
 	 * The `REST_REQUEST` constant is only defined on `parse_request` (deep
 	 * inside `rest_api_loaded()`), long AFTER plugins load and register their
@@ -1124,7 +1124,7 @@ final class Helper {
 	 * therefore evaluated to false for every REST request and silently failed
 	 * to boot write-context services (content sync, change detection, the
 	 * "do not translate" block filter, the webhook dispatcher, …) on Gutenberg
-	 * saves and REST translation ops — is_admin() is also false during REST, so
+	 * saves and REST translation ops - is_admin() is also false during REST, so
 	 * NO gate matched. This helper answers the question early by sniffing the
 	 * request target, falling back to the constant once it exists.
 	 *
@@ -1183,7 +1183,7 @@ final class Helper {
 	}
 
 	/**
-	 * Whether the current request is a WRITE / translate context — i.e. one
+	 * Whether the current request is a WRITE / translate context - i.e. one
 	 * where content can be created or edited and PerfLocale's write-hook
 	 * services (content sync, change detection, the block "do not translate"
 	 * filter, term-assignment filtering, the webhook dispatcher) must be
@@ -1224,7 +1224,7 @@ final class Helper {
 	 * type to 'production' when unset, so ordinary single-environment
 	 * sites are unaffected.
 	 *
-	 * @param string $feature Dispatch surface ('webhooks', …) —
+	 * @param string $feature Dispatch surface ('webhooks', …) -
 	 *                        lets a filter callback allow one surface but
 	 *                        not another.
 	 * @return bool True when dispatch may proceed.
@@ -1241,7 +1241,7 @@ final class Helper {
 		 *
 		 * Default false: staging/development clones do not fire webhooks.
 		 * Return true to opt a surface (or every surface)
-		 * back in — e.g. a dedicated QA environment that owns its own
+		 * back in - e.g. a dedicated QA environment that owns its own
 		 * webhook endpoints.
 		 *
 		 * @hook perflocale/dispatch/allow_non_production
@@ -1256,7 +1256,7 @@ final class Helper {
 
 		/**
 		 * Fires when an outward-facing dispatch is blocked by the
-		 * non-production environment gate. Observability hook — lets a
+		 * non-production environment gate. Observability hook - lets a
 		 * logger or admin notice surface that webhooks are intentionally
 		 * muted on this clone.
 		 *
@@ -1304,7 +1304,7 @@ final class Helper {
 	 * Both sides are percent-decoded first, which is the half that made this a
 	 * multibyte defect rather than only an inconsistency. The admin types
 	 * `/日本語/` into the settings field and it is stored verbatim, while the
-	 * request path arrives percent-encoded — deliberately, because the router
+	 * request path arrives percent-encoded - deliberately, because the router
 	 * uses esc_url_raw specifically to preserve the escapes. The two forms could
 	 * never meet, so a non-Latin excluded path excluded nothing. Decoding the
 	 * NEEDLE too means an admin who pastes an already-encoded path still matches.
@@ -1370,9 +1370,9 @@ final class Helper {
 
 		// Fast path. This runs on the request path, so the common case should not
 		// pay for a sanitize_title() round trip it cannot possibly need. A value
-		// already in the exact shape sanitize_title_for_query() emits — lowercase
+		// already in the exact shape sanitize_title_for_query() emits - lowercase
 		// alphanumerics, dash or underscore, no leading or trailing dash, and no
-		// doubled dash, which sanitize_title collapses — is returned by that
+		// doubled dash, which sanitize_title collapses - is returned by that
 		// function unchanged, so returning it here is identical by construction.
 		// Proven against the slow path over 64,083 inputs including every one and
 		// two character string over a hostile alphabet and 5,000 real slugs from
@@ -1437,7 +1437,7 @@ final class Helper {
 	 * still drove `posts_per_page=777` and rendered all 50 matching sources.
 	 * The protection has to sit where the value is USED.
 	 *
-	 * The stored preference is deliberately NOT rewritten — a render is not the
+	 * The stored preference is deliberately NOT rewritten - a render is not the
 	 * place to mutate a user's settings; only the effective value is clamped.
 	 *
 	 * @param int    $value   Raw stored value.
@@ -1578,7 +1578,7 @@ final class Helper {
 	 * itself writes a literal per cent as %25 (see {@see self::truncate_slug()}),
 	 * and a title typed into wp-admin keeps it, because core's only default
 	 * `title_save_pre` filter is `trim`. So the strip is not something the rest
-	 * of WordPress does to titles — it is specific to this sanitiser.
+	 * of WordPress does to titles - it is specific to this sanitiser.
 	 *
 	 * Every other guarantee of `sanitize_text_field()` is kept, in core's order:
 	 * invalid UTF-8 removed, tags stripped, `<` handled the way core handles it,
@@ -1586,14 +1586,14 @@ final class Helper {
 	 *
 	 * The invalid-UTF-8 scrub is NOT dead code here even though the XLIFF caller
 	 * feeds it DOM output (always valid UTF-8): the REST, machine-translation and
-	 * TranslatePress-migration callers do not. It is load-bearing for those —
+	 * TranslatePress-migration callers do not. It is load-bearing for those -
 	 * `wpdb::process_fields()` refuses a write whose value `strip_invalid_text()`
 	 * had to change, so an unscrubbed bad byte loses the whole post update rather
 	 * than mangling one field. Bytes are dropped individually rather than core's
 	 * all-or-nothing empty return, matching {@see \PerfLocale\Xliff\XliffExporter}.
 	 *
 	 * Takes `mixed` deliberately. This file is `strict_types=1`, and the REST
-	 * sanitize_callbacks below hand through whatever the client sent — a `string`
+	 * sanitize_callbacks below hand through whatever the client sent - a `string`
 	 * parameter would turn a malformed request into an uncaught TypeError.
 	 *
 	 * @param mixed $str           Raw value; anything not a string yields ''.
@@ -1725,9 +1725,9 @@ final class Helper {
 	 * inputs and every boundary form (leading zeros, out-of-range octets,
 	 * trailing newline, bracketed literals, zone ids), with zero
 	 * disagreements. The three predicates together were then differentially
-	 * tested against filter_var across 671,529 comparisons — every IPv4 /16
+	 * tested against filter_var across 671,529 comparisons - every IPv4 /16
 	 * boundary, every IPv6 first hextet, dotted-quad IPv6 forms, and a
-	 * randomised full-space sweep — again with zero disagreements.
+	 * randomised full-space sweep - again with zero disagreements.
 	 *
 	 * @param string $ip Candidate address.
 	 */
@@ -2149,7 +2149,7 @@ final class Helper {
 	 * PHP built without ext-filter, and is deliberately conservative rather than
 	 * faithful: printable ASCII only, well-formed percent-escapes, http(s) only,
 	 * no userinfo, and RFC 1035 label and host length limits. Differentially
-	 * fuzzed against filter_var over 330,056 URLs — hostile authority alphabets,
+	 * fuzzed against filter_var over 330,056 URLs - hostile authority alphabets,
 	 * 80,000 random raw-byte hosts, and every label and host length across the
 	 * 63 and 253 boundaries; bracketed hosts are checked separately. The
 	 * standing property is that it never accepts what filter_var rejects. It
@@ -2198,7 +2198,7 @@ final class Helper {
 		// parse_url, not wp_parse_url: a fallback whose whole purpose is working
 		// when something is missing should not itself need WordPress loaded. The
 		// two differ only for protocol-relative and root-relative URLs, which the
-		// scheme test below rejects anyway, so they are equivalent here — and this
+		// scheme test below rejects anyway, so they are equivalent here - and this
 		// way the branch can be exercised without booting WordPress, which matters
 		// because WordPress does not survive disable_functions=filter_var on every
 		// site.
@@ -2346,7 +2346,7 @@ final class Helper {
 	 *
 	 * BCP 47 / RFC 5646 conventions (case-insensitive at match time, but
 	 * the canonical form is what tools, validators, and SEO crawlers
-	 * expect — and what every reference site emits):
+	 * expect - and what every reference site emits):
 	 *
 	 *   - language subtag (2-3 letters):   lowercase  (`en`, `de`, `zh`)
 	 *   - region subtag (2 letters):       UPPERCASE  (`US`, `GB`, `BR`)
@@ -2357,7 +2357,7 @@ final class Helper {
 	 *   `pt_BR`        → `pt-BR`
 	 *   `zh_Hans_CN`   → `zh-Hans-CN`
 	 *   `ar`           → `ar`
-	 *   `fr_FR`        → `fr-FR`  (NOT collapsed to `fr` — keeping the
+	 *   `fr_FR`        → `fr-FR`  (NOT collapsed to `fr` - keeping the
 	 *                              redundant region helps regional CDNs
 	 *                              + matches Google's reference output)
 	 *
@@ -2367,13 +2367,13 @@ final class Helper {
 	 *   - leading/trailing whitespace
 	 *
 	 * Anything obviously malformed (empty, only-separators, non-alpha
-	 * subtags) returns the trimmed input lowercased — graceful degrade,
+	 * subtags) returns the trimmed input lowercased - graceful degrade,
 	 * no fatal.
 	 *
 	 * @internal This is an implementation detail consumed by the admin
 	 *           Languages form and the SEO hreflang emitter. Despite
 	 *           being public-static, it is NOT part of the @api surface
-	 *           the rest of this class is bound by — signature and
+	 *           the rest of this class is bound by - signature and
 	 *           behaviour may change between minor releases. Third-party
 	 *           code that needs a BCP-47 string should normalise its
 	 *           inputs and use WordPress' get_bloginfo('language')
@@ -2430,7 +2430,7 @@ final class Helper {
 		foreach ( $parts as $i => $part ) {
 			$len = strlen( $part );
 
-			// Bail out on non-alpha tokens — let them pass through
+			// Bail out on non-alpha tokens - let them pass through
 			// lowercased rather than try to "fix" something we don't
 			// understand (e.g. private-use subtags `x-mywp1`).
 			if ( ! self::is_ascii_alpha( $part ) ) {
@@ -2471,7 +2471,7 @@ final class Helper {
 	 * can simply check `if ( $suggestion !== '' )`.
 	 *
 	 * @internal Admin-form helper for the Languages page. Not part of
-	 *           the @api surface — signature and heuristics may change.
+	 *           the @api surface - signature and heuristics may change.
 	 *
 	 * @param object $language Language row (`->slug`, `->locale`).
 	 * @return string Suggested slug, e.g. `en-us`, or empty string.
@@ -2528,7 +2528,7 @@ final class Helper {
 	 *
 	 * Family = the language part of a slug (everything before the first
 	 * `-`). So `en` and `en-GB` share family `en`; `en` and `de-DE` do
-	 * NOT — they're different languages. Cross-family matches were the
+	 * NOT - they're different languages. Cross-family matches were the
 	 * source of false-positive nudges (a site running just `de`, `fr`,
 	 * `es` was being told to rename them all to `de-DE`, `fr-FR`, etc.,
 	 * even when those single-variant choices were intentional and there
@@ -2583,7 +2583,7 @@ final class Helper {
 			}
 
 			if ( $bare === null || ! $has_region_var ) {
-				// Either no bare member (`en-US` + `en-GB` is fine — no
+				// Either no bare member (`en-US` + `en-GB` is fine - no
 				// asymmetry), OR no region member yet (`de` standing
 				// alone is intentional, leave it alone).
 				continue;
@@ -2610,7 +2610,7 @@ final class Helper {
 	 * Same shape as {@see detect_bare_languages_with_region_siblings()},
 	 * but DROPS the "has region-qualified sibling" requirement. At form-
 	 * render time the user is about to add a region-qualified sibling
-	 * — that's the action that will create the imbalance. Surfacing the
+	 * - that's the action that will create the imbalance. Surfacing the
 	 * rename checkbox only when the imbalance already exists makes the
 	 * nudge fire one beat too late (after the user has already submitted).
 	 *
@@ -2700,8 +2700,8 @@ final class Helper {
 		// Regional Indicator Symbols U+1F1E6–U+1F1FF form a contiguous 4-byte
 		// UTF-8 block whose leading three bytes are constant (F0 9F 87); only
 		// the trailing continuation byte varies. Encoding the pair directly
-		// avoids a hard dependency on mb_chr() — which has no WP core polyfill,
-		// so a host built without mbstring would fatal here — and never depends
+		// avoids a hard dependency on mb_chr() - which has no WP core polyfill,
+		// so a host built without mbstring would fatal here - and never depends
 		// on mb_internal_encoding().
 		$first  = "\xF0\x9F\x87" . chr( 0xA6 + ord( $code[0] ) - ord( 'A' ) );
 		$second = "\xF0\x9F\x87" . chr( 0xA6 + ord( $code[1] ) - ord( 'A' ) );
@@ -2726,7 +2726,7 @@ final class Helper {
 		// Byte-level decode, the exact inverse of country_code_to_emoji()
 		// above. Regional Indicator Symbols U+1F1E6-U+1F1FF are always 4-byte
 		// UTF-8 sharing the constant prefix F0 9F 87, with only the trailing
-		// continuation byte varying across A6..BF — so a valid pair is exactly
+		// continuation byte varying across A6..BF - so a valid pair is exactly
 		// 8 bytes and needs no multibyte functions.
 		//
 		// Deliberately avoids mb_ord()/mb_strlen()/mb_substr(): mb_ord() is
@@ -2822,7 +2822,7 @@ final class Helper {
 	 * `wp-content/uploads/perflocale/`. Honors `wp_upload_dir()` so the path
 	 * is per-blog on multisite (subsites land under `uploads/sites/<id>/`).
 	 *
-	 * Single source of truth — callers should always go through this helper
+	 * Single source of truth - callers should always go through this helper
 	 * (and the `uploads_temp_dir` / `uploads_exports_dir` /
 	 * `uploads_translations_dir` siblings) rather than hard-coding paths.
 	 *
@@ -2835,7 +2835,7 @@ final class Helper {
 	}
 
 	/**
-	 * Translations output dir — `uploads/perflocale/translations/`. The
+	 * Translations output dir - `uploads/perflocale/translations/`. The
 	 * generator writes `.mo`/`.l10n.php` files here for built-in plugin
 	 * strings.
 	 *
@@ -2847,7 +2847,7 @@ final class Helper {
 	}
 
 	/**
-	 * Scratch dir for in-flight imports — `uploads/perflocale/temp/`.
+	 * Scratch dir for in-flight imports - `uploads/perflocale/temp/`.
 	 * Files staged here survive request teardown until the async worker
 	 * picks them up; backed by a 24h delayed `perflocale_cleanup_temp_import`
 	 * event so abandoned uploads don't accumulate.
@@ -2860,7 +2860,7 @@ final class Helper {
 	}
 
 	/**
-	 * Export bundle dir — `uploads/perflocale/exports/`. Single-use:
+	 * Export bundle dir - `uploads/perflocale/exports/`. Single-use:
 	 * `process_export_download()` unlinks the file after streaming.
 	 *
 	 * @return string
@@ -2880,7 +2880,7 @@ final class Helper {
 	 * perflocale_jobs_gc cron handler.
 	 *
 	 * Skips the .htaccess + index.php hardening files (they shouldn't be
-	 * old — they're refreshed by harden_directory() — but defensively
+	 * old - they're refreshed by harden_directory() - but defensively
 	 * named-skip them so a no-op call here can't accidentally delete the
 	 * directory's defense-in-depth files).
 	 *
@@ -2948,7 +2948,7 @@ final class Helper {
 	/**
 	 * Write defense-in-depth protection files into a plugin-owned directory.
 	 *
-	 * Two files (idempotent — won't overwrite existing):
+	 * Two files (idempotent - won't overwrite existing):
 	 *   - `.htaccess` with `Deny from all` for Apache hosts
 	 *   - `index.php` "silence is golden" against `Options +Indexes` autoindex
 	 *
@@ -2962,7 +2962,7 @@ final class Helper {
 	 * filename: `AdminController` names import temp files with
 	 * `wp_generate_password( 16, false )` and
 	 * `DataExportJob::default_export_path()` names exports with 32 characters
-	 * — the same length WP core uses for privacy exports, which live in this
+	 * - the same length WP core uses for privacy exports, which live in this
 	 * same public tree (`wp_privacy_generate_personal_data_export_file()`). Do
 	 * not shorten either token on the strength of this file.
 	 *
@@ -2979,7 +2979,7 @@ final class Helper {
 	 *
 	 * Cheap to call on every directory creation: each file is written once
 	 * (existence check short-circuits subsequent calls) so the cost is the
-	 * two `exists` probes — negligible compared to the work the caller
+	 * two `exists` probes - negligible compared to the work the caller
 	 * is doing.
 	 *
 	 * @param string $dir Absolute filesystem path to an existing directory.
@@ -3225,7 +3225,7 @@ final class Helper {
 				return $repo->find_by_slug( $lang );
 			}
 		} catch ( \Throwable $e ) {
-			// Bootstrap not ready — fall through to global defaults.
+			// Bootstrap not ready - fall through to global defaults.
 			unset( $e );
 		}
 
@@ -3236,14 +3236,14 @@ final class Helper {
 	 * Load an addon's `.mo` file the WordPress 6.7+-friendly way.
 	 *
 	 * `load_plugin_textdomain()` has been effectively deprecated since
-	 * WordPress 4.6 — Core's just-in-time loader resolves wp.org-hosted
+	 * WordPress 4.6 - Core's just-in-time loader resolves wp.org-hosted
 	 * `.mo` files on the first `__()` call without any plugin opt-in. On
 	 * 6.7+ calling `load_plugin_textdomain()` (or `load_textdomain()`)
 	 * before the `init` action triggers a `_doing_it_wrong` notice.
 	 *
 	 * For external/non-wp.org addons that ship their own `.mo` files we
 	 * still need to register them explicitly. The right place is `init`
-	 * at priority 99 — late enough that the user's locale is finalised,
+	 * at priority 99 - late enough that the user's locale is finalised,
 	 * but early enough to win over PHP code that calls `__()` shortly
 	 * after.
 	 *
@@ -3256,7 +3256,7 @@ final class Helper {
 	 *       );
 	 *   }, 99 );
 	 *
-	 * For wp.org-hosted addons: don't call this at all — Core's
+	 * For wp.org-hosted addons: don't call this at all - Core's
 	 * just-in-time loader has been doing it for you since WP 4.6.
 	 *
 	 * @param string $domain Text domain matching the addon's `Text Domain` header.
@@ -3265,7 +3265,7 @@ final class Helper {
 	 * @param string $locale Optional explicit locale; defaults to determine_locale().
 	 * @return bool True if a `.mo` file was located and loaded.
 	 *
-	 * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+	 * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
 	 */
 	public static function load_addon_textdomain( string $domain, string $mo_dir, string $locale = '' ): bool {
 		// Calling load_textdomain() before `init` triggers WP 6.7+'s own
@@ -3314,7 +3314,7 @@ final class Helper {
 	 * One late hook instead of a wp_style_add_data() call at each of the
 	 * dozen registration sites: iterate the registered styles, and for
 	 * every `perflocale*` handle whose `-rtl.css` twin exists on disk, set
-	 * the core `rtl => replace` extra — WP then swaps `.css` for
+	 * the core `rtl => replace` extra - WP then swaps `.css` for
 	 * `-rtl.css` at print time. Covers add-on handles
 	 * too (same prefix, same URL→path mapping).
 	 *
@@ -3324,10 +3324,10 @@ final class Helper {
 	 * (`_x( 'ltr', 'text direction' )` comes out of the default textdomain).
 	 * PerfLocale's own `text_direction` column needs no pack, and is what
 	 * `HreflangManager::filter_language_attributes()` reads to put `dir="rtl"`
-	 * on `<html>` — whenever the `seo_og_locale` setting is on, which is its
+	 * on `<html>` - whenever the `seo_og_locale` setting is on, which is its
 	 * default. A site that adds Persian as a translation language without
-	 * installing the `fa_IR` core pack — which nothing in this plugin does
-	 * for you — therefore serves an RTL document
+	 * installing the `fa_IR` core pack - which nothing in this plugin does
+	 * for you - therefore serves an RTL document
 	 * dressed in the LTR stylesheets, because both halves of core's swap
 	 * (this `rtl` extra AND `WP_Styles::do_item()`'s own
 	 * `'rtl' === $this->text_direction` gate) hang off that same `is_rtl()`.
@@ -3342,8 +3342,8 @@ final class Helper {
 	 * The LTR fast path is no longer free, so do not describe it as such: the
 	 * `$force` probe is one `Helper::is_rtl()`, i.e. a memoised current-language
 	 * lookup with no query behind it. Measured on real front-end requests to
-	 * this plugin's own test site it is the FIRST such lookup of the request —
-	 * nothing warms the memo earlier — and the whole hook costs ~0.02 ms and
+	 * this plugin's own test site it is the FIRST such lookup of the request -
+	 * nothing warms the memo earlier - and the whole hook costs ~0.02 ms and
 	 * zero additional queries. Repeat calls in the same request are ~0.00006 ms.
 	 *
 	 * @return void
@@ -3356,7 +3356,7 @@ final class Helper {
 			// Front end only. In wp-admin the interface direction is core's
 			// call: determine_locale() prefers the *user's* profile locale,
 			// which is routinely LTR on a site whose default content language
-			// is RTL — flipping the plugin's admin CSS there would be wrong.
+			// is RTL - flipping the plugin's admin CSS there would be wrong.
 			// On the front end the current language IS the document language,
 			// and the plugin is already the thing asserting its direction.
 			$force = self::get_instance()->is_rtl();
@@ -3375,7 +3375,7 @@ final class Helper {
 		// defeat the match. On CDN or domain-mapped setups where the host itself
 		// differs there is no reliable URL→path mapping, so the match fails and
 		// we skip: the LTR stylesheet still loads, only the RTL swap is skipped
-		// — a safe, cosmetic-only degradation.
+		// - a safe, cosmetic-only degradation.
 		$content_rel = (string) preg_replace( '#^https?:#', '', content_url() );
 
 		// Our own stylesheets are all registered from PERFLOCALE_URL, so map
@@ -3402,7 +3402,7 @@ final class Helper {
 
 			$src_rel = (string) preg_replace( '#^https?:#', '', $src );
 
-			// Only claim the twin when it actually shipped — a 'replace' entry
+			// Only claim the twin when it actually shipped - a 'replace' entry
 			// without the file 404s the whole stylesheet on RTL.
 			if ( $plugin_rel !== '' && str_starts_with( $src_rel, $plugin_rel ) ) {
 				$path = PERFLOCALE_DIR . substr( $src_rel, strlen( $plugin_rel ) );
@@ -3422,7 +3422,7 @@ final class Helper {
 			}
 
 			// core's swap is off for this request, so the `rtl` extra alone
-			// would print nothing different. Rewrite the source instead —
+			// would print nothing different. Rewrite the source instead -
 			// scoped to `perflocale*` handles, so core's and the theme's
 			// stylesheets keep whatever direction WordPress chose for them.
 			// The query string is carried over verbatim: it is where the
@@ -3432,13 +3432,14 @@ final class Helper {
 	}
 
 	/**
-	 * Whether the current user may EDIT a translatable object.
+	 * Whether the current user, or the user named by $user_id, may EDIT a
+	 * translatable object.
 	 *
 	 * ⭐ WHY THIS IS NOT JUST `current_user_can( 'edit_post', $id )`.
 	 *
 	 * A post type registered with `map_meta_cap => false` does not get core's meta-cap
 	 * mapping. `current_user_can( 'edit_post', $id )` on such a type is mapped straight
-	 * to the type's PRIMITIVE capability — `edit_{$capability_type}` — and if the host
+	 * to the type's PRIMITIVE capability - `edit_{$capability_type}` - and if the host
 	 * plugin never grants that capability to any role, the answer is `false` for
 	 * EVERYBODY, administrators included. It is not a permission failure; the question
 	 * simply has no answer in core's model, and only the host knows the real one.
@@ -3457,7 +3458,7 @@ final class Helper {
 	 *
 	 * ⚠️ SECURITY SHAPE. The filter is consulted, never trusted blindly, and the bundled
 	 * addons only ever answer for their OWN post type and only when core has already
-	 * said no — so they can widen for that type and can never revoke access core
+	 * said no - so they can widen for that type and can never revoke access core
 	 * granted. What a widened answer opens depends on the caller:
 	 *
 	 *   - the Translations REST routes and the admin Create action require the
@@ -3476,20 +3477,28 @@ final class Helper {
 	 * Deferring to the HOST's own authorization function is the correct answer here;
 	 * inventing capabilities inside another plugin's model is not.
 	 *
+	 * A user other than the current one (the user whose rights gate a
+	 * scheduled post that WordPress publishes without a person, see
+	 * ContentSync::sync_siblings()) is answered by core alone,
+	 * `user_can( $user_id, 'edit_post', $id )`: the
+	 * `perflocale/object/user_can` listeners answer with the host's own check
+	 * of the current user, so they are not asked about anyone else.
+	 *
 	 * @since 1.0.5
 	 *
-	 * @param int $post_id Post ID.
+	 * @param int      $post_id Post ID.
+	 * @param int|null $user_id User asked about; null for the current user.
 	 * @return bool
 	 */
-	public static function user_can_edit_object( int $post_id ): bool {
-		return self::object_permission( 'edit', 'edit_post', $post_id );
+	public static function user_can_edit_object( int $post_id, ?int $user_id = null ): bool {
+		return self::object_permission( 'edit', 'edit_post', $post_id, $user_id );
 	}
 
 	/**
 	 * Whether the current user may DELETE a translatable object.
 	 *
-	 * Same reasoning as {@see self::user_can_edit_object()} — `delete_post` on a
-	 * `map_meta_cap => false` type maps to a primitive nobody holds — so removing a
+	 * Same reasoning as {@see self::user_can_edit_object()} - `delete_post` on a
+	 * `map_meta_cap => false` type maps to a primitive nobody holds - so removing a
 	 * translation was refused for everyone on those types too.
 	 *
 	 * @since 1.0.5
@@ -3499,6 +3508,24 @@ final class Helper {
 	 */
 	public static function user_can_delete_object( int $post_id ): bool {
 		return self::object_permission( 'delete', 'delete_post', $post_id );
+	}
+
+	/**
+	 * Whether the current user may see a translatable object: read it or edit it.
+	 *
+	 * A translation map ({@see \PerfLocale\Api\TranslationsController::get_translations()},
+	 * the get-translations ability) shows a sibling's id and status only to a
+	 * user who passes this. Either half is enough, because in core neither
+	 * `edit_post` nor `read_post` implies the other and a user who may open
+	 * the post in the editor sees it there. Both go through the host seam,
+	 * as in {@see self::user_can_copy_translation_source()}.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function user_can_view_object( int $post_id ): bool {
+		return self::object_permission( 'read', 'read_post', $post_id )
+			|| self::object_permission( 'edit', 'edit_post', $post_id );
 	}
 
 	/**
@@ -3564,7 +3591,7 @@ final class Helper {
 	 * ⚠️ PUBLISH transitions are deliberately NOT routed through here, but TRASH is. The
 	 * asymmetry is not an oversight:
 	 *
-	 *   - Trash is a deletion, and `update_translation()` says so in its own comment —
+	 *   - Trash is a deletion, and `update_translation()` says so in its own comment -
 	 *     it gates `status=trash` on the same check `delete_translation()` uses "so the
 	 *     two routes cannot disagree about who may remove content". Routing one and not
 	 *     the other would break exactly that invariant.
@@ -3574,12 +3601,19 @@ final class Helper {
 	 *     directly and never consults `post_status`. Widening a publish path for
 	 *     behaviour nobody can reach is surface for nothing.
 	 *
-	 * @param string $action     Semantic action: 'edit', 'delete', 'read' or 'create'.
-	 * @param string $capability Core capability checked by default.
-	 * @param int    $post_id    Post ID.
+	 * @param string   $action     Semantic action: 'edit', 'delete', 'read' or 'create'.
+	 * @param string   $capability Core capability checked by default.
+	 * @param int      $post_id    Post ID.
+	 * @param int|null $user_id    User asked about; null for the current user. Another
+	 *                             user gets core's answer only (user_can()), without the
+	 *                             filter, whose listeners check the current user.
 	 * @return bool
 	 */
-	private static function object_permission( string $action, string $capability, int $post_id ): bool {
+	private static function object_permission( string $action, string $capability, int $post_id, ?int $user_id = null ): bool {
+		if ( null !== $user_id && get_current_user_id() !== $user_id ) {
+			return user_can( $user_id, $capability, $post_id );
+		}
+
 		$can = current_user_can( $capability, $post_id );
 
 		// Resolved once, and only to give the filter something to switch on. A listener
@@ -3594,7 +3628,7 @@ final class Helper {
 		 * Filter whether the current user may act on one translatable object.
 		 *
 		 * For a post type whose host registered `map_meta_cap => false` without adding a
-		 * `map_meta_cap` filter, core's answer is meaningless — see
+		 * `map_meta_cap` filter, core's answer is meaningless - see
 		 * {@see \PerfLocale\Helper::user_can_edit_object()}. A listener should answer
 		 * with the HOST's own authorization function rather than with a capability name,
 		 * and should return `$can` untouched for every type it does not own.
@@ -3614,7 +3648,9 @@ final class Helper {
 		 * would be copied from ({@see \PerfLocale\Helper::user_can_copy_translation_source()}).
 		 * A listener that treats every action other than 'delete' as 'edit' answers it
 		 * with its edit rule, which never grants more than the 'edit' half already
-		 * requires.
+		 * requires. 'read', then 'edit', is also asked about each sibling a
+		 * translation map lists ({@see \PerfLocale\Helper::user_can_view_object()}):
+		 * a sibling that passes neither is listed without its id and status.
 		 *
 		 * 'create' is asked about that same copy source, when a translation would be
 		 * created (and by the Translations panel about the post it lists), and means

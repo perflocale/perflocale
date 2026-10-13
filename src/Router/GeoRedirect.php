@@ -75,7 +75,7 @@ final class GeoRedirect {
 	 * CF-Connecting-IP is only trustworthy when the immediate peer really is
 	 * Cloudflare: a generic reverse proxy forwards a client-sent header of that
 	 * name verbatim, so REMOTE_ADDR is checked against this list first. A
-	 * stale list fails SAFE — CF-Connecting-IP is simply ignored and
+	 * stale list fails SAFE - CF-Connecting-IP is simply ignored and
 	 * detection falls back to X-Forwarded-For / REMOTE_ADDR.
 	 *
 	 * @var array<int, string>
@@ -127,7 +127,7 @@ final class GeoRedirect {
 		$this->cache    = $cache;
 
 		// Preserve the geo-specific breaker thresholds (3 fails, 15min
-		// cooldown — more conservative than the shared default of 5/5min
+		// cooldown - more conservative than the shared default of 5/5min
 		// because a single missed country lookup costs the visitor a
 		// wrong-language landing). Registered once per request via the
 		// static flag; subsequent GeoRedirect constructions are no-ops.
@@ -140,7 +140,7 @@ final class GeoRedirect {
 	 * migration to the shared {@see PerfLocale\Concurrency\Breaker}
 	 * primitive.
 	 *
-	 * Idempotent — a process-wide static flag guards against re-adding
+	 * Idempotent - a process-wide static flag guards against re-adding
 	 * the filters when multiple GeoRedirect instances are constructed
 	 * in the same request.
 	 *
@@ -252,7 +252,7 @@ final class GeoRedirect {
 
 		// Pages the admin excluded from language routing must not be
 		// geo-redirected either (single-language campaign landing pages).
-		// URL-derived — stays above nocache_headers() so excluded pages
+		// URL-derived - stays above nocache_headers() so excluded pages
 		// keep full-page cacheability, and above the geo lookup so no IP
 		// is ever sent to the provider for an excluded page.
 		if ( $this->router->is_excluded_request_path() ) {
@@ -265,7 +265,7 @@ final class GeoRedirect {
 		// (a bot, a cookied visitor, or a same-country visitor primes it),
 		// PHP never runs for later visitors and the geo redirect is
 		// silently dead. This must fire BEFORE the visitor-specific
-		// declines below — only URL-derived conditions above it. Enabling
+		// declines below - only URL-derived conditions above it. Enabling
 		// geo redirect therefore trades cacheability of default-language
 		// entry pages for a redirect that actually fires; operators who
 		// need both should deploy the edge worker (assets/js/edge-helper.js).
@@ -416,7 +416,7 @@ final class GeoRedirect {
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
 		// This 302 is a per-visitor language decision (geo/cookie-driven) on a
-		// shared URL — mark it uncacheable so an edge/server cache that stores
+		// shared URL - mark it uncacheable so an edge/server cache that stores
 		// 3xx (Varnish, nginx fastcgi_cache) can't pin one visitor's redirect
 		// onto everyone. Plugin page caches already skip it via the Set-Cookie
 		// above; this covers caches that ignore Set-Cookie on redirects.
@@ -468,7 +468,7 @@ final class GeoRedirect {
 		// Cache-key derivation is privacy-load-bearing: a bare md5(ip) is
 		// reversible over the 4-billion-address IPv4 space, so persisting it
 		// (options table / Redis, 24h) stores personal data. Anonymize the
-		// host bits first (core's /24 / v6-prefix zeroing — country lookups
+		// host bits first (core's /24 / v6-prefix zeroing - country lookups
 		// are stable at that granularity) and HMAC with a site salt so the
 		// stored key can't be dictionary-reversed offline. Bonus: one entry
 		// now serves the whole /24, cutting provider lookups.
@@ -477,11 +477,11 @@ final class GeoRedirect {
 		$cache     = $this->cache();
 
 		// 3-layer cache lookup via CacheManager. If the cache container
-		// isn't available (very rare — only on early-boot edge paths) we
+		// isn't available (very rare - only on early-boot edge paths) we
 		// fall through and query the provider uncached.
 		if ( $cache instanceof CacheManager ) {
 			// Read-only: only POSITIVE results are ever written (see set() below),
-			// so any non-empty hit is a real country code — no sentinel needed.
+			// so any non-empty hit is a real country code - no sentinel needed.
 			// get_cached() (not get()) means a MISS writes nothing, so unseen
 			// IPs never add negative-result rows.
 			$cached = $cache->get_cached( $cache_key, 'perflocale_geo_lookup' );
@@ -669,18 +669,18 @@ final class GeoRedirect {
 	 * Build the country-to-language mapping.
 	 *
 	 * Two layers, in order:
-	 *   1. Saved `geo_country_map` setting — explicit per-language ISO
+	 *   1. Saved `geo_country_map` setting - explicit per-language ISO
 	 *      country codes. Filtered server-side: the default language is
 	 *      dropped (an explicit default mapping over-redirects), and
 	 *      non-ISO entries are dropped (defends against legacy emoji
 	 *      saves from before this hardening pass).
-	 *   2. Locale-derived fallback — for languages NOT covered by the
+	 *   2. Locale-derived fallback - for languages NOT covered by the
 	 *      saved map AND whose `locale` carries an ISO country part
 	 *      (`en_US` → `US`, `de_DE` → `DE`). The default language is
 	 *      excluded here too.
 	 *
 	 * Generic-locale languages (e.g. `ar` with no `_XX` suffix) are
-	 * intentionally not auto-derived — the admin must configure them
+	 * intentionally not auto-derived - the admin must configure them
 	 * explicitly because there's no single right answer (Arabic spans
 	 * SA/EG/AE/JO/MA/DZ/etc.).
 	 *
@@ -744,7 +744,7 @@ final class GeoRedirect {
 			$parts = explode( '_', (string) ( $lang->locale ?? '' ) );
 
 			if ( ! isset( $parts[1] ) || ! preg_match( '/^[A-Za-z]{2}$/', $parts[1] ) ) {
-				continue; // generic locale like `ar` — admin must configure explicitly.
+				continue; // generic locale like `ar` - admin must configure explicitly.
 			}
 
 			$code = strtoupper( substr( $parts[1], 0, 2 ) );
@@ -768,8 +768,8 @@ final class GeoRedirect {
 	 */
 	private function get_visitor_ip(): string {
 		// Proxy headers are CLIENT-CONTROLLED on a default WordPress install
-		// — X-Forwarded-For / CF-Connecting-IP / X-Real-IP arrive as the
-		// client sent them — so they are not trusted by default.
+		// - X-Forwarded-For / CF-Connecting-IP / X-Real-IP arrive as the
+		// client sent them - so they are not trusted by default.
 		//
 		// Site operators who run behind a real reverse proxy (Cloudflare,
 		// Nginx with proxy_set_header, AWS ALB) must opt in by setting
@@ -792,7 +792,7 @@ final class GeoRedirect {
 			return $remote_addr;
 		}
 
-		// Cloudflare — CF-Connecting-IP is a single, chain-less value that only
+		// Cloudflare - CF-Connecting-IP is a single, chain-less value that only
 		// Cloudflare sets authoritatively (it strips any client-sent copy). A
 		// generic nginx/ALB forwards a client-sent header of the same name
 		// verbatim, so honour it ONLY when the immediate peer is a published
@@ -805,7 +805,7 @@ final class GeoRedirect {
 			}
 		}
 
-		// X-Forwarded-For — a well-behaved proxy APPENDS the address it saw, so
+		// X-Forwarded-For - a well-behaved proxy APPENDS the address it saw, so
 		// the real client is the RIGHTMOST entry that is not itself one of our
 		// trusted proxies. Walking right-to-left and skipping trusted hops
 		// discards any addresses the client prepended (they sit to the left of
@@ -830,7 +830,7 @@ final class GeoRedirect {
 			}
 		}
 
-		// X-Real-IP — single value set by the trusted proxy itself (nginx
+		// X-Real-IP - single value set by the trusted proxy itself (nginx
 		// proxy_set_header). Trust it only as a direct value from that proxy,
 		// validated, after the forgery-resistant X-Forwarded-For walk.
 		if ( ! empty( $_SERVER['HTTP_X_REAL_IP'] ) ) {
@@ -894,7 +894,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Whether an IP falls inside Cloudflare's published edge ranges — used to
+	 * Whether an IP falls inside Cloudflare's published edge ranges - used to
 	 * authenticate that a CF-Connecting-IP header genuinely came from
 	 * Cloudflare (REMOTE_ADDR is a CF edge) rather than a client forgery
 	 * forwarded by a generic proxy.
@@ -977,7 +977,7 @@ final class GeoRedirect {
 	/**
 	 * Get the available provider definitions.
 	 *
-	 * No providers ship with the plugin — the list is whatever the site
+	 * No providers ship with the plugin - the list is whatever the site
 	 * registers through `perflocale/geo/providers`. The same filter is
 	 * applied on the lookup path, so the admin picker and the runtime
 	 * resolver always agree on which providers exist; without it a

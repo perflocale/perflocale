@@ -1,0 +1,3 @@
+<?php
+defined( 'ABSPATH' ) || exit;
+return ['domain'=>'perflocale','plural-forms'=>'nplurals=6; plural=(n == 0) ? 0 : ((n == 1) ? 1 : ((n == 2) ? 2 : ((n % 100 >= 3 && n % 100 <= 10) ? 3 : ((n % 100 >= 11 && n % 100 <= 99) ? 4 : 5))));','language'=>'ar','project-id-version'=>'PerfLocale 1.0.7','pot-creation-date'=>'2026-10-05T14:12:36+00:00','po-revision-date'=>'2026-10-05T14:23:13+00:00','messages'=>['Language switcher'=>'مبدّل اللغة','No languages configured.'=>'لم يتم إعداد أي لغة.','Choose language, currently %s'=>'اختر اللغة، اللغة الحالية: %s']];

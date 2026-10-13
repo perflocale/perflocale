@@ -2,7 +2,7 @@
  * Drag-and-drop reorder for the Languages admin list.
  *
  * Vanilla JS, no dependencies. Uses native HTML5 drag-and-drop API with
- * the row-level handle as the only `draggable` element — clicking the row
+ * the row-level handle as the only `draggable` element - clicking the row
  * itself (e.g. the language title link) keeps working. On drop:
  *   1. Optimistically reflow the DOM to show the new order immediately.
  *   2. POST the ordered ID array to the REST `/languages/reorder` endpoint.
@@ -10,7 +10,7 @@
  *   4. On error, revert the DOM to its pre-drop snapshot and surface the
  *      failure inline (no toast spam, no stale state).
  *
- * Drag-and-drop is a pointer-only gesture — it does not exist on a
+ * Drag-and-drop is a pointer-only gesture - it does not exist on a
  * touchscreen, and the handle is invisible until row hover, which a phone
  * also lacks. Small screens therefore get explicit up/down buttons
  * (`[data-perflocale-move]`, shown by CSS below 782px). They are not a
@@ -37,7 +37,7 @@
 		var i18n     = settings.i18n || {};
 
 		// The REST root always arrives from rest_url() via wp_localize_script.
-		// Never assume /wp-json/ — plain permalinks serve ?rest_route= and the
+		// Never assume /wp-json/ - plain permalinks serve ?rest_route= and the
 		// prefix is filterable. Without the payload, leave the list static.
 		if ( ! settings.restUrl ) {
 			return;
@@ -49,7 +49,7 @@
 		var dragging = null;
 		var snapshot = null; // pre-drop ID order for revert-on-error.
 		var saving = false;   // in-flight guard: one reorder POST at a time.
-		var pendingFocus = null; // { row, dir } — focus to restore after a save.
+		var pendingFocus = null; // { row, dir } - focus to restore after a save.
 		var statusTimer = null;
 
 		function setStatus( text, cls ) {
@@ -87,7 +87,7 @@
 		}
 
 		// The buttons are the only reorder affordance on touch, so a dead one
-		// is a dead end — disable what cannot act instead of ignoring the tap.
+		// is a dead end - disable what cannot act instead of ignoring the tap.
 		// `saving` is included because persist() serializes: a tap accepted
 		// mid-save would reflow the list without ever being written.
 		function refreshMoveButtons() {
@@ -111,7 +111,7 @@
 
 		// Focus has to survive the save. persist() disables every move button
 		// while the request is open, and a browser blurs a control the instant
-		// it is disabled — so the button the user just pressed drops focus to
+		// it is disabled - so the button the user just pressed drops focus to
 		// <body> and a keyboard or screen-reader user loses their place in the
 		// list entirely. Restoring focus in the click handler cannot work:
 		// moveRow() calls persist() before it returns, so by then every button
@@ -195,7 +195,7 @@
 				} );
 
 				// Keyboard operability: the handle is a focusable button but
-				// HTML5 drag-and-drop has no keyboard path — without this the
+				// HTML5 drag-and-drop has no keyboard path - without this the
 				// reorder feature simply doesn't exist for keyboard users.
 				// Arrow up/down moves the row one slot and persists; the
 				// aria-live status region announces the result.
@@ -211,7 +211,7 @@
 				} );
 
 				// Touch/click path. Same move, same persistence. Focus is not
-				// restored here on purpose — moveRow() calls persist(), which
+				// restored here on purpose - moveRow() calls persist(), which
 				// disables every button before this handler resumes, so any
 				// focus() call at this point would target a disabled control and
 				// be discarded. applyPendingFocus() does it when the save ends.
@@ -273,7 +273,7 @@
 					if ( ! dragging || dragging === row ) return;
 					ev.preventDefault();
 
-					// Same in-flight guard as dragstart — never mutate the
+					// Same in-flight guard as dragstart - never mutate the
 					// DOM into an order that won't be persisted.
 					if ( saving ) {
 						clearDropMarkers();
@@ -354,7 +354,7 @@
 				.finally( function () {
 					saving = false;
 					// Runs after the catch block's revert, so this reflects
-					// whatever order is actually on screen now — and it is what
+					// whatever order is actually on screen now - and it is what
 					// hands focus back, so it must come before the intent is
 					// dropped.
 					refreshMoveButtons();

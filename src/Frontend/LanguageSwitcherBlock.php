@@ -23,7 +23,7 @@ final class LanguageSwitcherBlock {
 
 	/**
 	 * Per-request memo of the `switcher_auto_insert` setting (null until
-	 * first read). Cleared on switch_blog — the setting is per-blog.
+	 * first read). Cleared on switch_blog - the setting is per-blog.
 	 *
 	 * @var bool|null
 	 */
@@ -54,7 +54,7 @@ final class LanguageSwitcherBlock {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// `register_block_type_args` is intentionally NOT wired here — that
+		// `register_block_type_args` is intentionally NOT wired here - that
 		// filter fires for EVERY block type registered after init (100-250
 		// invocations on a typical site), and our callback short-circuits on
 		// 99% of them. register_block() attaches+detaches the filter only
@@ -104,7 +104,7 @@ final class LanguageSwitcherBlock {
 		 * Filter the default attributes applied to the auto-inserted switcher.
 		 *
 		 * Use this to force a specific display mode, font size, layout, etc.
-		 * for the auto-inserted block — typically you want compact + dropdown
+		 * for the auto-inserted block - typically you want compact + dropdown
 		 * inside an FSE header, but a site with a wide hero header might want
 		 * the full inline list instead.
 		 *
@@ -171,7 +171,7 @@ final class LanguageSwitcherBlock {
 		}
 
 		// This filter fires for EVERY (block, position) pair the template
-		// engine walks — thousands of invocations on block-heavy screens
+		// engine walks - thousands of invocations on block-heavy screens
 		// (4,000+ on a wp-admin pages list). The enabled flag is request-
 		// constant and the anchor-override decision is constant per
 		// (anchor, position) pair, so both are memoised; per-call work
@@ -309,8 +309,8 @@ final class LanguageSwitcherBlock {
 		// Scope the register_block_type_args filter to just our own
 		// registration: attach immediately before, detach immediately after.
 		// WP's block-registry calls our filter only during the call below,
-		// so any other block-type registration in the request — WooCommerce,
-		// FSE patterns, third-party plugins — runs without paying the
+		// so any other block-type registration in the request - WooCommerce,
+		// FSE patterns, third-party plugins - runs without paying the
 		// callback's cost (~150-400 µs/request total).
 		add_filter( 'register_block_type_args', [ $this, 'apply_setting_defaults' ], 10, 2 );
 
@@ -365,7 +365,7 @@ final class LanguageSwitcherBlock {
 		}
 
 		// The built-in arrow is a hardcoded, input-free SVG; return it as-is so
-		// its case-sensitive `viewBox` survives — wp_kses (via kses_fragment)
+		// its case-sensitive `viewBox` survives - wp_kses (via kses_fragment)
 		// lowercases attribute names, and browsers ignore a lowercased
 		// `viewbox` on <svg>, leaving the chevron unable to scale with the
 		// trigger font size. Only third-party-FILTERED markup is sanitised.
@@ -597,7 +597,7 @@ final class LanguageSwitcherBlock {
 			 *
 			 * Applied inside the populate block (and the filtered result is
 			 * memoised) so a second switcher on the same page doesn't re-run
-			 * the filter on already-filtered data — non-idempotent callbacks
+			 * the filter on already-filtered data - non-idempotent callbacks
 			 * would otherwise compound across renders.
 			 *
 			 * @hook perflocale/switcher/languages
@@ -736,7 +736,7 @@ final class LanguageSwitcherBlock {
 			// An untranslated language shown as a non-link placeholder is NOT
 			// the current language: it must not wear the --current style, and it
 			// carries aria-disabled so assistive tech announces it as an inert
-			// option — mirroring the dropdown and nav-menu placeholder paths.
+			// option - mirroring the dropdown and nav-menu placeholder paths.
 			$is_placeholder = ( ! $has_translation && $untranslated_link === 'no_link' );
 
 			if ( $is_current ) {
@@ -888,7 +888,7 @@ final class LanguageSwitcherBlock {
 
 		// Pre-count the options the loop below would actually render (same
 		// skip rules). On an untranslated page with hideCurrent + untranslated
-		// languages hidden, that count is ZERO — rendering a trigger whose
+		// languages hidden, that count is ZERO - rendering a trigger whose
 		// panel opens empty is a dead control, so suppress the whole block.
 		$renderable = 0;
 

@@ -98,7 +98,7 @@ final class TermListColumns {
 		add_action( 'quick_edit_custom_box', [ $this, 'render_quick_edit_field' ], 10, 3 );
 		add_action( 'edited_term', [ $this, 'save_quick_edit_language' ], 15, 3 );
 
-		// Inline JS attached during enqueue phase (NOT admin_footer-* — that
+		// Inline JS attached during enqueue phase (NOT admin_footer-* - that
 		// fires after wp_print_footer_scripts has already emitted the
 		// `perflocale-admin` script payload, so wp_add_inline_script() calls
 		// at that point are silently dropped).
@@ -167,7 +167,7 @@ final class TermListColumns {
 					// decode, so the query string the browser navigated to
 					// became '...category&#038;post_type=post' and the
 					// language parameter was parsed into the fragment and
-					// dropped — the filter silently did nothing. The
+					// dropped - the filter silently did nothing. The
 					// wp_json_encode() call below (JSON_HEX_* flags) is the
 					// context-correct escaper for a JS string literal.
 					'filterUrl' => $filter_url,
@@ -337,7 +337,7 @@ final class TermListColumns {
 			$lang_slug = $this->preloaded_languages[ $term_id ] ?? null;
 
 			if ( $lang_slug === null ) {
-				$badge_html = '<span class="perflocale-badge perflocale-badge--none" title="' . esc_attr__( 'No language set', 'perflocale' ) . '">&mdash;</span>';
+				$badge_html = '<span class="perflocale-badge perflocale-badge--none" title="' . esc_attr__( 'No language set', 'perflocale' ) . '">-</span>';
 			} else {
 				$found = false;
 				foreach ( $this->get_languages() as $lang ) {
@@ -351,7 +351,7 @@ final class TermListColumns {
 					}
 				}
 				if ( ! $found ) {
-					$badge_html = '<span class="perflocale-badge perflocale-badge--none">&mdash;</span>';
+					$badge_html = '<span class="perflocale-badge perflocale-badge--none">-</span>';
 				}
 			}
 		} else {
@@ -359,7 +359,7 @@ final class TermListColumns {
 			$term_lang = $this->get_manager()->detect_term_language( $term_id );
 
 			if ( ! $term_lang ) {
-				$badge_html = '<span class="perflocale-badge perflocale-badge--none" title="' . esc_attr__( 'No language set', 'perflocale' ) . '">&mdash;</span>';
+				$badge_html = '<span class="perflocale-badge perflocale-badge--none" title="' . esc_attr__( 'No language set', 'perflocale' ) . '">-</span>';
 			} else {
 				$flag         = \PerfLocale\Helper::get_flag_emoji( $term_lang );
 				$flag         = $flag !== '' ? $flag . ' ' : '';
@@ -385,7 +385,7 @@ final class TermListColumns {
 	 * this term (excluding the term's own current language).
 	 *
 	 * Used by the Quick Edit JS to disable conflicting `<option>`s in the
-	 * inline language picker — picking a language that another sibling
+	 * inline language picker - picking a language that another sibling
 	 * already owns would produce a 409 in `set_term_language()`.
 	 *
 	 * @param int    $term_id      Current term ID.
@@ -393,7 +393,7 @@ final class TermListColumns {
 	 * @return array<int, string>
 	 */
 	private function get_taken_languages_for_term( int $term_id, string $current_slug ): array {
-		// Reuse the preloaded translations payload when available — the
+		// Reuse the preloaded translations payload when available - the
 		// translations array is keyed by lang_slug → translated_term_id, so
 		// every key is a language slug already used by a sibling.
 		if ( $this->preloaded_translations !== null ) {
@@ -553,7 +553,7 @@ final class TermListColumns {
 		}
 
 		// Map each page term to its siblings via its OWN group id (already in
-		// the rows) — O(terms) instead of the previous O(terms × groups ×
+		// the rows) - O(terms) instead of the previous O(terms × groups ×
 		// members) in_array() scan. Only page terms that appeared in the rows
 		// have a group; the rest simply have no translations to preload.
 		foreach ( $term_ids as $page_tid ) {
@@ -627,7 +627,7 @@ final class TermListColumns {
 			return;
 		}
 
-		// Disambiguate term-flavour calls from post-flavour calls — both fire
+		// Disambiguate term-flavour calls from post-flavour calls - both fire
 		// the same action, but only the term variant carries 'edit-tags'.
 		if ( $screen_id !== 'edit-tags' ) {
 			return;
@@ -663,7 +663,7 @@ final class TermListColumns {
 	 * Save the language picked in Quick Edit.
 	 *
 	 * `edited_term` fires after `wp_update_term()`, which `wp_ajax_inline_save_tax`
-	 * calls. The language change is decoupled from the term name/slug update —
+	 * calls. The language change is decoupled from the term name/slug update -
 	 * we only mutate translation_links rows, never the term itself.
 	 *
 	 * @param int    $term_id  Term ID.
@@ -706,7 +706,7 @@ final class TermListColumns {
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
 
 		if ( ! $this->get_manager()->set_term_language( $term_id, $language ) ) {
-			// Quick Edit saves over AJAX — no admin_notices surface exists.
+			// Quick Edit saves over AJAX - no admin_notices surface exists.
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; quick-edit has no notice surface.
 			error_log( sprintf( 'PerfLocale: quick-edit language save failed for term %d (language "%s").', $term_id, $language ) );
 		}
@@ -716,7 +716,7 @@ final class TermListColumns {
 	 * Inline JS that pre-populates the term Quick Edit language `<select>`
 	 * from row data each time a row's Quick Edit is opened.
 	 *
-	 * Mirrors {@see PostListColumns::quick_edit_js()} — same state-shape,
+	 * Mirrors {@see PostListColumns::quick_edit_js()} - same state-shape,
 	 * same `inUse` decoration, but reads from the term row IDs (`tag-{id}`
 	 * / `edit-{id}`) and hooks core's `inlineEditTax.edit` instead of
 	 * `inlineEditPost.edit`.

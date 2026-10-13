@@ -134,6 +134,11 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'rwmb_after_save_field', [ $this, 'record_clear_on_save' ], 10, 5 );
 		add_action( 'rwmb_flush_data', [ $this, 'record_clear_on_set' ], 10, 2 );
 		add_action( 'rwmb_before_save_post', [ \PerfLocale\Translation\ContentSync::class, 'open_person_edit' ], 10, 1 );
+
+		// That nonce check comes after core's post_updated on the Frontend
+		// Submission form, so the post's row as it was before the save is
+		// kept just before the form updates the post.
+		add_action( 'rwmb_frontend_before_save_post', [ $this, 'note_front_end_row' ], 10, 1 );
 		add_filter( 'rwmb_rest_value', [ $this, 'record_clear_on_rest' ], PHP_INT_MAX, 4 );
 
 		// The value of a password field is not copied into a new translation,
@@ -154,6 +159,22 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ self::class, 'reset_static_caches' ] );
 		}
+	}
+
+	/**
+	 * `rwmb_frontend_before_save_post`: the Frontend Submission form is about
+	 * to update the post it edits. Its row as it is now is the row before the
+	 * save, which a save that clears the post's stale mark compares the post
+	 * columns with (ContentSync::note_pre_save_row()). A form that creates a
+	 * post has no post yet and keeps nothing.
+	 *
+	 * @param mixed $form The form's post object (MBFS\Post), whose `post_id` is the post edited.
+	 * @return void
+	 */
+	public function note_front_end_row( mixed $form = null ): void {
+		$post_id = is_object( $form ) ? ( get_object_vars( $form )['post_id'] ?? 0 ) : 0;
+
+		\PerfLocale\Translation\ContentSync::note_pre_save_row( $post_id );
 	}
 
 	/**
@@ -381,7 +402,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 * Machine-translatable MetaBox keys: LEAF text/textarea/wysiwyg fields
 	 * only. Serialized text types (fieldset_text, text_list, key_value,
 	 * input_list) are whole-array blobs, url/email/oembed must not be
-	 * translated, and group fields store serialized sub-structures — all
+	 * translated, and group fields store serialized sub-structures - all
 	 * excluded. Gated by the mt_meta_custom_fields setting.
 	 *
 	 * @param array<int, string> $keys      Meta keys.
@@ -739,7 +760,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 * that unpublished post's title on a public page and link to a URL an
 	 * anonymous visitor cannot open. PerfLocale creates translations as drafts,
 	 * so that is the normal state of a half-finished translation, not an edge
-	 * case. Returning null keeps the published source in place — the same rule
+	 * case. Returning null keeps the published source in place - the same rule
 	 * the ACF addon applies to its relationship / post-object fields and the
 	 * WooCommerce addon to cross-sell and upsell IDs.
 	 *
@@ -773,7 +794,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 * Translate post IDs to their current-language equivalents.
 	 *
 	 * Handles single IDs, arrays, comma-separated strings, and WP_Post objects.
-	 * A sibling the visitor may not see is skipped — see
+	 * A sibling the visitor may not see is skipped - see
 	 * {@see self::public_translation_id()}.
 	 *
 	 * @param mixed  $value Post ID(s) in various formats.

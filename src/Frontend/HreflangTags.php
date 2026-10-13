@@ -91,7 +91,7 @@ final class HreflangTags {
 		// hreflang toggle: in subdomain/domain URL modes a fallback render
 		// (default-language content served on a language host because no
 		// translation exists) would otherwise be SELF-canonical on every
-		// language host — cross-host duplicate content. Registered before the
+		// language host - cross-host duplicate content. Registered before the
 		// hreflang gate so disabling hreflang output cannot disable it.
 		add_filter( 'get_canonical_url', [ $this, 'filter_fallback_canonical' ], 10, 2 );
 
@@ -106,7 +106,7 @@ final class HreflangTags {
 		}
 
 		if ( $placement === 'http_header' || $placement === 'both' ) {
-			// Explicit priority 1 — runs early so PerfLocale's Link headers
+			// Explicit priority 1 - runs early so PerfLocale's Link headers
 			// land before any SEO plugin's. Sibling send_headers hooks on this
 			// plugin set explicit priorities too (e.g. the cache-tag emitter and
 			// Content-Language header) so the default here was the odd one out.
@@ -121,7 +121,7 @@ final class HreflangTags {
 	 * Fires on core's `get_canonical_url`. When the queried post is rendered
 	 * in a language other than its own purely as fallback (no translation
 	 * exists in the current language), the canonical core computed inherits
-	 * the current request context — on a language host that means a
+	 * the current request context - on a language host that means a
 	 * self-canonical duplicate of the default-language URL. Converting the
 	 * canonical to the post's own language pins it: base host in
 	 * subdomain/domain modes, unprefixed (or correctly prefixed) path in
@@ -190,7 +190,7 @@ final class HreflangTags {
 	 * Pin an SEO plugin's canonical for a missing-translation fallback render.
 	 *
 	 * {@see filter_fallback_canonical()} only rides core's `get_canonical_url`,
-	 * and that filter never fires once an SEO plugin owns `rel=canonical` —
+	 * and that filter never fires once an SEO plugin owns `rel=canonical` -
 	 * Rank Math, Yoast, AIOSEO, SEOPress, The SEO Framework and Slim SEO all
 	 * remove core's `rel_canonical` and compute their own. Each addon therefore
 	 * re-registers the guard on its own plugin's canonical filter, so the
@@ -204,8 +204,8 @@ final class HreflangTags {
 	 * `_seopress_robots_canonical`, `_genesis_canonical_uri`,
 	 * `slim_seo[canonical]`), so an unconditional pin would rewrite a URL the
 	 * owner chose deliberately. Acting only when the incoming value is the
-	 * post's own permalink — the exact value core would have handed
-	 * filter_fallback_canonical() — leaves overrides, paginated sub-page URLs
+	 * post's own permalink - the exact value core would have handed
+	 * filter_fallback_canonical() - leaves overrides, paginated sub-page URLs
 	 * and plugin-specific rewrites untouched. Skipping the pin on those is the
 	 * safe direction: it restores the pre-SEO-plugin status quo, never worse.
 	 *
@@ -238,7 +238,7 @@ final class HreflangTags {
 		// Insensitive to both cosmetic differences the plugins introduce. They
 		// run their own user_trailingslashit() / rtrim() pass over the
 		// permalink, and SEOPress renders the tag as
-		// htmlspecialchars( urldecode( get_permalink() ) ) — so its addon
+		// htmlspecialchars( urldecode( get_permalink() ) ) - so its addon
 		// hands over a percent-DECODED URL while get_permalink() keeps a
 		// non-ASCII slug encoded, which without this would make the whole
 		// guard inert on every non-Latin-slug site. Neither difference means
@@ -251,7 +251,7 @@ final class HreflangTags {
 		// derive from get_permalink(). Rank Math builds it from home_url()
 		// (class-paper.php: `if ( is_front_page() ) { $canonical =
 		// user_trailingslashit( home_url() ); }`), and home_url() is
-		// language-mapped where get_permalink( page_on_front ) is not — so on
+		// language-mapped where get_permalink( page_on_front ) is not - so on
 		// /de/ the plugin offers `/de/` while the permalink is `/`, the
 		// comparison below mismatches, and the guard silently skips the single
 		// most duplicate-content-exposed URL on the site. In subdomain and
@@ -262,7 +262,7 @@ final class HreflangTags {
 		// Whether anything is actually rewritten is still
 		// filter_fallback_canonical()'s decision, and it refuses to pin when
 		// the front page has a translation in the current language or is
-		// itself current-language content — so an owner-set canonical, which
+		// itself current-language content - so an owner-set canonical, which
 		// matches neither candidate, is still returned untouched.
 		if ( is_front_page() && (int) $post->ID === (int) get_option( 'page_on_front' ) ) {
 			$defaults[] = home_url( '/' );
@@ -373,7 +373,7 @@ final class HreflangTags {
 	 * applies to core's own sitemap entries, for the SEO plugins that replace
 	 * core sitemaps wholesale. An unlinked object is default-language content
 	 * by definition, but every SEO plugin builds its `<loc>` from
-	 * get_permalink() / get_term_link() in the REQUEST context — and in
+	 * get_permalink() / get_term_link() in the REQUEST context - and in
 	 * subdomain/domain URL modes home_url() is host-mapped to the current
 	 * language, so each language host's sitemap advertises the same
 	 * untranslated object under its own host (cross-host duplicate content).
@@ -383,7 +383,7 @@ final class HreflangTags {
 	 * In path-based modes this is a no-op in practice but NOT by
 	 * construction: handed a prefixed URL it strips the prefix
 	 * (`/de/about/` → `/about/`). What makes it safe is the caller's guard,
-	 * not the URL mode — an object with no translation links already
+	 * not the URL mode - an object with no translation links already
 	 * resolves to the default language's URL shape, so there is no prefix
 	 * to strip. Only call this for such an object; if an unlinked object
 	 * could ever carry a prefixed permalink, this would start rewriting
@@ -432,7 +432,7 @@ final class HreflangTags {
 			return;
 		}
 
-		// Build a cache key covering singular, archive, home AND pagination —
+		// Build a cache key covering singular, archive, home AND pagination -
 		// archive/home recompute costs 3–8ms per page on multi-language sites,
 		// so they're cached too, not just singular.
 		$cache_key     = $this->build_cache_key();
@@ -496,7 +496,7 @@ final class HreflangTags {
 			// esc_url()/esc_attr() per attribute, we run wp_kses() at the
 			// point of output with a tight <link rel|hreflang|href>
 			// allowlist. The pass is idempotent on the well-formed tags we
-			// emit and costs ~50-200 µs on this wp_head callback — cheap
+			// emit and costs ~50-200 µs on this wp_head callback - cheap
 			// insurance that nothing but hreflang <link>s can ever reach the
 			// page head, regardless of how the cached value was produced.
 			echo wp_kses(
@@ -516,7 +516,7 @@ final class HreflangTags {
 	 * Whether this request is a non-HTML resource that must never emit
 	 * hreflang alternates.
 	 *
-	 * Core sitemaps render at template_redirect — AFTER send_headers — so at
+	 * Core sitemaps render at template_redirect - AFTER send_headers - so at
 	 * header time a `/wp-sitemap.xml` request still parses as is_home(), and
 	 * build_cache_key() would hand it the shared HOME bucket. get_hreflang_data()
 	 * would then persist the sitemap's own path-preserved URL as every language
@@ -539,17 +539,17 @@ final class HreflangTags {
 	 * Build a deterministic transient key for the current page context.
 	 *
 	 * Returns null for previews, for non-page resources (sitemaps, feeds,
-	 * embeds, robots, favicon — which would otherwise land in a real page's
+	 * embeds, robots, favicon - which would otherwise land in a real page's
 	 * bucket and poison it), and for any query shape not enumerated below,
 	 * where a key would be too variable to earn its cache entry.
 	 *
 	 * It deliberately does NOT bail on a logged-in view of unpublished
 	 * content: an editor opening a draft or private post DOES get a real
 	 * singular key and DOES fill the bucket. That is safe only because the
-	 * alternate set is user-independent by construction —
+	 * alternate set is user-independent by construction -
 	 * UrlConverter::get_translations_for_current_page() admits
 	 * a sibling only at `post_status === 'publish'`, with no capability check
-	 * anywhere in the path — so the editor stores exactly the bytes an
+	 * anywhere in the path - so the editor stores exactly the bytes an
 	 * anonymous visitor would have computed. And an anonymous request to that
 	 * same unpublished URL 404s, where output_hreflang() returns before it
 	 * ever reads the bucket.
@@ -561,8 +561,8 @@ final class HreflangTags {
 	 * @return string|null
 	 */
 	private function build_cache_key(): ?string {
-		// Previews only. The singular key below is (post id, language) — it
-		// carries no preview dimension — so without this bail a preview render
+		// Previews only. The singular key below is (post id, language) - it
+		// carries no preview dimension - so without this bail a preview render
 		// would write into the very bucket an ordinary visit reads. Skip
 		// caching there rather than reason about what WP substitutes into a
 		// previewed post. Note this is NOT a bail on "users who can see
@@ -707,7 +707,7 @@ final class HreflangTags {
 		// Blog-keyed per-request memo (shared between output_hreflang at wp_head
 		// and send_hreflang_headers at send_headers). Keyed by blog id so a
 		// mid-request switch_to_blog() can't hand blog B the alternates computed
-		// for blog A — the hreflang URLs, active-language set, and translated
+		// for blog A - the hreflang URLs, active-language set, and translated
 		// slugs are all per-blog. A function-local static keyed only on "not
 		// null" would leak across the switch (no reset can reach a function
 		// static); blog-keying self-corrects with no switch_blog hook needed.
@@ -725,7 +725,7 @@ final class HreflangTags {
 		// path recomputed the full alternate set (3-8ms on archives) on
 		// EVERY request. Same key/TTL/group as the HTML layer, so the two
 		// caches invalidate together; the tags cached here are the FILTERED
-		// tags — identical to what the HTML transient has always persisted.
+		// tags - identical to what the HTML transient has always persisted.
 		$cache_key     = $this->build_cache_key();
 		$cache_manager = $this->cache();
 
@@ -756,7 +756,7 @@ final class HreflangTags {
 	}
 
 	/**
-	 * The actual alternate-set computation — see get_hreflang_data() for
+	 * The actual alternate-set computation - see get_hreflang_data() for
 	 * the memo + persistent-cache layers in front of it.
 	 *
 	 * @return array<int, array{hreflang: string, href: string}>
@@ -788,12 +788,12 @@ final class HreflangTags {
 		}
 
 		// Per-post hreflang opt-out (Helper::SEO_EXCLUDE_META): on singular
-		// requests, drop flagged siblings from the alternate set — and when
+		// requests, drop flagged siblings from the alternate set - and when
 		// the CURRENT post is flagged, emit no hreflang block at all (a set
 		// referencing an excluded URL, or emitted FROM one, breaks hreflang
 		// reciprocity). The flagged-id set is empty on almost every site,
 		// so the common cost is one memoised set lookup. Term archives are
-		// out of scope — the flag is post meta.
+		// out of scope - the flag is post meta.
 		$excluded_slugs = [];
 
 		if ( is_singular() && Helper::seo_excluded_post_ids() !== [] ) {
@@ -831,14 +831,14 @@ final class HreflangTags {
 			$missing_action = (string) $this->settings->get( 'missing_translation_action', 'show_default' );
 			$fallbacks      = (array) $this->settings->get( 'language_fallbacks', [] );
 
-			// Hoist the current-request URL out of the per-language loop —
+			// Hoist the current-request URL out of the per-language loop -
 			// it's the same value every iteration.
 			//
 			// For singulars and term archives use the object's own canonical
 			// link, NOT the query-stripped $_SERVER reconstruction: under
 			// Plain permalinks the page identity lives in the query string
 			// (?p=42 / ?cat=5), which current_request_url() strips for cache-
-			// poisoning safety — the collapsed URL would make every fallback
+			// poisoning safety - the collapsed URL would make every fallback
 			// alternate point at the language HOMEPAGE. get_permalink()/
 			// get_term_link() are server-derived (same anti-poisoning
 			// property) and mode-aware; convert() swaps their lang param.
@@ -904,7 +904,7 @@ final class HreflangTags {
 			$current_slug = $this->router->get_current_slug();
 			// x-default must point at the DEFAULT-language version of this page.
 			// If that sibling isn't published (so it's absent from $urls), omit
-			// x-default rather than falling back to the current-language page —
+			// x-default rather than falling back to the current-language page -
 			// pointing it at, say, the German page would tell search engines the
 			// German URL is the universal/fallback target. The filter below can
 			// still supply an explicit URL (e.g. a language-picker landing page).
@@ -948,7 +948,7 @@ final class HreflangTags {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/seo/hreflang_tags returned %s — the filter contract is array-in / array-out. Falling back to the unfiltered tags.', 'perflocale' ),
+						__( 'A hook on perflocale/seo/hreflang_tags returned %s - the filter contract is array-in / array-out. Falling back to the unfiltered tags.', 'perflocale' ),
 						get_debug_type( $filtered )
 					)
 				),
@@ -1228,20 +1228,20 @@ final class HreflangTags {
 	 *
 	 * Used by the include-fallbacks mode to compute per-language variants
 	 * of the current URL. It returns the request path AS IS, language prefix
-	 * and all — swapping one language's prefix for another is
+	 * and all - swapping one language's prefix for another is
 	 * {@see UrlConverter::convert()}'s job, and convert() takes a fully
 	 * formed URL in some language, not a stripped one. The only thing removed
 	 * here is the query string (see below).
 	 *
 	 * Sanitizer choice: `esc_url_raw` (not `sanitize_text_field`) so
 	 * percent-encoded bytes in non-ASCII slugs (e.g. `/de/%C3%BCber-uns/`
-	 * for `über-uns`) survive into the per-language alternate URL —
+	 * for `über-uns`) survive into the per-language alternate URL -
 	 * `sanitize_text_field` would `preg_replace('/%[a-f0-9]{2}/i','',...)`
 	 * and corrupt the path.
 	 *
 	 * The query string is deliberately stripped before returning: the
 	 * cached hreflang payload is keyed only by (post_id|archive, language,
-	 * paged) — see {@see build_cache_key()}. Without the strip, the FIRST
+	 * paged) - see {@see build_cache_key()}. Without the strip, the FIRST
 	 * visitor's query string would be baked into the 12h-cached
 	 * `<link rel="alternate" href>` set served to EVERY subsequent visitor
 	 * of the same page, because the cache key and the payload would differ.
@@ -1270,7 +1270,7 @@ final class HreflangTags {
 
 		$authority = (string) $home['host'] . ( isset( $home['port'] ) ? ':' . (int) $home['port'] : '' );
 
-		// Drop query + fragment — cache key doesn't include them, so leaving
+		// Drop query + fragment - cache key doesn't include them, so leaving
 		// them in the URL would let the first request's query string poison
 		// the cached alternates for every subsequent visitor of this page.
 		$qpos = strpos( $uri, '?' );

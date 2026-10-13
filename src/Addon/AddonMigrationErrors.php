@@ -65,7 +65,7 @@ final class AddonMigrationErrors {
 	 * Serialize a read-modify-write on the error option under the concurrency
 	 * lock so two simultaneous record()/clear() calls (multi-addon activation,
 	 * overlapping scheduled migrations) can't lose each other's writes. Falls
-	 * back to an unlocked run if the lock is unavailable/contended — this is a
+	 * back to an unlocked run if the lock is unavailable/contended - this is a
 	 * best-effort error log, never durable system state.
 	 *
 	 * @param callable $mutate Returns the mutate result (any value, incl. null).
@@ -75,7 +75,31 @@ final class AddonMigrationErrors {
 		$run = static fn() => [ 'r' => $mutate() ];
 
 		if ( class_exists( '\\PerfLocale\\Concurrency\\Lock' ) ) {
-			$out = \PerfLocale\Concurrency\Lock::with( 'addon_migration_errors', 5, $run );
+			$out = \PerfLocale\Concurrency\Lock::with(
+				'addon_migration_errors',
+				5,
+				static function () use ( $run ): array {
+					// The lock leaves this request's caches as they are. The
+					// option is not autoloaded, so get_option() keeps the row
+					// it read under the option's own key: a read of that copy
+					// would miss a record another request wrote or cleared
+					// since, and the write would replace that change. The copy
+					// is dropped, so the read goes to the database.
+					wp_cache_delete( self::OPTION, 'options' );
+
+					// When `notoptions` lists the option, the callback's read
+					// would return that absence even after another request
+					// has created the row; dropping `notoptions` then sends
+					// the read to the database. Otherwise nothing is dropped.
+					$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+					if ( is_array( $notoptions ) && isset( $notoptions[ self::OPTION ] ) ) {
+						wp_cache_delete( 'notoptions', 'options' );
+					}
+
+					return $run();
+				}
+			);
 			if ( is_array( $out ) ) {
 				return $out['r'];
 			}
@@ -165,11 +189,11 @@ final class AddonMigrationErrors {
 	 * migration failures inline on the card so operators don't have to dig
 	 * through error_log to find out why an addon is quarantined.
 	 *
-	 * Records are stored in insertion order — newer overwrites the same
-	 * key — so "most recent" = highest-positioned record matching the
+	 * Records are stored in insertion order - newer overwrites the same
+	 * key - so "most recent" = highest-positioned record matching the
 	 * addon id.
 	 *
-	 * The returned shape is best-effort — records are validated as arrays
+	 * The returned shape is best-effort - records are validated as arrays
 	 * but individual keys are not asserted, since the persisted option
 	 * could have been written by an older plugin version with a different
 	 * schema. Callers should null-coalesce each key they read.

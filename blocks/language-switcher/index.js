@@ -74,7 +74,7 @@
 			// Trigger label format on dropdown switchers. `inherit` keeps
 			// trigger and options in sync (the common case). The other
 			// values let a header pill show "EN" while the dropdown list
-			// keeps full names — useful when nav-bar real estate is tight.
+			// keeps full names - useful when nav-bar real estate is tight.
 			var triggerFormatOptions = [
 				{ value: 'inherit', label: __( 'Match options format', 'perflocale' ) },
 				{ value: 'native',  label: __( 'Native (e.g. Deutsch)', 'perflocale' ) },
@@ -124,7 +124,7 @@
 						options: nameFormatOptions,
 						onChange: function ( v ) { set( { nameFormat: v } ); }
 					} ),
-					// Only meaningful in dropdown mode — inline / simple
+					// Only meaningful in dropdown mode - inline / simple
 					// modes don't have a separate trigger button, so the
 					// "trigger" format would be unused. Hidden in those
 					// modes to keep the inspector free of dead controls.
@@ -158,7 +158,7 @@
 					} )
 				),
 				el( PanelBody, { title: __( 'Appearance', 'perflocale' ), initialOpen: false },
-					// Arrow style only matters in dropdown mode — inline/
+					// Arrow style only matters in dropdown mode - inline/
 					// simple displays don't render a trigger button. Hide
 					// the control in those modes so it isn't misleading.
 					attrs.display === 'dropdown' ? el( SelectControl, {

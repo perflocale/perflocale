@@ -32,15 +32,15 @@ final class Migrator {
 	 * Register hooks.
 	 *
 	 * Coverage matrix:
-	 *   - admin_init        — every wp-admin pageview.
-	 *   - rest_api_init     — every REST request (covers headless / decoupled
+	 *   - admin_init        - every wp-admin pageview.
+	 *   - rest_api_init     - every REST request (covers headless / decoupled
 	 *                         frontends that never load wp-admin).
-	 *   - wp_loaded prio 1  — every other request: WP-CLI commands, wp-cron
+	 *   - wp_loaded prio 1  - every other request: WP-CLI commands, wp-cron
 	 *                         (DOING_CRON), and public frontend pageviews.
 	 *                         Priority 1 puts us ahead of any code that
 	 *                         depends on the schema being current.
 	 *
-	 * All three handlers are idempotent — `maybe_migrate()` early-returns
+	 * All three handlers are idempotent - `maybe_migrate()` early-returns
 	 * when stored version >= target, `maybe_update()` when stored version
 	 * matches the constant, and `maybe_migrate_addons()` is per-addon
 	 * checksum-gated. Multiple firings during a single request are safe.
@@ -98,7 +98,7 @@ final class Migrator {
 			// Disabled or quarantined addons must not run migration/manifest
 			// code. refresh()/migrate() call addon-author methods
 			// (get_uninstall_targets(), get_schema_version()) that a
-			// proven-broken addon can throw from — and boot-skipping never
+			// proven-broken addon can throw from - and boot-skipping never
 			// unregisters, so get_addons() still returns them. A disabled
 			// addon's schema simply migrates on the first request after
 			// re-enable (this runs every request).
@@ -149,7 +149,7 @@ final class Migrator {
 		// Concurrency guard. maybe_migrate() is hooked on admin_init +
 		// rest_api_init + wp_loaded, so right after an upgrade several parallel
 		// requests can all pass the version gate above and run the SAME
-		// migrate_to_N concurrently — a data-transform step would then race /
+		// migrate_to_N concurrently - a data-transform step would then race /
 		// double-apply. A short-lived, atomic wp_cache_add mutex lets only the
 		// first request through; the others bail and the migration completes on
 		// that one request (or the next load if it was the loser).
@@ -188,7 +188,7 @@ final class Migrator {
 				Schema::create_tables();
 
 				// dbDelta swallows DDL errors and its return value reports
-				// intent, not outcome — so a create that failed (restricted
+				// intent, not outcome - so a create that failed (restricted
 				// grants, disk full, an index the server rejects) would
 				// otherwise be recorded as a completed migration and never
 				// retried. Ask the server what actually exists before

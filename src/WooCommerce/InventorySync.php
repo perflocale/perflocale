@@ -78,7 +78,7 @@ final class InventorySync {
 		'_sale_price_dates_from',
 		'_sale_price_dates_to',
 		// Identity. The GTIN/UPC/EAN (WC 9.1+) identifies the same physical
-		// product in every language — the WC addon already exempts shared
+		// product in every language - the WC addon already exempts shared
 		// values from WC's uniqueness validation for translation siblings,
 		// so without syncing it here a GTIN edited AFTER translation
 		// creation would silently diverge (harmless meta on WC < 9.1).
@@ -373,6 +373,90 @@ final class InventorySync {
 	private array $epoch_pending = [];
 
 	/**
+	 * Duplicate signatures of the variation maps in $variation_maps, per
+	 * blog, parent id and signature (build_variation_map()).
+	 *
+	 * @var array<int, array<int, array<string, true>>>
+	 */
+	private static array $variation_dups = [];
+
+	/**
+	 * Whether the answer kept in $first_matches is the only child of the
+	 * parent with that signature, per blog, parent id and signature, where
+	 * the stored variation map that gave it says so (stored_first_siblings()).
+	 *
+	 * @var array<int, array<int, array<string, bool>>>
+	 */
+	private static array $match_unique = [];
+
+	/**
+	 * What this process last read of each blog's stored copy maps
+	 * (read_copy_maps()): when, both epochs, whether this process made the
+	 * copy-map epoch since, and each source variation's stored map (false
+	 * for none), per blog.
+	 *
+	 * @var array<int, array{at: float, vsig: string, copy: string, made: bool, rows: array<int, mixed>}>
+	 */
+	private array $copy_reads = [];
+
+	/**
+	 * How many times this process renewed a blog's copy-map epoch or
+	 * stored-map epoch, per blog. A copy map built while it changed is not
+	 * stored.
+	 *
+	 * @var array<int, int>
+	 */
+	private array $copy_renewals = [];
+
+	/**
+	 * The epoch pair under which each blog's memos were last emptied before
+	 * a copy map was built (prepare_copy_map_build()), per blog.
+	 *
+	 * @var array<int, string>
+	 */
+	private array $copy_stamps = [];
+
+	/**
+	 * TranslationGroupRepository::link_changes() when a term flush last
+	 * renewed the copy-map epoch (renew_copy_map_after_term_flush()).
+	 *
+	 * @var int
+	 */
+	private int $copy_link_mark = 0;
+
+	/**
+	 * Taxonomy of each term deleted in this process, per blog and term id,
+	 * for the flushes that follow the deletion.
+	 *
+	 * @var array<int, array<int, string>>
+	 */
+	private array $deleted_terms = [];
+
+	/**
+	 * Slug of each `pa_*` term before its edit, per blog and term id, or ''
+	 * when it could not be read (note_term_slug()).
+	 *
+	 * @var array<int, array<int, string>>
+	 */
+	private array $term_slugs = [];
+
+	/**
+	 * The cart lines whose copy maps were primed last, per blog
+	 * (prime_cart_copy_maps()).
+	 *
+	 * @var array<int, string>
+	 */
+	private array $cart_primed = [];
+
+	/**
+	 * Whether the Store API is computing a quantity limit for product data
+	 * outside a cart right now (mark_catalog_limits()).
+	 *
+	 * @var bool
+	 */
+	private bool $catalog_limits = false;
+
+	/**
 	 * Record the relative stock operation WooCommerce is about to run.
 	 *
 	 * Registered on `woocommerce_update_product_stock_query` at priority 1 so
@@ -523,7 +607,7 @@ final class InventorySync {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Deliberate atomic read-modify-write; no WP meta API can express one, which is exactly why WooCommerce writes its own here too.
 		// `meta_value + (%f)` with a PLAIN %f, not `meta_value %+f`. The sign
 		// already rides in prepare()'s %F output, and `%+f` is a "complex
-		// placeholder" that trips WordPress.DB.PreparedSQLPlaceholders — which
+		// placeholder" that trips WordPress.DB.PreparedSQLPlaceholders - which
 		// Plugin Check pulls in at full severity, so it would move the tracked
 		// dist score off 0.
 		//
@@ -538,14 +622,14 @@ final class InventorySync {
 		// pre-change value. The predicate matched zero rows, the caller fell
 		// through to the absolute mirror, and that copied one worker's stale
 		// snapshot. Measured on three sites: three sales of a stock-10 product
-		// ended at (9,9,9) where the serial control ended at (7,7,7) — two of
+		// ended at (9,9,9) where the serial control ended at (7,7,7) - two of
 		// three decrements lost, and the loss grows with concurrency.
 		//
 		// A delta is valid whatever the sibling currently holds: "sold one" is
 		// -1 regardless of the base. Applying it inside a single UPDATE is
 		// atomic in the engine, so N concurrent orders produce N decrements.
 		//
-		// The trade is that a sibling which has ALREADY drifted stays drifted —
+		// The trade is that a sibling which has ALREADY drifted stays drifted -
 		// its value moves by the right amount from the wrong base. That is the
 		// correct direction to fail: an absolute 'set' (admin stock edit,
 		// quick/bulk edit, REST or CLI write) still runs the absolute mirror
@@ -591,7 +675,7 @@ final class InventorySync {
 
 		// Mirror WC_Product::validate_props(): a product that does NOT manage
 		// its own stock has an operator-chosen `_stock_status`, and deriving one
-		// from a leftover `_stock` value would silently overwrite it — flipping
+		// from a leftover `_stock` value would silently overwrite it - flipping
 		// an always-in-stock product to outofstock because an old quantity row
 		// happened to be 0.
 		if ( 'yes' !== (string) get_post_meta( $product_id, '_manage_stock', true ) ) {
@@ -670,7 +754,7 @@ final class InventorySync {
 			// read, so a stale figure here is visible to shoppers and can
 			// oversell. Reading the source columns inside the UPDATE means the
 			// row always lands on the committed quantity whatever order two
-			// concurrent orders finished in — which is what makes this safe to
+			// concurrent orders finished in - which is what makes this safe to
 			// call unlocked. It is also cheaper than the version it replaces.
 			//
 			// An inner JOIN on `_stock`: callers only reach here after
@@ -752,7 +836,7 @@ final class InventorySync {
 	/**
 	 * Rebuild a product's wc_product_meta_lookup row from its current meta.
 	 *
-	 * The sibling sync writes meta with update_post_meta() (deliberately — it
+	 * The sibling sync writes meta with update_post_meta() (deliberately - it
 	 * must bypass WC's unique-SKU validation so translations can share a SKU,
 	 * and avoid the overhead of full CRUD saves). That bypasses WC's change-
 	 * tracking, so neither a plain $product->save() nor the data store's
@@ -803,13 +887,13 @@ final class InventorySync {
 			// PARENT-managed variation (get_manage_stock() returns 'parent'),
 			// and wc_update_product_stock() would then redirect to the sibling
 			// PARENT and fire woocommerce_product_set_stock for a product
-			// whose lock is NOT held here — an unguarded nested group sync.
+			// whose lock is NOT held here - an unguarded nested group sync.
 			// Parent-managed variations take the direct-column path below;
 			// the parent's own rollup covers its aggregate state.
 			wc_update_product_stock( $product, $product->get_stock_quantity(), 'set' );
 		} else {
 			// Older WC has no per-product lookup refresh API and the stock
-			// path above only covers stock-managed products — after a raw
+			// path above only covers stock-managed products - after a raw
 			// price/SKU/stock-status meta sync a NON-stock-managed sibling's
 			// wc_product_meta_lookup row (backing catalog price sort/filter,
 			// SKU search and WooCommerce's own variable-parent stock rollup)
@@ -877,6 +961,22 @@ final class InventorySync {
 		add_action( 'transition_post_status', [ $this, 'forget_after_status_change' ], 10, 3 );
 		add_action( 'deleted_post', [ $this, 'forget_after_post_deleted' ], 10, 2 );
 		add_action( 'shutdown', [ $this, 'renew_pending_epochs' ], PHP_INT_MAX, 0 );
+
+		// The stored copy maps (stored_variation_copies()) check every
+		// product fact by value; which attribute term reads as which
+		// translation group they take from the copy-map epoch, which these
+		// renew. In every request context: a cron event run inside a
+		// visitor's request can link or edit a term too. Each callback
+		// returns at once for any other taxonomy or object type.
+		$this->copy_link_mark = \PerfLocale\Database\Repository\TranslationGroupRepository::link_changes();
+		add_action( 'perflocale/cache/flush_object', [ $this, 'renew_copy_map_after_term_flush' ], 10, 2 );
+		add_action( 'perflocale/cache/flush_translations', [ $this, 'renew_copy_map_epoch' ], 10, 0 );
+		add_action( 'edit_terms', [ $this, 'note_term_slug' ], 10, 2 );
+		add_action( 'edited_term', [ $this, 'renew_copy_map_after_term_edit' ], 10, 3 );
+		add_action( 'delete_term', [ $this, 'renew_copy_map_after_term_delete' ], 5, 3 );
+		add_action( 'woocommerce_attribute_updated', [ $this, 'renew_copy_map_epoch' ], 10, 0 );
+		add_action( 'woocommerce_attribute_deleted', [ $this, 'renew_copy_map_epoch' ], 10, 0 );
+		add_action( 'set_object_terms', [ $this, 'forget_after_product_type_terms' ], 10, 6 );
 
 		// Which data stores read variations is a per-blog answer.
 		add_action( 'switch_blog', [ $this, 'forget_store_verdicts' ], 10, 0 );
@@ -947,20 +1047,20 @@ final class InventorySync {
 		// then roll the sibling parents' derived aggregates (price range,
 		// stock status) up via WC_Product_Variable::sync(). Priority 20 so WC
 		// has persisted the variation's own meta for this save first. The
-		// order-driven stock path above stays separate — it fires from
+		// order-driven stock path above stays separate - it fires from
 		// wc_update_product_stock(), not from these save flows.
 		add_action( 'woocommerce_save_product_variation', [ $this, 'sync_variation_fields' ], 20, 1 );
 		add_action( 'woocommerce_rest_insert_product_variation_object', [ $this, 'sync_on_rest_variation_save' ], 10, 1 );
 
 		// Variations-tab BULK actions (set/adjust prices, sale dates, toggles,
 		// dimensions) run plain CRUD saves and never fire
-		// woocommerce_save_product_variation — only this dedicated hook. One
+		// woocommerce_save_product_variation - only this dedicated hook. One
 		// handler per bulk action; the sibling-parent rollup is amortised to
 		// once per bulk run instead of once per variation.
 		add_action( 'woocommerce_bulk_edit_variations', [ $this, 'sync_after_bulk_variation_edit' ], 20, 4 );
 
 		// Products-list Quick Edit and Bulk Edit save via CRUD and never fire
-		// woocommerce_process_product_meta — without these hooks a price /
+		// woocommerce_process_product_meta - without these hooks a price /
 		// SKU / dimension change made there silently diverges across
 		// languages (stock quantity alone propagated, via the set_stock
 		// hooks). Both fire after the CRUD save has persisted the meta.
@@ -974,7 +1074,7 @@ final class InventorySync {
 		// and returns at once outside Quick/Bulk Edit.
 		add_action( 'woocommerce_variation_set_stock_status', [ $this, 'note_quick_edit_child' ], 10, 3 );
 
-		// CSV importer rows (products AND variations) — an imported price
+		// CSV importer rows (products AND variations) - an imported price
 		// list otherwise updates only the imported language's products.
 		add_action( 'woocommerce_product_import_inserted_product_object', [ $this, 'sync_on_import' ], 10, 2 );
 
@@ -1011,14 +1111,14 @@ final class InventorySync {
 
 		// NB: the shared SKUs this sync writes stay saveable because the WC
 		// addon exempts translation siblings from WC's unique-SKU (and GTIN)
-		// validation — PerfLocaleWooCommerce::allow_translation_duplicate_sku.
+		// validation - PerfLocaleWooCommerce::allow_translation_duplicate_sku.
 	}
 
 	/**
 	 * Sync every variation touched by a Variations-tab bulk action, rolling
 	 * the sibling parents up once at the end.
 	 *
-	 * @param string            $bulk_action Bulk action slug (unused — field diffing is value-based).
+	 * @param string            $bulk_action Bulk action slug (unused - field diffing is value-based).
 	 * @param array<mixed>      $data        Bulk action payload (unused).
 	 * @param int|string        $product_id  Parent (variable) product ID.
 	 * @param array<int|string> $variations  Affected variation IDs.
@@ -1413,7 +1513,7 @@ final class InventorySync {
 
 	/**
 	 * Per-product opt-out meta flag ('yes' = this product manages its own
-	 * shared fields — nothing syncs INTO it, and its saves push nothing OUT).
+	 * shared fields - nothing syncs INTO it, and its saves push nothing OUT).
 	 *
 	 * Set from the checkbox in the WooCommerce product Advanced panel (see
 	 * the addon's render/save handlers) or programmatically. Lives on the
@@ -1473,12 +1573,60 @@ final class InventorySync {
 	private const EPOCH_RENEW_INTERVAL = 1.0;
 
 	/**
+	 * Transient name prefix of the stored copy maps, followed by the source
+	 * variation's id (see stored_variation_copies()).
+	 */
+	private const VARIATION_COPY_PREFIX = 'perflocale_vcopy_';
+
+	/**
+	 * Transient holding the epoch of the stored copy maps: "<uuid>|<unix
+	 * time it was made>". Every change that can alter which variation is a
+	 * copy of which, and that a copy map does not check by value, deletes it
+	 * (renew_copy_map_epoch()); a reader makes a new one. A copy map is used
+	 * only while it carries the current value. Deleted by name on activation
+	 * and on every cache flush, like STORED_MAP_EPOCH.
+	 */
+	public const COPY_MAP_EPOCH = 'perflocale_vcopy_epoch';
+
+	/**
+	 * Shape version of a stored copy map; any other value is a miss.
+	 */
+	private const COPY_MAP_FORMAT = 1;
+
+	/**
+	 * Lifetime of a stored copy map, in seconds.
+	 */
+	private const COPY_MAP_TTL = DAY_IN_SECONDS;
+
+	/**
+	 * Largest serialised copy map that is stored, in bytes.
+	 */
+	private const COPY_MAP_MAX_BYTES = 16384;
+
+	/**
+	 * Most stock ids whose stored copy maps one cart read primes at once.
+	 */
+	private const COPY_MAP_BATCH = 50;
+
+	/**
+	 * Default seconds a copy-map epoch must have existed before a copy map is
+	 * stored with it (copy_map_settle_seconds()).
+	 */
+	private const COPY_MAP_SETTLE = 60;
+
+	/**
+	 * Seconds after which this process reads the epochs again from the
+	 * store instead of its own copy (read_copy_maps()).
+	 */
+	private const COPY_EPOCH_REREAD = 5.0;
+
+	/**
 	 * Master switch for cross-language product-data sync.
 	 *
 	 * @return bool
 	 */
 	private function sync_enabled(): bool {
-		// wc_sync_stock is the long-standing master switch — the WC addon
+		// wc_sync_stock is the long-standing master switch - the WC addon
 		// doesn't even register this class when it's off. Re-reading it here
 		// is belt-and-braces (a mid-request settings change) and gives the
 		// filter a per-request override point.
@@ -1491,7 +1639,7 @@ final class InventorySync {
 
 	/**
 	 * Whether a product (or a variation via its parent) is opted out of the
-	 * cross-language sync — by the per-product meta flag or by the
+	 * cross-language sync - by the per-product meta flag or by the
 	 * long-standing skip filter.
 	 *
 	 * Checked on BOTH ends of every flow: an opted-out product neither
@@ -1685,7 +1833,7 @@ final class InventorySync {
 						}
 
 						// update_post_meta() returns false BOTH on failure AND
-						// when the new value equals the stored one — and an
+						// when the new value equals the stored one - and an
 						// already-in-sync sibling is the COMMON case, not an
 						// error. Skip the write (and the log) when the value
 						// already matches, so WP_DEBUG logs carry only genuine
@@ -1703,7 +1851,9 @@ final class InventorySync {
 							continue;
 						}
 
-						$result  = update_post_meta( $sibling_id, $field, $value );
+						// update_post_meta() unslashes; the value read from the
+						// source is unslashed, so it is slashed for the write.
+						$result  = update_post_meta( $sibling_id, $field, \PerfLocale\Helper::deep_slash( $value ) );
 						$changed = true;
 
 						if ( '_stock' === $field ) {
@@ -1783,9 +1933,9 @@ final class InventorySync {
 	 */
 	public function sync_on_stock_change( \WC_Product $product ): void {
 		// Variations are NOT linked into translation groups (they inherit the
-		// parent's language — Bootstrap::auto_assign_default_language skips
+		// parent's language - Bootstrap::auto_assign_default_language skips
 		// product_variation). So get_translations(variation_id) is always empty
-		// and the sibling loop below would bail — meaning an order that
+		// and the sibling loop below would bail - meaning an order that
 		// decremented a variation's stock never propagated to the sibling-
 		// language variations, and every language kept its own stock counter
 		// (cross-language oversell). Route variations to the parent-anchored
@@ -1816,7 +1966,7 @@ final class InventorySync {
 		$absolute   = [];
 		$flipped    = [];
 
-		// PASS 1 — RELATIVE, DELIBERATELY LOCK-FREE.
+		// PASS 1 - RELATIVE, DELIBERATELY LOCK-FREE.
 		//
 		// Lock::acquire() is a NON-BLOCKING mutex: on contention it returns
 		// false immediately, it never waits. This loop used to sit inside two
@@ -1862,7 +2012,7 @@ final class InventorySync {
 			$absolute[] = $sibling_id;
 		}
 
-		// PASS 2 — ABSOLUTE mirror, for siblings pass 1 could not apply to and
+		// PASS 2 - ABSOLUTE mirror, for siblings pass 1 could not apply to and
 		// for every non-order change ('set': admin edit, quick/bulk edit, REST,
 		// CLI, resync). This one really is a read-modify-write, so it takes the
 		// locks. Dropping a 'set' on contention is safe in a way dropping a
@@ -1883,7 +2033,7 @@ final class InventorySync {
 					try {
 						// See the price-sync loop above: update_post_meta()
 						// returns false for value-unchanged too, so only treat a
-						// write that CHANGED something as a candidate failure —
+						// write that CHANGED something as a candidate failure -
 						// an in-sync sibling is normal, not an error to log.
 						$stock_same  = ( (string) get_post_meta( $sibling_id, '_stock', true ) === (string) $stock_quantity );
 						$status_same = ( (string) get_post_meta( $sibling_id, '_stock_status', true ) === (string) $stock_status );
@@ -1975,9 +2125,20 @@ final class InventorySync {
 	 * the original attribute terms on translated variations, so the maps are
 	 * string-for-string equal. When a translator has manually diverged a
 	 * sibling's attributes we skip it (never guess). Same two-pass write path as
-	 * the parent flow — a lock-free atomic relative replay, then a locked
+	 * the parent flow - a lock-free atomic relative replay, then a locked
 	 * absolute mirror; raw update_post_meta does NOT re-fire
 	 * woocommerce_variation_set_stock, so there is no re-entrancy loop.
+	 *
+	 * Where the copies come from: when this request's stock check (the cart
+	 * or checkout check that came before the order) already read the
+	 * variation's stored copy map, the map is still fresh and valid and it
+	 * names every copy parent, the copies are the ones the map names
+	 * (held_variation_copies()); otherwise each copy parent is matched as
+	 * above. Either way the stock, the stock management and the opt-out are
+	 * read live. Like the stock check, an order that takes its copies from
+	 * the stored map does not see translation links of attribute terms
+	 * changed directly in the database until the cache is cleared (see
+	 * copy_maps_enabled()).
 	 *
 	 * @param \WC_Product_Variation $variation Variation whose stock changed.
 	 * @return void
@@ -2007,11 +2168,42 @@ final class InventorySync {
 			return;
 		}
 
-		$src_attrs  = $this->normalise_variation_attrs( $variation->get_attributes(), (int) $parent_id );
+		$attributes = $variation->get_attributes();
+		$source     = (int) $parent_id;
+
+		// The copies this request already holds from the variation's stored
+		// copy map (read by the stock check made earlier in this request),
+		// used only when the map names every copy parent: then no copy parent
+		// is matched below. Otherwise every copy parent is matched.
+		$held = is_int( $variation_id ) ? $this->held_variation_copies( $variation_id ) : [];
+
+		if ( [] !== $held ) {
+			$copy_parents = is_array( $parent_sibs ) ? array_values( array_diff( wp_parse_id_list( wp_list_pluck( $parent_sibs, 'object_id' ) ), wp_parse_id_list( [ $parent_id ] ) ) ) : [];
+			$held_parents = array_keys( $held );
+
+			sort( $copy_parents );
+			sort( $held_parents );
+
+			if ( $copy_parents !== $held_parents ) {
+				$held = [];
+			}
+		}
+
+		if ( [] === $held ) {
+			// What the match of each copy parent below reads, and what comparing
+			// the source's attributes with theirs reads, read for all of them at
+			// once.
+			$this->prime_copy_parents( is_array( $parent_sibs ) ? array_values( array_diff( wp_parse_id_list( wp_list_pluck( $parent_sibs, 'object_id' ) ), wp_parse_id_list( [ $parent_id ] ) ) ) : [], $source, is_array( $attributes ) ? array_map( 'strval', array_keys( $attributes ) ) : [] );
+
+			$src_attrs = $this->normalise_variation_attrs( $attributes, $source );
+		} else {
+			$src_attrs = [];
+		}
+
 		$synced_ids = [];
 		$absolute   = [];
 
-		// PASS 1 — RELATIVE, LOCK-FREE. See sync_on_stock_change() for the full
+		// PASS 1 - RELATIVE, LOCK-FREE. See sync_on_stock_change() for the full
 		// reasoning: Lock::acquire() never waits, so a lock around an already
 		// atomic `meta_value + delta` could only ever DROP a customer's
 		// purchase. Two shoppers buying the same variation in two languages hit
@@ -2023,10 +2215,10 @@ final class InventorySync {
 				continue;
 			}
 
-			$sib_variation_id = $this->match_sibling_variation( $sib_parent_id, $src_attrs );
+			$sib_variation_id = [] !== $held ? $held[ $sib_parent_id ] : $this->match_sibling_variation( $sib_parent_id, $src_attrs );
 
 			// A variation-level opt-out must block INCOMING writes too, not
-			// only outgoing ones — the source-side gate reads the same flag,
+			// only outgoing ones - the source-side gate reads the same flag,
 			// so checking just the parent here would leave the key
 			// protecting a variation in one direction only. Placed after
 			// the match so the cheaper parent-level skip short-circuits
@@ -2046,7 +2238,7 @@ final class InventorySync {
 			$absolute[] = $sib_variation_id;
 		}
 
-		// PASS 2 — ABSOLUTE mirror (read-modify-write), so it takes the locks.
+		// PASS 2 - ABSOLUTE mirror (read-modify-write), so it takes the locks.
 		if ( ! empty( $absolute ) && Lock::acquire( $this->lock_name( $variation_id ), self::LOCK_TTL_OUTER ) ) {
 			++$this->writing;
 
@@ -2098,7 +2290,8 @@ final class InventorySync {
 	 * The ids whose stock is one physical stock with a stock id: itself, and
 	 * each language copy that manages its own stock too. A variation's copies
 	 * are the attribute-matched variations of its parent's copies (see
-	 * stored_first_siblings() and first_sibling_variation()). A copy opted
+	 * stored_variation_copies(), stored_first_siblings() and
+	 * first_sibling_variation()). A copy opted
 	 * out of the sync, or one that does not manage its own stock, keeps its
 	 * own stock; an opted-out id has no copies.
 	 *
@@ -2121,6 +2314,10 @@ final class InventorySync {
 		if ( isset( $this->stock_groups[ $blog ][ $stock_id ] ) ) {
 			return $this->stock_groups[ $blog ][ $stock_id ];
 		}
+
+		// A cart line's group is asked for once per line: the reads every
+		// line needs are made for all of them at once.
+		$this->prime_cart_copy_maps( $stock_id );
 
 		$group = [ $stock_id ];
 
@@ -2156,6 +2353,11 @@ final class InventorySync {
 	 * The language copies of a product, or the matching variations of the
 	 * language copies of a variation's parent. $product_id itself excluded.
 	 *
+	 * A variation's copies come from its stored copy map when that map holds
+	 * (stored_variation_copies()); otherwise they are matched below, and the
+	 * answer is stored when record_variation_copies() may store it. A copy
+	 * parent opted out of the sync is left out either way, as it stands now.
+	 *
 	 * @param int $product_id Product or variation id.
 	 * @return array<int, int>
 	 */
@@ -2177,6 +2379,24 @@ final class InventorySync {
 			return array_values( array_diff( $copies, [ $product_id ] ) );
 		}
 
+		[ $stored_copies, $record ] = $this->stored_variation_copies( $product_id );
+
+		if ( null !== $stored_copies ) {
+			$copies = [];
+
+			foreach ( $stored_copies as $copy_parent => $copy_id ) {
+				if ( $copy_id !== $product_id && ! $this->is_sync_opted_out( (int) $copy_parent ) ) {
+					$copies[] = $copy_id;
+				}
+			}
+
+			return $copies;
+		}
+
+		if ( null !== $record ) {
+			$this->prepare_copy_map_build( $record );
+		}
+
 		$parent_id = (int) wp_get_post_parent_id( $product_id );
 		$links     = $parent_id > 0 ? $repo->get_translations( $parent_id, ObjectType::Post ) : [];
 
@@ -2187,6 +2407,8 @@ final class InventorySync {
 		$src = $this->stored_variation_attributes( $product_id );
 
 		if ( null === $src ) {
+			// Built from the product: no reader to check a stored map against.
+			$record    = null;
 			$variation = wc_get_product( $product_id );
 
 			if ( ! $variation instanceof \WC_Product_Variation ) {
@@ -2231,8 +2453,10 @@ final class InventorySync {
 		}
 
 		// The copy parents' stored variation maps first; a parent they do not
-		// answer is scanned.
-		$stored = [] !== $wanted ? $this->stored_first_siblings( $wanted, $attrs ) : [];
+		// answer is scanned. A copy map to be stored also needs the answer
+		// of every opted-out copy parent, since opting out is read live.
+		$ask    = null !== $record ? $parents : $wanted;
+		$stored = [] !== $ask ? $this->stored_first_siblings( $ask, $attrs ) : [];
 
 		foreach ( $wanted as $copy_parent ) {
 			$copy_id = $stored[ $copy_parent ] ?? $this->first_sibling_variation( $copy_parent, $attrs );
@@ -2240,6 +2464,10 @@ final class InventorySync {
 			if ( $copy_id > 0 && $copy_id !== $product_id ) {
 				$copies[] = $copy_id;
 			}
+		}
+
+		if ( null !== $record ) {
+			$this->record_variation_copies( $product_id, $parent_id, $parents, $src, $attrs, $stored, $record );
 		}
 
 		return $copies;
@@ -2462,10 +2690,14 @@ final class InventorySync {
 	 */
 	public function mark_catalog_limits( $minimum, $product = null, $cart_item = null ) {
 		$this->catalog_stock_id = 0;
+		$this->catalog_limits   = false;
 
 		if ( null !== $cart_item || ! $product instanceof \WC_Product ) {
 			return $minimum;
 		}
+
+		// Read-only for the stored copy maps (may_record_copies()).
+		$this->catalog_limits = true;
 
 		/**
 		 * Filter whether Store API product data outside a cart counts the
@@ -2497,6 +2729,7 @@ final class InventorySync {
 	 */
 	public function unmark_catalog_limits( $maximum ) {
 		$this->catalog_stock_id = 0;
+		$this->catalog_limits   = false;
 
 		return $maximum;
 	}
@@ -2903,7 +3136,7 @@ final class InventorySync {
 	 *
 	 * Unlike the variable PARENT (where price keys are child-derived
 	 * aggregates WC owns and this class must not copy), a variation's
-	 * `_price` is a real single value — safe and necessary to mirror.
+	 * `_price` is a real single value - safe and necessary to mirror.
 	 * total_sales is per-variant by design (see SHARED_FIELDS note).
 	 */
 	private const VARIATION_FIELDS = [
@@ -3033,7 +3266,7 @@ final class InventorySync {
 	 *
 	 * Cheap when the row has no translations (one cached group lookup +
 	 * short-circuit), but a mass import of a fully-translated catalog runs a
-	 * sibling sync per row — the filter lets operators skip it and rely on a
+	 * sibling sync per row - the filter lets operators skip it and rely on a
 	 * post-import resync instead.
 	 *
 	 * @param \WC_Product          $product Imported product object.
@@ -3072,7 +3305,7 @@ final class InventorySync {
 	 * normalised attribute set, and skip (never guess) when a translator
 	 * has diverged a sibling's attributes. Same lock discipline: outer lock
 	 * on the source variation, inner lock per sibling write, so hooks fired
-	 * as side-effects of the writes bail instead of looping — and a
+	 * as side-effects of the writes bail instead of looping - and a
 	 * concurrent save of the sibling itself skips rather than fights.
 	 *
 	 * The SOURCE parent's aggregates are deliberately left alone: WC's own
@@ -3167,7 +3400,7 @@ final class InventorySync {
 				$sib_variation_id = $this->match_sibling_variation( $sib_parent_id, $src_attrs );
 
 				// A variation-level opt-out must block INCOMING writes too, not
-				// only outgoing ones — the source-side gate reads the same flag,
+				// only outgoing ones - the source-side gate reads the same flag,
 				// so checking just the parent here would leave the key
 				// protecting a variation in one direction only. Placed after
 				// the match so the cheaper parent-level skip short-circuits
@@ -3215,7 +3448,9 @@ final class InventorySync {
 							continue;
 						}
 
-						$result  = update_post_meta( $sib_variation_id, $field, $value );
+						// update_post_meta() unslashes; the value read from the
+						// source is unslashed, so it is slashed for the write.
+						$result  = update_post_meta( $sib_variation_id, $field, \PerfLocale\Helper::deep_slash( $value ) );
 						$changed = true;
 
 						if ( '_stock' === $field ) {
@@ -3238,7 +3473,7 @@ final class InventorySync {
 					}
 
 					// Rebuild the sibling variation's wc_product_meta_lookup row
-					// (price sort / stock filter / SKU search) — the raw meta
+					// (price sort / stock filter / SKU search) - the raw meta
 					// writes bypass WC's change tracking. Re-entrancy safe: the
 					// sibling lock is held. Only a copy that wrote `_stock` lets
 					// the refresh re-set the quantity, and a full copy that
@@ -3283,7 +3518,7 @@ final class InventorySync {
 	 * WC_Product_Variable::sync(); without this the sibling shop archive
 	 * keeps the stale price range until the sibling's next manual save.
 	 * Locked so any hook fired from inside the rollup that lands back in
-	 * this class bails immediately; skipped (not queued) under contention —
+	 * this class bails immediately; skipped (not queued) under contention -
 	 * the next sibling save rebuilds the same derived state from the same
 	 * children.
 	 *
@@ -3322,7 +3557,7 @@ final class InventorySync {
 	 * (PerfLocaleWooCommerce::translate_variation_attributes(); without it the
 	 * variation dropdown renders empty and the translated product is
 	 * unpurchasable), so English `pa_color=red` and German `pa_color=rot` are
-	 * the SAME variation with different raw signatures — and stock, price and
+	 * the SAME variation with different raw signatures - and stock, price and
 	 * field sync silently skipped every one of them. Canonicalising both sides
 	 * makes the two agree.
 	 *
@@ -3394,7 +3629,7 @@ final class InventorySync {
 	 */
 	private function canonical_attr_value( string $taxonomy, string $value ): string {
 		// Custom (non-taxonomy) attributes carry literal strings and "any
-		// <attribute>" is stored empty — neither names a term, so neither can
+		// <attribute>" is stored empty - neither names a term, so neither can
 		// be canonicalised. Both keep their raw value, unchanged.
 		if ( $taxonomy === '' || $value === '' || ! taxonomy_exists( $taxonomy ) ) {
 			return $value;
@@ -3556,12 +3791,16 @@ final class InventorySync {
 		self::$canonical_attr_memo = [];
 		self::$variation_maps      = [];
 		self::$first_matches       = [];
+		self::$variation_dups      = [];
+		self::$match_unique        = [];
 	}
 
 	/**
 	 * WooCommerce product props whose change alters a stock group and a
-	 * variation match: a variation's attributes, parent and status. A change
-	 * of whether a product manages its stock alters no match; its meta write
+	 * variation match: a variation's attributes, parent and status. A save
+	 * that sets a product's attributes again with the values stored for them
+	 * changes nothing a match reads (attribute_row_unchanged()). A change of
+	 * whether a product manages its stock alters no match; its meta write
 	 * (STOCK_SHARING_META) drops the stock groups.
 	 */
 	private const STRUCTURAL_PROPS = [ 'attributes', 'parent_id', 'status' ];
@@ -3579,7 +3818,10 @@ final class InventorySync {
 	/**
 	 * Note a WooCommerce save that creates a product or changes one of
 	 * STRUCTURAL_PROPS, so that forget_after_structural_save() drops the
-	 * blog's stock groups and variation matches once it is written.
+	 * blog's stock groups and variation matches once it is written. A save
+	 * of an existing product whose only such change is its attributes is
+	 * noted unless it writes the attribute row stored now
+	 * (attribute_row_unchanged()).
 	 *
 	 * @param mixed $product Product being saved.
 	 * @return void
@@ -3589,9 +3831,160 @@ final class InventorySync {
 			return;
 		}
 
-		if ( $product->get_id() <= 0 || [] !== array_intersect( self::STRUCTURAL_PROPS, array_keys( (array) $product->get_changes() ) ) ) {
+		if ( $product->get_id() <= 0 ) {
 			$this->structural_saves[ $product ] = true;
+			return;
 		}
+
+		$props = array_intersect( self::STRUCTURAL_PROPS, array_keys( (array) $product->get_changes() ) );
+
+		if ( [] === $props ) {
+			return;
+		}
+
+		if ( [ 'attributes' ] === array_values( $props ) && $this->attribute_row_unchanged( $product ) ) {
+			return;
+		}
+
+		$this->structural_saves[ $product ] = true;
+	}
+
+	/**
+	 * Whether a save of this existing product writes the `_product_attributes`
+	 * row that is stored now, so that it changes nothing a stock match reads.
+	 *
+	 * Stock matches read a product's attributes only through two of its post
+	 * meta rows, never through its terms: `_product_attributes`, which
+	 * WC_Product_Data_Store_CPT::update_attributes() writes from
+	 * get_attributes(), and `_product_version`, which tells the variation
+	 * reader whether the product was saved before WooCommerce 2.4
+	 * (variation_attribute_context()). The options of a taxonomy attribute
+	 * are the product's terms; that row holds none of them.
+	 *
+	 * True only when all of these hold, in this order:
+	 * - the product is not a variation (a variation's attributes are
+	 *   strings, which WooCommerce compares by value);
+	 * - its data store is WooCommerce's own post-table store of simple,
+	 *   variable or grouped products, the writer this check rebuilds;
+	 * - no callback filters the attributes a variation returns, and
+	 *   variations and variable products are read by WooCommerce's own stores
+	 *   (reads_cpt_variation_stores()), so that row is what the reader reads;
+	 * - the product's post meta is in the object cache already: the check
+	 *   reads only post meta already there and never loads it, because the
+	 *   save clears that cache before its own first read;
+	 * - `_product_version` is 2.4.0 or later;
+	 * - every attribute is a WC_Product_Attribute with array options and
+	 *   array extra data, or null for one being removed;
+	 * - the row built the way WooCommerce builds it is identical (===) to the
+	 *   one stored row, or none is built and none is stored.
+	 * Anything else, and any error while the row is built, reads as changed.
+	 *
+	 * The `_product_attributes` meta listener (forget_after_meta_change()) is
+	 * required for correctness and stays registered for every save:
+	 * WooCommerce clears the post's cache before it writes the row, so the
+	 * write compares against the database and fires the listener on every
+	 * real change, also when this product object or this process's cache is
+	 * older than the database. Building the row runs the
+	 * `woocommerce_product_get_attributes` filter once more per such save.
+	 *
+	 * @param object $product Existing product being saved (WC_Product).
+	 * @return bool
+	 */
+	private function attribute_row_unchanged( object $product ): bool {
+		if ( is_a( $product, 'WC_Product_Variation' ) || ! method_exists( $product, 'get_data_store' ) || ! method_exists( $product, 'get_id' ) || ! method_exists( $product, 'get_attributes' ) ) {
+			return false;
+		}
+
+		$store = $product->get_data_store();
+		$class = is_object( $store ) && method_exists( $store, 'get_current_class_name' ) ? $store->get_current_class_name() : '';
+
+		if ( ! in_array( $class, [ 'WC_Product_Data_Store_CPT', 'WC_Product_Variable_Data_Store_CPT', 'WC_Product_Grouped_Data_Store_CPT' ], true )
+			|| false !== has_filter( 'woocommerce_product_variation_get_attributes' )
+			|| ! function_exists( 'wc_implode_text_attributes' )
+			|| ! $this->reads_cpt_variation_stores() ) {
+			return false;
+		}
+
+		$id = $product->get_id();
+
+		if ( ! is_int( $id ) || false === wp_cache_get( $id, 'post_meta' ) ) {
+			return false;
+		}
+
+		$version = get_post_meta( $id, '_product_version', true );
+
+		if ( ! is_string( $version ) || '' === $version || version_compare( $version, '2.4.0', '<' ) ) {
+			return false;
+		}
+
+		try {
+			$attributes = $product->get_attributes();
+			$row        = [];
+
+			if ( ! is_array( $attributes ) ) {
+				return false;
+			}
+
+			foreach ( $attributes as $key => $attribute ) {
+				if ( null === $attribute ) {
+					continue;
+				}
+
+				if ( ! self::is_product_attribute( $attribute )
+					|| ! is_object( $attribute )
+					|| ! method_exists( $attribute, 'get_options' )
+					|| ! method_exists( $attribute, 'get_name' )
+					|| ! method_exists( $attribute, 'get_position' )
+					|| ! method_exists( $attribute, 'get_visible' )
+					|| ! method_exists( $attribute, 'get_variation' )
+					|| ! method_exists( $attribute, 'is_taxonomy' ) ) {
+					return false;
+				}
+
+				$options = $attribute->get_options();
+
+				if ( ! is_array( $options ) ) {
+					return false;
+				}
+
+				$entry = [
+					'name'         => $attribute->get_name(),
+					'value'        => $attribute->is_taxonomy() ? '' : wc_implode_text_attributes( $options ),
+					'position'     => $attribute->get_position(),
+					'is_visible'   => $attribute->get_visible() ? 1 : 0,
+					'is_variation' => $attribute->get_variation() ? 1 : 0,
+					'is_taxonomy'  => $attribute->is_taxonomy() ? 1 : 0,
+				];
+
+				if ( method_exists( $attribute, 'get_all_extra_data' ) ) {
+					$extra = $attribute->get_all_extra_data();
+
+					if ( ! is_array( $extra ) ) {
+						return false;
+					}
+
+					$entry = array_merge( $extra, $entry );
+				}
+
+				$row[ $key ] = $entry;
+			}
+		} catch ( \Throwable $e ) {
+			return false;
+		}
+
+		$stored = get_post_meta( $id, '_product_attributes', false );
+
+		return [] === $row ? [] === $stored : ( is_array( $stored ) && 1 === count( $stored ) && $stored[0] === $row );
+	}
+
+	/**
+	 * Whether a value is a WooCommerce product attribute object.
+	 *
+	 * @param mixed $value Value.
+	 * @return bool
+	 */
+	private static function is_product_attribute( mixed $value ): bool {
+		return is_object( $value ) && is_a( $value, 'WC_Product_Attribute' );
 	}
 
 	/**
@@ -3661,6 +4054,8 @@ final class InventorySync {
 
 			if ( 'product' === $post->post_type ) {
 				delete_transient( self::STORED_MAP_PREFIX . (int) $post->ID );
+			} else {
+				delete_transient( self::VARIATION_COPY_PREFIX . (int) $post->ID );
 			}
 		}
 	}
@@ -3683,7 +4078,7 @@ final class InventorySync {
 	public function forget_stock_matches(): void {
 		$blog = get_current_blog_id();
 
-		unset( $this->stock_groups[ $blog ], self::$variation_maps[ $blog ], self::$first_matches[ $blog ] );
+		unset( $this->stock_groups[ $blog ], self::$variation_maps[ $blog ], self::$first_matches[ $blog ], self::$variation_dups[ $blog ], self::$match_unique[ $blog ] );
 
 		if ( isset( $this->epoch_renewed[ $blog ] ) && microtime( true ) - $this->epoch_renewed[ $blog ] < self::EPOCH_RENEW_INTERVAL ) {
 			$this->epoch_pending[ $blog ] = true;
@@ -3697,7 +4092,9 @@ final class InventorySync {
 	 * Renew the current blog's epoch of its stored variation maps
 	 * (STORED_MAP_EPOCH), which retires every stored map of the blog in every
 	 * process. With no epoch there is no stored map to retire, and none is
-	 * stored until a read has made one (stored_first_siblings()).
+	 * stored until a read has made one (stored_first_siblings()). The
+	 * copy-map epoch is deleted too, whatever this process holds of it
+	 * (delete_copy_map_epoch()).
 	 *
 	 * @return void
 	 */
@@ -3710,6 +4107,8 @@ final class InventorySync {
 		if ( false !== get_transient( self::STORED_MAP_EPOCH ) ) {
 			set_transient( self::STORED_MAP_EPOCH, wp_generate_uuid4(), MONTH_IN_SECONDS );
 		}
+
+		$this->delete_copy_map_epoch();
 	}
 
 	/**
@@ -3798,7 +4197,10 @@ final class InventorySync {
 	 * The parent's part of wc_get_product_variation_attributes(), which is the
 	 * same for every variation of a parent: its attributes, the meta keys of
 	 * those used for variations (`attribute_` plus the sanitised name, in the
-	 * parent's order), and whether it was saved before WooCommerce 2.4.
+	 * parent's order), and whether it was saved before WooCommerce 2.4. These
+	 * come from the parent's `_product_attributes` and `_product_version`
+	 * rows only, never from its terms; attribute_row_unchanged() relies on
+	 * that.
 	 *
 	 * @param int $parent_id Variable product id.
 	 * @return array{parent: int, attributes: array<mixed>, keys: array<int, string>, pre_24: bool}
@@ -3899,24 +4301,28 @@ final class InventorySync {
 
 	/**
 	 * Read the children transients of these variable products
-	 * (variable_children()), their stored variation maps and the maps' epoch
-	 * (stored_first_siblings()) into the request's caches at once: one
-	 * options query without a persistent object cache, one multi-get with
-	 * one.
+	 * (variable_children()) and, with $stored_maps, their stored variation
+	 * maps and the maps' epoch (stored_first_siblings()) into the request's
+	 * caches at once: one options query without a persistent object cache,
+	 * one multi-get with one.
 	 *
-	 * @param array<int, int> $parent_ids Product ids.
+	 * @param array<int, int> $parent_ids  Product ids.
+	 * @param bool            $stored_maps Read the stored variation maps and their epoch too.
 	 * @return void
 	 */
-	private function prime_variable_children( array $parent_ids ): void {
+	private function prime_variable_children( array $parent_ids, bool $stored_maps = true ): void {
 		if ( [] === $parent_ids ) {
 			return;
 		}
 
-		$names = [ self::STORED_MAP_EPOCH ];
+		$names = $stored_maps ? [ self::STORED_MAP_EPOCH ] : [];
 
 		foreach ( $parent_ids as $parent_id ) {
 			$names[] = 'wc_product_children_' . (int) $parent_id;
-			$names[] = self::STORED_MAP_PREFIX . (int) $parent_id;
+
+			if ( $stored_maps ) {
+				$names[] = self::STORED_MAP_PREFIX . (int) $parent_id;
+			}
 		}
 
 		if ( wp_using_ext_object_cache() ) {
@@ -3933,6 +4339,98 @@ final class InventorySync {
 		}
 
 		wp_prime_option_caches( $options );
+	}
+
+	/**
+	 * Before the stock mirror matches the variation of each copy parent
+	 * (sync_variation_stock()), read for all of the parents at once what
+	 * those matches would read one parent at a time:
+	 * - the parents' posts and meta, which the opt-out check reads;
+	 * - with a persistent object cache, the terms of each parent the match
+	 *   builds because its children list cannot be used (sibling_children()),
+	 *   which wc_get_product() reads. The type check in variable_children()
+	 *   reads a parent's product_type terms only once WooCommerce's product
+	 *   cache has lost the parent's type (a save of the product or of one of
+	 *   its variations), and from the object cache while that holds them. The
+	 *   children lists are not read ahead, since a list found missing there
+	 *   is fetched again when it is asked for;
+	 * - without one, the children lists (variable_children()) and the terms
+	 *   of every parent, since WooCommerce reads each parent's product type
+	 *   from its terms in every request;
+	 * - the translation group of every attribute term that the source's
+	 *   parent and the parents carry in the source's attribute taxonomies
+	 *   (prime_canonical_attr_values()), which comparing the source's
+	 *   attributes with those of each parent's variations otherwise reads
+	 *   term by term, a lookup by slug and a group query each: the groups in
+	 *   one query, from the term relationships in those taxonomies, read
+	 *   once per taxonomy with a persistent object cache and, without one,
+	 *   with the terms above, the source's parent among them. A parent whose
+	 *   relationships the object cache no longer holds is compared term by
+	 *   term.
+	 * Parents whose variation map this request already holds and opted-out
+	 * parents are left out. The posts, meta and children lists are read only
+	 * for two or more parents, and the terms for two or more products, so
+	 * each read takes the place of reads the matches would make.
+	 *
+	 * @param array<int, int>    $parent_ids    Copy parents.
+	 * @param int                $source_parent The source variation's parent.
+	 * @param array<int, string> $keys          The source variation's attribute keys.
+	 * @return void
+	 */
+	private function prime_copy_parents( array $parent_ids, int $source_parent, array $keys ): void {
+		$this->drop_memos_after_link_changes();
+
+		$blog    = get_current_blog_id();
+		$parents = array_values( array_filter( wp_parse_id_list( $parent_ids ), static fn( int $id ): bool => $id > 0 && ! isset( self::$variation_maps[ $blog ][ $id ] ) ) );
+
+		if ( [] === $parents ) {
+			return;
+		}
+
+		if ( count( $parents ) > 1 ) {
+			_prime_post_caches( $parents, false, true );
+		}
+
+		$parents    = array_values( array_filter( $parents, fn( int $id ): bool => ! $this->is_sync_opted_out( $id ) ) );
+		$taxonomies = array_values( array_filter( $keys, static fn( string $key ): bool => str_starts_with( $key, 'pa_' ) && taxonomy_exists( $key ) ) );
+
+		if ( [] === $parents ) {
+			return;
+		}
+
+		$terms = $parents;
+
+		if ( wp_using_ext_object_cache() ) {
+			if ( count( $parents ) > 1 ) {
+				$terms = array_values( array_filter( $parents, fn( int $id ): bool => null === $this->variable_children( $id ) ) );
+			}
+		} else {
+			if ( count( $parents ) > 1 && false === has_filter( 'woocommerce_get_children' ) && $this->reads_cpt_variation_stores() ) {
+				$this->prime_variable_children( $parents, false );
+			}
+
+			if ( [] !== $taxonomies ) {
+				$terms[] = $source_parent;
+			}
+		}
+
+		if ( count( $terms ) > 1 ) {
+			_prime_post_caches( $terms, true, false );
+		}
+
+		if ( [] === $taxonomies ) {
+			return;
+		}
+
+		$products = array_merge( [ $source_parent ], $parents );
+
+		if ( wp_using_ext_object_cache() ) {
+			foreach ( $taxonomies as $taxonomy ) {
+				wp_cache_get_multiple( $products, $taxonomy . '_relationships' );
+			}
+		}
+
+		$this->prime_canonical_attr_values( $products, $taxonomies );
 	}
 
 	/**
@@ -4098,7 +4596,7 @@ final class InventorySync {
 		}
 
 		if ( ! isset( self::$first_matches[ $blog ][ $parent_id ] ) && count( self::$first_matches[ $blog ] ?? [] ) >= 16 ) {
-			unset( self::$first_matches[ $blog ] );
+			unset( self::$first_matches[ $blog ], self::$match_unique[ $blog ] );
 		}
 
 		self::$first_matches[ $blog ][ $parent_id ][ $sig ] = $found;
@@ -4120,7 +4618,9 @@ final class InventorySync {
 			: (int) wp_get_post_parent_id( (int) $variation_id );
 
 		if ( $parent_id > 0 ) {
-			unset( self::$variation_maps[ get_current_blog_id() ][ $parent_id ], self::$first_matches[ get_current_blog_id() ][ $parent_id ] );
+			$blog = get_current_blog_id();
+
+			unset( self::$variation_maps[ $blog ][ $parent_id ], self::$first_matches[ $blog ][ $parent_id ], self::$variation_dups[ $blog ][ $parent_id ], self::$match_unique[ $blog ][ $parent_id ] );
 		}
 	}
 
@@ -4228,10 +4728,12 @@ final class InventorySync {
 			return self::$variation_maps[ $blog ][ $parent_id ];
 		}
 
-		$set = $this->sibling_children( $parent_id );
-		$map = null !== $set ? $this->build_variation_map( $parent_id, $set ) : [];
+		$set    = $this->sibling_children( $parent_id );
+		$tokens = null;
+		$dups   = [];
+		$map    = null !== $set ? $this->build_variation_map( $parent_id, $set, $tokens, $dups ) : [];
 
-		$this->remember_variation_map( $blog, $parent_id, $map );
+		$this->remember_variation_map( $blog, $parent_id, $map, $dups );
 
 		return $map;
 	}
@@ -4244,15 +4746,25 @@ final class InventorySync {
 	 * @param array{children: array<int, int>, context: array<string, mixed>|null, build: bool} $set sibling_children() of the parent.
 	 * @param array<string, array<string, string>>|null                                         $tokens    When given, receives the canonical tokens
 	 *                                                                                                     of every child's values (normalise_variation_attrs()).
+	 * @param array<string, true>                                                               $dups      Receives each signature more than one
+	 *                                                                                                     child has.
+	 * @param-out array<string, true> $dups
 	 * @return array<string, int>
 	 */
-	private function build_variation_map( int $parent_id, array $set, ?array &$tokens = null ): array {
-		$map = [];
+	private function build_variation_map( int $parent_id, array $set, ?array &$tokens = null, array &$dups = [] ): array {
+		$map  = [];
+		$dups = [];
 
 		foreach ( $set['children'] as $child_id ) {
 			$sig = $this->child_signature( (int) $child_id, $set['context'], $parent_id, $tokens );
 
-			if ( null !== $sig && ! isset( $map[ $sig ] ) ) {
+			if ( null === $sig ) {
+				continue;
+			}
+
+			if ( isset( $map[ $sig ] ) ) {
+				$dups[ $sig ] = true;
+			} else {
 				$map[ $sig ] = (int) $child_id;
 			}
 		}
@@ -4262,19 +4774,22 @@ final class InventorySync {
 
 	/**
 	 * Keep a parent's variation map for the request (sibling_variation_map()),
-	 * in the blog's bounded bucket.
+	 * in the blog's bounded bucket, with the signatures more than one of its
+	 * children has.
 	 *
-	 * @param int                $blog      Blog id.
-	 * @param int                $parent_id Parent product id.
-	 * @param array<string, int> $map       Attribute-signature => variation-id map.
+	 * @param int                 $blog      Blog id.
+	 * @param int                 $parent_id Parent product id.
+	 * @param array<string, int>  $map       Attribute-signature => variation-id map.
+	 * @param array<string, true> $dups      Signatures more than one child has.
 	 * @return void
 	 */
-	private function remember_variation_map( int $blog, int $parent_id, array $map ): void {
+	private function remember_variation_map( int $blog, int $parent_id, array $map, array $dups ): void {
 		if ( ! isset( self::$variation_maps[ $blog ][ $parent_id ] ) && count( self::$variation_maps[ $blog ] ?? [] ) >= 16 ) {
-			unset( self::$variation_maps[ $blog ] );
+			unset( self::$variation_maps[ $blog ], self::$variation_dups[ $blog ] );
 		}
 
 		self::$variation_maps[ $blog ][ $parent_id ] = $map;
+		self::$variation_dups[ $blog ][ $parent_id ] = $dups;
 	}
 
 	/**
@@ -4287,7 +4802,8 @@ final class InventorySync {
 	 * autoloaded. It is read together with WooCommerce's children transients
 	 * (prime_variable_children()). It holds what sibling_variation_map()
 	 * holds: each attribute signature of the parent's children
-	 * (child_signature()) and the first child with it. It is used only while
+	 * (child_signature()) and the first child with it, and the signatures
+	 * more than one child has. It is used only while
 	 * all of these hold:
 	 * - it carries the blog's current epoch (STORED_MAP_EPOCH), which
 	 *   changes that can alter a match renew (forget_stock_matches()), at the
@@ -4372,10 +4888,18 @@ final class InventorySync {
 					$answers[ $parent_id ] = $child_id;
 
 					if ( ! isset( self::$first_matches[ $blog ][ $parent_id ] ) && count( self::$first_matches[ $blog ] ?? [] ) >= 16 ) {
-						unset( self::$first_matches[ $blog ] );
+						unset( self::$first_matches[ $blog ], self::$match_unique[ $blog ] );
 					}
 
 					self::$first_matches[ $blog ][ $parent_id ][ $sig ] = $child_id;
+
+					// A map stored without its duplicate signatures leaves
+					// the answer's uniqueness unknown.
+					if ( is_array( $stored['d'] ?? null ) ) {
+						self::$match_unique[ $blog ][ $parent_id ][ $sig ] = ! isset( $stored['d'][ $sig ] );
+					} else {
+						unset( self::$match_unique[ $blog ][ $parent_id ][ $sig ] );
+					}
 				} else {
 					$rebuild[ $parent_id ] = [ $set, $state, $stored ];
 				}
@@ -4406,15 +4930,17 @@ final class InventorySync {
 
 		foreach ( $rebuild as $parent_id => [ $set, $state, $stored ] ) {
 			$tokens = [];
-			$map    = $this->build_variation_map( $parent_id, $set, $tokens );
+			$dups   = [];
+			$map    = $this->build_variation_map( $parent_id, $set, $tokens, $dups );
 
-			$this->remember_variation_map( $blog, $parent_id, $map );
+			$this->remember_variation_map( $blog, $parent_id, $map, $dups );
 
 			$entry = [
 				'e' => $epoch,
 				's' => $state,
 				't' => $tokens,
 				'm' => $map,
+				'd' => $dups,
 			];
 
 			if ( '' !== $epoch && $entry !== $stored ) {
@@ -4465,11 +4991,1185 @@ final class InventorySync {
 	}
 
 	/**
+	 * Whether stored copy maps can be read and stored in this request: the
+	 * variations and variable products are read by WooCommerce's own
+	 * post-table stores, no callback changes a variation's attributes, a
+	 * product's children, the children's query or a product's type, and the
+	 * maps are switched on (copy_maps_enabled()). A callback on the class a
+	 * product is built with is evaluated for each copy parent instead
+	 * (copy_parent_reads_children()). Checked in this process each time,
+	 * never stored.
+	 *
+	 * @return bool
+	 */
+	private function copy_map_ready(): bool {
+		return '' !== self::wc_version()
+			&& function_exists( 'wc_get_product_variation_attributes' )
+			&& false === has_filter( 'woocommerce_product_variation_get_attributes' )
+			&& false === has_filter( 'woocommerce_get_children' )
+			&& false === has_filter( 'woocommerce_variable_children_args' )
+			&& false === has_filter( 'woocommerce_product_type_query' )
+			&& self::copy_maps_enabled()
+			&& $this->reads_cpt_variation_stores();
+	}
+
+	/**
+	 * Whether cart and checkout stock checks use the stored copy maps, by
+	 * the `perflocale/woocommerce/stock_map_enabled` filter, applied each
+	 * time it is asked. The stored maps also give the copies for the stock
+	 * sync of an order placed after such a check in the same request
+	 * (sync_variation_stock()). The listeners that retire the maps stay
+	 * registered either way, and the stored variation maps of each product
+	 * (stored_first_siblings()) are not affected. A translation link of an
+	 * attribute term changed directly in the database is not seen by a
+	 * stored map, for the stock check and for the order's stock sync alike,
+	 * until the cache is cleared.
+	 *
+	 * @return bool
+	 */
+	private static function copy_maps_enabled(): bool {
+		/**
+		 * Filter whether cart and checkout stock checks use stored stock
+		 * maps: the stored answer, per variation, to which variation of each
+		 * language copy matches it. The same stored answer gives the copies
+		 * whose stock moves when an order placed after the check in the same
+		 * request reduces the stock. False looks the matching variations up
+		 * on every check and on every stock sync. Stock, held stock, stock
+		 * management and the opt-out are always read live. Does not switch
+		 * Inventory Sync. After changing translation links of attribute
+		 * terms directly in the database, clear the cache: until then the
+		 * stored maps, for the check and for the order's stock sync, do not
+		 * see the change.
+		 *
+		 * @hook perflocale/woocommerce/stock_map_enabled
+		 * @param bool $enabled Default true.
+		 */
+		return (bool) apply_filters( 'perflocale/woocommerce/stock_map_enabled', true );
+	}
+
+	/**
+	 * Whether WooCommerce builds a copy parent, as a variable product, as
+	 * WC_Product_Variable itself, so that its children are the ones its
+	 * children list holds (variable_children()). Only a callback on
+	 * `woocommerce_product_class` can make it another class; the filter is
+	 * applied here, for this parent, with the arguments
+	 * WC_Product_Factory::get_product_classname() gives it.
+	 *
+	 * @param int $parent_id Copy parent id.
+	 * @return bool
+	 */
+	private static function copy_parent_reads_children( int $parent_id ): bool {
+		if ( false === has_filter( 'woocommerce_product_class' ) ) {
+			return true;
+		}
+
+		return 'WC_Product_Variable' === apply_filters( 'woocommerce_product_class', 'WC_Product_Variable', 'variable', 'product', $parent_id ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WooCommerce's own filter, applied as WC_Product_Factory::get_product_classname() applies it.
+	}
+
+	/**
+	 * WooCommerce's version, or '' when it is not loaded.
+	 *
+	 * @return string
+	 */
+	private static function wc_version(): string {
+		$version = defined( 'WC_VERSION' ) ? constant( 'WC_VERSION' ) : '';
+
+		return is_string( $version ) ? $version : '';
+	}
+
+	/**
+	 * Seconds a copy-map epoch must have existed before a copy map is stored
+	 * with it. Longer than any request and any database replica's lag, so
+	 * the data a stored map is built from is read after every change that
+	 * renewed the epoch before it was made has committed. A filter can raise
+	 * it, never lower it below COPY_MAP_SETTLE. Read only when a missing map
+	 * may be stored (stored_variation_copies()).
+	 *
+	 * @return int
+	 */
+	private function copy_map_settle_seconds(): int {
+		/**
+		 * Filter the seconds a copy-map epoch must have existed before a
+		 * stored copy map is written with it. Values below the default are
+		 * ignored, so a filter cannot remove the wait.
+		 *
+		 * @hook perflocale/woocommerce/stock_map_settle_seconds
+		 * @param int $seconds Default 60.
+		 */
+		return max( self::COPY_MAP_SETTLE, (int) apply_filters( 'perflocale/woocommerce/stock_map_settle_seconds', self::COPY_MAP_SETTLE ) );
+	}
+
+	/**
+	 * The unix time a copy-map epoch value was made, or null when the value
+	 * does not carry one.
+	 *
+	 * @param string $epoch Epoch value.
+	 * @return int|null
+	 */
+	private static function copy_epoch_time( string $epoch ): ?int {
+		$parts = explode( '|', $epoch );
+
+		return 2 === count( $parts ) && '' !== $parts[0] && \PerfLocale\Helper::is_ascii_digits( $parts[1] ) ? (int) $parts[1] : null;
+	}
+
+	/**
+	 * Stock ids of the cart lines that manage stock, on the blog the cart
+	 * was loaded on. Empty without a cart and while another blog is
+	 * switched to.
+	 *
+	 * @return array<int, int>
+	 */
+	private function cart_stock_ids(): array {
+		$wc   = function_exists( 'WC' ) && ! ( is_multisite() && ms_is_switched() ) ? WC() : null;
+		$cart = is_object( $wc ) && property_exists( $wc, 'cart' ) ? $wc->cart : null;
+
+		// get_cart_contents(), unlike get_cart(), never loads the session.
+		$lines = is_object( $cart ) && method_exists( $cart, 'get_cart_contents' ) ? $cart->get_cart_contents() : null;
+		$ids   = [];
+
+		foreach ( is_array( $lines ) ? $lines : [] as $line ) {
+			$product = is_array( $line ) ? ( $line['data'] ?? null ) : null;
+
+			if ( is_object( $product ) && method_exists( $product, 'managing_stock' ) && method_exists( $product, 'get_stock_managed_by_id' ) && true === $product->managing_stock() ) {
+				$id    = $product->get_stock_managed_by_id();
+				$ids[] = is_numeric( $id ) ? (int) $id : 0;
+			}
+		}
+
+		return array_values( array_unique( array_filter( $ids ) ) );
+	}
+
+	/**
+	 * Whether a copy map found missing for this variation may be stored now:
+	 * the variation is the stock id of a cart line, or an order's stock hold
+	 * has started (the checkout, pay-for-order). Never while the Store API
+	 * computes product data outside a cart.
+	 *
+	 * @param int $variation_id Source variation id.
+	 * @return bool
+	 */
+	private function may_record_copies( int $variation_id ): bool {
+		if ( $this->catalog_limits ) {
+			return false;
+		}
+
+		return $this->stock_hold_started || in_array( $variation_id, $this->cart_stock_ids(), true );
+	}
+
+	/**
+	 * Read both epochs and the stored copy maps of these variations into this
+	 * process's view of the blog (copy_reads), in one read: one multi-get
+	 * with a persistent object cache, else one options query. Ids read in the
+	 * last COPY_EPOCH_REREAD seconds are not read again; after that the
+	 * epochs and maps are read from the store again, not from this process's
+	 * runtime copy. A renewal this process still owes is made first.
+	 *
+	 * @param array<int, int> $variation_ids Source variation ids.
+	 * @param bool            $create        Make the copy-map epoch when it is missing or unreadable.
+	 * @return array{vsig: string, copy: string, time: int, created: bool}
+	 *         Both epochs ('' when missing), the unix time the copy-map epoch
+	 *         was made (0 when missing), and whether this read made it.
+	 */
+	private function read_copy_maps( array $variation_ids, bool $create ): array {
+		$blog = get_current_blog_id();
+
+		if ( isset( $this->epoch_pending[ $blog ] ) ) {
+			$this->renew_stored_map_epoch();
+		}
+
+		$view  = $this->copy_reads[ $blog ] ?? null;
+		$fresh = null !== $view && microtime( true ) - $view['at'] <= self::COPY_EPOCH_REREAD;
+		$ids   = [];
+
+		foreach ( $variation_ids as $id ) {
+			$id = (int) $id;
+
+			if ( $id > 0 && ! ( $fresh && array_key_exists( $id, $view['rows'] ) ) ) {
+				$ids[ $id ] = self::VARIATION_COPY_PREFIX . $id;
+			}
+		}
+
+		if ( ! $fresh ) {
+			$got  = $this->read_transients( array_merge( [ self::STORED_MAP_EPOCH, self::COPY_MAP_EPOCH ], array_values( $ids ) ), null !== $view );
+			$view = [
+				'at'   => microtime( true ),
+				'vsig' => is_string( $got[ self::STORED_MAP_EPOCH ] ?? null ) ? $got[ self::STORED_MAP_EPOCH ] : '',
+				'copy' => is_string( $got[ self::COPY_MAP_EPOCH ] ?? null ) ? $got[ self::COPY_MAP_EPOCH ] : '',
+				'made' => false,
+				'rows' => [],
+			];
+		} elseif ( [] !== $ids ) {
+			$got = $this->read_transients( array_values( $ids ), false );
+		} else {
+			$got = [];
+		}
+
+		if ( count( $view['rows'] ) + count( $ids ) > 256 ) {
+			$view['rows'] = [];
+		}
+
+		foreach ( $ids as $id => $name ) {
+			$view['rows'][ $id ] = $got[ $name ] ?? false;
+		}
+
+		// A missing or unreadable epoch is made here; nothing is stored with
+		// it until this process reads it again from the store.
+		if ( $create && null === self::copy_epoch_time( $view['copy'] ) ) {
+			$view['copy'] = wp_generate_uuid4() . '|' . time();
+			$view['made'] = true;
+
+			if ( ! self::write_transient_rows( self::COPY_MAP_EPOCH, $view['copy'], MONTH_IN_SECONDS ) ) {
+				set_transient( self::COPY_MAP_EPOCH, $view['copy'], MONTH_IN_SECONDS );
+			}
+		}
+
+		$this->copy_reads[ $blog ] = $view;
+
+		$made = self::copy_epoch_time( $view['copy'] );
+
+		return [
+			'vsig'    => $view['vsig'],
+			'copy'    => null !== $made ? $view['copy'] : '',
+			'time'    => $made ?? 0,
+			'created' => $view['made'],
+		];
+	}
+
+	/**
+	 * Several transients of the current blog in one read, by name; false for
+	 * a missing one. With $force, a persistent object cache is asked again
+	 * and, without one, this process's copies of the rows are dropped first
+	 * (their entries in `notoptions` too), so the rows are read from the
+	 * database.
+	 *
+	 * @param array<int, string> $names Transient names.
+	 * @param bool               $force Read past this process's copies.
+	 * @return array<string, mixed>
+	 */
+	private function read_transients( array $names, bool $force ): array {
+		$out = [];
+
+		if ( wp_using_ext_object_cache() ) {
+			$got = wp_cache_get_multiple( $names, 'transient', $force );
+
+			foreach ( $names as $name ) {
+				$out[ $name ] = $got[ $name ] ?? false;
+			}
+
+			return $out;
+		}
+
+		$options = [];
+
+		foreach ( $names as $name ) {
+			$options[] = '_transient_' . $name;
+			$options[] = '_transient_timeout_' . $name;
+		}
+
+		if ( $force ) {
+			$notoptions = wp_cache_get( 'notoptions', 'options' );
+			$dropped    = false;
+
+			foreach ( $options as $option ) {
+				wp_cache_delete( $option, 'options' );
+
+				if ( is_array( $notoptions ) && isset( $notoptions[ $option ] ) ) {
+					unset( $notoptions[ $option ] );
+					$dropped = true;
+				}
+			}
+
+			if ( $dropped ) {
+				wp_cache_set( 'notoptions', $notoptions, 'options' );
+			}
+		}
+
+		wp_prime_option_caches( $options );
+
+		foreach ( $names as $name ) {
+			$out[ $name ] = get_transient( $name );
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The copies of a source variation from its stored copy map.
+	 *
+	 * A stored copy map (VARIATION_COPY_PREFIX) is what stock_copies() found
+	 * for one source variation: its parent, the parent's linked products and,
+	 * for each of them, the one child variation with the source's attribute
+	 * signature, with the raw values the answer was derived from. It is used
+	 * only while copy_map_ready() holds, it carries the current
+	 * WooCommerce version and both current epochs (STORED_MAP_EPOCH,
+	 * COPY_MAP_EPOCH), and everything below still reads as it did:
+	 * - the source is a variation of the same parent, the parent's linked
+	 *   products are the same, the source's attributes (WooCommerce's
+	 *   reader) and the parent's local attribute sources are the same, and
+	 *   the same keys name a registered taxonomy, all of them `pa_*`;
+	 * - each named copy exists, is a published or private variation of its
+	 *   linked product, and reads the same attributes with that product's
+	 *   reader, whose local attribute sources are the same.
+	 * Stock, holds, stock management and the opt-out are never stored. Any
+	 * other case is a miss: stock_copies() matches the copies, and the
+	 * second value tells it whether and with which epochs the answer may be
+	 * stored (record_variation_copies()).
+	 *
+	 * @param int $variation_id Source variation id.
+	 * @return array{0: array<int, int>|null, 1: array{vsig: string, copy: string, renewals: int}|null}
+	 *         Copy parent id => copy variation id on a hit (null on a miss),
+	 *         and what a miss's answer may be stored with (null: not stored).
+	 */
+	private function stored_variation_copies( int $variation_id ): array {
+		if ( ! $this->copy_map_ready() ) {
+			return [ null, null ];
+		}
+
+		$blog   = get_current_blog_id();
+		$record = $this->may_record_copies( $variation_id );
+		$state  = $this->read_copy_maps( [ $variation_id ], $record );
+
+		if ( '' !== $state['vsig'] && '' !== $state['copy'] ) {
+			$hit = $this->copy_map_hit( $variation_id, $this->copy_reads[ $blog ]['rows'][ $variation_id ] ?? false, $state['vsig'], $state['copy'] );
+
+			if ( null !== $hit ) {
+				return [ $hit, null ];
+			}
+		}
+
+		if ( ! $record || '' === $state['vsig'] || '' === $state['copy'] || $state['created'] || time() - $state['time'] < $this->copy_map_settle_seconds() ) {
+			return [ null, null ];
+		}
+
+		return [
+			null,
+			[
+				'vsig'     => $state['vsig'],
+				'copy'     => $state['copy'],
+				'renewals' => $this->copy_renewals[ $blog ] ?? 0,
+			],
+		];
+	}
+
+	/**
+	 * The copies of a source variation from its stored copy map, only when
+	 * this request already read that map and the read is still fresh (the
+	 * cart's stock check reads it before the order reduces the stock), so the
+	 * answer costs no read. Copy parent id => copy variation id; empty when
+	 * the map is not held, not valid now, or the maps are off. The order
+	 * trusts the map under the same freshness rule as the cart check: the
+	 * view of the epochs is used for up to COPY_EPOCH_REREAD seconds, and the
+	 * map is checked again by value (stored_variation_copies()).
+	 *
+	 * @param int $variation_id Source variation id.
+	 * @return array<int, int>
+	 */
+	private function held_variation_copies( int $variation_id ): array {
+		$view = $this->copy_reads[ get_current_blog_id() ] ?? null;
+
+		if ( null === $view || microtime( true ) - $view['at'] > self::COPY_EPOCH_REREAD || ! array_key_exists( $variation_id, $view['rows'] ) || false === $view['rows'][ $variation_id ] ) {
+			return [];
+		}
+
+		[ $stored ] = $this->stored_variation_copies( $variation_id );
+
+		return is_array( $stored ) ? $stored : [];
+	}
+
+	/**
+	 * Check a stored copy map of a source variation against what it was
+	 * built from (see stored_variation_copies()).
+	 *
+	 * @param int    $variation_id Source variation id.
+	 * @param mixed  $entry        Stored copy map, as read.
+	 * @param string $vsig         Current STORED_MAP_EPOCH.
+	 * @param string $copy         Current COPY_MAP_EPOCH.
+	 * @return array<int, int>|null Copy parent id => copy variation id, or null.
+	 */
+	private function copy_map_hit( int $variation_id, mixed $entry, string $vsig, string $copy ): ?array {
+		if ( ! is_array( $entry )
+			|| self::COPY_MAP_FORMAT !== ( $entry['f'] ?? null )
+			|| self::wc_version() !== ( $entry['v'] ?? null )
+			|| $vsig !== ( $entry['e'] ?? null )
+			|| $copy !== ( $entry['t'] ?? null )
+			|| ! is_int( $entry['a'] ?? null ) || $entry['a'] <= 0
+			|| ! is_array( $entry['p'] ?? null ) || [] === $entry['p']
+			|| ! is_array( $entry['r'] ?? null )
+			|| ! is_string( $entry['h'] ?? null )
+			|| ! is_array( $entry['x'] ?? null )
+			|| ! is_array( $entry['c'] ?? null ) || count( $entry['c'] ) !== count( $entry['p'] ) ) {
+			return null;
+		}
+
+		$anchor = $entry['a'];
+		$post   = get_post( $variation_id );
+
+		if ( ! $post instanceof \WP_Post || 'product_variation' !== $post->post_type || (int) $post->post_parent !== $anchor ) {
+			return null;
+		}
+
+		/**
+		 * Translation group repository.
+		 *
+		 * @var \PerfLocale\Database\Repository\TranslationGroupRepository $repo
+		 */
+		$repo    = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
+		$parents = array_values( array_diff( wp_parse_id_list( wp_list_pluck( $repo->get_translations( $anchor, ObjectType::Post ), 'object_id' ) ), [ $anchor ] ) );
+
+		sort( $parents );
+
+		if ( $parents !== $entry['p'] ) {
+			return null;
+		}
+
+		$src = $this->stored_variation_attributes( $variation_id );
+
+		if ( null === $src || $src !== $entry['r'] || $this->local_sources_hash( $anchor ) !== $entry['h'] ) {
+			return null;
+		}
+
+		$named = [];
+		$rows  = [];
+		$lists = [ $src ];
+
+		foreach ( $parents as $copy_parent ) {
+			$row = $entry['c'][ $copy_parent ] ?? null;
+
+			if ( ! is_array( $row ) || ! is_int( $row['i'] ?? null ) || $row['i'] <= 0 || ! is_array( $row['r'] ?? null ) || ! is_string( $row['h'] ?? null ) ) {
+				return null;
+			}
+
+			$named[ $copy_parent ] = $row['i'];
+			$rows[ $copy_parent ]  = [ $row['r'], $row['h'] ];
+			$lists[]               = $row['r'];
+		}
+
+		$keys = $this->taxonomy_keys( $lists );
+
+		if ( $keys !== $entry['x'] ) {
+			return null;
+		}
+
+		foreach ( $keys as $key ) {
+			if ( ! str_starts_with( $key, 'pa_' ) ) {
+				return null;
+			}
+		}
+
+		// The named copies' and their parents' posts and meta in one query
+		// each; the stock group reads the same rows next.
+		_prime_post_caches( array_merge( array_values( $named ), $parents ), false, true );
+
+		foreach ( $named as $copy_parent => $copy_id ) {
+			$copy_post = get_post( $copy_id );
+
+			if ( ! $copy_post instanceof \WP_Post
+				|| 'product_variation' !== $copy_post->post_type
+				|| (int) $copy_post->post_parent !== $copy_parent
+				|| ! self::copy_parent_reads_children( $copy_parent )
+				|| ! in_array( $copy_post->post_status, [ 'publish', 'private' ], true )
+				|| $this->stored_variation_attributes( $copy_id, $this->variation_attribute_context( $copy_parent ) ) !== $rows[ $copy_parent ][0]
+				|| $this->local_sources_hash( $copy_parent ) !== $rows[ $copy_parent ][1] ) {
+				return null;
+			}
+		}
+
+		return $named;
+	}
+
+	/**
+	 * Before stock_copies() matches copies whose answer may be stored: when
+	 * this process has not done so under the current epoch pair, empty the
+	 * blog's memos built from translation groups and variation maps, and the
+	 * repository's per-process term group lookups. The answer is then built
+	 * only from data read after the epochs were seen settled.
+	 *
+	 * @param array{vsig: string, copy: string, renewals: int} $record What the answer may be stored with.
+	 * @return void
+	 */
+	private function prepare_copy_map_build( array $record ): void {
+		$blog  = get_current_blog_id();
+		$stamp = $record['vsig'] . '|' . $record['copy'];
+
+		if ( ( $this->copy_stamps[ $blog ] ?? '' ) === $stamp ) {
+			return;
+		}
+
+		$this->copy_stamps[ $blog ] = $stamp;
+
+		unset( self::$canonical_attr_memo[ $blog ], self::$variation_maps[ $blog ], self::$first_matches[ $blog ], self::$variation_dups[ $blog ], self::$match_unique[ $blog ] );
+
+		\PerfLocale\Database\Repository\TranslationGroupRepository::forget_found_groups( ObjectType::Term );
+	}
+
+	/**
+	 * Store the copy map of a source variation that stock_copies() just
+	 * matched (see stored_variation_copies()). Nothing is stored unless all
+	 * of these hold:
+	 * - neither epoch was renewed by this process since they were read, and
+	 *   no renewal is owed;
+	 * - every linked product of the source's parent, opted out or not, has a
+	 *   copy that a stored or freshly built variation map names as the only
+	 *   child with the source's signature;
+	 * - every key that names a registered taxonomy is a `pa_*` attribute;
+	 * - the map passes the checks a read makes (copy_map_hit()) and is at
+	 *   most COPY_MAP_MAX_BYTES serialised.
+	 * Without a persistent object cache the map's two rows are written in one
+	 * statement (write_transient_rows()).
+	 *
+	 * @param int                                              $variation_id Source variation id.
+	 * @param int                                              $parent_id    Its parent.
+	 * @param array<int, int>                                  $parents      The parent's linked products, the parent excluded.
+	 * @param array<string, string>                            $src          Source attributes (stored_variation_attributes()).
+	 * @param array<string, string>                            $attrs        The same, normalised.
+	 * @param array<int, int>                                  $answers      What stored_first_siblings() answered.
+	 * @param array{vsig: string, copy: string, renewals: int} $record       Epochs read before the match.
+	 * @return void
+	 */
+	private function record_variation_copies( int $variation_id, int $parent_id, array $parents, array $src, array $attrs, array $answers, array $record ): void {
+		$blog = get_current_blog_id();
+
+		if ( [] === $parents || ( $this->copy_renewals[ $blog ] ?? 0 ) !== $record['renewals'] || isset( $this->epoch_pending[ $blog ] ) || ! $this->copy_map_ready() ) {
+			return;
+		}
+
+		$sig  = (string) wp_json_encode( $attrs );
+		$rows = [];
+
+		foreach ( $parents as $copy_parent ) {
+			$copy_parent = (int) $copy_parent;
+			$copy_id     = $this->unique_answer( $copy_parent, $sig );
+
+			if ( $copy_id <= 0 || ( isset( $answers[ $copy_parent ] ) && (int) $answers[ $copy_parent ] !== $copy_id ) ) {
+				return;
+			}
+
+			$copy_attrs = $this->stored_variation_attributes( $copy_id, $this->variation_attribute_context( $copy_parent ) );
+
+			if ( null === $copy_attrs ) {
+				return;
+			}
+
+			$rows[ $copy_parent ] = [
+				'i' => $copy_id,
+				'r' => $copy_attrs,
+				'h' => $this->local_sources_hash( $copy_parent ),
+			];
+		}
+
+		$sorted = array_map( 'intval', $parents );
+		sort( $sorted );
+		ksort( $rows );
+
+		$keys = $this->taxonomy_keys( array_merge( [ $src ], array_column( $rows, 'r' ) ) );
+
+		foreach ( $keys as $key ) {
+			if ( ! str_starts_with( $key, 'pa_' ) ) {
+				return;
+			}
+		}
+
+		$entry = [
+			'f' => self::COPY_MAP_FORMAT,
+			'v' => self::wc_version(),
+			'e' => $record['vsig'],
+			't' => $record['copy'],
+			'a' => $parent_id,
+			'p' => $sorted,
+			'r' => $src,
+			'h' => $this->local_sources_hash( $parent_id ),
+			'x' => $keys,
+			'c' => $rows,
+		];
+
+		if ( strlen( (string) wp_json_encode( $entry ) ) > self::COPY_MAP_MAX_BYTES || null === $this->copy_map_hit( $variation_id, $entry, $record['vsig'], $record['copy'] ) ) {
+			return;
+		}
+
+		if ( ! self::write_transient_rows( self::VARIATION_COPY_PREFIX . $variation_id, $entry, self::COPY_MAP_TTL ) ) {
+			set_transient( self::VARIATION_COPY_PREFIX . $variation_id, $entry, self::COPY_MAP_TTL );
+		}
+
+		if ( isset( $this->copy_reads[ $blog ] ) ) {
+			$this->copy_reads[ $blog ]['rows'][ $variation_id ] = $entry;
+		}
+	}
+
+	/**
+	 * The copy a variation map built or read in this request names for a
+	 * signature, when the map says no other child of the parent has it; 0
+	 * otherwise (no map, no match, a duplicate, or uniqueness unknown).
+	 *
+	 * @param int    $parent_id Copy parent id.
+	 * @param string $sig       Normalised source signature.
+	 * @return int
+	 */
+	private function unique_answer( int $parent_id, string $sig ): int {
+		$blog = get_current_blog_id();
+
+		if ( isset( self::$variation_maps[ $blog ][ $parent_id ] ) ) {
+			if ( ! isset( self::$variation_dups[ $blog ][ $parent_id ] ) || isset( self::$variation_dups[ $blog ][ $parent_id ][ $sig ] ) ) {
+				return 0;
+			}
+
+			return (int) ( self::$variation_maps[ $blog ][ $parent_id ][ $sig ] ?? 0 );
+		}
+
+		if ( isset( self::$first_matches[ $blog ][ $parent_id ][ $sig ] ) && true === ( self::$match_unique[ $blog ][ $parent_id ][ $sig ] ?? null ) ) {
+			return (int) self::$first_matches[ $blog ][ $parent_id ][ $sig ];
+		}
+
+		return 0;
+	}
+
+	/**
+	 * A product's local attribute sources (LOCAL_ATTR_SOURCE_META) as one
+	 * hash, read from its meta cache.
+	 *
+	 * @param int $product_id Product id.
+	 * @return string
+	 */
+	private function local_sources_hash( int $product_id ): string {
+		return md5( (string) wp_json_encode( get_post_meta( $product_id, self::LOCAL_ATTR_SOURCE_META, true ) ) );
+	}
+
+	/**
+	 * The attribute keys of these attribute lists that name a registered
+	 * taxonomy, sorted.
+	 *
+	 * @param array<int, array<mixed>> $lists Attribute key => value lists.
+	 * @return array<int, string>
+	 */
+	private function taxonomy_keys( array $lists ): array {
+		$keys = [];
+
+		foreach ( $lists as $list ) {
+			foreach ( array_keys( $list ) as $key ) {
+				$key = (string) $key;
+
+				if ( '' !== $key && taxonomy_exists( $key ) ) {
+					$keys[ $key ] = true;
+				}
+			}
+		}
+
+		$keys = array_map( 'strval', array_keys( $keys ) );
+		sort( $keys );
+
+		return $keys;
+	}
+
+	/**
+	 * Before the first group of a cart line is built, read what every
+	 * stock-managed cart line's group needs at once: the translations of
+	 * each line's product (a variation's parent), the stored copy maps and
+	 * both epochs (only with a variation line and only when
+	 * copy_map_ready()), and the posts and meta of the copies and copy
+	 * parents the maps name and of the simple products' copies. Groups are
+	 * still built one stock id at a time, when asked for. Once per blog in
+	 * a process, for at most COPY_MAP_BATCH lines whose group is not built
+	 * yet, and only when there are two or more of them.
+	 *
+	 * @param int $stock_id Stock id whose group is about to be built.
+	 * @return void
+	 */
+	private function prime_cart_copy_maps( int $stock_id ): void {
+		$blog = get_current_blog_id();
+
+		if ( isset( $this->cart_primed[ $blog ] ) ) {
+			return;
+		}
+
+		$ids = $this->cart_stock_ids();
+
+		if ( ! in_array( $stock_id, $ids, true ) ) {
+			return;
+		}
+
+		$ids = array_slice( array_values( array_filter( $ids, fn( int $id ): bool => ! isset( $this->stock_groups[ $blog ][ $id ] ) ) ), 0, self::COPY_MAP_BATCH );
+
+		if ( count( $ids ) < 2 ) {
+			return;
+		}
+
+		$this->cart_primed[ $blog ] = implode( ',', $ids );
+
+		$variations = [];
+		$products   = [];
+		$anchors    = [];
+
+		foreach ( $ids as $id ) {
+			$post = get_post( $id );
+
+			if ( ! $post instanceof \WP_Post ) {
+				continue;
+			}
+
+			if ( 'product_variation' === $post->post_type ) {
+				$variations[] = $id;
+				$anchors[]    = (int) $post->post_parent;
+			} else {
+				$products[] = $id;
+				$anchors[]  = $id;
+			}
+		}
+
+		/**
+		 * Translation group repository.
+		 *
+		 * @var \PerfLocale\Database\Repository\TranslationGroupRepository $repo
+		 */
+		$repo = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
+		$repo->prime_translations( ObjectType::Post, array_values( array_filter( $anchors ) ) );
+
+		$prime = [];
+
+		if ( [] !== $variations && $this->copy_map_ready() ) {
+			$state = $this->read_copy_maps( $variations, ! $this->catalog_limits );
+
+			foreach ( $variations as $id ) {
+				$entry = $this->copy_reads[ $blog ]['rows'][ $id ] ?? false;
+
+				if ( ! is_array( $entry ) || '' === $state['copy'] || $state['copy'] !== ( $entry['t'] ?? null ) || $state['vsig'] !== ( $entry['e'] ?? null ) || ! is_array( $entry['c'] ?? null ) ) {
+					continue;
+				}
+
+				foreach ( $entry['c'] as $copy_parent => $row ) {
+					$prime[] = (int) $copy_parent;
+
+					if ( is_array( $row ) && is_int( $row['i'] ?? null ) ) {
+						$prime[] = $row['i'];
+					}
+				}
+			}
+		}
+
+		foreach ( $products as $id ) {
+			$prime = array_merge( $prime, array_diff( wp_parse_id_list( wp_list_pluck( $repo->get_translations( $id, ObjectType::Post ), 'object_id' ) ), [ $id ] ) );
+		}
+
+		$prime = array_values( array_unique( array_filter( $prime ) ) );
+
+		if ( [] !== $prime ) {
+			_prime_post_caches( $prime, false, true );
+		}
+	}
+
+	/**
+	 * Delete the current blog's copy-map epoch, which retires every stored
+	 * copy map of the blog in every process. Unconditional: whatever this
+	 * process holds of the epoch, the store is asked, and it needs no write
+	 * space in the cache. Without a persistent object cache its value row is
+	 * read by its key and, when it is stored, both of its rows are deleted in
+	 * one statement (delete_transient_rows()).
+	 *
+	 * @return void
+	 */
+	private function delete_copy_map_epoch(): void {
+		$blog = get_current_blog_id();
+
+		$this->copy_renewals[ $blog ] = ( $this->copy_renewals[ $blog ] ?? 0 ) + 1;
+		unset( $this->copy_reads[ $blog ] );
+
+		if ( ! self::delete_transient_rows( self::COPY_MAP_EPOCH ) ) {
+			delete_transient( self::COPY_MAP_EPOCH );
+		}
+	}
+
+	/**
+	 * Store a transient with an expiry in one statement where transients are
+	 * rows of the options table (no persistent object cache, not installing):
+	 * the value row and the timeout row that set_transient() writes, written
+	 * together, inserted or replaced, never autoloaded. This request's options
+	 * cache is then left as add_option() leaves it: both values cached, both
+	 * names out of `notoptions`. False when transients are stored elsewhere or
+	 * the statement fails, or when a callback filters reads of these rows
+	 * (transient_rows_read_filtered()); the caller then stores it with
+	 * set_transient(). The option and transient hooks of these rows do not
+	 * fire; no PerfLocale callback acts on them.
+	 *
+	 * @param string $transient Transient name.
+	 * @param mixed  $value     Value.
+	 * @param int    $ttl       Seconds until it expires.
+	 * @return bool
+	 */
+	private static function write_transient_rows( string $transient, mixed $value, int $ttl ): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb || wp_using_ext_object_cache() || wp_installing() || self::transient_rows_read_filtered( $transient ) ) {
+			return false;
+		}
+
+		$stored = maybe_serialize( $value );
+
+		if ( ! is_string( $stored ) ) {
+			return false;
+		}
+
+		$data    = '_transient_' . $transient;
+		$timeout = '_transient_timeout_' . $transient;
+		$expires = (string) ( time() + $ttl );
+
+		// The value add_option() stores for a row that is not autoloaded.
+		$autoload = function_exists( 'wp_autoload_values_to_autoload' ) ? 'off' : 'no';
+
+		// The rows in key order, the order a delete of both locks them in.
+		$sql = $wpdb->prepare(
+			'INSERT INTO %i (option_name, option_value, autoload) VALUES (%s, %s, %s), (%s, %s, %s) ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = VALUES(autoload)',
+			$wpdb->options,
+			$data,
+			$stored,
+			$autoload,
+			$timeout,
+			$expires,
+			$autoload
+		);
+
+		if ( ! is_string( $sql ) ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The two rows set_transient() writes, in one prepared statement; the options cache is set below.
+		$written = $wpdb->query( $sql );
+
+		if ( false === $written ) {
+			return false;
+		}
+
+		wp_cache_set( $data, $stored, 'options' );
+		wp_cache_set( $timeout, $expires, 'options' );
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		if ( is_array( $notoptions ) && ( isset( $notoptions[ $data ] ) || isset( $notoptions[ $timeout ] ) ) ) {
+			unset( $notoptions[ $data ], $notoptions[ $timeout ] );
+			wp_cache_set( 'notoptions', $notoptions, 'options' );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether a callback filters reads of a transient's rows before the
+	 * options table answers them: WordPress's `pre_option` filter, the
+	 * `pre_option_{$option}` filter of either row, or the transient's
+	 * `pre_transient_{$transient}` filter. Code that answers those reads
+	 * itself relies on the option and transient hooks of the writes, which
+	 * only the transient API fires.
+	 *
+	 * @param string $transient Transient name.
+	 * @return bool
+	 */
+	private static function transient_rows_read_filtered( string $transient ): bool {
+		return false !== has_filter( 'pre_option' )
+			|| false !== has_filter( 'pre_option__transient_' . $transient )
+			|| false !== has_filter( 'pre_option__transient_timeout_' . $transient )
+			|| false !== has_filter( 'pre_transient_' . $transient );
+	}
+
+	/**
+	 * Delete a transient where transients are rows of the options table (no
+	 * persistent object cache, not installing): one read of its value row by
+	 * its key, as delete_option() reads it, then, when that row is stored, one
+	 * statement that deletes the value row and the timeout row. No delete
+	 * runs that could match no row: where the binary log records statements,
+	 * such a delete is still a logged write.
+	 * - Value row not stored: nothing is written and `notoptions` is left as
+	 *   it is; a timeout row without its value row is left, as
+	 *   delete_transient() leaves it. This request's cached copies of the two
+	 *   rows are dropped: a copy of a value row the table does not hold was
+	 *   read before another process deleted it.
+	 * - Otherwise this request's options cache is left as delete_option()
+	 *   leaves it: neither value cached, both names in `notoptions`.
+	 * False when transients are stored elsewhere, a statement fails or cannot
+	 * be prepared, or a callback filters reads of these rows
+	 * (transient_rows_read_filtered()); the caller then deletes it with
+	 * delete_transient(). The option and transient hooks of these rows do not
+	 * fire; no PerfLocale callback acts on them.
+	 *
+	 * @param string $transient Transient name.
+	 * @return bool
+	 */
+	private static function delete_transient_rows( string $transient ): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb || wp_using_ext_object_cache() || wp_installing() || self::transient_rows_read_filtered( $transient ) ) {
+			return false;
+		}
+
+		$data    = '_transient_' . $transient;
+		$timeout = '_transient_timeout_' . $transient;
+
+		// One key: a unique-key lookup (a list of keys is a range read, which
+		// costs more).
+		$sql = $wpdb->prepare( 'SELECT option_name FROM %i WHERE option_name = %s', $wpdb->options, $data );
+
+		if ( ! is_string( $sql ) ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Whether the value row is stored, read past this request's options cache, in one prepared statement.
+		$found = $wpdb->query( $sql );
+
+		if ( false === $found ) {
+			return false;
+		}
+
+		if ( 0 === $found ) {
+			wp_cache_delete( $data, 'options' );
+			wp_cache_delete( $timeout, 'options' );
+
+			return true;
+		}
+
+		$sql = $wpdb->prepare( 'DELETE FROM %i WHERE option_name IN (%s, %s)', $wpdb->options, $data, $timeout );
+
+		if ( ! is_string( $sql ) ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The two rows delete_transient() deletes, in one prepared statement; the options cache is cleared below.
+		$deleted = $wpdb->query( $sql );
+
+		if ( false === $deleted ) {
+			return false;
+		}
+
+		$alloptions = wp_cache_get( 'alloptions', 'options' );
+
+		if ( is_array( $alloptions ) && ( isset( $alloptions[ $data ] ) || isset( $alloptions[ $timeout ] ) ) ) {
+			unset( $alloptions[ $data ], $alloptions[ $timeout ] );
+			wp_cache_set( 'alloptions', $alloptions, 'options' );
+		}
+
+		wp_cache_delete( $data, 'options' );
+		wp_cache_delete( $timeout, 'options' );
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+		$notoptions = is_array( $notoptions ) ? $notoptions : [];
+
+		$notoptions[ $data ]    = true;
+		$notoptions[ $timeout ] = true;
+
+		wp_cache_set( 'notoptions', $notoptions, 'options' );
+
+		return true;
+	}
+
+	/**
+	 * Retire the current blog's stored copy maps after a change of which
+	 * translation group an attribute term reads as (delete_copy_map_epoch()),
+	 * and drop this process's memos built from those groups.
+	 *
+	 * @return void
+	 */
+	public function renew_copy_map_epoch(): void {
+		$blog = get_current_blog_id();
+
+		$this->copy_link_mark = \PerfLocale\Database\Repository\TranslationGroupRepository::link_changes();
+
+		unset( $this->stock_groups[ $blog ], self::$canonical_attr_memo[ $blog ], self::$variation_maps[ $blog ], self::$first_matches[ $blog ], self::$variation_dups[ $blog ], self::$match_unique[ $blog ] );
+
+		$this->delete_copy_map_epoch();
+	}
+
+	/**
+	 * After a term's translation caches were flushed: when a translation
+	 * group or link was written since the last renewal from here
+	 * (TranslationGroupRepository::link_changes()), renew the copy-map epoch
+	 * unless the term is known to be outside the `pa_*` attribute
+	 * taxonomies. A flush with no write behind it (a term edit) renews
+	 * nothing; one write renews once, however many members it flushes.
+	 *
+	 * @param mixed $object_id   Object id.
+	 * @param mixed $object_type Object type.
+	 * @return void
+	 */
+	public function renew_copy_map_after_term_flush( $object_id, $object_type = '' ): void {
+		if ( 'term' !== $object_type || \PerfLocale\Database\Repository\TranslationGroupRepository::link_changes() === $this->copy_link_mark ) {
+			return;
+		}
+
+		$term_id = is_numeric( $object_id ) ? (int) $object_id : 0;
+		$term    = $term_id > 0 ? get_term( $term_id ) : null;
+
+		if ( $term instanceof \WP_Term ) {
+			$taxonomy = (string) $term->taxonomy;
+		} else {
+			$taxonomy = $this->deleted_terms[ get_current_blog_id() ][ $term_id ] ?? '';
+		}
+
+		if ( '' !== $taxonomy && ! str_starts_with( $taxonomy, 'pa_' ) ) {
+			return;
+		}
+
+		$this->renew_copy_map_epoch();
+	}
+
+	/**
+	 * Note a `pa_*` term's slug before it is edited (`edit_terms`).
+	 *
+	 * @param mixed $term_id  Term id.
+	 * @param mixed $taxonomy Taxonomy.
+	 * @return void
+	 */
+	public function note_term_slug( $term_id, $taxonomy = '' ): void {
+		if ( ! is_string( $taxonomy ) || ! str_starts_with( $taxonomy, 'pa_' ) ) {
+			return;
+		}
+
+		$blog = get_current_blog_id();
+		$id   = is_numeric( $term_id ) ? (int) $term_id : 0;
+		$term = $id > 0 ? get_term( $id, $taxonomy ) : null;
+
+		if ( count( $this->term_slugs[ $blog ] ?? [] ) >= 64 ) {
+			unset( $this->term_slugs[ $blog ] );
+		}
+
+		$this->term_slugs[ $blog ][ $id ] = $term instanceof \WP_Term ? (string) $term->slug : '';
+	}
+
+	/**
+	 * After a `pa_*` term was edited: renew the copy-map epoch when its slug
+	 * changed or its old slug is unknown. WooCommerce rewrites the slug in
+	 * its variations' meta with a direct query.
+	 *
+	 * @param mixed $term_id  Term id.
+	 * @param mixed $tt_id    Term taxonomy id.
+	 * @param mixed $taxonomy Taxonomy.
+	 * @return void
+	 */
+	public function renew_copy_map_after_term_edit( $term_id, $tt_id = 0, $taxonomy = '' ): void {
+		unset( $tt_id );
+
+		if ( ! is_string( $taxonomy ) || ! str_starts_with( $taxonomy, 'pa_' ) ) {
+			return;
+		}
+
+		$blog   = get_current_blog_id();
+		$id     = is_numeric( $term_id ) ? (int) $term_id : 0;
+		$before = $this->term_slugs[ $blog ][ $id ] ?? '';
+
+		unset( $this->term_slugs[ $blog ][ $id ] );
+
+		$term = $id > 0 ? get_term( $id, $taxonomy ) : null;
+
+		if ( '' === $before || ! $term instanceof \WP_Term || $term->slug !== $before ) {
+			$this->renew_copy_map_epoch();
+		}
+	}
+
+	/**
+	 * After a term was deleted: note its taxonomy for the flushes that
+	 * follow, and renew the copy-map epoch for a `pa_*` term.
+	 *
+	 * @param mixed $term_id  Term id.
+	 * @param mixed $tt_id    Term taxonomy id.
+	 * @param mixed $taxonomy Taxonomy.
+	 * @return void
+	 */
+	public function renew_copy_map_after_term_delete( $term_id, $tt_id = 0, $taxonomy = '' ): void {
+		unset( $tt_id );
+
+		$blog = get_current_blog_id();
+
+		if ( count( $this->deleted_terms[ $blog ] ?? [] ) >= 64 ) {
+			unset( $this->deleted_terms[ $blog ] );
+		}
+
+		$this->deleted_terms[ $blog ][ is_numeric( $term_id ) ? (int) $term_id : 0 ] = is_string( $taxonomy ) ? $taxonomy : '';
+
+		if ( ! is_string( $taxonomy ) || str_starts_with( $taxonomy, 'pa_' ) ) {
+			$this->renew_copy_map_epoch();
+		}
+	}
+
+	/**
+	 * After an existing product's type term was replaced outside WooCommerce's
+	 * own type change: drop the stock groups and variation matches
+	 * (forget_stock_matches()) and renew the copy-map epoch. A save that sets
+	 * the same type again, and a new product's first type, change nothing.
+	 *
+	 * @param mixed $object_id  Object id.
+	 * @param mixed $terms      Terms given.
+	 * @param mixed $tt_ids     Term taxonomy ids set.
+	 * @param mixed $taxonomy   Taxonomy.
+	 * @param mixed $append     Whether the terms were appended.
+	 * @param mixed $old_tt_ids Term taxonomy ids before.
+	 * @return void
+	 */
+	public function forget_after_product_type_terms( $object_id, $terms = [], $tt_ids = [], $taxonomy = '', $append = false, $old_tt_ids = [] ): void {
+		unset( $object_id, $terms );
+
+		if ( 'product_type' !== $taxonomy ) {
+			return;
+		}
+
+		$old = array_values( wp_parse_id_list( is_array( $old_tt_ids ) ? $old_tt_ids : [] ) );
+		$new = array_values( wp_parse_id_list( is_array( $tt_ids ) ? $tt_ids : [] ) );
+
+		if ( $append ) {
+			$new = array_values( array_unique( array_merge( $old, $new ) ) );
+		}
+
+		sort( $old );
+		sort( $new );
+
+		if ( [] === $old || $old === $new ) {
+			return;
+		}
+
+		$this->forget_stock_matches();
+		$this->renew_copy_map_epoch();
+	}
+
+	/**
+	 * Delete both epochs of the current blog, which retires every stored
+	 * variation map and copy map of the blog.
+	 *
+	 * @return void
+	 */
+	public static function retire_stored_maps(): void {
+		delete_transient( self::STORED_MAP_EPOCH );
+		delete_transient( self::COPY_MAP_EPOCH );
+	}
+
+	/**
+	 * Retire the stored maps when the stock sync setting changed. Hooked by
+	 * the plugin in every request (Bootstrap), like the two below, because
+	 * this class listens for changes only while the sync runs.
+	 *
+	 * @param mixed $settings Settings after the change.
+	 * @param mixed $before   Settings before it.
+	 * @return void
+	 */
+	public static function retire_after_settings_change( $settings = [], $before = [] ): void {
+		$now = is_array( $settings ) ? (bool) ( $settings['wc_sync_stock'] ?? true ) : true;
+		$was = is_array( $before ) ? (bool) ( $before['wc_sync_stock'] ?? true ) : true;
+
+		if ( $now !== $was ) {
+			self::retire_stored_maps();
+		}
+	}
+
+	/**
+	 * Retire the stored maps when WooCommerce is activated or deactivated.
+	 *
+	 * @param mixed $plugin Plugin basename.
+	 * @return void
+	 */
+	public static function retire_after_plugin_toggle( $plugin = '' ): void {
+		if ( 'woocommerce/woocommerce.php' === $plugin ) {
+			self::retire_stored_maps();
+		}
+	}
+
+	/**
 	 * Legacy-WC fallback: refresh the price/SKU/stock-status columns of an
 	 * EXISTING wc_product_meta_lookup row directly.
 	 *
 	 * Only the columns this class syncs are touched (sku, min/max price,
-	 * onsale, stock_status); the row is never INSERTed — WC owns row
+	 * onsale, stock_status); the row is never INSERTed - WC owns row
 	 * creation. Values come from the product object's own accessors so
 	 * variable parents get their true child-price range.
 	 *
@@ -4496,7 +6196,7 @@ final class InventorySync {
 
 			// The GTIN column ships with the accessor (WC 9.1 adds both in one
 			// migration), so method_exists doubles as the column-presence
-			// probe — a fixed SQL naming the column would error on WC < 9.1.
+			// probe - a fixed SQL naming the column would error on WC < 9.1.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Targeted refresh of WC's lookup row; no WC API exists for this on older versions.
 			if ( method_exists( $product, 'get_global_unique_id' ) ) {
 				$wpdb->query(
@@ -4533,7 +6233,7 @@ final class InventorySync {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		} catch ( \Throwable $e ) {
 			// A missing lookup table (very old WC) or accessor error must never
-			// break the sync itself — the meta is already correct; only the
+			// break the sync itself - the meta is already correct; only the
 			// derived cache row stays stale, matching pre-fix behaviour.
 			unset( $e );
 		}

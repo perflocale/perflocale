@@ -35,14 +35,14 @@ final class SlugManager {
 	 * as an eager DI singleton, so the same instance serves every blog the
 	 * request touches. Without the prefix, `switch_to_blog( 2 )` followed
 	 * by `get_slug( 'post', 5, 7 )` would happily return blog 1's cached
-	 * slug for post 5 — slug rows live in `wp_<id>_perflocale_slug_translations`
+	 * slug for post 5 - slug rows live in `wp_<id>_perflocale_slug_translations`
 	 * and the object IDs are NOT globally unique across subsites.
 	 *
 	 * On single-site WP, `get_current_blog_id()` returns 1 so the prefix is
 	 * constant; this costs one extra hash-table lookup per access and saves
 	 * silent cross-blog bleed on multisite.
 	 *
-	 * Capped per (blog_id, object_type) at SLUGS_CAP entries — long-running
+	 * Capped per (blog_id, object_type) at SLUGS_CAP entries - long-running
 	 * CLI (sitemap rebuild, bulk slug regeneration) walks every post/term
 	 * and would otherwise grow this map unboundedly through the long-lived
 	 * DI singleton.
@@ -446,7 +446,7 @@ final class SlugManager {
 		// Fallback to repository (which uses the 3-layer cache).
 		$slug = $this->get_repo()->get_slug( $object_type, $object_id, $language_id );
 
-		// FIFO eviction at SLUGS_CAP per (blog, object_type) — see property
+		// FIFO eviction at SLUGS_CAP per (blog, object_type) - see property
 		// docblock for rationale. Counted at the object_id level since
 		// each object_id holds a small map of language→slug pairs.
 		if ( isset( $this->slugs[ $blog_id ][ $object_type ] ) && count( $this->slugs[ $blog_id ][ $object_type ] ) >= self::SLUGS_CAP ) {

@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Wraps the main content with `<div data-nosnippet>` whenever the rendered
- * singular post's language differs from the URL's language — in practice
+ * singular post's language differs from the URL's language - in practice
  * the show_default branch of `missing_translation_action`.
  *
  * Without this wrapper, Google happily indexes the default-language text

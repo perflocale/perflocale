@@ -61,7 +61,7 @@ final class LanguageSwitcher {
 
 		// Ordering-proof widget registration: in admin this service can be
 		// booted AFTER widgets_init (init:1) has already fired, and a
-		// listener attached to a past event never runs — the widget would
+		// listener attached to a past event never runs - the widget would
 		// silently not exist in Appearance → Widgets or the Legacy Widget
 		// picker.
 		if ( did_action( 'widgets_init' ) ) {
@@ -111,7 +111,7 @@ final class LanguageSwitcher {
 			'triggerFormat'    => $args['trigger_format'],
 			'arrowStyle'       => $args['arrow_style'],
 			// wp_validate_boolean, NOT a raw (bool) cast: shortcode attributes
-			// arrive as strings, and (bool) "false"/"no" is TRUE in PHP — so
+			// arrive as strings, and (bool) "false"/"no" is TRUE in PHP - so
 			// hide_current="false" would hide the current language. This also
 			// accepts the real booleans the block render path passes.
 			'showFlags'        => wp_validate_boolean( $args['show_flags'] ),
@@ -146,7 +146,7 @@ final class LanguageSwitcher {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/switcher/output returned %s — the filter contract is string-in / string-out. Falling back to the unfiltered switcher HTML.', 'perflocale' ),
+						__( 'A hook on perflocale/switcher/output returned %s - the filter contract is string-in / string-out. Falling back to the unfiltered switcher HTML.', 'perflocale' ),
 						get_debug_type( $filtered )
 					)
 				),
@@ -189,7 +189,7 @@ final class LanguageSwitcher {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/switcher/link_attrs returned %s — must be an associative array of attribute name => value. Falling back to the unfiltered base attributes so the link still renders.', 'perflocale' ),
+						__( 'A hook on perflocale/switcher/link_attrs returned %s - must be an associative array of attribute name => value. Falling back to the unfiltered base attributes so the link still renders.', 'perflocale' ),
 						get_debug_type( $attrs )
 					)
 				),
@@ -282,11 +282,11 @@ final class LanguageSwitcher {
 		// pre-existing programmatic control (and can widen or narrow it).
 		// Verbatim (case-sensitive): nav-menu location slugs may be
 		// mixed-case, and $args->theme_location below is the raw registered
-		// key — lowercasing here would never match e.g. `headerMenu`.
+		// key - lowercasing here would never match e.g. `headerMenu`.
 		$setting_locations = array_values(
 			array_filter(
 				array_map( 'strval', (array) $this->settings->get( 'switcher_menu_locations', [] ) ),
-				// Only drop empties — NOT the default falsy filter, which would
+				// Only drop empties - NOT the default falsy filter, which would
 				// discard a legitimate location slug of "0" that the save side
 				// (an array_intersect against registered keys) keeps.
 				static fn( string $s ): bool => $s !== ''
@@ -357,7 +357,7 @@ final class LanguageSwitcher {
 				if ( $untranslated_link === 'no_link' ) {
 					$url = '';
 				} else {
-					// Target language's home, not the current language's —
+					// Target language's home, not the current language's -
 					// matches LanguageSwitcherBlock::render().
 					$url = perflocale_home_url( $lang->slug );
 				}

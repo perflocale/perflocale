@@ -60,7 +60,7 @@ final class PerfLocaleBeaverBuilder implements \PerfLocale\Addon\AddonInterface 
 	public function boot( \PerfLocale\Plugin $plugin ): void {
 		// Add BB data as translatable meta.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		// ⚠️ Only the TEXT-FREE keys mirror — see add_mirror_keys() for what is on
+		// ⚠️ Only the TEXT-FREE keys mirror - see add_mirror_keys() for what is on
 		// that list and why the builder document is not. A mirror is
 		// bidirectional, so mirroring a document that carries the user's words
 		// destroys translated text in both directions.
@@ -105,7 +105,7 @@ final class PerfLocaleBeaverBuilder implements \PerfLocale\Addon\AddonInterface 
 	 * A continuous mirror is bidirectional in ContentSync ("any group member's
 	 * save propagates group-wide"), so mirroring a builder document that carries
 	 * headings, paragraphs and button labels destroys translated text in BOTH
-	 * directions — a translator's save overwrites the source, and the next source
+	 * directions - a translator's save overwrites the source, and the next source
 	 * save overwrites the translation. That was reproduced end to end for
 	 * Elementor on 4.2.1 and 4.1.3, and observed for Beaver Builder on a replica;
 	 * every builder here stores text the same way, so all of them were moved.
@@ -123,7 +123,7 @@ final class PerfLocaleBeaverBuilder implements \PerfLocale\Addon\AddonInterface 
 	 * @return array<int, string>
 	 */
 	public function add_mirror_keys( array $keys, string $post_type ): array {
-		// NOT `_fl_builder_data` — that is the published layout, and every module's
+		// NOT `_fl_builder_data` - that is the published layout, and every module's
 		// heading, text editor content and button label lives inside it.
 		$keys[] = '_fl_builder_data_settings';
 		// The enabled flag decides whether BB renders the layout at all

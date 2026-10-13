@@ -31,10 +31,10 @@ final class Assets {
 
 		// FSE / block-theme safety net: when a perflocale switcher block
 		// renders from a wp_template part (header.html, footer.html, etc.)
-		// — i.e. not from $post->post_content — the wp_enqueue_scripts
+		// - i.e. not from $post->post_content - the wp_enqueue_scripts
 		// pass at the top of enqueue() can't see it (page_has_block() only
 		// inspects the global $post). The block-SPECIFIC render filter
-		// fires only when our block actually renders — unlike the generic
+		// fires only when our block actually renders - unlike the generic
 		// `render_block`, which would call this callback for every block
 		// on the page (thousands on FSE templates) just to compare names.
 		// Calling wp_enqueue_style this late still works because WP prints
@@ -57,7 +57,7 @@ final class Assets {
 
 	/**
 	 * Render-time enqueue: ensure the frontend stylesheet is queued when a
-	 * perflocale block renders from anywhere — including template parts
+	 * perflocale block renders from anywhere - including template parts
 	 * which the early wp_enqueue_scripts pass cannot inspect.
 	 *
 	 * Safe to call repeatedly: wp_enqueue_style is idempotent on the same

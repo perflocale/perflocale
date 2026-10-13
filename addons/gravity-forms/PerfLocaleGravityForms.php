@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Translates form field labels, descriptions, placeholders, choices, and
  * confirmations at render time. Gravity Forms keeps forms in its own
- * gf_form* tables — a GF form id is NOT a wp_posts id — so per-form
+ * gf_form* tables - a GF form id is NOT a wp_posts id - so per-form
  * translations live in a per-form option keyed by the GF form id, with one
  * entry per language slug. Translations are written programmatically via
  * save_translations() or supplied at render time through the
@@ -108,7 +108,7 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 			return $form;
 		}
 
-		// Default language renders the original strings — skip the lookup.
+		// Default language renders the original strings - skip the lookup.
 		$default = $router->get_default_language();
 		if ( $default && $current_slug === $default->slug ) {
 			return $form;

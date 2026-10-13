@@ -157,7 +157,7 @@ final class TranslationsPage {
 		// link is not the default language, so the ID resolution can be bound
 		// to that language up front instead of loading every language's rows
 		// into PHP and then throwing most of them away. 0 when the site has no
-		// default language — in which case that filter is not registered
+		// default language - in which case that filter is not registered
 		// either, and the unbounded behaviour is still correct. The
 		// all-language status filter in matches_filters() skips this
 		// language's link the same way the SQL selector does.
@@ -276,7 +276,7 @@ final class TranslationsPage {
 
 			// Resolve the active provider's display name so the bulk-action
 			// label reads "Translate via DeepL into…" instead of a generic
-			// "MT-translate" — admins can see at a glance which API will run.
+			// "MT-translate" - admins can see at a glance which API will run.
 			$mt_provider_name = '';
 			if ( $mt_available ) {
 				try {
@@ -365,13 +365,13 @@ final class TranslationsPage {
 				?>
 				</p></div>
 			<?php elseif ( $bulk_message === 'bulk_mark_failed' ) : ?>
-				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Nothing was flagged: the database rejected the update. The translations are unchanged — check the error log and try again.', 'perflocale' ); ?></p></div>
+				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Nothing was flagged: the database rejected the update. The translations are unchanged - check the error log and try again.', 'perflocale' ); ?></p></div>
 			<?php elseif ( $bulk_message === 'bulk_mt_unavailable' ) : ?>
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Machine translation is unavailable. Configure a provider with a valid API key under Settings → Addons → Machine Translation.', 'perflocale' ); ?></p></div>
 			<?php
 			/*
 			 * ⚠️ These three used to redirect with `perflocale_bulk=<key>`, which
-			 * NOTHING reads — this block switches on `$_GET['message']`. Every
+			 * NOTHING reads - this block switches on `$_GET['message']`. Every
 			 * failed "Translate the entire site" therefore bounced the operator
 			 * back to a silent page. The handler now uses the `message` key, and
 			 * these arms give each outcome words.
@@ -388,7 +388,7 @@ final class TranslationsPage {
 				<?php
 				printf(
 					/* translators: %s: comma-separated list of post type slugs. */
-					esc_html__( 'Nothing to translate. These post types are marked translatable but are not registered right now — the plugin that provides them is probably inactive: %s', 'perflocale' ),
+					esc_html__( 'Nothing to translate. These post types are marked translatable but are not registered right now - the plugin that provides them is probably inactive: %s', 'perflocale' ),
 					esc_html( $_missing )
 				);
 				?>
@@ -419,7 +419,7 @@ final class TranslationsPage {
 				<?php
 				printf(
 					/* translators: %d: the server's max_input_vars limit. */
-					esc_html__( 'Nothing was changed. The form did not arrive complete — this server accepts at most %d form fields (max_input_vars), and the request reached that limit. Lower "Rows per page" in Screen Options, or select fewer rows, and try again.', 'perflocale' ),
+					esc_html__( 'Nothing was changed. The form did not arrive complete - this server accepts at most %d form fields (max_input_vars), and the request reached that limit. Lower "Rows per page" in Screen Options, or select fewer rows, and try again.', 'perflocale' ),
 					absint( $_limit )
 				);
 				?>
@@ -439,11 +439,11 @@ final class TranslationsPage {
 			 * the cheap half of that problem: tell the people who actually have such
 			 * content, and nobody else.
 			 *
-			 * ⚠️ COST. This runs ONLY while rendering this screen — never on the front
+			 * ⚠️ COST. This runs ONLY while rendering this screen - never on the front
 			 * end, never on another admin page, never on cron. It asks nothing at all
 			 * when both types are already enabled, and otherwise uses
 			 * wp_count_posts(), whose per-status counts core keeps in the object
-			 * cache and invalidates on save — so on a warm cache it costs no query,
+			 * cache and invalidates on save - so on a warm cache it costs no query,
 			 * and on a cold one far less than this screen's own listing query.
 			 */
 			$hint_candidates = [];
@@ -562,7 +562,7 @@ final class TranslationsPage {
 				}
 				?>
 				<?php
-				// ⭐ COMPLETENESS MARKER — must be the LAST field in the form.
+				// ⭐ COMPLETENESS MARKER - must be the LAST field in the form.
 				// PHP silently discards input past `max_input_vars`, so if this
 				// arrives the browser sent everything before it too. A recursive
 				// element COUNT cannot prove the same thing: it also counts array
@@ -622,7 +622,7 @@ final class TranslationsPage {
 				</div>
 				<div class="alignright perflocale-str-toolbar__count perflocale-str-toolbar__count--inline">
 				<?php
-					/* translators: %s: total item count (assignments, posts, or terms — i18n-formatted, may be wrapped in <strong>). */
+					/* translators: %s: total item count (assignments, posts, or terms - i18n-formatted, may be wrapped in <strong>). */
 					printf( esc_html__( '%s items', 'perflocale' ), '<strong>' . esc_html( number_format_i18n( $total ) ) . '</strong>' );
 				?>
 				</div>
@@ -648,7 +648,7 @@ final class TranslationsPage {
 							</label>
 						</th>
 						<?php
-						// ID column dropped — the source post ID is always
+						// ID column dropped - the source post ID is always
 						// available via `View`/`Edit` links and the page-source
 						// of the linked URL, and the visual real-estate is
 						// better used by the title row-actions (Edit | View
@@ -660,7 +660,7 @@ final class TranslationsPage {
 						foreach ( $visible_langs as $language ) :
 							$lang_label = $language->native_name ?: ( $language->name ?: $language->slug );
 							$lang_title = $language->name && $language->native_name && $language->name !== $language->native_name
-								? $language->name . ' — ' . $language->native_name
+								? $language->name . ' - ' . $language->native_name
 								: ( $language->name ?: $language->native_name ?: $language->slug );
 							?>
 							<th scope="col" class="perflocale-col-lang" data-perflocale-lang-col="<?php echo esc_attr( $language->slug ); ?>" title="<?php echo esc_attr( $lang_title ); ?>">
@@ -807,7 +807,7 @@ final class TranslationsPage {
 	 * Render a single language-column cell for a source post's row.
 	 *
 	 * The badge shows `link.status` as render() resolved it: the link's
-	 * effective status (TranslationStatus::effective() — empty / draft /
+	 * effective status (TranslationStatus::effective() - empty / draft /
 	 * pending / published / needs_update, from the linked post's status with
 	 * a stored needs_update kept).
 	 *
@@ -857,7 +857,7 @@ final class TranslationsPage {
 		$review_badge = '';
 
 		// Resolve the edit URL once. Linkable when this column points at a
-		// DIFFERENT post (a sibling translation) — clicking the source-row's
+		// DIFFERENT post (a sibling translation) - clicking the source-row's
 		// own column would just re-open the title link, so leave that as a
 		// plain span.
 		$edit_url = '';
@@ -877,7 +877,7 @@ final class TranslationsPage {
 
 		if ( $edit_url !== '' ) {
 			// $icon is a hard-coded `<span class="dashicons …">` string defined
-			// a few lines above — no user input is ever interpolated into it,
+			// a few lines above - no user input is ever interpolated into it,
 			// so feeding it through esc_html() would mangle the markup, and
 			// wp_kses() would strip the dashicons class. Print verbatim.
 			printf(
@@ -1136,7 +1136,7 @@ final class TranslationsPage {
 
 		// Pre-build the prepared subquery once. $type and $default_id are
 		// the only dynamic values and both are placeholder-bound.
-		// wpdb->prepare() can return null on placeholder mismatch — cast to
+		// wpdb->prepare() can return null on placeholder mismatch - cast to
 		// empty string so the .= concat below stays a string operation.
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$subquery = (string) $wpdb->prepare(
@@ -1212,7 +1212,7 @@ final class TranslationsPage {
 			return;
 		}
 
-		// ⭐ Offer exactly what the handler will accept — see
+		// ⭐ Offer exactly what the handler will accept - see
 		// Settings::get_site_translate_post_types(). Offering `public + show_ui`
 		// here meant the panel listed types the plugin refuses to translate and
 		// hid every addon type it would happily translate.
@@ -1280,7 +1280,7 @@ final class TranslationsPage {
 					<?php echo esc_html__( 'Runs as a resumable background job in bounded chunks; existing translations are never overwritten. Track progress under PerfLocale → Jobs.', 'perflocale' ); ?>
 				</p>
 				<?php
-				// ⭐ COMPLETENESS MARKER — must be the LAST field in the form.
+				// ⭐ COMPLETENESS MARKER - must be the LAST field in the form.
 				// PHP silently discards input past `max_input_vars`, so if this
 				// arrives the browser sent everything before it too. A recursive
 				// element COUNT cannot prove the same thing: it also counts array
@@ -1544,7 +1544,7 @@ final class TranslationsPage {
 		// Filter by specific language.
 		if ( $filter_language > 0 ) {
 			if ( ! isset( $translation_map[ $filter_language ] ) ) {
-				// No translation for this language — only matches the 'empty'
+				// No translation for this language - only matches the 'empty'
 				// status filter. Don't also match when status_filter is empty,
 				// or the language dropdown alone becomes a no-op: picking
 				// "German" alone should narrow to posts that have German.
@@ -1560,7 +1560,7 @@ final class TranslationsPage {
 
 		// Filter by status across all languages.
 		if ( $filter_status === 'empty' ) {
-			// Match if any active language is missing a translation — not
+			// Match if any active language is missing a translation - not
 			// unconditionally true, or status='empty' + "All Languages" would
 			// be a no-op.
 			foreach ( $active_language_ids as $lid ) {

@@ -94,7 +94,7 @@ final class SchemaEnricher {
 		}
 
 		// Handle a bare list of entities. ($graph === array_values($graph) is
-		// the idiomatic list check, equivalent to array_is_list() — which
+		// the idiomatic list check, equivalent to array_is_list() - which
 		// Plugin Check maps to WP 6.5 although it's a PHP 8.1 native the
 		// plugin's PHP floor already guarantees.)
 		if ( $graph === array_values( $graph ) ) {
@@ -232,7 +232,7 @@ final class SchemaEnricher {
 
 		$locale = (string) ( $lang->locale ?? '' );
 		// Canonical BCP 47 form for `inLanguage` (`en-US` not `en_US` or
-		// `en-us`) — search engines and rich-results validators expect it.
+		// `en-us`) - search engines and rich-results validators expect it.
 		$in_language = $locale !== '' ? \PerfLocale\Helper::format_locale_as_bcp47( $locale ) : (string) ( $lang->slug ?? '' );
 
 		$siblings    = [];

@@ -86,7 +86,7 @@ final class OgLocale {
 	 * @return array<int, string>
 	 */
 	public static function alternate_locales(): array {
-		// Blog-keyed per-request memo — the alternate og:locale set is per-blog
+		// Blog-keyed per-request memo - the alternate og:locale set is per-blog
 		// (active languages + their locales differ). Keying by blog id means a
 		// mid-request switch_to_blog() gets its own entry instead of blog A's,
 		// with no switch_blog reset needed (a plain function-local static would
@@ -128,7 +128,7 @@ final class OgLocale {
 		// `_perflocale_seo_exclude` must hide a translation from EVERY search
 		// signal, not just hreflang: an og:locale:alternate naming a locale the
 		// hreflang set deliberately omits contradicts it. Mirrors the same
-		// two-part contract as HreflangTags — emit nothing FROM an excluded
+		// two-part contract as HreflangTags - emit nothing FROM an excluded
 		// page, and skip excluded siblings. The flagged-id set is empty on
 		// almost every site, so the common cost is one memoised lookup.
 		$excluded_slugs = [];

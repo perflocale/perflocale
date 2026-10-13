@@ -20,11 +20,11 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Decides which {@see JobRunnerInterface} implementation to use.
  *
  * Selection order:
- *   1. `perflocale/jobs/runner` filter — power-user override; returns
+ *   1. `perflocale/jobs/runner` filter - power-user override; returns
  *      an instance to use unconditionally (great for tests).
- *   2. The `background_engine` setting — when set to 'force_wp_cron',
+ *   2. The `background_engine` setting - when set to 'force_wp_cron',
  *      always returns {@see WpCronRunner} even if AS is available.
- *   3. Action Scheduler detection — if AS is loaded and at ≥ 3.4, return
+ *   3. Action Scheduler detection - if AS is loaded and at ≥ 3.4, return
  *      {@see ActionSchedulerRunner}. Older AS versions had race conditions
  *      around multisite claims that we'd rather avoid.
  *   4. Fallback: {@see WpCronRunner}.
@@ -37,14 +37,14 @@ final class JobRunnerFactory {
 
 	/**
 	 * Minimum Action Scheduler version we trust. Earlier versions had bugs
-	 * around per-blog claims on multisite — bumping to a safe baseline costs
+	 * around per-blog claims on multisite - bumping to a safe baseline costs
 	 * us nothing because every WooCommerce-shipped AS for the last ~2 years
 	 * is above 3.4.
 	 */
 	public const MIN_AS_VERSION = '3.4';
 
 	/**
-	 * Memoized resolved runner, keyed by blog ID — `background_engine` is a
+	 * Memoized resolved runner, keyed by blog ID - `background_engine` is a
 	 * per-blog setting, so a flat memo would carry blog A's choice into
 	 * blog B after switch_to_blog(). Memoization keeps dispatcher + worker
 	 * + cancel within one request on the same runner choice: without it,
@@ -64,7 +64,7 @@ final class JobRunnerFactory {
 	 * Called when the engine setting changes mid-request (the settings-save
 	 * flow re-schedules recurring events immediately) so the re-schedule
 	 * picks under the NEW setting instead of a runner memoized earlier in
-	 * the request. Clearing all blogs over-invalidates at worst — one
+	 * the request. Clearing all blogs over-invalidates at worst - one
 	 * extra resolution per blog.
 	 *
 	 * @return void
@@ -88,7 +88,7 @@ final class JobRunnerFactory {
 		}
 
 		/**
-		 * Override the runner instance globally — for tests, custom
+		 * Override the runner instance globally - for tests, custom
 		 * deployments, or third-party schedulers (e.g. an external queue).
 		 * Memoized once chosen so dispatcher + worker + cancel within a
 		 * single request all hit the same instance.
@@ -104,7 +104,7 @@ final class JobRunnerFactory {
 		}
 
 		// A non-null, non-JobRunnerInterface return is a definite developer
-		// mistake — the filter is silently ignored otherwise, which is the
+		// mistake - the filter is silently ignored otherwise, which is the
 		// exact failure mode _doing_it_wrong is for. Null (the default) means
 		// "no override" and is the happy path; skip the nudge there.
 		if ( $override !== null ) {
@@ -113,7 +113,7 @@ final class JobRunnerFactory {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/jobs/runner returned %s — must be an instance of \\PerfLocale\\Background\\JobRunnerInterface (or null to skip override). Falling back to the default runner chain.', 'perflocale' ),
+						__( 'A hook on perflocale/jobs/runner returned %s - must be an instance of \\PerfLocale\\Background\\JobRunnerInterface (or null to skip override). Falling back to the default runner chain.', 'perflocale' ),
 						get_debug_type( $override )
 					)
 				),
@@ -157,7 +157,7 @@ final class JobRunnerFactory {
 		}
 
 		// Unknown/empty engine, or the stored AS engine is no longer
-		// available — fall back to the current best pick so we still target
+		// available - fall back to the current best pick so we still target
 		// a live store.
 		return self::pick();
 	}
@@ -166,7 +166,7 @@ final class JobRunnerFactory {
 	 * Whether Action Scheduler is loaded AND new enough for us to trust.
 	 *
 	 * Probes `function_exists('as_enqueue_async_action')` because AS's
-	 * own bootstrap defines that function once it's fully wired — any
+	 * own bootstrap defines that function once it's fully wired - any
 	 * earlier check (class_exists, defined-constant) can return true
 	 * before AS is actually ready to receive enqueues.
 	 *
@@ -184,7 +184,7 @@ final class JobRunnerFactory {
 		}
 
 		// Best-effort version check. The constant is defined by AS ≥ 3.0,
-		// so missing-constant means a very old or custom bundling — be
+		// so missing-constant means a very old or custom bundling - be
 		// conservative and trust it (modern bundlings will have it).
 		if ( defined( '\\ActionScheduler::PLUGIN_VERSION' ) ) {
 			if ( ! version_compare( \ActionScheduler::PLUGIN_VERSION, self::MIN_AS_VERSION, '>=' ) ) {

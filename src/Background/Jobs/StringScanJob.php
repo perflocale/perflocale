@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * StringScanner walks `*.php` and `*.twig` files looking for `__()`,
  * `_e()`, `esc_html__()`, and friends. On a large WordPress directory
  * (thousands of files) this is the slowest sync call in the plugin
- * outside of MT — perfect candidate for backgrounding.
+ * outside of MT - perfect candidate for backgrounding.
  *
  * Two operating modes:
  *
@@ -83,7 +83,7 @@ final class StringScanJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Threshold check estimates the actual scan size in both modes —
+	 * Threshold check estimates the actual scan size in both modes -
 	 * count of top-level PHP files (× 2 fudge factor for nested dirs)
 	 * across the target(s). Returning a real number (rather than the
 	 * old `PHP_INT_MAX` shortcut for mode='all') is what makes the
@@ -163,7 +163,7 @@ final class StringScanJob extends AbstractJob {
 	 * Plugin directories this scan must cover: site-active PLUS network-active.
 	 *
 	 * `active_plugins` alone misses every NETWORK-activated plugin on
-	 * multisite — those live in the network-wide `active_sitewide_plugins`
+	 * multisite - those live in the network-wide `active_sitewide_plugins`
 	 * site-option, keyed by plugin file with the activation timestamp as the
 	 * value. Their strings were therefore never scanned and never translatable,
 	 * and, worse, scan_all() still armed `perflocale_strings_last_full_scan`
@@ -199,7 +199,7 @@ final class StringScanJob extends AbstractJob {
 			$relative = dirname( (string) $plugin_file );
 
 			// A SINGLE-FILE plugin (`hello.php`) has a dirname of '.', which
-			// resolves to the plugins ROOT — and the scanner recurses, so that
+			// resolves to the plugins ROOT - and the scanner recurses, so that
 			// one entry would walk every plugin on the site on every scan.
 			// There is no directory of its own to scan, so skip it rather than
 			// turn one file into a full-tree crawl. Same reasoning for an
@@ -215,7 +215,7 @@ final class StringScanJob extends AbstractJob {
 			}
 		}
 
-		// Dedupe — a plugin can be both site- and network-active, and symlinks
+		// Dedupe - a plugin can be both site- and network-active, and symlinks
 		// can resolve identically.
 		return array_values( array_unique( $dirs ) );
 	}
@@ -287,7 +287,7 @@ final class StringScanJob extends AbstractJob {
 			$targets[] = WPMU_PLUGIN_DIR;
 		}
 
-		// Dedupe — defensive in case the active_plugins list contains dupes
+		// Dedupe - defensive in case the active_plugins list contains dupes
 		// or symlinks resolve identically.
 		$targets = array_values( array_unique( $targets ) );
 
@@ -303,7 +303,7 @@ final class StringScanJob extends AbstractJob {
 
 		foreach ( $targets as $dir ) {
 			if ( ! self::is_safe_content_path( $dir ) ) {
-				// Record the skip — see the GC marker below. Silently skipping
+				// Record the skip - see the GC marker below. Silently skipping
 				// made the scan claim full coverage it did not have.
 				$skipped[] = $dir;
 				++$processed;
@@ -340,7 +340,7 @@ final class StringScanJob extends AbstractJob {
 		// by the path guard (symlinked plugin dir, relocated wp-content), or
 		// one the scanner could not read in full, never re-marked its strings'
 		// last_seen_at, so arming the marker would let the 90-day GC delete
-		// strings — and their translations — that are still very much in use.
+		// strings - and their translations - that are still very much in use.
 		// The same holds when a database error kept a batch of already-stored
 		// strings from being re-marked as seen. Leaving the marker untouched
 		// means this run neither arms nor extends the GC window; a marker from
@@ -363,8 +363,8 @@ final class StringScanJob extends AbstractJob {
 			// every other domain's strings look untouched to the GC. Arming the
 			// GLOBAL marker would let gc_stale_strings() delete them, and their
 			// translations, once they aged past the retention window. No shipped
-			// surface dispatches mode='all' with a domain — AdminController::
-			// process_string_scan passes ['mode' => 'all'] and nothing else — so
+			// surface dispatches mode='all' with a domain - AdminController::
+			// process_string_scan passes ['mode' => 'all'] and nothing else - so
 			// this guard is here to make sure adding one later cannot silently
 			// turn the GC into a data-loss path.
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a filtered scan.
@@ -395,7 +395,7 @@ final class StringScanJob extends AbstractJob {
 		// `targets` is what was actually SCANNED in full, not what was
 		// selected. A target the path guard rejected, or one only partly
 		// read, did not re-mark all of its strings, so counting it here would
-		// make the stored result claim coverage the run did not have — the
+		// make the stored result claim coverage the run did not have - the
 		// same shape as the GC marker above, which is conditioned on
 		// $skipped. `skipped_targets` (and a bounded sample of the paths) is
 		// the operator's only in-UI signal: the error_log line is unreachable
@@ -419,7 +419,7 @@ final class StringScanJob extends AbstractJob {
 			// row and rendered by the Jobs page and the REST detail endpoint,
 			// and the host's directory layout is not the operator's business.
 			// A target under neither root (a relocated theme root) is left
-			// whole — naming the unreadable directory IS the message.
+			// whole - naming the unreadable directory IS the message.
 			$result['skipped_paths'] = array_map(
 				static function ( string $path ): string {
 					return str_replace(
@@ -516,7 +516,7 @@ final class StringScanJob extends AbstractJob {
 	 * (Composer/Bedrock layouts, shared plugin mounts, local development),
 	 * and resolving those first made the guard reject them. The consequence
 	 * was silent: the target was skipped without a notice, its strings were
-	 * never re-seen, yet the run still recorded a completed full scan — so
+	 * never re-seen, yet the run still recorded a completed full scan - so
 	 * gc_stale_strings() treated last_seen_at as authoritative and deleted
 	 * those strings AND their translations after the retention window.
 	 * WordPress core follows symlinked plugin directories in exactly the

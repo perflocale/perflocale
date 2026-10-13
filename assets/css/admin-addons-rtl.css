@@ -42,14 +42,14 @@
 /* ==========================================================================
  Addons Page
  ========================================================================== */
-/* ⭐ THE UNDERLINED TAB STRIP — RTL twin.
+/* ⭐ THE UNDERLINED TAB STRIP - RTL twin.
 
    This sheet REPLACES the LTR one (wp_style_add_data( …, 'rtl', 'replace' )), so
    it is a full copy rather than an override. The only direction-aware value is
    the indicator thumb's `inset-inline-start`, which flips on its own.
 
    The active tab's 2px underline merges into the strip's own baseline via
-   `margin-bottom: -2px` — that join is the design.
+   `margin-bottom: -2px` - that join is the design.
 
    It only survives on ONE row. The strip used to be `flex-wrap: wrap`, and with
    ten filters it wrapped (two rows at 1280px, four on a phone), stranding the
@@ -59,7 +59,7 @@
 
    THREE ELEMENTS, EACH WITH ONE JOB:
      -wrap    positioning context; owns the vertical rhythm.
-     -scroll  the scroller. Its native scrollbar is HIDDEN — see -bar.
+     -scroll  the scroller. Its native scrollbar is HIDDEN - see -bar.
      -tabs    the strip; owns the 2px baseline the underline merges into.
    The scroller and the strip cannot be the same element: a visible scrollbar is
    laid out INSIDE a scroll container and would come between the tabs and their
@@ -76,7 +76,7 @@
 	overscroll-behavior-x: contain;
 	/* The native bar is suppressed because it cannot do this job. iOS and
 	   Android draw scrollbars as transient overlays that vanish at rest, and
-	   iOS ignores ::-webkit-scrollbar altogether — so on exactly the devices
+	   iOS ignores ::-webkit-scrollbar altogether - so on exactly the devices
 	   that need the hint, the native bar is invisible. -bar below is drawn by
 	   us instead, and is the same on every platform. */
 	scrollbar-width: none;
@@ -98,7 +98,7 @@
 }
 
 /* The scroll indicator. Hidden until the script measures a real overflow, so a
-   site with few enough filters — or with JS off — never shows a bar that would
+   site with few enough filters - or with JS off - never shows a bar that would
    suggest content that is not there. */
 .perflocale-addons-tabs-bar {
 	display: none;
@@ -174,7 +174,7 @@
 
 /* Below a wide desktop, buy back the few pixels that decide whether the strip
    fits at all. Measured at a 1280px viewport the admin content area is 1078px
-   and the strip wanted 1102px — it overflowed by 24px, which would have put a
+   and the strip wanted 1102px - it overflowed by 24px, which would have put a
    scroll bar under the row for the sake of nothing. Trimming 3px of horizontal
    padding per tab returns 60px and the whole strip fits. Sizes only; the design
    is untouched. */
@@ -184,8 +184,8 @@
 	}
 }
 
-/* Phones and small tablets. Here the strip genuinely cannot fit — it wants
-   ~1000px against a ~370px viewport — so it scrolls, and the indicator is the
+/* Phones and small tablets. Here the strip genuinely cannot fit - it wants
+   ~1000px against a ~370px viewport - so it scrolls, and the indicator is the
    affordance that says so. Tighten the rhythm to show more at rest and keep the
    type at full size rather than shrinking it. */
 @media screen and (max-width: 782px) {
@@ -199,13 +199,13 @@
 }
 
 /* ⭐ DESKTOP: NO DRAWN INDICATOR.
-   The bar below the tabs is a TOUCH affordance — it exists because iOS and
+   The bar below the tabs is a TOUCH affordance - it exists because iOS and
    Android hide their scrollbars at rest, so a phone user gets no hint that the
    strip continues. A pointer user does not have that problem: the native
    scrollbar appears on hover/scroll, shift+wheel works, and a permanent grey
    bar under the tabs just reads as clutter on a wide screen.
    So above tablet width the drawn indicator is hidden and the native scrollbar
-   is handed back its job — which means it still appears if the window really is
+   is handed back its job - which means it still appears if the window really is
    too narrow for the strip, and never appears when the strip fits. */
 @media screen and (min-width: 1025px) {
 	.perflocale-addons-tabs-bar,

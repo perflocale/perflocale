@@ -24,21 +24,21 @@ if ( ! defined( 'ABSPATH' ) ) {
  * The panel had four call sites and no shared renderer, and every one of them
  * only works on a screen WordPress itself owns:
  *
- *   - Admin\MetaBox          — add_meta_box(), so a post.php/post-new.php screen
- *   - assets/js/editor-sidebar.js       — block editor, PluginDocumentSettingPanel
- *   - assets/js/site-editor-sidebar.js  — Site Editor, same React API
- *   - Admin\TermMetaBox      — {$taxonomy}_edit_form_fields
+ *   - Admin\MetaBox          - add_meta_box(), so a post.php/post-new.php screen
+ *   - assets/js/editor-sidebar.js       - block editor, PluginDocumentSettingPanel
+ *   - assets/js/site-editor-sidebar.js  - Site Editor, same React API
+ *   - Admin\TermMetaBox      - {$taxonomy}_edit_form_fields
  *
  * A host plugin that builds its OWN editor screen therefore gets nothing.
  * Contact Form 7 is the case that forced this: its form editor is a custom
  * admin page (`admin.php?page=wpcf7&post=<id>&action=edit`), it never calls
- * `add_meta_box()` — the postboxes on that page are hand-built markup — and
+ * `add_meta_box()` - the postboxes on that page are hand-built markup - and
  * `wp.plugins.registerPlugin` does not exist there, so neither the metabox nor
  * either React panel can reach it. Its forms are nonetheless real WP posts that
  * PerfLocale translates.
  *
  * ⭐ WHY THIS RENDERS HTML ON THE SERVER RATHER THAN MOUNTING THE REACT PANEL.
- * Not conservatism — the React panels are structurally impossible on the screen
+ * Not conservatism - the React panels are structurally impossible on the screen
  * this was built for. Contact Form 7 emits its entire editor page through
  * `wp_kses()` (contact-form-7/includes/html-formatter.php:786), and output
  * echoed on its hooks is buffered into that same pass
@@ -47,14 +47,14 @@ if ( ! defined( 'ABSPATH' ) ) {
  * DO survive, along with `class`, `id`, `href`, `title` and the global
  * `data-*`/`aria-*`/`role` attributes, because CF7's allowlist starts from
  * `wp_kses_allowed_html( 'post' )` (contact-form-7/includes/formatting.php:384).
- * So server-rendered markup is the only shape that works — and it is also the
+ * So server-rendered markup is the only shape that works - and it is also the
  * shape the classic metabox already used, which is why this class is an
  * extraction rather than a new design.
  *
  * WHAT IS DELIBERATELY NOT IN HERE
  *
- * Only the LANGUAGE LIST moved. MetaBox's footer — the language `<select>`, the
- * sync opt-out, the SEO opt-out — stayed behind, because those are form inputs
+ * Only the LANGUAGE LIST moved. MetaBox's footer - the language `<select>`, the
+ * sync opt-out, the SEO opt-out - stayed behind, because those are form inputs
  * that only mean something on a screen whose submit is handled by
  * `MetaBox::save_meta_box()` on `save_post`. Rendering them on a host's own
  * editor would show controls that silently discard what the operator typed.
@@ -92,7 +92,7 @@ final class TranslationsPanel {
 	 * taken as the post id, which is what CF7 passes; a host that passes
 	 * something else (WPForms hands over a `WP_Post`) supplies a `resolve`
 	 * callable instead. Anything that cannot be resolved to a positive id
-	 * renders nothing — see the `-1` case in render().
+	 * renders nothing - see the `-1` case in render().
 	 *
 	 * @param string               $hook    Action hook to render on.
 	 * @param array<string, mixed> $options priority, accepted_args, resolve, context, title.
@@ -110,7 +110,7 @@ final class TranslationsPanel {
 			$hook,
 			function ( ...$hook_args ) use ( $resolve, $args ): void {
 				// ⚠️ `is_numeric`, not a bare `(int)` cast. Hosts pass all sorts of
-				// things as the first hook argument — Elementor's
+				// things as the first hook argument - Elementor's
 				// `elementor/documents/register_controls` passes a Document OBJECT,
 				// WPForms passes a WP_Post. Casting an object to int in PHP yields
 				// 1 (with a warning), so an addon author who forgets `resolve`
@@ -151,7 +151,7 @@ final class TranslationsPanel {
 		// built markup. Each dynamic value was already escaped as it was written
 		// (see render_row(), where every one passes through esc_html/esc_attr/
 		// esc_url), so wp_kses_post() removes no element, attribute or class we
-		// produce — `ul`, `li`, `span` and `a` with class/href/title all survive
+		// produce - `ul`, `li`, `span` and `a` with class/href/title all survive
 		// it. It may still re-spell entities: from WordPress 7.0, wp_kses_hair()
 		// (wp-includes/kses.php) decodes each attribute value and re-encodes it,
 		// so the `&#038;` that esc_url() emits comes back as `&amp;` and an
@@ -166,8 +166,8 @@ final class TranslationsPanel {
 		//
 		// ⚠️ This line is the ONLY place PerfLocale sanitizes the filter's output.
 		// get_html() returns it as the listener left it, so the kses guarantee
-		// covers a panel echoed here — including every mount(), which calls
-		// this — and nothing that takes the string from get_html() instead.
+		// covers a panel echoed here - including every mount(), which calls
+		// this - and nothing that takes the string from get_html() instead.
 		// Consequence for listeners, documented on the hooks page: on the panels
 		// PerfLocale echoes, the markup is limited to what wp_kses_post() permits.
 		echo wp_kses_post( $html );
@@ -184,7 +184,7 @@ final class TranslationsPanel {
 	 * `perflocale/panel/render` filter, exactly as the last listener left it.
 	 * PerfLocale escapes every row value it writes, but a listener may wrap or
 	 * replace that markup wholesale, and nothing in this method passes it through
-	 * kses — render() does that at its echo. So do not echo this string: call
+	 * kses - render() does that at its echo. So do not echo this string: call
 	 * render() with the same arguments to output the panel. A caller that needs
 	 * the string itself must pass it through wp_kses_post(), or its host's
 	 * narrower allowlist, at its own sink before output. kses filters HTML
@@ -222,7 +222,7 @@ final class TranslationsPanel {
 		// Helper, not a bare `current_user_can( 'edit_post', … )`: a host that
 		// registers its type with `map_meta_cap => false` and never grants the
 		// resulting primitive makes core answer `false` for everyone, including
-		// administrators — so the panel would silently never render on precisely
+		// administrators - so the panel would silently never render on precisely
 		// the custom editor screens this registry exists to serve. See
 		// Helper::user_can_edit_object().
 		if ( ! \PerfLocale\Helper::user_can_edit_object( $post_id ) ) {
@@ -257,13 +257,13 @@ final class TranslationsPanel {
 		 * Filter the rendered Translations panel markup.
 		 *
 		 * Runs on the finished string, so a listener can wrap, replace or
-		 * suppress the panel wholesale. ⚠️ Wherever PerfLocale echoes the panel —
-		 * render(), which every mount() goes through — what is returned is passed
+		 * suppress the panel wholesale. ⚠️ Wherever PerfLocale echoes the panel -
+		 * render(), which every mount() goes through - what is returned is passed
 		 * through `wp_kses_post()` first, so a listener still escapes its own
 		 * dynamic values: kses removes tags outside that allowlist but keeps the
 		 * text inside them, and removes disallowed attributes and URL protocols
 		 * rather than the elements that carry them. A host
-		 * that filters its own page through kses — Contact Form 7 does — narrows
+		 * that filters its own page through kses - Contact Form 7 does - narrows
 		 * it further still. That escaping happens at render()'s echo, not here:
 		 * get_html() returns this filter's result unsanitized, and code that
 		 * outputs the string from get_html() instead of calling render() must
@@ -307,7 +307,7 @@ final class TranslationsPanel {
 		// One query for every sibling instead of one query PER sibling. The loop
 		// below calls get_post() on each translation to check the link row is not
 		// pointing at a deleted post, and on a cold cache each of those was its own
-		// SELECT — measured as one extra query per existing sibling, so the panel
+		// SELECT - measured as one extra query per existing sibling, so the panel
 		// got slower for exactly the sites that have the most translations.
 		//
 		// Same idiom the REST route already uses for this list
@@ -344,7 +344,7 @@ final class TranslationsPanel {
 				'source_status'   => (string) $post->post_status,
 				// Resolved HERE rather than while rendering so the rows filter can
 				// retarget it. ObjectLinks applies `perflocale/admin/edit_post_link`,
-				// but that filter is keyed on POST TYPE alone — it cannot send the
+				// but that filter is keyed on POST TYPE alone - it cannot send the
 				// same type somewhere different depending on which screen the panel
 				// is on. A builder that mounts this inside its own canvas wants
 				// "Edit" to stay in that canvas while the Translations screen keeps

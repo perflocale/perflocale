@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *     in {@see JobState}. Required for the Jobs admin UI.
  *
  *   - BackgroundEvents enqueues without any `$job_id` or per-job state.
- *     Cheaper — no option writes for state tracking — and matches how the
+ *     Cheaper - no option writes for state tracking - and matches how the
  *     pre-refactor code paths worked. The cost: these events don't appear
  *     in *PerfLocale → Jobs*. They appear in *Tools → Scheduled Actions*
  *     when AS is the engine (under the `perflocale` group) and in
@@ -53,7 +53,7 @@ final class BackgroundEvents {
 
 		// Both schedulers report refusal, and this used to ignore both. A
 		// `pre_schedule_event` filter veto, a duplicate, or an Action Scheduler
-		// store error produced NO event and NO record of the attempt — so a
+		// store error produced NO event and NO record of the attempt - so a
 		// webhook retry that was never admitted looked identical to one that
 		// had been queued. Callers can still ignore the return; the log line
 		// below means a silent drop is at least visible in the error log.
@@ -82,7 +82,7 @@ final class BackgroundEvents {
 	/**
 	 * Cancel any pending instances matching (hook, args).
 	 *
-	 * Defensively un-schedules in BOTH back-ends — if the engine setting
+	 * Defensively un-schedules in BOTH back-ends - if the engine setting
 	 * was switched mid-life, an event enqueued under the previous engine
 	 * could still be pending. Idempotent + cheap.
 	 *
@@ -95,7 +95,7 @@ final class BackgroundEvents {
 
 		if ( JobRunnerFactory::action_scheduler_available() ) {
 			// `as_unschedule_all_actions` returns NULL on success in current
-			// AS versions — we can't trust the return value as a "did anything
+			// AS versions - we can't trust the return value as a "did anything
 			// match" signal. Detect existence before the call instead.
 			$had_pending = false !== as_next_scheduled_action( $hook, $args, ActionSchedulerRunner::GROUP );
 			as_unschedule_all_actions( $hook, $args, ActionSchedulerRunner::GROUP );
@@ -133,8 +133,8 @@ final class BackgroundEvents {
 	 * is IN PROGRESS right now, and a pending ASYNC (run-as-soon-as-possible)
 	 * action. See Action Scheduler's functions.php (3.9.3 / 4.0.0): the
 	 * `@return` at :344, the in-progress probe at :362-366 and the
-	 * NullSchedule branch at :378-379. next_run() has to discard that — its
-	 * contract is a timestamp — so building this on top of it would report
+	 * NullSchedule branch at :378-379. next_run() has to discard that - its
+	 * contract is a timestamp - so building this on top of it would report
 	 * "not scheduled" for every running or async action, and every caller
 	 * here is an idempotence or health guard: Activator::activate() would
 	 * stack a fresh resume sweep on each activation, and Site Health would
@@ -158,6 +158,25 @@ final class BackgroundEvents {
 			: wp_next_scheduled( $hook, $args );
 
 		return is_int( $next_wp );
+	}
+
+	/**
+	 * Whether Action Scheduler itself holds a pending or in-progress action
+	 * of the hook, whatever WP-Cron holds.
+	 *
+	 * The answer of is_scheduled() covers both engines, so a caller that
+	 * moves an event from WP-Cron to Action Scheduler asks this before it
+	 * clears the WP-Cron copy. One Action Scheduler probe; false when Action Scheduler
+	 * is not available.
+	 *
+	 * @param string                 $hook Hook name.
+	 * @param array<int, mixed>|null $args Exact args, or null for any.
+	 * @return bool
+	 */
+	public static function is_scheduled_in_action_scheduler( string $hook, ?array $args = null ): bool {
+		$next_as = self::as_next_raw( $hook, $args );
+
+		return true === $next_as || is_int( $next_as );
 	}
 
 	/**
@@ -202,7 +221,7 @@ final class BackgroundEvents {
 	 *
 	 * Callers must pass BOTH an interval in seconds (used by Action
 	 * Scheduler) AND a WP-Cron schedule name (used by the fallback). The
-	 * two have to match — there is no shared primitive, since
+	 * two have to match - there is no shared primitive, since
 	 * `wp_schedule_event()` takes a registered schedule name while
 	 * `as_schedule_recurring_action()` takes raw seconds. Stock schedules
 	 * (`'hourly'`, `'twicedaily'`, `'daily'`, `'weekly'`) are always safe;
@@ -217,10 +236,10 @@ final class BackgroundEvents {
 	 * @param string            $wp_cron_schedule    WP-Cron schedule
 	 *                                               name (fallback).
 	 * Returns whether the event was actually ADMITTED. It used to be `void` and
-	 * discarded both schedulers' answers, which made all five refusal shapes —
+	 * discarded both schedulers' answers, which made all five refusal shapes -
 	 * an Action Scheduler pre-admission returning 0, a `pre_schedule_event`
 	 * veto returning false, that veto returning a WP_Error, an unregistered
-	 * WP-Cron schedule name, and a successful schedule — produce exactly the
+	 * WP-Cron schedule name, and a successful schedule - produce exactly the
 	 * same observable result: nothing. A maintenance task that was never
 	 * scheduled looked identical to one that was, so the plugin's own recurring
 	 * work could be absent indefinitely with no signal anywhere.
@@ -260,7 +279,7 @@ final class BackgroundEvents {
 
 		if ( ! $accepted ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			error_log( 'PerfLocale BackgroundEvents: scheduler refused recurring ' . $hook . ' — ' . $reason . '; the event was NOT queued.' );
+			error_log( 'PerfLocale BackgroundEvents: scheduler refused recurring ' . $hook . ' - ' . $reason . '; the event was NOT queued.' );
 		}
 
 		return $accepted;
@@ -290,10 +309,10 @@ final class BackgroundEvents {
 	 * Find the next-run UNIX timestamp for a hook in either back-end.
 	 *
 	 * Returns the earlier of the AS and WP-Cron next-runs (in case both
-	 * happen to be scheduled — e.g. after an engine-setting flip), or
+	 * happen to be scheduled - e.g. after an engine-setting flip), or
 	 * null when no match has a timestamp (see the NULL paragraph below).
 	 *
-	 * `$args = null` (the default) matches ANY args — see is_scheduled().
+	 * `$args = null` (the default) matches ANY args - see is_scheduled().
 	 *
 	 * NULL IS NOT "NOTHING PENDING". A pending ASYNC Action Scheduler action
 	 * and an Action Scheduler action that is IN PROGRESS have no timestamp,
@@ -404,7 +423,7 @@ final class BackgroundEvents {
 	 * (functions.php): with empty args it takes the `cancel_actions_by_hook`
 	 * branch only when the hook is set AND the group is EMPTY; supplying the
 	 * group instead falls through to a `do { as_unschedule_action($hook, [], $group) }`
-	 * loop, which matches `args = '[]'` EXACTLY — so every pending action that
+	 * loop, which matches `args = '[]'` EXACTLY - so every pending action that
 	 * carries arguments (all the per-blog ones, scheduled with `[ $blog_id ]`)
 	 * survived deactivation and kept firing with no callback. Caught by
 	 * tools/regression-tests/cov-background.php J.1.k.
@@ -441,7 +460,7 @@ final class BackgroundEvents {
 	 * Called by `Lock::reap_expired`, `JobState::gc`, and similar
 	 * recurring handlers right before they return. Stores both the
 	 * completion timestamp and the wall-clock duration so the Jobs
-	 * admin page can show "ran 2 hours ago — took 14 ms" without
+	 * admin page can show "ran 2 hours ago - took 14 ms" without
 	 * needing a separate logging layer.
 	 *
 	 * @param string    $hook        Hook name that just finished.
@@ -497,7 +516,7 @@ final class BackgroundEvents {
 	/**
 	 * Whether the current engine choice resolves to Action Scheduler.
 	 *
-	 * Mirrors {@see JobRunnerFactory::pick()} without instantiating —
+	 * Mirrors {@see JobRunnerFactory::pick()} without instantiating -
 	 * cheaper for the common-path `enqueue()` call.
 	 *
 	 * @return bool
@@ -505,7 +524,7 @@ final class BackgroundEvents {
 	/**
 	 * Whether the active engine is Action Scheduler (vs. plain WP-Cron).
 	 *
-	 * Public so callers can pick a different fan-out strategy per engine —
+	 * Public so callers can pick a different fan-out strategy per engine -
 	 * e.g. the webhook queue only coalesces on WP-Cron, where every
 	 * wp_schedule_single_event rewrites the single autoloaded `cron`
 	 * option; AS enqueues each async action into its own table row.
@@ -534,7 +553,7 @@ final class BackgroundEvents {
 				}
 			}
 		} catch ( \Throwable $e ) {
-			// Very early bootstrap — default to AS-available.
+			// Very early bootstrap - default to AS-available.
 			unset( $e );
 		}
 

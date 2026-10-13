@@ -75,7 +75,7 @@ final class SpeculationRulesEmitter {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Feature defaults OFF — skip attaching hooks entirely so disabled
+		// Feature defaults OFF - skip attaching hooks entirely so disabled
 		// installs don't pay for an add_action() + callback fire (which
 		// would just short-circuit on the same setting read inside
 		// resolve_target_urls()).

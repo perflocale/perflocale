@@ -20,10 +20,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Delegates to whichever provider the host site has configured under the
  * core AI Client (OpenAI, Anthropic, local Ollama, etc.). Lets PerfLocale
- * sites translate without provisioning a separate MT API key — they reuse
+ * sites translate without provisioning a separate MT API key - they reuse
  * the AI key already configured for the rest of core / other plugins.
  *
- * Targets the WP 7.0+ surface — `wp_ai_client_prompt( $prompt )` returns a
+ * Targets the WP 7.0+ surface - `wp_ai_client_prompt( $prompt )` returns a
  * fluent `WP_AI_Client_Prompt_Builder`, which the wrapper closure inside
  * `resolve_client_callback()` configures (temperature / max tokens /
  * provider / system instruction / model preference / request timeout) and
@@ -32,7 +32,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Feature-detected: when `wp_ai_client_prompt()` is absent (WP 6.x), OR
  * `wp_supports_ai()` returns false on this request,
  * `resolve_client_callback()` returns null and `is_configured()` returns
- * false — the provider stays out of the picker UI. Sites with an exotic
+ * false - the provider stays out of the picker UI. Sites with an exotic
  * AI setup can return a custom resolver via the
  * `perflocale/mt/wp_ai_client_resolver` filter.
  */
@@ -220,7 +220,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch(). Expressed to the model as a
 	 *   prompt rule (there is no wire-level format switch for LLMs).
 	 *
@@ -241,7 +241,7 @@ final class WpAiClientProvider extends AbstractProvider {
 		// (which is the canonical breaker site for HTTP-based providers) because
 		// the WP AI Client is invoked via a PHP callback, not wp_remote_*. Without
 		// the explicit gate here, a sustained upstream outage would burn through
-		// the user's API quota one call at a time — every visitor / translator
+		// the user's API quota one call at a time - every visitor / translator
 		// keeps hitting the failing provider until the budget cap stops them.
 		// Same breaker key (`mt_<provider_id>`) the Site Health card surfaces.
 		$breaker_key = 'mt_' . $this->get_id();
@@ -326,7 +326,7 @@ final class WpAiClientProvider extends AbstractProvider {
 		// Record the failure on the breaker BEFORE re-throwing so the
 		// next caller in this request (or shortly after) gets the open
 		// breaker instead of another failing upstream call. Auth errors
-		// trip on the first hit (threshold_override=1) — no number of
+		// trip on the first hit (threshold_override=1) - no number of
 		// retries fixes a bad API key, so the breaker should open fast
 		// and let the operator see it in Site Health.
 		$reason             = self::classify_error( $e );
@@ -344,7 +344,7 @@ final class WpAiClientProvider extends AbstractProvider {
 		//
 		// Otherwise mask credential-shaped runs BEFORE the message is
 		// surfaced. This provider bypasses AbstractProvider::make_request(),
-		// which is where every HTTP provider's error body gets masked — so
+		// which is where every HTTP provider's error body gets masked - so
 		// without this call the raw upstream text is what gets thrown, and for
 		// a background job it is persisted verbatim on the job row that the
 		// Jobs page and the REST detail endpoint render. Real upstreams do
@@ -432,7 +432,7 @@ final class WpAiClientProvider extends AbstractProvider {
 
 	/**
 	 * Test connection by translating a known-cheap fixture string. Real key
-	 * validation happens inside the AI client itself — a failing key surfaces
+	 * validation happens inside the AI client itself - a failing key surfaces
 	 * as a RuntimeException from the call.
 	 *
 	 * {@inheritDoc}
@@ -623,7 +623,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * in order; the goal is to return the model's translation as a string.
 	 *
 	 * @param mixed  $result Whatever the client returned.
-	 * @param string $source Original text — informs artifact stripping and
+	 * @param string $source Original text - informs artifact stripping and
 	 *   fallback error messages.
 	 * @return string
 	 *
@@ -678,11 +678,11 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * smuggle in: surrounding double-quotes, "Translation:" prefixes,
 	 * <result>…</result> wrappers from system-prompt-tuned models, etc.
 	 *
-	 * Conservative — only strips when the artifact is unambiguous. The MT
+	 * Conservative - only strips when the artifact is unambiguous. The MT
 	 * integrity gate (PlaceholderMasker) is the second line of defence.
 	 *
 	 * @param string $text   Raw model output.
-	 * @param string $source Source text — a quote-wrapped source means quotes
+	 * @param string $source Source text - a quote-wrapped source means quotes
 	 *   in the output are faithful content, so quote stripping is skipped.
 	 * @return string
 	 */
@@ -700,7 +700,7 @@ final class WpAiClientProvider extends AbstractProvider {
 		// the output were faithfully carried over, not chat decoration.
 		$strip_quotes = ! self::is_quote_wrapped( trim( $source ) );
 
-		// Strip wrapping quotes BEFORE the prefix sniff — chat-tuned models
+		// Strip wrapping quotes BEFORE the prefix sniff - chat-tuned models
 		// commonly emit `"Translation: …"` (both decorations at once) and the
 		// regex only matches at offset 0, so quotes have to go first.
 		if (
@@ -730,7 +730,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Whether a string is wrapped in quotation marks — straight, curly, or
+	 * Whether a string is wrapped in quotation marks - straight, curly, or
 	 * guillemets. A source quoted in ANY convention makes quotes in the
 	 * translated output content rather than decoration (the model may
 	 * legitimately convert «…» / „…“ to the target language's quote style).
@@ -755,7 +755,7 @@ final class WpAiClientProvider extends AbstractProvider {
 		 * Filter the callable used to invoke the WordPress AI Client.
 		 *
 		 * Return any callable accepting `(string $prompt, array $args)` and
-		 * returning the model output (string, array, or object — the
+		 * returning the model output (string, array, or object - the
 		 * response normaliser handles all three). Useful for unit tests,
 		 * custom routing, or as a forward-compatibility shim if core
 		 * renames the API.
@@ -781,7 +781,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * to a simple `(string $prompt, array $args): string` signature so the
 	 * rest of this class doesn't need to know about the builder. Args keys
 	 * recognised (each gated by is_callable so a stripped / future
-	 * builder build can't fatal — see the ⚠️ note at the call site for why
+	 * builder build can't fatal - see the ⚠️ note at the call site for why
 	 * method_exists is the WRONG guard here):
 	 *
 	 *   - `temperature`        → `->usingTemperature( float )`
@@ -806,7 +806,7 @@ final class WpAiClientProvider extends AbstractProvider {
 
 		// WP 7.0+ canonical API. wp_supports_ai() lets the host disable AI
 		// per-request (WP_AI_SUPPORT constant + `wp_supports_ai` filter),
-		// so respect it before invoking the builder — saves an upstream
+		// so respect it before invoking the builder - saves an upstream
 		// call that core has already decided to refuse.
 		// Called by name (WP 7.0 AI Client is optional progressive
 		// enhancement on a 6.4-minimum plugin); the function_exists() guards
@@ -823,7 +823,7 @@ final class WpAiClientProvider extends AbstractProvider {
 
 				// Type-narrow for PHPStan + defensive at runtime. The
 				// builder API may evolve in WP 7.x and any non-object
-				// return is malformed — treat as a fatal error rather
+				// return is malformed - treat as a fatal error rather
 				// than calling methods on a non-object.
 				if ( ! is_object( $builder ) ) {
 					throw new \RuntimeException(
@@ -832,7 +832,7 @@ final class WpAiClientProvider extends AbstractProvider {
 				}
 
 				// Builder methods mutate `$this` in-place and return $this
-				// for chaining (see WP_AI_Client_Prompt_Builder::__call —
+				// for chaining (see WP_AI_Client_Prompt_Builder::__call -
 				// `return $this`), so each option is applied for side-effect
 				// and the builder is never reassigned.
 				//
@@ -850,7 +850,7 @@ final class WpAiClientProvider extends AbstractProvider {
 				// magic method and false for a genuinely absent one, which is
 				// the question being asked. Found by
 				// tools/regression-tests/wp-ai-client-roundtrip.php C.6, which
-				// is the first test to drive core's real builder — the stubbed
+				// is the first test to drive core's real builder - the stubbed
 				// resolver in cov-machine-translation.php never touched it.
 				$apply = static function ( object $target, string $method, $value ): void {
 					if ( ! is_callable( [ $target, $method ] ) ) {
@@ -910,7 +910,7 @@ final class WpAiClientProvider extends AbstractProvider {
 				//
 				// When no AI provider is configured / available / the prompt is
 				// blocked, __call returns `$this->error` (a WP_Error) or the
-				// builder itself instead of throwing — so we detect the failure
+				// builder itself instead of throwing - so we detect the failure
 				// shape and convert it to a RuntimeException for the outer
 				// try / breaker. Without this, the strict `: string` return type
 				// triggers a TypeError that the breaker classifier reads as
@@ -936,7 +936,7 @@ final class WpAiClientProvider extends AbstractProvider {
 				}
 
 				throw new \RuntimeException(
-					esc_html__( 'WordPress AI Client returned no text — likely no AI provider configured, or the prompt was blocked by a wp_ai_client_prevent_prompt filter.', 'perflocale' )
+					esc_html__( 'WordPress AI Client returned no text - likely no AI provider configured, or the prompt was blocked by a wp_ai_client_prevent_prompt filter.', 'perflocale' )
 				);
 			};
 		}
@@ -968,7 +968,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	 *   - 'invalid_request' → the provider refused the request itself (400)
 	 *   - 'unknown'         → couldn't classify; surface raw message verbatim
 	 *
-	 * Heuristic only — every AI provider phrases errors differently. We
+	 * Heuristic only - every AI provider phrases errors differently. We
 	 * inspect the message + HTTP status hints from `WP_Error`-style codes
 	 * when present. Conservative: ambiguous strings fall through to
 	 * 'unknown' rather than misclassify and mask a real issue.
@@ -979,7 +979,7 @@ final class WpAiClientProvider extends AbstractProvider {
 	public static function classify_error( \Throwable $e ): string {
 		$msg = strtolower( $e->getMessage() );
 
-		// Auth failures — checked first because some providers return 401 with
+		// Auth failures - checked first because some providers return 401 with
 		// a "rate limit"-shaped message; the auth case is more urgent.
 		if (
 			str_contains( $msg, 'unauthorized' )

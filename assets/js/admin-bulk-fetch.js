@@ -1,5 +1,5 @@
 /**
- * PerfLocale — request helper of the bulk tools on Settings → Translation.
+ * PerfLocale - request helper of the bulk tools on Settings → Translation.
  *
  * window.perflocaleBulkFetch( data, state ) posts `data` (a FormData) to
  * admin-ajax.php and resolves with the parsed JSON answer. When a tool answers

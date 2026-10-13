@@ -213,7 +213,7 @@ final class StringTranslation {
 				if ( is_array( $results ) ) {
 					foreach ( $results as $row ) {
 						// Skip internal, output-buffer-served domains (a leading
-						// "_", such as "_pfl_dyn") — not gettext-
+						// "_", such as "_pfl_dyn") - not gettext-
 						// resolved, so they must not populate the map (which would
 						// register the gettext filters on otherwise-untranslated
 						// languages).
@@ -225,7 +225,7 @@ final class StringTranslation {
 						$gettext                    = $gettext || self::is_gettext_domain( (string) $row->domain );
 
 						// Plural forms 2..N (Polish/Russian/Arabic) live in the
-						// plural-context row's extra_forms JSON — NULL for every
+						// plural-context row's extra_forms JSON - NULL for every
 						// 2-form language, so this branch is skipped for almost
 						// all rows.
 						if ( isset( $row->extra_forms ) && $row->extra_forms !== null && $row->extra_forms !== '' ) {
@@ -259,13 +259,13 @@ final class StringTranslation {
 		);
 
 		// A persistent object cache can hand back something that is no longer
-		// the array we stored — a truncated Redis payload, or a drop-in that
+		// the array we stored - a truncated Redis payload, or a drop-in that
 		// reports a hit but returns false for a value it could not unserialize.
 		// $translations is a TYPED property, so assigning that straight through
 		// throws at the ASSIGNMENT: a fatal on every front-end request for as
 		// long as the poisoned entry lives, not a degraded page. Treat a
-		// non-array payload as "no translations" — the same defensive shape
-		// LanguageRepository::find() uses for its non-object payloads —
+		// non-array payload as "no translations" - the same defensive shape
+		// LanguageRepository::find() uses for its non-object payloads -
 		// so the request finishes serving source strings instead of white-
 		// screening. A well-formed array is passed through UNCHANGED.
 		$this->translations = is_array( $preloaded ) ? $preloaded : [];
@@ -349,7 +349,7 @@ final class StringTranslation {
 					if ( is_array( $results ) ) {
 						foreach ( $results as $row ) {
 							// Skip internal, output-buffer-served domains (a
-							// leading "_", such as "_pfl_dyn") —
+							// leading "_", such as "_pfl_dyn") -
 							// they're not gettext-resolved, so they must not
 							// populate the map (which would register the gettext
 							// filters on otherwise-untranslated languages).
@@ -392,7 +392,7 @@ final class StringTranslation {
 			// string "GARBAGE" through.
 			if ( is_array( $fallback_translations ) && $fallback_translations !== [] ) {
 				// The extra-forms sub-map needs a PER-HASH merge (primary
-				// hash wins), not the whole-key `+=` — otherwise the primary
+				// hash wins), not the whole-key `+=` - otherwise the primary
 				// language's EXTRA_FORMS_KEY entry would block every fallback
 				// plural, or vice-versa. Splice it out, merge separately.
 				$fallback_extra = $fallback_translations[ self::EXTRA_FORMS_KEY ] ?? [];
@@ -408,7 +408,7 @@ final class StringTranslation {
 				// has its own form-1 translation but no extra forms, attaching
 				// the fallback's forms 2..N would serve a MIXED-language plural
 				// set (form 1 in the primary language, "many" in the fallback
-				// language) — same-language form-1 fallback is the lesser evil.
+				// language) - same-language form-1 fallback is the lesser evil.
 				$adoptable_extra = [];
 
 				if ( is_array( $fallback_extra ) && $fallback_extra !== [] ) {
@@ -584,7 +584,7 @@ final class StringTranslation {
 	 *
 	 * Form 1 is the plural row's own `translation`; forms 2..N come from
 	 * that row's `extra_forms` JSON (loaded into the reserved sub-map).
-	 * Falls back to form 1 when a specific extra form is absent — the
+	 * Falls back to form 1 when a specific extra form is absent - the
 	 * partially-translated-plural behaviour, matching gettext.
 	 *
 	 * @param string $original     The plural original text.
@@ -618,7 +618,7 @@ final class StringTranslation {
 					// perflocale/string/translate filter; run forms 2..N through
 					// the same filter so a listener (e.g. a glossary marker)
 					// sees every plural form consistently, not just the first
-					// two. Cold path (plural, form >= 2 only) — no hot-path cost.
+					// two. Cold path (plural, form >= 2 only) - no hot-path cost.
 					if ( has_filter( 'perflocale/string/translate' ) ) {
 						$candidate = (string) apply_filters(
 							'perflocale/string/translate',

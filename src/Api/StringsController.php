@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * POST /perflocale/v1/strings/machine-translate - Queue bulk MT for strings.
  *
  * String translations are WRITTEN via the admin Strings page (AdminController)
- * — there is deliberately no REST write route for individual strings.
+ * - there is deliberately no REST write route for individual strings.
  */
 final class StringsController extends RestController {
 
@@ -44,7 +44,7 @@ final class StringsController extends RestController {
 				// sanitize_callbacks mirror get_strings() exactly (absint /
 				// sanitize_text_field). Because REST sanitises BEFORE it
 				// type-validates, a non-numeric per_page/offset is coerced to 0
-				// by absint and then passes the integer check — identical to the
+				// by absint and then passes the integer check - identical to the
 				// handler's own absint() coercion, so no previously-accepted
 				// request is rejected. `page` is intentionally absent: the
 				// handler reads offset, not page.
@@ -103,7 +103,7 @@ final class StringsController extends RestController {
 				// boolean-coercion would change how 'true'/'0'/1 are read. The
 				// array params (target_lang_ids, string_ids) and the nested
 				// `filter` object are also left to the handler's own (array)
-				// cast — declaring type=array would newly reject a scalar the
+				// cast - declaring type=array would newly reject a scalar the
 				// (array) cast currently wraps.
 				'args'                => [
 					'mode'        => [
@@ -126,9 +126,9 @@ final class StringsController extends RestController {
 	 *
 	 * Accepts one of three selection modes:
 	 *
-	 *   - `mode=ids`    + `string_ids[]=N`             — selected rows
-	 *   - `mode=filter` + `filter={domain,context,search}` — current filter set
-	 *   - `mode=all`                                    — entire strings table
+	 *   - `mode=ids`    + `string_ids[]=N`             - selected rows
+	 *   - `mode=filter` + `filter={domain,context,search}` - current filter set
+	 *   - `mode=all`                                    - entire strings table
 	 *
 	 * Plus the universal `target_lang_ids[]=N` list. Routes through the
 	 * Dispatcher which decides sync vs async based on the bulk_string_translate
@@ -289,7 +289,7 @@ final class StringsController extends RestController {
 		$path = match ( $target ) {
 			'theme' => get_stylesheet_directory(),
 			// WP_PLUGIN_DIR honours installs that relocate the plugins
-			// directory via the WP_PLUGIN_DIR constant — WP_CONTENT_DIR
+			// directory via the WP_PLUGIN_DIR constant - WP_CONTENT_DIR
 			// would silently miss those.
 			'plugins' => WP_PLUGIN_DIR,
 			'parent' => get_template_directory(),

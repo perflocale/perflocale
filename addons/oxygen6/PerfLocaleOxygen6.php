@@ -64,7 +64,7 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 		// `ct_*` keys that Oxygen Classic registers, so running both
 		// addons concurrently is safe (no key collisions).
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		// ⚠️ Only the TEXT-FREE keys mirror — see add_mirror_keys() for what is on
+		// ⚠️ Only the TEXT-FREE keys mirror - see add_mirror_keys() for what is on
 		// that list and why the builder document is not. A mirror is
 		// bidirectional, so mirroring a document that carries the user's words
 		// destroys translated text in both directions.
@@ -94,7 +94,7 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 	 * A continuous mirror is bidirectional in ContentSync ("any group member's
 	 * save propagates group-wide"), so mirroring a builder document that carries
 	 * headings, paragraphs and button labels destroys translated text in BOTH
-	 * directions — a translator's save overwrites the source, and the next source
+	 * directions - a translator's save overwrites the source, and the next source
 	 * save overwrites the translation. That was reproduced end to end for
 	 * Elementor on 4.2.1 and 4.1.3, and observed for Beaver Builder on a replica;
 	 * every builder here stores text the same way, so all of them were moved.
@@ -120,7 +120,7 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 			$prefix = '_breakdance_';
 		}
 
-		// NOT `{$prefix}data` — that is the document holding the user's text.
+		// NOT `{$prefix}data` - that is the document holding the user's text.
 		$keys[] = $prefix . 'template_settings';
 
 		return $keys;

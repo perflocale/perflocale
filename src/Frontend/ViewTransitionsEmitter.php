@@ -48,7 +48,7 @@ final class ViewTransitionsEmitter {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Feature defaults OFF — skip attaching hooks entirely so disabled
+		// Feature defaults OFF - skip attaching hooks entirely so disabled
 		// installs don't pay for two add_action() + two callback fires that
 		// would just short-circuit on the same setting read.
 		if ( ! (bool) $this->settings->get( 'view_transitions_enabled', false ) ) {
@@ -62,7 +62,7 @@ final class ViewTransitionsEmitter {
 		// output lands in the right place.
 		add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_style' ] );
 
-		// The cross-document opt-in <meta> tag rides wp_head directly —
+		// The cross-document opt-in <meta> tag rides wp_head directly -
 		// no stylesheet or script to attach it to.
 		add_action( 'wp_head', [ $this, 'emit_meta' ], 2 );
 	}
@@ -161,7 +161,7 @@ final class ViewTransitionsEmitter {
 		wp_register_style( $handle, false, [], defined( 'PERFLOCALE_VERSION' ) ? PERFLOCALE_VERSION : null );
 		wp_enqueue_style( $handle );
 
-		// $css is a fixed literal defined in this file — no variable, no user
+		// $css is a fixed literal defined in this file - no variable, no user
 		// input, no stored option reaches it. wp_add_inline_style() is the
 		// correct API for inline CSS (there is no esc_* function for a
 		// stylesheet body; escaping CSS as HTML would corrupt it). Automated

@@ -1,5 +1,5 @@
 /**
- * PerfLocale — JS-side Abilities API shim.
+ * PerfLocale - JS-side Abilities API shim.
  *
  * Registers the plugin's six PHP-side abilities with the WordPress JS
  * Abilities API (WP 7.0+) so client-side AI tools and editor extensions
@@ -9,7 +9,7 @@
  * Feature-detected: if `window.wp.abilities.register` isn't present
  * (every WP version through 7.0.x at the time of writing), this script
  * is a no-op. The shim activates automatically once core ships the JS
- * side of the API — no plugin update required.
+ * side of the API - no plugin update required.
  *
  * NOTE (speculative contract): the JS-side `wp.abilities.register` API is
  * not shipped in any released WordPress yet, so the exact register()
@@ -19,7 +19,7 @@
  * 7.0.2. If core ships a different register contract (e.g. it wires the
  * REST transport itself, or names the callback differently), revisit the
  * `register()` payload and runAbility() below. Until then this stays a
- * gated no-op with zero runtime effect — see PERFLOCALE_ABILITIES_JS in
+ * gated no-op with zero runtime effect - see PERFLOCALE_ABILITIES_JS in
  * the release checklist.
  *
  * @package PerfLocale
@@ -54,9 +54,9 @@
 	 *
 	 * WP 7.x ships the run route at
 	 * `/wp-abilities/v1/abilities/{namespace}/{slug}/run`. The controller
-	 * chooses the HTTP method from the ability's annotations — readonly
+	 * chooses the HTTP method from the ability's annotations - readonly
 	 * runs as GET, destructive-and-idempotent as DELETE, everything else
-	 * as POST — and reads the payload from a single wrapped `input` key
+	 * as POST - and reads the payload from a single wrapped `input` key
 	 * (JSON body for POST/DELETE, `?input=<json>` for GET). We mirror that
 	 * contract using the annotations localized alongside each ability.
 	 *

@@ -260,7 +260,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Machine-translatable Pods keys: LEAF text/paragraph/wysiwyg fields
-	 * only (code/email/phone/website/oembed/link excluded — not human prose).
+	 * only (code/email/phone/website/oembed/link excluded - not human prose).
 	 * Gated by the mt_meta_custom_fields setting.
 	 *
 	 * @param array<int, string> $keys      Meta keys.
@@ -394,7 +394,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 
 		// Resolve the language first: nothing is translated on the default
 		// language, so bail BEFORE the (more expensive) Pods field-config
-		// lookup below — matching the ACF and Meta Box addons' ordering.
+		// lookup below - matching the ACF and Meta Box addons' ordering.
 		$lang_slug = $this->get_current_slug();
 
 		if ( $lang_slug === '' ) {
@@ -499,7 +499,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 * that unpublished post's title on a public page and link to a URL an
 	 * anonymous visitor cannot open. PerfLocale creates translations as drafts,
 	 * so that is the normal state of a half-finished translation, not an edge
-	 * case. Returning null keeps the published source in place — the same rule
+	 * case. Returning null keeps the published source in place - the same rule
 	 * the ACF addon applies to its relationship / post-object fields and the
 	 * WooCommerce addon to cross-sell and upsell IDs.
 	 *
@@ -534,7 +534,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * Handles arrays of IDs, arrays of associative arrays (output=arrays),
 	 * WP_Post objects, and single IDs. A sibling the visitor may not see is
-	 * skipped — see {@see self::public_translation_id()}.
+	 * skipped - see {@see self::public_translation_id()}.
 	 *
 	 * @param mixed  $value Post reference value(s).
 	 * @param string $lang_slug Target language slug.
@@ -546,7 +546,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 			$translated = [];
 
 			foreach ( $value as $key => $item ) {
-				// Array of associative arrays — Pods returns each entry as a row map keyed by ID, post_title, … when its output is set to 'arrays'.
+				// Array of associative arrays - Pods returns each entry as a row map keyed by ID, post_title, … when its output is set to 'arrays'.
 				if ( is_array( $item ) && isset( $item['ID'] ) ) {
 					$item_id     = (int) $item['ID'];
 					$translation = $this->public_translation_id( $item_id, $lang_slug );

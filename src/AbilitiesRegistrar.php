@@ -61,7 +61,7 @@ final class AbilitiesRegistrar {
 			return;
 		}
 
-		// Idempotent for the same reason the abilities are — see the guards in
+		// Idempotent for the same reason the abilities are - see the guards in
 		// the register_*() methods below.
 		if ( true === self::call_optional( 'wp_has_ability_category', 'perflocale-translation' ) ) {
 			return;
@@ -97,17 +97,31 @@ final class AbilitiesRegistrar {
 		// ⚠️ WRITE abilities, gated separately and OFF by default.
 		// `translate-post` spends the site's machine-translation budget and
 		// `create-translation` creates posts. Both are capability-checked, so
-		// this is not a privilege boundary — it is a SURPRISE boundary: an
+		// this is not a privilege boundary - it is a SURPRISE boundary: an
 		// agent acting for an administrator could legitimately do either, and
 		// the owner would have no idea it happened until the provider bill or
 		// the post list showed it.
-		/** @hook perflocale/abilities/write_enabled Enable the ABILITIES THAT WRITE. Default: the `abilities_write_enabled` setting. */
-		if ( ! apply_filters( 'perflocale/abilities/write_enabled', (bool) $this->plugin->get( 'settings' )->get( 'abilities_write_enabled', false ) ) ) {
+		if ( ! $this->write_abilities_enabled() ) {
 			return;
 		}
 
 		$this->register_translate_post();
 		$this->register_create_translation();
+	}
+
+	/**
+	 * Whether the current blog allows the abilities that write.
+	 *
+	 * Read at registration and again in both write abilities' permission
+	 * callbacks: the registry is process-global and outlives
+	 * switch_to_blog(), so the blog an ability runs on decides, not the blog
+	 * that registered it.
+	 *
+	 * @return bool
+	 */
+	private function write_abilities_enabled(): bool {
+		/** @hook perflocale/abilities/write_enabled Enable the ABILITIES THAT WRITE. Default: the `abilities_write_enabled` setting. */
+		return (bool) apply_filters( 'perflocale/abilities/write_enabled', (bool) $this->plugin->get( 'settings' )->get( 'abilities_write_enabled', false ) );
 	}
 
 	/**
@@ -119,7 +133,7 @@ final class AbilitiesRegistrar {
 	 * Invoke an optional core function by name, only when it exists.
 	 *
 	 * The Abilities API (`wp_register_ability*`, WP 6.9+) and AI Client
-	 * (WP 7.0+) are optional progressive enhancements — the plugin's minimum
+	 * (WP 7.0+) are optional progressive enhancements - the plugin's minimum
 	 * is 6.4 and it is fully functional without them. Calling by name keeps
 	 * this guarded, optional usage from tripping static WP-version scanners
 	 * while preserving the function_exists() safety check at the point of use.
@@ -174,7 +188,7 @@ final class AbilitiesRegistrar {
 		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
 		// name is registered twice. Now that abilities register at BOOT by
 		// default, any path that re-enters registration in the same request
-		// would trip that — a test rig re-entering to add the write abilities
+		// would trip that - a test rig re-entering to add the write abilities
 		// is the live example.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/list-languages' ) ) {
 			return;
@@ -192,7 +206,7 @@ final class AbilitiesRegistrar {
 					'additionalProperties' => false,
 				],
 				// Every output property carries title + description, matching
-				// the WP 7.1 core-ability schema convention — MCP clients and
+				// the WP 7.1 core-ability schema convention - MCP clients and
 				// LLM tool-use surface these to decide how to read the result.
 				'output_schema'       => [
 					'type'       => 'object',
@@ -260,11 +274,17 @@ final class AbilitiesRegistrar {
 						'count'     => count( $result ),
 					];
 				},
-				// Public read-only by design: the active-language list is
-				// already emitted on every front-end page (switcher, hreflang
-				// tags) and mirrors the public GET /perflocale/v1/languages
-				// route. Nothing here is written or secret.
-				'permission_callback' => '__return_true',
+				// The same rule as GET /perflocale/v1/languages: public unless
+				// `perflocale/api/languages_public` returns false, then any
+				// logged-in user. The filter's second argument stays a
+				// WP_REST_Request for callbacks typed against the route.
+				'permission_callback' => static function (): bool {
+					if ( (bool) apply_filters( 'perflocale/api/languages_public', true, new \WP_REST_Request( 'GET', '/perflocale/v1/languages' ) ) ) {
+						return true;
+					}
+
+					return current_user_can( 'read' );
+				},
 				'meta'                => [
 					'annotations'  => [
 						'readonly'    => true,
@@ -286,7 +306,7 @@ final class AbilitiesRegistrar {
 		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
 		// name is registered twice. Now that abilities register at BOOT by
 		// default, any path that re-enters registration in the same request
-		// would trip that — a test rig re-entering to add the write abilities
+		// would trip that - a test rig re-entering to add the write abilities
 		// is the live example.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/get-translations' ) ) {
 			return;
@@ -320,8 +340,8 @@ final class AbilitiesRegistrar {
 						'translations' => [
 							'type'                 => 'object',
 							'title'                => 'Translations',
-							'description'          => 'Map of language slug to the translated object\'s ID. The queried object itself is included under its own language.',
-							'additionalProperties' => [ 'type' => 'integer' ],
+							'description'          => 'Map of language slug to the translated object\'s ID. The queried object itself is included under its own language. A translated post the caller may neither read nor edit, or a translated term the caller may not edit, is listed with null.',
+							'additionalProperties' => [ 'type' => [ 'integer', 'null' ] ],
 						],
 					],
 				],
@@ -356,6 +376,30 @@ final class AbilitiesRegistrar {
 						}
 					}
 
+					// A sibling the caller may not see: language and existence
+					// only, as in the REST map. A post is seen through read or
+					// edit rights; a term through edit_term, the right the
+					// queried term is gated on.
+					if ( $type === Enum\ObjectType::Post ) {
+						_prime_post_caches( array_values( $map ), false, false );
+					} else {
+						_prime_term_caches( array_values( $map ), false );
+					}
+
+					foreach ( $map as $slug => $sibling_id ) {
+						if ( $sibling_id === $object_id ) {
+							continue;
+						}
+
+						$visible = $type === Enum\ObjectType::Post
+							? Helper::user_can_view_object( $sibling_id )
+							: current_user_can( 'edit_term', $sibling_id );
+
+						if ( ! $visible ) {
+							$map[ $slug ] = null;
+						}
+					}
+
 					return [ 'translations' => $map ];
 				},
 				'permission_callback' => function () {
@@ -382,7 +426,7 @@ final class AbilitiesRegistrar {
 		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
 		// name is registered twice. Now that abilities register at BOOT by
 		// default, any path that re-enters registration in the same request
-		// would trip that — a test rig re-entering to add the write abilities
+		// would trip that - a test rig re-entering to add the write abilities
 		// is the live example.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/detect-language' ) ) {
 			return;
@@ -445,7 +489,7 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'invalid_id', __( 'Invalid object ID.', 'perflocale' ) );
 					}
 
-					// Per-object read gate — the language assignment of a private
+					// Per-object read gate - the language assignment of a private
 					// or draft object is not public information. Same gate the REST
 					// twin GET /perflocale/v1/translations/<type>/<id> applies.
 					$denied = $this->authorize_object_read( $object_id, (string) $object_type );
@@ -501,7 +545,7 @@ final class AbilitiesRegistrar {
 		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
 		// name is registered twice. Now that abilities register at BOOT by
 		// default, any path that re-enters registration in the same request
-		// would trip that — a test rig re-entering to add the write abilities
+		// would trip that - a test rig re-entering to add the write abilities
 		// is the live example.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/convert-url' ) ) {
 			return;
@@ -565,7 +609,7 @@ final class AbilitiesRegistrar {
 				// UrlConverter::convert(), which is read-only and forces
 				// the host back to home_url, but unauthenticated URL
 				// rewriting on a public-facing MCP/REST surface is a
-				// sharper edge than necessary — gate on session presence
+				// sharper edge than necessary - gate on session presence
 				// at minimum so anonymous traffic can't burn cycles on
 				// the converter. Sites that want this ability genuinely
 				// public can override via the
@@ -606,9 +650,9 @@ final class AbilitiesRegistrar {
 	 * MachineTranslateController::translate() applies four gates before it
 	 * reaches TranslationService::translate_post():
 	 *
-	 *   1. edit_post on the SOURCE — kept inline in the execute_callback so
+	 *   1. edit_post on the SOURCE - kept inline in the execute_callback so
 	 *      its `cannot_edit_post` code and ordering are unchanged;
-	 *   2. the target-side guards — edit_post on the source is neither
+	 *   2. the target-side guards - edit_post on the source is neither
 	 *      authority to rewrite a translation the caller cannot edit (the
 	 *      overwrite guard, `cannot_overwrite_translation`) nor, when no live
 	 *      translation exists, authority over the default-language post whose
@@ -624,8 +668,8 @@ final class AbilitiesRegistrar {
 	 * is one more caller of that one implementation rather than a copy of it.
 	 *
 	 * ORDER MATTERS: admit() increments both counters when it allows, so it is
-	 * called in the same position the controllers call it — after both
-	 * target-side guards, before mt_enabled() — so the ability and the routes
+	 * called in the same position the controllers call it - after both
+	 * target-side guards, before mt_enabled() - so the ability and the routes
 	 * cannot disagree about which denial a caller sees, and so a request is
 	 * counted exactly once.
 	 *
@@ -704,7 +748,7 @@ final class AbilitiesRegistrar {
 		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
 		// name is registered twice. Now that abilities register at BOOT by
 		// default, any path that re-enters registration in the same request
-		// would trip that — a test rig re-entering to add the write abilities
+		// would trip that - a test rig re-entering to add the write abilities
 		// is the live example.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/translate-post' ) ) {
 			return;
@@ -783,7 +827,7 @@ final class AbilitiesRegistrar {
 					// existing-target overwrite guard, the copy-source check
 					// (`source_forbidden`), the create check on its type
 					// (`cannot_create_type`), the shared MT rate limiter, and
-					// mt_enabled() — in that order, matching the controller so
+					// mt_enabled() - in that order, matching the controller so
 					// the two entry points cannot disagree about which denial a
 					// caller sees.
 					$denied = $this->authorize_mt( $post_id, (string) $slug );
@@ -813,7 +857,7 @@ final class AbilitiesRegistrar {
 					}
 				},
 				'permission_callback' => function () {
-					return current_user_can( 'perflocale_use_mt' );
+					return current_user_can( 'perflocale_use_mt' ) && $this->write_abilities_enabled();
 				},
 				'meta'                => [
 					'annotations'  => [
@@ -836,7 +880,7 @@ final class AbilitiesRegistrar {
 		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
 		// name is registered twice. Now that abilities register at BOOT by
 		// default, any path that re-enters registration in the same request
-		// would trip that — a test rig re-entering to add the write abilities
+		// would trip that - a test rig re-entering to add the write abilities
 		// is the live example.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/create-translation' ) ) {
 			return;
@@ -917,7 +961,7 @@ final class AbilitiesRegistrar {
 					// ADDITIVE, never a replacement: edit_post does NOT imply
 					// read_post. On a private post owned by someone else read_post
 					// needs read_private_posts while edit_post needs
-					// edit_others_posts + edit_private_posts — independent
+					// edit_others_posts + edit_private_posts - independent
 					// primitives, so both checks stay. This second half is the
 					// write authority: create_translation() mints a post and a
 					// link row against the source, and the REST twin
@@ -973,7 +1017,7 @@ final class AbilitiesRegistrar {
 					];
 				},
 				'permission_callback' => function () {
-					return current_user_can( 'perflocale_translate' );
+					return current_user_can( 'perflocale_translate' ) && $this->write_abilities_enabled();
 				},
 				'meta'                => [
 					'annotations'  => [

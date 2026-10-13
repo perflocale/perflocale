@@ -73,7 +73,7 @@ final class PerfLocaleCommand {
 	}
 
 	// The service-container's `register_hooks()` duck-typing skips classes
-	// that don't define the method — and exposing a public no-op here would
+	// that don't define the method - and exposing a public no-op here would
 	// register it as a `wp perflocale register_hooks` subcommand, since
 	// WP-CLI auto-exposes every public method. So we deliberately omit it.
 
@@ -177,7 +177,7 @@ final class PerfLocaleCommand {
 		$format = $assoc_args['format'] ?? 'table';
 
 		if ( 'ids' === $format ) {
-			// format_items() can't render 'ids' from associative rows — it
+			// format_items() can't render 'ids' from associative rows - it
 			// stringifies each row ("Array to string conversion"). Emit the
 			// ID column directly so `--format=ids` stays scriptable.
 			\WP_CLI::line( implode( ' ', wp_list_pluck( $items, 'ID' ) ) );
@@ -215,7 +215,7 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( "Language with locale {$locale} already exists." );
 		}
 
-		// Resolve display data from the bundled language table — the same
+		// Resolve display data from the bundled language table - the same
 		// source the admin UI's quick-select uses. Without this, the raw
 		// locale became the display name ('de_DE' instead of 'Deutsch') and
 		// leaked into the public front-end switcher on CLI-provisioned sites.
@@ -490,7 +490,7 @@ final class PerfLocaleCommand {
 				$batch = get_posts(
 					[
 						'post_type'      => $post_type,
-						// Bounded WP-CLI batch loop (paged, id-only) — not a
+						// Bounded WP-CLI batch loop (paged, id-only) - not a
 						// front-end query; a large page keeps the run efficient.
 						'posts_per_page' => 500, // phpcs:ignore WordPress.WP.PostsPerPage.posts_per_page_posts_per_page
 						'paged'          => $paged++,
@@ -526,7 +526,7 @@ final class PerfLocaleCommand {
 
 		// Bulk-prime the L1 translation cache for every source post in
 		// one SELECT. Without this, get_translation_id() inside the loop
-		// pays the cold-path cost (~1-2 ms) for each first-time lookup —
+		// pays the cold-path cost (~1-2 ms) for each first-time lookup -
 		// linear waste on 200+ post bulk translates. Mirrors the same
 		// prime done in BulkTranslateJob and PostListColumns.
 		$repo = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
@@ -542,7 +542,7 @@ final class PerfLocaleCommand {
 		// to translate_post() finishes the current post first (no torn
 		// writes), then exits with the partial-progress summary. Guarded by
 		// function_exists() because some hardened CLI builds compile PHP
-		// without pcntl — in that environment Ctrl-C still terminates the
+		// without pcntl - in that environment Ctrl-C still terminates the
 		// process, just without the graceful summary.
 		$interrupted = false;
 
@@ -606,8 +606,8 @@ final class PerfLocaleCommand {
 
 		if ( $interrupted ) {
 			$remaining = count( $post_ids ) - ( $translated + $skipped + $failed );
-			\WP_CLI::warning( 'Interrupted by SIGINT — ' . $summary . " Remaining: {$remaining}." );
-			\WP_CLI::halt( 130 ); // 128 + SIGINT (2) — conventional shell exit code for Ctrl-C.
+			\WP_CLI::warning( 'Interrupted by SIGINT - ' . $summary . " Remaining: {$remaining}." );
+			\WP_CLI::halt( 130 ); // 128 + SIGINT (2) - conventional shell exit code for Ctrl-C.
 		}
 
 		if ( $failed > 0 ) {
@@ -629,7 +629,7 @@ final class PerfLocaleCommand {
 	 * @return void
 	 */
 	/**
-	 * `wp perflocale translate --dry-run` — estimate characters/cost for the
+	 * `wp perflocale translate --dry-run` - estimate characters/cost for the
 	 * selection without dispatching anything or spending provider quota.
 	 *
 	 * @param array<int, string>    $args        Positional args.
@@ -676,7 +676,7 @@ final class PerfLocaleCommand {
 			\WP_CLI::warning( 'This run would exceed the monthly character limit.' );
 		}
 
-		\WP_CLI::success( 'Dry run complete — nothing was translated.' );
+		\WP_CLI::success( 'Dry run complete - nothing was translated.' );
 	}
 
 	private function translate_single( int $post_id, string $target_lang, string $provider, $settings, CacheManager $cache, bool $include_meta = false ): void {
@@ -832,7 +832,12 @@ final class PerfLocaleCommand {
 					_prime_post_caches( array_map( 'intval', array_values( $translations ) ), false, false );
 				}
 
-				$items = [];
+				$items  = [];
+				$format = $assoc_args['format'] ?? 'table';
+
+				// The status of a deleted post is "-" in the table view and
+				// an empty value in the machine formats (json, csv, yaml).
+				$none = 'table' === $format ? '-' : '';
 
 				foreach ( $translations as $lang_slug => $tid ) {
 					$post    = get_post( $tid );
@@ -840,11 +845,9 @@ final class PerfLocaleCommand {
 						'Language' => \PerfLocale\Helper::format_locale_as_bcp47( $lang_slug ) . ( $post_lang && $post_lang->slug === $lang_slug ? ' *' : '' ),
 						'Post ID'  => $tid,
 						'Title'    => $post ? $post->post_title : '(deleted)',
-						'Status'   => $post ? $post->post_status : '-',
+						'Status'   => $post ? $post->post_status : $none,
 					];
 				}
-
-				$format = $assoc_args['format'] ?? 'table';
 
 				if ( empty( $items ) && in_array( $format, [ 'table' ], true ) ) {
 					\WP_CLI::log( 'No translations found for this post.' );
@@ -937,7 +940,7 @@ final class PerfLocaleCommand {
 	 * : Directory to scan (default: active theme). Named --dir, not --path:
 	 * wp-cli extracts its GLOBAL --path (the WordPress root) from anywhere
 	 * on the command line, so a subcommand --path flag can never reach the
-	 * command — wp-cli consumes it and tries to bootstrap WordPress from
+	 * command - wp-cli consumes it and tries to bootstrap WordPress from
 	 * the scan directory instead.
 	 *
 	 * @param array<int, string>    $args Positional args.
@@ -1017,7 +1020,7 @@ final class PerfLocaleCommand {
 	/**
 	 * Verify slug translations and report missing entries.
 	 *
-	 * @param CacheManager $cache Cache manager — accepted for signature parity
+	 * @param CacheManager $cache Cache manager - accepted for signature parity
 	 *                           with sibling slugs_* subcommands; verification
 	 *                           reads directly from the DB.
 	 * @return void
@@ -1562,7 +1565,7 @@ final class PerfLocaleCommand {
 			}
 
 			// Blog IDs are matched positionally, but they are NOT stable across
-			// networks — importing a backup taken on a DIFFERENT network can land
+			// networks - importing a backup taken on a DIFFERENT network can land
 			// a slice on the wrong site, whose translation_links/slug_translations
 			// then reference alien post/term IDs (corruption). DataImporter owns
 			// the comparison (host + port + path, scheme-agnostic) so this guard
@@ -1572,13 +1575,13 @@ final class PerfLocaleCommand {
 			// correct" override.
 			//
 			// Three cases, and the helper's null covers two of them, so they
-			// are told apart here — exactly as DataImporter::import() tells
+			// are told apart here - exactly as DataImporter::import() tells
 			// them apart for a single-site bundle, so the same file gets the
 			// same verdict from either command. No address at all (key absent,
 			// or empty) is NOT checked: every released exporter writes one, so
 			// such a slice is hand-made or ancient and the operator is on
-			// their own. An address that is present but unreadable — a number,
-			// an array, a bare scheme, a JSON `false` — is a mismatch, because
+			// their own. An address that is present but unreadable - a number,
+			// an array, a bare scheme, a JSON `false` - is a mismatch, because
 			// nothing in it identifies the site the slice came from.
 			// Everything else is compared.
 			$slice_url = $slice['export']['site_url'] ?? null;
@@ -1588,8 +1591,8 @@ final class PerfLocaleCommand {
 			if ( ! $forced && ( false === $verdict || ( $has_url && null === $verdict ) ) ) {
 				// The slice address prints as the file recorded it, so the
 				// operator can match it against what they exported. The target
-				// prints as the value the comparison anchors on — the raw
-				// `home` option — rather than home_url(), which in a
+				// prints as the value the comparison anchors on - the raw
+				// `home` option - rather than home_url(), which in a
 				// non-default language is a different address and would make
 				// a correct skip look like a bug.
 				\WP_CLI::warning(
@@ -1733,7 +1736,7 @@ final class PerfLocaleCommand {
 		}
 
 		// Both conditions leave the .po itself valid, so they are warnings, not
-		// errors — but they are invisible without this: the damage only appears
+		// errors - but they are invisible without this: the damage only appears
 		// when someone imports the file back and their work lands on the wrong
 		// row (or on a row nothing reads).
 		if ( ! empty( $report['dup_groups'] ) ) {
@@ -1858,7 +1861,7 @@ final class PerfLocaleCommand {
 	 * when you want re-import to allocate fresh translation_groups rather
 	 * than reuse mappings from the prior run. WITHOUT this flag, re-import
 	 * looks up the existing (migration_type, source_key) → group_id
-	 * mapping and reuses it (the disaster-recovery default) — running
+	 * mapping and reuses it (the disaster-recovery default) - running
 	 * --force-restart on a database whose translation_groups already
 	 * point at the source plugin's data WILL orphan those groups.
 	 *
@@ -1912,7 +1915,7 @@ final class PerfLocaleCommand {
 		// next pass allocates fresh translation_groups rather than
 		// reusing the mapping from a prior (now-restored-over) run. The
 		// CLI source string for TranslatePress is 'translatepress' but
-		// the migration_type stored in the source_map is 'trp' — see
+		// the migration_type stored in the source_map is 'trp' - see
 		// TranslatePressImporter::import(). It runs inside the import lock:
 		// clearing the map under a running import would orphan its groups.
 		$before = null;
@@ -1937,8 +1940,8 @@ final class PerfLocaleCommand {
 		\WP_CLI::log( "Migrating from {$source}..." );
 
 		// The runner holds the import lock (one import at a time, whatever
-		// the path or the source), runs the import, and — unless the import
-		// was refused — flushes every cache the admin migration jobs flush,
+		// the path or the source), runs the import, and - unless the import
+		// was refused - flushes every cache the admin migration jobs flush,
 		// including the files-mode .l10n.php bundles.
 		$result = [];
 
@@ -2199,7 +2202,7 @@ final class PerfLocaleCommand {
 			\WP_CLI::log( ' Invalid language references: 0 ✓' );
 		}
 
-		// 4. Widow translation groups — non-string groups with zero links
+		// 4. Widow translation groups - non-string groups with zero links
 		// (from manual SQL or 3rd-party code moving an object between groups
 		// without deleting the source). String-type groups are excluded:
 		// StringRepository manages their lifecycle and a momentarily-empty
@@ -2327,7 +2330,7 @@ final class PerfLocaleCommand {
 		// value.
 		//
 		// Serving is NOT affected: the runtime hashes the live source string,
-		// which still matches the stored hash. What breaks is EXPORT — the PO
+		// which still matches the stored hash. What breaks is EXPORT - the PO
 		// msgid is written from `original`, so a re-import hashes the damaged
 		// text, misses, and creates a PHANTOM row that the site never reads. A
 		// translator's work lands somewhere invisible.
@@ -2466,7 +2469,7 @@ final class PerfLocaleCommand {
 			$total = array_sum( $counts );
 
 			// Show a column for EVERY status count_by_status can return (the
-			// no-type call spans post/term/string links — string links carry
+			// no-type call spans post/term/string links - string links carry
 			// 'translated'), so the per-language row reconciles: the buckets
 			// sum to Total. Previously only Published/Draft/Empty were shown,
 			// so any 'translated'/'pending'/'needs_update' link inflated Total
@@ -2550,7 +2553,7 @@ final class PerfLocaleCommand {
 	 *     wp perflocale jobs retry  5fc94964-29f6-4697-8c4e-64a8ffb5c72d
 	 *     wp perflocale jobs delete 5fc94964-29f6-4697-8c4e-64a8ffb5c72d
 	 *
-	 *     # Operator brake — stop the worker fleet without deactivating the plugin
+	 *     # Operator brake - stop the worker fleet without deactivating the plugin
 	 *     wp perflocale jobs pause
 	 *     wp perflocale jobs unpause
 	 *
@@ -2726,7 +2729,7 @@ final class PerfLocaleCommand {
 		}
 
 		if ( ! in_array( (string) $state['status'], [ 'queued', 'running' ], true ) ) {
-			\WP_CLI::warning( "Job is in status '{$state['status']}' — only queued/running jobs can be canceled." );
+			\WP_CLI::warning( "Job is in status '{$state['status']}' - only queued/running jobs can be canceled." );
 			return;
 		}
 
@@ -2738,7 +2741,7 @@ final class PerfLocaleCommand {
 
 			if ( 'canceled' !== $status ) {
 				if ( \PerfLocale\Background\JobState::is_terminal( $status ) ) {
-					\WP_CLI::warning( "Job is in status '{$status}' — only queued/running jobs can be canceled." );
+					\WP_CLI::warning( "Job is in status '{$status}' - only queued/running jobs can be canceled." );
 					return;
 				}
 
@@ -2750,7 +2753,7 @@ final class PerfLocaleCommand {
 
 		// Release the per-job + per-type locks immediately. Otherwise the
 		// per-type lock (TTL 30 min) blocks every same-type dispatch with
-		// exponential backoff until the TTL elapses — same fix as the REST
+		// exponential backoff until the TTL elapses - same fix as the REST
 		// cancel endpoint.
 		\PerfLocale\Background\JobLock::release( $job_id );
 		\PerfLocale\Background\JobLock::release_type( (string) $state['type'] );
@@ -2778,13 +2781,13 @@ final class PerfLocaleCommand {
 		}
 
 		if ( ! in_array( (string) $state['status'], [ 'failed', 'canceled' ], true ) ) {
-			\WP_CLI::warning( "Job is in status '{$state['status']}' — only failed/canceled jobs can be retried." );
+			\WP_CLI::warning( "Job is in status '{$state['status']}' - only failed/canceled jobs can be retried." );
 			return;
 		}
 
 		// Re-inject the blog-id sentinel so the worker can switch_to_blog
 		// before reading the per-blog JobState row. Without this, retries
-		// of jobs dispatched from a non-main multisite site orphan — same
+		// of jobs dispatched from a non-main multisite site orphan - same
 		// fix as the REST retry endpoint.
 		$blog_id     = (int) ( $state['blog_id'] ?? 0 );
 		$worker_args = \PerfLocale\Background\WorkerRegistry::with_blog_sentinel(
@@ -2797,7 +2800,7 @@ final class PerfLocaleCommand {
 		}
 
 		// Record the engine that re-queued (mirrors WorkerRegistry::
-		// schedule_recording_engine) — after an engine switch, cancel/
+		// schedule_recording_engine) - after an engine switch, cancel/
 		// is_scheduled probes would otherwise target the wrong store.
 		$runner = \PerfLocale\Background\JobRunnerFactory::pick();
 		try {
@@ -2847,7 +2850,7 @@ final class PerfLocaleCommand {
 
 		if ( ! in_array( (string) $state['status'], [ 'complete', 'failed', 'canceled' ], true ) ) {
 			\WP_CLI::warning(
-				"Job is in status '{$state['status']}' — cancel it first ('wp perflocale jobs cancel {$job_id}') before deleting."
+				"Job is in status '{$state['status']}' - cancel it first ('wp perflocale jobs cancel {$job_id}') before deleting."
 			);
 			return;
 		}
@@ -2903,17 +2906,17 @@ final class PerfLocaleCommand {
 
 	/**
 	 * Format a unix timestamp as a "5 mins ago" style relative string for
-	 * CLI display. Returns "—" for zero/empty timestamps.
+	 * the table view. Returns "-" for zero/empty timestamps.
 	 *
 	 * @param int $ts
 	 * @return string
 	 */
 	private function format_time( int $ts ): string {
 		if ( $ts <= 0 ) {
-			return '—';
+			return '-';
 		}
 		// `max( 1, ... )` guarantees $diff >= 1, so the trailing " ago" is
-		// always appended — no need for the redundant `> 0` ternary.
+		// always appended - no need for the redundant `> 0` ternary.
 		return human_time_diff( $ts, time() ) . ' ago';
 	}
 
@@ -3030,11 +3033,11 @@ final class PerfLocaleCommand {
 		}
 
 		// Machine-readable formats (json/csv/yaml/count/ids) must always
-		// emit a parseable representation — even when the list is empty.
+		// emit a parseable representation - even when the list is empty.
 		// A human "Success: ..." line would break callers piping to jq/awk.
 		// Only print the friendly empty-state line for the default table view.
 		if ( $rows === [] && in_array( $format, [ 'table' ], true ) ) {
-			\WP_CLI::success( 'No active breakers — system healthy.' );
+			\WP_CLI::success( 'No active breakers - system healthy.' );
 			return;
 		}
 
@@ -3055,6 +3058,10 @@ final class PerfLocaleCommand {
 	private function breakers_status( string $key, string $format ): void {
 		$status = \PerfLocale\Concurrency\Breaker::status( $key );
 
+		// An absent time is "-" in the table view and an empty value in the
+		// machine formats (json, csv, yaml), so scripts need no placeholder.
+		$none = 'table' === $format ? '-' : '';
+
 		$rows = [
 			[
 				'field' => 'key',
@@ -3074,15 +3081,15 @@ final class PerfLocaleCommand {
 			],
 			[
 				'field' => 'first_failure',
-				'value' => (int) ( $status['first_failure'] ?? 0 ) > 0 ? gmdate( 'Y-m-d H:i:s', (int) $status['first_failure'] ) : '—',
+				'value' => (int) ( $status['first_failure'] ?? 0 ) > 0 ? gmdate( 'Y-m-d H:i:s', (int) $status['first_failure'] ) : $none,
 			],
 			[
 				'field' => 'last_failure',
-				'value' => (int) ( $status['last_failure'] ?? 0 ) > 0 ? gmdate( 'Y-m-d H:i:s', (int) $status['last_failure'] ) : '—',
+				'value' => (int) ( $status['last_failure'] ?? 0 ) > 0 ? gmdate( 'Y-m-d H:i:s', (int) $status['last_failure'] ) : $none,
 			],
 			[
 				'field' => 'opened_at',
-				'value' => (int) ( $status['opened_at'] ?? 0 ) > 0 ? gmdate( 'Y-m-d H:i:s', (int) $status['opened_at'] ) : '—',
+				'value' => (int) ( $status['opened_at'] ?? 0 ) > 0 ? gmdate( 'Y-m-d H:i:s', (int) $status['opened_at'] ) : $none,
 			],
 			[
 				'field' => 'cooldown_remaining',

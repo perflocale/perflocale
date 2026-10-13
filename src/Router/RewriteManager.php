@@ -94,6 +94,8 @@ final class RewriteManager {
 		// transient roundtrip when L1+L2 are cold). `clear_verified()` is
 		// called explicitly whenever rewrite rules regenerate, so the
 		// transient's auto-expiration safety net isn't needed.
+		CacheManager::before_autoloaded_read( self::VERIFIED_OPTION );
+
 		return get_option( self::VERIFIED_OPTION, '' ) === '1';
 	}
 
@@ -114,7 +116,9 @@ final class RewriteManager {
 	 * @return void
 	 */
 	private function clear_verified(): void {
-		delete_option( self::VERIFIED_OPTION );
+		// Also drops a flag left in the cached alloptions list without its row,
+		// which would otherwise keep the rules scan off until a cache flush.
+		CacheManager::delete_autoloaded_options( [ self::VERIFIED_OPTION ] );
 
 		// Belt-and-suspenders: clear the older cache- and transient-backed
 		// storage too in case an upgrade left a stale TRUE there.
@@ -260,7 +264,7 @@ final class RewriteManager {
 		// So the request ends with the flag CLEARED and the next frontend hit
 		// re-scans get_option( 'rewrite_rules' ), finds the language patterns
 		// the flush just wrote, and re-marks. That is the intended settling
-		// path — one extra scan, never a flush loop — but it does mean two
+		// path - one extra scan, never a flush loop - but it does mean two
 		// requests landing on a cold site can both flush. Both flushes produce
 		// identical rules, so the outcome is the same either way.
 		$this->mark_verified();
@@ -346,7 +350,7 @@ final class RewriteManager {
 			// Some third-party rules (WooCommerce wc-auth/wc-api among them)
 			// anchor their pattern with a leading ^. Prepending the language
 			// group would leave that ^ mid-regex, and since WP matches rules
-			// as #^pattern#, a mid-pattern anchor can never match — the rule
+			// as #^pattern#, a mid-pattern anchor can never match - the rule
 			// becomes dead weight in every match loop. Strip it: our prefix
 			// re-anchors the pattern at the start anyway.
 			$new_rules[ $lang_regex . '/' . ltrim( $pattern, '^' ) ] = $new_rewrite;

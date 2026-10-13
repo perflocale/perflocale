@@ -172,7 +172,7 @@ final class AddonManifestWriter {
 	 * sub-namespace (`perflocale_{addon_id}_` for transients/cron-hooks,
 	 * additionally `_perflocale_{addon_id}_` for meta keys).
 	 *
-	 * Soft-prefix isolation is NOT enforced — the trust model matches
+	 * Soft-prefix isolation is NOT enforced - the trust model matches
 	 * WordPress's own (a sibling plugin can wipe your transients on its
 	 * uninstall too). This helper only surfaces accidental sub-namespace
 	 * omissions to addon authors during development; production users
@@ -180,7 +180,7 @@ final class AddonManifestWriter {
 	 *
 	 * Suppress on a per-addon basis via the
 	 * `perflocale/addon/manifest/check_soft_prefix_namespacing` filter
-	 * — useful for addons that intentionally coordinate state across the
+	 * - useful for addons that intentionally coordinate state across the
 	 * addon namespace.
 	 *
 	 * @param string               $addon_id   Addon identifier.

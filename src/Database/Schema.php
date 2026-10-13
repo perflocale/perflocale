@@ -35,7 +35,7 @@ final class Schema {
 	private const TABLES_EXIST_KEY = 'tables_exist';
 
 	/**
-	 * Autoloaded per-blog option holding the positive tables_exist verdict —
+	 * Autoloaded per-blog option holding the positive tables_exist verdict -
 	 * the persistent layer for sites without an external object cache.
 	 */
 	private const TABLES_EXIST_OPTION = 'perflocale_tables_exist';
@@ -87,8 +87,8 @@ final class Schema {
 
 		// Table 3: Translation links.
 		// `type` mirrors the owning group's type ('post' / 'term' / 'string').
-		// object_id is a POLYMORPHIC id — post, term, and string id-spaces share
-		// the column — so the object-uniqueness key MUST include the type or a
+		// object_id is a POLYMORPHIC id - post, term, and string id-spaces share
+		// the column - so the object-uniqueness key MUST include the type or a
 		// post and a term with a colliding numeric id can't coexist and routine
 		// writes corrupt each other. Shipped inline in the canonical schema.
 		//
@@ -98,10 +98,10 @@ final class Schema {
 		// Without it, main-query language filtering and the found-rows COUNT
 		// degrade to full link-table scans per outer row (~11 s uncached at
 		// 10k posts; ~2 ms with the index). Do not "dedupe" it against
-		// `object_lang` — it is not a leftmost prefix of it.
+		// `object_lang` - it is not a leftmost prefix of it.
 		//
 		// Indexes intentionally NOT included (EXPLAIN-verified against real
-		// data — kept here so a future contributor doesn't re-add them):
+		// data - kept here so a future contributor doesn't re-add them):
 		// - `KEY status (status)`: low cardinality (3-4 values); the
 		// planner picks `group_status` for filtered status queries
 		// and ignores the standalone single-column index.
@@ -131,13 +131,13 @@ final class Schema {
 		// Table 4: Translatable strings.
 		//
 		// Column sizing:
-		// - context VARCHAR(191) — fits InnoDB's 767-byte per-column index
+		// - context VARCHAR(191) - fits InnoDB's 767-byte per-column index
 		//   limit on legacy MySQL (utf8mb4 × 191 = 764 bytes) so both
 		//   KEY context and KEY domain_context indexes work on every MySQL.
 		//   Practical translation contexts (the _x() 3rd arg) are always
 		//   short identifiers ("menu_item", "post_status", "navigation"),
 		//   so 191 chars is well past what real-world i18n data needs.
-		// - original_hash CHAR(64) ASCII — SHA-256 hex digests use exactly
+		// - original_hash CHAR(64) ASCII - SHA-256 hex digests use exactly
 		//   64 chars from [0-9a-f]. ASCII charset stores 1 byte/char vs
 		//   utf8mb4's 4; the UNIQUE index drops from 256 → 64 bytes/row.
 		//   latin1_bin collation keeps hash comparisons collation-free at
@@ -154,7 +154,7 @@ final class Schema {
 		//   register_setting_string() (manually-registered strings stay
 		//   fresh as long as the code path that registers them runs).
 		//   The daily GC deletes rows whose last_seen_at is older than
-		//   the filterable retention window (default 90 days) — covers
+		//   the filterable retention window (default 90 days) - covers
 		//   the disabled-plugin / removed-theme cleanup case.
 		$sql_strings = "CREATE TABLE {$prefix}strings (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -180,11 +180,11 @@ final class Schema {
 		//
 		// Two invariants, both DB-enforced:
 		//
-		// 1. `UNIQUE KEY object_slug (object_type, object_id, language_id)` —
+		// 1. `UNIQUE KEY object_slug (object_type, object_id, language_id)` -
 		// each object has exactly ONE translated slug per language.
 		//
 		// 2. `UNIQUE KEY slug_lookup (language_id, object_type, object_subtype,
-		// slug)` — within a single (language, object_type, object_subtype)
+		// slug)` - within a single (language, object_type, object_subtype)
 		// namespace, every translated slug is unique. The `object_subtype`
 		// column captures the WP sub-type that `object_type` alone can't:
 		// - For posts (object_type='post'): the post_type ('post',
@@ -202,10 +202,10 @@ final class Schema {
 		// Column sizing:
 		// - slug is indexed at slug(191), NOT in full. InnoDB's per-COLUMN
 		//   index limit is 767 bytes under REDUNDANT/COMPACT row format
-		//   (MySQL <= 5.6, MariaDB <= 10.1 — both inside WP 6.4's supported
+		//   (MySQL <= 5.6, MariaDB <= 10.1 - both inside WP 6.4's supported
 		//   matrix). utf8mb4 x 200 + 2 length bytes = 802, so indexing the
 		//   full column makes CREATE TABLE fail outright with "Specified key
-		//   was too long; max key length is 767 bytes" — the other eight
+		//   was too long; max key length is 767 bytes" - the other eight
 		//   tables create fine, leaving a half-provisioned schema and an
 		//   activation error that misleadingly blames DB permissions.
 		//   191 x 4 + 2 = 766, one byte under the cap, and it is the same
@@ -227,7 +227,7 @@ final class Schema {
 
 
 		// Table 9: Content hashes - track source content for change detection.
-		// content_hash is a SHA-256 hex digest — 64 chars from [0-9a-f].
+		// content_hash is a SHA-256 hex digest - 64 chars from [0-9a-f].
 		// latin1 stores 1 byte/char vs utf8mb4's 4, and latin1_bin keeps
 		// hash comparison collation-free. See strings table for why latin1
 		// (not ascii) matters for wpdb's table-charset resolution.
@@ -248,7 +248,7 @@ final class Schema {
 		// every lookup is now a direct index seek.
 		// `extra_forms` holds the JSON-encoded plural forms BEYOND the two
 		// this row's `translation` and its sibling singular/plural rows
-		// cover — i.e. msgstr[2..N] for CLDR languages with 3-6 plural
+		// cover - i.e. msgstr[2..N] for CLDR languages with 3-6 plural
 		// forms (Polish, Russian, Arabic …). It lives only on the
 		// `plural`-context row and is NULL for every 2-form language and
 		// every non-plural string, so the common case pays zero storage and
@@ -267,21 +267,21 @@ final class Schema {
 
 		// Table 11: Background-job state. Dedicated table for typed, indexed
 		// state tracking. Replaces the older option-based store (one row per
-		// job in wp_options) — the option store doesn't allow indexed
+		// job in wp_options) - the option store doesn't allow indexed
 		// queries, so admin filters / stuck-job scans / GDPR sweeps were
 		// O(N) over the full active-index. Typed columns + indexes here
 		// give:
-		// - `uuid`             — external-facing identifier (REST URLs,
+		// - `uuid`             - external-facing identifier (REST URLs,
 		// Action Scheduler args).
-		// - `version`          — optimistic-concurrency CAS column. Every
+		// - `version`          - optimistic-concurrency CAS column. Every
 		// mutating UPDATE bumps it AND checks the
 		// prior value, so concurrent writers serialise
 		// at the DB row-lock layer without ever
 		// overwriting each other.
-		// - `status_updated`   — covers stuck-job watchdog
+		// - `status_updated`   - covers stuck-job watchdog
 		// (`WHERE status IN (...) AND updated_at < ?`).
-		// - `type_status`      — admin / CLI filtering by job type + status.
-		// - `created_by`       — GDPR exporter/eraser + per-user admin views.
+		// - `type_status`      - admin / CLI filtering by job type + status.
+		// - `created_by`       - GDPR exporter/eraser + per-user admin views.
 		//
 		// LONGTEXT for args/result/log because args can be ~100 KB
 		// (filterable) and a 20-entry log ring buffer can grow past
@@ -290,7 +290,7 @@ final class Schema {
 		// `updated_at` deliberately has NO `ON UPDATE CURRENT_TIMESTAMP`:
 		// that stamps the MySQL SERVER's clock, while every sibling datetime
 		// is written by PHP in UTC (current_time('mysql', true)) and every
-		// consumer — the stuck-job watchdog, the GC sweeps, hydrate() —
+		// consumer - the stuck-job watchdog, the GC sweeps, hydrate() -
 		// compares it with gmdate(). When the DB timezone is not UTC the two
 		// clocks disagree: on a server behind UTC a row touched a second ago
 		// already looks hours stale, so the watchdog force-fails jobs that
@@ -365,7 +365,7 @@ final class Schema {
 		dbDelta( $sql_jobs );
 		dbDelta( $sql_migration_map );
 
-		// Schema is now present — clear any cached verdict so the next
+		// Schema is now present - clear any cached verdict so the next
 		// tables_exist() re-confirms against the fresh state. Covers both
 		// activation (Activator) and upgrades (Migrator), the two callers.
 		self::flush_tables_exist_cache();
@@ -412,7 +412,7 @@ final class Schema {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		}
 
-		// Tables are gone — drop the cached "installed" verdict so nothing
+		// Tables are gone - drop the cached "installed" verdict so nothing
 		// keeps querying the now-missing tables.
 		self::flush_tables_exist_cache();
 	}
@@ -432,10 +432,10 @@ final class Schema {
 	/**
 	 * Make a table identifier safe to interpolate into a query string.
 	 *
-	 * `wpdb::prepare()` binds VALUES with %d/%s placeholders — it cannot bind
+	 * `wpdb::prepare()` binds VALUES with %d/%s placeholders - it cannot bind
 	 * SQL identifiers (table/column names). So a table name that genuinely
-	 * has to be interpolated — DDL such as CREATE/DROP/TRUNCATE, or a dynamic
-	 * FROM — is hardened here instead: every character outside the set a real
+	 * has to be interpolated - DDL such as CREATE/DROP/TRUNCATE, or a dynamic
+	 * FROM - is hardened here instead: every character outside the set a real
 	 * MySQL identifier can contain ([A-Za-z0-9_]) is stripped. This is
 	 * lossless for our own prefixed table names (WordPress already constrains
 	 * `$table_prefix` to that set) and neutralises any unexpected
@@ -459,7 +459,7 @@ final class Schema {
 	 * On a site with a persistent object cache (Redis / Memcached) the
 	 * recurring SHOW TABLES collapses to an in-memory hit. Without a
 	 * persistent backend wp_cache is per-request only, so this degrades to
-	 * exactly one SHOW TABLES per request — no regression. That same
+	 * exactly one SHOW TABLES per request - no regression. That same
 	 * fall-through is why the WordPress Plugin Checker sandbox (no
 	 * persistent cache + a `wp_pc_` table prefix while sharing the main
 	 * `wp_options`) still runs the authoritative query and correctly sees
@@ -558,7 +558,7 @@ final class Schema {
 
 		// Persistent verdict lives in an autoloaded option: on sites WITHOUT
 		// an external object cache the wp_cache layer is empty every request,
-		// which made this method run SHOW TABLES per request — a measurable
+		// which made this method run SHOW TABLES per request - a measurable
 		// cost on servers with large table catalogs (thousands of tables make
 		// the catalog scan multi-ms). The option rides alloptions, so a warm
 		// verdict costs an array lookup. Only the positive verdict is stored;

@@ -28,10 +28,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  * holds only the reference. This class swaps that reference at render time.
  *
  * A synced pattern is a `wp_block` post. A page that uses one does NOT contain
- * its text — it contains `<!-- wp:block {"ref":123} /-->`, and core loads post
+ * its text - it contains `<!-- wp:block {"ref":123} /-->`, and core loads post
  * 123 at render time. Translating the page therefore cannot reach it: there is
  * nothing in the page to translate. (An *inserted* theme pattern is the
- * opposite case — the inserter copies the markup into `post_content`, so it is
+ * opposite case - the inserter copies the markup into `post_content`, so it is
  * ordinary page content and the page translation covers it. The two look
  * identical in the editor, which is why this needs saying twice.)
  *
@@ -40,7 +40,17 @@ if ( ! defined( 'ABSPATH' ) ) {
  * `attrs['ref']` lets `render_block_core_block()` run its own five checks
  * against the translated post. Filtering the rendered output instead would mean
  * re-implementing all of them. The cost on a page with no synced patterns is one
- * string comparison per block — see rewrite_ref().
+ * string comparison per block - see rewrite_ref().
+ *
+ * ONE PATH `render_block_data` DOES NOT REACH: core fires it in render_block()
+ * and for inner blocks (class-wp-block.php:614), but core/navigation renders
+ * the TOP-LEVEL blocks of its overlay template part with `$block->render()`
+ * (blocks/navigation.php, get_template_part_blocks_html()), so a Navigation
+ * block or a synced pattern placed directly in an overlay part, with no group
+ * around it, never passes through it. For those blocks the same swap runs
+ * inside the block type's own render_callback, see render_navigation() and
+ * render_pattern(). The callbacks are wrapped only while the filter is
+ * attached, and a ref rewrite_ref() already swapped is not resolved again.
  *
  * WHAT CORE DOES WITH A `ref` (wp-includes/blocks/block.php), all of it load-bearing:
  *
@@ -70,7 +80,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * or the next save writes the translated id into the source page and the two
  * languages collapse onto one pattern. That is why register_hooks() refuses to
  * attach anything under is_admin(), and why the filters are detached before REST
- * dispatch — the same write-back hazard {@see OptionStrings} exists to contain.
+ * dispatch - the same write-back hazard {@see OptionStrings} exists to contain.
  */
 final class BlockRefTranslator {
 
@@ -95,6 +105,17 @@ final class BlockRefTranslator {
 	private const BLOCKS = [
 		'core/block'      => 'wp_block',
 		'core/navigation' => 'wp_navigation',
+	];
+
+	/**
+	 * The render_callback that stands in for each block type of BLOCKS while a
+	 * translated page renders.
+	 *
+	 * @var array<string, string>
+	 */
+	private const WRAPPERS = [
+		'core/block'      => 'render_pattern',
+		'core/navigation' => 'render_navigation',
 	];
 
 	/**
@@ -150,6 +171,48 @@ final class BlockRefTranslator {
 	private static array $memo = [];
 
 	/**
+	 * Every translated id the memo has handed out, keyed like the memo
+	 * (blog, language, post type, translated id).
+	 *
+	 * A block that `render_block_data` reached arrives at its wrapped
+	 * render_callback already carrying its translation's id; this lets the
+	 * callback recognise it with one lookup instead of resolving that id again.
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $targets = [];
+
+	/**
+	 * The render_callback each block type had before the wrapper replaced it,
+	 * keyed by block name. Set when the wrapper is first installed.
+	 *
+	 * @var array<string, callable>
+	 */
+	private static array $core_render = [];
+
+	/**
+	 * The block names whose render chain holds the wrapper.
+	 *
+	 * A name is set from the moment the wrapper is installed until unwrap
+	 * writes the saved callback back. A callback other code installed over
+	 * the wrapper keeps the wrapper in its chain, so the name stays set and a
+	 * later attach() neither re-reads render_callback nor installs the wrapper
+	 * again: saving that callback as the one to call would make the two call
+	 * each other.
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $wrapped = [];
+
+	/**
+	 * The instance whose language the wrappers swap in, or null to pass every
+	 * block through unchanged.
+	 *
+	 * @var self|null
+	 */
+	private static ?self $render_owner = null;
+
+	/**
 	 * Translation manager, built on first use only.
 	 */
 	private ?PostTranslationManager $manager = null;
@@ -183,7 +246,7 @@ final class BlockRefTranslator {
 
 		// ⚠️ And again when a rendering window imposes a different language.
 		// `override_current_language()` (LanguageRouter.php:2373) is the supported
-		// way to render part of a request in another language — WooCommerce order
+		// way to render part of a request in another language - WooCommerce order
 		// emails are the live example. Subscribing only to `language/detected`
 		// left $slug frozen at the language the REQUEST arrived in, so a synced
 		// pattern inside such a window rendered in the wrong language while the
@@ -231,7 +294,7 @@ final class BlockRefTranslator {
 		$current = (string) $this->router->get_current_slug();
 
 		// Nothing is ever translated into its own language, so the default
-		// language pays nothing at all — not even the per-block name compare.
+		// language pays nothing at all - not even the per-block name compare.
 		if ( '' === $current || ( $default && $current === $default->slug ) ) {
 			return;
 		}
@@ -239,6 +302,8 @@ final class BlockRefTranslator {
 		$this->slug = $current;
 
 		add_filter( 'render_block_data', [ $this, 'rewrite_ref' ], 10, 1 );
+
+		$this->wrap_render_callbacks();
 	}
 
 	/**
@@ -254,6 +319,175 @@ final class BlockRefTranslator {
 
 		// Also closes the door on relanguage().
 		$this->attached = false;
+
+		$this->unwrap_render_callbacks();
+	}
+
+	/**
+	 * Route the render_callback of each block type in WRAPPERS through its
+	 * wrapper.
+	 *
+	 * Runs from attach(), so only on a front-end request in a language other
+	 * than the default, after `init` registered the blocks. The registered
+	 * block types are changed rather than `register_block_type_args` filtered:
+	 * that filter would run for every block type registered on every request,
+	 * the default language included. Each type is wrapped once until unwrap
+	 * puts its saved callback back; a later attach() only takes ownership,
+	 * also when other code has installed its own callback over a wrapper. A
+	 * type that is not registered, or not dynamic, is left alone.
+	 *
+	 * @return void
+	 */
+	private function wrap_render_callbacks(): void {
+		$registry = \WP_Block_Type_Registry::get_instance();
+
+		foreach ( self::WRAPPERS as $name => $wrapper ) {
+			if ( isset( self::$wrapped[ $name ] ) ) {
+				continue;
+			}
+
+			$type = $registry->get_registered( $name );
+
+			if ( ! $type instanceof \WP_Block_Type || ! $type->is_dynamic() ) {
+				continue;
+			}
+
+			self::$core_render[ $name ] = $type->render_callback;
+			$type->render_callback      = [ self::class, $wrapper ];
+			self::$wrapped[ $name ]     = true;
+		}
+
+		self::$render_owner = $this;
+	}
+
+	/**
+	 * Put each wrapped block type's own render_callback back.
+	 *
+	 * The REST API, and with it the editor, then renders the blocks exactly as
+	 * they were registered. A callback some other code installed over a
+	 * wrapper is left in place; the wrapper beneath it stays installed and
+	 * passes blocks through unchanged while it has no owner.
+	 *
+	 * @return void
+	 */
+	private function unwrap_render_callbacks(): void {
+		if ( self::$render_owner !== $this ) {
+			return;
+		}
+
+		self::$render_owner = null;
+
+		$registry = \WP_Block_Type_Registry::get_instance();
+
+		foreach ( self::WRAPPERS as $name => $wrapper ) {
+			$type = $registry->get_registered( $name );
+			$core = self::$core_render[ $name ] ?? null;
+
+			if ( $type instanceof \WP_Block_Type && $type->render_callback === [ self::class, $wrapper ] && is_callable( $core ) ) {
+				$type->render_callback = $core;
+				unset( self::$wrapped[ $name ] );
+			}
+		}
+	}
+
+	/**
+	 * The render_callback of core/navigation while a translated page renders.
+	 *
+	 * @see render_wrapped()
+	 *
+	 * @param mixed  $attributes Block attributes.
+	 * @param string $content    Block content.
+	 * @param mixed  $block      The WP_Block being rendered.
+	 * @return mixed What core's callback returns.
+	 */
+	public static function render_navigation( $attributes, $content = '', $block = null ) {
+		return self::render_wrapped( 'core/navigation', $attributes, $content, $block );
+	}
+
+	/**
+	 * The render_callback of core/block (a synced pattern) while a translated
+	 * page renders.
+	 *
+	 * @see render_wrapped()
+	 *
+	 * @param mixed  $attributes Block attributes.
+	 * @param string $content    Block content.
+	 * @param mixed  $block      The WP_Block being rendered.
+	 * @return mixed What core's callback returns.
+	 */
+	public static function render_pattern( $attributes, $content = '', $block = null ) {
+		return self::render_wrapped( 'core/block', $attributes, $content, $block );
+	}
+
+	/**
+	 * Render a wrapped block with its `ref` pointed at this language's
+	 * translation.
+	 *
+	 * Swaps the block's `ref` for its translation through translated_ref(),
+	 * with every check that applies on `render_block_data`, then hands the
+	 * block to the callback the type had before. A ref that is already this
+	 * language's translation (rewrite_ref() swapped it) is passed through
+	 * without a lookup, so a block is never swapped twice. Only the attributes
+	 * passed to that callback change; the parsed block and the WP_Block are
+	 * left as they are.
+	 *
+	 * @param string $name       Block name, a key of WRAPPERS.
+	 * @param mixed  $attributes Block attributes.
+	 * @param mixed  $content    Block content.
+	 * @param mixed  $block      The WP_Block being rendered.
+	 * @return mixed What the saved callback returns.
+	 */
+	private static function render_wrapped( string $name, $attributes, $content, $block ) {
+		$render = self::$core_render[ $name ] ?? null;
+
+		if ( ! is_callable( $render ) ) {
+			return '';
+		}
+
+		if ( null !== self::$render_owner && is_array( $attributes ) ) {
+			$attributes = self::$render_owner->swap_ref( $attributes, self::BLOCKS[ $name ] );
+		}
+
+		return call_user_func( $render, $attributes, $content, $block );
+	}
+
+	/**
+	 * The attributes with `ref` pointed at this language's translation.
+	 *
+	 * @param array<mixed> $attributes Block attributes.
+	 * @param string       $post_type  Post type the reference is required to be.
+	 * @return array<mixed>
+	 */
+	private function swap_ref( array $attributes, string $post_type ): array {
+		if ( '' === $this->slug ) {
+			return $attributes;
+		}
+
+		$ref = $attributes['ref'] ?? null;
+		$ref = is_int( $ref ) || ( is_string( $ref ) && is_numeric( $ref ) ) ? (int) $ref : 0;
+
+		if ( $ref <= 0 || isset( self::$targets[ $this->memo_key( $post_type, $ref ) ] ) ) {
+			return $attributes;
+		}
+
+		$translated = $this->translated_ref( $ref, $post_type );
+
+		if ( $translated > 0 ) {
+			$attributes['ref'] = $translated;
+		}
+
+		return $attributes;
+	}
+
+	/**
+	 * Memo key for a post id of a post type in this blog and language.
+	 *
+	 * @param string $post_type Post type.
+	 * @param int    $id        Post id.
+	 * @return string
+	 */
+	private function memo_key( string $post_type, int $id ): string {
+		return get_current_blog_id() . ':' . $this->slug . ':' . $post_type . ':' . $id;
 	}
 
 	/**
@@ -301,7 +535,7 @@ final class BlockRefTranslator {
 	 * Public because `UrlConverter::prime_navigation_block_items()` needs the
 	 * SAME answer: it runs on `pre_render_block`, which fires BEFORE
 	 * `render_block_data`, so without this it would batch-prime the SOURCE
-	 * menu's items and then watch the TRANSLATED menu render — one lookup per
+	 * menu's items and then watch the TRANSLATED menu render - one lookup per
 	 * item instead of one batched query, on exactly the pages using the feature.
 	 *
 	 * @param int    $ref       Source post id.
@@ -313,7 +547,7 @@ final class BlockRefTranslator {
 			return 0;
 		}
 
-		$key = get_current_blog_id() . ':' . $this->slug . ':' . $post_type . ':' . $ref;
+		$key = $this->memo_key( $post_type, $ref );
 
 		if ( isset( self::$memo[ $key ] ) ) {
 			$memoised = self::$memo[ $key ];
@@ -353,6 +587,8 @@ final class BlockRefTranslator {
 
 		self::$memo[ $key ] = $id;
 
+		self::$targets[ $this->memo_key( $post_type, $id ) ] = true;
+
 		return $id;
 	}
 
@@ -381,7 +617,7 @@ final class BlockRefTranslator {
 	 * `trim()` rather than `=== ''`: content holding only whitespace renders
 	 * just as blank, which is the case BlockTemplateTranslator records for
 	 * templates. Not `empty()`, which would also reject the content "0". Block
-	 * markup is not parsed — that would cost CPU on every reference. The
+	 * markup is not parsed - that would cost CPU on every reference. The
 	 * password arm is stricter than core's `! empty()`: a password of "0" is
 	 * refused too.
 	 *
@@ -403,13 +639,13 @@ final class BlockRefTranslator {
 	 * WHY: resolution is per reference, and each one costs a link query plus a
 	 * post read. Measured cold on this machine, 25 distinct patterns cost 30
 	 * queries; batching the links and priming the post cache costs 3, after
-	 * which the per-reference path costs 0. The same shape holds at scale — 50
+	 * which the per-reference path costs 0. The same shape holds at scale - 50
 	 * distinct patterns added 49 queries on sites without an object cache. A
 	 * warm persistent cache hides most of it, which is exactly why the sites
 	 * that lack one are the ones that need this.
 	 *
 	 * ⚠️ This ONLY warms caches. It does not populate the memo, decide anything,
-	 * or change what translated_ref() returns — every guard still runs per
+	 * or change what translated_ref() returns - every guard still runs per
 	 * reference against the real post. So a miss (a pattern coming from a
 	 * template rather than the post, a ref this regex does not see) simply falls
 	 * back to the previous per-reference cost. It cannot produce a wrong answer,
@@ -492,6 +728,7 @@ final class BlockRefTranslator {
 	 * @return void
 	 */
 	public static function reset_memo(): void {
-		self::$memo = [];
+		self::$memo    = [];
+		self::$targets = [];
 	}
 }

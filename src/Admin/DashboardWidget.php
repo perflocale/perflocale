@@ -107,7 +107,7 @@ final class DashboardWidget {
 
 		// ── Coverage bar (pure CSS; width is data-driven) ────────────
 		if ( ! $s['has_targets'] ) {
-			// Only the default language exists — nothing to translate into.
+			// Only the default language exists - nothing to translate into.
 			printf(
 				'<p class="perflocale-dashwidget__caption">%s</p>',
 				esc_html__( 'Add a second language to start tracking translation coverage.', 'perflocale' )

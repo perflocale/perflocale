@@ -85,7 +85,7 @@ final class MachineTranslateController extends RestController {
 						'sanitize_callback' => 'sanitize_key',
 						'validate_callback' => 'rest_validate_request_arg',
 					],
-					// Array params intentionally undeclared beyond docs — the
+					// Array params intentionally undeclared beyond docs - the
 					// handler applies its own (array)+intval normalization, and
 					// a strict type would reject scalars the cast accepts.
 					'post_ids'        => [
@@ -111,10 +111,10 @@ final class MachineTranslateController extends RestController {
 		);
 
 		// Scope-orchestration endpoint: translate ONE object (post or term)
-		// including registered meta — the Content scope of a front-end
+		// including registered meta - the Content scope of a front-end
 		// "Translate page" flow. Skip-existing by default: an existing
 		// translation returns status=exists and the client must explicitly
-		// re-call with overwrite=true (translate_post OVERWRITES — the caller
+		// re-call with overwrite=true (translate_post OVERWRITES - the caller
 		// owns that decision, never this endpoint silently).
 		register_rest_route(
 			$this->namespace,
@@ -189,7 +189,7 @@ final class MachineTranslateController extends RestController {
 	}
 
 	/**
-	 * POST /machine-translate/object — translate one post or term (Content scope).
+	 * POST /machine-translate/object - translate one post or term (Content scope).
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response|\WP_Error
@@ -247,7 +247,7 @@ final class MachineTranslateController extends RestController {
 
 			// A front-end editor calls this from ANY language's page, so the
 			// queried object may be a translation SIBLING. translate_post()
-			// always treats its input as default-language text — feeding it a
+			// always treats its input as default-language text - feeding it a
 			// sibling would send e.g. German text labeled as English (wrong-
 			// direction garbage). Resolve to the default-language sibling; a
 			// post with no default-language row translates as-is (unlinked
@@ -291,7 +291,7 @@ final class MachineTranslateController extends RestController {
 			}
 
 			try {
-				// fast_fail: this is an interactive UI call — better a quick
+				// fast_fail: this is an interactive UI call - better a quick
 				// retryable error than a minutes-long retry loop.
 				$result = $service->translate_post( $id, $target_lang, $provider_id, true, true );
 			} catch ( \Throwable $e ) {
@@ -373,7 +373,7 @@ final class MachineTranslateController extends RestController {
 		}
 
 		// Translate BEFORE creating the sibling (the post path's deliberate
-		// ordering). Terms have no draft state — a sibling created first
+		// ordering). Terms have no draft state - a sibling created first
 		// would go live with source-language text, and on provider failure
 		// it would persist; the default overwrite=false retry would then
 		// report 'exists' without ever translating it.
@@ -439,7 +439,7 @@ final class MachineTranslateController extends RestController {
 	}
 
 	/**
-	 * POST /machine-translate/estimate — pre-dispatch character/cost estimate.
+	 * POST /machine-translate/estimate - pre-dispatch character/cost estimate.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response|\WP_Error
@@ -465,7 +465,7 @@ final class MachineTranslateController extends RestController {
 
 			// The estimate exposes CHAR_LENGTH aggregates of the named posts, so
 			// require read access to every named source (mirrors the job's own
-			// per-row edit checks without being as strict — this is read-only).
+			// per-row edit checks without being as strict - this is read-only).
 			foreach ( $post_ids as $pid ) {
 				if ( $pid > 0 && ! current_user_can( 'read_post', $pid ) ) {
 					return $this->error( 'rest_forbidden', __( 'You cannot access one of the requested posts.', 'perflocale' ), 403 );
@@ -549,7 +549,7 @@ final class MachineTranslateController extends RestController {
 
 		// Overwrite guard: translate_post() rewrites an EXISTING target-language
 		// translation in place, so edit_post on the source is not authority to
-		// overwrite a translation post the caller can't edit — mirrors
+		// overwrite a translation post the caller can't edit - mirrors
 		// PUT /translations/{type}/{id}/{lang}, which requires edit_post on the
 		// translation before writing to it.
 		$existing = ( new \PerfLocale\Translation\PostTranslationManager( $plugin->get( 'cache' ), $plugin->get( 'settings' ) ) )

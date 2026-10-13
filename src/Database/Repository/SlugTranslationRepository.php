@@ -88,7 +88,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			return self::$has_any_slugs_memo;
 		}
 
-		// L0 — autoloaded option for free reads across requests on
+		// L0 - autoloaded option for free reads across requests on
 		// no-Redis sites. See has_any_groups() for rationale.
 		if ( get_option( 'perflocale_has_any_slugs', '' ) === '1' ) {
 			self::$has_any_slugs_memo = true;
@@ -140,7 +140,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	 * Resolve the full table name for the current blog.
 	 *
 	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly — capturing the name in the constructor would otherwise
+	 * correctly - capturing the name in the constructor would otherwise
 	 * pin this instance to whichever blog was active at construction.
 	 *
 	 * @return string
@@ -275,7 +275,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 
 		// Race-safe write loop. Slug-collision auto-suffix WITHIN the same
 		// (language, object_type, object_subtype) namespace is normally
-		// resolved by find_unique_slug() — but between its SELECT and our
+		// resolved by find_unique_slug() - but between its SELECT and our
 		// INSERT/UPDATE, a concurrent worker can claim the same candidate.
 		// The `UNIQUE KEY slug_lookup` catches that at the DB level as a
 		// duplicate-key error; we retry with a freshly resolved candidate
@@ -286,7 +286,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 		// allowed at the DB level and never trip this retry path.
 		$result = false;
 
-		// A duplicate-key rejection is an EXPECTED outcome here — the loop
+		// A duplicate-key rejection is an EXPECTED outcome here - the loop
 		// provokes it deliberately to detect a slug another worker just
 		// claimed, then retries with a fresh candidate. Left unsuppressed,
 		// wpdb prints each one as a "WordPress database error" (visible with
@@ -301,7 +301,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			$candidate = $this->find_unique_slug( $object_type, $object_subtype, $object_id, $language_id, $slug );
 
 			// Check if a row already exists for this object (we'd UPDATE)
-			// or not (we'd INSERT). Re-check on each retry — a concurrent
+			// or not (we'd INSERT). Re-check on each retry - a concurrent
 			// worker may have just inserted our row.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$exists = $this->wpdb->get_var(
@@ -341,9 +341,9 @@ final class SlugTranslationRepository implements RepositoryInterface {
 					$this->table(),
 					[
 						'object_type'    => sanitize_key( $object_type ),
-						// NOT sanitize_key(): every reader — the UPDATE branch above,
+						// NOT sanitize_key(): every reader - the UPDATE branch above,
 						// find_unique_slug(), resolve_from_slug() and the router's own
-						// lookup — matches the RAW subtype, and sanitize_key() strips
+						// lookup - matches the RAW subtype, and sanitize_key() strips
 						// non-ASCII bytes. A WooCommerce attribute taxonomy such as
 						// `pa_色` was written as `pa_` and could never be read back,
 						// so its translated archive fell through to the source
@@ -367,7 +367,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 
 			// Only retry on a UNIQUE-violation. Other errors (table
 			// missing, connection lost, etc.) won't be fixed by another
-			// pass — bail immediately so we don't burn cycles on a real
+			// pass - bail immediately so we don't burn cycles on a real
 			// fault.
 			if ( strpos( (string) $this->wpdb->last_error, 'Duplicate entry' ) === false ) {
 				break;
@@ -378,7 +378,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 
 		if ( $result === false ) {
 			// Distinguish "every suffix in the namespace is taken" from a real
-			// fault (missing table, lost connection) — the remedies differ.
+			// fault (missing table, lost connection) - the remedies differ.
 			$db_error = (string) $this->wpdb->last_error;
 			$this->report_write_failure(
 				str_contains( $db_error, 'Duplicate entry' ) ? 'duplicate_exhausted' : 'db_error',
@@ -421,8 +421,8 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	/**
 	 * Report a slug write that did not happen.
 	 *
-	 * A failed write is not fatal — the object keeps its untranslated slug and
-	 * its URL still resolves — but it used to be completely silent: set_slug()
+	 * A failed write is not fatal - the object keeps its untranslated slug and
+	 * its URL still resolves - but it used to be completely silent: set_slug()
 	 * returned false and every caller discarded it, so a site could lose slug
 	 * translations with nothing to show for it. Signal it instead:
 	 *
@@ -461,7 +461,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 				(int) ( $context['object_id'] ?? 0 ),
 				(int) ( $context['language_id'] ?? 0 ),
 				(string) ( $context['slug'] ?? '' ),
-				isset( $context['db_error'] ) && '' !== $context['db_error'] ? ' — ' . $context['db_error'] : ''
+				isset( $context['db_error'] ) && '' !== $context['db_error'] ? ' - ' . $context['db_error'] : ''
 			)
 		);
 	}
@@ -484,22 +484,22 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	 * costs nine characters (`%e6%96%b0`), one Cyrillic character six. An
 	 * ordinary 26-character Japanese title becomes a 198-character slug, which
 	 * is past the 191-character index prefix, so the collision path below trims
-	 * it — and a plain mb_substr() lands mid-escape roughly two times in three,
+	 * it - and a plain mb_substr() lands mid-escape roughly two times in three,
 	 * leaving a tail like `…%e3%81%8`.
 	 *
 	 * That is not a cosmetic defect. The trimmed slug goes straight into a URL
 	 * path (UrlConverter builds the translated permalink from it, unencoded,
 	 * because it is already encoded), and Apache and nginx both reject a
 	 * malformed escape in a path with **HTTP 400** before WordPress is reached.
-	 * The result is a translated permalink — in hreflang, in the switcher, in
-	 * the sitemap — that cannot be fetched at all. The stored value is also not
+	 * The result is a translated permalink - in hreflang, in the switcher, in
+	 * the sitemap - that cannot be fetched at all. The stored value is also not
 	 * sanitize_title()-stable, so re-deriving it yields a different string.
 	 *
 	 * Mirrors core's `_truncate_post_slug()`: decode, and if the slug really was
 	 * encoded, re-encode with a length budget so the cut can only fall on a
 	 * character boundary. `utf8_uri_encode()` never returns more than $length
 	 * characters and never ends mid-escape. Trailing hyphens are trimmed for the
-	 * same reason core trims them — a slug ending in `-` then `-2` reads as `--2`.
+	 * same reason core trims them - a slug ending in `-` then `-2` reads as `--2`.
 	 *
 	 * @param string $slug   Slug to trim (already sanitize_title()'d).
 	 * @param int    $length Maximum length in characters.
@@ -517,12 +517,12 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	 * Resolve a collision-free slug within a single (language, object_type,
 	 * object_subtype) namespace.
 	 *
-	 * Mirrors WordPress's `wp_unique_post_slug()` logic — if the desired
+	 * Mirrors WordPress's `wp_unique_post_slug()` logic - if the desired
 	 * slug already belongs to a DIFFERENT object in the same language +
 	 * object_type + object_subtype, append `-2`, `-3`, … until an unused
 	 * slug is found. Cross-namespace collisions (e.g. category/uncategorized
 	 * and product_cat/uncategorized both translating to "sin-categoria"
-	 * in Spanish) are NOT conflicts here — different subtypes are distinct
+	 * in Spanish) are NOT conflicts here - different subtypes are distinct
 	 * URL spaces.
 	 *
 	 * Caps the search at 99 attempts to bound cold-path cost.
@@ -531,7 +531,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 	 * @param string $object_subtype Sub-type (post_type / taxonomy).
 	 * @param int    $object_id      The object we're assigning the slug to.
 	 *                               A collision with this same object_id is
-	 *                               NOT a conflict — we're just updating
+	 *                               NOT a conflict - we're just updating
 	 *                               its existing slug to the same value.
 	 * @param int    $language_id    Language ID.
 	 * @param string $slug           Desired slug (already sanitized).
@@ -551,7 +551,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			//
 			// Two index-friendly forms, chosen so the slug column is never
 			// wrapped in a function (LEFT(slug, 191) = ? is exact but
-			// unsargable — measured 44.8 ms scanning 20k rows versus 0.07 ms
+			// unsargable - measured 44.8 ms scanning 20k rows versus 0.07 ms
 			// for the forms below):
 			//
 			// - shorter than the prefix: LEFT(stored,191) can only equal a
@@ -593,10 +593,10 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			}
 
 			// The suffix has to land INSIDE the indexed prefix or the next
-			// candidate collides identically — appending past character 191
+			// candidate collides identically - appending past character 191
 			// leaves the compared prefix unchanged. Trimming the base to make
-			// room is what core's _truncate_post_slug() does, and — as that
-			// function knows and a bare mb_substr() does not — the cut has to
+			// room is what core's _truncate_post_slug() does, and - as that
+			// function knows and a bare mb_substr() does not - the cut has to
 			// respect percent-escapes. See truncate_to_prefix().
 			$suffix    = '-' . $i;
 			$base      = self::truncate_to_prefix( $slug, max( 1, self::SLUG_INDEX_PREFIX - mb_strlen( $suffix ) ) );
@@ -604,7 +604,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 		}
 
 		// Exhausted the search. Return the last candidate and let the
-		// downstream INSERT/UPDATE proceed — soft-fail: the caller still gets a
+		// downstream INSERT/UPDATE proceed - soft-fail: the caller still gets a
 		// slug back, just one that might clash on a pathological site.
 		return $candidate;
 	}

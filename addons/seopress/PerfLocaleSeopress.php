@@ -110,7 +110,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
 	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context — where SEOPress's canonical filter never fires anyway (its
+	 * context - where SEOPress's canonical filter never fires anyway (its
 	 * wp_head branches are gated on `! is_admin()`).
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
@@ -148,7 +148,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 		// core's `get_canonical_url`, but SEOPress removes core's
 		// rel_canonical and emits its own, so that filter never fires and the
 		// guard is inert whenever this plugin is active. Re-register it on
-		// SEOPress's own canonical filter — which SEOPress only calls at all
+		// SEOPress's own canonical filter - which SEOPress only calls at all
 		// when something is hooked to it. HreflangTags decides whether the
 		// value is PerfLocale's to correct, so the `_seopress_robots_canonical`
 		// override (its own wp_head branch, same filter) is left alone.
@@ -164,7 +164,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 		// one (matches the Yoast/Rank Math/AIOSEO addons). The callback gates
 		// itself to sitemap requests, so ordinary term queries are untouched.
 		// Sitemap predicate is request-constant (REQUEST_URI is fixed before
-		// plugins_loaded) — register the get_terms_args callback only on
+		// plugins_loaded) - register the get_terms_args callback only on
 		// sitemap requests instead of no-op dispatching on every term query.
 		if ( $this->is_sitemap_request() ) {
 			add_filter( 'get_terms_args', [ $this, 'include_all_languages_in_sitemap' ] );
@@ -173,7 +173,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 		// Enrich SEOPress schema graph with inLanguage + translation siblings.
 		// SEOPress assembles its decoded JSON-LD as an array of schema entities
 		// keyed by schema slug on `seopress_json_schema_generator_get_jsons`
-		// (JsonSchemaGenerator::getJsons) — there is no `seopress_schema_graph`
+		// (JsonSchemaGenerator::getJsons) - there is no `seopress_schema_graph`
 		// filter. Gated on the setting so we don't register a no-op filter when
 		// enrichment is disabled.
 		if ( $plugin->has( 'settings' ) && $plugin->get( 'settings' )->seo_schema_enrichment_enabled() ) {
@@ -193,7 +193,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 	 * wp_specialchars_decode() reverses only the htmlspecialchars half; the
 	 * href stays percent-DECODED, so what reaches the guard is not the raw
 	 * get_permalink() the other five addons pass. HreflangTags's
-	 * permalink-equality test decodes both sides for exactly this reason —
+	 * permalink-equality test decodes both sides for exactly this reason -
 	 * without that it would never match a non-ASCII slug and the pin would be
 	 * silently inert here. Re-encoding the href instead is not an option: the
 	 * decode is lossy about which characters SEOPress encoded.
@@ -250,7 +250,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 	 * Whether the current request renders an XML sitemap.
 	 *
 	 * REQUEST_URI is fixed before plugins_loaded, so the verdict is
-	 * request-constant — used both to gate the get_terms_args registration
+	 * request-constant - used both to gate the get_terms_args registration
 	 * and inside the callback for callers that invoke it directly.
 	 *
 	 * @return bool
@@ -321,7 +321,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Machine-translatable SEO meta: titles/descriptions/social text ONLY.
-	 * The focus keyword is deliberately excluded — keyword targeting in the
+	 * The focus keyword is deliberately excluded - keyword targeting in the
 	 * target language is a human decision (add it back via this same filter
 	 * if a site wants it). Gated by the mt_meta_seo setting.
 	 *
@@ -330,7 +330,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	/**
-	 * The SEOPress meta keys this addon machine-translates — all plain-text SEO
+	 * The SEOPress meta keys this addon machine-translates - all plain-text SEO
 	 * fields, so all route to the provider's text mode via mt_meta_key_format().
 	 */
 	private const MT_TEXT_KEYS = [
@@ -434,17 +434,17 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 	 * Pin an unlinked entry's loc to the default language's URL shape.
 	 *
 	 * The twin of the guard core's SitemapIntegration applies to its own
-	 * entries — which SEOPress's sitemap replaces wholesale. Only objects with
+	 * entries - which SEOPress's sitemap replaces wholesale. Only objects with
 	 * NO translation links qualify: those are default-language content by
 	 * definition, whereas a linked object's loc already names its own
-	 * language. That guard is also what makes the pin safe — not the URL
+	 * language. That guard is also what makes the pin safe - not the URL
 	 * mode: pin_sitemap_url_to_default() strips a language prefix from any
 	 * URL it is handed, so in path-based modes it comes out a no-op only
 	 * because an unlinked object's loc has no prefix to strip.
 	 *
 	 * SEOPress hands over the rendered `<url>` element, so the swap is a
 	 * targeted replacement of the `<loc>` it built from this entry's `loc`
-	 * value (`<image:loc>` cannot collide — the needle starts at `<loc>`).
+	 * value (`<image:loc>` cannot collide - the needle starts at `<loc>`).
 	 *
 	 * @param string                      $output      Sitemap URL entry XML.
 	 * @param array<string, mixed>        $url         URL data array.
@@ -467,7 +467,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 		// htmlspecialchars( urldecode( $permalink ) ) for a post entry,
 		// esc_url( get_term_link() ) for a term one. Decode before converting
 		// and re-encode with the equivalent WordPress escaper afterwards. The
-		// no-op test compares the DECODED pair, never the re-encoded one —
+		// no-op test compares the DECODED pair, never the re-encoded one -
 		// that keeps a no-op conversion byte-identical instead of rewriting
 		// the entity encoding.
 		$loc     = (string) $url['loc'];
@@ -535,7 +535,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 			// Validate the guess against ground truth: SEOPress pushes
 			// NON-term entries (post-type archives, author archives)
 			// through the same filter, and their last path segment can
-			// collide with a term slug — accepting on slug alone would
+			// collide with a term slug - accepting on slug alone would
 			// splice that term's hreflang into an unrelated entry. A real
 			// term entry's own link path always equals the entry path.
 			$term_link = get_term_link( $term );
@@ -597,7 +597,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		// Active languages only. get_slug_map() is the bootstrap bundle's
-		// active-only slug -> row hash — the same source core's hreflang and
+		// active-only slug -> row hash - the same source core's hreflang and
 		// sitemap paths filter on. find_by_slug() resolves DEACTIVATED
 		// languages too, which would advertise them as alternates; the map
 		// lookup is also O(1) instead of a per-sibling cache descent.
@@ -643,7 +643,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 			++$count;
 		}
 
-		// A lone self-referencing alternate is meaningless hreflang noise — an
+		// A lone self-referencing alternate is meaningless hreflang noise - an
 		// alternates set needs at least two members (self + a sibling). Emit
 		// nothing when only one language survived the publish filter.
 		return $count > 1 ? $xml : '';

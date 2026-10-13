@@ -22,7 +22,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Runs the WPML migration in the background.
  *
  * The underlying importer already chunks per-table and tolerates
- * being run multiple times (idempotent — re-running picks up where it
+ * being run multiple times (idempotent - re-running picks up where it
  * left off via existing translation-group lookups). The job layer adds:
  *
  *   - Crash recovery: the importer's heartbeat reports progress after each
@@ -112,7 +112,16 @@ final class WpmlMigrationJob extends AbstractJob {
 	public function execute( array $args, callable $progress ): array {
 		$progress( 0, 1 );
 
-		$result = MigrationRunner::import( 'wpml', Plugin::get_instance()->get( 'cache' ), null, MigrationRunner::job_reporter( $progress ) );
+		// WPML string translations are stored at the trust level of the user
+		// who asked for the import, the current user on both paths, as in
+		// DataImportJob: Dispatcher::execute_inline() runs inside their
+		// request, and WorkerRegistry::run_on_current_blog() calls
+		// wp_set_current_user() with the job's `created_by` before execute().
+		// WP-CLI calls MigrationRunner::import() without the flag and keeps
+		// WPML's bytes.
+		$sanitize_strings = ! current_user_can( 'unfiltered_html' );
+
+		$result = MigrationRunner::import( 'wpml', Plugin::get_instance()->get( 'cache' ), null, MigrationRunner::job_reporter( $progress ), $sanitize_strings );
 
 		return MigrationRunner::job_result( $result );
 	}

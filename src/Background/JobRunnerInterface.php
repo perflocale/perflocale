@@ -17,8 +17,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Abstraction over WP-Cron and Action Scheduler.
  *
  * Two implementations:
- *   - {@see WpCronRunner}            — always available, uses wp_schedule_* primitives
- *   - {@see ActionSchedulerRunner}   — used when Action Scheduler is loaded (≥ 3.4)
+ *   - {@see WpCronRunner}            - always available, uses wp_schedule_* primitives
+ *   - {@see ActionSchedulerRunner}   - used when Action Scheduler is loaded (≥ 3.4)
  *
  * {@see JobRunnerFactory::pick()} returns the right one at runtime based on:
  *   1. The `perflocale/jobs/runner` filter (force override)
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   3. Whether AS is loaded and at a compatible version
  *
  * Workers receive callbacks as `function ( string $job_id, array $args )`
- * regardless of which runner enqueued them — both runners normalise the
+ * regardless of which runner enqueued them - both runners normalise the
  * argument shape before calling the worker hook.
  */
 interface JobRunnerInterface {
@@ -61,7 +61,7 @@ interface JobRunnerInterface {
 
 	/**
 	 * Cancel any pending action for {@param string $job_id}. Does NOT
-	 * interrupt a job already running — the worker's lock-TTL handles that.
+	 * interrupt a job already running - the worker's lock-TTL handles that.
 	 *
 	 * @param string $job_id Job identifier.
 	 * @return bool True if a pending action was found and cancelled; false otherwise.

@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * POSTs content to a configured URL and expects the translated text in
  * the immediate JSON response (`{"translation": "..."}`). The agency must
- * respond synchronously — asynchronous callback workflows are not
+ * respond synchronously - asynchronous callback workflows are not
  * implemented in core. Addons can hook the
  * `perflocale/mt/agency_async_response` filter to short-circuit the throw
  * and supply a deferred translation (for example by matching the
@@ -54,7 +54,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch(). Carried to the agency as a
 	 *   'format' payload field on the text path only: the default payload
 	 *   stays byte-compatible with agency endpoints that validate it
@@ -128,7 +128,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 		 * translated text.
 		 *
 		 * Return a non-empty string to use as the translation. Return null
-		 * (the default) to raise a RuntimeException — without an async
+		 * (the default) to raise a RuntimeException - without an async
 		 * handler the agency must respond synchronously with the
 		 * translation; otherwise nothing meaningful can be persisted.
 		 *

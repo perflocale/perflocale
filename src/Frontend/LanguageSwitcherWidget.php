@@ -65,7 +65,7 @@ class LanguageSwitcherWidget extends \WP_Widget {
 		$instance = wp_parse_args( $instance, self::DEFAULTS );
 
 		// Core's widget renderer always supplies the wrapper keys, but a
-		// programmatic caller (the_widget()/direct ->widget([], …)) may not —
+		// programmatic caller (the_widget()/direct ->widget([], …)) may not -
 		// default them so kses never receives null and no "undefined array
 		// key" notice is raised.
 		$args = wp_parse_args(
@@ -107,7 +107,7 @@ class LanguageSwitcherWidget extends \WP_Widget {
 		 * Render before emitting any chrome. The block returns '' whenever it
 		 * has nothing to offer (an untranslated page with the current language
 		 * hidden and untranslated languages hidden skips every option), and the
-		 * theme's `before_widget`/`after_widget` is a real box — often a
+		 * theme's `before_widget`/`after_widget` is a real box - often a
 		 * bordered <section> carrying the title. Emitting it around nothing put
 		 * an empty "Languages" widget in the sidebar or footer.
 		 */

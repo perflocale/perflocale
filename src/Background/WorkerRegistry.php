@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  *   1. Reads the job state from {@see JobState}.
  *   2. Acquires the {@see JobLock} (atomic INSERT IGNORE + CAS reclaim).
- *   3. Re-validates the dispatcher's capability via `user_can()` — guards
+ *   3. Re-validates the dispatcher's capability via `user_can()` - guards
  *      against caps revoked between dispatch and execution.
  *   4. Sets the current-user context to the dispatcher's user_id so
  *      anything inside `execute()` that calls `current_user_can()` sees
@@ -87,7 +87,7 @@ final class WorkerRegistry {
 	public static function register( string $type, callable $factory ): void {
 		self::$factories[ $type ] = $factory;
 
-		// Bind ONCE per type — multiple register() calls for the same type
+		// Bind ONCE per type - multiple register() calls for the same type
 		// would otherwise stack listeners. WP's add_action de-dupes by
 		// (hook, callable) identity, so passing [self::class, 'run']
 		// repeatedly is a no-op after the first.
@@ -115,10 +115,10 @@ final class WorkerRegistry {
 
 		// Multisite: the jobs table is per-blog ($wpdb->prefix), so every
 		// JobState write lands on the dispatching blog and the worker MUST be
-		// on that blog before it reads state. Both runners normally are —
+		// on that blog before it reads state. Both runners normally are -
 		// Action Scheduler's tables
 		// are per-blog ($wpdb->prefix) and WP-Cron's queue is a per-blog
-		// option, so a tick fired for blog N runs in blog N's context — but
+		// option, so a tick fired for blog N runs in blog N's context - but
 		// that is a property of two third-party queues, not something this
 		// worker can assume: a queue runner invoked from the network admin, a
 		// custom runner supplied through `perflocale/jobs/runner`, or a future
@@ -150,7 +150,7 @@ final class WorkerRegistry {
 	}
 
 	/**
-	 * Inner worker body — runs on the (already-switched) blog of the
+	 * Inner worker body - runs on the (already-switched) blog of the
 	 * dispatching site. Split out so {@see run()} can wrap the entire
 	 * body in a single switch_to_blog / restore_current_blog pair.
 	 *
@@ -163,14 +163,14 @@ final class WorkerRegistry {
 		$state = JobState::get( $job_id );
 
 		if ( ! $state ) {
-			// Orphan event — JobState row was GC'd or never created.
+			// Orphan event - JobState row was GC'd or never created.
 			// Silently no-op; nothing actionable.
 			return;
 		}
 
 		// Bail on ANY terminal status, not just 'canceled'. A stray/duplicate
 		// cron event for a job that already completed or failed would otherwise
-		// re-execute it — double-translating, double-billing the MT provider, or
+		// re-execute it - double-translating, double-billing the MT provider, or
 		// re-running a migration over data the operator has since edited.
 		if ( JobState::is_terminal( (string) $state['status'] ) ) {
 			return;
@@ -181,7 +181,7 @@ final class WorkerRegistry {
 		// it for a future cron tick instead of running. When the operator
 		// flips the switch back the next tick picks the work up. Without this,
 		// the only options when something is mis-dispatching are "let it run"
-		// or "deactivate the plugin" — neither is operator-friendly.
+		// or "deactivate the plugin" - neither is operator-friendly.
 		if ( self::queue_is_paused() ) {
 			JobState::append_log(
 				$job_id,
@@ -343,7 +343,7 @@ final class WorkerRegistry {
 					$job_id,
 					sprintf(
 					/* translators: 1: job_id, 2: retry count */
-						__( 'Per-job concurrency lock held by another worker after %2$d retries; marking failed so the operator can intervene. Either another worker is genuinely running this job, or the lock row is wedged — check wp_options for `perflocale_job_lock_%1$s`.', 'perflocale' ),
+						__( 'Per-job concurrency lock held by another worker after %2$d retries; marking failed so the operator can intervene. Either another worker is genuinely running this job, or the lock row is wedged - check wp_options for `perflocale_job_lock_%1$s`.', 'perflocale' ),
 						$job_id,
 						$max_retries
 					)
@@ -352,7 +352,7 @@ final class WorkerRegistry {
 			}
 
 			// Backoff: lock_ttl/4 (so the next retry lands BEFORE the lock
-			// would naturally expire — gives us multiple chances to catch
+			// would naturally expire - gives us multiple chances to catch
 			// a held lock as the holder finishes), with a floor of 60s and
 			// exponential growth on consecutive busy hits. Jitter avoids
 			// thundering-herd if N workers raced into the same lock.
@@ -537,7 +537,7 @@ final class WorkerRegistry {
 						throw new JobCanceledException( 'Job canceled mid-flight.' );
 					}
 
-					// Pause check — if the operator paused the queue while this
+					// Pause check - if the operator paused the queue while this
 					// worker was running, cooperatively bail out. The shared
 					// sentinel routes to the JobCanceledException catch, which
 					// tells pause from cancel by the fresh row status and
@@ -631,12 +631,12 @@ final class WorkerRegistry {
 			}
 		} catch ( JobCanceledException $e ) {
 			// Two cooperative bails share this sentinel: operator CANCEL
-			// (row status is already 'canceled' — that's how the progress
+			// (row status is already 'canceled' - that's how the progress
 			// callback detected it) and operator PAUSE (status still
 			// 'running'). Distinguish by the fresh row status: a paused
 			// worker must be re-queued exactly like the pre-run pause gate,
 			// otherwise the job strands as 'running' with no scheduled event
-			// — unpause never resumes it and the 6h watchdog force-fails it.
+			// - unpause never resumes it and the 6h watchdog force-fails it.
 			$fresh_state = JobState::get_fresh( $job_id );
 
 			if ( ! $fresh_state || (string) $fresh_state['status'] === 'canceled' ) {
@@ -701,7 +701,7 @@ final class WorkerRegistry {
 			wp_set_current_user( $prev_user );
 			JobLock::release( $job_id );
 			// Release the type lock based on the flag captured at acquisition
-			// time, not by re-evaluating the filter — the filter could return
+			// time, not by re-evaluating the filter - the filter could return
 			// a different value here than at acquire time, leaking the lock.
 			if ( $type_locked ) {
 				JobLock::release_type( $type );
@@ -919,7 +919,7 @@ final class WorkerRegistry {
 		// Never resurrect a job that already reached a terminal-by-intent
 		// state. A non-cancel exception racing with an operator cancel (or a
 		// completion) would otherwise re-schedule a job the operator believes
-		// is finished. 'failed' is intentionally NOT terminal here — that is
+		// is finished. 'failed' is intentionally NOT terminal here - that is
 		// exactly the state this retry path exists to recover from.
 		$current_status = (string) ( $state['status'] ?? '' );
 		if ( $current_status === 'canceled' || $current_status === 'complete' ) {
@@ -930,7 +930,7 @@ final class WorkerRegistry {
 
 		/**
 		 * Maximum number of times a worker is re-scheduled after a thrown
-		 * exception. Includes the initial attempt — i.e. max_attempts=5
+		 * exception. Includes the initial attempt - i.e. max_attempts=5
 		 * runs the job up to 5 times total.
 		 *
 		 * @hook perflocale/jobs/max_attempts
@@ -1054,7 +1054,7 @@ final class WorkerRegistry {
 	 * Whether the queue is paused via the `background_paused` setting.
 	 *
 	 * Returns false (not paused) if the Settings service hasn't booted yet
-	 * — extremely early bootstrap shouldn't deadlock the queue against a
+	 * - extremely early bootstrap shouldn't deadlock the queue against a
 	 * missing container.
 	 *
 	 * @return bool
@@ -1065,7 +1065,7 @@ final class WorkerRegistry {
 		// callback doesn't reload `alloptions` (every autoloaded option) on
 		// every tick; the pause still lands within a tick of the next expiry.
 		// Keyed by blog_id because `perflocale_settings` is per-blog and a
-		// persistent PHP-FPM child serves workers for several blogs — without
+		// persistent PHP-FPM child serves workers for several blogs - without
 		// the key, blog 3's worker could read blog 2's cached pause state.
 		// Per-blog cache: each entry stores the resolved pause flag plus the timestamp when it was last refreshed from the option store.
 		static $cache = [];
@@ -1089,7 +1089,7 @@ final class WorkerRegistry {
 
 		// Fresh-read the pause flag WITHOUT busting the shared `alloptions`
 		// cache entry. `perflocale_settings` is autoloaded, so get_option()
-		// serves it from that blob — forcing a re-read means deleting
+		// serves it from that blob - forcing a re-read means deleting
 		// `alloptions`, which on a persistent (Redis/Memcached) object cache is
 		// fleet-wide: every concurrent web request then re-runs the full
 		// autoloaded-options SELECT and re-sets the blob. At the ~10s cadence
@@ -1102,7 +1102,7 @@ final class WorkerRegistry {
 		// / 'option_{$option}' with our prefixed 'perflocale_settings' option):
 		// reproduced verbatim so an operator filter registered on the core names
 		// (the ones they'd use with get_option) fires in this direct-read path.
-		// The core name is mandatory — a prefixed alias would not match.
+		// The core name is mandatory - a prefixed alias would not match.
 		$stored = apply_filters( 'pre_option_perflocale_settings', false, 'perflocale_settings', null ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound
 
 		if ( false === $stored ) {
@@ -1153,7 +1153,7 @@ final class WorkerRegistry {
 			$fallback = false;
 
 			// Settings container should be available whenever the worker
-			// callback runs — a throw here means something fundamental is
+			// callback runs - a throw here means something fundamental is
 			// wrong (container not booted, Settings table missing, etc.).
 			// Default to "not paused" so jobs keep running, but emit a
 			// diagnostic so the supervisor can spot the breakage instead
@@ -1196,7 +1196,7 @@ final class WorkerRegistry {
 	 * originally accepted under (operator flipped background_engine, or AS
 	 * became (un)available mid-flight). JobState['engine'] must follow, or the
 	 * watchdog's for_engine($state['engine'])->is_scheduled() probe targets the
-	 * wrong store — force-failing a healthy job or missing a stuck one. Mirrors
+	 * wrong store - force-failing a healthy job or missing a stuck one. Mirrors
 	 * Resumer's engine-write.
 	 *
 	 * @param int                  $timestamp When to run.

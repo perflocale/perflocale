@@ -62,11 +62,11 @@ final class LanguageRouter {
 	 * "Botanica" → not bots). Compound crawler names whose trailing "bot" is
 	 * preceded by a letter (googlebot, twitterbot, applebot, …) must be
 	 * enumerated explicitly because `\bbot\b` sees a letter-letter boundary,
-	 * not a word boundary — and facebookexternalhit carries no "bot" token at
+	 * not a word boundary - and facebookexternalhit carries no "bot" token at
 	 * all. Enumeration is deliberately used over a generic `\w*bot\b` branch,
 	 * which would false-positive on names like "Abbot".
 	 *
-	 * Single source of truth — used by browser-language redirect, edge-hint
+	 * Single source of truth - used by browser-language redirect, edge-hint
 	 * redirect, geo-IP redirect, and the language-cookie write. Add new bot
 	 * tokens here once and they propagate everywhere.
 	 *
@@ -124,7 +124,7 @@ final class LanguageRouter {
 	 * ALREADY carries the home path. Handing that straight back to home_url()
 	 * concatenates the path twice: on a `/sub` subsite `GET /sub/` produced
 	 * `http://site/sub/sub/`, and the language redirect built from it landed
-	 * on `/sub/de/sub/` — a hard 404 on the subsite's own front page for every
+	 * on `/sub/de/sub/` - a hard 404 on the subsite's own front page for every
 	 * first-time visitor. So strip the home path off the request before
 	 * home_url() puts it back; on a root install there is nothing to strip and
 	 * this stays the bare `home_url( add_query_arg( [] ) )` it always was.
@@ -132,7 +132,7 @@ final class LanguageRouter {
 	 * The home path comes from the RAW `home` option, never from home_url():
 	 * UrlConverter::filter_home_url() prepends the default language's prefix
 	 * when hide_default_prefix=false, so home_url( '/' ) reports `/sub/en/`
-	 * there and the `/sub` we need to strip would never match — the doubling
+	 * there and the `/sub` we need to strip would never match - the doubling
 	 * would survive on exactly the sites that show their default prefix. Same
 	 * reasoning, and the same two lines, as the four detection-side strips in
 	 * this class. Reading a stored option also keeps the URL server-controlled:
@@ -150,7 +150,7 @@ final class LanguageRouter {
 	 * one blog's URL to the next after a switch_to_blog().
 	 *
 	 * Single source of truth for the browser-language, edge-hint and geo-IP
-	 * redirect targets — three separate copies of this string surgery is how
+	 * redirect targets - three separate copies of this string surgery is how
 	 * the doubling reached all three call sites at once.
 	 *
 	 * @return string Absolute URL of the current request.
@@ -365,7 +365,7 @@ final class LanguageRouter {
 		// AIOWPSecurity, etc.) call switch_to_blog() with the SAME blog ID to scope
 		// internal lookups, which still fires switch_blog. Resetting on a same-blog
 		// transition wipes the detected language and breaks the switcher for the
-		// rest of the request. Gated behind is_multisite() — switch_to_blog is
+		// rest of the request. Gated behind is_multisite() - switch_to_blog is
 		// a no-op on single-site, so the handler has nothing to do there.
 		if ( is_multisite() ) {
 			// Three args: core has passed 'switch' or 'restore' as the third
@@ -407,14 +407,14 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Cheap path-shape check first — bail on the homepage case (path
+		// Cheap path-shape check first - bail on the homepage case (path
 		// trims to '') BEFORE doing any DB / option lookups. Locale-prefix
 		// mode fires this handler on every frontend request; skipping the
 		// slug-map and home-option fetch on no-prefix paths recovers
 		// ~0.5–1 ms p50 on homepage hits. The full home-path stripping
 		// below only runs when there's a real first segment to canonicalise.
 		// esc_url_raw (not sanitize_text_field) preserves percent-encoded
-		// bytes — sanitize_text_field strips %XX, corrupting non-ASCII
+		// bytes - sanitize_text_field strips %XX, corrupting non-ASCII
 		// slugs like /de/%C3%BCber-uns/ before the redirect target is
 		// rebuilt below. Same fix applied to SlugRedirector::maybe_redirect().
 		$request_uri = esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
@@ -594,7 +594,7 @@ final class LanguageRouter {
 
 		// Split the request URI into path + query so we preserve the query
 		// string verbatim while we only mutate the path. esc_url_raw (not
-		// sanitize_text_field) preserves percent-encoded bytes — see the
+		// sanitize_text_field) preserves percent-encoded bytes - see the
 		// maybe_canonicalise_prefix_form() rationale above.
 		$request_uri = esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
 		$qs_pos      = strpos( $request_uri, '?' );
@@ -607,7 +607,7 @@ final class LanguageRouter {
 
 		// Strip any home-path prefix (WP installed in a subfolder like /blog)
 		// so prefix detection compares the site-relative path only. Use the
-		// raw `home` option, NOT our home_url filter — the filter prepends the
+		// raw `home` option, NOT our home_url filter - the filter prepends the
 		// default-language prefix (when hide_default_prefix=false), which we'd
 		// mistake for a sub-install and strip, loop-redirecting /fr/ to itself.
 		$home_path = (string) ( wp_parse_url( (string) get_option( 'home' ), PHP_URL_PATH ) ?: '/' );
@@ -762,7 +762,7 @@ final class LanguageRouter {
 
 		// Home-only: the site-relative path must be EXACTLY the default
 		// language's prefixed home (no further segment). Match both the slug
-		// form (`/en/`) and — in `url_prefix_type=locale` mode — the locale
+		// form (`/en/`) and - in `url_prefix_type=locale` mode - the locale
 		// form (`/en-us/`), which is the CANONICAL prefixed URL the rewrite
 		// rules serve and the one crawlers discover; without it that twin
 		// stays an un-redirected duplicate of `/`. `/en/contact/` does not
@@ -892,12 +892,12 @@ final class LanguageRouter {
 
 			// A language resolved from a VISITOR-specific source (cookie /
 			// Accept-Language / edge hint) varies the response body at a
-			// shared URL — exactly what a URL-keyed full-page cache must
+			// shared URL - exactly what a URL-keyed full-page cache must
 			// never store: one visitor's language would be cached under the
 			// bare URL and served to everyone (the readme's "caches separate
 			// by URL" guarantee only holds for URL-derived languages). Mark
-			// these responses uncacheable; URL-detected requests — the
-			// overwhelming majority — stay fully cacheable.
+			// these responses uncacheable; URL-detected requests - the
+			// overwhelming majority - stay fully cacheable.
 			if (
 				in_array( $detection_method, [ 'cookie', 'browser', 'edge_hint' ], true )
 				&& ! is_admin()
@@ -943,7 +943,7 @@ final class LanguageRouter {
 		}
 
 		// Site-relative: strip a subfolder-install home path via the raw
-		// `home` option (not our filtered home_url — see the canonical
+		// `home` option (not our filtered home_url - see the canonical
 		// redirect's rationale).
 		$home_path = (string) ( wp_parse_url( (string) get_option( 'home' ), PHP_URL_PATH ) ?: '/' );
 		$home_path = '/' . trim( $home_path, '/' );
@@ -1038,7 +1038,7 @@ final class LanguageRouter {
 
 		// Pages the admin excluded from language routing must not be
 		// auto-redirected either (single-language campaign landing pages).
-		// URL-derived — stays above nocache_headers() so excluded pages
+		// URL-derived - stays above nocache_headers() so excluded pages
 		// keep full-page cacheability.
 		if ( $this->is_excluded_request_path() ) {
 			return;
@@ -1047,7 +1047,7 @@ final class LanguageRouter {
 		// Whether this response is a 302 or a 200 depends on the INDIVIDUAL
 		// visitor from here on (cookie, consent, bot UA, Accept-Language).
 		// A full-page cache storing any of those 200s under the entry URL
-		// starves the redirect for every later first-time visitor — so the
+		// starves the redirect for every later first-time visitor - so the
 		// entry response must be uncacheable while the feature is on. Must
 		// run BEFORE the visitor-specific declines; only URL-derived
 		// conditions above it (mirrors GeoRedirect::maybe_redirect()).
@@ -1088,7 +1088,7 @@ final class LanguageRouter {
 		}
 
 		// Skip bots / crawlers - they should see the default content.
-		// Detection logic + pattern lives in self::is_bot_ua() — single
+		// Detection logic + pattern lives in self::is_bot_ua() - single
 		// source of truth across browser/edge/geo redirect paths.
 		$ua = sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ?? '' ) );
 
@@ -1146,7 +1146,7 @@ final class LanguageRouter {
 		// it from the canonical URL if desired.
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
-		// Per-visitor language redirect on a shared URL — mark uncacheable so an
+		// Per-visitor language redirect on a shared URL - mark uncacheable so an
 		// edge/server cache that stores 3xx can't pin it onto other visitors.
 		// Whitelist the (possibly cross-host) target so wp_safe_redirect() does
 		// not fall back to /wp-admin/ in domain/subdomain url-mode.
@@ -1300,7 +1300,7 @@ final class LanguageRouter {
 		$this->set_language_cookie( $edge_slug );
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
-		// Per-visitor language redirect on a shared URL — mark uncacheable so an
+		// Per-visitor language redirect on a shared URL - mark uncacheable so an
 		// edge/server cache that stores 3xx can't pin it onto other visitors.
 		// Whitelist the (possibly cross-host) target so wp_safe_redirect() does
 		// not fall back to /wp-admin/ in domain/subdomain url-mode.
@@ -1507,7 +1507,7 @@ final class LanguageRouter {
 		// modes the bare host always maps to the default; in subdirectory mode
 		// an un-prefixed path only means the default when the default prefix is
 		// hidden (otherwise it should resolve normally, not be forced here).
-		// NB: get_url_mode() returns 'subdirectory', never 'path' — comparing
+		// NB: get_url_mode() returns 'subdirectory', never 'path' - comparing
 		// against 'path' made this branch always-true and forced the default in
 		// subdirectory mode even with a visible default prefix.
 		if ( $slug === null && self::$default_language !== null ) {
@@ -1548,7 +1548,7 @@ final class LanguageRouter {
 	 * segment (`/sub/wp-json/wc/store/...`), and resolving a non-default
 	 * language from the cookie there left the request inconsistent with
 	 * subdirectory-mode path expectations: every Store API call returned an
-	 * HTML 404 instead of JSON. Verified on blog 2 of a test network — no cookie
+	 * HTML 404 instead of JSON. Verified on blog 2 of a test network - no cookie
 	 * and an `en` (default) cookie both returned 200, `de`/`es`/`fr` all
 	 * returned 404, the same route with the language IN the path returned
 	 * 200, and a non-Store REST route with the same cookie returned 200.
@@ -1674,7 +1674,7 @@ final class LanguageRouter {
 	 * @return string|null Detected language slug or null.
 	 */
 	private function detect_slug_from_request_uri( array $slug_map ): ?string {
-		// esc_url_raw preserves percent-encoded bytes — wp_parse_url() needs
+		// esc_url_raw preserves percent-encoded bytes - wp_parse_url() needs
 		// the original form to extract a structurally-correct path component.
 		$request_uri = esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '' ) ) );
 		$path        = wp_parse_url( $request_uri, PHP_URL_PATH );
@@ -1764,8 +1764,8 @@ final class LanguageRouter {
 	 * A language is addressable by TWO forms: its own slug (`en`) and the
 	 * locale form of its locale (`en-us` for `en_US`). Which one the plugin
 	 * WRITES depends on the URL Prefix Format setting; which ones it READS is
-	 * deliberately both, so flipping that setting — or an old bookmark, or a
-	 * link someone already published — never 404s or silently serves the
+	 * deliberately both, so flipping that setting - or an old bookmark, or a
+	 * link someone already published - never 404s or silently serves the
 	 * wrong language.
 	 *
 	 * TWO passes, and the order matters. Every language's own slug is claimed
@@ -1773,7 +1773,7 @@ final class LanguageRouter {
 	 *
 	 * A single pass let a LATER language's alias overwrite an EARLIER
 	 * language's real slug: give one language the slug `de-de` and another
-	 * the locale `de_DE`, and `/de-de/` silently served the second one — the
+	 * the locale `de_DE`, and `/de-de/` silently served the second one - the
 	 * first became unreachable by its own slug, and reversing the row order
 	 * hid the problem. A slug is a real, UNIQUE-constrained identifier; an
 	 * alias is a convenience. The identifier must always win.
@@ -1807,10 +1807,44 @@ final class LanguageRouter {
 	}
 
 	/**
+	 * Language slug that a subdirectory-mode path segment addresses.
+	 *
+	 * Looks the segment up in the prefix map detect_from_path() routes by,
+	 * as given and then percent-decoded, as detect_from_path() does.
+	 *
+	 * @internal Used by UrlConverter to recognise a language root URL, and by
+	 *           SlugRedirector to keep a served prefix from being redirected.
+	 *
+	 * @param string $segment One path segment after the home path, without slashes.
+	 * @return string|null Language slug, or null when no active language uses the segment.
+	 */
+	public function slug_for_path_prefix( string $segment ): ?string {
+		if ( $segment === '' ) {
+			return null;
+		}
+
+		$prefix_map = $this->prefix_map( $this->get_language_slug_map() );
+
+		if ( isset( $prefix_map[ $segment ] ) ) {
+			return $prefix_map[ $segment ];
+		}
+
+		if ( str_contains( $segment, '%' ) ) {
+			$decoded = rawurldecode( $segment );
+
+			if ( isset( $prefix_map[ $decoded ] ) ) {
+				return $prefix_map[ $decoded ];
+			}
+		}
+
+		return null;
+	}
+
+	/**
 	 * Detect language from the `lang` query parameter (query URL mode).
 	 *
 	 * The raw value is only ever matched against the active-language prefix
-	 * map — an unknown or malformed value means "no language in the URL"
+	 * map - an unknown or malformed value means "no language in the URL"
 	 * and the default-language fallback applies. The user-supplied string
 	 * never propagates further: every URL the plugin builds afterwards
 	 * uses the slug stored in the languages table.
@@ -1877,7 +1911,7 @@ final class LanguageRouter {
 		// The URL Prefix Format setting decides which one gets WRITTEN; both
 		// are always read. So `?lang=en` keeps resolving on a site later
 		// switched to full-locale prefixes, and `?lang=en-us` resolves on a
-		// slug-prefix site — no bookmark, backlink or indexed URL ever dies
+		// slug-prefix site - no bookmark, backlink or indexed URL ever dies
 		// because someone changed a setting.
 		if ( isset( $prefix_map[ $slug ] ) ) {
 			return $prefix_map[ $slug ];
@@ -1957,20 +1991,20 @@ final class LanguageRouter {
 			$resolved  = (string) ( $redirects[ $prefix ] ?? '' );
 
 			if ( $resolved === '' || ! isset( $slug_map[ $resolved ] ) ) {
-				return; // Unknown value — leave the URL alone.
+				return; // Unknown value - leave the URL alone.
 			}
 		}
 
 		// Canonical form under the CURRENT URL Prefix Format setting. This is
 		// the same value UrlConverter writes, so one language keeps exactly
 		// one indexable query URL: reading both forms would otherwise leave
-		// `?lang=en` and `?lang=en-us` both answering 200 — duplicate content,
+		// `?lang=en` and `?lang=en-us` both answering 200 - duplicate content,
 		// which is the thing this plugin exists to prevent. Mirrors what
 		// maybe_canonicalise_prefix_form() does for subdirectory mode.
 		$canonical = $this->settings->get_url_prefix( $slug_map[ $resolved ] );
 
 		if ( $canonical === $prefix ) {
-			return; // Already canonical — no redirect.
+			return; // Already canonical - no redirect.
 		}
 
 		// Never 301 to a prefix that resolves to a DIFFERENT language. Two
@@ -2040,7 +2074,7 @@ final class LanguageRouter {
 			if ( ! empty( $wp->matched_query ) ) {
 				// $first_seg is a validated slug-map key (no regex
 				// metacharacters), so strip the leading "{$first_seg}" or
-				// "{$first_seg}/" prefix with string ops — equivalent to the
+				// "{$first_seg}/" prefix with string ops - equivalent to the
 				// old anchored preg_replace but ~3x cheaper on this
 				// every-request parse_request path.
 				$mq = (string) $wp->matched_query;
@@ -2102,7 +2136,7 @@ final class LanguageRouter {
 	 *  1. No extension dependency. `WpOrg\Requests\IdnaEncoder` is autoloaded
 	 *     unconditionally by wp-settings.php and has shipped since WP 6.2,
 	 *     below this plugin's 6.4 floor.
-	 *  2. It is deterministic across hosts. The two encoders DISAGREE — for
+	 *  2. It is deterministic across hosts. The two encoders DISAGREE - for
 	 *     `faß.de`, idn_to_ascii() with UTS-46 gives `fass.de` while the core
 	 *     encoder gives `xn--fa-hia.de`. An intl-if-available design would make
 	 *     which language a visitor gets depend on which extension the host
@@ -2111,7 +2145,7 @@ final class LanguageRouter {
 	 *     HTTP_HOST is legitimately empty under CLI.
 	 *
 	 * Order matters. The ASCII fast path comes first so that the overwhelmingly
-	 * common case is a strtolower() and never reaches the encoder — that is what
+	 * common case is a strtolower() and never reaches the encoder - that is what
 	 * keeps existing sites byte-identical and keeps a crafted Host away from
 	 * punycode entirely. The length cap comes before the encoder because an
 	 * 8KB non-ASCII Host costs about 1.4ms of CPU to encode; 253 is the maximum
@@ -2138,7 +2172,7 @@ final class LanguageRouter {
 		}
 
 		// Fast path: an all-ASCII host only needs case folding. strtolower(),
-		// not mb_strtolower() — the extension-guard suite forbids mbstring here
+		// not mb_strtolower() - the extension-guard suite forbids mbstring here
 		// and a hostname's ASCII range is all that can matter for the fold.
 		if ( ! preg_match( '/[\x80-\xFF]/', $host ) ) {
 			return strtolower( $host );
@@ -2157,7 +2191,7 @@ final class LanguageRouter {
 		} catch ( \Throwable $e ) {
 			// Over-long label, or anything else the encoder refuses. A host we
 			// cannot canonicalise simply will not match a configured domain,
-			// which is the correct outcome — never a fatal on a front-end request.
+			// which is the correct outcome - never a fatal on a front-end request.
 			unset( $e );
 
 			return strtolower( $host );
@@ -2171,7 +2205,7 @@ final class LanguageRouter {
 	 * @return string|null Detected language slug or null.
 	 */
 	private function detect_from_subdomain( array $slug_map ): ?string {
-		// Strip any :port — HTTP_HOST carries it on non-80/443 setups (dev,
+		// Strip any :port - HTTP_HOST carries it on non-80/443 setups (dev,
 		// staging, ported production) but wp_parse_url(home_url()) never does,
 		// so an unstripped host would match neither branch and force default.
 		$host      = self::normalize_host( sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) ) );
@@ -2202,7 +2236,7 @@ final class LanguageRouter {
 	 */
 	private function detect_from_domain( array $slug_map ): ?string {
 		// Strip any :port so a ported HTTP_HOST still matches the (typically
-		// portless) configured domain values — see detect_from_subdomain().
+		// portless) configured domain values - see detect_from_subdomain().
 		$host    = self::normalize_host( sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) ) );
 		$domains = $this->settings->get_language_domains();
 
@@ -2371,7 +2405,7 @@ final class LanguageRouter {
 			}
 
 			// Try base language (e.g., 'pt-br' → 'pt'). Split on the subtag
-			// separator rather than truncating to 2 chars — a 3-letter code
+			// separator rather than truncating to 2 chars - a 3-letter code
 			// like 'fil' must not be cut to 'fi' and false-match Finnish.
 			$base = explode( '-', $lang_code )[0];
 
@@ -2434,7 +2468,7 @@ final class LanguageRouter {
 
 		// Never Set-Cookie for crawlers. Bots are exempt from all three
 		// cookie CONSUMERS (browser-language, edge-hint and geo redirects),
-		// so a cookie written to a bot can never be read — but the header
+		// so a cookie written to a bot can never be read - but the header
 		// itself is poison for page caches (Varnish's builtin turns a
 		// Set-Cookie response into hit-for-pass). Same single-source UA
 		// check the redirect paths use.
@@ -2478,20 +2512,20 @@ final class LanguageRouter {
 		// Skip the write entirely when nothing in the active config can ever
 		// CONSUME the cookie. A Set-Cookie on every first anonymous view is
 		// poison for page caches (Varnish builtin turns it into hit-for-pass
-		// and every follow-up request carries an uncacheable Cookie header) —
+		// and every follow-up request carries an uncacheable Cookie header) -
 		// paid for a value no code path would read. The answer carries WHICH
 		// consumer kept it alive, because the narrowing below turns on that.
 		//
 		// LAST of the pure guards on purpose: it is the most expensive of them.
-		// This one costs up to three settings reads plus the detection order —
-		// and the filters each of those dispatches — where the five above it are
+		// This one costs up to three settings reads plus the detection order -
+		// and the filters each of those dispatches - where the five above it are
 		// an in-memory flag, a memoised UA match, ONE settings read and two
 		// lookups in a bundle this request has already loaded. Below the
 		// same-value guard it
 		// runs at most ONCE PER VISITOR, on the first request that was genuinely
 		// about to emit a Set-Cookie, instead of on every request of every
 		// returning visitor who already holds the right cookie. Every guard here
-		// is a pure early return with the same outcome — no write — so the order
+		// is a pure early return with the same outcome - no write - so the order
 		// is free to be the cheap one; moving this back above them is a straight
 		// loss on the busiest path.
 		//
@@ -2512,23 +2546,23 @@ final class LanguageRouter {
 		//
 		// WHY IT IS REDUNDANT. When WooCommerce is the SOLE reason this cookie is
 		// readable, both of its readers treat "no cookie" and "cookie === the
-		// default slug" identically — PROVIDED the router itself answers with the
+		// default slug" identically - PROVIDED the router itself answers with the
 		// default on a URL that carries no language (the clause below).
 		// detect_locale_early() then falls through to self::$default_language when
 		// its Store API branch finds nothing, and
 		// EmailTranslation::get_current_language_slug() only lets a cookie
 		// override the router when the router's own answer is empty or already
 		// the default. The header bought nothing and cost the page cache
-		// everything — Varnish's builtin VCL turns a Set-Cookie response into
+		// everything - Varnish's builtin VCL turns a Set-Cookie response into
 		// hit-for-pass, and every follow-up request then carries a Cookie header.
 		//
 		// EVERY CLAUSE IS LOAD-BEARING. What breaks if one is "simplified" away:
 		//
 		// WooCommerce must be the SOLE consumer. The three redirect features read
-		// this cookie on every request as "returning visitor — never steer
+		// this cookie on every request as "returning visitor - never steer
 		// again", and the detection loop of a subdirectory + visible-default-
 		// prefix site resolves the language FROM it. For those the default value
-		// is the whole point, so they still write — which is why
+		// is the whole point, so they still write - which is why
 		// language_cookie_consumer() reports the detection shape BEFORE the
 		// WooCommerce one instead of letting a store hide it. That ordering is
 		// the honest model, not the guard: the url_mode clause below refuses the
@@ -2541,7 +2575,7 @@ final class LanguageRouter {
 		// shopper gets English coupon/stock/checkout errors and an English order
 		// email. That is the bug the WooCommerce branch exists for, and this
 		// narrowing must never reach it. "Default" is asked of the same row the
-		// readers ask — the repository's default language, not the is_default
+		// readers ask - the repository's default language, not the is_default
 		// flag on an arbitrary slug-map row, so a table carrying two flagged rows
 		// can never make this skip a write the readers would not call redundant.
 		//
@@ -2550,7 +2584,7 @@ final class LanguageRouter {
 		// default language would keep perflocale_lang=de forever, and their cart,
 		// checkout and order emails would stay German. Overwriting a stale value
 		// is exactly what this write is for; only the first, no-cookie case is
-		// redundant — and a visitor who already carries a cookie is uncacheable
+		// redundant - and a visitor who already carries a cookie is uncacheable
 		// anyway, so no cache benefit is given up.
 		//
 		// An un-routed URL must resolve to the default WITHOUT the cookie. In
@@ -2558,7 +2592,7 @@ final class LanguageRouter {
 		// fallback in detect_locale_early() deliberately refuses to force the
 		// default there, so an un-prefixed URL leaves current_language null.
 		//
-		// WHICH REQUEST SHAPES THAT REALLY REACHES, precisely — a half-true
+		// WHICH REQUEST SHAPES THAT REALLY REACHES, precisely - a half-true
 		// version of this paragraph is how a future reader talks themselves out
 		// of the clause. Anything that runs wp() gets a language regardless:
 		// detect_language() fires on parse_request and its FINAL fallback is
@@ -2577,11 +2611,11 @@ final class LanguageRouter {
 		//
 		// detect_locale_early()'s Store API branch leans on the same clause for a
 		// narrower reason: it is what gives such a shopper a language BEFORE
-		// WooCommerce loads its text domain on init — which parse_request, where
+		// WooCommerce loads its text domain on init - which parse_request, where
 		// the fallback above lives, is far too late for.
 		//
 		// No edge worker may be in front. assets/js/edge-helper.js reads any
-		// perflocale_lang value as "returning visitor — stop steering"; with no
+		// perflocale_lang value as "returning visitor - stop steering"; with no
 		// cookie it re-derives the language from Accept-Language on every request
 		// and the default language becomes unreachable for that visitor. See
 		// edge_worker_may_steer() for how both worker strategies are covered.
@@ -2604,7 +2638,7 @@ final class LanguageRouter {
 			/**
 			 * Whether to skip a language-cookie write that would change no
 			 * answer (the default slug, first visit, WooCommerce the only
-			 * reader). Return false to always write the cookie — for an edge,
+			 * reader). Return false to always write the cookie - for an edge,
 			 * CDN or analytics layer of your own that reads it.
 			 *
 			 * @hook perflocale/cookie/skip_redundant_write
@@ -2660,7 +2694,7 @@ final class LanguageRouter {
 	/** No active code path can read the language cookie. */
 	private const COOKIE_CONSUMER_NONE = '';
 
-	/** A redirect feature reads it as "returning visitor — don't steer". */
+	/** A redirect feature reads it as "returning visitor - don't steer". */
 	private const COOKIE_CONSUMER_REDIRECT = 'redirect';
 
 	/** Only WooCommerce reads it (Store API language, order-email language). */
@@ -2675,21 +2709,21 @@ final class LanguageRouter {
 	 * Returns the REASON, not a yes/no, because set_language_cookie() narrows
 	 * exactly one of them: a WooCommerce-only site does not need the cookie
 	 * written for its own default language, while every other consumer does.
-	 * Checked in precedence order — the redirect features read the cookie on
+	 * Checked in precedence order - the redirect features read the cookie on
 	 * every request, so they answer first and cheapest.
 	 *
 	 * Consumers: the redirect features (browser / geo / edge-hint all treat
-	 * an existing cookie as "returning visitor — don't redirect"), the cookie
-	 * step of the detection loop — which is only reachable when a URL can lack
+	 * an existing cookie as "returning visitor - don't redirect"), the cookie
+	 * step of the detection loop - which is only reachable when a URL can lack
 	 * language routing, i.e. subdirectory mode with a VISIBLE default prefix
 	 * (every other mode force-resolves unprefixed URLs to the default in
-	 * detect_locale_early()) — and WooCommerce (see below).
+	 * detect_locale_early()) - and WooCommerce (see below).
 	 *
 	 * ONE READER IS DELIBERATELY ABSENT from that list: clean_redirect_sentinel()
 	 * is registered unconditionally and reads the cookie before stripping
 	 * ?perflocale_redirected=1. It never needs the cookie kept alive on its own
-	 * account — that sentinel is only ever appended by the three redirect paths,
-	 * which answer REDIRECT above — but it is the reader an exhaustive reading
+	 * account - that sentinel is only ever appended by the three redirect paths,
+	 * which answer REDIRECT above - but it is the reader an exhaustive reading
 	 * of the list would otherwise miss.
 	 *
 	 * ORDER MATTERS. WooCommerce is reported LAST of the three, because it is
@@ -2697,7 +2731,7 @@ final class LanguageRouter {
 	 * detection consumer unreachable on every store, so a subdirectory site
 	 * with a visible default prefix silently lost the cookie its own detection
 	 * loop reads the moment WooCommerce was installed. Cheap checks still come
-	 * first — the redirect flags are in-memory booleans, and the detection
+	 * first - the redirect flags are in-memory booleans, and the detection
 	 * shape stops at one settings read in every url_mode but subdirectory.
 	 *
 	 * @param bool|null $unrouted_resolves_to_default Out-parameter, so the
@@ -2718,7 +2752,7 @@ final class LanguageRouter {
 		}
 
 		// Where an un-routed URL does NOT mean the default language, something
-		// has to resolve it — and the detection loop's cookie / edge_hint steps
+		// has to resolve it - and the detection loop's cookie / edge_hint steps
 		// are what read this cookie to do it. Resolved INTO the out-parameter:
 		// the caller's narrowing needs the same answer and must not ask twice.
 		$unrouted_resolves_to_default = $this->unrouted_url_resolves_to_default();
@@ -2733,7 +2767,7 @@ final class LanguageRouter {
 
 		// WooCommerce Store API requests (block cart/checkout) post to the
 		// unprefixed REST base and resolve their language FROM this cookie
-		// (see detect_locale_early) — on WC sites the cookie is functional.
+		// (see detect_locale_early) - on WC sites the cookie is functional.
 		// EmailTranslation::get_current_language_slug() is a second, prefix-
 		// independent reader: the classic checkout posts to admin-ajax.php,
 		// where the cookie is the only thing tagging the order's language.
@@ -2748,9 +2782,9 @@ final class LanguageRouter {
 	 * Whether this slug is the site's default language.
 	 *
 	 * Asks the same row every reader whose equivalence the narrowing relies on
-	 * asks — LanguageRepository::get_default(), which is what
+	 * asks - LanguageRepository::get_default(), which is what
 	 * detect_locale_early() falls back to and what
-	 * EmailTranslation::get_current_language_slug() compares against — rather
+	 * EmailTranslation::get_current_language_slug() compares against - rather
 	 * than the is_default flag on a slug-map row. The two agree only while
 	 * exactly one active row carries the flag; a hand-edited or half-migrated
 	 * table would otherwise make the narrowing skip a write for a slug the
@@ -2779,7 +2813,7 @@ final class LanguageRouter {
 	 * default fallback with. Subdirectory mode with a visible default prefix is
 	 * the one shape where an un-prefixed URL is NOT the default language, so
 	 * there the cookie is the only language signal a request that never reaches
-	 * parse_request has — admin-ajax.php above all, where the classic checkout
+	 * parse_request has - admin-ajax.php above all, where the classic checkout
 	 * posts. set_language_cookie() spells out which shapes those are, and which
 	 * ones detect_language() answers for anyway.
 	 *
@@ -2799,7 +2833,7 @@ final class LanguageRouter {
 	 * perflocale_lang cookie, so the cookie is functional for them even when
 	 * nothing inside WordPress would read it. Strategy B announces itself on
 	 * every request it forwards, with the hint header; Strategy A rewrites the
-	 * URL silently and announces nothing — but neither can run without
+	 * URL silently and announces nothing - but neither can run without
 	 * `edge_integration_enabled`, which is what exposes the /config endpoint
 	 * both of them fetch. Checking the setting first therefore covers the
 	 * silent strategy, and the header covers a worker pointed at a config it
@@ -2851,7 +2885,7 @@ final class LanguageRouter {
 	 * writes: a non-default slug, an existing cookie of any value, any redirect
 	 * feature on, an edge worker in front, or a site in subdirectory mode with a
 	 * visible default prefix. An integration that needs the header for a reader
-	 * of its own — an edge, CDN or analytics layer — restores the old behaviour
+	 * of its own - an edge, CDN or analytics layer - restores the old behaviour
 	 * with `add_filter( 'perflocale/cookie/skip_redundant_write', '__return_false' )`.
 	 *
 	 * @param string $slug Language slug.
@@ -2942,7 +2976,7 @@ final class LanguageRouter {
 
 	/**
 	 * Temporarily override the current language for an internal rendering
-	 * window — order emails rendered outside the customer's own request
+	 * window - order emails rendered outside the customer's own request
 	 * (admin status change, gateway webhook, cron) must resolve
 	 * language-keyed lookups (term names, attribute labels, string
 	 * translations) in the ORDER's language, not the triggering request's.
@@ -3057,7 +3091,7 @@ final class LanguageRouter {
 	}
 
 	/**
-	 * Reset only the data-derived static caches — leave per-request
+	 * Reset only the data-derived static caches - leave per-request
 	 * detection state (current_language, detection_finalized) intact.
 	 *
 	 * Hooked to the language CRUD action chain so a language add / slug
@@ -3076,7 +3110,7 @@ final class LanguageRouter {
 
 	/**
 	 * Language state parked by open switch_to_blog() calls, one frame per
-	 * call, in depth order — a stack, mirroring core's own
+	 * call, in depth order - a stack, mirroring core's own
 	 * `$GLOBALS['_wp_switched_stack']`. `blog` records which blog the frame
 	 * belongs to so a restore can prove the frame it pops is its own.
 	 *
@@ -3114,14 +3148,14 @@ final class LanguageRouter {
 	 * restore_current_blog() (WP 5.4+; the plugin's floor is 6.4). The two
 	 * legs do opposite things here:
 	 *
-	 *   - 'switch'  — park the leaving blog's language state one frame deeper,
+	 *   - 'switch'  - park the leaving blog's language state one frame deeper,
 	 *                 then start the entering blog clean, exactly as a first
 	 *                 visit to it would. If that blog is already open further
 	 *                 down the stack (a re-entrant switch), its live state is
-	 *                 COPIED from that frame rather than detected again — the
+	 *                 COPIED from that frame rather than detected again - the
 	 *                 frame stays where it is, because the restore that owns
 	 *                 it still has to find it.
-	 *   - 'restore' — pop the frame this leg's matching switch parked and hand
+	 *   - 'restore' - pop the frame this leg's matching switch parked and hand
 	 *                 its state back. Nothing is parked on the way out.
 	 *
 	 * Same blog id on either leg (WooCommerce and AIOWPSecurity both call
@@ -3140,7 +3174,7 @@ final class LanguageRouter {
 	 *   - keying the store by blog id instead of by depth let a re-entrant
 	 *     switch consume the frame an outer restore still needed, so the
 	 *     request returned to that blog with no language at all and nothing
-	 *     to re-detect it — `detect_language()` runs on parse_request, once.
+	 *     to re-detect it - `detect_language()` runs on parse_request, once.
 	 *
 	 * @param int|string $new_blog_id  Target blog id.
 	 * @param int|string $prev_blog_id Previous blog id.
@@ -3203,7 +3237,7 @@ final class LanguageRouter {
 			// Surface the overflow in WP_DEBUG. With the return leg no longer
 			// parking anything, reaching this branch means MAX_STACK_DEPTH
 			// switch_to_blog() calls are open at once with no matching
-			// restore_current_blog() — worth knowing, because the evicted
+			// restore_current_blog() - worth knowing, because the evicted
 			// frame is a blog whose language will not come back when its
 			// restore finally arrives. The message reports what was measured
 			// and names no culprit: the unbalanced calls may be anyone's,
@@ -3236,7 +3270,7 @@ final class LanguageRouter {
 
 		// Re-entering a blog that is still open lower down the stack: copy its
 		// live state instead of detecting again, and LEAVE the frame in place
-		// — the restore that parked it still has to find it. A blog whose
+		// - the restore that parked it still has to find it. A blog whose
 		// visit already finished has no frame left, so it is detected afresh,
 		// which is the point: state captured before anything changed must not
 		// be reused as if it were current.
@@ -3266,7 +3300,7 @@ final class LanguageRouter {
 	 *
 	 * The frame is only accepted when it belongs to the blog being returned
 	 * to. A mismatch means this handler's stack and core's have drifted apart
-	 * — third-party code firing `switch_blog` by hand, a frame evicted at the
+	 * - third-party code firing `switch_blog` by hand, a frame evicted at the
 	 * cap, or the plugin being loaded mid-request with switches already open.
 	 * In that case the frame is put back untouched (it may still be somebody
 	 * else's) and the blog is treated as freshly entered, which is always

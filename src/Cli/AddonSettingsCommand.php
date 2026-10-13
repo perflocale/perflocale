@@ -185,7 +185,7 @@ final class AddonSettingsCommand {
 		}
 
 		// Fields declared `'storage' => 'global'` live in the shared
-		// `perflocale_settings` option, not in addon storage — the addon's
+		// `perflocale_settings` option, not in addon storage - the addon's
 		// runtime reads them via Settings. Write through Settings::update()
 		// so the full invalidation chain runs (config-cache flush, cron
 		// reschedules, settings-updated listeners); a raw `wp option patch`
@@ -263,7 +263,7 @@ final class AddonSettingsCommand {
 
 		$entry = AddonSettings::get_addon( $addon_id );
 
-		// Collect global-storage fields too — they're declared by the
+		// Collect global-storage fields too - they're declared by the
 		// addon but live in `perflocale_settings`. Operator running
 		// `settings list woocommerce` expects to see WC's settings even
 		// though they're not in the addon-settings option.
@@ -362,7 +362,7 @@ final class AddonSettingsCommand {
 	}
 
 	/**
-	 * Render a setting value for the CLI table — bool → 'true'/'false',
+	 * Render a setting value for the CLI table - bool → 'true'/'false',
 	 * array/object → JSON, null → '', everything else string-cast.
 	 *
 	 * @param mixed $v

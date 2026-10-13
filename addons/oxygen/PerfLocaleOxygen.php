@@ -79,12 +79,12 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	public function boot( \PerfLocale\Plugin $plugin ): void {
 		// Register Oxygen meta keys as translatable.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		// ⚠️ Only the TEXT-FREE keys mirror — see add_mirror_keys(). The builder
+		// ⚠️ Only the TEXT-FREE keys mirror - see add_mirror_keys(). The builder
 		// documents (`_ct_builder_json` / `_ct_builder_shortcodes`, legacy
 		// `ct_*` spellings too) are NOT on that list: a mirror is
 		// bidirectional, so mirroring a document holding the user's words
 		// destroys translated text in both directions.
-		// The other-template key is excluded for a separate reason — it stores a
+		// The other-template key is excluded for a separate reason - it stores a
 		// per-page template POST ID, so mirroring would pin every sibling to the
 		// source-language template.
 		add_filter( 'perflocale/sync/mirror_meta_keys', [ $this, 'add_mirror_keys' ], 10, 2 );
@@ -102,7 +102,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		// Oxygen picks the template for a request by RULE MATCHING: it loads
 		// every published ct_template with `new WP_Query( [ 'post_type' =>
 		// 'ct_template', 'post_status' => 'publish' ] )` and walks them
-		// (component-framework/includes/templates.php — the inner-content,
+		// (component-framework/includes/templates.php - the inner-content,
 		// posts and archives resolvers), from the front-end dispatcher in
 		// component-init.php, which returns early on `is_admin()`.
 		//
@@ -114,8 +114,8 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		//   /de/   => [1102639]      (de)
 		//   /es/   => []   -> ct_get_archives_template() === false -> NO LAYOUT
 		//   /fr/   => []   -> ditto
-		// Every site that runs "Assign Default Language" — which Settings tells
-		// operators to do first — lands in exactly that state on every language
+		// Every site that runs "Assign Default Language" - which Settings tells
+		// operators to do first - lands in exactly that state on every language
 		// it has not hand-translated templates for.
 		//
 		// Never-scoping alone would be wrong in the other direction: unlike
@@ -124,7 +124,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		// `copy_post_meta()` gives a sibling the same `_ct_template_order` and
 		// matching rules as its source. Two published siblings would then match
 		// identically and `orderby => meta_value_num` would return whichever
-		// row MySQL happened to yield — making the rendered language undefined.
+		// row MySQL happened to yield - making the rendered language undefined.
 		// So the exemption is paired with resolve_template_language() below,
 		// which collapses each translation group back to exactly one row.
 		add_filter( 'perflocale/query/never_scoped_post_types', [ $this, 'never_scope_template_types' ] );
@@ -139,15 +139,15 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		//   $page_blocks = new WP_Query( $args2 );
 		//   … register_block_type( 'oxygen-vsb/ovsb-' . $post->post_name, … )
 		//
-		// (oxygen-gutenberg/oxygen-gutenberg.php:63-104.) `page` is scoped —
-		// correctly, it is browsed by language — so on a non-default language
+		// (oxygen-gutenberg/oxygen-gutenberg.php:63-104.) `page` is scoped -
+		// correctly, it is browsed by language - so on a non-default language
 		// that query returned only that language's pages and the source's block
 		// type was never registered. An unregistered dynamic block renders as
 		// NOTHING, so the page body silently emptied. Measured on a test site
 		// with the plugin activated: `/` registered
 		// `oxygen-vsb/ovsb-zzfullpageblock`, `/de/` registered ZERO blocks.
 		//
-		// The remedy cannot be the never-scoped list — putting `page` on it
+		// The remedy cannot be the never-scoped list - putting `page` on it
 		// would leak every language's pages into every page listing. Instead
 		// this one query shape is marked all-languages, which is what block
 		// REGISTRATION needs: block names are slug-keyed and global, so
@@ -183,8 +183,8 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 				$keys[] = $key;
 			}
 		}
-		// 'ct_options' is not post meta — it's a JSON attribute inside ct_*
-		// shortcodes — so it never had anything to sync.
+		// 'ct_options' is not post meta - it's a JSON attribute inside ct_*
+		// shortcodes - so it never had anything to sync.
 
 		return $keys;
 	}
@@ -195,7 +195,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 * A strict subset of {@see self::add_meta_keys()}, and now a much smaller one.
 	 *
 	 * ⚠️ `ct_builder_json` and `ct_builder_shortcodes` USED TO BE HERE AND MUST NOT
-	 * COME BACK. They are not a layout skeleton — they are the documents holding
+	 * COME BACK. They are not a layout skeleton - they are the documents holding
 	 * every heading, paragraph and button label on the page. ContentSync's mirror
 	 * is bidirectional ("any group member's save propagates group-wide"), so
 	 * mirroring them destroys translated text in both directions: the translator
@@ -205,7 +205,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 * so it was moved with them rather than waiting for its own incident.
 	 *
 	 * Both keys stay on the TRANSLATABLE list, so a new translation is still born
-	 * with the source's full layout — it simply owns it afterwards. The accepted
+	 * with the source's full layout - it simply owns it afterwards. The accepted
 	 * cost is that later structural edits no longer propagate; keeping a
 	 * translator's words is worth more than automatic layout parity.
 	 *
@@ -235,7 +235,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 * CSS built from the old layout. With the state entry gone the frontend
 	 * falls back to live `xlink=css` output. Done inline rather than via
 	 * oxygen_vsb_delete_css_file(): that function trips undefined-index
-	 * warnings on entries flagged 'empty' — and an 'empty' entry must ALSO
+	 * warnings on entries flagged 'empty' - and an 'empty' entry must ALSO
 	 * be cleared, or a layout that gained CSS stays skipped by
 	 * oxygen_vsb_load_cached_css_files().
 	 *
@@ -289,7 +289,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * `oxy_user_library` is Oxygen's reusable-block store. The Gutenberg
 	 * bridge registers one block type per library post, keyed on the POST
-	 * SLUG, from a front-end `init` query — so a scoped query means the block
+	 * SLUG, from a front-end `init` query - so a scoped query means the block
 	 * is never registered and every embedded reusable block renders empty.
 	 * It is listed here rather than in add_post_types() on purpose: nothing
 	 * marks it translatable today, and exempting a type that is not scoped is
@@ -308,8 +308,8 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Exempt oxygen-gutenberg's full-page-block registration query from scoping.
 	 *
-	 * Matched on the exact shape the companion plugin uses — post type `page`
-	 * plus the `_ct_oxygenberg_full_page_block` meta key — so no ordinary page
+	 * Matched on the exact shape the companion plugin uses - post type `page`
+	 * plus the `_ct_oxygenberg_full_page_block` meta key - so no ordinary page
 	 * query is affected. See the rationale in boot().
 	 *
 	 * Registered at priority 1, ahead of PerfLocale's own `pre_get_posts`
@@ -348,7 +348,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 	 *   2. otherwise the row in the DEFAULT language (the source);
 	 *   3. otherwise the first row of that group the query returned.
 	 *
-	 * Only rows the query ALREADY returned are considered — a sibling is never
+	 * Only rows the query ALREADY returned are considered - a sibling is never
 	 * substituted in. That matters: `PostTranslationManager` creates siblings
 	 * as drafts, and Oxygen's resolvers all filter `post_status => 'publish'`,
 	 * so an unpublished translation must stay invisible exactly as it is today.
@@ -385,7 +385,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 		$current = $plugin->get( 'router' )->get_current_language();
 
 		// No current language means wp-admin or a pre-routing request. Leave
-		// the builder's own listings alone — collapsing them would hide a
+		// the builder's own listings alone - collapsing them would hide a
 		// translated template from the operator's template list.
 		if ( ! is_object( $current ) || ! isset( $current->slug ) ) {
 			return $posts;
@@ -419,12 +419,12 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 
 			// UNLINKED ONLY. A template with no link row has no language, so
 			// there is no language rule to apply to it and it must render for
-			// everyone — that is the untranslated Oxygen site, and dropping its
+			// everyone - that is the untranslated Oxygen site, and dropping its
 			// templates would blank the layout.
 			//
 			// ⚠️ DO NOT restore the `count( $translations ) < 2` form this
 			// replaced ("a group of one: nothing to collapse"). Collapsing is
-			// not the only job here — the never-sideways rule below is the
+			// not the only job here - the never-sideways rule below is the
 			// other one, and a group of ONE is where it matters most. Delete
 			// the source and the German sibling out of a three-language group
 			// and the lone FRENCH template is the entire group, so `count < 2`
@@ -436,7 +436,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 			//
 			// Measured on the frozen 1.0.5 candidate, group {fr: 1107006} on a
 			// /de/ request: returned [1107006] with the old guard, [] with this
-			// one — matching 1.0.4 exactly.
+			// one - matching 1.0.4 exactly.
 			if ( ! is_array( $translations ) || $translations === [] ) {
 				$out[] = $post;
 				continue;
@@ -466,7 +466,7 @@ final class PerfLocaleOxygen implements \PerfLocale\Addon\AddonInterface {
 			// IS here belongs to some third language, so drop it: a template
 			// may fall back to its SOURCE, never sideways to another
 			// translation. This is reachable whenever the rule meta has
-			// diverged between siblings — Oxygen's index-template lookup, for
+			// diverged between siblings - Oxygen's index-template lookup, for
 			// instance, filters on `_ct_template_index`, so a sibling that was
 			// flagged as the index while its source was not is the only row
 			// the query returns. Without this arm an /es/ visitor would get

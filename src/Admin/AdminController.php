@@ -30,7 +30,7 @@ final class AdminController {
 	/**
 	 * Admin page hooks (used for conditional script loading).
 	 *
-	 * add_menu_page / add_submenu_page return string|false — the value can
+	 * add_menu_page / add_submenu_page return string|false - the value can
 	 * be `false` when the current user lacks the menu capability. We store
 	 * both shapes here and gate consumers (load-XXX action, screen-id
 	 * comparisons) with is_string() before use.
@@ -81,7 +81,7 @@ final class AdminController {
 		add_action( 'admin_init', [ $this, 'process_dashboard_actions' ] );
 
 		// A POST body PHP discarded for exceeding post_max_size reaches every
-		// handler above as an empty $_POST, so none of them can report it —
+		// handler above as an empty $_POST, so none of them can report it -
 		// their route guards and nonce checks are the first things it breaks.
 		// This notice is the only surface left that can say what happened.
 		add_action( 'admin_notices', [ $this, 'render_discarded_post_notice' ] );
@@ -248,12 +248,12 @@ final class AdminController {
 		$values = $page->extract_tab_values( $tab );
 
 		// The boolean matters. wpdb refuses a write whose value is too long for
-		// its column or carries invalid UTF-8 — it does not truncate or repair —
+		// its column or carries invalid UTF-8 - it does not truncate or repair -
 		// so update() can fail with nothing stored while the redirect below
 		// reports success. Carry the real result through to the notice.
 		// update() returns false for a refused write AND for a save that changed
 		// nothing, so the no-op signal is consulted alongside it. Without that,
-		// re-saving a tab unchanged — the common case — would show an error.
+		// re-saving a tab unchanged - the common case - would show an error.
 		$settings_saved = $this->settings->update( $values ) || \PerfLocale\Settings::last_update_was_noop();
 
 		// When performance tab is saved, handle string translation mode changes.
@@ -303,7 +303,7 @@ final class AdminController {
 	// Upload limits
 	//
 	// Both import forms on this plugin's screens gate uploads in application
-	// code at 50 MB — 25x a stock host's `upload_max_filesize`. On a stock
+	// code at 50 MB - 25x a stock host's `upload_max_filesize`. On a stock
 	// host PHP therefore refuses the file first and the application gate is
 	// never what the operator hits; only a generously configured host reaches
 	// it. The helpers below turn the two ways PHP can refuse an upload into
@@ -316,7 +316,7 @@ final class AdminController {
 	 * Deliberately kept as a SECOND ceiling rather than lowered to
 	 * `wp_max_upload_size()`. PHP refuses anything above its own limit before
 	 * this code runs, so the only uploads this gate ever sees are ones a
-	 * generous host already accepted — which is exactly the case it exists
+	 * generous host already accepted - which is exactly the case it exists
 	 * for, because core's \PO parser holds every entry of the file in memory
 	 * at once. Lowering it to `wp_max_upload_size()` would make it dead code
 	 * on a stock host and weaker on the hosts that need it, and would tie an
@@ -353,6 +353,31 @@ final class AdminController {
 		 * @hook perflocale/import/max_file_bytes
 		 */
 		return (int) apply_filters( 'perflocale/import/max_file_bytes', 50 * MB_IN_BYTES );
+	}
+
+	/**
+	 * The sentence the WPML import notice adds when the filters for accounts
+	 * without `unfiltered_html` changed stored string translations, with a
+	 * leading space; empty for a count of 0. Same copy as the JSON import's.
+	 *
+	 * @param int $count Rows the filters changed.
+	 * @return string
+	 */
+	private static function sanitized_import_note( int $count ): string {
+		if ( $count <= 0 ) {
+			return '';
+		}
+
+		return ' ' . sprintf(
+			/* translators: %d: number of imported rows (string translations, languages, translated slugs) the filters changed */
+			_n(
+				'%d imported item was changed by the filters that apply to accounts without the unfiltered_html capability (disallowed markup such as scripts is removed; other values may be reformatted the way the PerfLocale screens save them).',
+				'%d imported items were changed by the filters that apply to accounts without the unfiltered_html capability (disallowed markup such as scripts is removed; other values may be reformatted the way the PerfLocale screens save them).',
+				$count,
+				'perflocale'
+			),
+			$count
+		);
 	}
 
 	/**
@@ -398,8 +423,8 @@ final class AdminController {
 	/**
 	 * `size_format()` for a byte count that has to render no matter what.
 	 *
-	 * Core's size_format() returns false for a negative input — which only a
-	 * third-party `upload_size_limit` filter could produce — and a message
+	 * Core's size_format() returns false for a negative input - which only a
+	 * third-party `upload_size_limit` filter could produce - and a message
 	 * reading "limit: " helps nobody. Clamping at zero keeps the sentence
 	 * whole.
 	 *
@@ -410,12 +435,12 @@ final class AdminController {
 	public static function format_bytes( mixed $bytes ): string {
 		// Deliberately NOT typed `int`. Every caller feeds this
 		// `wp_max_upload_size()`, whose return passes through the third-party
-		// `upload_size_limit` filter — and a plugin may return a float, a
+		// `upload_size_limit` filter - and a plugin may return a float, a
 		// numeric string, or an ini-shaped string like '64M'. This file declares
 		// strict_types, so a narrow parameter would throw at ARGUMENT BINDING,
 		// before any guard in the body could run: a white screen on the Strings
 		// admin page on every load, caused by another plugin's filter. WordPress
-		// core tolerates exactly this — `size_format( wp_max_upload_size() )` in
+		// core tolerates exactly this - `size_format( wp_max_upload_size() )` in
 		// wp-includes/media.php is untyped and survives. Normalise here instead,
 		// and route the ini-shaped case through wp_convert_hr_to_bytes() so a
 		// '64M' answer renders as 64 MB rather than 64 bytes.
@@ -430,7 +455,7 @@ final class AdminController {
 	 * The upload ceiling in bytes, normalised the same way {@see format_bytes()} does.
 	 *
 	 * `min()` on a raw `wp_max_upload_size()` has the same exposure as the
-	 * signature above did — a filter returning '64M' makes `min()` compare a
+	 * signature above did - a filter returning '64M' makes `min()` compare a
 	 * string against an int and pick the wrong one, silently. Callers that need
 	 * the NUMBER rather than the label go through here.
 	 *
@@ -451,7 +476,7 @@ final class AdminController {
 	 *
 	 * `$_FILES[…]['error']` is the only record of WHY an upload arrived with
 	 * an empty `tmp_name`. Ignore it and a file the server refused looks
-	 * exactly like no file at all — and the two need opposite responses, so
+	 * exactly like no file at all - and the two need opposite responses, so
 	 * each code gets its own sentence. An over-limit file is the operator's
 	 * to shrink or the host's limit to raise; a missing or unwritable
 	 * temporary directory is a host fault that no smaller file will fix.
@@ -475,16 +500,16 @@ final class AdminController {
 				);
 
 			case UPLOAD_ERR_PARTIAL:
-				return __( 'Only part of the file reached the server, so nothing was imported. The upload was interrupted — try again.', 'perflocale' );
+				return __( 'Only part of the file reached the server, so nothing was imported. The upload was interrupted - try again.', 'perflocale' );
 
 			case UPLOAD_ERR_NO_FILE:
 				return __( 'No file was received. Choose a file and submit the form again.', 'perflocale' );
 
 			case UPLOAD_ERR_NO_TMP_DIR:
-				return __( 'This server has no temporary folder for uploads, so no file can be uploaded to it at all. Ask your host to configure the PHP upload_tmp_dir setting — a smaller file will not help.', 'perflocale' );
+				return __( 'This server has no temporary folder for uploads, so no file can be uploaded to it at all. Ask your host to configure the PHP upload_tmp_dir setting - a smaller file will not help.', 'perflocale' );
 
 			case UPLOAD_ERR_CANT_WRITE:
-				return __( 'The server could not write the uploaded file to disk. Check the free disk space and the permissions on the PHP temporary folder — a smaller file will not help.', 'perflocale' );
+				return __( 'The server could not write the uploaded file to disk. Check the free disk space and the permissions on the PHP temporary folder - a smaller file will not help.', 'perflocale' );
 
 			case UPLOAD_ERR_EXTENSION:
 				return __( 'A PHP extension on this server stopped the upload. Ask your host which extension blocked it.', 'perflocale' );
@@ -504,15 +529,15 @@ final class AdminController {
 	 * Above that limit PHP discards the whole body before any script runs:
 	 * `$_POST`, `$_FILES` and therefore `_wpnonce` all arrive empty. Every
 	 * handler in this class then bails at its own route guard without a word;
-	 * a handler ordered nonce-first instead — as several of WordPress core's
-	 * admin forms are — reports a security failure for a request nobody
+	 * a handler ordered nonce-first instead - as several of WordPress core's
+	 * admin forms are - reports a security failure for a request nobody
 	 * forged. The signature is a POST that declared more bytes than
 	 * post_max_size allows and arrived with both superglobals empty.
 	 *
 	 * `post_max_size = 0` disables the limit and PHP then never discards, so
 	 * an empty `$_POST` there is a genuinely empty body, not a truncated one.
-	 * A SAPI that does not publish CONTENT_LENGTH falls back to false — no
-	 * notice, i.e. the behaviour that shipped before this — rather than to a
+	 * A SAPI that does not publish CONTENT_LENGTH falls back to false - no
+	 * notice, i.e. the behaviour that shipped before this - rather than to a
 	 * false alarm.
 	 *
 	 * @return bool True when the body was discarded.
@@ -526,7 +551,7 @@ final class AdminController {
 			return false;
 		}
 
-		// Emptiness only — no value is read out of either superglobal. A body
+		// Emptiness only - no value is read out of either superglobal. A body
 		// PHP parsed leaves at least one of them populated.
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- No nonce can exist: this is the branch where the body carrying it was discarded.
 		if ( ! empty( $_POST ) || ! empty( $_FILES ) ) {
@@ -547,7 +572,7 @@ final class AdminController {
 	 * body is gone, so no form handler runs.
 	 *
 	 * SECURITY. This is the one branch in the plugin that runs where a nonce
-	 * cannot be verified — the nonce was inside the discarded body — so it is
+	 * cannot be verified - the nonce was inside the discarded body - so it is
 	 * inert by construction. It reads no value out of `$_POST` or `$_FILES`
 	 * (only whether they are empty), echoes nothing from the request, writes
 	 * no option, transient, post or row, and performs no action. A forged
@@ -581,7 +606,7 @@ final class AdminController {
 			esc_html(
 				sprintf(
 					/* translators: 1: largest single file this server accepts, e.g. "2 MB". 2: largest whole submission this server accepts, e.g. "8 MB". */
-					__( 'That submission was too large for this server, so PHP discarded it before WordPress saw it — nothing was uploaded, imported or changed. This server accepts at most %1$s per file and %2$s per submission. Use a smaller file, or ask your host to raise the PHP upload_max_filesize and post_max_size settings.', 'perflocale' ),
+					__( 'That submission was too large for this server, so PHP discarded it before WordPress saw it - nothing was uploaded, imported or changed. This server accepts at most %1$s per file and %2$s per submission. Use a smaller file, or ask your host to raise the PHP upload_max_filesize and post_max_size settings.', 'perflocale' ),
 					self::format_bytes( self::max_upload_bytes() ),
 					self::format_bytes( wp_convert_hr_to_bytes( (string) ini_get( 'post_max_size' ) ) )
 				)
@@ -645,7 +670,7 @@ final class AdminController {
 				: [];
 
 			// Decide sync vs async manually here rather than via
-			// Dispatcher::dispatch — the sync path needs to STREAM the
+			// Dispatcher::dispatch - the sync path needs to STREAM the
 			// export to the browser (admin clicked "Export", expects a
 			// download), and Dispatcher's inline path would write to disk
 			// first, costing double I/O on small sites. Async path goes
@@ -672,7 +697,7 @@ final class AdminController {
 					exit;
 				}
 
-				// Dispatcher returned inline anyway (e.g. denied/never) —
+				// Dispatcher returned inline anyway (e.g. denied/never) -
 				// fall through to the streaming path below.
 			}
 
@@ -756,7 +781,7 @@ final class AdminController {
 			// so the async worker can still see the file when WP-Cron /
 			// Action Scheduler runs on a later request. Mirrors the
 			// chunked-stream pattern used by the CSV importer
-			// below — Plugin Check rejects move_uploaded_file/rename/copy.
+			// below - Plugin Check rejects move_uploaded_file/rename/copy.
 			$temp_dir = \PerfLocale\Helper::uploads_temp_dir();
 
 			if ( $temp_dir === '' || ! wp_mkdir_p( $temp_dir ) ) {
@@ -843,7 +868,7 @@ final class AdminController {
 
 			$r = is_array( $result['result'] ?? null ) ? $result['result'] : [];
 
-			// Sync path completed — delete now and drop the scheduled
+			// Sync path completed - delete now and drop the scheduled
 			// safety-net cleanup so it doesn't fire against a stale path.
 			if ( file_exists( $persisted_path ) ) {
 				wp_delete_file( $persisted_path );
@@ -854,7 +879,7 @@ final class AdminController {
 			);
 
 			// Only `async` was handled above, so every other Dispatcher
-			// outcome lands here — and three of them report the failure in
+			// outcome lands here - and three of them report the failure in
 			// `error` while carrying no `result` at all: a sync run that
 			// threw, `denied` (the user lacks the cap), and `error` (job-id
 			// allocation and the like). With $r empty the `errors` branch
@@ -976,6 +1001,15 @@ final class AdminController {
 
 			if ( $skipped_lines !== [] ) {
 				$msg .= ' ' . implode( ' ', $skipped_lines );
+			}
+
+			$strings_sanitized = $r['strings_sanitized'] ?? 0;
+			$msg              .= self::sanitized_import_note( is_int( $strings_sanitized ) ? $strings_sanitized : 0 );
+			$strings_rejected  = $r['strings_rejected'] ?? 0;
+			$rejected_note     = \PerfLocale\Migration\WpmlImporter::rejected_strings_note( is_int( $strings_rejected ) ? $strings_rejected : 0 );
+
+			if ( $rejected_note !== '' ) {
+				$msg .= ' ' . $rejected_note;
 			}
 
 			wp_safe_redirect( add_query_arg( 'import_result', rawurlencode( $msg ), $redirect_url ) );
@@ -1138,7 +1172,7 @@ final class AdminController {
 			// default resolves to NULL and takes filter_locale(),
 			// is_default_language() and the switcher down with it. Ignoring
 			// that refusal repointed core's `page_on_front` at a translation,
-			// dropped the visitor cookie and reported success — a destructive
+			// dropped the visitor cookie and reported success - a destructive
 			// write for a default change that never happened. Everything below
 			// is conditional on the promotion actually landing.
 			if ( ! $new_lang || ! $repo->set_default( $lang_id ) ) {
@@ -1188,7 +1222,7 @@ final class AdminController {
 			exit;
 		}
 
-		// Handle delete via GET. The destructive verb is 'confirm-delete' —
+		// Handle delete via GET. The destructive verb is 'confirm-delete' -
 		// 'delete' now renders the read-only cascade-preview screen
 		// (LanguagesPage::render_delete_preview), so a stale bookmark of
 		// the old delete URL shows the preview instead of deleting.
@@ -1212,7 +1246,7 @@ final class AdminController {
 
 			// delete() wraps every cascade DELETE in one transaction and returns
 			// false after a ROLLBACK, precisely so the operator sees the failed
-			// action and can retry — discarding that return reported "Language
+			// action and can retry - discarding that return reported "Language
 			// deleted successfully" over a language that is still there. The
 			// missing-row / is-default cases used to fall through to the POST
 			// handler below and re-render the screen with nothing removed and
@@ -1301,7 +1335,7 @@ final class AdminController {
 			// now; this turns that refusal into a message that names the value
 			// the operator actually typed, rather than a silently re-rendered
 			// form. Reuses the invalid_slug notice the edit branch already has.
-			// Checked against the repository's own constant, and checked HERE —
+			// Checked against the repository's own constant, and checked HERE -
 			// before the rename-checkbox loop further down commits rename_slug()
 			// calls and records 301s. A refused insert after those renames would
 			// leave every renamed language's prefix moved with nothing put in its
@@ -1401,7 +1435,7 @@ final class AdminController {
 			// Default new languages to the bottom of the list. The schema's
 			// `sort_order DEFAULT 0` would land every new row above all
 			// existing rows because the list query is `ORDER BY sort_order
-			// ASC, id ASC` — visually jarring when admins add a language
+			// ASC, id ASC` - visually jarring when admins add a language
 			// expecting it to append, not jump to the top.
 			global $wpdb;
 			$lt = $wpdb->prefix . 'perflocale_languages';
@@ -1493,7 +1527,7 @@ final class AdminController {
 						// first, so the promotion is then rejected. Ignoring that
 						// return repointed core's `page_on_front` at the language's
 						// translation, dropped the visitor cookie and scheduled a
-						// rewrite flush — a destructive write for a default change
+						// rewrite flush - a destructive write for a default change
 						// that never happened, reported as "Language updated
 						// successfully". Honour the refusal exactly as the GET
 						// set_default branch above does; the row edit itself has
@@ -1552,7 +1586,7 @@ final class AdminController {
 			}
 
 			// update() refuses a slug the routing layer cannot express, and the
-			// refusal happens BEFORE the row is written — so a name, flag or
+			// refusal happens BEFORE the row is written - so a name, flag or
 			// is_active change posted alongside a bad slug is discarded with it.
 			// Without this branch the screen simply re-renders with nothing
 			// saved and nothing said, which is the silent-failure shape the two
@@ -1807,8 +1841,8 @@ final class AdminController {
 		}
 
 		// Sanitize with wp_kses_post, NOT sanitize_textarea_field. Gettext
-		// originals are stored verbatim and routinely carry markup — a link
-		// `<a href="%s">`, `<strong>`, an entity — and sanitize_textarea_field
+		// originals are stored verbatim and routinely carry markup - a link
+		// `<a href="%s">`, `<strong>`, an entity - and sanitize_textarea_field
 		// strips EVERY tag (taking the %s placeholder inside the attribute with
 		// it) and deletes %xx sequences, silently corrupting any HTML-bearing
 		// translation on save. wp_kses_post preserves post-safe markup and the
@@ -1843,7 +1877,7 @@ final class AdminController {
 		$link_failures = 0;
 
 		// Pre-fetch every string's group_id in ONE query. The old loop
-		// issued a SELECT per string — fine for the typical admin-form
+		// issued a SELECT per string - fine for the typical admin-form
 		// save of 20–50 entries, but linear waste on 200+ bulk imports
 		// (CLI, REST). Building the {string_id => group_id} map upfront
 		// also dedups repeated string_ids in the input for free.
@@ -1895,7 +1929,7 @@ final class AdminController {
 			}
 		}
 
-		// Languages actually written/deleted this save — scopes the cache
+		// Languages actually written/deleted this save - scopes the cache
 		// flush + file regeneration below to what changed.
 		$touched_lang_ids = [];
 
@@ -1925,7 +1959,7 @@ final class AdminController {
 			// Skipping the string outright is not an option either: the
 			// redirect carries saved=0 and StringsPage gates its notice on
 			// saved > 0, so the operator's typed translation would vanish with
-			// no message at all — and stay untranslatable forever, since
+			// no message at all - and stay untranslatable forever, since
 			// nothing else repairs a string that has no translation row yet.
 			// Self-heal instead, onto a fresh string-type group, with the same
 			// two statements TranslationFileGenerator::
@@ -1949,7 +1983,7 @@ final class AdminController {
 					// and its unusable group_id may belong to a live post/term
 					// group whose link this would delete. Clearing an already
 					// blank cell has nothing to heal for, so no group is minted
-					// here — the string_translations delete below is keyed on
+					// here - the string_translations delete below is keyed on
 					// string_id and stays correct either way.
 					if ( ! $needs_group ) {
 						// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -1964,11 +1998,11 @@ final class AdminController {
 					}
 
 					// Drop the stored translation text too so subsequent
-					// reads correctly return "no translation" — but only when
+					// reads correctly return "no translation" - but only when
 					// there is a row to drop. The grid re-posts EVERY cell on
 					// the page and most of them are blank, so an unconditional
 					// DELETE here costs one write per empty cell on a save
-					// that changed nothing, and — worse — leaves $deleted
+					// that changed nothing, and - worse - leaves $deleted
 					// non-zero, firing the whole cache-flush + .l10n.php
 					// regeneration + `perflocale/strings/changed` block below
 					// over a no-op. $current_map already holds every stored
@@ -2013,14 +2047,14 @@ final class AdminController {
 				// unchanged): leave it entirely alone. The grid re-posts every
 				// cell, so writing here would reset a needs_update flag the
 				// source-change tracker set on a translation the operator never
-				// edited — and re-run wp_kses over already-stored markup.
+				// edited - and re-run wp_kses over already-stored markup.
 				if ( ! $text_change && ! $extra_change ) {
 					continue;
 				}
 
 				// The cell is about to be written, so the string needs a group
 				// it can legally own. Mint one and repoint `strings.group_id`
-				// at it — the same INSERT-then-UPDATE pair, in the same order,
+				// at it - the same INSERT-then-UPDATE pair, in the same order,
 				// that repair_orphaned_translations() shape (2) runs, so the
 				// two self-heal paths cannot drift. Only the first written cell
 				// pays for this; the remaining languages reuse the new group.
@@ -2036,7 +2070,7 @@ final class AdminController {
 
 					if ( ! $inserted ) {
 						// No group id to write under, so every cell of this
-						// string is skipped. Counted, not silent — see the
+						// string is skipped. Counted, not silent - see the
 						// upsert failure branch below.
 						++$link_failures;
 						continue 2;
@@ -2060,13 +2094,13 @@ final class AdminController {
 				// translations object_id = string_id (each language-link points
 				// back to the string row).
 				//
-				// translation_links carries TWO unique keys — group_lang
+				// translation_links carries TWO unique keys - group_lang
 				// (group_id, language_id) and object_lang (type, object_id,
-				// language_id) — and upsert_link()'s INSERT … ON DUPLICATE KEY
+				// language_id) - and upsert_link()'s INSERT … ON DUPLICATE KEY
 				// UPDATE can land on either. Sibling-language links for this
 				// string are preserved because they differ in language_id on
 				// both keys; the object_lang case (this string already holding a
-				// row for this language under a DIFFERENT, usually dead, group —
+				// row for this language under a DIFFERENT, usually dead, group -
 				// the shape the $needs_group heal above mints a new group for)
 				// is resolved inside upsert_link(), which drops the stale row and
 				// retries rather than leaving the link on the dead group.
@@ -2086,7 +2120,7 @@ final class AdminController {
 				// Store the translation text in the dedicated table (upsert
 				// on the (string_id, language_id) PRIMARY KEY; extra_forms
 				// is preserved by set() itself). Skip the write when only the
-				// plural forms changed — set() would be a no-op but still
+				// plural forms changed - set() would be a no-op but still
 				// costs a query.
 				if ( $text_change ) {
 					$st_repo->set( $string_id, $lang_id, (string) $value );
@@ -2094,7 +2128,7 @@ final class AdminController {
 
 				// Extra plural forms 2..N: runs after set() because the row
 				// must exist (set_extra_forms is an UPDATE). Only 3+ form
-				// languages post these inputs — they always submit (empty
+				// languages post these inputs - they always submit (empty
 				// strings included), so an operator clearing every field
 				// still reaches set_extra_forms, which normalises to NULL.
 				// Only write when the forms actually changed.
@@ -2121,7 +2155,7 @@ final class AdminController {
 				$cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
 			}
 
-			// Regenerate .l10n.php files if using file mode — scoped to the
+			// Regenerate .l10n.php files if using file mode - scoped to the
 			// languages this save actually touched (a one-string save was
 			// re-fetching EVERY language's full translation set). The
 			// all-language cache-delete loop above deliberately stays broad:
@@ -2135,7 +2169,7 @@ final class AdminController {
 			 * Fires after string translations are saved from the admin
 			 * Strings screen. Lets addons that derive state from the
 			 * `strings`/`string_translations` tables (per-language string
-			 * bundles, for example) invalidate it — core itself only knows
+			 * bundles, for example) invalidate it - core itself only knows
 			 * about its own gettext caches.
 			 *
 			 * @hook perflocale/strings/changed
@@ -2176,7 +2210,7 @@ final class AdminController {
 	/**
 	 * Whether the Translations page should expose the "MT-translate" bulk
 	 * action. True only when the active provider is fully configured
-	 * (API key set, etc.). When false, the option is hidden — better than
+	 * (API key set, etc.). When false, the option is hidden - better than
 	 * a greyed-out "why doesn't this work?" entry.
 	 *
 	 * @return bool
@@ -2192,7 +2226,7 @@ final class AdminController {
 
 		// Master switch first: with MT disabled the REST endpoints already
 		// refuse (mt_disabled 403), so admin bulk surfaces must not offer the
-		// action either — a configured provider alone is not enough.
+		// action either - a configured provider alone is not enough.
 		if ( ! $settings->mt_enabled() ) {
 			return false;
 		}
@@ -2236,7 +2270,7 @@ final class AdminController {
 		$include_meta = ! empty( $_POST['include_meta'] );
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
 
-		// ⭐ Only types this site is configured to translate may be targeted —
+		// ⭐ Only types this site is configured to translate may be targeted -
 		// anything else in the POST is dropped (crafted type names included).
 		// This used to be `public + show_ui`, which silently discarded every
 		// addon-registered type (CF7, WPForms, product_variation) the
@@ -2256,7 +2290,7 @@ final class AdminController {
 
 			// ⚠️ Only the types THIS REQUEST asked for. Listing every
 			// unregistered configured type told an operator who selected
-			// "Posts" that their run failed because of `elementor_library` —
+			// "Posts" that their run failed because of `elementor_library` -
 			// a diagnostic that points at the wrong thing is worse than none.
 			$dropped = $requested_count > 0
 				? array_values( array_intersect( $requested_types, $settings_for_types->get_unregistered_translatable_post_types() ) )
@@ -2303,7 +2337,7 @@ final class AdminController {
 	/**
 	 * Process the Translations-page bulk-actions POST. Two actions:
 	 *
-	 *   - mt_translate     — MT-translate selected source posts into the
+	 *   - mt_translate     - MT-translate selected source posts into the
 	 *                        chosen target language (or all). Skips pairs
 	 *                        that already have a translation. Routed
 	 *                        through the Dispatcher: small selections run
@@ -2313,9 +2347,10 @@ final class AdminController {
 	 *                        The sync/async cutoff is configurable per
 	 *                        site under Settings → Performance → Background
 	 *                        Thresholds → "Bulk machine translation".
-	 *   - mark_needs_update — Flip status='needs_update' on existing
+	 *   - mark_needs_update - Flip status='needs_update' on existing
 	 *                        translation_links rows, scoped to the chosen
-	 *                        target language (or all).
+	 *                        target language (or all), for the selected
+	 *                        posts the user may edit.
 	 *
 	 * @return void
 	 */
@@ -2334,7 +2369,7 @@ final class AdminController {
 
 		// ⚠️ COMPLETENESS BEFORE BRANCHING. This used to sit inside the subset
 		// branch only, so `site_translate` returned above it and was never
-		// checked at all — a truncated site-wide POST dispatched a job for a
+		// checked at all - a truncated site-wide POST dispatched a job for a
 		// SUBSET of the requested languages with no warning.
 		//
 		// And it used to infer truncation from `count( $_POST, COUNT_RECURSIVE )`,
@@ -2346,7 +2381,7 @@ final class AdminController {
 		// `max_input_vars` in order, so if that field arrived, everything before
 		// it did too.
 		//
-		// A MISSING marker is not proof of truncation either — it may simply be
+		// A MISSING marker is not proof of truncation either - it may simply be
 		// a programmatic or pre-upgrade caller that never sent one. Refuse only
 		// when the marker is absent AND the request reached the server's
 		// ceiling, which is the one combination that really does indicate loss.
@@ -2375,7 +2410,7 @@ final class AdminController {
 
 		// Site-wide MT: the "Translate the entire site" panel posts the same
 		// nonce with action=site_translate. Dispatches the chunked background
-		// chain (SiteTranslateJob) — never an inline loop.
+		// chain (SiteTranslateJob) - never an inline loop.
 		if ( sanitize_key( wp_unslash( $_POST['perflocale_translations_action'] ) ) === 'site_translate' ) {
 			$this->process_site_translate();
 			return;
@@ -2537,6 +2572,26 @@ final class AdminController {
 
 			case 'mark_needs_update':
 				global $wpdb;
+
+				// Only the groups of the selected posts this user may edit: the
+				// capability check above covers the screen, and a selected post
+				// can be of a type the user has no rights on.
+				_prime_post_caches( $ids, false, false );
+				$ids = array_values( array_filter( $ids, static fn( int $id ): bool => \PerfLocale\Helper::user_can_edit_object( $id ) ) );
+
+				if ( $ids === [] ) {
+					/**
+					 * No selected post is one this user may edit, so no row is
+					 * flagged; listeners still see the action, with a count of zero.
+					 *
+					 * @hook perflocale/translations/bulk_marked_needs_update
+					 */
+					do_action( 'perflocale/translations/bulk_marked_needs_update', $ids, $target_lang_ids, 0 );
+
+					// The redirect closure exits.
+					$redirect( 'bulk_marked_needs_update', [ 'count' => 0 ] );
+				}
+
 				$tl                = \PerfLocale\Database\Schema::table( 'translation_links' );
 				$tg                = \PerfLocale\Database\Schema::table( 'translation_groups' );
 				$id_placeholders   = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
@@ -2546,7 +2601,7 @@ final class AdminController {
 				// Join through group_id, do NOT match object_id against the
 				// target languages. The checkboxes on the Translations screen
 				// carry SOURCE post ids, and a source post's own link row is
-				// its DEFAULT-language row — the one language $target_lang_ids
+				// its DEFAULT-language row - the one language $target_lang_ids
 				// deliberately excludes (see the "all" branch above). Filtering
 				// `object_id IN (selection) AND language_id IN (targets)` on a
 				// single row therefore asks for two disjoint sets and matches
@@ -2554,8 +2609,8 @@ final class AdminController {
 				// resolve each selected post's group from its own row (s) and
 				// flip that group's rows in the target languages (t).
 				//
-				// object_id is polymorphic — a term with the same numeric id
-				// owns its own row here — so the scope has to say "posts".
+				// object_id is polymorphic - a term with the same numeric id
+				// owns its own row here - so the scope has to say "posts".
 				// It says so the way the rest of the plugin says it: through
 				// translation_groups.type, exactly like TranslationsPage::
 				// register_source_only_filter(), which decides the very same
@@ -2570,8 +2625,8 @@ final class AdminController {
 				// COUNT(DISTINCT t.id), not COUNT(*): the s-side join yields
 				// one row per (source row, target row) pair, so a group with
 				// more than one matching s row would multiply its own targets
-				// in the count. The UPDATE is unaffected either way — it flips
-				// each t row at most once — but the operator-facing number and
+				// in the count. The UPDATE is unaffected either way - it flips
+				// each t row at most once - but the operator-facing number and
 				// the hook payload must be target rows, not join pairs.
 				//
 				// Resolve the scope before writing, in one indexed query, for
@@ -2581,7 +2636,7 @@ final class AdminController {
 				// the pre-update status until the TTL). And it yields a row
 				// count that survives a re-run: $wpdb->query() reports MySQL's
 				// *changed* rows, so flagging an already-flagged translation
-				// would report "0 translations flagged" — the same green
+				// would report "0 translations flagged" - the same green
 				// message over a no-op that this branch exists to fix. The
 				// notice says "%d translations flagged as needing update", so
 				// the honest number is the rows the scope matched, all of which
@@ -2654,8 +2709,8 @@ final class AdminController {
 
 					if ( $updated === false ) {
 						// The scope matched but the write did not land. Skip the
-						// cache invalidation — the cached statuses are still the
-						// stored ones — and redirect to a DIFFERENT message.
+						// cache invalidation - the cached statuses are still the
+						// stored ones - and redirect to a DIFFERENT message.
 						// Reporting count=0 through `bulk_marked_needs_update`
 						// rendered a GREEN "0 translations flagged as needing
 						// update": the identical success notice an empty
@@ -2715,7 +2770,7 @@ final class AdminController {
 			// Capture the build phase in an output buffer so any stray PHP
 			// notice/deprecation/warning emitted during PO serialisation
 			// can't leak into the response stream BEFORE our Content-Type
-			// header — which would otherwise produce a corrupt .po file
+			// header - which would otherwise produce a corrupt .po file
 			// with HTML noise at the top.
 			ob_start();
 			$tmp   = wp_tempnam( 'perflocale-po-' );
@@ -2757,7 +2812,7 @@ final class AdminController {
 			// Same reason as the JSON importer above: an over-limit PO arrives
 			// as a populated $_FILES entry with an empty tmp_name, and only
 			// the `error` slot says so. Only the numeric code travels in the
-			// redirect — the sentence is built on the page from
+			// redirect - the sentence is built on the page from
 			// upload_error_message(), so nothing from the request is echoed.
 			$upload_error = isset( $_FILES['po_file']['error'] ) && is_scalar( $_FILES['po_file']['error'] )
 				? (int) $_FILES['po_file']['error']
@@ -2794,7 +2849,7 @@ final class AdminController {
 				exit;
 			}
 
-			// Reject oversized uploads BEFORE parsing — core \PO accumulates every
+			// Reject oversized uploads BEFORE parsing - core \PO accumulates every
 			// entry in memory, so a huge PO would OOM/timeout the request. Mirrors
 			// the JSON-import (perflocale/import/max_file_bytes) size gate.
 			$max_po_bytes = self::po_max_bytes();
@@ -2814,7 +2869,7 @@ final class AdminController {
 			$result = self::import_po_upload( $tmp_path, $lang, $replace );
 
 			// Pass the full breakdown via a per-user transient (not URL
-			// params) so the post-import page is clean — same flash
+			// params) so the post-import page is clean - same flash
 			// pattern as the string scanner. Transient is deleted on
 			// first read. Inserted/updated/unchanged/no_translation give
 			// the user an honest per-row breakdown.
@@ -2859,7 +2914,7 @@ final class AdminController {
 	 *   2. Nonce verifies the per-job download intent (`perflocale_export_download_<JOB_ID>`).
 	 *   3. Caller has the same capability the export-data form required
 	 *      (`perflocale_import_export`, as
-	 *      DataExportJob::get_required_capability() does) — handlers off
+	 *      DataExportJob::get_required_capability() does) - handlers off
 	 *      the Jobs page are reachable by lower-tier translator roles,
 	 *      who must not pull a full database export.
 	 *   4. Job is real, type `data_export`, status `complete`, and
@@ -2933,7 +2988,7 @@ final class AdminController {
 		 * monitoring-pipeline events, or compliance-driven hooks that
 		 * need to record every export-egress event. Anything `do_action`
 		 * callbacks `echo` from here would land in the response body
-		 * before the JSON download — don't.
+		 * before the JSON download - don't.
 		 *
 		 * @hook  perflocale/export/download/before_serve
 		 * @since 1.0.0
@@ -2951,7 +3006,7 @@ final class AdminController {
 		// sanitize_file_name() strips quotes, control chars, slashes etc. so
 		// the filename cannot inject additional Content-Disposition fields.
 		// The current happy-path filename (perflocale-export-{date}.json) is
-		// already safe — this is defense-in-depth for any future caller that
+		// already safe - this is defense-in-depth for any future caller that
 		// dispatches DataExportJob with a custom `path` argument.
 		$safe_filename = sanitize_file_name( basename( $real_path ) );
 		header( 'Content-Disposition: attachment; filename="' . $safe_filename . '"' );
@@ -2967,14 +3022,14 @@ final class AdminController {
 		/**
 		 * Fires AFTER the export file has been streamed to the browser and
 		 * BEFORE the single-use deletion takes effect. The file is still
-		 * readable at $real_path at this point — your callback is the last
+		 * readable at $real_path at this point - your callback is the last
 		 * chance to act on it before it disappears.
 		 *
 		 * Useful for offsite-backup logic ("ship a copy to S3 every time
 		 * an admin downloads"), or for chaining a post-download step
 		 * (e.g. queue an Integrity-check job that re-reads the file).
 		 *
-		 * Don't `echo` from here — the HTTP body is already being sent.
+		 * Don't `echo` from here - the HTTP body is already being sent.
 		 *
 		 * @hook  perflocale/export/download/after_serve
 		 * @since 1.0.0
@@ -3119,7 +3174,7 @@ final class AdminController {
 			wp_die( esc_html__( 'You do not have permission to create translations of this content.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// Auto-translate via MT if enabled — and only for languages inside the
+		// Auto-translate via MT if enabled - and only for languages inside the
 		// mt_auto_translate_languages scope (empty = all). An out-of-scope
 		// language falls through to the clean-stub branch below, which is the
 		// whole point: a translator working from scratch gets an empty stub
@@ -3172,7 +3227,7 @@ final class AdminController {
 		// empty stub stays fillable by auto-MT if the language is added to
 		// the scope later (the skip-existing guard treats non-empty content
 		// as human-owned). MT-disabled / MT-failure fallbacks keep copying
-		// the source — long-standing behavior that gives editors a working
+		// the source - long-standing behavior that gives editors a working
 		// starting point.
 		if ( ! $new_id ) {
 			$new_id = $manager->create_translation( $source_id, $target_lang, $mt_in_scope );
@@ -3188,7 +3243,7 @@ final class AdminController {
 		// ⚠️ The translation is ALREADY WRITTEN at this point. A post type with
 		// no editor of its own (every addon-contributed type is non-public)
 		// yields no edit URL, and the previous code called wp_die( 'Failed to
-		// create translation.' ) — reporting a failure for work that succeeded,
+		// create translation.' ) - reporting a failure for work that succeeded,
 		// and stranding the user on a dead page. With Classic Editor active it
 		// was worse: the relative '?classic-editor' passed the truthiness check
 		// and wp_validate_redirect() returned it verbatim, so the browser
@@ -3270,7 +3325,7 @@ final class AdminController {
 	 * traffic immediately rather than waiting for the cooldown to
 	 * elapse and a probe to land.
 	 *
-	 * Capability: `manage_options` — same gate Site Health itself uses.
+	 * Capability: `manage_options` - same gate Site Health itself uses.
 	 * CSRF: per-key nonce so a stolen nonce for one breaker can't reset
 	 * a different one.
 	 *
@@ -3445,7 +3500,7 @@ final class AdminController {
 	 *   2. Anything else → write to perflocale_disabled_addons via
 	 *      AddonRegistry::set_disabled(), the canonical path for
 	 *      registry-registered addons (including bundled ones like
-	 *      WooCommerce — disabling means disabling, no safeguard).
+	 *      WooCommerce - disabling means disabling, no safeguard).
 	 *
 	 * @return void
 	 */
@@ -3467,12 +3522,12 @@ final class AdminController {
 			wp_die( esc_html__( 'You do not have permission to toggle addons.', 'perflocale' ) );
 		}
 
-		// CSRF + capability confirmed — only now read the rest of the request.
+		// CSRF + capability confirmed - only now read the rest of the request.
 		$desired  = isset( $_POST['disable'] ) ? (string) wp_unslash( $_POST['disable'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- compared as string === '1' only; never output, stored raw, or used in SQL.
 		$want_off = ( $desired === '1' );
 
 		if ( isset( self::BUILTIN_FEATURE_TOGGLES[ $addon_id ] ) ) {
-			// Built-in feature — flip the underlying settings flag.
+			// Built-in feature - flip the underlying settings flag.
 			// Settings::update() takes a key-value map and runs the
 			// write under its own lock; the bool return reflects
 			// whether the option was committed.
@@ -3527,8 +3582,8 @@ final class AdminController {
 			//
 			// "A translation exists" is not "a translation is reachable".
 			// Generate Missing Translations creates every translation as a
-			// DRAFT, so on a site where that has been run — which the Settings
-			// screen tells operators to do — the new default language's
+			// DRAFT, so on a site where that has been run - which the Settings
+			// screen tells operators to do - the new default language's
 			// homepage was very likely a draft, and this pointed
 			// `page_on_front` straight at it. A draft cannot be served, so the
 			// site's front page would break for everyone.
@@ -3565,7 +3620,7 @@ final class AdminController {
 	 * `add_menu_page()`. A plain plugin URL (e.g. via plugins_url())
 	 * skips that pipeline and renders unstyled, so hover / active states
 	 * are flat. The source SVG must be solid white (#fff) for the
-	 * filter to produce the correct contrast across schemes — see
+	 * filter to produce the correct contrast across schemes - see
 	 * assets/images/icon.svg.
 	 *
 	 * Caching: the file is only ~7 KB but `register_menus()` runs on
@@ -3575,7 +3630,7 @@ final class AdminController {
 	 *
 	 * Fallback: if the file can't be read for any reason (permissions,
 	 * partial install) we fall back to a Dashicon so the menu is never
-	 * broken — just visually generic.
+	 * broken - just visually generic.
 	 *
 	 * @return string Data URI, or 'dashicons-translation' fallback.
 	 */
@@ -3594,7 +3649,7 @@ final class AdminController {
 
 			if ( is_string( $svg ) && $svg !== '' ) {
 				// base64 here builds a standard image data: URI for a bundled
-				// SVG icon — not code obfuscation.
+				// SVG icon - not code obfuscation.
 				$memo = 'data:image/svg+xml;base64,' . base64_encode( $svg ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
 				return $memo;
 			}
@@ -3671,7 +3726,7 @@ final class AdminController {
 			[ $this, 'render_addons' ]
 		);
 
-		// Background Jobs — anyone with translate cap can view their own
+		// Background Jobs - anyone with translate cap can view their own
 		// jobs; supervisors can manage everyone's. JobsController enforces
 		// per-row permissions on cancel/retry/delete.
 		$this->page_hooks['jobs'] = add_submenu_page(
@@ -3757,7 +3812,7 @@ final class AdminController {
 	/**
 	 * Register the network-admin "PerfLocale" menu on multisite.
 	 *
-	 * Only the Jobs overview is exposed here — the rest of PerfLocale
+	 * Only the Jobs overview is exposed here - the rest of PerfLocale
 	 * (settings, languages, translations) is per-site by design and
 	 * has nothing to aggregate at the network level. Capability is
 	 * `manage_network_options` so super-admins (and anything granted
@@ -3781,9 +3836,12 @@ final class AdminController {
 	 * Render the network-admin Jobs overview.
 	 *
 	 * Aggregates per-site state in one pass: switches to each blog,
-	 * reads the active-jobs index + the last-run timestamps recorded
-	 * by `BackgroundEvents::record_run()`, and tabulates them with
-	 * direct links to the per-site Jobs page.
+	 * counts its queued, running and failed rows in the jobs table, reads
+	 * the last-run timestamps recorded by `BackgroundEvents::record_run()`,
+	 * and tabulates them with direct links to the per-site Jobs page.
+	 * A site whose jobs table is missing or cannot be read shows "unknown"
+	 * in its Active and Failed cells, never 0. A site without a stamped
+	 * `perflocale_db_version` shows "unknown" without a table lookup.
 	 *
 	 * Scoped to the network being administered, and capped at the
 	 * first 100 of its sites to keep the load manageable on very large
@@ -3800,7 +3858,7 @@ final class AdminController {
 		$limit = 100;
 
 		// `network_id` is not optional here. WP_Site_Query defaults it to 0,
-		// which emits NO `site_id` predicate at all — on a multi-network
+		// which emits NO `site_id` predicate at all - on a multi-network
 		// install this page would list, switch_to_blog() into, and link to
 		// sites belonging to networks the current Network Admin screen has
 		// nothing to do with. Every other lookup on this screen (options,
@@ -3835,24 +3893,21 @@ final class AdminController {
 			switch_to_blog( $blog_id );
 
 			try {
-				$active_jobs  = (array) get_option( 'perflocale_active_jobs', [] );
 				$last_runs    = (array) get_option( \PerfLocale\Background\BackgroundEvents::LAST_RUN_OPTION, [] );
 				$engine_label = (string) get_option( 'perflocale_active_engine', '' );
 
-				$pending_count = 0;
-				$failed_count  = 0;
+				// A blog without a stamped schema version never ran the plugin and
+				// has no jobs table: its row is "unknown" without a catalog query.
+				// A stamped version does not prove the tables exist, so
+				// tables_exist() still asks before the count is read.
+				$db_version = get_option( 'perflocale_db_version', 0 );
+				$job_counts = is_numeric( $db_version ) && (int) $db_version > 0 && \PerfLocale\Database\Schema::tables_exist()
+					? \PerfLocale\Background\JobState::count_by_status( [ 'queued', 'running', 'failed' ] )
+					: null;
 
-				foreach ( $active_jobs as $job ) {
-					if ( ! is_array( $job ) ) {
-						continue;
-					}
-					$status = (string) ( $job['status'] ?? '' );
-					if ( in_array( $status, [ 'queued', 'running' ], true ) ) {
-						++$pending_count;
-					} elseif ( $status === 'failed' ) {
-						++$failed_count;
-					}
-				}
+				// Null when the table is missing or the read failed; the row then shows "unknown".
+				$pending_count = null === $job_counts ? null : (int) ( $job_counts['queued'] ?? 0 ) + (int) ( $job_counts['running'] ?? 0 );
+				$failed_count  = null === $job_counts ? null : (int) ( $job_counts['failed'] ?? 0 );
 
 				$rows[] = [
 					'blog_id'       => $blog_id,
@@ -3924,14 +3979,18 @@ final class AdminController {
 								</a>
 							</td>
 							<td>
-								<?php if ( $row['pending_count'] > 0 ) : ?>
+								<?php if ( null === $row['pending_count'] ) : ?>
+									<em title="<?php esc_attr_e( 'The jobs table of this site could not be read.', 'perflocale' ); ?>"><?php esc_html_e( 'unknown', 'perflocale' ); ?></em>
+								<?php elseif ( $row['pending_count'] > 0 ) : ?>
 									<strong><?php echo (int) $row['pending_count']; ?></strong>
 								<?php else : ?>
 									<span style="color:#646970;">0</span>
 								<?php endif; ?>
 							</td>
 							<td>
-								<?php if ( $row['failed_count'] > 0 ) : ?>
+								<?php if ( null === $row['failed_count'] ) : ?>
+									<em title="<?php esc_attr_e( 'The jobs table of this site could not be read.', 'perflocale' ); ?>"><?php esc_html_e( 'unknown', 'perflocale' ); ?></em>
+								<?php elseif ( $row['failed_count'] > 0 ) : ?>
 									<strong style="color:#a35a00;"><?php echo (int) $row['failed_count']; ?></strong>
 								<?php else : ?>
 									<span style="color:#646970;">0</span>
@@ -3941,21 +4000,21 @@ final class AdminController {
 								<?php if ( $row['engine'] !== '' ) : ?>
 									<code style="font-size:11px;"><?php echo esc_html( $row['engine'] ); ?></code>
 								<?php else : ?>
-									<span style="color:#646970;">—</span>
+									<span style="color:#646970;">-</span>
 								<?php endif; ?>
 							</td>
 							<td>
 								<?php
 								echo $row['last_lock_run'] > 0
 									? esc_html( human_time_diff( $row['last_lock_run'], time() ) . ' ' . __( 'ago', 'perflocale' ) )
-									: '<span style="color:#646970;">—</span>';
+									: '<span style="color:#646970;">-</span>';
 								?>
 							</td>
 							<td>
 								<?php
 								echo $row['last_gc_run'] > 0
 									? esc_html( human_time_diff( $row['last_gc_run'], time() ) . ' ' . __( 'ago', 'perflocale' ) )
-									: '<span style="color:#646970;">—</span>';
+									: '<span style="color:#646970;">-</span>';
 								?>
 							</td>
 						</tr>

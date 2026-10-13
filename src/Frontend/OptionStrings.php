@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * WHERE THE TRANSLATIONS LIVE
  * Ordinary rows in the strings table, written through
- * {@see StringRepository::register_setting_string()} — the same seam the
+ * {@see StringRepository::register_setting_string()} - the same seam the
  * WooCommerce addon uses for attribute labels
  * (addons/woocommerce/PerfLocaleWooCommerce.php:1220). That buys the Strings admin
  * screen, machine translation, PO/XLIFF import-export and both serving modes
@@ -43,7 +43,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * (wp-includes/blocks/site-title.php:18; site-tagline.php does the same). The
  * apparently safer output-only hook would therefore miss the exact blocks that
  * block themes use to render the title. `option_blogname` is the only complete
- * seam — which is why the guards below carry the whole weight of this feature.
+ * seam - which is why the guards below carry the whole weight of this feature.
  *
  * THE HAZARD THIS CLASS EXISTS TO CONTAIN
  * If a translated value is read anywhere WordPress then writes it back, the
@@ -56,7 +56,7 @@ final class OptionStrings {
 	/**
 	 * Text domain for option strings.
 	 *
-	 * Deliberately not underscore-prefixed — see the class docblock.
+	 * Deliberately not underscore-prefixed - see the class docblock.
 	 */
 	public const DOMAIN = 'perflocale-options';
 
@@ -89,8 +89,8 @@ final class OptionStrings {
 	private array $resolved = [];
 
 	/**
-	 * Each resolved translation after sanitize_option() — the bytes
-	 * update_option() would hand the write-side veto — keyed by option name.
+	 * Each resolved translation after sanitize_option() - the bytes
+	 * update_option() would hand the write-side veto - keyed by option name.
 	 * Usually identical to $resolved, which is already escaped, but
 	 * sanitize_option() can do more than escape (a utf8mb3 options column
 	 * encodes emoji; a sanitize_option_* filter may rewrite the value). Filled
@@ -106,7 +106,7 @@ final class OptionStrings {
 	 *
 	 * Set once register_hooks() has cleared admin / CLI / XML-RPC / cron, and
 	 * cleared again by the REST detach. A language-override window may only
-	 * re-resolve while this is true — otherwise an override would reattach read
+	 * re-resolve while this is true - otherwise an override would reattach read
 	 * filters in exactly the contexts the guards exist to keep them out of.
 	 */
 	private bool $attached = false;
@@ -124,7 +124,7 @@ final class OptionStrings {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// WRITE SIDE — always on, in every context. This is the net that makes
+		// WRITE SIDE - always on, in every context. This is the net that makes
 		// the catastrophic outcome structurally impossible rather than merely
 		// unlikely, so it must not sit behind any of the read-side guards.
 		foreach ( array_keys( self::OPTIONS ) as $option ) {
@@ -149,7 +149,7 @@ final class OptionStrings {
 		add_filter( 'perflocale/strings/context_label', [ self::class, 'context_label' ], 10, 2 );
 
 		// On upgrade, so the strings are on the Strings screen the moment someone
-		// updates — without this they only appear after a scan or a settings
+		// updates - without this they only appear after a scan or a settings
 		// save, and an operator looking for their site title finds nothing. That
 		// gap is what produced the support thread this feature answers.
 		add_action( 'perflocale/updated', [ self::class, 'register_source_strings' ] );
@@ -158,7 +158,7 @@ final class OptionStrings {
 		// registered by hand and NEVER rediscovered by the scanner, so their
 		// `last_seen_at` moves only when register_source_strings() runs. Today
 		// the `after_scan` hook above happens to keep them fresh, which closes
-		// the window by construction — but that is a coupling between two
+		// the window by construction - but that is a coupling between two
 		// unrelated hooks, not a guarantee, and the failure mode is a translated
 		// site title deleted 90 days later with its translations, silently, by
 		// cron. Declaring the domain protected removes the coupling outright.
@@ -177,20 +177,20 @@ final class OptionStrings {
 			}
 		);
 
-		// READ SIDE — everything below decides whether the option_* filters are
+		// READ SIDE - everything below decides whether the option_* filters are
 		// ever attached at all.
 		//
 		// Each guard closes a distinct way the translated value could be written
 		// back over the original:
 		//
-		//  1. is_admin()  — Settings > General renders the field and options.php
+		//  1. is_admin()  - Settings > General renders the field and options.php
 		//                   saves the POST verbatim.
-		//  2. WP_CLI      — `wp option get blogname` then `wp option update`.
-		//  3. XMLRPC      — class-wp-xmlrpc-server.php wp.getOptions / wp.setOptions.
-		//  4. wp_doing_cron() — update_option() reads $old_value through this very
+		//  2. WP_CLI      - `wp option get blogname` then `wp option update`.
+		//  3. XMLRPC      - class-wp-xmlrpc-server.php wp.getOptions / wp.setOptions.
+		//  4. wp_doing_cron() - update_option() reads $old_value through this very
 		//                   filter (wp-includes/option.php:887), so a translated
 		//                   read corrupts the `$value === $old_value` no-op check.
-		//  5. REST        — handled separately below, because it CANNOT be
+		//  5. REST        - handled separately below, because it CANNOT be
 		//                   detected here.
 		if ( is_admin() || wp_doing_cron() ) {
 			return;
@@ -205,11 +205,11 @@ final class OptionStrings {
 		// (wp-includes/rest-api.php:478) long after plugins have registered their
 		// hooks. REST matters because register_setting() maps blogname to the
 		// REST `title` field and the Site Editor's site-title control GETs it and
-		// PUTs it straight back — with is_admin() false.
+		// PUTs it straight back - with is_admin() false.
 		//
 		// So detach instead of refusing to attach. rest_api_loaded() defines the
 		// constant, then rest_get_server() fires `rest_api_init`, then
-		// serve_request() dispatches — so unhooking at priority 0 removes the
+		// serve_request() dispatches - so unhooking at priority 0 removes the
 		// filters before any controller can read through them, at zero per-read
 		// cost on ordinary front-end requests.
 		add_action( 'rest_api_init', [ $this, 'detach_read_filters' ], 0 );
@@ -220,7 +220,7 @@ final class OptionStrings {
 
 		// ⚠️ And again whenever a rendering window imposes a different language.
 		// `override_current_language()` (LanguageRouter.php:2373) is the supported
-		// way to render part of a request in another language — WooCommerce order
+		// way to render part of a request in another language - WooCommerce order
 		// emails are the live example. Subscribing only to `language/detected`
 		// left the title frozen in the language the REQUEST arrived in, so a
 		// German customer's confirmation email carried the English site title
@@ -244,7 +244,7 @@ final class OptionStrings {
 			return;
 		}
 
-		// Drop the previous window's answers first — including the memoised
+		// Drop the previous window's answers first - including the memoised
 		// sanitized forms, which belong to the old language's translation and
 		// would otherwise let the write-side veto match the wrong string.
 		foreach ( array_keys( self::OPTIONS ) as $option ) {
@@ -380,7 +380,7 @@ final class OptionStrings {
 
 		// ⚠️ This callback fires for EVERY blog's details, not only ours. Writing
 		// this blog's raw title onto another blog's object relabels that blog
-		// with this one's name — `get_site( $other )->blogname` comes back as
+		// with this one's name - `get_site( $other )->blogname` comes back as
 		// the caller's title.
 		//
 		// Only OUR blog can have been poisoned in the first place: filter_option()
@@ -396,7 +396,7 @@ final class OptionStrings {
 			// No blog_id to check against: fall back to the same signal
 			// filter_option() uses, rather than guessing.
 			//
-			// ⚠️ is_multisite() first — ms_is_switched() lives in ms-blogs.php and
+			// ⚠️ is_multisite() first - ms_is_switched() lives in ms-blogs.php and
 			// does NOT EXIST on a single-site install, so calling it unguarded is
 			// a fatal. On single site there is only one blog, so falling through
 			// to restore is also the correct answer.
@@ -415,7 +415,7 @@ final class OptionStrings {
 	 * negative allowlists leak; this makes "the operator saved the German title
 	 * over the English one" impossible even if one of them is later broken.
 	 *
-	 * ⚠️ `$old_value` is NOT trustworthy here — wp-includes/option.php:887 obtains
+	 * ⚠️ `$old_value` is NOT trustworthy here - wp-includes/option.php:887 obtains
 	 * it with `get_option()`, which passes through the read filter. The raw value
 	 * is re-read with the filter detached instead.
 	 *
@@ -439,8 +439,8 @@ final class OptionStrings {
 		// update_option() runs sanitize_option() before it applies this filter,
 		// so $value has ALREADY been through esc_html(). A translation compared
 		// in any other form misses every title containing an apostrophe,
-		// ampersand or angle bracket — "Alex's Bakery" arrives as
-		// "Alex&#039;s Bakery" — and the guard silently lets the round-trip
+		// ampersand or angle bracket - "Alex's Bakery" arrives as
+		// "Alex&#039;s Bakery" - and the guard silently lets the round-trip
 		// through, destroying the operator's real title with no backup and no
 		// error.
 		//
@@ -461,7 +461,7 @@ final class OptionStrings {
 	 * Memoised per option: sanitize_option() applies filters and can query the
 	 * options column charset, and a write path should not pay for it twice.
 	 * Computed lazily rather than at attach time so the ordinary front-end read
-	 * path — which never writes — pays nothing at all.
+	 * path - which never writes - pays nothing at all.
 	 *
 	 * @param string $option Option name.
 	 * @return string
@@ -483,7 +483,7 @@ final class OptionStrings {
 	 * front-end request after language detection (a form handler on
 	 * `template_redirect`, a shortcode) fires this with them in place, and
 	 * get_option() would then hand the registration the translation instead of
-	 * the text just stored — registering it as the new source and moving every
+	 * the text just stored - registering it as the new source and moving every
 	 * translation onto it. Detach them for the read and put back exactly the
 	 * ones that were attached.
 	 *
@@ -515,7 +515,7 @@ final class OptionStrings {
 	 * register_setting_string() no-ops when the text is unchanged, and migrates
 	 * existing translations when it is not.
 	 *
-	 * ⚠️ Must never run on a read path — it takes a Lock and does
+	 * ⚠️ Must never run on a read path - it takes a Lock and does
 	 * SELECT-then-INSERT with a stale-string migration
 	 * (StringRepository.php:853-945).
 	 *
@@ -626,13 +626,13 @@ final class OptionStrings {
 	/**
 	 * Supply the friendly label for one of our own contexts.
 	 *
-	 * Scoped to this domain: another domain's `blogname` context — an addon's,
-	 * say — must keep its own label.
+	 * Scoped to this domain: another domain's `blogname` context - an addon's,
+	 * say - must keep its own label.
 	 *
 	 * ⚠️ The labels are written out as LITERALS here rather than translated from
 	 * the OPTIONS map. `__( $variable )` cannot be read by make-pot, so the
 	 * strings would be missing from the POT file and untranslatable in every
-	 * language — the failure being silent, and in a feature whose entire purpose
+	 * language - the failure being silent, and in a feature whose entire purpose
 	 * is translation. A switch costs two lines and keeps the extractor working.
 	 *
 	 * @param string $label  Context label so far.

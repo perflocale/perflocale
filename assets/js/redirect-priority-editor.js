@@ -149,7 +149,7 @@
 	 * Explicit reordering for pointers that cannot drag.
 	 *
 	 * ⚠️ This editor shipped drag-and-drop plus ArrowLeft/ArrowRight, and a
-	 * phone has neither — so the priority order was readable but not editable
+	 * phone has neither - so the priority order was readable but not editable
 	 * on touch. Same DOM move as the keyboard handler above, so the two input
 	 * methods cannot disagree about the resulting order. Focus stays on the
 	 * pressed button so a chip can be walked several places with repeated taps.

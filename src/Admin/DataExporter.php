@@ -180,7 +180,7 @@ final class DataExporter {
 	 *
 	 * A settings blob arrives from `get_option()` via `maybe_unserialize()`,
 	 * and a serialized payload can carry an `R:` back-reference that makes the
-	 * array cyclic — an unbounded walk would then recurse until the stack
+	 * array cyclic - an unbounded walk would then recurse until the stack
 	 * dies. Real config is one to three levels deep, so 8 is generous. Past
 	 * the cap the value is DROPPED rather than passed through: an un-walked
 	 * subtree could hold credentials the walk never checked, so the cap fails
@@ -192,7 +192,7 @@ final class DataExporter {
 	 * Temp files a `write_to_file()` call has created but not yet published,
 	 * keyed by absolute path.
 	 *
-	 * Every ordinary exit path — success, validation failure, exception —
+	 * Every ordinary exit path - success, validation failure, exception -
 	 * removes its own entry, so this is empty except while a write is in
 	 * flight. {@see self::sweep_pending_temp_files()} is the net for the
 	 * EXTRAordinary exits (a memory_limit fatal or a killed worker mid-export)
@@ -250,7 +250,7 @@ final class DataExporter {
 		} catch ( \Throwable $e ) {
 			// A table read failed mid-stream (see export_table()). Headers
 			// and part of the body are already sent, so there is no clean
-			// HTTP error to return — but the envelope is UNTERMINATED, which
+			// HTTP error to return - but the envelope is UNTERMINATED, which
 			// means what the browser saved is not parseable JSON and
 			// DataImporter will refuse it. That is the point: a partial dump
 			// must never look like a complete backup. Name the reason in the
@@ -300,14 +300,14 @@ final class DataExporter {
 	 * existing flush / size / trailing-brace validation runs on THAT, and only
 	 * a file that passed all three is rename()d onto $path. Nothing exists at
 	 * $path until this method is about to return the byte count, so a
-	 * concurrent reader — the download endpoint, a backup agent, an anonymous
-	 * GET on a host that ignores .htaccess — sees either no file or the
+	 * concurrent reader - the download endpoint, a backup agent, an anonymous
+	 * GET on a host that ignores .htaccess - sees either no file or the
 	 * previous complete one, never a half-written export.
 	 *
 	 * Converts the ONE expected failure to `false`: {@see self::export_table()}
 	 * raises a RuntimeException on a failed read, and this method turns that
 	 * into the same `false` every other write failure returns. It is not
-	 * exception-proof — random_bytes() below runs before the try and throws if
+	 * exception-proof - random_bytes() below runs before the try and throws if
 	 * the CSPRNG is unavailable, and any non-RuntimeException from a hooked
 	 * third party is deliberately re-raised rather than swallowed. Callers
 	 * ({@see \PerfLocale\Background\Jobs\DataExportJob}, the CLI `export` and
@@ -362,7 +362,7 @@ final class DataExporter {
 
 			// Only export_table()'s RuntimeException is an expected failure and
 			// becomes `false`. A TypeError or any other Throwable raised by a
-			// third party hooked into the export must stay loud — swallowing it
+			// third party hooked into the export must stay loud - swallowing it
 			// would report a clean "export failed" for a bug that is not ours
 			// and is not a failed read.
 			if ( ! $e instanceof \RuntimeException ) {
@@ -407,7 +407,7 @@ final class DataExporter {
 		if ( $fh ) {
 			// Read the last 16 bytes so we can tolerate trailing
 			// whitespace (write_to() ends with "}\n"). Anything past
-			// the closing brace must be whitespace only — a truncated
+			// the closing brace must be whitespace only - a truncated
 			// dump tends to end mid-string / mid-token, never with a
 			// well-balanced `}` followed by `\n`.
 			$tail_len = min( 16, $size );
@@ -425,14 +425,14 @@ final class DataExporter {
 			}
 		}
 
-		// Every gate passed — publish. This is the first and only moment the
+		// Every gate passed - publish. This is the first and only moment the
 		// export becomes visible at $path, and rename() is atomic within a
 		// filesystem, so no reader can ever observe a partial one.
 		// Atomicity IS the point: rename(2) is atomic within a filesystem, so a
 		// concurrent reader sees either the previous complete export or the new
 		// one, never a partial file. WP_Filesystem::move() gives no such
 		// guarantee and can degrade to copy-then-delete, reintroducing the very
-		// window this closes — and it would run as a different UID than the
+		// window this closes - and it would run as a different UID than the
 		// fopen() that wrote the temp (see TranslationFileGenerator::write_l10n_file()'s
 		// docblock), so both halves of this write must stay native. Sibling
 		// path, so never cross-device.
@@ -484,8 +484,8 @@ final class DataExporter {
 	 * Shutdown sweep for temp files no ordinary exit path reached.
 	 *
 	 * Public only because `register_shutdown_function()` needs a callable. It
-	 * is a no-op unless a write died mid-stream — a memory_limit fatal on a
-	 * very large export is the realistic case — and it can never touch a
+	 * is a no-op unless a write died mid-stream - a memory_limit fatal on a
+	 * very large export is the realistic case - and it can never touch a
 	 * PUBLISHED export: write_to_file() drops the entry the instant rename()
 	 * succeeds, and the published name is not the temp name.
 	 *
@@ -576,7 +576,7 @@ final class DataExporter {
 	 *
 	 * Deliberately strict: the WHOLE trimmed value must parse as a URL with a
 	 * user or pass component. A credential-shaped substring inside a longer
-	 * prose value does not qualify — dropping a whole setting because it
+	 * prose value does not qualify - dropping a whole setting because it
 	 * happens to mention a URL would be silent data loss in the export, which
 	 * is the failure mode this file works hardest to avoid. The two cheap
 	 * string tests short-circuit before wp_parse_url() for the ~120 settings
@@ -618,7 +618,7 @@ final class DataExporter {
 	 * asymmetry this creates with the importer: `DataImporter` restores a
 	 * credential key the export omitted only at the TOP level of an addon
 	 * entry, so a NESTED credential is not carried across a restore and has
-	 * to be re-entered. Losing it is the intended trade — the alternative is
+	 * to be re-entered. Losing it is the intended trade - the alternative is
 	 * shipping it in every backup. The addon-id level itself is deliberately
 	 * NOT key-matched here: only the entries are walked, exactly as before.
 	 *
@@ -683,7 +683,7 @@ final class DataExporter {
 	 * - The Translator role's full capabilities map (in case an admin added
 	 *   custom caps via User Role Editor or similar).
 	 * - PerfLocale-prefixed caps granted to administrator + editor (lets
-	 *   us restore custom grants — e.g. an admin who gave Editors
+	 *   us restore custom grants - e.g. an admin who gave Editors
 	 *   `perflocale_manage_languages`).
 	 * - The `perflocale_caps_version` option so the importer can decide
 	 *   whether `ensure_roles_exist()` should re-run on next admin_init.
@@ -775,7 +775,7 @@ final class DataExporter {
 	 * is what a utf8 column read over a non-UTF-8 connection produces for the
 	 * connection charset's own repertoire. It CANNOT catch a character MySQL
 	 * already replaced with a literal "?" on the wire because the results
-	 * charset could not represent it at all — that arrives as valid ASCII and
+	 * charset could not represent it at all - that arrives as valid ASCII and
 	 * encodes cleanly. Detecting the latter needs a charset check on the
 	 * connection, not on the value.
 	 *
@@ -797,7 +797,7 @@ final class DataExporter {
 				esc_html(
 					sprintf(
 						/* translators: 1: what was being encoded, 2: the JSON encoder's message. */
-						'PerfLocale export: %1$s could not be encoded as JSON (%2$s). Refusing to publish an export with unreadable bytes in it — the previous export file has been left untouched. This usually means the database connection charset does not match the column charset; compare DB_CHARSET in wp-config.php with the tables\' own charset before changing either.',
+						'PerfLocale export: %1$s could not be encoded as JSON (%2$s). Refusing to publish an export with unreadable bytes in it - the previous export file has been left untouched. This usually means the database connection charset does not match the column charset; compare DB_CHARSET in wp-config.php with the tables\' own charset before changing either.',
 						$context,
 						$e->getMessage()
 					)
@@ -911,7 +911,7 @@ final class DataExporter {
 			// conceptually the same surface from an operator POV: cloning
 			// staging → prod should pick up addon-level config too, not
 			// silently drop it. Each addon's entry is redacted with the
-			// same CREDENTIAL_KEY_PATTERN as the main settings — any
+			// same CREDENTIAL_KEY_PATTERN as the main settings - any
 			// addon's secrets stay on the exporting site.
 			$addon_settings = get_option( 'perflocale_addon_settings', [] );
 
@@ -926,7 +926,7 @@ final class DataExporter {
 			// leave the target's disabled-list intact, producing a silent
 			// "configured but disabled" state mismatch. Empty array on
 			// the source means "nothing disabled" and must be preserved
-			// literally — that's a meaningful operator intent.
+			// literally - that's a meaningful operator intent.
 			$disabled_addons = (array) get_option( 'perflocale_disabled_addons', [] );
 			self::write_chunk( $out, '"disabled_addons": ' . self::encode_or_fail( array_values( array_filter( array_map( 'strval', $disabled_addons ) ) ), 'disabled_addons' ) . ',' . "\n" );
 		}
@@ -1009,7 +1009,7 @@ final class DataExporter {
 		);
 
 		foreach ( $external_sections as $name => $payload ) {
-			// Reserved keys can't be overwritten — addons append, never
+			// Reserved keys can't be overwritten - addons append, never
 			// replace. addon_settings/disabled_addons are in the shared list
 			// too: both carry redacted credentials, and only the core
 			// exporter may write them. Names are also charset-restricted so
@@ -1052,7 +1052,7 @@ final class DataExporter {
 	 *                                null emits the whole table.
 	 * @return void
 	 * @throws \RuntimeException When a batch SELECT fails. A partial table must
-	 *                          never be emitted as a complete one — see the
+	 *                          never be emitted as a complete one - see the
 	 *                          comment on the guard for what a partial export
 	 *                          does to a replace-mode restore. Callers:
 	 *                          write_to_file() converts this to `false`,
@@ -1068,7 +1068,7 @@ final class DataExporter {
 
 		// Keyset pagination cursors. Every export table has an `id` PK except
 		// string_translations, which is keyed on the (string_id, language_id)
-		// tuple — paginate on that tuple there.
+		// tuple - paginate on that tuple there.
 		$has_id    = ( 'string_translations' !== $table_name );
 		$last_id   = 0;
 		$last_str  = 0;
@@ -1087,7 +1087,7 @@ final class DataExporter {
 		 * @hook perflocale/export/batch_size
 		 * @param int    $size       Default 1000.
 		 * @param string $table_name Table being exported (so callers can
-		 *                           vary per-table — heavier rows for
+		 *                           vary per-table - heavier rows for
 		 *                           `strings`, lighter for `languages`).
 		 */
 		$batch_size = (int) apply_filters( 'perflocale/export/batch_size', self::BATCH_SIZE, $table_name );
@@ -1143,7 +1143,7 @@ final class DataExporter {
 			// indistinguishable here. wpdb::get_results( …, ARRAY_A ) builds
 			// `$new_array = array()` and only fills it `if ( $this->last_result )`,
 			// so a lost connection, a killed query, a max_allowed_packet
-			// overrun or a crashed table hands back `[]` — which sails past
+			// overrun or a crashed table hands back `[]` - which sails past
 			// the is_array() guard, writes no rows, leaves the keyset cursor
 			// where it was and exits this do/while as an ordinary
 			// end-of-table. The envelope then closes cleanly, the size and
@@ -1156,12 +1156,12 @@ final class DataExporter {
 			// needs `count( $rows ) > 0` to fire, so nothing catches it.
 			// Failing loudly here is the only place this is catchable.
 			//
-			// wpdb::query() calls flush() before every query — which resets
-			// last_error to '' — and assigns it from mysqli_error()
+			// wpdb::query() calls flush() before every query - which resets
+			// last_error to '' - and assigns it from mysqli_error()
 			// afterwards, so a non-empty value here belongs to the SELECT
 			// above and to nothing before it. Costs no extra query. The
 			// instanceof is PHPStan narrowing, not a runtime guard (the
-			// $wpdb global reads as `mixed` in this file — see the existing
+			// $wpdb global reads as `mixed` in this file - see the existing
 			// "Cannot call method get_results() on mixed" baseline entry);
 			// the get_results() call above would already have fataled.
 			$db_error = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';

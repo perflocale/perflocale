@@ -143,7 +143,7 @@ final class TranslationService {
 	 * `source` (core omits it, but the core/video and core/audio blocks emit
 	 * it). A hand-maintained list silently stripped figure, figcaption, video,
 	 * audio, dl/dt/dd, caption, colgroup, details/summary and the sectioning
-	 * elements — which corrupts machine-translated block markup, and turns a
+	 * elements - which corrupts machine-translated block markup, and turns a
 	 * body made entirely of embed markup into an empty string.
 	 *
 	 * Developers can expand or tighten the allowlist with the
@@ -339,7 +339,7 @@ final class TranslationService {
 			$provider->get_id()
 		);
 
-		// Monthly overage cap — the same gate translate_batch_texts() applies,
+		// Monthly overage cap - the same gate translate_batch_texts() applies,
 		// so single-text callers (block-editor toolbar clicks) can't keep
 		// spending provider budget after the cap is hit. Counted on exactly
 		// what is sent to the provider.
@@ -366,7 +366,7 @@ final class TranslationService {
 		// A non-empty source that comes back empty is a provider failure, not
 		// a translation: the block-editor callers write the return value
 		// straight into block attributes, so returning '' here would blank the
-		// user's content under a success toast. Fail loudly instead — the same
+		// user's content under a success toast. Fail loudly instead - the same
 		// philosophy as translate_batch_texts()'s size-mismatch guard and
 		// translate_post()'s "existing content was kept" warning. Runs before
 		// the post_translate_text filter so an integration that deliberately
@@ -411,7 +411,7 @@ final class TranslationService {
 	 * @param string   $target_lang
 	 * @param string   $provider_id Provider ID ('' = configured default).
 	 * @param bool     $fast_fail   Skip provider-internal retries.
-	 * @param string   $format      Destination format hint: 'html' (default —
+	 * @param string   $format      Destination format hint: 'html' (default -
 	 *   provider HTML mode + allowlist sanitiser) or 'text' (provider text
 	 *   mode + text sanitiser, for plain-text destinations that must not carry
 	 *   entity-escaped output). One format per call; group by format upstream.
@@ -467,12 +467,12 @@ final class TranslationService {
 			);
 		}
 
-		// Monthly overage cap — the same gate translate_post/MetaTranslator
+		// Monthly overage cap - the same gate translate_post/MetaTranslator
 		// apply before spending provider budget. Enforced HERE so every
 		// provider-bound path (term MT, bulk string jobs) honors the cap:
 		// $non_empty at this point is exactly the provider-billed subset
 		// (empty inputs are already separated out above, and callers that
-		// pre-check merely re-read the same option — no double count).
+		// pre-check merely re-read the same option - no double count).
 		$provider_chars = 0;
 		foreach ( $non_empty as $t ) {
 			$provider_chars += mb_strlen( (string) $t );
@@ -497,7 +497,7 @@ final class TranslationService {
 		// will return a SHORTER array than we sent (truncated response, partial
 		// timeout). Falling through silently would leave the missing slots as
 		// empty strings, which the block-editor caller writes back to block
-		// attributes — destroying source text. Treat any size mismatch as a
+		// attributes - destroying source text. Treat any size mismatch as a
 		// hard failure rather than a silent no-op.
 		if ( count( $translated ) !== count( $non_empty ) ) {
 			throw new \RuntimeException(
@@ -516,7 +516,7 @@ final class TranslationService {
 		foreach ( $translated as $i => $t ) {
 			// A 'text' batch (SEO title/description, ACF text/textarea) has a
 			// plain-text destination: sanitize_mt_html() runs wp_kses, which
-			// normalises a bare '&' to '&amp;' — re-escaping the very characters
+			// normalises a bare '&' to '&amp;' - re-escaping the very characters
 			// the text-mode provider call was made to keep literal. Use the
 			// text sanitiser there (strips tags, keeps newlines, no entity
 			// re-encoding); HTML batches keep the allowlist sanitiser.
@@ -562,9 +562,9 @@ final class TranslationService {
 
 		// Declare the SOURCE object's OWN language, not the site default.
 		// A post that is itself a translation, or an original authored in a
-		// non-default language — routine after a WPML / Polylang /
+		// non-default language - routine after a WPML / Polylang /
 		// TranslatePress import, where pre-existing posts are linked into
-		// groups — was being announced to the provider as the site default, so
+		// groups - was being announced to the provider as the site default, so
 		// DeepL and Google were told "this is English" about text that is not.
 		// The value travels on from here into MetaTranslator and into the
 		// perflocale/machine_translation/after hook, so it has to be right.
@@ -572,7 +572,7 @@ final class TranslationService {
 		// detect_post_language() is the same lookup PostTranslationManager uses
 		// when it creates the group (PostTranslationManager.php:767-770), it is
 		// memoised per request and blog-keyed, and it returns null for a post
-		// with no language row — which is the ONLY case that should fall back
+		// with no language row - which is the ONLY case that should fall back
 		// to the configured default. In a bulk run the read is an L1 hit:
 		// BulkTranslateJob primes every source id before the loop.
 		$source_language = ( new PostTranslationManager( $this->cache, $this->settings ) )
@@ -615,14 +615,14 @@ final class TranslationService {
 			 */
 			$texts = apply_filters( 'perflocale/mt/pre_translate', $texts, $source_lang, $target_lang, $provider->get_id() );
 
-			// Title and excerpt are plain-text destinations — request text
+			// Title and excerpt are plain-text destinations - request text
 			// mode so the provider returns unescaped output (HTML mode
 			// contractually entity-escapes markup-significant characters:
 			// &amp;, &#39;). Content is an HTML destination and stays in
 			// html mode. Providers accept one format per request, so the
 			// [title, content, excerpt] triple travels as two calls. Empty
 			// slots are skipped client-side: some providers reject empty
-			// strings (DeepL — on the html path its neutral-root wrap
+			// strings (DeepL - on the html path its neutral-root wrap
 			// incidentally hides this), and '' translates to '' anyway.
 			$plain_inputs = [];
 			$plain_slots  = [];
@@ -705,7 +705,7 @@ final class TranslationService {
 					esc_html(
 						sprintf(
 							/* translators: %s is the offending return type. */
-							__( 'A hook on perflocale/mt/post_translate returned %s — must be an array<int,string> of [title, content, excerpt]. Falling back to the unfiltered translation.', 'perflocale' ),
+							__( 'A hook on perflocale/mt/post_translate returned %s - must be an array<int,string> of [title, content, excerpt]. Falling back to the unfiltered translation.', 'perflocale' ),
 							is_array( $translated ) ? 'a malformed array (expected positional [title, content, excerpt] strings)' : get_debug_type( $translated )
 						)
 					),
@@ -721,7 +721,7 @@ final class TranslationService {
 			// would otherwise permit.
 			//
 			// Title/excerpt were requested in text mode, so the provider
-			// output is already unescaped plain text — no entity decode here.
+			// output is already unescaped plain text - no entity decode here.
 			// Decoding on top of text-mode output would DOUBLE-decode: a
 			// legitimate literal '&amp;' a user typed as content would come
 			// back as '&amp;' and be collapsed to '&'.
@@ -737,8 +737,8 @@ final class TranslationService {
 
 			// Never persist an empty FIELD over source text that wasn't empty.
 			// The count-shape guards upstream only compare array LENGTHS, so a
-			// provider returning "" — or an allowlist that strips a body made
-			// entirely of embed markup — reaches here as a well-shaped result
+			// provider returning "" - or an allowlist that strips a body made
+			// entirely of embed markup - reaches here as a well-shaped result
 			// and would blank an existing, possibly human-reviewed translation
 			// while reporting success. Mirrors the "source value kept"
 			// semantics MetaTranslator and BulkStringTranslateJob already use:
@@ -748,7 +748,7 @@ final class TranslationService {
 			// travel in the provider's TEXT batch, and every bundled provider
 			// reads that batch positionally with `$row['text'] ?? ''`, so an
 			// upstream JSON-key rename (or a proxy rewriting the envelope)
-			// produces empty strings behind a 200, with the right COUNT — which
+			// produces empty strings behind a 200, with the right COUNT - which
 			// is all the mismatch guards above check. Without this loop a
 			// re-translate then wrote post_title = '' over a reviewed
 			// translation and reported success: the post shows as "(no title)"
@@ -801,11 +801,14 @@ final class TranslationService {
 					$result['kept'] = array_keys( $emptied );
 				}
 
+				// An empty page_template leaves the stored template alone: one the
+				// theme no longer has would stop the save before its hooks.
 				$update_fields = [
-					'ID'           => $translated_id,
-					'post_title'   => $result['title'],
-					'post_content' => $result['content'],
-					'post_excerpt' => $result['excerpt'],
+					'ID'            => $translated_id,
+					'post_title'    => $result['title'],
+					'post_content'  => $result['content'],
+					'post_excerpt'  => $result['excerpt'],
+					'page_template' => '',
 				];
 
 				foreach ( $emptied as $column ) {
@@ -832,7 +835,7 @@ final class TranslationService {
 					// state (target slug removed mid-call, link transaction
 					// failed). Falling through here would mean we ran the MT
 					// call (and burned characters) but produced no translation
-					// post — a silent loss the caller (CLI / REST / cron)
+					// post - a silent loss the caller (CLI / REST / cron)
 					// would report as success. Surface the failure.
 					throw new \RuntimeException(
 						esc_html__( 'Failed to create the translation post; the source-language post may have been moved or its translation group invalidated mid-translation.', 'perflocale' )
@@ -855,12 +858,15 @@ final class TranslationService {
 					// wp_slash: provider output is unslashed; wp_update_post()
 					// unslashes internally, so backslashes in machine-translated
 					// content (code samples, paths) would be silently stripped.
+					// An empty page_template leaves the stored template alone: one
+					// the theme no longer has would stop the save before its hooks.
 					wp_slash(
 						[
-							'ID'           => $translated_id,
-							'post_title'   => $result['title'],
-							'post_content' => $result['content'],
-							'post_excerpt' => $result['excerpt'],
+							'ID'            => $translated_id,
+							'post_title'    => $result['title'],
+							'post_content'  => $result['content'],
+							'post_excerpt'  => $result['excerpt'],
+							'page_template' => '',
 						]
 					),
 					true
@@ -875,7 +881,7 @@ final class TranslationService {
 
 			// Meta-field MT (SEO titles/descriptions, registered custom
 			// fields). Failure-isolated: a meta problem never fails the post
-			// translation — it lands in $result['meta']['errors'] + the
+			// translation - it lands in $result['meta']['errors'] + the
 			// _perflocale_meta_mt_errors breadcrumb.
 			if ( $include_meta ) {
 				$result['meta'] = ( new MetaTranslator( $this->settings, $this ) )

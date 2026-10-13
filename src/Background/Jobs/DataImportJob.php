@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * enough to warrant it (Auto mode), or whenever the admin has chosen
  * Always-async background processing.
  *
- * The job is a pure wrapper around {@see DataImporter::import()} —
+ * The job is a pure wrapper around {@see DataImporter::import()} -
  * the underlying import code already streams its way through the file
  * and is bounded in memory; the AbstractJob layer adds:
  *
@@ -33,7 +33,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Args shape:
  *   - 'file_path' : string  Absolute path to the JSON export to import.
- *                            Must be inside `wp-content/uploads/` —
+ *                            Must be inside `wp-content/uploads/` -
  *                            validated below.
  *   - 'replace'   : bool    Whether to TRUNCATE-then-restore (true) or
  *                            merge into existing rows (false).
@@ -42,7 +42,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                            import form, so DataImporter's site-identity gate
  *                            is skipped. Recorded in the args, not decided at
  *                            run time, because it is a statement about the
- *                            FILE the operator chose — a replay has to keep
+ *                            FILE the operator chose - a replay has to keep
  *                            the same answer.
  *
  * Result shape (matches DataImporter::import()):
@@ -65,7 +65,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * sync dispatcher already show it.
  *
  * The pipeline has no terminal-failure signal, so the worker retries a
- * thrown job with backoff up to `perflocale/jobs/max_attempts` (5) — the
+ * thrown job with backoff up to `perflocale/jobs/max_attempts` (5) - the
  * same shape the two path guards below already have. A refusal is
  * deterministic, so each retry re-reads the file, re-decodes it and refuses
  * again; DataImporter runs the site-identity gate AHEAD of its per-value
@@ -85,7 +85,7 @@ final class DataImportJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Matches the cap the admin import form and CLI command require —
+	 * Matches the cap the admin import form and CLI command require -
 	 * `perflocale_import_export`.
 	 */
 	public function get_required_capability(): string {
@@ -121,7 +121,7 @@ final class DataImportJob extends AbstractJob {
 	 * For DataImport, the natural cost dimension is the import file size.
 	 * We translate bytes → rough row count assuming an average 200-byte
 	 * JSON row (translation table dumps land in that ballpark). Cheap +
-	 * conservative — over-counts compared to actually parsing the JSON,
+	 * conservative - over-counts compared to actually parsing the JSON,
 	 * but parsing now would defeat the purpose of a cheap pre-dispatch
 	 * decision.
 	 *
@@ -145,8 +145,8 @@ final class DataImportJob extends AbstractJob {
 	 * {@inheritDoc}
 	 *
 	 * @param array<string, mixed> $args
-	 * @param callable             $progress Called exactly TWICE — once before
-	 *                                       the import and once after it —
+	 * @param callable             $progress Called exactly TWICE - once before
+	 *                                       the import and once after it -
 	 *                                       because DataImporter doesn't yet
 	 *                                       expose per-table progress
 	 *                                       callbacks. Promoting this to true
@@ -156,7 +156,7 @@ final class DataImportJob extends AbstractJob {
 	 *   Consequence worth knowing before you rely on Cancel: the progress
 	 *   callback is also the ONLY place the worker probes for an operator
 	 *   cancel, so a cancel issued WHILE the import is running is not seen
-	 *   until the final tick — by which point DataImporter has already
+	 *   until the final tick - by which point DataImporter has already
 	 *   finished and committed every row, and the post-import cache flush has
 	 *   run. The cancel is honoured at that point (the tick throws), so the
 	 *   job row ends up `canceled` with no stored result even though the
@@ -174,7 +174,7 @@ final class DataImportJob extends AbstractJob {
 		$file    = isset( $args['file_path'] ) ? (string) $args['file_path'] : '';
 		$replace = ! empty( $args['replace'] );
 
-		// Path traversal guard — the dispatching user already has the
+		// Path traversal guard - the dispatching user already has the
 		// `perflocale_import_export` cap, but defence-in-depth pays off
 		// when args are re-played from JobState after a queue + crash.
 		if ( ! self::is_safe_upload_path( $file ) ) {
@@ -216,13 +216,13 @@ final class DataImportJob extends AbstractJob {
 		// finished import.
 		//
 		// This throw exists for the ASYNC path only. Dispatch compares
-		// self::args_size() — the file size divided by 200 — against
+		// self::args_size() - the file size divided by 200 - against
 		// self::get_default_threshold() (1000), so a bundle under roughly
 		// 200 KB runs INLINE, and there the refusal already surfaces without
 		// help: Dispatcher::execute_inline returns the importer's array and
 		// AdminController redirects on its `error`. Above the threshold the
 		// operator is redirected to a job instead, and a job that RETURNED
-		// the refusal would be marked complete — "0 imported", with the
+		// the refusal would be marked complete - "0 imported", with the
 		// reason readable only inside the result JSON in the detail drawer.
 		// Throwing puts the sentence in the job row's `error`, which the Jobs
 		// list renders beside the failed row.
@@ -237,8 +237,8 @@ final class DataImportJob extends AbstractJob {
 		//
 		// esc_html() is required here by WordPress.Security.EscapeOutput: an
 		// exception message is treated as output. That makes this the one
-		// import error that reaches the operator pre-escaped — every other one
-		// is plain __() text — so the refusal sentences quote with typographic
+		// import error that reaches the operator pre-escaped - every other one
+		// is plain __() text - so the refusal sentences quote with typographic
 		// marks, which survive the second escape the Jobs screen applies. An
 		// `&` inside an address the FILE recorded still renders as `&amp;`;
 		// cosmetic, and the address is the operator's own upload.
@@ -246,7 +246,7 @@ final class DataImportJob extends AbstractJob {
 			throw new \RuntimeException( esc_html( (string) ( $result['errors'][0] ?? '' ) ) );
 		}
 
-		// Flush post-import caches — see MigrationCacheHelper for the
+		// Flush post-import caches - see MigrationCacheHelper for the
 		// full sequence + rationale. Deliberately below the refusal above: a
 		// refused import wrote nothing, and this regenerates every
 		// translation file in files mode.

@@ -5,8 +5,8 @@
  * Single source of truth for "remove every PerfLocale-owned row from this
  * site". Called from two places:
  *
- *   1. uninstall.php — once per blog when the plugin is deleted.
- *   2. perflocale.php's wp_uninitialize_site handler — when a network admin
+ *   1. uninstall.php - once per blog when the plugin is deleted.
+ *   2. perflocale.php's wp_uninitialize_site handler - when a network admin
  *      permanently deletes a subsite from the network.
  *
  * Both paths share the same option/transient/meta delete-list so they
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Per-site cleanup orchestrator. Static-only — must be called inside the
+ * Per-site cleanup orchestrator. Static-only - must be called inside the
  * blog context of the site being purged (after switch_to_blog when on
  * multisite).
  */
@@ -142,7 +142,7 @@ final class SiteCleanup {
 		'perflocale_rewrites_verified',
 		// Old-slug → new-slug 301 redirect map written by
 		// LanguageRepository::rename_slug() (autoloaded). Created on-demand
-		// (only when a slug is renamed) so it matches no LIKE pattern — must
+		// (only when a slug is renamed) so it matches no LIKE pattern - must
 		// be listed explicitly or it lingers in alloptions on every request
 		// after a full uninstall.
 		'perflocale_slug_redirects',
@@ -166,7 +166,7 @@ final class SiteCleanup {
 		// TranslatePress importer per-post checkpoint. Written by
 		// TranslatePressImporter so an interrupted run can resume from the
 		// last committed batch. Cleared on successful completion but
-		// survives crash / watchdog kill / manual abort — must be in the
+		// survives crash / watchdog kill / manual abort - must be in the
 		// uninstall sweep so it doesn't haunt a reinstall.
 		'perflocale_trp_import_post_checkpoint',
 		// The language selection that checkpoint was written under.
@@ -180,10 +180,10 @@ final class SiteCleanup {
 	 * `wp_options`). The per-site uninstall purge loop switch_to_blog()'s
 	 * through every blog and only touches `wp_options`, so these are removed
 	 * separately, on EVERY network, by purge_network_scope() once a sweep has
-	 * completed — never after an interrupted one, because the resume marker
+	 * completed - never after an interrupted one, because the resume marker
 	 * is in this list.
 	 *
-	 * Every `perflocale_*` network option MUST be listed here — the orphan-data
+	 * Every `perflocale_*` network option MUST be listed here - the orphan-data
 	 * audit (concurrency scenario 26) scans `wp_sitemeta` against this list and
 	 * fails on any uncovered key, closing the leak class rather than a single
 	 * instance.
@@ -197,7 +197,7 @@ final class SiteCleanup {
 		// Resume marker for an uninstall sweep that did not finish: it ran
 		// out of execution budget, or a site failed. Listed here so the
 		// orphan-data audit covers it and so the run that finishes the sweep
-		// removes it — uninstall.php deletes this list ONLY on the completing
+		// removes it - uninstall.php deletes this list ONLY on the completing
 		// pass, precisely so an interrupted sweep keeps its own marker.
 		self::RESUME_OPTION,
 	];
@@ -222,7 +222,7 @@ final class SiteCleanup {
 	 * ⚠️ A marker that is honoured forever is worse than no marker at all.
 	 * An interrupted uninstall that the operator never finishes leaves one
 	 * behind in `wp_sitemeta`, where it would silently skip every blog at or
-	 * below `last_site_id` on the NEXT uninstall — months later, after a
+	 * below `last_site_id` on the NEXT uninstall - months later, after a
 	 * re-install, on data that has nothing to do with the pass that wrote it.
 	 * Past this age the marker's cursor is not trusted and the row is
 	 * dropped, so the sweep starts from the beginning; its `any_preserve`,
@@ -238,7 +238,7 @@ final class SiteCleanup {
 	 *
 	 * Spelled as a number rather than `DAY_IN_SECONDS`: this class is the one
 	 * the uninstall path loads by hand, and it must not depend on a WordPress
-	 * constant being defined wherever it is included — a bare-PHP harness
+	 * constant being defined wherever it is included - a bare-PHP harness
 	 * without WP loaded fataled on exactly that.
 	 *
 	 * @var int
@@ -280,14 +280,14 @@ final class SiteCleanup {
 		'perflocale_link_lock_%',
 		// Generic concurrency locks written by Concurrency\Lock (mt_usage_*,
 		// etc). Lock::reap_expired() handles them daily
-		// in a live install, but on uninstall the reaper is gone too — any
+		// in a live install, but on uninstall the reaper is gone too - any
 		// expired rows from the last run would persist forever otherwise.
 		'perflocale_lock_%',
 		// Per-type eager link map (autoloaded). Pattern-cleared because
 		// the type suffix is open-ended ('post', 'term', etc).
 		'perflocale_eager_links_%',
 		// Gravity Forms addon per-form translation stores (one option per GF
-		// form id — the numeric suffix is open-ended, so pattern-cleared).
+		// form id - the numeric suffix is open-ended, so pattern-cleared).
 		'perflocale_gf_translations_%',
 		// Generational cache tokens: one autoloaded int per cache group
 		// (CacheManager::bump_group_generation). The group-name suffix is
@@ -298,7 +298,7 @@ final class SiteCleanup {
 		// Circuit-breaker tracking index (autoload=no, single row).
 		// Maintained by PerfLocale\Concurrency\Breaker so Site Health
 		// can enumerate active breakers regardless of transient storage
-		// backend. Not pattern-needed — single fixed key — but listed
+		// backend. Not pattern-needed - single fixed key - but listed
 		// alongside the other breaker artifacts for grep-discoverability.
 		'perflocale_breakers_index',
 		// Per-breaker atomic failure counters (autoload=no, one row per
@@ -327,7 +327,7 @@ final class SiteCleanup {
 
 	/**
 	 * Post-meta key prefixes cleared on full uninstall. Each entry is the
-	 * literal prefix (NOT a SQL LIKE pattern) — the cleanup loop runs them
+	 * literal prefix (NOT a SQL LIKE pattern) - the cleanup loop runs them
 	 * through `$wpdb->esc_like()` so the underscores are treated as literal
 	 * characters, not single-char wildcards.
 	 *
@@ -360,7 +360,7 @@ final class SiteCleanup {
 	 * runs while the plugin is being deleted and WordPress removes the files
 	 * immediately afterwards, so a queued job would fire against a callback
 	 * that no longer exists. Whatever does not finish in this request never
-	 * happens — which is why an interrupted sweep leaves a marker instead.
+	 * happens - which is why an interrupted sweep leaves a marker instead.
 	 *
 	 * The chunk size and the deadline mirror
 	 * {@see \PerfLocale\Deactivator::deactivate_for_network()}, with two
@@ -394,7 +394,7 @@ final class SiteCleanup {
 		// Everything about the marker is checked before it is trusted: it is
 		// whatever happens to be in wp_sitemeta. A hand-edited row, a
 		// half-written one, or one left by an uninstall nobody ever finished
-		// must all degrade to "start from the beginning" — the safe
+		// must all degrade to "start from the beginning" - the safe
 		// direction, because it re-walks clean blogs instead of skipping
 		// dirty ones.
 		//
@@ -456,8 +456,8 @@ final class SiteCleanup {
 		}
 
 		// KEYSET paging on blog_id, not offset paging. The site list can
-		// change during the sweep — a network admin deleting a subsite in
-		// another tab — and an offset over a list that shrank skips a blog:
+		// change during the sweep - a network admin deleting a subsite in
+		// another tab - and an offset over a list that shrank skips a blog:
 		// with ids [1,2,3] and a chunk of 2, deleting site 1 after the first
 		// page makes the offset-2 page empty, so site 3 is never purged and
 		// the sweep reports complete. A cursor on the id cannot skip.
@@ -465,7 +465,7 @@ final class SiteCleanup {
 		// A direct query because WP_Site_Query has no "id greater than"
 		// argument, and faking one with a `sites_clauses` filter does not
 		// work: the query cache is keyed on query vars, so every page would
-		// be served page one — an endless loop under WP-CLI.
+		// be served page one - an endless loop under WP-CLI.
 		$cursor         = $done_up_to;
 		$entered        = 0;
 		$purged         = 0;
@@ -584,7 +584,7 @@ final class SiteCleanup {
 						$high_water = $site_id;
 					}
 				} catch ( \Throwable $e ) {
-					// One blog's failure must not abort the sweep — every
+					// One blog's failure must not abort the sweep - every
 					// other blog still loses the code that owns its rows.
 					++$failed;
 					$had_failure = true;
@@ -602,7 +602,7 @@ final class SiteCleanup {
 		// A pass is complete only if it reached the end AND nothing failed.
 		// Counting a blog that threw as finished would delete the resume
 		// marker and let uninstall.php remove the network options as though
-		// every site were clean — and WordPress then deletes the plugin
+		// every site were clean - and WordPress then deletes the plugin
 		// files, so nothing on disk would be left to finish that blog. Kept
 		// incomplete, the marker survives at $high_water (frozen just below
 		// the first failure), and deleting the plugin again resumes there.
@@ -663,7 +663,7 @@ final class SiteCleanup {
 
 		return [
 			'complete'     => $complete,
-			// Why a pass is incomplete — each needs different advice.
+			// Why a pass is incomplete - each needs different advice.
 			'out_of_time'  => $out_of_time,
 			'list_error'   => $list_error,
 			'meta_error'   => $meta_error,
@@ -744,8 +744,8 @@ final class SiteCleanup {
 	 * execution limit (WP-CLI, most cron runners) and the loop may run to
 	 * completion.
 	 *
-	 * Why bound it at all: a kill lands in the middle of one blog's purge —
-	 * tables dropped, options half-swept — and WordPress then deletes the
+	 * Why bound it at all: a kill lands in the middle of one blog's purge -
+	 * tables dropped, options half-swept - and WordPress then deletes the
 	 * plugin directory anyway, leaving nothing on disk that knows how to
 	 * finish. Stopping between blogs instead leaves every unswept blog
 	 * internally consistent and records where to pick up.
@@ -753,7 +753,7 @@ final class SiteCleanup {
 	 * ⚠️ `max_execution_time` is a CPU-time limit on most builds, and a purge
 	 * is mostly waiting on the database, so PHP's own timer may never fire.
 	 * It is used here as the best available PROXY for the wall-clock budget
-	 * that actually kills plugin-deletion requests — the web server's or
+	 * that actually kills plugin-deletion requests - the web server's or
 	 * proxy's own timeout, which PHP cannot see. Being early costs one extra
 	 * pass; being late costs a half-purged blog.
 	 *
@@ -784,8 +784,8 @@ final class SiteCleanup {
 	 * 'none' when get_option() finds no settings row.
 	 *
 	 * 'none' is a blog PerfLocale was never activated on. It matters only to
-	 * purge_network()'s one network-global decision — sweep the shared
-	 * user-meta table or not — where treating such a blog as "preserve" would
+	 * purge_network()'s one network-global decision - sweep the shared
+	 * user-meta table or not - where treating such a blog as "preserve" would
 	 * disable the sweep on every partially activated network, and treating
 	 * it as "delete" would be inventing a choice nobody made.
 	 *
@@ -805,7 +805,7 @@ final class SiteCleanup {
 			return 'none';
 		}
 
-		// Anything present but unreadable counts as keep — never as delete.
+		// Anything present but unreadable counts as keep - never as delete.
 		return ( is_array( $settings ) && ! empty( $settings['delete_data_on_uninstall'] ) ) ? 'delete' : 'preserve';
 	}
 
@@ -851,7 +851,7 @@ final class SiteCleanup {
 	public static function purge_current_site( bool $delete_data, bool $single_site_teardown = false, bool $network_sweep = false ): bool {
 		// Remember which blogs this request has already purged. Core's
 		// wp_uninitialize_site() runs AFTER this (priority 10 vs our 5) and
-		// calls remove_user_from_blog for every member of the dying blog —
+		// calls remove_user_from_blog for every member of the dying blog -
 		// which would send TranslatorRole's handler into
 		// JobState::anonymize_for_user against tables we just dropped,
 		// logging a spurious "Table doesn't exist" per deleted subsite.
@@ -891,7 +891,7 @@ final class SiteCleanup {
 		// on, so it must not go until there is nothing left to get wrong.
 		//
 		// And only if everything above SUCCEEDED. A DROP or a meta DELETE
-		// that failed — a lock-wait timeout, a host query-killer — left data
+		// that failed - a lock-wait timeout, a host query-killer - left data
 		// behind; with the settings row gone too, the retry would read this
 		// blog as one that never ran PerfLocale and never remove it.
 		// Not checked on purpose: delete_option() also returns false for a
@@ -937,7 +937,7 @@ final class SiteCleanup {
 		// Whether the steps a retry cannot finish without this blog's settings
 		// row all succeeded: the table drops, the post/term meta DELETEs and,
 		// on a single site, the user-meta DELETE.
-		// Only a step that FAILED clears it — `false === $wpdb->query()`,
+		// Only a step that FAILED clears it - `false === $wpdb->query()`,
 		// strictly: 0 affected rows is the normal result on most blogs, and
 		// treating it as a failure would keep every blog's settings row
 		// forever and pin the resume marker at the first delete-mode blog.
@@ -951,7 +951,7 @@ final class SiteCleanup {
 		// 2. Drop core tables (canonical list lives in Schema::drop_tables).
 		Schema::drop_tables();
 
-		// drop_tables() reports nothing, and a DROP can fail — a lock-wait
+		// drop_tables() reports nothing, and a DROP can fail - a lock-wait
 		// timeout, a metadata lock held by a long-running query. Ask what is
 		// left rather than assume.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- one SHOW TABLES per purged blog, on the uninstall path only.
@@ -990,7 +990,7 @@ final class SiteCleanup {
 			self::delete_options_like( $pattern );
 		}
 
-		// 4. User meta — namespace LIKE sweep. We own `perflocale_*`
+		// 4. User meta - namespace LIKE sweep. We own `perflocale_*`
 		// exclusively, so a prefix DELETE is safe and sweeps any new key a
 		// dev forgot to register in USER_META_KEYS. That constant stays the
 		// canonical fixed list for the GDPR erase flow (no wildcard there).
@@ -1006,14 +1006,14 @@ final class SiteCleanup {
 		//
 		// ALSO SKIP on the network uninstall sweep. The table is shared by
 		// every blog, so a per-blog sweep would let the FIRST blog that chose
-		// "delete my data" wipe every user's preferences installation-wide —
+		// "delete my data" wipe every user's preferences installation-wide -
 		// including for users of blogs whose admin chose to keep them.
 		// purge_network() decides it once, after the whole walk.
 		if ( ! $single_site_teardown && ! $network_sweep && ! self::sweep_plugin_user_meta() ) {
 			$clean = false;
 		}
 
-		// 5. Term meta — language tags on menus.
+		// 5. Term meta - language tags on menus.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$deleted = $wpdb->query(
 			$wpdb->prepare(
@@ -1027,7 +1027,7 @@ final class SiteCleanup {
 			$clean = false;
 		}
 
-		// 6. Post meta — prefix LIKE deletes cover the WC-order language tag
+		// 6. Post meta - prefix LIKE deletes cover the WC-order language tag
 		// plus per-language attachment caption/description/alt-text
 		// variants. See POST_META_PREFIXES for the exact coverage. Each
 		// prefix runs through esc_like() so the underscores stay literal
@@ -1054,7 +1054,7 @@ final class SiteCleanup {
 		}
 
 		// 7. Role + caps. `true`: this is the full-data path, so the
-		// Translator role ASSIGNMENT goes too — see sweep_orphan_user_caps().
+		// Translator role ASSIGNMENT goes too - see sweep_orphan_user_caps().
 		self::strip_role_and_caps( false, true );
 
 		// 8. Translation files in uploads/perflocale/translations.
@@ -1068,7 +1068,7 @@ final class SiteCleanup {
 		//     switch, so a hard flush would write the ORIGINAL blog's
 		//     permalink structure and post types into this subsite's option
 		//     and, because WP_Rewrite short-circuits on a non-empty option,
-		//     they would stick — every subsite with a different structure
+		//     they would stick - every subsite with a different structure
 		//     404s until someone re-saves its permalinks.
 		//   - Regenerating with the plugin still loaded walks home_url →
 		//     UrlConverter → our repositories, whose tables step 2 just
@@ -1083,7 +1083,7 @@ final class SiteCleanup {
 		// 10. Persistent object-cache (L2) flush. The wp_options transient
 		// rows are cleared by step 3 above, but on a Redis/Memcached
 		// backend every key written via wp_cache_set( …, 'perflocale_*' )
-		// lives in the cache server and persists until its TTL — up to
+		// lives in the cache server and persists until its TTL - up to
 		// ~12 h, which can show up as ghost reads on the next install.
 		// Flush every plugin-owned group explicitly.
 		//
@@ -1122,7 +1122,7 @@ final class SiteCleanup {
 			return;
 		}
 
-		// Bump each group's generation — reliable on every object-cache
+		// Bump each group's generation - reliable on every object-cache
 		// backend, including those whose wp_cache_flush_group() is missing
 		// (WP < 6.1) or a silent no-op (e.g. Redis Object Cache + Predis).
 		foreach ( \PerfLocale\Cache\CacheManager::GROUPS as $group ) {
@@ -1131,7 +1131,7 @@ final class SiteCleanup {
 
 		// On a persistent object cache, PerfLocale's transients (breaker state,
 		// MT rate-limit counters, etc.) live in WP's 'transient'/'site-transient'
-		// cache groups, NOT wp_options — so deleting the _transient_perflocale_%
+		// cache groups, NOT wp_options - so deleting the _transient_perflocale_%
 		// option rows is a no-op for them. Flush those groups too so a full
 		// uninstall leaves no ghost keys for a quick reinstall to read back.
 		// Gated on an external cache (on the DB backend the rows already went)
@@ -1145,7 +1145,7 @@ final class SiteCleanup {
 		// bump_group_generation() above RE-WRITES each `perflocale_cgen_<group>`
 		// option (it persists the incremented generation), which the
 		// OPTION_PATTERNS sweep in full_purge() already deleted a few steps
-		// earlier — so without this, a full-data uninstall leaves ~10 orphaned
+		// earlier - so without this, a full-data uninstall leaves ~10 orphaned
 		// generation tokens in wp_options forever. This method is the LAST cache
 		// step and runs only during uninstall, where nothing reads the cache
 		// afterwards, so removing the tokens now is safe: the L2 keys they gated
@@ -1159,7 +1159,7 @@ final class SiteCleanup {
 	 *
 	 * On a persistent object cache, PerfLocale's transients (breaker state,
 	 * MT rate-limit counters, etc.) live in WP's 'transient'/'site-transient'
-	 * cache groups, NOT wp_options — so deleting the _transient_perflocale_%
+	 * cache groups, NOT wp_options - so deleting the _transient_perflocale_%
 	 * option rows is a no-op for them. Flushing those groups, and each plugin
 	 * group, is what leaves no ghost keys for a quick reinstall to read back.
 	 * The generation bump alone is not enough: the cgen tokens that gate the
@@ -1170,7 +1170,7 @@ final class SiteCleanup {
 	 *
 	 * ⚠️ These flushes are NETWORK-WIDE on Redis Object Cache: a group flush
 	 * matches every blog prefix, and 'site-transient' is a global group. So
-	 * this runs once per uninstall pass — never once per blog, never on a
+	 * this runs once per uninstall pass - never once per blog, never on a
 	 * pass that deleted nothing, and never when one subsite is deleted, where it would wipe every surviving site's cached
 	 * data (every plugin's transients, core's update checks) to clear keys
 	 * that became unreachable when the blog did. Gated on an external cache
@@ -1180,7 +1180,7 @@ final class SiteCleanup {
 	 * uninstall.php runs on (normally the main site); the other blogs'
 	 * entries expire by their TTL. Flushing per
 	 * blog instead would repeat a whole-keyspace scan once per blog on Redis,
-	 * the common backend — the cost this method exists to avoid.
+	 * the common backend - the cost this method exists to avoid.
 	 *
 	 * @return void
 	 */
@@ -1422,7 +1422,7 @@ final class SiteCleanup {
 		// store method; `as_unschedule_all_actions('', [], $group)`
 		// dispatches to it explicitly (see action-scheduler/functions.php
 		// `as_unschedule_all_actions()`). This catches recurring events
-		// that were scheduled with `[$blog_id]` args — which the older
+		// that were scheduled with `[$blog_id]` args - which the older
 		// per-hook + empty-args sweep silently missed.
 		if ( class_exists( '\\ActionScheduler_Store' )
 			&& method_exists( '\\ActionScheduler_Store', 'instance' )
@@ -1440,7 +1440,7 @@ final class SiteCleanup {
 		}
 
 		// Fallback: enumerate hooks (with their actual args) and cancel
-		// per-hook. Used only if the store API is missing — kept so
+		// per-hook. Used only if the store API is missing - kept so
 		// future AS API changes don't leave us silently unable to clean
 		// up.
 		if ( ! function_exists( 'as_get_scheduled_actions' )
@@ -1470,7 +1470,7 @@ final class SiteCleanup {
 				break;
 			}
 
-			// Cancel by id — guarantees we catch every action regardless of
+			// Cancel by id - guarantees we catch every action regardless of
 			// hook/args/group-membership shape.
 			foreach ( $ids as $id ) {
 				try {
@@ -1648,8 +1648,8 @@ final class SiteCleanup {
 	 * deletion, the plugin's own error record is deleted moments later, and
 	 * an unreported failure here is data left behind with no trace.
 	 *
-	 * `skipped_by_filter` is not a problem — it is an operator's own filter
-	 * choosing to keep that addon's data — so it is not reported.
+	 * `skipped_by_filter` is not a problem - it is an operator's own filter
+	 * choosing to keep that addon's data - so it is not reported.
 	 *
 	 * @param string                        $addon_id Addon identifier.
 	 * @param \PerfLocale\Addon\PurgeResult $result   What the purge did.
@@ -1689,7 +1689,7 @@ final class SiteCleanup {
 		global $wpdb;
 
 		// ⚠️ `_` IS A SINGLE-CHARACTER WILDCARD IN LIKE. Every pattern in
-		// OPTION_PATTERNS contains underscores — `perflocale_lock_%` also
+		// OPTION_PATTERNS contains underscores - `perflocale_lock_%` also
 		// matches `perflocaleXlockY...`, so the DELETE reached further than the
 		// pattern says. Nothing is known to have been lost (no other plugin
 		// ships an option that close to ours), but a cleanup routine must
@@ -1716,8 +1716,8 @@ final class SiteCleanup {
 			if ( str_starts_with( $name, '_transient_timeout_' ) || str_starts_with( $name, '_site_transient_timeout_' ) ) {
 				// Usually already gone: delete_transient() on the matching
 				// value row takes its timeout with it. But a timeout whose
-				// value row no longer exists — left by a DB-cleanup tool or a
-				// crashed write — has nothing to take it, and skipping it would
+				// value row no longer exists - left by a DB-cleanup tool or a
+				// crashed write - has nothing to take it, and skipping it would
 				// leave it behind forever. Delete the exact row. Not
 				// delete_transient( substr( … ) ): that would build the name
 				// `timeout_perflocale_…` and, on a persistent object cache,
@@ -1763,7 +1763,7 @@ final class SiteCleanup {
 	 *     neither `perflocale_caps_version` nor the Translator role is left
 	 *     alone. The full-data path must pass false: by the time it calls
 	 *     this, its own option sweep has already deleted that flag.
-	 * @param bool $drop_role_assignment Full-data path only — see
+	 * @param bool $drop_role_assignment Full-data path only - see
 	 *     {@see sweep_orphan_user_caps()}.
 	 * @return void
 	 */
@@ -1799,8 +1799,8 @@ final class SiteCleanup {
 		// may have granted perflocale_translate to Authors, a WooCommerce
 		// shop_manager or a custom reviewer role, and those grants would
 		// outlive a "delete all plugin data" uninstall if only the two roles
-		// the plugin itself grants to were visited. Everywhere else — deactivation
-		// and preserve mode — the narrow default is REQUIRED: install_caps()
+		// the plugin itself grants to were visited. Everywhere else - deactivation
+		// and preserve mode - the narrow default is REQUIRED: install_caps()
 		// re-grants only editor and administrator, so widening it there would
 		// permanently strip custom roles on every deactivate/reactivate cycle.
 		// The operator's filter still narrows either list.
@@ -1823,7 +1823,7 @@ final class SiteCleanup {
 			foreach ( $caps as $cap ) {
 				// WP_Roles::remove_cap() calls update_option() on the whole
 				// `wp_user_roles` array every time, including for a cap the
-				// role never had — serialising the array and comparing it
+				// role never had - serialising the array and comparing it
 				// against the stored copy on each call. update_option()
 				// no-ops when the value is unchanged, so those calls cost
 				// work rather than DB writes; skipping them is the saving,
@@ -1845,7 +1845,7 @@ final class SiteCleanup {
 		self::sweep_orphan_user_caps( $drop_role_assignment );
 
 		// Drop the install version flag in lock-step with the caps we just
-		// removed. The flag and the caps are two halves of the same state —
+		// removed. The flag and the caps are two halves of the same state -
 		// if the caps go and the flag stays, install_caps() short-circuits
 		// on the next reinstall and the caps never come back. full_purge()
 		// already deletes this via STATIC_OPTIONS so the duplicate is a
@@ -1867,7 +1867,7 @@ final class SiteCleanup {
 	 * current blog's table.
 	 *
 	 * @param bool $drop_role_assignment Also remove the Translator ROLE key.
-	 *     Full-data uninstall only — deactivation and preserve mode keep it,
+	 *     Full-data uninstall only - deactivation and preserve mode keep it,
 	 *     because WordPress promises that a deactivation is reversible.
 	 * @return void
 	 */
@@ -1887,7 +1887,7 @@ final class SiteCleanup {
 
 		// Strip CAPABILITIES only, never the role assignment. WordPress stores a
 		// role assignment as a KEY in wp_capabilities, and ROLE_SLUG is
-		// 'perflocale_translator' — which matches a naive 'perflocale_' prefix
+		// 'perflocale_translator' - which matches a naive 'perflocale_' prefix
 		// test. Stripping it leaves a translator-only user with a:0:{}: no role,
 		// no `read` cap, locked out of wp-admin, with nothing recording who had
 		// it. That would fire on a plain deactivation (which WordPress
@@ -1897,7 +1897,7 @@ final class SiteCleanup {
 		//
 		// EXCEPT on a full-data uninstall ($drop_role_assignment). There the
 		// role itself is gone, so a translator-only user already has no
-		// capabilities at all — stripping the key locks nobody out who was not
+		// capabilities at all - stripping the key locks nobody out who was not
 		// locked out already. Leaving it would mean that deleting the plugin
 		// with "Delete all plugin data" ticked and installing it again (a
 		// common troubleshooting step) silently hands every former translator

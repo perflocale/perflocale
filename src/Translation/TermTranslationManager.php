@@ -81,12 +81,12 @@ final class TermTranslationManager {
 
 	/**
 	 * Strip a trailing "-<language-slug>" from a term slug to recover the
-	 * canonical base — but ONLY when the suffix is an actual active language
+	 * canonical base - but ONLY when the suffix is an actual active language
 	 * slug. The previous `/-[a-z]{2,3}$/` matched any short trailing word
 	 * ("green-tea" → "green", "how-to" → "how", "sci-fi" → "sci"), so merely
 	 * creating a translation rewrote the source term's canonical display slug
 	 * and started 301-redirecting its live public URL. It also failed the
-	 * inverse — regioned/longer slugs ("pt-br", "zh-hans") were never stripped.
+	 * inverse - regioned/longer slugs ("pt-br", "zh-hans") were never stripped.
 	 * Anchoring to the real language slugs fixes both directions.
 	 *
 	 * @param string $slug Term slug, possibly language-suffixed.
@@ -206,7 +206,7 @@ final class TermTranslationManager {
 		// to `force_insert_term()` which writes raw via $wpdb and would
 		// create duplicate term rows.
 		//
-		// Lock key intentionally narrow — term IDs in wp_terms are
+		// Lock key intentionally narrow - term IDs in wp_terms are
 		// globally unique across taxonomies, so source_id is sufficient
 		// to scope the contention; we still include target_slug so
 		// different target-language translations of the same term don't
@@ -215,7 +215,7 @@ final class TermTranslationManager {
 		 * @hook perflocale/translation/create_term_lock_ttl
 		 *
 		 * Lock TTL (seconds) for the create_translation() critical
-		 * section in TermTranslationManager. Default 30 — terms have no
+		 * section in TermTranslationManager. Default 30 - terms have no
 		 * meta/featured-image copy step so the inserts are quick.
 		 *
 		 * @param int $ttl Default 30.
@@ -343,7 +343,7 @@ final class TermTranslationManager {
 		// get_term(). Without wp_slash a backslash in a term name/description
 		// is silently stripped in the translation sibling. The force_insert_term
 		// fallback below writes via raw $wpdb->insert (no unslash) and MUST keep
-		// the raw values — so slash only for this call.
+		// the raw values - so slash only for this call.
 		$slashed_args                = $args;
 		$slashed_args['description'] = isset( $args['description'] ) ? wp_slash( $args['description'] ) : null;
 		if ( $slashed_args['description'] === null ) {
@@ -399,7 +399,7 @@ final class TermTranslationManager {
 
 		// Link terms. A failure here would leave the freshly-created term as an
 		// orphan (a wp_terms row that's in no translation group), and we'd
-		// wrongly report success. Roll the term back and fail — mirrors
+		// wrongly report success. Roll the term back and fail - mirrors
 		// PostTranslationManager::do_create_translation()'s link-failure path.
 		if ( ! $this->link_terms( $source_id, $new_term_id, $target_slug, $source ) ) {
 			wp_delete_term( $new_term_id, $taxonomy );
@@ -471,24 +471,24 @@ final class TermTranslationManager {
 			return $result !== false;
 		}
 
-		// No group exists yet — same create-first-group race
+		// No group exists yet - same create-first-group race
 		// PostTranslationManager has. Two concurrent term saves can both
 		// observe `$group === null`, both call `create_group()`, both
 		// succeed (translation_groups has no UNIQUE on (type, object_id)),
 		// leaving the source term in two groups. Serialise with the
-		// token-guarded Lock primitive — keyed by source_id only (term IDs
+		// token-guarded Lock primitive - keyed by source_id only (term IDs
 		// are globally unique across taxonomies in wp_terms).
 		$lock_result = \PerfLocale\Concurrency\Lock::with(
 			'link_term_first_group_' . $source_id,
 			30,
 			function () use ( $source_id, $target_id, $target_lang, $source ): bool {
-				// Re-read inside the lock — another worker may have
+				// Re-read inside the lock - another worker may have
 				// committed the group between the top-of-method
 				// find_for_object() and us acquiring the lock. The
 				// top-of-method call memoized its null in the request-local
 				// $find_cache; without dropping that entry the re-read
 				// returns the same stale null and never observes a group a
-				// concurrent PHP process just committed — defeating the guard
+				// concurrent PHP process just committed - defeating the guard
 				// and creating a second group for this term.
 				$this->groups->invalidate_find_cache( $source_id, ObjectType::Term );
 				$double_check = $this->groups->find_for_object( $source_id, ObjectType::Term );
@@ -503,7 +503,7 @@ final class TermTranslationManager {
 					return $result !== false;
 				}
 
-				// True first translation — create the group with the source
+				// True first translation - create the group with the source
 				// row, then link the target.
 				$source_lang = $this->languages->get_default();
 
@@ -538,7 +538,7 @@ final class TermTranslationManager {
 			return $lock_result;
 		}
 
-		// Lost the lock race — sibling worker is creating the first
+		// Lost the lock race - sibling worker is creating the first
 		// group right now. Re-read once more: if it landed, link the
 		// target through the existing-group branch. Drop the memoized null
 		// first so the re-read reflects the sibling's committed group.
@@ -596,7 +596,7 @@ final class TermTranslationManager {
 	 * Mirrors create_translation()'s decisions: 0 when nothing would be copied
 	 * (the source term is missing, the target language is unknown, or a
 	 * translation is already linked and would simply be returned), otherwise
-	 * the resolved content source — the default-language member of the group,
+	 * the resolved content source - the default-language member of the group,
 	 * or `$source_id` itself.
 	 *
 	 * Side-effect free, with no user policy: callers acting for a user apply
@@ -749,7 +749,7 @@ final class TermTranslationManager {
 			// 0      → either (a) row was deleted between the conflict-
 			// check SELECT and this UPDATE, OR (b) the row's
 			// language_id was already this value (idempotent
-			// no-op — MySQL reports affected_rows as CHANGED,
+			// no-op - MySQL reports affected_rows as CHANGED,
 			// not matched).
 			// >0     → row updated successfully.
 			// Previously the call ignored the return value and unconditionally
@@ -774,7 +774,7 @@ final class TermTranslationManager {
 				if ( $current_lang === null || (int) $current_lang !== (int) $lang->id ) {
 					return false;
 				}
-				// Else: idempotent — already at target language. Fall through.
+				// Else: idempotent - already at target language. Fall through.
 			}
 
 			$this->groups->invalidate_group_cache( (int) $group->id );
@@ -887,7 +887,7 @@ final class TermTranslationManager {
 
 			// Set slug translation for every term in the group. Look up
 			// each term's taxonomy (the slug-translations subtype) at the
-			// callsite — different members of the same translation group
+			// callsite - different members of the same translation group
 			// always share the taxonomy in practice, but resolving per
 			// member keeps us correct if that invariant ever changes.
 			foreach ( $members as $m ) {
@@ -947,7 +947,7 @@ final class TermTranslationManager {
 		// wp_unique_term_slug()'s intent.
 		//
 		// Both halves of that walk are load-bearing. get_term_by( 'slug', ... )
-		// hands the needle to WP_Term_Query, which sanitize_title()s it — so a
+		// hands the needle to WP_Term_Query, which sanitize_title()s it - so a
 		// $base already at SLUG_MAX_LENGTH makes every "$base-N" candidate come
 		// back as $base itself, the same pre-existing term matches forever and
 		// the loop never terminates: a 100% CPU spin holding

@@ -31,7 +31,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 *
 	 * Shared across all instances (static). Entries are cleared by
 	 * invalidate_find_cache() when groups/links change. Capped at
-	 * FIND_CACHE_CAP entries — long-running CLI processes (bulk MT,
+	 * FIND_CACHE_CAP entries - long-running CLI processes (bulk MT,
 	 * sitemap rebuild, XLIFF import) walk every post and would otherwise
 	 * grow this array to N×~150 bytes per entry without bound.
 	 *
@@ -66,8 +66,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * Per-request memo of the eager link map, keyed by `{blog_id}:{type}`.
 	 *
 	 * Each entry is either:
-	 *   - array<int, list<object>>  — object_id → group's full link list
-	 *   - 'too_large'               — sentinel: this blog is over the size
+	 *   - array<int, list<object>>  - object_id → group's full link list
+	 *   - 'too_large'               - sentinel: this blog is over the size
 	 *                                 cap, fall back to per-post caching
 	 *
 	 * Multisite must blog-prefix the key (same pattern as $find_cache via
@@ -86,16 +86,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * Blog-prefixed for the same reason as $find_cache and
 	 * $eager_link_map_memo: group ids are per-blog, so on multisite the same
 	 * id names a different group on every blog and an id-only memo hands
-	 * blog B the answer computed for blog A — a string write would then be
+	 * blog B the answer computed for blog A - a string write would then be
 	 * let loose on (or refused for) the wrong group.
 	 *
 	 * Cleared by reset_static_caches() as well, and the blog key is not what
-	 * makes that necessary — a replace-mode import is. DataImporter wipes
+	 * makes that necessary - a replace-mode import is. DataImporter wipes
 	 * `translation_groups` and re-inserts the export's rows under their
 	 * ORIGINAL ids, and the table is polymorphic (post, term and string groups
 	 * share one id space), so an id this process already answered for can come
 	 * back carrying a different type. Every import path closes with
-	 * MigrationCacheHelper::flush_post_migration_caches(), which routes here —
+	 * MigrationCacheHelper::flush_post_migration_caches(), which routes here -
 	 * without this line an Action Scheduler worker that ran a string job
 	 * before the import would keep answering from the pre-import types for the
 	 * rest of its process lifetime.
@@ -124,25 +124,39 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 	/**
 	 * Seconds after this process deleted a blog's cached all-language status
-	 * selections during which another status change in the same process does
-	 * not delete them again (forget_status_selectors()).
+	 * selections, or deferred that deletion, during which another status
+	 * change in the same process does not delete them again
+	 * (forget_status_selectors()).
 	 */
 	private const STATUS_SELECTORS_FORGET_SECONDS = 2.0;
 
 	/**
 	 * When this process last deleted a blog's cached all-language status
-	 * selections (microtime( true ), see forget_status_selectors()), keyed by
-	 * blog id. A request or job that changes the status of many posts deletes
-	 * those entries once per STATUS_SELECTORS_FORGET_SECONDS instead of once
-	 * per post, and a long-running process (WP-CLI, cron, Action Scheduler)
-	 * still deletes them again on a later change. Reading a selection in this
-	 * process removes the blog's entry. Not part of reset_static_caches():
-	 * that runs on every `switch_blog`, which would bring back one delete per
-	 * post where a host switches to the same blog on each save.
+	 * selections or deferred that deletion (microtime( true ), see
+	 * forget_status_selectors()), keyed by blog id. A request or job that
+	 * changes the status of many posts deletes those entries once per
+	 * STATUS_SELECTORS_FORGET_SECONDS instead of once per post, and a
+	 * long-running process (WP-CLI, cron, Action Scheduler) still deletes them
+	 * again on a later change. Reading a selection in this process removes the
+	 * blog's entry. Not part of reset_static_caches(): that runs on every
+	 * `switch_blog`, which would bring back one delete per post where a host
+	 * switches to the same blog on each save.
 	 *
 	 * @var array<int, float>
 	 */
 	private static array $status_selectors_forgotten_at = [];
+
+	/**
+	 * Blogs whose cached all-language status selections a status change asked
+	 * to delete while a transaction was registered (set_in_transaction()),
+	 * keyed by blog id, valued by the default language ID. A pending-work
+	 * record, not a memo: release_status_selectors() deletes them once that
+	 * transaction has ended, so no option DELETE runs inside it. Like
+	 * $status_selectors_forgotten_at, not part of reset_static_caches().
+	 *
+	 * @var array<int, int>
+	 */
+	private static array $status_selectors_pending = [];
 
 	/**
 	 * Suspend eager-link-map reads/rebuilds for the duration of a bulk
@@ -193,8 +207,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * has zero links of the type.
 	 *
 	 * Distinct from a stored `[]` on purpose. A `[]` is what a FAILED cold
-	 * build used to persist — `wpdb::get_var()` answers NULL on error and
-	 * `(int) null === 0`, which took the "no rows" branch — so the two states
+	 * build used to persist - `wpdb::get_var()` answers NULL on error and
+	 * `(int) null === 0`, which took the "no rows" branch - so the two states
 	 * are indistinguishable in the pre-1.0.1 shape, and the memo handed the
 	 * empty array to every consumer after the first as an authoritative
 	 * "this object has no translations". With this sentinel, `[]` means only
@@ -221,9 +235,10 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * create_group()/link_object() that a transaction is already active so they
 	 * nest inside it rather than issuing a second START (which MySQL treats as
 	 * an implicit COMMIT of the outer). The owner MUST reset this to false on
-	 * every exit path (commit, rollback, throw) — ideally via try/finally —
+	 * every exit path (commit, rollback, throw) - ideally via try/finally -
 	 * otherwise a leaked `true` would silently run later statements outside any
-	 * transaction.
+	 * transaction. An owner whose transaction can change a post status calls
+	 * release_status_selectors() after its COMMIT or ROLLBACK.
 	 *
 	 * @param bool $active Whether an external transaction is now active.
 	 * @return void
@@ -243,6 +258,14 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	private readonly CacheManager $cache;
 
 	/**
+	 * The group create_group() is linking its first object into. It holds no
+	 * link yet, so link_object() reads no member that the new link replaces.
+	 *
+	 * @var int
+	 */
+	private int $new_group_id = 0;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param CacheManager $cache Cache manager.
@@ -257,7 +280,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	/**
 	 * Resolve the groups table name for the current blog.
 	 *
-	 * Computed on every call so switch_to_blog() is honoured — capturing
+	 * Computed on every call so switch_to_blog() is honoured - capturing
 	 * the name in the constructor would otherwise pin this instance to
 	 * the blog that was active at construction.
 	 *
@@ -283,8 +306,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 *
 	 * Every member of a translation group sees the same `$value` (the full
 	 * link list). Pre-populating L1 for every sibling means downstream
-	 * get_translations(sibling_id) calls — hreflang, language switcher,
-	 * cross-language permalinks — hit L1 immediately instead of round-
+	 * get_translations(sibling_id) calls - hreflang, language switcher,
+	 * cross-language permalinks - hit L1 immediately instead of round-
 	 * tripping to L2 or worse.
 	 *
 	 * @param mixed                       $value    Link list (array of objects) or anything else (skipped).
@@ -349,7 +372,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * change underneath a still-running process: after a language slug
 	 * rename or delete (LanguageRepository), and after a data import
 	 * (MigrationCacheHelper). Only the import is what makes clearing
-	 * $is_string_group_memo more than belt-and-braces — a rename touches no
+	 * $is_string_group_memo more than belt-and-braces - a rename touches no
 	 * group row, but a replace-mode import can put a different TYPE behind an
 	 * id this process already answered for. See that property's docblock.
 	 *
@@ -377,6 +400,25 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	}
 
 	/**
+	 * Drop the current blog's per-process find_for_object() answers for one
+	 * object type, so the next lookups read the database. For a caller that
+	 * must build from data read after a given moment (the stored copy maps of
+	 * InventorySync).
+	 *
+	 * @param ObjectType $type Object type.
+	 * @return void
+	 */
+	public static function forget_found_groups( ObjectType $type ): void {
+		$prefix = get_current_blog_id() . ':group_' . $type->value . '_';
+
+		foreach ( array_keys( self::$find_cache ) as $key ) {
+			if ( str_starts_with( (string) $key, $prefix ) ) {
+				unset( self::$find_cache[ $key ] );
+			}
+		}
+	}
+
+	/**
 	 * Find a group by ID.
 	 *
 	 * @param int $id Group ID.
@@ -398,7 +440,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	/**
 	 * Find an object's OWN link row (group membership plus language).
 	 *
-	 * {@see find_for_object()} answers "which group is this in?" — it selects
+	 * {@see find_for_object()} answers "which group is this in?" - it selects
 	 * `g.*`, so it structurally cannot say which LANGUAGE the object is filed
 	 * under. Callers that need to decide whether an object is already filed
 	 * correctly (the WPML/Polylang importers, which must re-language objects
@@ -616,11 +658,11 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return;
 		}
 
-		// Step 0 — eager map fast-path. On small/medium sites (under the
+		// Step 0 - eager map fast-path. On small/medium sites (under the
 		// row + byte caps) we keep every translation_link in a single
 		// autoloaded option that costs ~1 µs to read (alloptions cache
 		// hit). When present, the whole prime path collapses to "copy
-		// what's needed into L1" — no SELECT-IN, no JOIN, no transient
+		// what's needed into L1" - no SELECT-IN, no JOIN, no transient
 		// peek. Bigger sites get a null return here and fall through to
 		// Steps 1-4 unchanged.
 		$eager_map = $this->get_eager_link_map( $type );
@@ -636,7 +678,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				$links = $eager_map[ $id ] ?? [];
 				$this->cache->set_static( $key, $links, 'perflocale_trans' );
 
-				// Sibling cascade — every member of this object's group
+				// Sibling cascade - every member of this object's group
 				// shares the same link list, so seed L1 for each.
 				foreach ( $links as $link ) {
 					$sibling_id = (int) ( $link->object_id ?? 0 );
@@ -654,7 +696,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return;
 		}
 
-		// Step 1 — drop anything already warm in L1 or L2. Pulling an L2 hit
+		// Step 1 - drop anything already warm in L1 or L2. Pulling an L2 hit
 		// (object cache) forward into L1 collapses the rest of the function to
 		// a no-op for warm-cache requests; without it, Redis/Memcached sites
 		// would still pay the L3 peek or the Step 3 JOIN. L2 reads go through
@@ -679,7 +721,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 			if ( $check_l2 ) {
 				$found = false;
-				// Must use CacheManager's generation-prefixed key — the L2
+				// Must use CacheManager's generation-prefixed key - the L2
 				// entries this fast-path skips on were written by
 				// CacheManager::get(); a bare $key would miss them all.
 				$value = wp_cache_get( CacheManager::l2_key( $key, 'perflocale_trans' ), 'perflocale_trans', false, $found );
@@ -694,7 +736,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			$after_l1[] = $id;
 		}
 
-		// Pipelined L2 fetch — one MGET for every cold L1 key. Keys must be
+		// Pipelined L2 fetch - one MGET for every cold L1 key. Keys must be
 		// generation-prefixed to match CacheManager::get()'s L2 writes, so
 		// fetch by versioned key and map the result back to the logical key.
 		if ( $l2_needed !== [] ) {
@@ -721,11 +763,11 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return;
 		}
 
-		// Step 2 — batched read of L3 transients for the remaining IDs. One
+		// Step 2 - batched read of L3 transients for the remaining IDs. One
 		// SELECT-IN + skipping writes for already-populated transients avoids
 		// set_transient()'s 3-queries-per-ID rewrite on warm requests. Under an
 		// external object cache transients aren't in wp_options, so the peek
-		// would return zero rows — skip it and let Step 3 + the object-cache-
+		// would return zero rows - skip it and let Step 3 + the object-cache-
 		// aware get_translations() fill path handle priming.
 		$stale_timeout_keys = [];
 
@@ -779,7 +821,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				$transient_id = $this->transient_option_name( $cache_key );
 
 				$has_value = array_key_exists( $transient_id, $existing_values );
-				// No timeout row = non-expiring (WP semantics — and exactly
+				// No timeout row = non-expiring (WP semantics - and exactly
 				// what CacheManager::set_many() writes: it skips the timeout
 				// row by design and relies on CacheInvalidator for staleness).
 				// Only an existing timeout in the past means expired. Requiring
@@ -904,14 +946,14 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		// Build the full write set first (own entries + sibling cascade) so a
 		// single batched cache->set_many() call collapses what used to be
-		// N × 2 update_option round-trips into multi-row INSERTs — one on the
+		// N × 2 update_option round-trips into multi-row INSERTs - one on the
 		// page-render path this method actually serves, and a bounded handful
 		// on a bulk prime, where set_many() splits the batch at its
 		// per-statement row/byte ceiling (500 rows / 256 KB). An entry here is
 		// one link row per language (~1.7 KB across four languages), so it is
-		// the byte ceiling that trips first — set_many() lets a single
+		// the byte ceiling that trips first - set_many() lets a single
 		// over-budget row through on its own, and nothing this method writes
-		// gets near that — leaving every statement well inside the 1 MB
+		// gets near that - leaving every statement well inside the 1 MB
 		// max_allowed_packet floor the budget is sized against.
 		$to_write = [];
 
@@ -984,7 +1026,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * and runs at most once per request.
 	 *
 	 * Only TRUE is cached. FALSE is checked again on the next request,
-	 * so a newly-created group becomes visible immediately — no explicit
+	 * so a newly-created group becomes visible immediately - no explicit
 	 * cache invalidation hook needed.
 	 *
 	 * @return bool
@@ -1010,7 +1052,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// Blog-prefixed key, same shape as find_cache_key()/eager_memo_key():
 		// a bare $group_id would serve another blog's group type after a
 		// switch_to_blog(). Lives on a class static rather than a
-		// function-local one so reset_static_caches() can reach it — see the
+		// function-local one so reset_static_caches() can reach it - see the
 		// property docblock for the replace-mode import that makes that
 		// reachability load-bearing rather than cosmetic.
 		$memo_key = get_current_blog_id() . ':' . $group_id;
@@ -1039,7 +1081,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return self::$has_any_groups_memo;
 		}
 
-		// L0 — autoloaded option. On no-Redis sites this is the only place
+		// L0 - autoloaded option. On no-Redis sites this is the only place
 		// the TRUE answer survives across requests without paying a DB
 		// roundtrip, since L2 (wp_cache) is per-request without persistence.
 		// The option is loaded with alloptions on every request, so reads
@@ -1049,7 +1091,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return self::$has_any_groups_memo;
 		}
 
-		// L1 — survives `reset_static()` cycles that some flows trigger
+		// L1 - survives `reset_static()` cycles that some flows trigger
 		// mid-request but is the first place a pinned TRUE answer lives.
 		$l1 = $this->cache->get_static( 'has_any_groups', 'perflocale_trans' );
 
@@ -1058,7 +1100,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return self::$has_any_groups_memo;
 		}
 
-		// L2 — pinned TRUE from a previous request on Redis-backed sites.
+		// L2 - pinned TRUE from a previous request on Redis-backed sites.
 		if ( $this->cache->l2_enabled() ) {
 			$found = false;
 			$value = wp_cache_get( 'has_any_groups', 'perflocale_trans', false, $found );
@@ -1070,7 +1112,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			}
 		}
 
-		// DB — cheap presence check; explicit LIMIT 1 stops the planner
+		// DB - cheap presence check; explicit LIMIT 1 stops the planner
 		// from scanning beyond the first matching row. The table name
 		// comes from Schema::table() (plugin-controlled `{$wpdb->prefix}
 		// perflocale_translation_groups`); not user input.
@@ -1091,7 +1133,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			}
 
 			// Persist via autoloaded option so subsequent requests skip
-			// the DB roundtrip entirely. Idempotent — no-op if already
+			// the DB roundtrip entirely. Idempotent - no-op if already
 			// stored as '1' on autoload.
 			update_option( 'perflocale_has_any_groups', '1', true );
 		}
@@ -1119,7 +1161,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			wp_cache_set( 'has_any_groups', 1, 'perflocale_trans', 0 );
 		}
 
-		// L0 — autoloaded option. update_option is a no-op if the value
+		// L0 - autoloaded option. update_option is a no-op if the value
 		// is already '1', so re-firing this on every group creation costs
 		// effectively nothing after the first one.
 		update_option( 'perflocale_has_any_groups', '1', true );
@@ -1155,7 +1197,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	public function get_eager_link_map( ObjectType $type ): ?array {
 		// Bulk-write suspension: a bulk-translate loop invalidates the map
 		// after EVERY created link, and the next row's read would rebuild
-		// and persist the whole map again — O(rows × map size). While
+		// and persist the whole map again - O(rows × map size). While
 		// suspended, readers fall back to the JOIN path (the pre-cap
 		// behaviour) and one rebuild happens after resume.
 		if ( self::$eager_link_map_suspended ) {
@@ -1180,6 +1222,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			// invariant explicit rather than relying on it.
 			return is_array( $cached ) && $cached !== [] ? $cached : null;
 		}
+
+		CacheManager::before_autoloaded_read( $option_key );
 
 		$stored = get_option( $option_key, false );
 
@@ -1206,7 +1250,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// could also write. It is therefore NOT trusted: fall through and
 		// rebuild once. The rebuild re-persists either the real map or
 		// EAGER_MAP_EMPTY, so an install poisoned by the old bug repairs itself
-		// on the next read instead of waiting for a write or a Clear Cache —
+		// on the next read instead of waiting for a write or a Clear Cache -
 		// one COUNT per blog/type after the update, not one per request.
 
 		// Caps are filterable so sites with extra RAM (or smaller envelope)
@@ -1240,7 +1284,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			)
 		);
 
-		// get_var() answers NULL when the query FAILED, and `(int) null` is 0 —
+		// get_var() answers NULL when the query FAILED, and `(int) null` is 0 -
 		// which used to take the "this type has no links" branch below and
 		// persist an AUTHORITATIVE empty map built from a deadlock or a "server
 		// has gone away". Every consumer then cached "no translations" until the
@@ -1282,8 +1326,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		);
 		// phpcs:enable
 
-		// A FAILED SELECT also yields `[]` here — wpdb::query() flushes
-		// last_result before it returns false — so `$rows === []` on its own
+		// A FAILED SELECT also yields `[]` here - wpdb::query() flushes
+		// last_result before it returns false - so `$rows === []` on its own
 		// cannot be read as "no rows". Check the error channel first and, on
 		// failure, persist and memoise nothing so a later healthy request
 		// rebuilds instead of the site serving an authoritative empty map.
@@ -1369,7 +1413,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @param string       $option_key Autoloaded option name.
 	 * @param array|string $value      Map, the {@see EAGER_MAP_EMPTY} sentinel,
 	 *                                 or the `'too_large'` sentinel. A bare `[]`
-	 *                                 is no longer written — see EAGER_MAP_EMPTY.
+	 *                                 is no longer written - see EAGER_MAP_EMPTY.
 	 * @return void
 	 */
 	private static function persist_eager_map( string $option_key, array|string $value ): void {
@@ -1388,17 +1432,18 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		++self::$link_changes;
 
 		$types = $type ? [ $type->value ] : [ 'post', 'term', 'string', 'post_type', 'taxonomy' ];
+		$names = [];
 
 		foreach ( $types as $t ) {
 			unset( self::$eager_link_map_memo[ self::eager_memo_key( $t ) ] );
-			delete_option( 'perflocale_eager_links_' . $t );
-			// delete_option() returns early WITHOUT clearing caches when the
-			// DB row is already gone — a cache entry orphaned by a rolled-back
-			// transaction (or an update/delete race between processes) then
-			// serves a stale map forever. Purge the single-option cache
-			// unconditionally so the next read must rebuild from the DB.
-			wp_cache_delete( 'perflocale_eager_links_' . $t, 'options' );
+			$names[] = 'perflocale_eager_links_' . $t;
 		}
+
+		// A map left in the cached alloptions list without its row (a
+		// rolled-back transaction, or a concurrent request that stored the
+		// list around this delete) would otherwise be served until the
+		// object cache is flushed; see CacheManager::delete_autoloaded_options().
+		CacheManager::delete_autoloaded_options( $names );
 
 		// A post-link mutation moves posts between language buckets, so the
 		// cached per-archive found_posts counts (PostQueryFilter's SQL_CALC
@@ -1419,7 +1464,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @return string Transient option base (without the `_transient_` prefix).
 	 */
 	private function transient_option_name( string $key ): string {
-		// Single source of truth lives in CacheManager — calling its public
+		// Single source of truth lives in CacheManager - calling its public
 		// derive method instead of reproducing the length-threshold + md5
 		// fallback inline guarantees we can't drift if either side changes.
 		return $this->cache->derive_transient_key( $key, 'perflocale_trans' );
@@ -1730,7 +1775,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	/**
 	 * `transition_post_status` handler: a translatable post that changed
 	 * status can change which sources the all-language status filter selects,
-	 * so the cached selections are deleted (forget_status_selectors()).
+	 * so the cached selections are deleted or, inside a registered
+	 * transaction, deferred (forget_status_selectors()).
 	 *
 	 * Registered by CacheManager::register_hooks() on write requests only.
 	 * A save that keeps the status, a post type that is not translatable and
@@ -1771,10 +1817,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Delete the cached all-language status selections of post groups for
-	 * one default language: one entry per status the Translations screen
-	 * offers ('empty' is never cached), from every cache layer. Skipped when
-	 * this process deleted them for the blog less than
+	 * Delete or, inside a registered transaction, defer the deletion of the
+	 * cached all-language status selections of post groups for one default
+	 * language: one entry per status the Translations screen offers ('empty'
+	 * is never cached), from every cache layer. A deferred deletion runs in
+	 * release_status_selectors() after that transaction ends, so it takes no
+	 * lock inside the transaction. Skipped when this process deleted them
+	 * for the blog, or deferred that deletion, less than
 	 * STATUS_SELECTORS_FORGET_SECONDS ago and has not read a selection since
 	 * ($status_selectors_forgotten_at).
 	 *
@@ -1790,6 +1839,70 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return;
 		}
 
+		if ( self::$in_transaction ) {
+			self::$status_selectors_forgotten_at[ $blog_id ] = microtime( true );
+			self::$status_selectors_pending[ $blog_id ]      = $source_language_id;
+
+			return;
+		}
+
+		unset( self::$status_selectors_pending[ $blog_id ] );
+
+		$this->delete_status_selectors( $source_language_id );
+
+		self::$status_selectors_forgotten_at[ $blog_id ] = microtime( true );
+	}
+
+	/**
+	 * Delete the status selections a status change asked to delete while a
+	 * transaction was registered, on every blog with a pending entry: a
+	 * callback inside the transaction can switch to another blog and change a
+	 * post status there. The current blog's selections are deleted in place;
+	 * another blog's between switch_to_blog() and restore_current_blog().
+	 * Does nothing while a transaction is still registered or when nothing is
+	 * pending.
+	 *
+	 * Any caller that registers a transaction with set_in_transaction( true )
+	 * and can change a post status calls this after its COMMIT or ROLLBACK.
+	 *
+	 * @internal Called by the TranslatePress importer around its batch transactions.
+	 *
+	 * @return void
+	 */
+	public function release_status_selectors(): void {
+		if ( self::$in_transaction || [] === self::$status_selectors_pending ) {
+			return;
+		}
+
+		$current_blog_id = get_current_blog_id();
+
+		foreach ( self::$status_selectors_pending as $blog_id => $source_language_id ) {
+			unset( self::$status_selectors_pending[ $blog_id ] );
+
+			if ( $blog_id === $current_blog_id ) {
+				$this->delete_status_selectors( $source_language_id );
+
+				continue;
+			}
+
+			switch_to_blog( $blog_id );
+
+			try {
+				$this->delete_status_selectors( $source_language_id );
+			} finally {
+				restore_current_blog();
+			}
+		}
+	}
+
+	/**
+	 * Delete one default language's cached all-language status selections of
+	 * post groups from every cache layer.
+	 *
+	 * @param int $source_language_id Default language ID (0 = none).
+	 * @return void
+	 */
+	private function delete_status_selectors( int $source_language_id ): void {
 		$keys = [];
 
 		foreach ( \PerfLocale\Enum\TranslationStatus::cases() as $status ) {
@@ -1799,8 +1912,6 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		$this->cache->delete_many( $keys, 'perflocale_trans' );
-
-		self::$status_selectors_forgotten_at[ $blog_id ] = microtime( true );
 	}
 
 	/**
@@ -1928,7 +2039,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return [];
 		}
 
-		// L0 — eager link map. Same fast-path as prime_translations Step 0:
+		// L0 - eager link map. Same fast-path as prime_translations Step 0:
 		// when the blog fits the size caps, every translation_link is in
 		// the autoloaded option, so a single-id lookup is an array hit
 		// instead of a 3-layer cache descent (worst-case DB roundtrip).
@@ -2110,7 +2221,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 *
 	 * When `$migration_source` is provided, the (migration_type, source_key)
 	 * tuple gets recorded in `perflocale_migration_source_map` INSIDE the
-	 * same transaction that creates the group row — so a retry after a
+	 * same transaction that creates the group row - so a retry after a
 	 * partial-failure crash or a post-import DB restore can find the
 	 * mapping and reuse the existing group_id instead of allocating a
 	 * duplicate. Callers (WpmlImporter / PolylangImporter) should
@@ -2129,7 +2240,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * plugin that survives DB restores (e.g. the source plugin's own
 	 * translation-group identifier, not the WP post_id). The `type`
 	 * string is the operator-facing name passed to
-	 * `wp perflocale migrate --force-restart <type>` — keep it short
+	 * `wp perflocale migrate --force-restart <type>` - keep it short
 	 * and stable.
 	 *
 	 * @param ObjectType                                $type Object type.
@@ -2173,7 +2284,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// If anything fails, both are rolled back - no orphaned empty groups.
 		// When an outer owner (e.g. a migration importer) has already opened a
 		// transaction and registered it via set_in_transaction(), nest inside it
-		// instead of issuing a second START — MySQL has no nested transactions,
+		// instead of issuing a second START - MySQL has no nested transactions,
 		// so a second START would IMPLICITLY COMMIT the outer one. Mirrors the
 		// $needs_own_transaction pattern in link_object().
 		$needs_own_transaction = ! self::$in_transaction;
@@ -2193,7 +2304,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		// try/finally guarantees the static $in_transaction flag is cleared
 		// (and the transaction rolled back) even if a hook fired inside
-		// link_object()/insert() throws — otherwise the flag would leak true
+		// link_object()/insert() throws - otherwise the flag would leak true
 		// for the rest of the request and make subsequent create_group()/
 		// link_object() calls silently run their statements outside a
 		// transaction.
@@ -2213,7 +2324,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			$group_id = (int) $this->wpdb->insert_id;
 
 			// Link the object.
-			$link_id = $this->link_object( $group_id, $object_id, $language_id, $status, $source );
+			$this->new_group_id = $group_id;
+
+			try {
+				$link_id = $this->link_object( $group_id, $object_id, $language_id, $status, $source );
+			} finally {
+				$this->new_group_id = 0;
+			}
 
 			if ( $link_id === false ) {
 				return false;
@@ -2228,7 +2345,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			// to the latest group rather than failing.
 			if ( is_array( $migration_source ) && $migration_source['type'] !== '' && $migration_source['key'] !== '' ) {
 				// Table bound with the %i identifier placeholder (WP 6.2+); values
-				// bound with %s/%s/%d — fully prepared, no interpolation. The
+				// bound with %s/%s/%d - fully prepared, no interpolation. The
 				// disable block spans the whole multi-line call because the
 				// sniff doesn't recognise the injected $this->wpdb property as
 				// the global $wpdb.
@@ -2284,7 +2401,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		// The pre-assignment read path caches an empty translations list for
 		// this object (auto_assign_default_language's detect runs before the
-		// group exists) — in L2 with an hour TTL and in the eager link map,
+		// group exists) - in L2 with an hour TTL and in the eager link map,
 		// so even a fresh request keeps seeing "no language" after the link
 		// lands. Same invalidation idiom as update_link_status().
 		$this->cache->flush_object( $object_id, $type->value );
@@ -2300,7 +2417,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 *
 	 * It enforces the invariant *"an object belongs to exactly one group of
 	 * its type"* by deleting the object's existing links before inserting the
-	 * new one — a `DELETE … INNER JOIN translation_groups … WHERE g.type =
+	 * new one - a `DELETE … INNER JOIN translation_groups … WHERE g.type =
 	 * <destination group's type> AND l.object_id = $object_id`, scoped to the
 	 * destination type so a term (or string) that merely shares the numeric
 	 * object_id keeps its own link. Correct for **posts and terms** (one post
@@ -2376,12 +2493,12 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		// Guard 3: the destination group must exist. Everything below keys off
-		// its type — the snapshot, the invariant DELETE and the type written
-		// into the new row — and with no group row there is no type: the DELETE
+		// its type - the snapshot, the invariant DELETE and the type written
+		// into the new row - and with no group row there is no type: the DELETE
 		// would fall back to "every link with this object_id, whatever its
 		// type", wiping a colliding term's (or string's) link and
 		// garbage-collecting that row's group, and the INSERT would store
-		// type='' — a link invisible to every type-qualified lookup — under a
+		// type='' - a link invisible to every type-qualified lookup - under a
 		// group id that names nothing. A missing group is always caller error
 		// (a group id read before a concurrent GC removed it, or a stale
 		// find_for_object() cache entry), never a state to write through.
@@ -2409,7 +2526,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// it from its group). Both the snapshot and the DELETE are therefore
 		// scoped to the DESTINATION group's type, and the row written carries
 		// that same type so the object_lang UNIQUE keeps the id-spaces apart.
-		// Guard 3 above guarantees the group row — and so the type — exists.
+		// Guard 3 above guarantees the group row - and so the type - exists.
 		$dest_type = (string) ( $group->type ?? '' );
 
 		// Use transaction to ensure DELETE + INSERT are atomic.
@@ -2452,7 +2569,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// the object belongs to exactly one group of that type. Type-scoped
 		// (see $dest_type note above) so a foreign type-space row that merely
 		// shares the numeric object_id is never wiped. Failure to delete means
-		// the invariant could be violated by the subsequent INSERT — abort +
+		// the invariant could be violated by the subsequent INSERT - abort +
 		// roll back so the broken state never commits.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders -- Replacements arrive via array_merge(), which WPCS cannot count.
 		$invariant_delete = $this->wpdb->query(
@@ -2472,6 +2589,39 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				self::$in_transaction = false;
 			}
 			return false;
+		}
+
+		// The post that holds this language in a post group leaves the group
+		// with the DELETE below, and the cached alternates of its page and of
+		// the group's pages still list it. Read it first (never the object
+		// being linked: its links of this type are gone already), locking the
+		// row that DELETE locks. A group create_group() made in this call has
+		// no link to read.
+		$displaced_id = 0;
+
+		if ( ObjectType::Post->value === $dest_type && $group_id !== $this->new_group_id ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders -- Table bound with %i; the NotPrepared sniff misses $this->wpdb->prepare().
+			$displaced = $this->wpdb->get_var(
+				$this->wpdb->prepare(
+					'SELECT object_id FROM %i WHERE group_id = %d AND language_id = %d FOR UPDATE',
+					$this->links_table(),
+					$group_id,
+					$language_id
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders
+
+			// A failed read means the transaction is in doubt, as for the
+			// statements around it.
+			if ( '' !== $this->wpdb->last_error ) {
+				if ( $needs_own_transaction ) {
+					$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					self::$in_transaction = false;
+				}
+				return false;
+			}
+
+			$displaced_id = (int) $displaced;
 		}
 
 		// Remove any existing link for this group+language
@@ -2585,7 +2735,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			) ) {
 				// Same shape as the INSERT-failure path at line ~1566: a true
 				// SQL error here (connection drop, lock timeout, permission)
-				// means the transaction is in a doubtful state — better to
+				// means the transaction is in a doubtful state - better to
 				// roll the whole link operation back so the caller can retry
 				// than to commit half-done cleanup with the main link applied.
 				// DELETE returning 0 affected rows is not false, so a benign
@@ -2617,20 +2767,31 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		// Invalidate cache for all objects in this group (including the new object).
-		$this->invalidate_group_cache( $group_id );
+		$member_ids = $this->invalidate_group_cache( $group_id );
 
 		// Refresh any previous group that survived the move so its remaining
 		// siblings no longer resolve the moved-out object as a member.
+		$left_member_ids = [];
+
 		foreach ( $surviving_prev as $prev_gid ) {
-			$this->invalidate_group_cache( $prev_gid );
+			$left_member_ids = array_merge( $left_member_ids, $this->invalidate_group_cache( $prev_gid ) );
 		}
 
-		// Also clear find_for_object cache for the linked object - the group
-		// cache query may not include it yet if the insert just happened.
-		$group_row = $this->find( $group_id );
-		if ( $group_row ) {
-			$find_key = self::find_cache_key( (string) $group_row->type, $object_id );
-			unset( self::$find_cache[ $find_key ] );
+		// The post that left the group is not among the members read above,
+		// so that invalidation did not reach its cached translations.
+		if ( $displaced_id > 0 ) {
+			$this->cache->flush_object( $displaced_id, $dest_type );
+			unset( self::$find_cache[ self::find_cache_key( $dest_type, $displaced_id ) ] );
+		}
+
+		// Also drop the linked object's find_for_object() entry, keyed by
+		// $dest_type (a group row's type never changes).
+		// invalidate_group_cache() above drops it only when its member
+		// SELECT succeeds.
+		unset( self::$find_cache[ self::find_cache_key( $dest_type, $object_id ) ] );
+
+		if ( ObjectType::Post->value === $dest_type ) {
+			self::report_link_change( $group_id, $object_id, $member_ids, $displaced_id, $left_member_ids );
 		}
 
 		/** @hook perflocale/translation/linked Fires after an object is linked to a group. */
@@ -2640,12 +2801,38 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	}
 
 	/**
+	 * Hand CacheInvalidator the posts a post link changed, for its
+	 * `perflocale/translation/linked` listener, which clears the cached
+	 * hreflang of their pages.
+	 *
+	 * @param int             $group_id        Group the object was linked to.
+	 * @param int             $object_id       Linked post.
+	 * @param array<int, int> $member_ids      The group's members after the link.
+	 * @param int             $displaced_id    Post that held the language in the group, 0 for none.
+	 * @param array<int, int> $left_member_ids Members of the groups the post left that still exist.
+	 * @return void
+	 */
+	private static function report_link_change( int $group_id, int $object_id, array $member_ids, int $displaced_id, array $left_member_ids ): void {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'cache_invalidator' ) ) {
+			return;
+		}
+
+		$invalidator = $plugin->get( 'cache_invalidator' );
+
+		if ( $invalidator instanceof \PerfLocale\Cache\CacheInvalidator ) {
+			$invalidator->note_link_change( $group_id, $object_id, $member_ids, $displaced_id, $left_member_ids );
+		}
+	}
+
+	/**
 	 * Additively link a language to a group via `INSERT … ON DUPLICATE KEY
 	 * UPDATE`. Sibling-language links are never touched.
 	 *
 	 * The intended collision is on the `(group_id, language_id)` UNIQUE key
-	 * `group_lang`, but the table carries a second UNIQUE — `object_lang`
-	 * `(type, object_id, language_id)` — and a stale link for this string in
+	 * `group_lang`, but the table carries a second UNIQUE - `object_lang`
+	 * `(type, object_id, language_id)` - and a stale link for this string in
 	 * another group collides on that one instead, updating a foreign row and
 	 * leaving this group unlinked. The write therefore re-reads the
 	 * group_lang key to decide what actually happened; when nothing linked,
@@ -2709,9 +2896,9 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			// instead of the intended group_lang (group_id, language_id). The
 			// ON DUPLICATE KEY UPDATE then rewrote a row that belongs to a
 			// DIFFERENT group and left its group_id alone, so nothing linked
-			// this string to $group_id. That stale row is unreachable debris —
+			// this string to $group_id. That stale row is unreachable debris -
 			// the strings table says this string belongs to $group_id, and a
-			// string carries exactly one group — so drop it and write again.
+			// string carries exactly one group - so drop it and write again.
 			// Same reap BulkStringTranslateJob performs, scoped by type
 			// because object_id is polymorphic (a post or term id collides
 			// freely with a string id) and by "not this group" so the row we
@@ -2752,7 +2939,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 *
 	 * The id is resolved by re-reading the group_lang key rather than by
 	 * trusting `insert_id`. On an ON DUPLICATE KEY UPDATE that updates,
-	 * `insert_id` names whichever row MySQL touched — and when the statement
+	 * `insert_id` names whichever row MySQL touched - and when the statement
 	 * collided on the object_lang key that is a row in a DIFFERENT group, so
 	 * returning it would report success for a link this group never got.
 	 * Costs one indexed lookup on the UNIQUE key per call.
@@ -2768,7 +2955,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table bound with %i; the NotPrepared sniff misses $this->wpdb->prepare().
 		// upsert_link() is the string-group-safe path (link_object()'s Guard 2
 		// routes string groups here; nothing routes post/term groups here), so
-		// type is always 'string' — set it explicitly, no group lookup needed.
+		// type is always 'string' - set it explicitly, no group lookup needed.
 		$result = $this->wpdb->query(
 			$this->wpdb->prepare(
 				'INSERT INTO %i (group_id, object_id, language_id, type, status, source)
@@ -2833,8 +3020,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	/**
 	 * Update the status/source of ONE object's translation link.
 	 *
-	 * `object_id` is polymorphic — it is a post id under `type='post'` and a
-	 * term id under `type='term'`, and the two id-spaces collide freely — so
+	 * `object_id` is polymorphic - it is a post id under `type='post'` and a
+	 * term id under `type='term'`, and the two id-spaces collide freely - so
 	 * the UPDATE is scoped by type as well. Without that scope, publishing
 	 * post 42's German translation also rewrote the status of term 42's
 	 * German link.
@@ -2854,10 +3041,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 *                                   chose $status by reading the current one, since
 	 *                                   the read and this write are separate statements.
 	 *                                   Null writes unconditionally.
-	 * @return bool True when the row was written. With $expect_status set, false also
+	 * @param string|null $expect_updated_at Write ONLY while the row's `updated_at` still
+	 *                                   reads this value as well: no other write reached
+	 *                                   the row since that time was read. Null for none.
+	 * @return bool True when the row was written. With a precondition set, false also
 	 *              means the precondition no longer held and nothing was changed.
 	 */
-	public function update_link_status( int $object_id, int $language_id, string $status, string $source = '', ObjectType $type = ObjectType::Post, ?string $expect_status = null ): bool {
+	public function update_link_status( int $object_id, int $language_id, string $status, string $source = '', ObjectType $type = ObjectType::Post, ?string $expect_status = null, ?string $expect_updated_at = null ): bool {
 		$data   = [
 			'status'     => sanitize_key( $status ),
 			'updated_at' => current_time( 'mysql' ),
@@ -2886,6 +3076,11 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			$where_format[]  = '%s';
 		}
 
+		if ( $expect_updated_at !== null ) {
+			$where['updated_at'] = $expect_updated_at;
+			$where_format[]      = '%s';
+		}
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$result = $this->wpdb->update(
 			$this->links_table(),
@@ -2903,16 +3098,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		// This has to return early rather than fall through. Flushing the
 		// object cache and firing `status_changed` for a write that did not
 		// happen would tell the switcher, hreflang and any CDN integration to
-		// re-read a status that never changed — and would report success to a
+		// re-read a status that never changed - and would report success to a
 		// caller whose whole reason for passing a precondition was to find out.
-		if ( $expect_status !== null && ( $result === false || (int) $result === 0 ) ) {
+		if ( ( $expect_status !== null || $expect_updated_at !== null ) && ( $result === false || (int) $result === 0 ) ) {
 			return false;
 		}
 
 		if ( $result !== false ) {
 			// Invalidate the type that was actually written. Flushing a type
 			// the write never touched costs two pointless cache deletes AND
-			// fires `perflocale/cache/flush_object` with that wrong type — a
+			// fires `perflocale/cache/flush_object` with that wrong type - a
 			// payload CDN integrations listening on the hook would turn into a
 			// spurious purge.
 			$this->cache->flush_object( $object_id, $type->value );
@@ -2948,6 +3143,58 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		return $result !== false;
+	}
+
+	/**
+	 * One object's translation link as stored now: its status and the time
+	 * it was last written, read from the table (no cache). Null when the
+	 * object has no link in that language, or when the query gave no answer.
+	 * One indexed query, for a decision that must see other processes'
+	 * writes; keep it off paths the caches serve.
+	 *
+	 * @param int        $object_id   Object ID.
+	 * @param int        $language_id Language ID.
+	 * @param ObjectType $type        Object type the id belongs to.
+	 * @return array{status: string, updated_at: string}|null
+	 */
+	public function get_link_state( int $object_id, int $language_id, ObjectType $type = ObjectType::Post ): ?array {
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- A read that must bypass every cache. The identifier is bound with %i; WPCS cannot follow prepare() called on a property.
+		$sql = $this->wpdb->prepare(
+			'SELECT status, updated_at FROM %i WHERE object_id = %d AND language_id = %d AND type = %s LIMIT 1',
+			$this->links_table(),
+			$object_id,
+			$language_id,
+			$type->value
+		);
+
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return null;
+		}
+
+		// query() answers the number of rows only when this query ran; the
+		// row is then in last_result (get_row() would hand back an earlier
+		// query's row when this one did not run).
+		$rows = $this->wpdb->query( $sql );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( ! is_int( $rows ) || 0 === $rows ) {
+			return null;
+		}
+
+		$result     = $this->wpdb->last_result;
+		$row        = is_array( $result ) ? ( $result[0] ?? null ) : null;
+		$fields     = is_object( $row ) ? get_object_vars( $row ) : [];
+		$status     = $fields['status'] ?? null;
+		$updated_at = $fields['updated_at'] ?? null;
+
+		if ( ! is_string( $status ) || ! is_string( $updated_at ) ) {
+			return null;
+		}
+
+		return [
+			'status'     => $status,
+			'updated_at' => $updated_at,
+		];
 	}
 
 	/**
@@ -3027,8 +3274,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				$this->delete_source_map_for_group( (int) $link->group_id );
 
 				// A group was garbage-collected. Drop the per-request memo so
-				// the next has_any_groups() re-checks, and — if NO groups
-				// remain at all — clear the autoloaded fast-path flag so a
+				// the next has_any_groups() re-checks, and - if NO groups
+				// remain at all - clear the autoloaded fast-path flag so a
 				// site that just removed its last translation returns to the
 				// zero-overhead gate instead of pinning it "on" forever.
 				// Self-healing: has_any_groups() re-queries + re-sets the flag
@@ -3037,7 +3284,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				self::$has_any_groups_memo = null;
 
 				// %i (WP 6.2+; plugin floor is 6.4) binds the table name as an
-				// identifier placeholder instead of string interpolation — same
+				// identifier placeholder instead of string interpolation - same
 				// semantics (prepare() backtick-quotes and escapes it), but the
 				// statement now contains no interpolated variable at all.
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -3163,7 +3410,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 		global $wpdb;
 
-		// $groups_table + $links_table come from Schema::table() — that
+		// $groups_table + $links_table come from Schema::table() - that
 		// helper returns "$wpdb->prefix . 'perflocale_' . <whitelist>",
 		// no user input, no shell interpolation, no SQL injection vector.
 		// Plugin Check's UnescapedDBParameter sniff can't trace the
@@ -3174,7 +3421,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		// MySQL doesn't allow LIMIT on multi-table DELETE, so split into a
 		// SELECT (with batch cap) and a single-table DELETE. LEFT JOIN +
-		// IS NULL is index-friendly here — the engine picks the (group_id)
+		// IS NULL is index-friendly here - the engine picks the (group_id)
 		// index on translation_links and the PK on groups.
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -3193,7 +3440,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return 0;
 		}
 
-		// Build a placeholder list — every value is a class-trusted bigint
+		// Build a placeholder list - every value is a class-trusted bigint
 		// from the SELECT above (no user input). Use %d so prepare()
 		// parameterises the IN-list properly.
 		$placeholders = implode( ', ', array_fill( 0, count( $ids ), '%d' ) );
@@ -3228,9 +3475,9 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * Invalidate cache for all objects in a translation group.
 	 *
 	 * @param int $group_id Group ID.
-	 * @return void
+	 * @return array<int, int> The objects the group links, as read for the invalidation; empty when the read failed.
 	 */
-	public function invalidate_group_cache( int $group_id ): void {
+	public function invalidate_group_cache( int $group_id ): array {
 		++self::$link_changes;
 
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -3248,7 +3495,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		if ( ! is_array( $links ) ) {
 			// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
-			return;
+			return [];
 		}
 
 		$dirty_types = [];
@@ -3272,14 +3519,19 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		if ( $dirty_types === [] ) {
 			$this->invalidate_eager_link_map();
 		} else {
+			$names = [];
+
 			foreach ( array_keys( $dirty_types ) as $type_value ) {
 				unset( self::$eager_link_map_memo[ self::eager_memo_key( $type_value ) ] );
-				delete_option( 'perflocale_eager_links_' . $type_value );
-				// Same orphaned-cache purge as invalidate_eager_link_map():
-				// delete_option() skips cache clearing when the row is gone.
-				wp_cache_delete( 'perflocale_eager_links_' . $type_value, 'options' );
+				$names[] = 'perflocale_eager_links_' . $type_value;
 			}
+
+			// Same as invalidate_eager_link_map(): a cached map without its
+			// row goes too.
+			CacheManager::delete_autoloaded_options( $names );
 		}
+
+		return array_map( static fn( $id ): int => is_numeric( $id ) ? (int) $id : 0, array_column( $links, 'object_id' ) );
 	}
 
 	/**
@@ -3337,7 +3589,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		// Cascade the links FIRST. A string group can carry language links
 		// (upsert_link() writes one per translated language), and deleting the
-		// group without them leaves rows whose group_id names nothing — debris
+		// group without them leaves rows whose group_id names nothing - debris
 		// that is not merely untidy: it occupies the object_lang UNIQUE
 		// (type, object_id, language_id), so the next upsert_link() for that
 		// string collides on it instead of on group_lang and the translation
@@ -3502,10 +3754,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			}
 		}
 
+		$names = [];
+
 		foreach ( array_keys( $dirty_types ) as $type_value ) {
 			unset( self::$eager_link_map_memo[ self::eager_memo_key( $type_value ) ] );
-			delete_option( 'perflocale_eager_links_' . $type_value );
-			wp_cache_delete( 'perflocale_eager_links_' . $type_value, 'options' );
+			$names[] = 'perflocale_eager_links_' . $type_value;
 		}
+
+		CacheManager::delete_autoloaded_options( $names );
 	}
 }

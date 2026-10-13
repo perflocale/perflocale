@@ -1,6 +1,6 @@
 <?php
 /**
- * AUTO-GENERATED — do not edit by hand.
+ * AUTO-GENERATED - do not edit by hand.
  *
  * Static FQCN → relative-path map used by the autoloader in
  * perflocale.php.
@@ -40,6 +40,7 @@ return [
 	'PerfLocale\\Admin\\DataExporter' => 'Admin/DataExporter.php',
 	'PerfLocale\\Admin\\DataImporter' => 'Admin/DataImporter.php',
 	'PerfLocale\\Admin\\EditorSidebar' => 'Admin/EditorSidebar.php',
+	'PerfLocale\\Admin\\LanguagePacks' => 'Admin/LanguagePacks.php',
 	'PerfLocale\\Admin\\LeftoverPluginCheck' => 'Admin/LeftoverPluginCheck.php',
 	'PerfLocale\\Admin\\MetaBox' => 'Admin/MetaBox.php',
 	'PerfLocale\\Admin\\ObjectLinks' => 'Admin/ObjectLinks.php',
@@ -65,6 +66,7 @@ return [
 	'PerfLocale\\Api\\JobsController' => 'Api/JobsController.php',
 	'PerfLocale\\Api\\LanguagesController' => 'Api/LanguagesController.php',
 	'PerfLocale\\Api\\MachineTranslateController' => 'Api/MachineTranslateController.php',
+	'PerfLocale\\Api\\NavigationLanguageField' => 'Api/NavigationLanguageField.php',
 	'PerfLocale\\Api\\RestController' => 'Api/RestController.php',
 	'PerfLocale\\Api\\StringsController' => 'Api/StringsController.php',
 	'PerfLocale\\Api\\TranslationsController' => 'Api/TranslationsController.php',
@@ -93,6 +95,7 @@ return [
 	'PerfLocale\\Background\\WorkerRegistry' => 'Background/WorkerRegistry.php',
 	'PerfLocale\\Background\\WpCronRunner' => 'Background/WpCronRunner.php',
 	'PerfLocale\\Bootstrap' => 'Bootstrap.php',
+	'PerfLocale\\BundledTranslations' => 'BundledTranslations.php',
 	'PerfLocale\\Cache\\CacheInvalidator' => 'Cache/CacheInvalidator.php',
 	'PerfLocale\\Cache\\CacheManager' => 'Cache/CacheManager.php',
 	'PerfLocale\\Cli\\AddonCommand' => 'Cli/AddonCommand.php',

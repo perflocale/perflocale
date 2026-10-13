@@ -231,8 +231,8 @@ final class AddonUninstaller {
 				null
 			);
 
-			// Notify on this exit too. Every other way out of purge() — the
-			// filter opt-out above and the normal completion below — fires this
+			// Notify on this exit too. Every other way out of purge() - the
+			// filter opt-out above and the normal completion below - fires this
 			// action, and HasCustomUninstall documents it as the terminal step
 			// of the purge contract. Staying silent exactly on the failure path
 			// is the worst case for an integrator: the one outcome they most
@@ -297,7 +297,7 @@ final class AddonUninstaller {
 		//
 		// None of them when ONE subsite is being deleted. On Redis a group
 		// flush reaches every blog, so it would empty every surviving site's
-		// options and transients because one blog went — and there is no
+		// options and transients because one blog went - and there is no
 		// stale read to prevent: the dying blog's keys carry its id, and core
 		// drops its tables right after this.
 		if ( ! $single_site_teardown && ( [] !== $plan->transient_prefixes || [] !== $plan->options ) ) {

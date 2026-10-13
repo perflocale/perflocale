@@ -3,9 +3,9 @@
  * CLDR plural rules: how many grammatical plural forms a language has, and
  * which form a given count selects.
  *
- * PerfLocale stores a plural string's forms across three places — form 0 in
+ * PerfLocale stores a plural string's forms across three places - form 0 in
  * the `singular`-context row, form 1 in the `plural`-context row, and forms
- * 2..N in that plural row's JSON `extra_forms` column — so the SERVING layer
+ * 2..N in that plural row's JSON `extra_forms` column - so the SERVING layer
  * needs, for a given (locale, number), the CLDR form INDEX. This class owns
  * that mapping: a shipped locale → gettext plural expression table (the same
  * data translate.wordpress.org uses) plus evaluation through WordPress's own
@@ -71,7 +71,7 @@ final class PluralRules {
 		'fr'  => array( 2, '(n > 1)' ),
 		'pt_br' => array( 2, '(n > 1)' ),
 		// Turkish + Persian are 2-form in BOTH CLDR (one/other) and every WP
-		// language-pack header ("nplurals=2; plural=(n > 1);") — classifying
+		// language-pack header ("nplurals=2; plural=(n > 1);") - classifying
 		// them 1-form silently discarded the plural msgstr WP-ecosystem POs
 		// ship. (n > 1) matches the header translators author under, so the
 		// n=0 text lands in the bucket they intended; for fa it is also the
@@ -79,39 +79,39 @@ final class PluralRules {
 		'tr'  => array( 2, '(n > 1)' ),
 		'fa'  => array( 2, '(n > 1)' ),
 
-		// 3 forms — Slavic (Russian/Ukrainian/Serbian/Croatian family).
+		// 3 forms - Slavic (Russian/Ukrainian/Serbian/Croatian family).
 		'ru'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2)' ),
 		'uk'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2)' ),
 		'sr'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2)' ),
 		'hr'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2)' ),
 		'be'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2)' ),
 
-		// 3 forms — Czech/Slovak.
+		// 3 forms - Czech/Slovak.
 		'cs'  => array( 3, '((n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2)' ),
 		'sk'  => array( 3, '((n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2)' ),
 
-		// 3 forms — Polish.
+		// 3 forms - Polish.
 		'pl'  => array( 3, '(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<12 || n%100>14) ? 1 : 2)' ),
 
-		// 3 forms — Lithuanian.
+		// 3 forms - Lithuanian.
 		'lt'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n%10>=2 && (n%100<10 || n%100>=20) ? 1 : 2)' ),
 
-		// 4 forms — Slovenian.
+		// 4 forms - Slovenian.
 		'sl'  => array( 4, '(n%100==1 ? 0 : n%100==2 ? 1 : n%100==3 || n%100==4 ? 2 : 3)' ),
 
-		// 4 forms — Scottish Gaelic.
+		// 4 forms - Scottish Gaelic.
 		'gd'  => array( 4, '((n==1 || n==11) ? 0 : (n==2 || n==12) ? 1 : (n > 2 && n < 20) ? 2 : 3)' ),
 
-		// 6 forms — Arabic.
+		// 6 forms - Arabic.
 		'ar'  => array( 6, '(n==0 ? 0 : n==1 ? 1 : n==2 ? 2 : n%100>=3 && n%100<=10 ? 3 : n%100>=11 ? 4 : 5)' ),
 
-		// 4 forms — Welsh.
+		// 4 forms - Welsh.
 		'cy'  => array( 4, '((n==1) ? 0 : (n==2) ? 1 : (n != 8 && n != 11) ? 2 : 3)' ),
 
-		// 3 forms — Latvian.
+		// 3 forms - Latvian.
 		'lv'  => array( 3, '(n%10==1 && n%100!=11 ? 0 : n != 0 ? 1 : 2)' ),
 
-		// 3 forms — Romanian.
+		// 3 forms - Romanian.
 		'ro'  => array( 3, '(n==1 ? 0 : (n==0 || (n%100 > 0 && n%100 < 20)) ? 1 : 2)' ),
 	);
 
@@ -178,7 +178,7 @@ final class PluralRules {
 	 * The CLDR plural FORM INDEX (0-based) a count selects in a locale.
 	 *
 	 * Delegates the arithmetic to WordPress's bundled {@see \Plural_Forms},
-	 * the same evaluator core uses for MO/PO plurals — so the result is
+	 * the same evaluator core uses for MO/PO plurals - so the result is
 	 * identical to what a native gettext consumer would pick. Compiled once
 	 * per expression and clamped to [0, nplurals-1] defensively.
 	 *

@@ -29,7 +29,7 @@ final class Activator {
 	 *
 	 * @param bool $fatal_on_missing_table When true (activation-hook path),
 	 *                                     wp_die() if a critical table is
-	 *                                     missing — that's the contract the
+	 *                                     missing - that's the contract the
 	 *                                     activation flow expects so the user
 	 *                                     sees the failure immediately.
 	 *                                     When false (called from
@@ -56,7 +56,7 @@ final class Activator {
 
 		// Every table defined in Schema.php must exist after activation. A
 		// host with restrictive DB perms could let dbDelta succeed on some
-		// tables and silently fail on others — verifying ALL of them
+		// tables and silently fail on others - verifying ALL of them
 		// surfaces partial-create failures at activation time instead of
 		// the first feature read against a missing table.
 		$required = [
@@ -102,17 +102,17 @@ final class Activator {
 
 		// Store the current DB and plugin versions. autoload=false because
 		// both values are only read by Migrator::maybe_migrate() on
-		// admin_init + rest_api_init paths, not by any frontend request —
+		// admin_init + rest_api_init paths, not by any frontend request -
 		// no need to carry them in alloptions on every page load.
 		// Autoloaded: both are tiny ints read by Migrator::maybe_migrate /
-		// maybe_update on wp_loaded — i.e. EVERY request — so a non-autoloaded
+		// maybe_update on wp_loaded - i.e. EVERY request - so a non-autoloaded
 		// row costs one options-table SELECT per request on sites without a
 		// persistent object cache.
 		// Only stamp the DB version on a FRESH install (no stored value). If a
 		// value is already present it belongs to the schema actually on disk:
 		// overwriting it with the new constant would make Migrator's
 		// `$current_version >= $target_version` gate short-circuit and silently
-		// skip every migration step. That happens on two ordinary flows —
+		// skip every migration step. That happens on two ordinary flows -
 		// deactivate → replace the plugin files → reactivate, and Delete plugin
 		// in the default preserve mode (which keeps the tables and the option).
 		// Harmless while DB_VERSION is 1, load-bearing from the first bump on.
@@ -129,7 +129,7 @@ final class Activator {
 
 		// Install the Translator role and grant the perflocale_* caps to
 		// administrators + editors right now, while we have a request.
-		// Without this, the caps would only land on the next admin_init —
+		// Without this, the caps would only land on the next admin_init -
 		// and the very first /wp-admin redirect after activation would
 		// 403 because the current user's $allcaps cache was built before
 		// the role caps existed. The admin_init handler stays in place
@@ -176,16 +176,17 @@ final class Activator {
 		// per-request there).
 		add_option( 'perflocale_disabled_addons', [], '', true );
 		add_option( 'perflocale_flush_rules', 1, '', true );
-		// Retire the stored variation maps a persistent object cache may
-		// still hold from an earlier activation (InventorySync).
+		// Retire the stored variation maps and copy maps a persistent object
+		// cache may still hold from an earlier activation (InventorySync).
 		delete_transient( \PerfLocale\WooCommerce\InventorySync::STORED_MAP_EPOCH );
+		delete_transient( \PerfLocale\WooCommerce\InventorySync::COPY_MAP_EPOCH );
 		self::set_autoload( 'perflocale_settings', 'yes' );
 		self::set_autoload( 'perflocale_webhooks', 'no' );
 		self::set_autoload( 'perflocale_addon_failures', 'yes' );
 		self::set_autoload( 'perflocale_disabled_addons', 'yes' );
 		self::set_autoload( 'perflocale_flush_rules', 'yes' );
 		// Version guards are read every request (Migrator on wp_loaded) /
-		// every admin request (caps guard on admin_init) — heal pre-existing
+		// every admin request (caps guard on admin_init) - heal pre-existing
 		// rows that were created with autoload off.
 		self::set_autoload( 'perflocale_db_version', 'yes' );
 		self::set_autoload( 'perflocale_version', 'yes' );
@@ -203,7 +204,7 @@ final class Activator {
 		//
 		// Scheduling at time() not time()+0 because some hosts trip on
 		// "you scheduled a past event"; +0 is fine in core but the +0
-		// idiom is explicit. The cron event is single-fire — no risk of
+		// idiom is explicit. The cron event is single-fire - no risk of
 		// the resume running on a steady-state interval.
 		//
 		// Idempotent: if the hook is already scheduled (rapid double-

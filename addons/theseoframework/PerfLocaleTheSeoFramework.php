@@ -70,7 +70,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
 	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context — where TSF's meta render data is still assembled for its SEO
+	 * context - where TSF's meta render data is still assembled for its SEO
 	 * bar but there is no fallback render to pin.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
@@ -108,12 +108,12 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 		// core's `get_canonical_url`, but TSF removes core's rel_canonical and
 		// emits its own, so that filter never fires and the guard is inert
 		// whenever this plugin is active. TSF 5.x exposes no canonical-specific
-		// filter — every head tag is assembled into one render-data map keyed
-		// by tag id — so the guard rides that map's `canonical` entry.
+		// filter - every head tag is assembled into one render-data map keyed
+		// by tag id - so the guard rides that map's `canonical` entry.
 		add_filter( 'the_seo_framework_meta_render_data', [ $this, 'pin_fallback_canonical' ] );
 
 		// TSF's "optimized sitemap" (on by default, replaces core sitemaps)
-		// builds its entries with plain WP_Query calls — without this unlock
+		// builds its entries with plain WP_Query calls - without this unlock
 		// PerfLocale's language filter stamps the default language onto those
 		// queries and every translated post vanishes from the sitemap. hpt =
 		// hierarchical post types, nhpt = non-hierarchical; TSF filters both.
@@ -132,7 +132,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	 *
 	 * TSF's own custom-canonical setting (`_genesis_canonical_uri`) is already
 	 * resolved into this href by the time the map is filtered, and
-	 * HreflangTags leaves an owner-set value alone — it only acts when the
+	 * HreflangTags leaves an owner-set value alone - it only acts when the
 	 * href is the post's own permalink.
 	 *
 	 * @param array<string, mixed>|mixed $data Meta render data keyed by tag id.
@@ -200,7 +200,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 
 	/**
 	 * Machine-translatable SEO meta: titles/descriptions/social text ONLY.
-	 * The focus keyword is deliberately excluded — keyword targeting in the
+	 * The focus keyword is deliberately excluded - keyword targeting in the
 	 * target language is a human decision (add it back via this same filter
 	 * if a site wants it). Gated by the mt_meta_seo setting.
 	 *
@@ -209,7 +209,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	 * @return array<int, string>
 	 */
 	/**
-	 * The SEO Framework meta keys this addon machine-translates — all plain-text
+	 * The SEO Framework meta keys this addon machine-translates - all plain-text
 	 * SEO fields, so all route to the provider's text mode via mt_meta_key_format().
 	 */
 	private const MT_TEXT_KEYS = [
@@ -249,17 +249,17 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	 * Enrich TSF's schema graph with inLanguage + translation siblings.
 	 *
 	 * TSF passes a SEQUENTIAL LIST of graph entities, which is the shape
-	 * SchemaEnricher::enrich_graph() handles directly — unlike the Rank Math,
+	 * SchemaEnricher::enrich_graph() handles directly - unlike the Rank Math,
 	 * SEOPress and Slim SEO addons, whose hosts pass a keyed map and which
 	 * therefore enrich entity by entity.
 	 *
 	 * Untyped parameter: TSF survives a non-array return from this filter and
-	 * keeps rendering — `$graph = apply_filters( 'the_seo_framework_schema_graph_data', … );`
+	 * keeps rendering - `$graph = apply_filters( 'the_seo_framework_schema_graph_data', … );`
 	 * is followed immediately by `if ( empty( $graph ) ) return [];`
 	 * (inc/classes/meta/schema.class.php:142-148), so a null from an earlier
 	 * callback drops the graph rather than fataling. An `array` declaration
 	 * would turn that survivable case into a TypeError raised at ARGUMENT
-	 * BINDING, before this body could return — the shape that took down
+	 * BINDING, before this body could return - the shape that took down
 	 * wpseo_sitemap_entry and wpseo_breadcrumb_links. The other five SEO
 	 * addons already hand an unrecognised payload straight back; this is the
 	 * last one that did not.

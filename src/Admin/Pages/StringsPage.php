@@ -29,7 +29,7 @@ final class StringsPage {
 	 * Controls the save form posts that are NOT one of the per-cell inputs:
 	 * `_wpnonce`, `_wp_http_referer`, the `perflocale_save_string_translations`
 	 * flag and the three filter carriers (`domain_filter`, `search`, `paged`)
-	 * — seven with the submit button, which posts into the form through its
+	 * - seven with the submit button, which posts into the form through its
 	 * `form` attribute. The remainder is slack: PHP's own cut-off is not exact
 	 * (a 1000-var limit was measured delivering 1001 names on PHP 8.2), and a
 	 * reserve costing 1.6% of a stock host's budget is cheaper than being one
@@ -40,7 +40,7 @@ final class StringsPage {
 	private const SAVE_FORM_RESERVED_INPUTS = 16;
 
 	/**
-	 * Preloaded plural extra_forms per "string_id_language_id" — populated
+	 * Preloaded plural extra_forms per "string_id_language_id" - populated
 	 * by preload_translation_texts() so the grid renders the extra plural
 	 * inputs without a per-cell query.
 	 *
@@ -113,8 +113,8 @@ final class StringsPage {
 
 		// Screen Options accepts up to 999 rows, and the save form below posts
 		// one input per (row × language): 999 rows over five languages is 5,016
-		// controls in ONE POST. PHP stops parsing at `max_input_vars` — 1000 on
-		// a stock host — and silently drops everything past the cut-off. The
+		// controls in ONE POST. PHP stops parsing at `max_input_vars` - 1000 on
+		// a stock host - and silently drops everything past the cut-off. The
 		// nonce, the action flag and the filter carriers are first in the form
 		// so they always survive; the save therefore runs, reports success and
 		// discards every edit that landed in the truncated tail. Nothing
@@ -180,7 +180,7 @@ final class StringsPage {
 		}
 
 		// PO export/import live next to the page heading (alongside the
-		// Documentation link) instead of in the per-row toolbar — they're
+		// Documentation link) instead of in the per-row toolbar - they're
 		// page-level actions, not per-result actions, and this matches
 		// WP-admin convention for top-of-page actions. Same non-default
 		// list the MT toolbar uses above.
@@ -302,12 +302,12 @@ final class StringsPage {
 
 			<?php if ( $save_failed > 0 ) : ?>
 				<div class="notice notice-error is-dismissible">
-					<p><?php /* translators: %d: number of translations that could not be saved */ printf( esc_html( _n( '%d translation could not be saved and was discarded — a database error stopped the write. Copy your text before reloading, then try again.', '%d translations could not be saved and were discarded — a database error stopped the write. Copy your text before reloading, then try again.', $save_failed, 'perflocale' ) ), esc_html( $save_failed ) ); ?></p>
+					<p><?php /* translators: %d: number of translations that could not be saved */ printf( esc_html( _n( '%d translation could not be saved and was discarded - a database error stopped the write. Copy your text before reloading, then try again.', '%d translations could not be saved and were discarded - a database error stopped the write. Copy your text before reloading, then try again.', $save_failed, 'perflocale' ) ), esc_html( $save_failed ) ); ?></p>
 				</div>
 			<?php endif; ?>
 
 			<?php
-			// PO import flash notice — pulled from a per-user transient so
+			// PO import flash notice - pulled from a per-user transient so
 			// the redirect back from the import handler doesn't leave
 			// `po_message=…&imported=…&errors=…` query strings in the URL
 			// (mirrors the scan-result transient pattern above).
@@ -318,10 +318,10 @@ final class StringsPage {
 			}
 
 			// Error-only messages (no_lang / missing_input / export_fail) still
-			// come through URL params for now — they're set on a redirect from
+			// come through URL params for now - they're set on a redirect from
 			// validation gates BEFORE the importer runs. Read once and let the
 			// browser strip them via history.replaceState below. Pure display
-			// state with sanitize_key — no nonce needed because nothing
+			// state with sanitize_key - no nonce needed because nothing
 			// mutates based on the value.
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$po_message = isset( $_GET['po_message'] ) ? sanitize_key( wp_unslash( (string) $_GET['po_message'] ) ) : '';
@@ -437,7 +437,7 @@ final class StringsPage {
 				<div class="notice notice-error is-dismissible">
 					<p>
 					<?php
-					// The importer's own ceiling, not PHP's — PHP refuses its
+					// The importer's own ceiling, not PHP's - PHP refuses its
 					// own limit long before the file reaches the gate that
 					// sets this message, so naming a number is what makes the
 					// difference between the two visible.
@@ -475,7 +475,7 @@ final class StringsPage {
 			// reloads don't replay the message and pagination URLs stay clean.
 			// Attached as inline JS to the registered `perflocale-admin` handle
 			// instead of a raw <script> tag so wp.org's "use wp_enqueue" rule
-			// is satisfied. Conditional add — only runs when there's a message
+			// is satisfied. Conditional add - only runs when there's a message
 			// to clean up.
 			if ( $po_message !== '' ) {
 				wp_add_inline_script(
@@ -795,7 +795,7 @@ final class StringsPage {
 											/**
 											 * Friendly label for a string's context.
 											 *
-											 * A context is an identifier meant for code — `blogname`,
+											 * A context is an identifier meant for code - `blogname`,
 											 * `attribute_label_size`. It is shown to an operator who is
 											 * looking for their site title, so a domain that knows a
 											 * human name for its contexts can supply one here.
@@ -1071,7 +1071,7 @@ final class StringsPage {
 					'modalOriginal="";' .
 					'applyBtn.classList.remove("has-warning");' .
 					// Return keyboard focus to the row button that opened the
-					// dialog — closing used to drop focus to <body>, stranding
+					// dialog - closing used to drop focus to <body>, stranding
 					// keyboard users at the top of the page.
 					'if(lastOpener){lastOpener.focus();lastOpener=null;}' .
 				'}' .
@@ -1116,7 +1116,7 @@ final class StringsPage {
 				// `strings-validate.js` declares perflocale-admin as a
 				// dependency, so it loads AFTER this inline script runs.
 				// Don\'t early-return on missing window.perflocaleStrValidate
-				// — attach listeners now and lazy-check inside validate()
+				// - attach listeners now and lazy-check inside validate()
 				// when events actually fire (by which time the file is
 				// loaded).
 				'var inputs=document.querySelectorAll(".perflocale-str-input");' .
@@ -1125,7 +1125,7 @@ final class StringsPage {
 				// Cache extracted source tokens per input so we don\'t re-run
 				// the regex on every keystroke. Source is read from the row\'s
 				// expand-button data-original (one button per language column,
-				// any will do — same source).
+				// any will do - same source).
 				'function getSource(input){' .
 					'var wrap=input.closest(".perflocale-str-input-wrap");' .
 					'if(!wrap)return"";' .
@@ -1146,7 +1146,7 @@ final class StringsPage {
 				'}' .
 
 				'function validate(input){' .
-					// Lazy-check the validator API — strings-validate.js may
+					// Lazy-check the validator API - strings-validate.js may
 					// not be loaded yet at IIFE-execution time but will be
 					// by the time any event fires.
 					'if(!window.perflocaleStrValidate)return;' .
@@ -1189,7 +1189,7 @@ final class StringsPage {
 					'input.addEventListener("input",function(){validate(input);});' .
 				'});' .
 
-				// Initial sweep — flag any pre-filled bad rows on page
+				// Initial sweep - flag any pre-filled bad rows on page
 				// load. Deferred to the next tick because strings-validate.js
 				// hasn\'t loaded yet at IIFE-execution time (it declares
 				// perflocale-admin as a dependency, so it ships AFTER this
@@ -1275,8 +1275,8 @@ final class StringsPage {
 	 * Bound the grid page size so the save form can never post more inputs
 	 * than PHP will accept.
 	 *
-	 * The form posts one control per (row × language), plus — on a plural row
-	 * in a language with more than two CLDR plural forms — one more per extra
+	 * The form posts one control per (row × language), plus - on a plural row
+	 * in a language with more than two CLDR plural forms - one more per extra
 	 * form. The bound assumes the WORST case, every row a plural row, because
 	 * the page size has to be fixed before the rows are queried and the real
 	 * plural count for the page is not knowable yet. On en/de/pl (Polish has
@@ -1286,7 +1286,7 @@ final class StringsPage {
 	 * `max_input_vars` is applied to $_GET, $_POST and $_COOKIE separately
 	 * (measured on PHP 8.2: 400 query vars and 400 cookies alongside the POST
 	 * left the POST budget untouched), so the reserve only has to cover this
-	 * form's own scalars — see SAVE_FORM_RESERVED_INPUTS.
+	 * form's own scalars - see SAVE_FORM_RESERVED_INPUTS.
 	 *
 	 * Default per-page is 20, so on any language set this is a no-op until an
 	 * operator raises the Screen Options value far enough to be in danger.
@@ -1300,7 +1300,7 @@ final class StringsPage {
 		$limit = $max_input_vars ?? (int) ini_get( 'max_input_vars' );
 
 		// There is no "unlimited" value to detect: PHP rejects a negative
-		// max_input_vars and silently falls back to 1000 (measured — `-d
+		// max_input_vars and silently falls back to 1000 (measured - `-d
 		// max_input_vars=-1` makes ini_get() report "1000"), and 0 is a real,
 		// pathological setting meaning "accept no input variables at all",
 		// which no row count can rescue. So a non-positive reading only ever
@@ -1459,7 +1459,7 @@ final class StringsPage {
 	/**
 	 * Get available domains.
 	 *
-	 * @param CacheManager $cache Cache — accepted for signature parity with
+	 * @param CacheManager $cache Cache - accepted for signature parity with
 	 *                           sibling getters; the result is short-lived
 	 *                           page-render data, not memoized here.
 	 * @return array<int,string>
@@ -1506,11 +1506,11 @@ final class StringsPage {
 	 * Cached in the 'perflocale_strings' object-cache group under a
 	 * generation-folded key (invalidated by any perflocale_strings generation
 	 * bump) with a 5-minute TTL fallback for new contexts arriving
-	 * via the scanner — the filter dropdown tolerating a ≤5-min-stale
+	 * via the scanner - the filter dropdown tolerating a ≤5-min-stale
 	 * context list is a fine trade for skipping the DISTINCT scan on
 	 * every page load.
 	 *
-	 * @param CacheManager $cache Cache — accepted for signature parity with
+	 * @param CacheManager $cache Cache - accepted for signature parity with
 	 *                           sibling getters; not memoized here.
 	 * @return array<int,string>
 	 */
@@ -1564,7 +1564,7 @@ final class StringsPage {
 	 */
 	private function full_path( string $path ): string {
 		// Derive the marker from WP_CONTENT_DIR rather than assuming the
-		// directory is named `wp-content` — it is renameable, and on the
+		// directory is named `wp-content` - it is renameable, and on the
 		// "WordPress in its own directory" layout the stored path is not
 		// ABSPATH-relative at all.
 		$marker = basename( rtrim( (string) WP_CONTENT_DIR, '/\\' ) ) . '/';

@@ -13,7 +13,7 @@ $config = [ // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPref
 	// EVERY option in this item's options.php belongs here. Blocksy's builder
 	// partial only re-renders when the changed option id appears in this list
 	// (static/js/customizer/sync/builder.js:385), and the partial is registered
-	// with fallback_refresh = false — so an option left out of it changes
+	// with fallback_refresh = false - so an option left out of it changes
 	// nothing in the Customizer preview at all, not even a full reload. The
 	// four below were added to options.php after this list was first written.
 	'selective_refresh' => [

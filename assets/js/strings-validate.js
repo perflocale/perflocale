@@ -3,16 +3,16 @@
  *
  * Two consumers share the extractor:
  *
- *   1. The Edit Translation MODAL — live-highlights placeholders as the
+ *   1. The Edit Translation MODAL - live-highlights placeholders as the
  *      user types. Each chip turns green when present, red when missing,
  *      amber when over-counted. Clicking a missing chip inserts the token
  *      at the textarea's caret. Clicking Apply on a non-clean state shows
- *      a confirm dialog (still allows save — translators sometimes
+ *      a confirm dialog (still allows save - translators sometimes
  *      legitimately drop a placeholder when collapsing args). This is the
  *      authoritative validation gate for translators editing one string
  *      at a time.
  *
- *   2. The PER-ROW INLINE indicator — paints a red border + ⚠ icon on any
+ *   2. The PER-ROW INLINE indicator - paints a red border + ⚠ icon on any
  *      row whose translation is missing a source placeholder, updated on
  *      every keystroke. Surfaces issues in the table view without forcing
  *      the user into the modal. Save-time gating intentionally relies on
@@ -46,7 +46,7 @@
 		TOKEN_RE.lastIndex = 0;
 		while ( ( m = TOKEN_RE.exec( text ) ) !== null ) {
 			if ( m[ 1 ] === '%' ) {
-				continue; // %% literal escape — skip
+				continue; // %% literal escape - skip
 			}
 			if ( ! seen[ m[ 0 ] ] ) {
 				seen[ m[ 0 ] ] = true;

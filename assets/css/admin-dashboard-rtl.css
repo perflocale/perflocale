@@ -1,4 +1,4 @@
-/* Dashboard page — visual language mirrors the Settings page: native
+/* Dashboard page - visual language mirrors the Settings page: native
  * form-table rows, widefat tables, and the WP admin accent color under
  * the shared PluginNav strip (styles in admin-core.css). Chrome is
  * deliberately minimal so the page reads as native WordPress. */
@@ -108,7 +108,7 @@ a.perflocale-dash-langs__row:focus-visible {
 	flex-shrink: 0;
 }
 
-/* Progress bars — WP accent fill, neutral track. */
+/* Progress bars - WP accent fill, neutral track. */
 .perflocale-dash-bar {
 	max-width: 520px;
 	height: 10px;
@@ -188,8 +188,9 @@ a.perflocale-dash-langs__row:focus-visible {
 	text-align: right;
 }
 
+/* A count of 0 is a real value: the cell's own text color. */
 .perflocale-dash-table__zero {
-	color: #a7aaad;
+	color: inherit;
 }
 
 .perflocale-dash-table__attn {

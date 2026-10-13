@@ -94,7 +94,7 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'slim_seo_canonical_url', [ $this, 'pin_fallback_canonical' ] );
 
 		// Slim SEO's /sitemap.xml tree replaces WP core sitemaps and builds
-		// its entries with plain WP_Query/get_terms calls — without this
+		// its entries with plain WP_Query/get_terms calls - without this
 		// unlock PerfLocale's language filter stamps the default language
 		// onto those queries and every translated post/term vanishes from
 		// the sitemap.
@@ -105,8 +105,8 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 		// setting so no callback runs when enrichment is disabled.
 		//
 		// `slim_seo_schema_graph`, NOT `slim_seo_schema_entities`. Manager::output()
-		// fires the entities filter over `$this->entities` — Schema\Types\Base
-		// OBJECTS keyed by `$entity->context` — and only turns them into schema
+		// fires the entities filter over `$this->entities` - Schema\Types\Base
+		// OBJECTS keyed by `$entity->context` - and only turns them into schema
 		// arrays two lines later (src/Schema/Manager.php:32 vs 37). A schema
 		// enricher hooked there is handed objects it cannot read and silently
 		// changes nothing; worse, anything it added to that array would reach
@@ -120,7 +120,7 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
 	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context — where Slim SEO's canonical filter never fires anyway.
+	 * context - where Slim SEO's canonical filter never fires anyway.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
 	 */
@@ -171,7 +171,7 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 	 * Enrich Slim SEO's schema graph with inLanguage + translation siblings.
 	 *
 	 * Slim SEO builds the graph with `array_map()` over its context-keyed
-	 * entity map, and `array_map()` preserves those string keys — so what
+	 * entity map, and `array_map()` preserves those string keys - so what
 	 * arrives here is a MAP ('website' => [...], 'webpage' => [...]), not the
 	 * sequential list Yoast, AIOSEO and TSF pass. SchemaEnricher::enrich_graph()
 	 * recognises an `@graph` envelope, a list, or one entity; a keyed map falls

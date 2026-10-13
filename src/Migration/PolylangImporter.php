@@ -85,7 +85,7 @@ final class PolylangImporter {
 	/**
 	 * Translation-link writes this run asked for and did not get.
 	 *
-	 * A refused link is not fatal — the objects keep their content — but the
+	 * A refused link is not fatal - the objects keep their content - but the
 	 * translation relationship it stood for is simply absent, and the import
 	 * summary counts only what was written. Tallied here and surfaced once in
 	 * {@see import()} so the operator is told to re-run instead of reading a
@@ -98,7 +98,7 @@ final class PolylangImporter {
 	/**
 	 * Constructor.
 	 *
-	 * @param CacheManager $cache Cache manager — accepted for DI consistency
+	 * @param CacheManager $cache Cache manager - accepted for DI consistency
 	 *                           with sibling importers; importer flushes via
 	 *                           the cache manager wired into the language and
 	 *                           group repos rather than holding a direct ref.
@@ -152,11 +152,11 @@ final class PolylangImporter {
 		$result['terms'] = $this->import_term_translations( $result );
 
 		// Polylang creates post_translations/term_translations terms only for
-		// LINKED objects — untranslated content carries its authoritative
+		// LINKED objects - untranslated content carries its authoritative
 		// language solely in the 'language' / 'term_language' taxonomies. A
 		// non-default single-language object MUST still get an explicit
 		// one-member group/link or it is served as the default language
-		// (wrong language, wrong hreflang) — same rule as the WPML importer's
+		// (wrong language, wrong hreflang) - same rule as the WPML importer's
 		// single-row-trid handling.
 		$result['posts'] += $this->import_single_language_objects( 'language', ObjectType::Post, $result );
 		$result['terms'] += $this->import_single_language_objects( 'term_language', ObjectType::Term, $result );
@@ -179,7 +179,7 @@ final class PolylangImporter {
 		if ( $this->link_failures > 0 ) {
 			$result['errors'][] = sprintf(
 				/* translators: %d: number of failed translation-link writes */
-				_n( 'Polylang import: %d translation link could not be written — that translation is not connected to its group; re-run the import to retry it.', 'Polylang import: %d translation links could not be written — those translations are not connected to their group; re-run the import to retry them.', $this->link_failures, 'perflocale' ),
+				_n( 'Polylang import: %d translation link could not be written - that translation is not connected to its group; re-run the import to retry it.', 'Polylang import: %d translation links could not be written - those translations are not connected to their group; re-run the import to retry them.', $this->link_failures, 'perflocale' ),
 				$this->link_failures
 			);
 		}
@@ -281,7 +281,7 @@ final class PolylangImporter {
 		// Read the term DESCRIPTION too: Polylang stores each language's
 		// authoritative WordPress locale there as a serialized array
 		// (['locale' => 'pt_BR', 'rtl' => …, 'flag_code' => …]). Matching on
-		// that exact locale — instead of a greedy str_starts_with on the slug —
+		// that exact locale - instead of a greedy str_starts_with on the slug -
 		// is the only way to distinguish regional variants (pt_BR vs pt_PT) and
 		// to handle Polylang's hyphenated slugs ('pt-br') against PerfLocale's
 		// underscore locales ('pt_BR').
@@ -305,7 +305,7 @@ final class PolylangImporter {
 		// Guard against two Polylang languages resolving to the SAME PerfLocale
 		// id (a locale match on one plus a slug-fallback match on another, or
 		// duplicate Polylang locales). The second would silently duplicate that
-		// language inside every migrated group — one object_id per (group,
+		// language inside every migrated group - one object_id per (group,
 		// language) is a hard invariant. Keep the first, skip and report the rest.
 		$claimed_by = [];
 
@@ -315,7 +315,7 @@ final class PolylangImporter {
 
 			$matched_id = null;
 
-			// Pass 1 — Polylang's locale is authoritative (slugs can collide, e.g.
+			// Pass 1 - Polylang's locale is authoritative (slugs can collide, e.g.
 			// a PerfLocale 'pt'=pt_BR vs a Polylang 'pt'=pt_PT). Exact, normalised
 			// locale match so 'pt-br' === 'pt_BR' and pt_BR/pt_PT never collapse.
 			if ( $pll_locale !== '' ) {
@@ -327,7 +327,7 @@ final class PolylangImporter {
 				}
 			}
 
-			// Pass 2 — fall back to an exact slug match (no description locale, or
+			// Pass 2 - fall back to an exact slug match (no description locale, or
 			// a locale PerfLocale doesn't carry). Never a str_starts_with prefix.
 			if ( $matched_id === null ) {
 				foreach ( $active_languages as $lang ) {
@@ -342,7 +342,7 @@ final class PolylangImporter {
 				if ( isset( $claimed_by[ $matched_id ] ) ) {
 					$result['errors'][] = sprintf(
 						/* translators: 1: first Polylang slug, 2: colliding Polylang slug, 3: colliding slug again */
-						__( 'Polylang languages "%1$s" and "%2$s" both map to the same PerfLocale language — "%3$s" was skipped. Add a distinct PerfLocale language for it and re-run.', 'perflocale' ),
+						__( 'Polylang languages "%1$s" and "%2$s" both map to the same PerfLocale language - "%3$s" was skipped. Add a distinct PerfLocale language for it and re-run.', 'perflocale' ),
 						$claimed_by[ $matched_id ],
 						$pll_slug,
 						$pll_slug
@@ -376,7 +376,7 @@ final class PolylangImporter {
 		}
 
 		// Decode with allowed_classes=false to block PHP-object injection from a
-		// crafted term description — the same guard already used at the other
+		// crafted term description - the same guard already used at the other
 		// two unserialize sites in this importer. A serialized array still
 		// decodes; a serialized object becomes __PHP_Incomplete_Class and fails
 		// the is_array() check below.
@@ -416,7 +416,7 @@ final class PolylangImporter {
 		$imported = 0;
 
 		// Batched-fetch refactor: fetch only the term_ids for the
-		// 'post_translations' taxonomy first (cheap — BIGINT per row),
+		// 'post_translations' taxonomy first (cheap - BIGINT per row),
 		// chunk them, then per chunk fetch the (term_id, description)
 		// rows. Description is a serialized PHP array that maybe-unserialize
 		// expands into N slots in memory per term, so chunking is the
@@ -452,7 +452,7 @@ final class PolylangImporter {
 
 		foreach ( $batches as $batch ) {
 			// $placeholders is a generated '%d,%d,...' string sized to the
-			// current batch — safe to interpolate into the IN() clause.
+			// current batch - safe to interpolate into the IN() clause.
 			$placeholders = implode( ',', array_fill( 0, count( $batch ), '%d' ) );
 
 			// $this->wpdb->terms / ->term_taxonomy are wpdb-provided table names.
@@ -504,7 +504,7 @@ final class PolylangImporter {
 		// Bulk-prime caches for every post id referenced by this batch in
 		// ONE pass before the per-term loop. Previously each iteration
 		// called get_post() and groups->find_for_object() per language slug
-		// twice (once to find seed, once to link siblings) — on a typical
+		// twice (once to find seed, once to link siblings) - on a typical
 		// 5-language Polylang term with N terms in a batch, that's
 		// 2 × 5 × N round-trips, each a DB lookup until WP's per-post-id
 		// cache warmed up incidentally during the loop.
@@ -545,7 +545,7 @@ final class PolylangImporter {
 			$post_id_list = array_keys( $all_post_ids );
 
 			if ( function_exists( '_prime_post_caches' ) ) {
-				// Skip term + meta priming (false, false) — we only need
+				// Skip term + meta priming (false, false) - we only need
 				// post existence + post-row data here, not post_meta or
 				// terms. Saves two extra SELECTs over the same id set.
 				_prime_post_caches( $post_id_list, false, false );
@@ -567,13 +567,13 @@ final class PolylangImporter {
 			// phpcs:enable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged
 
 			// A non-empty description that failed to unserialize (truncated/
-			// corrupt row) would otherwise be dropped silently — surface it so
+			// corrupt row) would otherwise be dropped silently - surface it so
 			// the operator knows a group was skipped rather than assuming a
 			// clean migration.
 			if ( ! is_array( $translations ) && '' !== trim( (string) $term->description ) ) {
 				$result['errors'][] = sprintf(
 					/* translators: %d: term_taxonomy term id */
-					__( 'Unreadable Polylang post_translations data for term %d — group skipped.', 'perflocale' ),
+					__( 'Unreadable Polylang post_translations data for term %d - group skipped.', 'perflocale' ),
 					(int) $term->term_id
 				);
 				continue;
@@ -632,7 +632,7 @@ final class PolylangImporter {
 
 				// Converge the source map on the REUSE path too. It is only
 				// written inside create_group(), so importing over objects that
-				// already had a group (the common case — every post gets one on
+				// already had a group (the common case - every post gets one on
 				// save) left the map empty, and `--force-restart` then cleared
 				// it permanently. set_group_id() is INSERT .. ON DUPLICATE KEY
 				// UPDATE, so this is idempotent and repairs stale rows too.
@@ -703,7 +703,7 @@ final class PolylangImporter {
 					$group_id,
 					$post_id,
 					$lang_id,
-					// Derive from the real post_status — see create_group above.
+					// Derive from the real post_status - see create_group above.
 					get_post_status( $post_id ) === 'publish'
 						? TranslationStatus::Published->value
 						: TranslationStatus::Draft->value,
@@ -760,7 +760,7 @@ final class PolylangImporter {
 
 		foreach ( $batches as $batch ) {
 			// $placeholders is a generated '%d,%d,...' string sized to the
-			// current batch — safe to interpolate into the IN() clause.
+			// current batch - safe to interpolate into the IN() clause.
 			$placeholders = implode( ',', array_fill( 0, count( $batch ), '%d' ) );
 
 			// $this->wpdb->terms / ->term_taxonomy are wpdb-provided table names.
@@ -825,7 +825,7 @@ final class PolylangImporter {
 			if ( ! is_array( $translations ) && '' !== trim( (string) $term->description ) ) {
 				$result['errors'][] = sprintf(
 					/* translators: %d: term_taxonomy term id */
-					__( 'Unreadable Polylang term_translations data for term %d — group skipped.', 'perflocale' ),
+					__( 'Unreadable Polylang term_translations data for term %d - group skipped.', 'perflocale' ),
 					(int) $term->term_id
 				);
 				continue;
@@ -835,7 +835,7 @@ final class PolylangImporter {
 				continue;
 			}
 
-			// Source-map first — survives DB restores. Same layering as the
+			// Source-map first - survives DB restores. Same layering as the
 			// post path in process_post_translation_terms().
 			$term_source_key   = $term->term_id . '|term';
 			$mapped_term_id    = $this->source_map->get_group_id( 'polylang', (string) $term_source_key );
@@ -918,7 +918,7 @@ final class PolylangImporter {
 					continue;
 				}
 
-				// Language-aware skip — see the post loop above.
+				// Language-aware skip - see the post loop above.
 				$already = $this->groups->find_link_for_object( $term_id, ObjectType::Term );
 
 				if ( $already
@@ -950,7 +950,7 @@ final class PolylangImporter {
 	 * Create one-member groups for objects that have a Polylang language but
 	 * no linked translations.
 	 *
-	 * Polylang stores each object's language as a term relationship — posts
+	 * Polylang stores each object's language as a term relationship - posts
 	 * under the 'language' taxonomy, terms under 'term_language' (whose term
 	 * slugs carry a 'pll_' prefix). Objects without linked translations never
 	 * appear in the post_translations/term_translations taxonomies, so the
@@ -1065,14 +1065,14 @@ final class PolylangImporter {
 						continue;
 					}
 
-					// Derive the link status once — a draft must never import as
+					// Derive the link status once - a draft must never import as
 					// published. Terms have no draft state.
 					$link_status = ( ObjectType::Post === $type && get_post_status( $object_id ) !== 'publish' )
 						? TranslationStatus::Draft->value
 						: TranslationStatus::Published->value;
 
 					// Objects already grouped by the pair passes (or a prior
-					// run of this pass) are done — but ONLY when they are also
+					// run of this pass) are done - but ONLY when they are also
 					// filed under the right language. Every post PerfLocale has
 					// seen already sits in an auto-created default-language
 					// group, so a group-only check skipped exactly the objects

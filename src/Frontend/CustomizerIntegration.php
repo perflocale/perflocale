@@ -436,7 +436,7 @@ final class CustomizerIntegration {
 		$safe_html = LanguageSwitcherBlock::kses_switcher( $html );
 
 		/*
-		 * The block suppresses itself whenever it has nothing to offer — on an
+		 * The block suppresses itself whenever it has nothing to offer - on an
 		 * untranslated page with "hide current language" on and untranslated
 		 * languages hidden, every option is skipped and render() returns ''.
 		 * The wrapper below is `position: fixed; z-index: 9999` with a border,
@@ -487,7 +487,7 @@ final class CustomizerIntegration {
 	 * JSON payload: WP_Customize_Manager::validate_setting_values() skips
 	 * only null before calling WP_Customize_Setting::sanitize(), so an
 	 * array (or any other JSON shape) reaches this filter unconverted and
-	 * a declared `string $value` threw a TypeError at argument binding —
+	 * a declared `string $value` threw a TypeError at argument binding -
 	 * a 500 out of the customizer instead of a rejected value. Anything
 	 * that is not one of the four known positions falls back to the
 	 * default, which is what an unrecognised string already did.

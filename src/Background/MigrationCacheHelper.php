@@ -45,7 +45,7 @@ final class MigrationCacheHelper {
 	/**
 	 * Flush every cache that could be holding pre-import state.
 	 *
-	 * Safe to call when no migration ran (e.g. dry-run paths) — every
+	 * Safe to call when no migration ran (e.g. dry-run paths) - every
 	 * flush is idempotent on already-empty state.
 	 *
 	 * @return void
@@ -58,7 +58,7 @@ final class MigrationCacheHelper {
 		// Eager-link maps are autoloaded and may contain links from BEFORE the
 		// import. Route through invalidate_eager_link_map(null) so ALL FIVE
 		// object-type variants (post/term/string/post_type/taxonomy) are purged
-		// — not just post/term — and each single-option cache key is cleared
+		// - not just post/term - and each single-option cache key is cleared
 		// unconditionally (delete_option() returns early without touching the
 		// cache when the DB row is already gone, so a stale autoloaded value
 		// restored from backup would otherwise survive inside alloptions).
@@ -77,7 +77,7 @@ final class MigrationCacheHelper {
 			$cache->flush_all();
 
 			// Files mode serves string translations from generated .l10n.php
-			// files, which no cache flush can refresh — without a full
+			// files, which no cache flush can refresh - without a full
 			// regeneration the just-imported string translations exist in
 			// the DB while the frontend keeps serving the pre-migration
 			// files. Migrations are rare one-shots; one full pass is the
@@ -97,7 +97,7 @@ final class MigrationCacheHelper {
 	 * long-command helper use: a legacy-site import touches tens of
 	 * thousands of posts/terms, and every get_post()/get_term() copy
 	 * accumulates in the RUNTIME object cache for the life of the request
-	 * — unbounded growth on WPML-scale imports. Dropping the runtime
+	 * - unbounded growth on WPML-scale imports. Dropping the runtime
 	 * copies between batches caps that; the next read simply re-fetches
 	 * (from the persistent cache when one is configured, else the DB), so
 	 * correctness is unaffected.
@@ -106,7 +106,7 @@ final class MigrationCacheHelper {
 	 * whole request when SAVEQUERIES is on (the actual culprit in a past
 	 * WPML-import OOM diagnosed on a dev site).
 	 *
-	 * Cheap and idempotent — callers invoke it once per committed batch.
+	 * Cheap and idempotent - callers invoke it once per committed batch.
 	 *
 	 * @return void
 	 */
@@ -118,8 +118,6 @@ final class MigrationCacheHelper {
 		// WP 6.1+ (plugin floor 6.4). Clears ONLY in-memory runtime copies;
 		// a persistent backend (Redis/Memcached) is untouched. Drop-ins
 		// lacking flush_runtime() make this a silent no-op.
-		if ( function_exists( 'wp_cache_flush_runtime' ) ) {
-			wp_cache_flush_runtime();
-		}
+		\PerfLocale\Cache\CacheManager::flush_runtime();
 	}
 }

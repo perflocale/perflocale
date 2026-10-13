@@ -77,7 +77,7 @@ final class TermMetaBox {
 	/**
 	 * Render language field on the "Add New Term" form.
 	 *
-	 * @param string $taxonomy Taxonomy slug — required by the WP `{$taxonomy}_add_form_fields` hook signature; the rendered field is taxonomy-agnostic.
+	 * @param string $taxonomy Taxonomy slug - required by the WP `{$taxonomy}_add_form_fields` hook signature; the rendered field is taxonomy-agnostic.
 	 * @return void
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- WP {$taxonomy}_add_form_fields hook signature; the rendered language field is taxonomy-agnostic.
@@ -247,6 +247,15 @@ final class TermMetaBox {
 			return;
 		}
 
+		// The edit form belongs to the term being edited. Another term saved
+		// in the same request (a translation the term sync updates) keeps its
+		// language. The add-term form carries no tag_ID.
+		$form_term = isset( $_POST['tag_ID'] ) && is_scalar( $_POST['tag_ID'] ) ? absint( $_POST['tag_ID'] ) : 0;
+
+		if ( $form_term !== $term_id && str_starts_with( (string) current_action(), 'edited_' ) ) {
+			return;
+		}
+
 		if ( ! current_user_can( 'manage_categories' ) ) {
 			return;
 		}
@@ -258,7 +267,7 @@ final class TermMetaBox {
 
 			if ( ! $manager->set_term_language( $term_id, $language ) ) {
 				// Same per-user one-shot transient that
-				// MetaBox::maybe_show_language_save_error() renders —
+				// MetaBox::maybe_show_language_save_error() renders -
 				// admin_notices fires on term screens too, so the post
 				// metabox's renderer covers this writer.
 				$user_id = get_current_user_id();
@@ -268,7 +277,7 @@ final class TermMetaBox {
 						'perflocale_lang_save_error_' . $user_id,
 						sprintf(
 							/* translators: 1: term ID, 2: language slug. */
-							__( 'PerfLocale could not save the language selection ("%2$s") for term %1$d. The language may have been deleted, or a database error occurred — please try again.', 'perflocale' ),
+							__( 'PerfLocale could not save the language selection ("%2$s") for term %1$d. The language may have been deleted, or a database error occurred - please try again.', 'perflocale' ),
 							$term_id,
 							$language
 						),

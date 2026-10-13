@@ -118,6 +118,12 @@
 	padding: 0;
 }
 
+.perflocale-lang-item__packs {
+	font-size: 12px;
+	color: #646970;
+	margin-top: 4px;
+}
+
 .perflocale-lang-item__actions {
 	display: flex;
 	gap: 6px;

@@ -127,7 +127,7 @@ final class LanguagesController extends RestController {
 					// update (the create path sanitises up-front; update relies
 					// on the model + the manage-languages capability gate). We
 					// therefore add NO sanitize_callback and no strict type on
-					// the numeric fields — that preserves the exact
+					// the numeric fields - that preserves the exact
 					// currently-accepted input shape.
 					'args'                => [
 						'name'           => [
@@ -215,10 +215,11 @@ final class LanguagesController extends RestController {
 	 */
 	public function public_read_permission_check( \WP_REST_Request $request ): bool|\WP_Error {
 		/**
-		 * Whether `GET /perflocale/v1/languages` and `GET /perflocale/v1/languages/{slug}`
-		 * may be read by anonymous visitors.
+		 * Whether `GET /perflocale/v1/languages`, `GET /perflocale/v1/languages/{slug}`
+		 * and the `perflocale/list-languages` ability may be read by anonymous visitors.
 		 *
-		 * Returning false requires the `read` capability instead.
+		 * Returning false requires the `read` capability instead. The ability
+		 * stays listed and answers only logged-in users.
 		 *
 		 * @param bool $public Default true.
 		 * @param \WP_REST_Request $request Current request.
@@ -260,11 +261,15 @@ final class LanguagesController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function get_item( $request ): \WP_REST_Response|\WP_Error {
-		$slug     = sanitize_key( $request->get_param( 'slug' ) );
+		// The URL segment only: get_param() prefers a body or query `slug`,
+		// which would name a different language than the route.
+		$slug     = sanitize_key( $request->get_url_params()['slug'] ?? '' );
 		$repo     = $this->get_repo();
 		$language = $repo->find_by_slug( $slug );
 
-		if ( ! $language ) {
+		// An inactive language is answered only to callers who manage
+		// languages, as the list route returns active languages only.
+		if ( ! $language || ( empty( $language->is_active ) && ! current_user_can( 'perflocale_manage_languages' ) ) ) {
 			return $this->error( 'not_found', __( 'Language not found.', 'perflocale' ), 404 );
 		}
 
@@ -294,7 +299,7 @@ final class LanguagesController extends RestController {
 		if ( $wants_default && $is_active === 0 ) {
 			return $this->error(
 				'invalid_default_inactive',
-				__( 'is_default requires is_active — an inactive language cannot be the default.', 'perflocale' ),
+				__( 'is_default requires is_active - an inactive language cannot be the default.', 'perflocale' ),
 				400
 			);
 		}
@@ -304,7 +309,7 @@ final class LanguagesController extends RestController {
 		// Pre-flight BOTH unique keys before touching the table. The languages
 		// table has two: slug and locale. Without this, a duplicate rode
 		// straight into the INSERT, which failed on the UNIQUE key, printed a
-		// raw wpdb error under WP_DEBUG, and came back as a generic 500 —
+		// raw wpdb error under WP_DEBUG, and came back as a generic 500 -
 		// indistinguishable from a real outage. The admin form and the CLI
 		// both pre-flight the same two keys; this brings REST into line, with
 		// 409 Conflict so a client can tell "already exists" from "broken".
@@ -359,7 +364,7 @@ final class LanguagesController extends RestController {
 			return $this->error( 'create_failed', __( 'Failed to create language.', 'perflocale' ), 500 );
 		}
 
-		// The insert above cannot set the default flag — set_default() promotes
+		// The insert above cannot set the default flag - set_default() promotes
 		// this language and demotes the prior default in a single transaction.
 		// Honor an explicit is_default=true so the REST path can set the default
 		// language like the CLI does; previously it was silently dropped.
@@ -389,7 +394,9 @@ final class LanguagesController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function update_item( $request ): \WP_REST_Response|\WP_Error {
-		$slug     = sanitize_key( $request->get_param( 'slug' ) );
+		// The URL segment only: get_param() prefers a body or query `slug`,
+		// which would name a different language than the route.
+		$slug     = sanitize_key( $request->get_url_params()['slug'] ?? '' );
 		$repo     = $this->get_repo();
 		$language = $repo->find_by_slug( $slug );
 
@@ -399,7 +406,7 @@ final class LanguagesController extends RestController {
 
 		// Sanitize each user-supplied value before write. Without this the
 		// route's permission_callback (manage cap) is the only filter on
-		// what gets stored — fine for trusted admins but no defense-in-depth
+		// what gets stored - fine for trusted admins but no defense-in-depth
 		// against an admin's session being misused, and an inconsistent
 		// contract vs create_item which DOES enum-validate text_direction.
 		$candidates = [
@@ -479,7 +486,9 @@ final class LanguagesController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function delete_item( $request ): \WP_REST_Response|\WP_Error {
-		$slug     = sanitize_key( $request->get_param( 'slug' ) );
+		// The URL segment only: get_param() prefers a body or query `slug`,
+		// which would name a different language than the route.
+		$slug     = sanitize_key( $request->get_url_params()['slug'] ?? '' );
 		$repo     = $this->get_repo();
 		$language = $repo->find_by_slug( $slug );
 
@@ -519,7 +528,7 @@ final class LanguagesController extends RestController {
 		}
 
 		// delete() runs its cascade in a transaction and returns false after a
-		// ROLLBACK — the language and every one of its links are still there.
+		// ROLLBACK - the language and every one of its links are still there.
 		// Reporting `{"deleted": true}` with HTTP 200 over that told every REST
 		// and CLI consumer the opposite of what the database holds.
 		if ( ! $repo->delete( (int) $language->id ) ) {

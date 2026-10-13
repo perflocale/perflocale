@@ -28,7 +28,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * ({@see MigrationState::record_outcome()}), and the post-import cache
  * flush. A refused import (`blocked`) writes nothing and flushes nothing.
  * An import that throws part-way is flushed too before the exception
- * leaves the lock.
+ * leaves the lock. While the importer runs, CacheInvalidator leaves the
+ * hreflang of the group changes it makes to that flush ({@see importing()}).
  */
 final class MigrationRunner {
 
@@ -38,6 +39,28 @@ final class MigrationRunner {
 	public const PROGRESS_INTERVAL = 2;
 
 	/**
+	 * Blogs on which this process is running an importer, by blog id.
+	 *
+	 * @var array<int, true>
+	 */
+	private static array $importing = [];
+
+	/**
+	 * Whether this process is running an importer on the current blog.
+	 *
+	 * Such a run ends with MigrationCacheHelper::flush_post_migration_caches()
+	 * on this blog, whether the importer returns or throws; an import refused
+	 * before it wrote anything (`blocked`) has nothing to flush.
+	 *
+	 * @internal Read by CacheInvalidator.
+	 *
+	 * @return bool
+	 */
+	public static function importing(): bool {
+		return isset( self::$importing[ get_current_blog_id() ] );
+	}
+
+	/**
 	 * Run an import.
 	 *
 	 * A MigrationLockedException from {@see MigrationLock::run()} reaches the
@@ -45,20 +68,21 @@ final class MigrationRunner {
 	 * importer or a heartbeat callback is passed on after the post-import
 	 * flush.
 	 *
-	 * @param string        $source wpml, polylang or translatepress.
-	 * @param CacheManager  $cache  Cache manager.
-	 * @param callable|null $before  Runs inside the lock before the import.
-	 * @param callable|null $on_beat Called with each importer heartbeat (after each batch), after the lock refresh, with the progress detail ({@see ImportHeartbeat}; an empty array when the call only keeps the lock).
+	 * @param string        $source           wpml, polylang or translatepress.
+	 * @param CacheManager  $cache            Cache manager.
+	 * @param callable|null $before           Runs inside the lock before the import.
+	 * @param callable|null $on_beat          Called with each importer heartbeat (after each batch), after the lock refresh, with the progress detail ({@see ImportHeartbeat}; an empty array when the call only keeps the lock).
+	 * @param bool          $sanitize_strings WPML only: store string translations through Helper::sanitize_untrusted_string_translation() ({@see WpmlImporter::set_sanitize_strings()}).
 	 * @return array<string, mixed> The importer's result, with `blocked` and `preflight`.
 	 * @throws \InvalidArgumentException On an unknown source.
 	 */
-	public static function import( string $source, CacheManager $cache, ?callable $before = null, ?callable $on_beat = null ): array {
+	public static function import( string $source, CacheManager $cache, ?callable $before = null, ?callable $on_beat = null, bool $sanitize_strings = false ): array {
 		if ( ! in_array( $source, [ 'wpml', 'polylang', 'translatepress' ], true ) ) {
 			throw new \InvalidArgumentException( esc_html( 'Unknown migration source: ' . $source ) );
 		}
 
 		return MigrationLock::run(
-			static function ( callable $heartbeat ) use ( $source, $cache, $before, $on_beat ): array {
+			static function ( callable $heartbeat ) use ( $source, $cache, $before, $on_beat, $sanitize_strings ): array {
 				if ( $before !== null ) {
 					$before();
 				}
@@ -70,8 +94,23 @@ final class MigrationRunner {
 					};
 				}
 
+				$blog_id = get_current_blog_id();
+				$was     = self::$importing[ $blog_id ] ?? null;
+
+				self::$importing[ $blog_id ] = true;
+
 				try {
-					$result = self::run_importer( $source, $cache, $heartbeat, $on_beat !== null );
+					try {
+						$result = self::run_importer( $source, $cache, $heartbeat, $on_beat !== null, $sanitize_strings );
+					} finally {
+						// The record ends before the flush below, so a link made
+						// inside the flush clears as any other does.
+						if ( null === $was ) {
+							unset( self::$importing[ $blog_id ] );
+						} else {
+							self::$importing[ $blog_id ] = $was;
+						}
+					}
 				} catch ( \Throwable $stopped ) {
 					// An import stopped part-way (a cancel or a paused queue at a
 					// heartbeat, or an error) keeps the batches it committed:
@@ -235,16 +274,18 @@ final class MigrationRunner {
 	/**
 	 * Run the source's importer.
 	 *
-	 * @param string       $source       Source.
-	 * @param CacheManager $cache        Cache manager.
-	 * @param callable     $heartbeat    Lock heartbeat.
-	 * @param bool         $has_reporter Whether the heartbeat passes the progress on to a reporter.
+	 * @param string       $source           Source.
+	 * @param CacheManager $cache            Cache manager.
+	 * @param callable     $heartbeat        Lock heartbeat.
+	 * @param bool         $has_reporter     Whether the heartbeat passes the progress on to a reporter.
+	 * @param bool         $sanitize_strings WPML only: sanitize string translations.
 	 * @return array<string, mixed> With `incomplete_notice` when the import did not finish.
 	 */
-	private static function run_importer( string $source, CacheManager $cache, callable $heartbeat, bool $has_reporter ): array {
+	private static function run_importer( string $source, CacheManager $cache, callable $heartbeat, bool $has_reporter, bool $sanitize_strings ): array {
 		if ( $source === 'wpml' ) {
 			$importer = new WpmlImporter( $cache );
 			$importer->set_heartbeat( $heartbeat, $has_reporter );
+			$importer->set_sanitize_strings( $sanitize_strings );
 
 			return $importer->import();
 		}

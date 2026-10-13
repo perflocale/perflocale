@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Extends `\RuntimeException` so existing callers that catch the documented
  * `\RuntimeException` contract keep working unchanged.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class XliffFormatException extends \RuntimeException {
 }

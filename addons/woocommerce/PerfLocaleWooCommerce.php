@@ -145,13 +145,13 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// `product_variation` is registered show_ui = false, so WordPress has no
 		// `_edit_link` for it and the Translations screen would render a dead
-		// link. A variation has no standalone editor in WooCommerce either — it
-		// is edited inside its parent product's Variations tab — so point there
+		// link. A variation has no standalone editor in WooCommerce either - it
+		// is edited inside its parent product's Variations tab - so point there
 		// rather than inventing a URL that does not exist.
 		add_filter( 'perflocale/admin/edit_post_link', [ $this, 'edit_link' ], 10, 3 );
 
 		// A variation is not publicly_queryable, so PerfLocale's viewability
-		// gate drops its front-end link — but WooCommerce maps a variation
+		// gate drops its front-end link - but WooCommerce maps a variation
 		// permalink onto the parent product with the attributes as a query
 		// string (WC_Post_Data::variation_post_link), and that URL returns 200.
 		// Restore it rather than losing a working preview link.
@@ -185,8 +185,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		//
 		// Two different WC filter families are in play and both are needed.
 		// wc_get_cart_url()/wc_get_checkout_url() fire `woocommerce_get_<page>_url`
-		// (wc-core-functions.php), while wc_get_page_permalink( $page ) — the
-		// function everything else goes through — fires the DYNAMIC
+		// (wc-core-functions.php), while wc_get_page_permalink( $page ) - the
+		// function everything else goes through - fires the DYNAMIC
 		// `woocommerce_get_<page>_page_permalink` (wc-page-functions.php).
 		// Hooking only the wrapper leaves every direct wc_get_page_permalink()
 		// caller unprefixed, so cart/checkout carry both forms. `shop` has no
@@ -200,8 +200,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'woocommerce_get_shop_page_permalink', [ $this, 'translate_wc_url' ] );
 
 		// The Mini-Cart footer buttons bypass wc_get_page_permalink() entirely
-		// — MiniCartCartButtonBlock / MiniCartCheckoutButtonBlock build their
-		// href as get_permalink( wc_get_page_id( … ) ) — so none of the filters
+		// - MiniCartCartButtonBlock / MiniCartCheckoutButtonBlock build their
+		// href as get_permalink( wc_get_page_id( … ) ) - so none of the filters
 		// above fire for them and a shopper browsing /de/ is handed an
 		// unprefixed /cart-3/ link that drops them back into the default
 		// language mid-funnel. Correct those at the page_link layer instead.
@@ -214,7 +214,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// core tree, and what every other untranslated page already does in a
 		// third-party tree). Without this gate a /de/ sitemap advertised
 		// /de/cart-3/ while that page's own canonical and x-default point at
-		// /cart-3/ — an "alternate page with proper canonical" signal on a
+		// /cart-3/ - an "alternate page with proper canonical" signal on a
 		// surface this filter was never meant to reach.
 		if ( ! is_admin() && ! \PerfLocale\Helper::is_rest_request() && ! $this->is_sitemap_request() ) {
 			// Priority 20 runs after UrlConverter::filter_page_link() (10), so
@@ -237,7 +237,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// ⭐ A GROUPED product's children are the same class of stored-ID list
 		// and were the one member of it not mapped. `_children` is copied
 		// verbatim to the translation, so on /de/ a grouped product handed
-		// WooCommerce the DEFAULT-language child ids — and those ids then went
+		// WooCommerce the DEFAULT-language child ids - and those ids then went
 		// through a language-scoped lookup that dropped them, leaving the
 		// add-to-cart form rendered with no purchasable children at all.
 		// Two independent faults stacked; mapping the ids fixes this one at
@@ -257,7 +257,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// cover each listed item's translation siblings: the SAME physical
 		// product carries a different post/term ID per language, and WC
 		// compares raw IDs. Expand the lists at READ time on the frontend
-		// only — the stored coupon and the admin edit screen keep the raw
+		// only - the stored coupon and the admin edit screen keep the raw
 		// saved IDs.
 		add_filter( 'woocommerce_coupon_get_product_ids', [ $this, 'expand_coupon_product_ids' ] );
 		add_filter( 'woocommerce_coupon_get_excluded_product_ids', [ $this, 'expand_coupon_product_ids' ] );
@@ -307,7 +307,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// Per-product opt-out checkbox (product data → Advanced): lets a
 			// merchant give ONE language's product independent prices/stock
 			// (e.g. a DE-only promotion) while the rest of the group keeps
-			// syncing — no code required. Only wired in admin when the sync
+			// syncing - no code required. Only wired in admin when the sync
 			// itself is active; the meta flag is read by InventorySync.
 			if ( is_admin() ) {
 				add_action( 'woocommerce_product_options_advanced', [ $this, 'render_sync_optout_field' ] );
@@ -356,10 +356,10 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// Clone variations onto a freshly-created product translation. Without
 		// this a translated VARIABLE product has no variation children and
-		// renders "out of stock" with no variation form — broken for the core
+		// renders "out of stock" with no variation form - broken for the core
 		// WC store use case. Runs late (20) so create_translation's own meta
 		// copy has finished.
-		// ⭐ Carry the SOURCE's product_type onto the translation — for every
+		// ⭐ Carry the SOURCE's product_type onto the translation - for every
 		// product type, not just variable. `product_type` is an internal WC
 		// taxonomy, so it is not in get_translatable_taxonomies() and
 		// copy_taxonomy_terms() never touches it; a translation therefore
@@ -370,14 +370,14 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// EXTERNAL products silently degraded: measured on a test store, a
 		// translated grouped product came back as WC_Product_Simple with
 		// get_children() === [] even though its `_children` meta was copied
-		// intact — no child products, and the wrong add-to-cart form.
+		// intact - no child products, and the wrong add-to-cart form.
 		//
 		// Priority 15: after create_translation's own meta/term copy, and
 		// BEFORE clone_product_variations() at 20, which loads the target with
 		// wc_get_product() and needs the class to already be right.
 		// ⭐ Re-scope the front page when WooCommerce turns it into a product
 		// archive. PerfLocale decides at pre_get_posts priority 5 and correctly
-		// exempts the query because it names an explicit `page_id` — at that
+		// exempts the query because it names an explicit `page_id` - at that
 		// moment it IS a page request. WC_Query::pre_get_posts then runs at
 		// priority 10 and, when the shop page is the site's front page and the
 		// theme supports WooCommerce or FSE, rewrites the SAME query to
@@ -409,7 +409,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		//   md5( wp_json_encode( $this->query_vars ) )
 		// (src/Blocks/Utils/BlocksWpQuery.php:50-68). That hash is computed
 		// BEFORE `get_posts()` runs, and `get_posts()` is what fires
-		// `pre_get_posts` — so PerfLocale's language stamp is not in the hash,
+		// `pre_get_posts` - so PerfLocale's language stamp is not in the hash,
 		// and every language shares one cache entry. Whichever language warmed
 		// it first serves its product ids to all the others for a month.
 		//
@@ -424,7 +424,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// Scoped to BlocksWpQuery instances ON PURPOSE. Injecting a language
 		// var into every WP_Query would also change WP core's own
 		// `generate_cache_key()` (class-wp-query.php:5010), which already
-		// includes the SQL — so scoped queries are separated per language
+		// includes the SQL - so scoped queries are separated per language
 		// ALREADY, and the only effect on exempt queries would be to multiply
 		// their cache entries by the language count for no benefit.
 		add_action( 'parse_query', [ $this, 'separate_block_query_cache_by_language' ] );
@@ -434,16 +434,15 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		add_action( 'perflocale/translation/created', [ $this, 'clone_product_variations' ], 20, 4 );
 
 		// Give a non-variable product translation its wc_product_meta_lookup
-		// row (WooCommerce 10.8+). Priority 25: after mirror_product_type()
-		// (15), whose recorded product type picks the data store, and the
-		// variation clone (20).
+		// row. Priority 25: after mirror_product_type() (15), whose recorded
+		// product type picks the data store, and the variation clone (20).
 		add_action( 'perflocale/translation/created', [ $this, 'refresh_copy_lookup_row' ], 25, 2 );
 
 		// Machine translation of a product also translates its variations'
 		// descriptions and its local (non-taxonomy) attribute options, which
 		// the post translation itself does not carry.
 		if ( $settings->mt_enabled() ) {
-			add_action( 'perflocale/machine_translation/after', [ $this, 'translate_variation_texts' ], 10, 5 );
+			add_action( 'perflocale/machine_translation/after', [ $this, 'translate_variation_texts' ], 10, 6 );
 		}
 
 		// Register WC non-gettext strings (attribute labels, email subjects/headings)
@@ -555,11 +554,13 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// option (read by ExchangeRateSync, MultiCurrency, the REST APIs,
 		// the SettingsPage save handler) and rendered + saved by
 		// {@see render_settings_subtab()} + {@see sanitize_currencies_post()}
-		// — NOT by AddonSettings. The `storage => 'global'` marker tells
+		// - NOT by AddonSettings. The `storage => 'global'` marker tells
 		// the framework not to seed defaults into perflocale_addon_settings
 		// (would create a dead duplicate copy), not to render via the
 		// auto-form, and to redirect `wp perflocale addon settings
 		// get/set` to read from the main settings option transparently.
+		// Every field here must stay global: AddonRegistry names this add-on
+		// in GLOBAL_SETTINGS_ONLY and never builds these fields at boot.
 		$global = [ 'storage' => 'global' ];
 		return [
 			'wc_email_translation'      => $global + [
@@ -733,7 +734,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// WC_AJAX::get_endpoint() builds the path from home_url('/', 'relative'),
 		// which carries the install's home path ('/shop/' on a subfolder install,
 		// '/blog2/' on an MU-subdirectory subsite). The language prefix belongs
-		// AFTER that home path — prepending it ('/fr/shop/…') lands outside the
+		// AFTER that home path - prepending it ('/fr/shop/…') lands outside the
 		// install's rewrite scope and the cart-fragment request 404s.
 		$home_path = rtrim( (string) wp_parse_url( home_url( '/' ), PHP_URL_PATH ), '/' );
 
@@ -797,7 +798,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				'id'          => \PerfLocale\WooCommerce\InventorySync::SYNC_OPTOUT_META,
 				'value'       => get_post_meta( (int) get_the_ID(), \PerfLocale\WooCommerce\InventorySync::SYNC_OPTOUT_META, true ),
 				'label'       => __( 'Independent across languages', 'perflocale' ),
-				'description' => __( 'Do not synchronize this product\'s shared data (prices, stock, dimensions, SKU) with its translations. Tick it on a single language\'s product to give only that language independent values — for example a promotional price in one language.', 'perflocale' ),
+				'description' => __( 'Do not synchronize this product\'s shared data (prices, stock, dimensions, SKU) with its translations. Tick it on a single language\'s product to give only that language independent values - for example a promotional price in one language.', 'perflocale' ),
 			]
 		);
 
@@ -815,7 +816,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 */
 	public function save_sync_optout_field( int $product_id ): void {
 		// WooCommerce verifies its own meta-box nonce before firing
-		// woocommerce_process_product_meta — the same trust model as every
+		// woocommerce_process_product_meta - the same trust model as every
 		// WC product field saved from this screen.
 		// phpcs:disable WordPress.Security.NonceVerification.Missing -- WC's save_meta_boxes nonce verified upstream.
 		if ( ! isset( $_POST['_perflocale_sync_optout_present'] ) ) {
@@ -977,7 +978,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	private function lookup_value_holders( string $column, string $value, int $product_id ): array {
 		global $wpdb;
 
-		// $column is interpolated as a SQL identifier — restrict it to the two
+		// $column is interpolated as a SQL identifier - restrict it to the two
 		// known lookup columns so it can never carry arbitrary input.
 		if ( ! in_array( $column, [ 'sku', 'global_unique_id' ], true ) ) {
 			return [];
@@ -1215,7 +1216,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		$plugin = \PerfLocale\Plugin::get_instance();
 
-		// Default language serves the raw label — a label is never translated
+		// Default language serves the raw label - a label is never translated
 		// into its own language, so skip the service resolution + lookups, as
 		// every sibling translate_* method in this class already does.
 		if ( $plugin->has( 'router' ) ) {
@@ -1551,7 +1552,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * WooCommerce has no standalone screen for a variation: `post.php` on a
 	 * `product_variation` renders an empty editor. The Variations metabox on the
 	 * parent product is the only place one can be edited, so that is where the
-	 * link goes. A variation whose parent has been deleted gets no link at all —
+	 * link goes. A variation whose parent has been deleted gets no link at all -
 	 * better than one that opens a blank screen.
 	 *
 	 * @param string $url       URL resolved so far ('' when core could not).
@@ -1721,7 +1722,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		$resolving[ $page_id_int ] = true;
 
 		try {
-			// Container singleton — WC resolves shop/cart/checkout/my-account
+			// Container singleton - WC resolves shop/cart/checkout/my-account
 			// page options repeatedly per request, so a fresh repository
 			// allocation per call is pure churn.
 			$groups_repo   = $plugin->get( 'group_repo' );
@@ -1736,8 +1737,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// "A translation exists" is not "a translation is reachable", and
 			// this returned the former while WooCommerce consumed it as the
 			// latter. Generate Missing Translations creates every translation
-			// as a DRAFT, so on a store where an operator ran it — which
-			// 1.0.5's own Settings copy tells them to do — wc_get_page_id(
+			// as a DRAFT, so on a store where an operator ran it - which
+			// 1.0.5's own Settings copy tells them to do - wc_get_page_id(
 			// 'cart' ) on /de/ returned a draft page id. Measured on
 			// a test store: 221 (live cart) became 1031357 (draft), so the
 			// cart, checkout and my-account links in the whole German funnel
@@ -1797,8 +1798,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		$repo->prime_translations( \PerfLocale\Enum\ObjectType::Post, $ids );
 
 		// Prime the TRANSLATIONS' post rows as well, in one more query.
-		// filter_wc_page_id() has to know each candidate's post_status — a
-		// DRAFT translation must not replace a live store page — and without
+		// filter_wc_page_id() has to know each candidate's post_status - a
+		// DRAFT translation must not replace a live store page - and without
 		// this that is a separate get_post() per WC page on a cold cache, five
 		// times per front-end request. The link lookups below are free: they
 		// read the map just primed above.
@@ -1823,7 +1824,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		if ( $translated_ids !== [] ) {
-			// Statuses only — no meta, no terms.
+			// Statuses only - no meta, no terms.
 			_prime_post_caches( $translated_ids, false, false );
 		}
 	}
@@ -1836,7 +1837,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * batch prime exists and hand back TRANSLATED ids instead of the stored
 	 * ones.
 	 *
-	 * The values come from the same caches get_option() reads — alloptions for
+	 * The values come from the same caches get_option() reads - alloptions for
 	 * autoloaded names, the per-key options cache for the rest, which
 	 * wp_prime_option_caches() fills in one query or one multi-get. That also
 	 * serves WooCommerce's own get_option() calls for these names later in the
@@ -1961,7 +1962,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * to, and callers pass non-string sentinels: WooCommerce's own
 	 * CartCheckoutUtils::has_cart_page() is `wc_get_page_permalink( 'cart', -1 )
 	 * !== -1`. Casting that int to the string '-1' answered "yes, this store
-	 * has a cart page" for a store that has none — and because the cast ran
+	 * has a cart page" for a store that has none - and because the cast ran
 	 * before any language check it did so on the default language, on
 	 * monolingual sites and in admin too. The visible damage was a dead "View
 	 * cart" button pointing at the home page on the add-to-cart notice, the two
@@ -2001,7 +2002,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * (`get_permalink( wc_terms_and_conditions_page_id() )`). The
 	 * `woocommerce_get_*` filters registered in boot() never fire for those.
 	 * What does fire is `page_link`, where UrlConverter::filter_page_link()
-	 * resolves the page in ITS OWN language — deliberately, because that same
+	 * resolves the page in ITS OWN language - deliberately, because that same
 	 * output feeds wp_get_canonical_url() and the fallback-canonical /
 	 * hreflang pinning. Correct for SEO, wrong for a shop link: on /de/ the
 	 * shopper is handed an unprefixed /cart-3/ and lands on an en-US page with
@@ -2009,7 +2010,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * Only UNTRANSLATED WooCommerce pages are touched. When the merchant has
 	 * translated the cart page, filter_wc_page_id() already swapped the option
-	 * to the translated ID and UrlConverter built the correct /de/warenkorb/ —
+	 * to the translated ID and UrlConverter built the correct /de/warenkorb/ -
 	 * so a page that resolves in the current language is left exactly as it is.
 	 *
 	 * WooCommerce keeps the cart, checkout, my-account and terms page IDs at
@@ -2027,7 +2028,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 */
 	public function force_wc_page_language_prefix( mixed $link, mixed $post_id ): mixed {
 		// Re-entry guard. This callback runs INSIDE get_permalink(), and the
-		// WC page IDs below are read with get_option() — whose option_* filter
+		// WC page IDs below are read with get_option() - whose option_* filter
 		// chain is open to any plugin, including ones that build permalinks.
 		// Re-entering would be harmless in value terms (convert() is
 		// idempotent) but would recurse without bound.
@@ -2053,19 +2054,19 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// the /de/ URL even while that page is the one being rendered, so its
 		// own og:url and its en-US and x-default alternates all move onto the
 		// German URL instead of pointing back at the source. (The shop page is
-		// unaffected either way — see get_wc_page_ids() for why it is not in
+		// unaffected either way - see get_wc_page_ids() for why it is not in
 		// the set.) Store navigation always links to a page OTHER than the one
 		// on screen, so the fix loses nothing by standing aside here.
 		//
 		// The WP_Post test is LOAD-BEARING, do not simplify it back to
-		// get_queried_object_id(). That id is polymorphic — a TERM id on a term
-		// archive, a USER id on an author archive — and those ids collide with
+		// get_queried_object_id(). That id is polymorphic - a TERM id on a term
+		// archive, a USER id on an author archive - and those ids collide with
 		// post ids freely: on a stock WooCommerce install the funnel pages and
 		// the first product_cat terms are allocated in the same low range. On
 		// this very site category 222 ('Sin categoría', a browsable archive) is
 		// the checkout page's id, so the id-only guard skipped the whole fix on
 		// /category/uncategorized-es/ and handed a German shopper an unprefixed
-		// /checkout-3/ — the exact polymorphism translation_links.type exists
+		// /checkout-3/ - the exact polymorphism translation_links.type exists
 		// for, and a bug that would read as flaky because it is page-dependent.
 		$queried = get_queried_object();
 
@@ -2097,7 +2098,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			}
 
 			// A non-null result means this page already IS the current
-			// language's version (or one exists and owns that URL) — the link
+			// language's version (or one exists and owns that URL) - the link
 			// UrlConverter produced is correct and must not be re-prefixed.
 			$in_current_language = $plugin->get( 'group_repo' )->get_translation_in_language(
 				$page_id,
@@ -2110,8 +2111,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// "A translation exists" and "a translation is reachable" are not
 			// the same claim, and this guard was making the first one do the
 			// second one's job. Generate Missing Translations creates every
-			// translation as a DRAFT, so the moment an operator runs it — which
-			// 1.0.5's own Settings copy tells them to do — a draft cart page
+			// translation as a DRAFT, so the moment an operator runs it - which
+			// 1.0.5's own Settings copy tells them to do - a draft cart page
 			// existed for German, this returned early, and get_permalink() of
 			// the cart, checkout and my-account pages handed a German shopper
 			// the UNPREFIXED English URL from the mini-cart and the terms link.
@@ -2205,7 +2206,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * REQUEST_URI is fixed before plugins_loaded, so the verdict is
 	 * request-constant and can gate the page_link registration in boot()
-	 * outright — no per-request cost on the pages the filter does run on.
+	 * outright - no per-request cost on the pages the filter does run on.
 	 *
 	 * @return bool
 	 */
@@ -2268,7 +2269,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		$translated_id = $manager->get_translation_id( $product_id, $current_slug );
 
-		// Never point a guest at a draft, pending or private sibling — the same
+		// Never point a guest at a draft, pending or private sibling - the same
 		// rule the cart LABEL applies in translated_product_title(). Failing the
 		// check falls through to url_converter->convert() at the end of this
 		// method, which is exactly what an UNTRANSLATED product already gets, so
@@ -2281,7 +2282,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			if ( $translated_permalink ) {
 				// Preserve variation query parameters (e.g., ?attribute_pa_color=blue)
 				// and ONLY those. The original permalink's other params are the
-				// SOURCE post's routing identity — re-applying them clobbers the
+				// SOURCE post's routing identity - re-applying them clobbers the
 				// translated URL: ?lang= re-routes the "current language" link
 				// back to the original language (query mode), and ?p=/?product=
 				// makes it load the original post outright (Plain permalinks).
@@ -2321,7 +2322,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * @param mixed $value Endpoint value or empty string.
 	 * @param mixed $permalink Base page permalink.
 	 * @return mixed Language-prefixed URL, or $url untouched when it is not a
-	 *               string — `woocommerce_get_endpoint_url` only ever carries
+	 *               string - `woocommerce_get_endpoint_url` only ever carries
 	 *               one, but the pass-through belongs to translate_wc_url().
 	 */
 	public function translate_endpoint_url( mixed $url, mixed $endpoint, mixed $value, mixed $permalink ): mixed {
@@ -2389,7 +2390,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// Simple product: map the LABEL to the current-language sibling the
 			// same way translate_cart_item_permalink() maps the LINK. Without
 			// this the cart showed the source-language title pointing at the
-			// translated URL — label and link disagreeing on the same row.
+			// translated URL - label and link disagreeing on the same row.
 			$translated_name = $this->translated_product_title( (int) ( $cart_item['product_id'] ?? 0 ) );
 
 			if ( $translated_name === null ) {
@@ -2466,7 +2467,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// The cart, mini-cart and checkout render for GUESTS. A translation is
 		// created as a DRAFT, so "linked but not public yet" is the normal state
-		// of half-finished work, not an edge case — swapping its title in
+		// of half-finished work, not an edge case - swapping its title in
 		// publishes unreleased copy to anyone holding an item in their basket.
 		// Keep the source label instead. Same rule the cross-sell mapper already
 		// applies in map_related_ids_to_language().
@@ -2846,7 +2847,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * Whether a translated post may be shown to the current visitor.
 	 *
 	 * Core's own visibility rule (WP 5.7+) with a status fallback for older
-	 * cores — the same six lines PerfLocaleAcf, PerfLocalePods and
+	 * cores - the same six lines PerfLocaleAcf, PerfLocalePods and
 	 * PerfLocaleMetabox already ship. Deliberately NOT pushed down into
 	 * PostTranslationManager::get_translation_id(): the editor, the
 	 * Translations page and every translation workflow legitimately resolve
@@ -3017,7 +3018,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			}
 
 			if ( ! taxonomy_exists( $taxonomy ) ) {
-				// Custom (non-taxonomy) attribute — keep its raw stored value.
+				// Custom (non-taxonomy) attribute - keep its raw stored value.
 				$translated_parts[] = $slug_value;
 				continue;
 			}
@@ -3610,7 +3611,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 						<?php
 						$default_currency = (string) get_option( 'woocommerce_currency', 'USD' );
 						// Auto-synced rates persist to a dedicated option, not into
-						// wc_currencies — read them here so the input mirrors the
+						// wc_currencies - read them here so the input mirrors the
 						// last-synced value when auto-sync is on.
 						$auto_rates = $auto_sync ? (array) get_option( \PerfLocale\WooCommerce\ExchangeRateSync::RATES_OPTION, [] ) : [];
 
@@ -3937,7 +3938,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				// Not a finite number above zero: refused, the stored rate of
 				// the row stays (rate_to_store()).
 				'exchange_rate' => \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $existing[ $slug ] ?? null, $code ),
-				// Carry the manual-rate pin through the POST handler — without it
+				// Carry the manual-rate pin through the POST handler - without it
 				// the auto-sync skip (ExchangeRateSync / MultiCurrency) never sees
 				// the flag, so a user-entered rate is silently overwritten.
 				'manual_rate'   => ! empty( $data['manual_rate'] ),
@@ -3967,7 +3968,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		foreach ( $attributes as $attribute ) {
 			// Custom (non-taxonomy) attributes carry literal strings, not term
-			// IDs — there is no sibling term to point at, so leave them alone.
+			// IDs - there is no sibling term to point at, so leave them alone.
 			if ( ! $attribute instanceof \WC_Product_Attribute || ! $attribute->is_taxonomy() ) {
 				continue;
 			}
@@ -4013,7 +4014,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		$manager = $this->get_term_manager();
 
 		foreach ( $attributes as $taxonomy => $slug ) {
-			// "Any <attribute>" is stored as an empty value — keep it empty.
+			// "Any <attribute>" is stored as an empty value - keep it empty.
 			if ( ! is_string( $slug ) || $slug === '' || ! taxonomy_exists( (string) $taxonomy ) ) {
 				continue;
 			}
@@ -4046,8 +4047,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * Injects a query var that nothing reads, purely so
 	 * `BlocksWpQuery::get_cached_posts()`'s md5 of `query_vars` differs per
 	 * language. Deliberately NOT `perflocale_language_id`: that var drives
-	 * `modify_query_clauses()`, and setting it here — before
-	 * `filter_by_language()` has had its say at `pre_get_posts` — would scope
+	 * `modify_query_clauses()`, and setting it here - before
+	 * `filter_by_language()` has had its say at `pre_get_posts` - would scope
 	 * queries that are meant to be exempt. See the rationale in boot().
 	 *
 	 * @param \WP_Query $query Query being parsed.
@@ -4090,7 +4091,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return;
 		}
 
-		// Already decided by someone — never override an existing stamp.
+		// Already decided by someone - never override an existing stamp.
 		if ( (int) $query->get( 'perflocale_language_id' ) > 0 ) {
 			return;
 		}
@@ -4286,9 +4287,9 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * translation.
 	 *
 	 * Copies attributes, prices, stock, shipping fields, image, and the
-	 * variation description (a seed — the translator owns it afterwards).
+	 * variation description (a seed - the translator owns it afterwards).
 	 * SKUs are copied VERBATIM: translation siblings deliberately share SKUs
-	 * (they are the same physical inventory — see InventorySync), so WC's
+	 * (they are the same physical inventory - see InventorySync), so WC's
 	 * unique-SKU validation is suspended for the duration of the clone.
 	 * Taxonomy attribute options and variation values are remapped to the
 	 * target language's sibling terms so the variation form can match them.
@@ -4319,7 +4320,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			}
 
 			// The product_type taxonomy term is not part of the meta copy, so
-			// the translation materialises as a simple product — set it to
+			// the translation materialises as a simple product - set it to
 			// variable BEFORE loading the target so WC returns the right class.
 			wp_set_object_terms( (int) $new_id, 'variable', 'product_type' );
 
@@ -4335,7 +4336,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			}
 
 			// Parent attribute definitions must match the source or the
-			// variation form can't render its selects — but for TAXONOMY
+			// variation form can't render its selects - but for TAXONOMY
 			// attributes they must name the TARGET language's terms. The
 			// translated product is assigned the sibling terms (see
 			// TermAssignmentFilter::normalize_assignment), while a verbatim
@@ -4343,7 +4344,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			// wc_dropdown_variation_attribute_options() only emits an <option>
 			// for a term whose slug appears in BOTH sets, so the intersection
 			// came out empty and the dropdown rendered with no choices at all
-			// — every translated variable product was unpurchasable.
+			// - every translated variable product was unpurchasable.
 			$target->set_attributes( $this->translate_attribute_options( $source->get_attributes(), (string) $target_slug ) );
 			$target->save();
 
@@ -4371,7 +4372,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 					$nv->set_sale_price( (string) $sv->get_sale_price( 'edit' ) );
 					// A sale price with no schedule is on sale immediately and
 					// indefinitely, and wc_scheduled_sales only ends sales that
-					// carry a _sale_price_dates_to — without the dates the clone
+					// carry a _sale_price_dates_to - without the dates the clone
 					// would go on sale permanently (or a future sale would start
 					// today). The source window must travel with the clone.
 					$nv->set_date_on_sale_from( $sv->get_date_on_sale_from( 'edit' ) );
@@ -4390,7 +4391,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 					if ( $sv->get_downloadable( 'edit' ) ) {
 						// The downloadable FLAG without the files grants
-						// ZERO download permissions at purchase — a customer
+						// ZERO download permissions at purchase - a customer
 						// buying the translated variation would pay for a
 						// download that never appears in their account or
 						// order emails. The file list, limit, and expiry
@@ -4405,7 +4406,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 					$nv->set_width( (string) $sv->get_width( 'edit' ) );
 					$nv->set_height( (string) $sv->get_height( 'edit' ) );
 					$nv->set_tax_class( (string) $sv->get_tax_class( 'edit' ) );
-					// Per-variation shipping class (e.g. "bulky") — without it the
+					// Per-variation shipping class (e.g. "bulky") - without it the
 					// clone falls back to the parent/none and is charged wrong.
 					$nv->set_shipping_class_id( (int) $sv->get_shipping_class_id( 'edit' ) );
 					$nv->set_menu_order( (int) $sv->get_menu_order( 'edit' ) );
@@ -4458,18 +4459,21 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * WC_Product_Variable::sync(). Grouped, external and simple products, and
 	 * custom types that are not 'variable', are built here.
 	 *
-	 * WooCommerce 10.8+ only: refresh_product_lookup_table() reads the row
-	 * from the translation's meta and writes it with one REPLACE. The product
+	 * The row is the one WooCommerce's own CRUD create writes: the data
+	 * store's update_lookup_table( $id, 'wc_product_meta_lookup' ) reads it
+	 * from the translation's meta and writes it with one REPLACE. On
+	 * WooCommerce 10.8+ the public refresh_product_lookup_table() calls it;
+	 * older versions have no public single-product rebuild, and
+	 * write_lookup_row() calls the same method directly. The product
 	 * object is not loaded for it: the row is built from meta alone, and loading
 	 * the product would also read every term of the translation and, outside
 	 * wp-admin, rewrite WooCommerce's term-count cache. WC_Data_Store::load()
 	 * with 'product-<type>' resolves the same data store the product object
 	 * uses (a registered custom type's own store, else the product store), and
-	 * the type is the one mirror_product_type() just wrote. Older
-	 * versions have no public single-product rebuild, and the translation is
-	 * left as it is there; WooCommerce → Status → Tools → Product lookup
-	 * tables builds the missing rows. The row is never written by hand, and
-	 * wc_update_product_stock() is not used: it fires
+	 * the type is the one mirror_product_type() just wrote. The row is never
+	 * written by hand, and no save path is used: a CRUD save fires the
+	 * product save hooks (webhooks, the sibling sync) and writes no row for
+	 * an unchanged product, and wc_update_product_stock() fires
 	 * woocommerce_product_set_stock, whose sibling mirror would write the
 	 * translation's just-copied quantity to the whole group and could
 	 * overwrite a concurrent sale.
@@ -4503,10 +4507,6 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return;
 		}
 
-		if ( version_compare( (string) WC()->version, '10.8.0', '<' ) ) {
-			return;
-		}
-
 		try {
 			$type = $type ?? \WC_Product_Factory::get_product_type( $new_id );
 
@@ -4514,12 +4514,72 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 				return;
 			}
 
-			\WC_Data_Store::load( 'product-' . sanitize_key( $type ) )->refresh_product_lookup_table( $new_id );
+			$store = \WC_Data_Store::load( 'product-' . sanitize_key( $type ) );
+
+			if ( version_compare( (string) WC()->version, '10.8.0', '>=' ) ) {
+				$store->refresh_product_lookup_table( $new_id );
+			} else {
+				$this->write_lookup_row( $store, $new_id );
+			}
 		} catch ( \Throwable $e ) {
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				error_log( 'PerfLocale WC: lookup row rebuild failed for translation ' . $new_id . ': ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			}
 		}
+	}
+
+	/**
+	 * Write a product's wc_product_meta_lookup row through its data store on
+	 * WooCommerce below 10.8.
+	 *
+	 * Calls the store's protected update_lookup_table( $id,
+	 * 'wc_product_meta_lookup' ) (WC_Data_Store_WP, WooCommerce 3.6+), the
+	 * method WooCommerce's CRUD create calls for a new product and 10.8's
+	 * public refresh_product_lookup_table() wraps. It builds the row from the
+	 * product's meta with the store's own get_data_for_lookup_table() and
+	 * writes it with one REPLACE: no action fires and no meta is written. The
+	 * store object is the one the WC_Data_Store wrapper resolved (its private
+	 * $instance). Both are reached through static closures scoped to the
+	 * class that declares them.
+	 *
+	 * @param \WC_Data_Store $store      Wrapper from WC_Data_Store::load().
+	 * @param int            $product_id Product ID.
+	 * @return void
+	 * @throws \RuntimeException When the wrapper has no store instance or the
+	 *                           store is not a WC_Data_Store_WP.
+	 */
+	private function write_lookup_row( \WC_Data_Store $store, int $product_id ): void {
+		if ( ! property_exists( \WC_Data_Store::class, 'instance' ) || ! class_exists( \WC_Data_Store_WP::class ) ) {
+			throw new \RuntimeException( 'WooCommerce has no data store instance' );
+		}
+
+		$read = \Closure::bind(
+			static function ( \WC_Data_Store $wrapper ): mixed {
+				return $wrapper->instance;
+			},
+			null,
+			\WC_Data_Store::class
+		);
+		/**
+		 * The store object the wrapper resolved. WooCommerce documents the
+		 * property as a WC_Data_Store.
+		 *
+		 * @var object|null $instance
+		 */
+		$instance = $read( $store );
+
+		if ( ! $instance instanceof \WC_Data_Store_WP ) {
+			throw new \RuntimeException( 'the product data store is not a WC_Data_Store_WP' );
+		}
+
+		$write = \Closure::bind(
+			static function ( \WC_Data_Store_WP $data_store, int $id ): void {
+				$data_store->update_lookup_table( $id, 'wc_product_meta_lookup' );
+			},
+			null,
+			\WC_Data_Store_WP::class
+		);
+		$write( $instance, $product_id );
 	}
 
 	/**
@@ -4543,14 +4603,16 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * translation's meta breadcrumb and reported through
 	 * perflocale/mt/meta_translate_failed.
 	 *
-	 * @param int|mixed   $source_id   Source post ID.
-	 * @param string      $provider_id Provider that translated the post.
-	 * @param array|mixed $result      translate_post() result (post_id = the translation).
-	 * @param string      $target_slug Target language slug.
-	 * @param string      $source_slug Source language slug.
+	 * @param int|mixed      $source_id   Source post ID.
+	 * @param string         $provider_id Provider that translated the post.
+	 * @param array|mixed    $result      translate_post() result (post_id = the translation).
+	 * @param string         $target_slug Target language slug.
+	 * @param string         $source_slug Source language slug.
+	 * @param \WP_Post|mixed $source_post Source post as translate_post() read it.
+	 *                                    Its post type is used when its ID is $source_id.
 	 * @return void
 	 */
-	public function translate_variation_texts( $source_id = 0, $provider_id = '', $result = [], $target_slug = '', $source_slug = '' ): void {
+	public function translate_variation_texts( $source_id = 0, $provider_id = '', $result = [], $target_slug = '', $source_slug = '', $source_post = null ): void {
 		$source_id = (int) $source_id;
 		$target_id = is_array( $result ) ? (int) ( $result['post_id'] ?? 0 ) : 0;
 
@@ -4558,7 +4620,14 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			return;
 		}
 
-		if ( 'product' !== get_post_type( $source_id ) || ! function_exists( 'wc_get_product' ) ) {
+		// The type comes from the source post the action passes. Read by ID
+		// it can cost a query: the sibling sync of the translation's save
+		// drops the source from the post cache.
+		$post_type = ( $source_post instanceof \WP_Post && (int) $source_post->ID === $source_id )
+			? (string) $source_post->post_type
+			: get_post_type( $source_id );
+
+		if ( 'product' !== $post_type || ! function_exists( 'wc_get_product' ) ) {
 			return;
 		}
 

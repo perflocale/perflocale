@@ -82,12 +82,12 @@ function pickLanguage( request, config ) {
 
 	// 2. A perflocale_lang cookie means RETURNING visitor: WordPress set it
 	// on their first routed request, and its own redirect features treat
-	// its presence as "already chose — never steer again". The worker must
+	// its presence as "already chose - never steer again". The worker must
 	// mirror that and stop steering entirely (return null = pass through,
 	// the URL is the truth). Without this, a German-browser visitor who
 	// clicks "English" in the switcher lands on an unprefixed default URL,
 	// the worker re-derives "de" from Accept-Language, and rewrites them
-	// straight back to German on every request, forever — the default
+	// straight back to German on every request, forever - the default
 	// language becomes unreachable for them.
 	const cookies = request.headers.get( 'cookie' ) || '';
 	const sticky = cookies.match( /(?:^|;\s*)(?:perflocale_lang|perflocale_edge_lang)=([a-z0-9_-]+)/ );

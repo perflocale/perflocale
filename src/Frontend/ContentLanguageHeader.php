@@ -90,7 +90,7 @@ final class ContentLanguageHeader {
 
 		// Prefer canonical BCP 47 locale (`de-DE`, `en-US`) over bare slug.
 		// The Helper enforces lowercase-language + UPPERCASE-region per
-		// RFC 5646 — same convention as the hreflang link tags.
+		// RFC 5646 - same convention as the hreflang link tags.
 		$locale = isset( $current->locale ) && $current->locale !== ''
 			? \PerfLocale\Helper::format_locale_as_bcp47( (string) $current->locale )
 			: (string) ( $current->slug ?? '' );

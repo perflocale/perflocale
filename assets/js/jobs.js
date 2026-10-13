@@ -1,6 +1,6 @@
 /* global perflocaleJobs */
 /**
- * PerfLocale — Background Jobs admin page.
+ * PerfLocale - Background Jobs admin page.
  *
  *   1. Polls /wp-json/perflocale/v1/jobs every 5 seconds while any row is
  *      in 'queued' or 'running' state and re-renders the table body in
@@ -85,7 +85,7 @@
 		return Math.floor(s / 3600) + 'h ' + ago;
 	};
 
-	// 1. Auto-refresh poller — only fires when at least one row is in-flight.
+	// 1. Auto-refresh poller - only fires when at least one row is in-flight.
 	// Updates the status / progress / updated cells in place rather than
 	// replacing the entire tbody. That keeps the per-row action buttons,
 	// detail-toggle state, and the expanded detail row (a sibling <tr>)
@@ -114,7 +114,7 @@
 				.then(function (r) {
 					// A non-2xx (expired REST nonce 403, transient 502/503
 					// exactly while jobs hammer the server) must take the
-					// SAME bounded-retry path as a network error — mapping
+					// SAME bounded-retry path as a network error - mapping
 					// it to null used to exit without rescheduling, leaving
 					// stale "running" badges frozen forever.
 					if (!r.ok) { throw new Error('poll ' + r.status); }
@@ -139,7 +139,7 @@
 							return;
 						}
 
-						// Status cell — preserve the inline error sub-div if any.
+						// Status cell - preserve the inline error sub-div if any.
 						var statusCell = row.querySelector('[data-perflocale-cell="status"]');
 						if (statusCell) {
 							var span = statusCell.querySelector('.perflocale-jobs-status');
@@ -152,7 +152,7 @@
 							}
 						}
 
-						// Progress cell — replace just the "%" text node + bar width.
+						// Progress cell - replace just the "%" text node + bar width.
 						var progressCell = row.querySelector('[data-perflocale-cell="progress"]');
 						if (progressCell) {
 							var pct = Math.min(100, Math.max(0, j.progress | 0));
@@ -160,7 +160,7 @@
 							var track = progressCell.querySelector('.perflocale-jobs-progress');
 							if (track) {
 								// Keep the progressbar's accessible value in
-								// sync with the visual width — screen readers
+								// sync with the visual width - screen readers
 								// announce aria-valuenow, not CSS.
 								track.setAttribute('aria-valuenow', String(pct));
 							}
@@ -185,7 +185,7 @@
 							}
 						}
 
-						// "X ago" cell — pure text replace.
+						// "X ago" cell - pure text replace.
 						var updatedCell = row.querySelector('[data-perflocale-cell="updated"]');
 						if (updatedCell) {
 							updatedCell.textContent = humanDelta(j.updated_at);
@@ -193,7 +193,7 @@
 					});
 
 					if (anyTerminalNow) {
-						// One row just finished — server-rendered actions
+						// One row just finished - server-rendered actions
 						// cell needs to swap (cancel → retry/delete). Reload once.
 						location.reload();
 						return;
@@ -220,7 +220,7 @@
 						notice.setAttribute('role', 'status');
 						var p = document.createElement('p');
 						p.textContent = (window.perflocaleJobs && window.perflocaleJobs.i18n && window.perflocaleJobs.i18n.pollPaused) ||
-							'Live updates paused after repeated errors — reload the page to resume.';
+							'Live updates paused after repeated errors - reload the page to resume.';
 						notice.appendChild(p);
 						table.parentNode.insertBefore(notice, table);
 					}
@@ -318,7 +318,7 @@
 
 			// Details toggle: fetch the per-job state on first expand, then
 			// cache the rendered detail in the sibling tr. Subsequent clicks
-			// just toggle visibility — no extra request.
+			// just toggle visibility - no extra request.
 			if (action === 'details') {
 				var detailRow = document.querySelector(
 					'[data-perflocale-job-detail="' + (jobId || '').replace(/"/g, '') + '"]'

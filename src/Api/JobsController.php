@@ -43,13 +43,11 @@ final class JobsController extends RestController {
 	protected $rest_base = 'jobs';
 
 	/**
-	 * Per-request memo of JobState rows keyed by BLOG ID + job id. Populated by
-	 * the permission_callback so the matching handler doesn't re-issue the same
-	 * DB read. WP_REST_Server reuses the same controller instance for a
-	 * permission_callback + callback pair within one REST dispatch, so this
-	 * memo's lifetime exactly matches what we need. Callers that must observe
-	 * post-mutation state (cancel_job / retry_job after their write) call
-	 * JobState::get() directly to bypass the stale entry.
+	 * JobState rows keyed by BLOG ID + job id, so a permission_callback and
+	 * its handler share one read. WP_REST_Server reuses this controller
+	 * instance for every dispatch in the process, so each per-job permission
+	 * check reads the row afresh (one read per dispatch) and every handler
+	 * that changes the row drops its entry.
 	 *
 	 * The blog id is part of the key because the jobs table is per-blog while
 	 * this memo is not, and a controller instance can outlive a
@@ -61,21 +59,67 @@ final class JobsController extends RestController {
 	private array $job_state_memo = [];
 
 	/**
-	 * Memoised JobState::get(). Returns the row the permission_callback
-	 * already resolved; on first miss reads through to JobState::get().
+	 * Memo key of a job on the current blog.
+	 *
+	 * @param string $id Job UUID.
+	 * @return string
+	 */
+	private function job_state_key( string $id ): string {
+		return ( function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0 ) . ':' . $id;
+	}
+
+	/**
+	 * Memoised JobState::get(). Returns the row this dispatch's
+	 * permission_callback already read; on a miss reads through.
 	 *
 	 * @param string $id Job UUID.
 	 * @return array<string, mixed>|null
 	 */
 	private function get_job_state( string $id ): ?array {
-		$key = ( function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0 ) . ':' . $id;
+		$key = $this->job_state_key( $id );
 
 		if ( array_key_exists( $key, $this->job_state_memo ) ) {
 			return $this->job_state_memo[ $key ];
 		}
 
+		return $this->load_job_state( $id );
+	}
+
+	/**
+	 * Reads the row from JobState and stores it for this dispatch's handler.
+	 *
+	 * @param string $id Job UUID.
+	 * @return array<string, mixed>|null
+	 */
+	private function load_job_state( string $id ): ?array {
+		$key = $this->job_state_key( $id );
+
 		$this->job_state_memo[ $key ] = JobState::get( $id );
 		return $this->job_state_memo[ $key ];
+	}
+
+	/**
+	 * Drops the stored row after a handler changed it.
+	 *
+	 * @param string $id Job UUID.
+	 * @return void
+	 */
+	private function forget_job_state( string $id ): void {
+		unset( $this->job_state_memo[ $this->job_state_key( $id ) ] );
+	}
+
+	/**
+	 * The job id the route's URL names, '' when it names none.
+	 *
+	 * The URL segment only: get_param() prefers a body or query `id`, which
+	 * would name a different job than the route.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return string
+	 */
+	private function url_id( \WP_REST_Request $request ): string {
+		$id = $request->get_url_params()['id'] ?? '';
+		return is_string( $id ) ? $id : '';
 	}
 
 	/**
@@ -133,9 +177,9 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * GET /jobs — list active jobs (newest first).
+	 * GET /jobs - list active jobs (newest first).
 	 *
-	 * Returns the bounded active-index — never the full per-job payload,
+	 * Returns the bounded active-index - never the full per-job payload,
 	 * which would be expensive to serialize on every poll. Clients fetch
 	 * `/jobs/{id}` for the row they want to expand.
 	 *
@@ -146,7 +190,7 @@ final class JobsController extends RestController {
 		$is_super    = current_user_can( 'perflocale_manage_translations' );
 		$current_uid = (int) get_current_user_id();
 
-		// list_active_summary() omits args/result/log — this endpoint only
+		// list_active_summary() omits args/result/log - this endpoint only
 		// reads a few small fields per row, so pulling the LONGTEXT columns
 		// every 5 s on the polling client is pure wasted bytes-on-wire.
 		foreach ( JobState::list_active_summary() as $job_id => $row ) {
@@ -179,13 +223,13 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * GET /jobs/{id} — full detail for one job.
+	 * GET /jobs/{id} - full detail for one job.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function get_job( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		$id = (string) $request->get_param( 'id' );
+		$id = $this->url_id( $request );
 
 		$state = $this->get_job_state( $id );
 
@@ -200,13 +244,13 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * POST /jobs/{id}/cancel — mark canceled + unschedule.
+	 * POST /jobs/{id}/cancel - mark canceled + unschedule.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function cancel_job( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		$id    = (string) $request->get_param( 'id' );
+		$id    = $this->url_id( $request );
 		$state = $this->get_job_state( $id );
 
 		// 404 covers both "row missing" and "not yours" so the existence
@@ -215,7 +259,7 @@ final class JobsController extends RestController {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		// 409 on terminal status — distinct from 404 so the API client can
+		// 409 on terminal status - distinct from 404 so the API client can
 		// distinguish "already done, nothing to cancel" from "no such job".
 		// Safe to disclose because the caller already proved ownership above.
 		if ( ! in_array( (string) $state['status'], [ 'queued', 'running' ], true ) ) {
@@ -230,7 +274,10 @@ final class JobsController extends RestController {
 		// the write does not land, nothing else is touched: the job keeps its
 		// event and its worker keeps its lock. An event that fires after the
 		// write finds a canceled row and stands down.
-		if ( ! JobState::cancel( $id ) ) {
+		$canceled = JobState::cancel( $id );
+		$this->forget_job_state( $id );
+
+		if ( ! $canceled ) {
 			$latest = JobState::get( $id );
 			$status = $latest ? (string) $latest['status'] : '';
 
@@ -271,13 +318,13 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * POST /jobs/{id}/retry — reset to queued and re-enqueue.
+	 * POST /jobs/{id}/retry - reset to queued and re-enqueue.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function retry_job( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		$id    = (string) $request->get_param( 'id' );
+		$id    = $this->url_id( $request );
 		$state = $this->get_job_state( $id );
 
 		// 404 covers "row missing" + "not yours" identically.
@@ -351,7 +398,10 @@ final class JobsController extends RestController {
 			$blog_id
 		);
 
-		if ( ! JobState::reset_for_retry( $id, true ) ) {
+		$reset = JobState::reset_for_retry( $id, true );
+		$this->forget_job_state( $id );
+
+		if ( ! $reset ) {
 			return new \WP_Error(
 				'perflocale_job_retry_failed',
 				__( 'Could not reset the job for retry; its state changed concurrently.', 'perflocale' ),
@@ -392,7 +442,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * DELETE /jobs/{id} — hard-delete the job state row + active-index entry.
+	 * DELETE /jobs/{id} - hard-delete the job state row + active-index entry.
 	 *
 	 * Only allowed on jobs that have already finished (complete/failed/
 	 * canceled). Running / queued jobs must be canceled first, so the
@@ -402,7 +452,7 @@ final class JobsController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function delete_job( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		$id    = (string) $request->get_param( 'id' );
+		$id    = $this->url_id( $request );
 		$state = $this->get_job_state( $id );
 
 		// 404 covers "row missing" + "not yours" identically (security).
@@ -419,6 +469,7 @@ final class JobsController extends RestController {
 		}
 
 		JobState::delete( $id );
+		$this->forget_job_state( $id );
 
 		return rest_ensure_response(
 			[
@@ -429,7 +480,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Read permission — any user who can translate may see the queue.
+	 * Read permission - any user who can translate may see the queue.
 	 *
 	 * @return bool|\WP_Error
 	 */
@@ -441,7 +492,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Coarse mutate permission — finer per-job check happens in {@see user_can_mutate()}.
+	 * Coarse mutate permission - finer per-job check happens in {@see user_can_mutate()}.
 	 *
 	 * @return bool|\WP_Error
 	 */
@@ -459,7 +510,7 @@ final class JobsController extends RestController {
 	 *
 	 * Returns 404 (not 403) when the user lacks per-job access, so the
 	 * existence of a job ID owned by another translator isn't observable.
-	 * The handler keeps its own check too — defense in depth, and so any
+	 * The handler keeps its own check too - defense in depth, and so any
 	 * internal caller still gets the gate.
 	 *
 	 * @param \WP_REST_Request $request
@@ -471,14 +522,14 @@ final class JobsController extends RestController {
 			return $base;
 		}
 
-		$id = (string) $request->get_param( 'id' );
+		$id = $this->url_id( $request );
 		if ( $id === '' ) {
-			// Should never happen — the route regex enforces 8-64 chars —
+			// Should never happen - the route regex enforces 8-64 chars -
 			// but defensively reject malformed paths at the gate.
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		$state = $this->get_job_state( $id );
+		$state = $this->load_job_state( $id );
 		if ( ! $state || ! $this->user_can_read( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
@@ -489,7 +540,7 @@ final class JobsController extends RestController {
 	/**
 	 * Per-job MUTATE permission (cancel / retry / delete). Same shape as
 	 * {@see read_job_permissions_check()} but routes through user_can_mutate
-	 * — currently identical to user_can_read, but kept as a separate hook
+	 * - currently identical to user_can_read, but kept as a separate hook
 	 * so future tightening (e.g. supervisor-only delete) only changes one
 	 * predicate.
 	 *
@@ -502,12 +553,12 @@ final class JobsController extends RestController {
 			return $base;
 		}
 
-		$id = (string) $request->get_param( 'id' );
+		$id = $this->url_id( $request );
 		if ( $id === '' ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		$state = $this->get_job_state( $id );
+		$state = $this->load_job_state( $id );
 		if ( ! $state || ! $this->user_can_mutate( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
@@ -606,7 +657,7 @@ final class JobsController extends RestController {
 	 *   - Don't echo raw `args` to non-supervisors (could leak post IDs,
 	 *     file paths). Show a redacted summary.
 	 *   - Coerce all numeric fields to int.
-	 *   - Pass the log ring buffer through as-is — already capped by JobState.
+	 *   - Pass the log ring buffer through as-is - already capped by JobState.
 	 *
 	 * @param array<string, mixed> $state
 	 * @return array<string, mixed>
@@ -616,7 +667,7 @@ final class JobsController extends RestController {
 		// Show them to the supervisor cap (so the admin can debug any
 		// job) AND to the original dispatching user (so they can see
 		// what their own job is doing). Every other translator sees a
-		// sentinel — they know args exist but not their contents.
+		// sentinel - they know args exist but not their contents.
 		$created_by = (int) ( $state['created_by'] ?? 0 );
 		$current    = (int) get_current_user_id();
 		$show_args  = ( $created_by > 0 && $current === $created_by )
@@ -625,7 +676,7 @@ final class JobsController extends RestController {
 		// Label for the dispatcher cell in the Jobs admin UI. `created_by`
 		// may be 0 (GDPR anonymisation zeroed it), may point to a user
 		// that no longer exists (admin deleted them without remap), or
-		// may be a regular live user — in which case surface their
+		// may be a regular live user - in which case surface their
 		// display_name (or user_login as fallback) so the UI shows
 		// something human instead of a bare numeric ID.
 		$created_by_label = null;
@@ -677,7 +728,7 @@ final class JobsController extends RestController {
 			// Only supervisors / dispatcher see raw args; everyone else gets
 			// a sentinel so the UI knows args exist without leaking values.
 			'args'             => $show_args ? (array) ( $state['args'] ?? [] ) : null,
-			'args_redacted'    => $show_args ? null : __( '(redacted — supervisors only)', 'perflocale' ),
+			'args_redacted'    => $show_args ? null : __( '(redacted - supervisors only)', 'perflocale' ),
 		];
 	}
 }

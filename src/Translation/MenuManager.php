@@ -57,7 +57,7 @@ final class MenuManager {
 		add_filter( 'wp_nav_menu_args', [ $this, 'filter_menu_args' ] );
 
 		// Frontend: point post/term menu items at the current language's
-		// sibling (the classic-menu twin of the FSE navigation-link fix —
+		// sibling (the classic-menu twin of the FSE navigation-link fix -
 		// classic items render their SAVED object's permalink, which
 		// resolves to the object's OWN language). Priority 9 so the
 		// front-page fix below still wins for front-page items.
@@ -149,12 +149,12 @@ final class MenuManager {
 	 * Point classic menu post/term items at the current language's sibling.
 	 *
 	 * A classic menu item renders its saved object's permalink, which the
-	 * permalink filters resolve to the object's OWN language — so on a
+	 * permalink filters resolve to the object's OWN language - so on a
 	 * translated page every explicit item linked back to the source
 	 * language. When a published sibling exists in the current language,
 	 * swap the item URL for the sibling's permalink (mirrors the FSE
 	 * navigation-link fix). Menus with an explicit language assignment are
-	 * skipped — those are curated per language.
+	 * skipped - those are curated per language.
 	 *
 	 * @param array<int, \WP_Post> $items Menu items.
 	 * @param object|null          $args  wp_nav_menu args (carries the menu term).
@@ -172,7 +172,7 @@ final class MenuManager {
 		}
 
 		// A menu with an EXPLICIT language assignment is curated for that
-		// language — its items were authored deliberately; leave them
+		// language - its items were authored deliberately; leave them
 		// untouched. (filter_menu_args already swapped to the per-language
 		// menu when one exists; item-level mapping only serves the shared
 		// single-menu setup.)
@@ -189,7 +189,7 @@ final class MenuManager {
 			$type      = (string) ( $item->type ?? '' );
 
 			if ( $object_id <= 0 || ( $type !== 'post_type' && $type !== 'taxonomy' ) ) {
-				continue; // Custom links / archives — nothing to localize.
+				continue; // Custom links / archives - nothing to localize.
 			}
 
 			$is_term = $type === 'taxonomy';
@@ -216,7 +216,7 @@ final class MenuManager {
 				$url  = $term instanceof \WP_Term ? get_term_link( $term ) : '';
 			} else {
 				if ( get_post_status( $sibling_id ) !== 'publish' ) {
-					continue; // Draft sibling — keep the working saved URL.
+					continue; // Draft sibling - keep the working saved URL.
 				}
 				$url = get_permalink( $sibling_id );
 			}
@@ -266,7 +266,7 @@ final class MenuManager {
 		$url_converter  = \PerfLocale\Plugin::get_instance()->get( 'url_converter' );
 		$default_lang   = $lang_repo->get_default();
 
-		// Raw (unfiltered) site home — the home_url filter re-prefixes with the
+		// Raw (unfiltered) site home - the home_url filter re-prefixes with the
 		// current request language, so we pass the bare option to the converter,
 		// which re-derives the correct per-language home for the active url mode.
 		$home_base = trailingslashit( (string) get_option( 'home' ) );
@@ -303,9 +303,9 @@ final class MenuManager {
 			}
 
 			// Delegate to the canonical URL converter so the per-language home is
-			// correct in EVERY url mode — subdirectory (path prefix, with the
+			// correct in EVERY url mode - subdirectory (path prefix, with the
 			// default hidden), subdomain (de.host), and per-language domain
-			// (host.de) — instead of unconditionally appending a path prefix.
+			// (host.de) - instead of unconditionally appending a path prefix.
 			// convert() also suppresses the home_url filter internally, so the
 			// current request language can't re-prefix the result.
 			$item->url = $url_converter->convert( $home_base, $page_lang->slug );
@@ -337,8 +337,8 @@ final class MenuManager {
 			// is later changed or the menu is deleted (save_menu_language does
 			// not reconcile siblings). Reject it only when the target has been
 			// RE-LABELED to a different language. An UNLABELED target ('') is
-			// the normal linked-menu case — the admin sets the language on one
-			// menu of the group and links the rest without labelling each — so
+			// the normal linked-menu case - the admin sets the language on one
+			// menu of the group and links the rest without labelling each - so
 			// we still trust it, but only if the menu actually still exists
 			// (a deleted menu's term meta is gone, so it too reads '', and we
 			// must not serve a dangling pointer).
@@ -452,7 +452,7 @@ final class MenuManager {
 		}
 
 		// Verify core's nav-menu save nonce: field `update-nav-menu-nonce`,
-		// action `update-nav_menu` — the exact pair nav-menus.php posts.
+		// action `update-nav_menu` - the exact pair nav-menus.php posts.
 		// Empty and invalid nonces are both rejected outright.
 		// Canonical WP order: nonce (CSRF) first, then capability. We use
 		// silent `return` on either failure because this hooks into core's
@@ -498,7 +498,7 @@ final class MenuManager {
 		// re-checking here keeps the CSRF guarantee LOCAL and visible instead of
 		// relying on an upstream check a static analyser can't see. A
 		// programmatic menu save (importer, WP-CLI) carries neither this nonce
-		// NOR our POST fields, so the early return loses nothing there — the
+		// NOR our POST fields, so the early return loses nothing there - the
 		// perflocale_menu_language isset() guard below would no-op anyway.
 		$nonce = isset( $_POST['update-nav-menu-nonce'] )
 			? sanitize_text_field( wp_unslash( $_POST['update-nav-menu-nonce'] ) )
@@ -576,7 +576,7 @@ final class MenuManager {
 	 * @return void
 	 */
 	public function setup_menu_item_filtering(): void {
-		// Hooked on admin_head-nav-menus.php — gate by capability so the
+		// Hooked on admin_head-nav-menus.php - gate by capability so the
 		// $_REQUEST['menu'] read only happens for users who can already
 		// view the nav-menus screen, then the URL parameter is treated
 		// purely as a display filter (no state mutation).
@@ -591,7 +591,7 @@ final class MenuManager {
 		// back to "the first menu" when no ?menu=N is in the URL, so we
 		// mirror that - otherwise the filter would silently bail on a
 		// bare /wp-admin/nav-menus.php load. $_REQUEST['menu'] is the
-		// SAME parameter core's own nav-menus.php screen reads — display-
+		// SAME parameter core's own nav-menus.php screen reads - display-
 		// only filter on an already-capability-gated admin page.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display filter on an already cap-gated nav-menus admin screen; matches WP core's own use of $_REQUEST['menu'] in nav-menus.php.
 		$menu_id = isset( $_REQUEST['menu'] ) ? absint( $_REQUEST['menu'] ) : 0;
@@ -889,7 +889,7 @@ final class MenuManager {
 		);
 		// NOT wp_localize_script(): WP_Scripts::localize() runs every scalar
 		// through html_entity_decode() (wp-includes/class-wp-scripts.php), which
-		// UNDOES the esc_html() applied to the language labels above — and the
+		// UNDOES the esc_html() applied to the language labels above - and the
 		// consumer assigns these strings to innerHTML. Language names come from
 		// the languages table, so a label containing markup would be re-inflated
 		// into live HTML on the way out. wp_json_encode() performs no entity

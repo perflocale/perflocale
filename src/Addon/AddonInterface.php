@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Each addon must implement this interface to be discovered
  * and managed by the AddonRegistry.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface AddonInterface {
 
@@ -61,7 +61,7 @@ interface AddonInterface {
 	public function is_compatible(): bool;
 
 	/**
-	 * Boot the addon — register hooks, filters, etc.
+	 * Boot the addon - register hooks, filters, etc.
 	 *
 	 * The `$plugin` argument is the full PerfLocale DI container. Addons
 	 * can use it to reach the plugin's internal toolkit:
@@ -76,7 +76,7 @@ interface AddonInterface {
 	 *     service by ID
 	 *
 	 * Beyond the container, these classes form the addon-facing @api
-	 * surface — call them directly, no DI lookup needed:
+	 * surface - call them directly, no DI lookup needed:
 	 *
 	 *   • \PerfLocale\Concurrency\Lock       Atomic critical-section guard
 	 *   • \PerfLocale\Concurrency\Breaker    Circuit breaker for external calls

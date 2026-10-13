@@ -53,7 +53,7 @@ final class TermQueryFilter {
 	 *
 	 * The join + where fragments are a pure function of the blog's table names
 	 * (Schema::table) and the language_id, so they can be built once per
-	 * language and spliced in on every subsequent terms_clauses cache-miss —
+	 * language and spliced in on every subsequent terms_clauses cache-miss -
 	 * mirroring PostQueryFilter::$query_clauses_cache. MUST be reset on
 	 * switch_blog: the fragments embed the blog-specific table prefix, and
 	 * language_id is a per-blog auto-increment, so a stale entry would splice
@@ -359,7 +359,7 @@ final class TermQueryFilter {
 		// Key by blog_id:post_id so multisite switch_to_blog() doesn't serve
 		// blog A's cached value to blog B (same post_id can map to a different
 		// language on a different subsite). The class-static is cleared on
-		// switch_blog via reset_static_caches() — defence in depth.
+		// switch_blog via reset_static_caches() - defence in depth.
 		$key = get_current_blog_id() . ':' . $post_id;
 
 		if ( isset( self::$post_lang_id_cache[ $key ] ) ) {
@@ -413,12 +413,12 @@ final class TermQueryFilter {
 			// version hits the translation_groups primary key and is constant-sized.
 			$alias = 'pl_term_lang';
 
-			// translation_links is polymorphic — object_id is a post OR a term id.
+			// translation_links is polymorphic - object_id is a post OR a term id.
 			// A post whose id equals a term's term_id would otherwise match this
 			// term on `object_id = t.term_id`, producing a spurious extra row that
 			// double-counts the term (and, via `_g.id IS NULL`, leaks it across
 			// languages). Nest the type='term' filter into an INNER JOIN INSIDE the
-			// LEFT JOIN so only term-typed links reach the result — a colliding
+			// LEFT JOIN so only term-typed links reach the result - a colliding
 			// post-link never participates. Mirrors PostQueryFilter::modify_query_clauses.
 			$join = " LEFT JOIN ( {$links_table} AS {$alias}"
 				. " INNER JOIN {$groups_table} AS {$alias}_g"

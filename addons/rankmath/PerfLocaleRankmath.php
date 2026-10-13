@@ -121,7 +121,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
 	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context — where Rank Math's canonical filter still fires for its own
+	 * context - where Rank Math's canonical filter still fires for its own
 	 * content analysis but there is no fallback render to pin.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
@@ -166,7 +166,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 
 		// Capture at PHP_INT_MAX so the captured URL key matches the final
 		// URL after any third-party rank_math/sitemap/entry rewriter has
-		// fired — without this, a canonical-URL or CDN plugin between
+		// fired - without this, a canonical-URL or CDN plugin between
 		// priorities 10-999 would mutate the URL after our capture, and
 		// add_sitemap_alternates would then miss the map lookup at line 132.
 		add_filter( 'rank_math/sitemap/entry', [ $this, 'capture_sitemap_entry' ], PHP_INT_MAX, 3 );
@@ -176,8 +176,8 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 
 		// Include all language terms in Rank Math taxonomy sitemaps. The
 		// sitemap predicate is request-constant (REQUEST_URI is fixed before
-		// plugins_loaded), so the callback — riding WP's hottest term-query
-		// filter — is only registered on sitemap requests instead of
+		// plugins_loaded), so the callback - riding WP's hottest term-query
+		// filter - is only registered on sitemap requests instead of
 		// dispatching a no-op for every get_terms() call on every pageload.
 		if ( $this->is_sitemap_request() ) {
 			add_filter( 'get_terms_args', [ $this, 'include_all_languages_in_sitemap' ] );
@@ -189,7 +189,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 		// Enrich Rank Math's schema graph with inLanguage + translation
 		// siblings. Gated on the setting. Rank Math assembles its @graph on the
 		// 'rank_math/json_ld' filter (do_filter('json_ld', [], $this) in
-		// class-jsonld.php) — there is NO 'rank_math/schema/data' filter, so the
+		// class-jsonld.php) - there is NO 'rank_math/schema/data' filter, so the
 		// previous hook never fired and enrichment silently did nothing. Run at
 		// priority 100, after Rank Math's own add_schema(10)/connect_schema_entities(99),
 		// so the fully-assembled graph is enriched. Only the first arg ($data)
@@ -214,14 +214,14 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Enrich Rank Math's schema graph via the shared SchemaEnricher.
 	 *
-	 * Rank Math emits a MAP of entities keyed by snippet name — 'publisher',
-	 * 'WebSite', 'WebPage', 'richSnippet' … — and only re-indexes it with
+	 * Rank Math emits a MAP of entities keyed by snippet name - 'publisher',
+	 * 'WebSite', 'WebPage', 'richSnippet' … - and only re-indexes it with
 	 * array_values() when it renders (class-jsonld.php:159). That is NOT a
 	 * shape SchemaEnricher::enrich_graph() handles: it recognises an `@graph`
 	 * envelope, a sequential list, or one lone entity, and a keyed map falls
 	 * through to the single-entity branch, where the `@type` lookup misses and
 	 * the whole map comes back untouched. Enrich each entity individually and
-	 * keep the keys. Do not "simplify" this loop into an enrich_graph() call —
+	 * keep the keys. Do not "simplify" this loop into an enrich_graph() call -
 	 * it would silently stop enriching every Rank Math page.
 	 *
 	 * @param array<string, array<string, mixed>>|mixed $graph Rank Math schema graph.
@@ -271,7 +271,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Machine-translatable SEO meta: titles/descriptions/social text ONLY.
-	 * The focus keyword is deliberately excluded — keyword targeting in the
+	 * The focus keyword is deliberately excluded - keyword targeting in the
 	 * target language is a human decision (add it back via this same filter
 	 * if a site wants it). Gated by the mt_meta_seo setting.
 	 *
@@ -280,7 +280,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	/**
-	 * The Rank Math meta keys this addon machine-translates — all plain-text SEO
+	 * The Rank Math meta keys this addon machine-translates - all plain-text SEO
 	 * fields, so all route to the provider's text mode via mt_meta_key_format().
 	 */
 	private const MT_TEXT_KEYS = [
@@ -334,7 +334,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * Whether the current request renders an XML sitemap.
 	 *
 	 * REQUEST_URI is fixed before plugins_loaded, so the verdict is
-	 * request-constant — used both to gate the get_terms_args registration
+	 * request-constant - used both to gate the get_terms_args registration
 	 * and inside the callback for callers that invoke it directly.
 	 *
 	 * @return bool
@@ -360,7 +360,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * actual object as the third argument. We store the mapping so
 	 * add_sitemap_alternates() can resolve the correct object type, and
 	 * {@see pin_untranslated_loc()} first pins the loc of an object that has
-	 * no translation links — so the map is keyed by the URL Rank Math will
+	 * no translation links - so the map is keyed by the URL Rank Math will
 	 * actually render.
 	 *
 	 * Neither the entry nor the object can be type-declared. Rank Math's own
@@ -368,7 +368,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * `[]` in the object position (local-seo/class-kml-file.php:104-111, type
 	 * 'local'), and Rank Math's WPML guard returns the empty STRING in the
 	 * entry position to drop a hidden-language post (sitemap/class-sitemap.php:80)
-	 * — the documented way to skip an entry, which is why every provider tests
+	 * - the documented way to skip an entry, which is why every provider tests
 	 * `! empty( $url )` after the filter. This callback runs at PHP_INT_MAX,
 	 * i.e. after every such rewriter, so it sees whatever they returned. An
 	 * `array`/`object` declaration would turn either into a TypeError raised
@@ -420,10 +420,10 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * Pin an unlinked entry's loc to the default language's URL shape.
 	 *
 	 * The twin of the guard core's SitemapIntegration applies to its own
-	 * entries — which Rank Math's sitemap replaces wholesale. Only objects
+	 * entries - which Rank Math's sitemap replaces wholesale. Only objects
 	 * with NO translation links qualify: those are default-language content
 	 * by definition, whereas a linked object's loc already names its own
-	 * language. That guard is also what makes the pin safe — not the URL
+	 * language. That guard is also what makes the pin safe - not the URL
 	 * mode: pin_sitemap_url_to_default() strips a language prefix from any
 	 * URL it is handed, so in path-based modes it comes out a no-op only
 	 * because an unlinked object's loc has no prefix to strip. The
@@ -573,7 +573,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		// Active languages only. get_slug_map() is the bootstrap bundle's
-		// active-only slug -> row hash — the same source core's hreflang and
+		// active-only slug -> row hash - the same source core's hreflang and
 		// sitemap paths filter on. find_by_slug() resolves DEACTIVATED
 		// languages too, which would advertise them as alternates; the map
 		// lookup is also O(1) instead of a per-sibling cache descent.
@@ -588,7 +588,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 			}
 
 			// Only published translations belong in the sitemap as hreflang
-			// alternates — skip draft/pending/private/trash (matches the
+			// alternates - skip draft/pending/private/trash (matches the
 			// AIOSEO/SEOPress addons).
 			if ( $object_type === \PerfLocale\Enum\ObjectType::Post && get_post_status( (int) $link->object_id ) !== 'publish' ) {
 				continue;
@@ -622,7 +622,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 			++$count;
 		}
 
-		// A lone self-referencing alternate is meaningless hreflang noise — an
+		// A lone self-referencing alternate is meaningless hreflang noise - an
 		// alternates set needs at least two members (self + a sibling). Emit
 		// nothing when only one language survived the publish filter.
 		return $count > 1 ? $xml : '';

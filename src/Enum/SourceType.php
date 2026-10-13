@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   - migration provenance reporting after Polylang/WPML/TranslatePress
  *     imports.
  *
- * Do NOT rename existing case values without a migration — the strings
+ * Do NOT rename existing case values without a migration - the strings
  * appear verbatim in the DB.
  *
  * Adding a new case: add the case here, expose a label via

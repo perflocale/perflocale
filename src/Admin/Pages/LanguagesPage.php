@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin\Pages;
 
+use PerfLocale\Admin\LanguagePacks;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Helper;
 use PerfLocale\Plugin;
@@ -19,6 +20,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Manages the Languages admin page.
+ *
+ * @phpstan-import-type Item from LanguagePacks
+ * @phpstan-type Packs array{locales: array<string, array{core: string, offered: list<Item>}>}
  */
 final class LanguagesPage {
 
@@ -59,8 +63,8 @@ final class LanguagesPage {
 	/**
 	 * Render the delete-preview screen: exactly what the cascade will
 	 * remove, BEFORE anything is touched. The destructive step moved to
-	 * action=confirm-delete (AdminController), so landing here — even
-	 * from an old bookmark of the previous action=delete URL — never
+	 * action=confirm-delete (AdminController), so landing here - even
+	 * from an old bookmark of the previous action=delete URL - never
 	 * deletes anything.
 	 *
 	 * @param object|null $language Language row, or null when not found.
@@ -86,7 +90,7 @@ final class LanguagesPage {
 		$blocked  = ! is_array( $blockers ) || $blockers['posts'] !== [];
 
 		$labels = [
-			'translation_links'   => __( 'Translation links (posts/terms unlinked from their translation groups — the posts themselves are NOT deleted)', 'perflocale' ),
+			'translation_links'   => __( 'Translation links (posts/terms unlinked from their translation groups - the posts themselves are NOT deleted)', 'perflocale' ),
 			'translation_groups'  => __( 'Translation groups left empty (garbage-collected)', 'perflocale' ),
 			'string_translations' => __( 'String translations', 'perflocale' ),
 			'slug_translations'   => __( 'Slug translations', 'perflocale' ),
@@ -108,7 +112,7 @@ final class LanguagesPage {
 						);
 						?>
 					</strong>
-					<?php echo esc_html__( 'This cannot be undone. The rows below are removed in a single transaction — if any step fails, nothing is deleted.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'This cannot be undone. The rows below are removed in a single transaction - if any step fails, nothing is deleted.', 'perflocale' ); ?>
 				</p>
 				<p><?php echo esc_html( $this->routing_loss_warning( $language, true ) ); ?></p>
 			</div>
@@ -291,12 +295,12 @@ final class LanguagesPage {
 	 * WHAT THAT COSTS DEPENDS ON THE URL MODE, and the wording must follow it.
 	 * Only subdirectory mode routes a language by a PATH prefix, so only there
 	 * does a retired URL become a 404 that core's redirect_guess_404_permalink()
-	 * may answer with a fuzzy match on an unrelated post — a guess that is not
+	 * may answer with a fuzzy match on an unrelated post - a guess that is not
 	 * even stable between requests, because core's query has no ORDER BY.
 	 * Subdomain, per-domain and query modes carry the language in the host or a
 	 * query argument: detect_from_subdomain() / detect_from_domain() /
 	 * detect_from_query_param() simply return null and LanguageRouter's fallback
-	 * forces the default language, so those URLs still answer 200 — in the
+	 * forces the default language, so those URLs still answer 200 - in the
 	 * default language. Telling that operator to expect core's guess would
 	 * describe a failure their site cannot have, and send them off writing
 	 * redirects they do not need.
@@ -313,7 +317,7 @@ final class LanguagesPage {
 	 *
 	 * @param object $language  Language row being deleted or deactivated.
 	 * @param bool   $permanent True on the delete screen, false for the active toggle.
-	 * @return string Plain text — escape at the point of output.
+	 * @return string Plain text - escape at the point of output.
 	 */
 	private function routing_loss_warning( object $language, bool $permanent ): string {
 		$settings     = Plugin::get_instance()->get( 'settings' );
@@ -325,7 +329,7 @@ final class LanguagesPage {
 			// not always '/'. A single-site install in a subfolder
 			// (example.com/blog/) and a subdirectory multisite child
 			// (example.com/sub/) both carry one, so this language's real URLs are
-			// /blog/de/ or /sub/de/, never /de/ — and an operator told to look for
+			// /blog/de/ or /sub/de/, never /de/ - and an operator told to look for
 			// the wrong path would find nothing to redirect, which is the whole
 			// point of this notice.
 			//
@@ -397,6 +401,7 @@ final class LanguagesPage {
 		$offset      = ( $page_num - 1 ) * $per_page;
 		$languages   = array_slice( $all_languages, $offset, $per_page );
 		$total_pages = max( 1, (int) ceil( $total_items / $per_page ) );
+		$packs       = $this->language_packs( $languages );
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$message = isset( $_GET['message'] ) ? sanitize_text_field( wp_unslash( $_GET['message'] ) ) : '';
@@ -427,6 +432,7 @@ final class LanguagesPage {
 					<?php
 					foreach ( $languages as $language ) :
 						$flag       = Helper::get_flag_emoji( $language );
+						$pack_hint  = $this->language_pack_hint( $language, $packs );
 						$edit_url   = admin_url( 'admin.php?page=perflocale-languages&action=edit&language_id=' . absint( $language->id ) );
 						$is_default = (bool) $language->is_default;
 						?>
@@ -518,6 +524,19 @@ final class LanguagesPage {
 										&middot; RTL
 									<?php endif; ?>
 								</div>
+								<?php
+								echo wp_kses(
+									$pack_hint,
+									[
+										'div' => [
+											'class' => [],
+										],
+										'a'   => [
+											'href' => [],
+										],
+									]
+								);
+								?>
 							</div>
 							<div class="perflocale-lang-item__actions">
 								<a href="<?php echo esc_url( $edit_url ); ?>" class="button button-small"><?php echo esc_html__( 'Edit', 'perflocale' ); ?></a>
@@ -544,7 +563,7 @@ final class LanguagesPage {
 										// bootstrap, so LanguageRepository::
 										// set_default() refuses it outright. Offer
 										// the action as visibly unavailable rather
-										// than hiding it — the operator can see the
+										// than hiding it - the operator can see the
 										// button exists and what unlocks it.
 										?>
 										<button type="button" class="button button-small" disabled
@@ -578,6 +597,146 @@ final class LanguagesPage {
 			<?php endif; ?>
 		</div>
 		<?php
+	}
+
+	/**
+	 * The language packs that can be installed for the active languages on
+	 * this page, by locale, read through the same LanguagePacks::report() and
+	 * LanguagePacks::findings() as Site Health's language-pack test (without
+	 * the theme and plugin names, which the hint does not show): a WordPress
+	 * pack that is not installed (state `missing`: WordPress.org is not known
+	 * to lack it), and the WordPress, theme and plugin packs core's last
+	 * update checks offered. Packs WordPress.org does not offer (`not_offered`
+	 * theme and plugin packs, a WordPress pack `not_available`) stay on Site
+	 * Health only. Only locales with an installable pack are returned, and
+	 * nothing is read for a user who cannot manage languages.
+	 *
+	 * @param array<int, object> $languages Language rows of this page.
+	 * @return array
+	 * @phpstan-return Packs
+	 */
+	private function language_packs( array $languages ): array {
+		$packs = [
+			'locales' => [],
+		];
+
+		if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
+			return $packs;
+		}
+
+		$locales = [];
+
+		foreach ( $languages as $language ) {
+			if ( ! empty( $language->is_active ) && isset( $language->locale ) && is_string( $language->locale ) ) {
+				$locales[] = $language->locale;
+			}
+		}
+
+		if ( [] === $locales ) {
+			return $packs;
+		}
+
+		$report = LanguagePacks::report( $locales, false );
+
+		foreach ( $report['locales'] as $locale => $row ) {
+			$findings = LanguagePacks::findings( $row );
+
+			if ( LanguagePacks::MISSING === $findings['core'] || LanguagePacks::OFFERED === $findings['core'] || [] !== $findings['offered'] ) {
+				$packs['locales'][ (string) $locale ] = [
+					'core'    => $findings['core'],
+					'offered' => $findings['offered'],
+				];
+			}
+		}
+
+		return $packs;
+	}
+
+	/**
+	 * The language-pack hint in an active language's row: the packs that can
+	 * be installed for its locale (see language_packs()), stated as Site
+	 * Health's language-pack test states them, by kind. Users who can install
+	 * languages also get the way to install them. Empty when there is no such
+	 * pack, so the hint goes once the packs are installed.
+	 *
+	 * @param object $language Language row.
+	 * @param array  $packs    Result of language_packs().
+	 * @return string The hint's markup (escaped), or an empty string.
+	 * @phpstan-param Packs $packs
+	 */
+	private function language_pack_hint( object $language, array $packs ): string {
+		$locale = isset( $language->locale ) && is_string( $language->locale ) ? $language->locale : '';
+
+		if ( empty( $language->is_active ) || ! isset( $packs['locales'][ $locale ] ) ) {
+			return '';
+		}
+
+		$findings    = $packs['locales'][ $locale ];
+		$can_install = current_user_can( 'install_languages' );
+		$name        = isset( $language->name ) && is_string( $language->name ) && '' !== $language->name ? $language->name : $locale;
+		$label       = esc_html( $name ) . ' (' . esc_html( $locale ) . ')';
+		$parts       = [];
+
+		if ( LanguagePacks::MISSING === $findings['core'] ) {
+			$text = esc_html__( 'The WordPress language pack is not installed for:', 'perflocale' ) . ' ' . $label . '.';
+
+			if ( $can_install ) {
+				$text .= ' ' . sprintf(
+					/* translators: %s: "Settings → General" link */
+					esc_html__( 'To install it, choose it as Site Language in %s and save, then set the Site Language back.', 'perflocale' ),
+					'<a href="' . esc_url( admin_url( 'options-general.php' ) ) . '">' . esc_html__( 'Settings → General', 'perflocale' ) . '</a>'
+				);
+			}
+
+			$parts[] = $text;
+		}
+
+		$ready = $this->pack_kinds( LanguagePacks::OFFERED === $findings['core'], $findings['offered'] );
+
+		if ( '' !== $ready ) {
+			$parts[] = esc_html__( 'Ready to install on Dashboard → Updates:', 'perflocale' ) . ' ' . $ready . '.';
+		}
+
+		if ( $can_install && '' !== $ready ) {
+			$parts[] = '<a href="' . esc_url( LanguagePacks::updates_url() ) . '">' . esc_html__( 'Open Dashboard → Updates', 'perflocale' ) . '</a>';
+		}
+
+		return '<div class="perflocale-lang-item__packs">' . implode( ' ', $parts ) . '</div>';
+	}
+
+	/**
+	 * The kinds of packs in a list, short: "WordPress, 1 theme, 2 plugins".
+	 *
+	 * @param bool  $core  Whether WordPress itself is in the list.
+	 * @param array $items Theme and plugin packs.
+	 * @return string Escaped text, empty for an empty list.
+	 * @phpstan-param list<Item> $items
+	 */
+	private function pack_kinds( bool $core, array $items ): string {
+		$themes  = 0;
+		$plugins = 0;
+
+		foreach ( $items as $item ) {
+			if ( 'theme' === $item['type'] ) {
+				++$themes;
+			} else {
+				++$plugins;
+			}
+		}
+
+		$kinds = $core ? [ esc_html__( 'WordPress', 'perflocale' ) ] : [];
+
+		if ( $themes > 0 ) {
+			/* translators: %s: number of themes */
+			$kinds[] = esc_html( sprintf( _n( '%s theme', '%s themes', $themes, 'perflocale' ), number_format_i18n( $themes ) ) );
+		}
+
+		if ( $plugins > 0 ) {
+			/* translators: %s: number of plugins */
+			$kinds[] = esc_html( sprintf( _n( '%s plugin', '%s plugins', $plugins, 'perflocale' ), number_format_i18n( $plugins ) ) );
+		}
+
+		return implode( ', ', $kinds );
 	}
 
 	/**
@@ -938,7 +1097,7 @@ final class LanguagesPage {
 					<?php endif; ?>
 
 					<?php
-					// Pre-flight rename nudge — extended in v… to cover ALL
+					// Pre-flight rename nudge - extended in v… to cover ALL
 					// active bare-language slugs whose locale exposes a
 					// region-qualified upgrade target, not just the default.
 					// A non-default `ar` next to `ar-MA` benefits from the
@@ -952,7 +1111,7 @@ final class LanguagesPage {
 						// Use the form-side detector: render checkboxes for
 						// every active bare language whose locale exposes a
 						// rename target. No "existing region-qualified
-						// sibling" requirement — at form-render time the
+						// sibling" requirement - at form-render time the
 						// user is precisely about to ADD that sibling.
 						$rename_candidates = Helper::bare_language_rename_candidates_for_form(
 							$this->repo->get_active()
@@ -998,7 +1157,7 @@ final class LanguagesPage {
 						// language part (everything before the first `-`).
 						// Other bare-language candidates stay hidden so
 						// the form only nudges about the directly relevant
-						// rename — surfacing all candidates at once would
+						// rename - surfacing all candidates at once would
 						// feel pushy.
 						wp_add_inline_script(
 							'perflocale-admin',
@@ -1054,7 +1213,7 @@ final class LanguagesPage {
 			return;
 		}
 
-		// Error-class messages (red, sticky) — duplicate-key collisions
+		// Error-class messages (red, sticky) - duplicate-key collisions
 		// caught by the AdminController before the wpdb->insert fires.
 		if ( $message === 'duplicate_slug' || $message === 'duplicate_locale' ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
@@ -1064,12 +1223,12 @@ final class LanguagesPage {
 			$text = $is_slug
 				? sprintf(
 					/* translators: %s: slug that already exists */
-					__( 'A language with the slug %s already exists. Pick a different slug — each language must have a unique URL identifier.', 'perflocale' ),
+					__( 'A language with the slug %s already exists. Pick a different slug - each language must have a unique URL identifier.', 'perflocale' ),
 					'<code>' . esc_html( $dup ) . '</code>'
 				)
 				: sprintf(
 					/* translators: %s: locale that already exists */
-					__( 'A language with the locale %s already exists. Pick a different locale — each language must have a unique WordPress locale.', 'perflocale' ),
+					__( 'A language with the locale %s already exists. Pick a different locale - each language must have a unique WordPress locale.', 'perflocale' ),
 					'<code>' . esc_html( $dup ) . '</code>'
 				);
 
@@ -1081,7 +1240,7 @@ final class LanguagesPage {
 		}
 
 		// A slug the routing layer cannot express. update() refuses it before
-		// writing the row, so the whole form was discarded — say so, and name
+		// writing the row, so the whole form was discarded - say so, and name
 		// the value, rather than re-rendering the screen with nothing saved.
 		if ( $message === 'invalid_slug' ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
@@ -1090,7 +1249,7 @@ final class LanguagesPage {
 			echo '<div class="notice notice-error is-dismissible"><p>' . wp_kses(
 				sprintf(
 					/* translators: %1$s: the rejected language slug, %2$s and %3$s: example slugs */
-					__( 'The slug %1$s cannot be used in URLs, so nothing was saved. Use two or three lowercase letters, optionally followed by a hyphen and two or three more — for example %2$s or %3$s.', 'perflocale' ),
+					__( 'The slug %1$s cannot be used in URLs, so nothing was saved. Use two or three lowercase letters, optionally followed by a hyphen and two or three more - for example %2$s or %3$s.', 'perflocale' ),
 					'<code>' . esc_html( $bad ) . '</code>',
 					'<code>de</code>',
 					'<code>pt-br</code>'
@@ -1128,7 +1287,7 @@ final class LanguagesPage {
 		// leave the site unchanged, so say so instead of reporting success.
 		if ( $message === 'delete_failed' ) {
 			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__(
-				'The language was not deleted and nothing on the site was changed. The default language cannot be removed, and the language may already be gone — reload this list, and check the error log if it is still here.',
+				'The language was not deleted and nothing on the site was changed. The default language cannot be removed, and the language may already be gone - reload this list, and check the error log if it is still here.',
 				'perflocale'
 			) . '</p></div>';
 			return;
@@ -1139,7 +1298,7 @@ final class LanguagesPage {
 		// return value instead of reporting success over a no-op.
 		if ( $message === 'default_change_failed' ) {
 			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__(
-				'The default language was not changed. Only an active language can be the default — activate it first, then set it as default.',
+				'The default language was not changed. Only an active language can be the default - activate it first, then set it as default.',
 				'perflocale'
 			) . '</p></div>';
 			return;

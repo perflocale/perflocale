@@ -33,7 +33,7 @@ final class LocaleDateFormat {
 
 	/**
 	 * Memoized format strings for one "blog_id:language_id" pair. Recomputed
-	 * whenever that key changes — i.e. when the router swaps languages
+	 * whenever that key changes - i.e. when the router swaps languages
 	 * mid-request (rare but possible in tests) or a switch_to_blog() moves
 	 * the request to another blog.
 	 *

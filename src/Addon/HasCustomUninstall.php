@@ -58,7 +58,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * STILL RUNS. The plugin must always be uninstallable even when a third-
  * party addon's custom cleanup is buggy.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface HasCustomUninstall {
 

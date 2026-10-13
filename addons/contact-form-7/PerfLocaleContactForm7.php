@@ -73,14 +73,14 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		// a real front-end WP_Query since CF7 5.8), never browsed by language. Once
 		// the source carries a default-language link row, the language WHERE excludes
 		// it on every other language and the embed falls through to CF7's
-		// "Error: Contact form not found." — proven at runtime: an EN-linked form with
+		// "Error: Contact form not found." - proven at runtime: an EN-linked form with
 		// no DE translation returns 0 objects from WPCF7_ContactForm::find() on /de/.
 		// Scoping this type does not filter the lookup, it breaks it; the same reason
-		// wp_template_part is on the core list. Translation still happens — at render
+		// wp_template_part is on the core list. Translation still happens - at render
 		// time, in translate_form_properties() below, which is where it belongs.
 		add_filter( 'perflocale/query/never_scoped_post_types', [ $this, 'never_scope_form_type' ] );
 
-		// Don't copy CF7's per-form identity meta into a translation — duplicating
+		// Don't copy CF7's per-form identity meta into a translation - duplicating
 		// `_hash` makes two forms share one hash and breaks CF7's by-hash form
 		// resolution. Rendering keys on post ID (translate_form_properties'
 		// get_translation_id round-trip), so dropping it is safe.
@@ -92,7 +92,7 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		// ID and opens any form record, translations included.
 		add_filter( 'perflocale/admin/edit_post_link', [ $this, 'edit_link' ], 10, 3 );
 
-		// ⭐ A "Translations" box on CF7's OWN form editor — a screen none of the
+		// ⭐ A "Translations" box on CF7's OWN form editor - a screen none of the
 		// existing panels can reach.
 		//
 		// CF7's editor is a custom admin page (admin.php?page=wpcf7&post=<id>
@@ -101,7 +101,7 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		// markup. `wp.plugins.registerPlugin` does not exist there either, so
 		// neither the block-editor nor the Site Editor sidebar can mount. The net
 		// effect was that the addon whose objects most often need translating was
-		// the one with no in-editor translations UI at all — you had to leave for
+		// the one with no in-editor translations UI at all - you had to leave for
 		// the Translations screen to find out whether a form had a German twin.
 		//
 		// `wpcf7_admin_misc_pub_section` fires inside the genuine `.postbox` in
@@ -111,7 +111,7 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		//
 		// ⚠️ That id is literally -1 on the Add New screen
 		// (contact-form-7/admin/admin.php:407), which is why the panel guards on
-		// `> 0` rather than absint() — see TranslationsPanel::get_html().
+		// `> 0` rather than absint() - see TranslationsPanel::get_html().
 		if ( is_admin() ) {
 			$plugin->get( 'translations_panel' )->mount(
 				'wpcf7_admin_misc_pub_section',
@@ -138,8 +138,8 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		//
 		// ⚠️ Do NOT extend this to CF7's "Add New" page by guessing its hook
 		// suffix. That one is derived from `sanitize_title()` of the LOCALISED
-		// menu title — plus whatever markup wpcf7_admin_menu_change_notice()
-		// appends to it — so it is not a stable string on any site, let alone a
+		// menu title - plus whatever markup wpcf7_admin_menu_change_notice()
+		// appends to it - so it is not a stable string on any site, let alone a
 		// translated one. There is nothing to show there anyway: an unsaved form
 		// has no id and no translations.
 		if ( $hook_suffix !== 'toplevel_page_wpcf7' ) {
@@ -262,7 +262,7 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		// recipient, sender and additional_headers were copied from the source
 		// when the translation was created and are never re-synced, so changing
 		// the recipient on the English form does NOT change where German
-		// submissions go — verified at runtime: source recipient edited to
+		// submissions go - verified at runtime: source recipient edited to
 		// NEW@example.com, the translation kept OLD@example.com.
 		//
 		// That is left as the DEFAULT on purpose. A different recipient per
@@ -270,7 +270,7 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 		// German team), and silently overriding it would break those sites. The
 		// operator is not left in the dark either: the same edit flips the
 		// translation's link status to `needs_update`, which surfaces as a red
-		// badge on the Translations screen — and since
+		// badge on the Translations screen - and since
 		// ContentChangeDetector::clear_needs_update() landed, editing the
 		// translation clears it again, so the signal is now a round trip rather
 		// than a one-way door.
@@ -367,13 +367,13 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 			return null;
 		}
 
-		// Default language serves the original form — skip the lookup.
+		// Default language serves the original form - skip the lookup.
 		$default = $router->get_default_language();
 		if ( $default && $current_slug === $default->slug ) {
 			return null;
 		}
 
-		// PostTranslationManager is NOT a registered container service — it is
+		// PostTranslationManager is NOT a registered container service - it is
 		// constructed on demand everywhere else in the plugin. The previous
 		// $plugin->get('post_translation_manager') silently failed the has()
 		// guard, so CF7 form translation never resolved. Construct it directly.

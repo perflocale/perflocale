@@ -45,7 +45,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * to wipe core WordPress tables. The admin's trust is in the addon's own
  * boot() code (like any WP plugin), not in its uninstall-target manifest.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface HasUninstallTargets {
 

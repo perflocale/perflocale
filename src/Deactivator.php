@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * each subsite keeps stale perflocale_* rewrite rules until it's next
  * visited (the rules sit in the per-blog `rewrite_rules` option), and
  * per-blog cleanup tasks (role caps, transient cleanup, etc.) leak forever
- * — which wp.org's automated uninstall-cleanup checks flag.
+ * - which wp.org's automated uninstall-cleanup checks flag.
  *
  * Action Scheduler is NOT network-wide, despite being commonly described
  * that way. ActionScheduler_Abstract_Schema::get_full_table_name() builds its
@@ -64,7 +64,7 @@ final class Deactivator {
 		if ( $network_deactivating && is_multisite() ) {
 			self::deactivate_for_network();
 		} else {
-			// Single-site (or per-site deactivate on multisite) — just clean
+			// Single-site (or per-site deactivate on multisite) - just clean
 			// up the blog we're currently on.
 			self::deactivate_for_blog();
 		}
@@ -80,12 +80,12 @@ final class Deactivator {
 	 * Scoped and chunked the same way the network-activation loop in
 	 * perflocale.php is:
 	 *
-	 *   - `network_id` — WP_Site_Query defaults to `'network_id' => 0`, which
+	 *   - `network_id` - WP_Site_Query defaults to `'network_id' => 0`, which
 	 *     core documents as "include all networks". On a multi-network install
 	 *     an unscoped get_sites() would hand us a sibling network's blogs and
 	 *     we'd strip rewrite rules, roles and schedules on a network nobody
 	 *     deactivated anything on. Scope it.
-	 *   - chunking — a network with tens of thousands of sites must not load
+	 *   - chunking - a network with tens of thousands of sites must not load
 	 *     every row at once. Chunk IDs are ~10 bytes each; the real work is
 	 *     the per-site cleanup, so the same 100-ID default (and the same
 	 *     filter, so operators tune one number, not two) applies here.
@@ -119,7 +119,7 @@ final class Deactivator {
 					'fields'     => 'ids',
 					'number'     => $chunk,
 					'offset'     => $offset,
-					// Deterministic order — `offset` paging is only stable
+					// Deterministic order - `offset` paging is only stable
 					// against a fixed sort, and it puts the network's main
 					// site (the blog the network admin is standing on) first.
 					'orderby'    => 'id',
@@ -136,9 +136,9 @@ final class Deactivator {
 
 				// `$entered > 0` guarantees forward progress. The budget is a
 				// hard cutoff, not a work estimate, so a request that reaches
-				// this loop having already spent it — a host with a small
+				// this loop having already spent it - a host with a small
 				// max_execution_time, or a bulk "deactivate selected" where
-				// earlier plugins' hooks burned it — would otherwise sweep
+				// earlier plugins' hooks burned it - would otherwise sweep
 				// NOTHING, not even the blog the network admin is standing on,
 				// which the pre-loop code always cleaned. The test still sits
 				// BEFORE switch_to_blog(), so no blog is ever left half-cleaned.
@@ -147,7 +147,7 @@ final class Deactivator {
 				// deactivate_for_blog() can throw part-way through (its failure
 				// is caught below so the remaining subsites still get swept),
 				// and a network where every blog throws would leave a
-				// success-counting guard permanently at 0 — the deadline would
+				// success-counting guard permanently at 0 - the deadline would
 				// never engage and PHP would hard-kill the request mid-loop,
 				// which is exactly the outcome sweep_deadline() exists to
 				// prevent. A blog that threw has already had part of its
@@ -161,11 +161,11 @@ final class Deactivator {
 				switch_to_blog( $site_id );
 				try {
 					self::deactivate_for_blog();
-					// Counts fully-cleaned blogs only — it is what the
+					// Counts fully-cleaned blogs only - it is what the
 					// out-of-time log line below reports to the operator.
 					++$swept;
 				} catch ( \Throwable $e ) {
-					// One blog's failure must not abort the network loop —
+					// One blog's failure must not abort the network loop -
 					// the remaining subsites still need cleanup. Log so an
 					// operator can spot stuck rewrite rows.
 					if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
@@ -210,7 +210,7 @@ final class Deactivator {
 	 *
 	 * Why bound it at all: `deactivate_{$plugin}` fires BEFORE core writes the
 	 * shortened `active_plugins` value, so a max_execution_time abort halfway
-	 * through the loop is the worst outcome available — the plugin stays
+	 * through the loop is the worst outcome available - the plugin stays
 	 * ACTIVE while every blog swept so far has already had its rewrite rules
 	 * deleted, its schedules cleared and the Translator role stripped.
 	 * Stopping early instead leaves the unswept blogs entirely untouched
@@ -266,7 +266,7 @@ final class Deactivator {
 		// Remove our own rewrite contribution BEFORE flushing. On a normal
 		// deactivation request RewriteManager's `rewrite_rules_array` filter is
 		// still hooked, so flush_rewrite_rules() would re-run it and re-add
-		// every language-prefixed rule — leaving the regenerated option
+		// every language-prefixed rule - leaving the regenerated option
 		// byte-for-byte the same and making this cleanup a silent no-op.
 		$plugin = \PerfLocale\Plugin::get_instance();
 
@@ -276,7 +276,7 @@ final class Deactivator {
 
 		// Soft flush, NOT flush_rewrite_rules(). Under switch_to_blog() core
 		// re-points $wpdb and the object cache but does NOT re-initialise
-		// $wp_rewrite — it still holds the ORIGINAL blog's permalink_structure
+		// $wp_rewrite - it still holds the ORIGINAL blog's permalink_structure
 		// and only the post types/taxonomies registered in THIS request. A hard
 		// flush would therefore write the network-admin blog's rules into this
 		// subsite's `rewrite_rules` option, dropping the subsite's own CPT and
@@ -284,7 +284,7 @@ final class Deactivator {
 		// short-circuits on a non-empty option, the wrong rules would stick
 		// until someone re-saved permalinks on every site. Deleting the option
 		// instead lets each blog regenerate its own correct rules on its next
-		// front-end request, which is exactly what we want here — our filter
+		// front-end request, which is exactly what we want here - our filter
 		// has already been removed above, so the regenerated set is clean.
 		delete_option( 'rewrite_rules' );
 
@@ -296,7 +296,7 @@ final class Deactivator {
 		// and editor on THIS blog. Without this, perflocale_* caps survive
 		// deactivation and continue to grant access to plugin admin pages on
 		// the next activation. The `perflocale/roles/cap_roles` filter inside
-		// remove_roles() lets a site opt a role out — useful while developing
+		// remove_roles() lets a site opt a role out - useful while developing
 		// locally with frequent re-activations.
 		\PerfLocale\Admin\TranslatorRole::remove_roles();
 
@@ -332,9 +332,9 @@ final class Deactivator {
 	 * AND Action Scheduler). Pending events that fire after deactivation
 	 * would otherwise log "no callback" errors until they naturally expire.
 	 *
-	 * Both stores are per-blog — WP-Cron lives in the blog's `cron` option and
+	 * Both stores are per-blog - WP-Cron lives in the blog's `cron` option and
 	 * Action Scheduler's tables are prefixed with `$wpdb->prefix` (see the
-	 * class docblock) — so this belongs inside the network loop, once per
+	 * class docblock) - so this belongs inside the network loop, once per
 	 * blog, not once per deactivation.
 	 *
 	 * @return void
@@ -346,13 +346,13 @@ final class Deactivator {
 		// put it back exactly as it was.
 		//
 		// Action Scheduler's tables are per-blog (see the class docblock), and
-		// AS creates them lazily on first use — so a subsite that was never
+		// AS creates them lazily on first use - so a subsite that was never
 		// visited has no wp_<id>_actionscheduler_* tables at all, and every AS
 		// call below fails its query. wpdb::print_error() writes to error_log()
 		// unconditionally: it is NOT gated on WP_DEBUG. Left alone, one such
 		// subsite sprays ~25 "table doesn't exist" lines into the host's log
 		// per deactivation, and where display errors are on it also prints an
-		// HTML error block into the `deactivate_{$plugin}` output — ahead of
+		// HTML error block into the `deactivate_{$plugin}` output - ahead of
 		// plugins.php's redirect, which then breaks.
 		//
 		// Nothing here reads a result set: an absent table means there was no
@@ -376,7 +376,7 @@ final class Deactivator {
 			}
 
 			// Then sweep the whole group, which also catches actions whose hook is
-			// not in cron_hooks() — Tier-2 runners enqueue per-job hooks and older
+			// not in cron_hooks() - Tier-2 runners enqueue per-job hooks and older
 			// builds scheduled hooks whose owning classes no longer exist here.
 			// Guarded with function_exists() because Action Scheduler is bundled by
 			// other plugins (WooCommerce et al) and may simply be absent; the group

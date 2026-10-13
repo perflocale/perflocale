@@ -137,7 +137,7 @@ final class SitemapIntegration {
 		add_filter( 'wp_sitemaps_taxonomies_entry', [ $this, 'add_taxonomy_alternate_links' ], 10, 4 );
 
 		// The blog-home entry (show_on_front=posts) is built by core as a
-		// bare home_url() array that bypasses wp_sitemaps_posts_entry — it
+		// bare home_url() array that bypasses wp_sitemaps_posts_entry - it
 		// only ever passes through this dedicated filter, so hook it too or
 		// the homepage ships without hreflang alternates in every url_mode.
 		add_filter( 'wp_sitemaps_posts_show_on_front_entry', [ $this, 'add_home_alternate_links' ] );
@@ -166,7 +166,7 @@ final class SitemapIntegration {
 	 *
 	 * Detection uses the user-facing `seo_plugin` setting first
 	 * (explicit), then falls back to the plugin's own constant / class
-	 * (defensive — covers users who haven't picked an SEO plugin in
+	 * (defensive - covers users who haven't picked an SEO plugin in
 	 * settings but DO have one active).
 	 *
 	 * Filterable via `perflocale/sitemap/inject_into_core` for sites with
@@ -248,7 +248,7 @@ final class SitemapIntegration {
 	 *
 	 * The blog home exists in every active language (no publish-status
 	 * gate applies), so one alternate per language is emitted, built via
-	 * the mode-aware converter — path prefixes in subdirectory mode,
+	 * the mode-aware converter - path prefixes in subdirectory mode,
 	 * `?lang=` in query mode, hosts in subdomain/domain modes.
 	 *
 	 * @param array<string, mixed> $entry Sitemap entry data (loc only).
@@ -349,7 +349,7 @@ final class SitemapIntegration {
 		if ( empty( $links ) ) {
 			// Untranslated post. In host-based URL modes (subdomain/domain)
 			// every language host serves its own /wp-sitemap.xml, and the loc
-			// core built inherits the REQUEST host — so the same untranslated
+			// core built inherits the REQUEST host - so the same untranslated
 			// post would be advertised self-canonically on every language
 			// host (cross-host duplicate content). An unlinked object is
 			// default-language content by definition, so pin the loc to the
@@ -541,7 +541,7 @@ final class SitemapIntegration {
 		$links = self::$repo_cache->get_translations( $term_id, ObjectType::Term );
 
 		if ( empty( $links ) ) {
-			// Untranslated term — same cross-host duplicate-content guard as
+			// Untranslated term - same cross-host duplicate-content guard as
 			// the post path.
 			return $this->pin_entry_loc_to_default( $entry );
 		}
@@ -615,14 +615,14 @@ final class SitemapIntegration {
 		// loads them all into memory on a single sitemap request. Cap the prime
 		// at a generous multiple of one page; SELECT one row past the cap so we
 		// can detect the over-limit case cheaply. When the type has MORE than
-		// the cap, skip bulk priming entirely — the per-entry get_post_status()/
+		// the cap, skip bulk priming entirely - the per-entry get_post_status()/
 		// get_permalink() lookups below still return correct output, they just
 		// query per sibling instead of from a warmed cache. Filterable.
 		$max_urls = function_exists( 'wp_sitemaps_get_max_urls' ) ? (int) wp_sitemaps_get_max_urls( 'post' ) : 2000;
 
 		// Bound the prime by what ONE PAGE can actually consume, not by a flat
 		// multiple of it. A page renders at most $max_urls entries, and each
-		// entry needs its siblings — so $max_urls * languages is the most this
+		// entry needs its siblings - so $max_urls * languages is the most this
 		// request can use. A flat multiple would load far more posts than the
 		// page renders (about 4 KB each, so tens of MB on a large catalog) on
 		// every sitemap page request. Sites whose catalog fits inside one
@@ -700,7 +700,7 @@ final class SitemapIntegration {
 		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
 		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
 
-		// Page-proportional bound — see prime_sitemap_caches() for why a flat
+		// Page-proportional bound - see prime_sitemap_caches() for why a flat
 		// multiple of the page size over-fetches on large catalogues.
 		$max_urls   = function_exists( 'wp_sitemaps_get_max_urls' ) ? (int) wp_sitemaps_get_max_urls( 'term' ) : 2000;
 		$lang_count = max( 2, count( self::$languages_cache ) );

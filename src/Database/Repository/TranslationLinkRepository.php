@@ -45,7 +45,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	 * Resolve the full table name for the current blog.
 	 *
 	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly — capturing the name in the constructor would otherwise
+	 * correctly - capturing the name in the constructor would otherwise
 	 * pin this instance to whichever blog was active at construction.
 	 *
 	 * @return string
@@ -132,7 +132,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 			$this->wpdb->prepare(
 				// Alias deliberately NOT `status`: for GROUP BY, MySQL resolves an
 				// unqualified name against the FROM columns FIRST and only then
-				// against SELECT aliases, and `l.status` is a real column — so
+				// against SELECT aliases, and `l.status` is a real column - so
 				// `GROUP BY status` grouped by the STORED status and silently
 				// merged an 'empty'/publish row with an 'empty'/draft row while
 				// emitting two rows keyed 'published'. `effective_status` exists on
@@ -160,7 +160,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 
 	/**
 	 * Batch-count status counts across (language × post_type × status) in
-	 * a single query — replaces an O(P×L) loop of per-cell
+	 * a single query - replaces an O(P×L) loop of per-cell
 	 * `count_by_status()` calls on the dashboard.
 	 *
 	 * Counts by effective status (effective_status_sql()), like
@@ -310,7 +310,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	 */
 	public function insert( array $data ): int|false {
 		// $data['source'] may be a SourceType enum case or a raw string
-		// (REST input arrives as a string) — normalise via SourceType::from_db
+		// (REST input arrives as a string) - normalise via SourceType::from_db
 		// which falls back to Manual on unknown values.
 		$source_raw = $data['source'] ?? \PerfLocale\Enum\SourceType::Manual;
 		if ( $source_raw instanceof \PerfLocale\Enum\SourceType ) {
@@ -320,7 +320,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		}
 
 		// Polymorphic object type (DB v3). This method predates the column;
-		// omitting it would insert the schema default '' — a row invisible to
+		// omitting it would insert the schema default '' - a row invisible to
 		// every type-qualified lookup. Accept an ObjectType case or its string
 		// value; default to 'post', the overwhelming common case.
 		$type_raw = $data['type'] ?? \PerfLocale\Enum\ObjectType::Post;

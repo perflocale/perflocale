@@ -78,6 +78,11 @@ final class AddonCommand {
 		$format   = (string) ( $assoc_args['format'] ?? 'table' );
 		$show_all = ! empty( $assoc_args['all'] );
 
+		// A value that does not apply is "-" in the table view and an empty
+		// value in the machine formats (json, csv, yaml), so scripts need no
+		// placeholder.
+		$none = 'table' === $format ? '-' : '';
+
 		$rows        = [];
 		$reg         = Plugin::get_instance()->has( 'addon_registry' )
 			? Plugin::get_instance()->get( 'addon_registry' )
@@ -91,12 +96,12 @@ final class AddonCommand {
 				// Bundled = ships inside the plugin's own addons/ directory.
 				// Operator's main signal for "is this one of yours or one of
 				// mine"; both kinds honour the disabled list.
-				'bundled'       => $reg && method_exists( $reg, 'is_bundled' ) ? $this->bool_label( $reg->is_bundled( $id ) ) : '-',
-				'booted'        => $reg && method_exists( $reg, 'is_booted' ) ? $this->bool_label( $reg->is_booted( $id ) ) : '-',
+				'bundled'       => $reg && method_exists( $reg, 'is_bundled' ) ? $this->bool_label( $reg->is_bundled( $id ) ) : $none,
+				'booted'        => $reg && method_exists( $reg, 'is_booted' ) ? $this->bool_label( $reg->is_booted( $id ) ) : $none,
 				'disabled'      => $this->bool_label( AddonRegistry::is_disabled( $id ) ),
 				'compatible'    => $this->bool_label( $this->safe_is_compatible( $addon ) ),
 				'has_schema'    => $this->bool_label( $addon instanceof HasSchema ),
-				'schema_target' => $addon instanceof HasSchema ? (string) $addon->get_schema_version() : '-',
+				'schema_target' => $addon instanceof HasSchema ? (string) $addon->get_schema_version() : $none,
 				'schema_stored' => (string) AddonSchemaManager::get_stored_version( $id ),
 				'has_uninstall' => $this->bool_label( $addon instanceof HasUninstallTargets ),
 				'has_custom'    => $this->bool_label( $addon instanceof HasCustomUninstall ),
@@ -112,15 +117,15 @@ final class AddonCommand {
 				$rows[ $id ] = [
 					'id'            => $id,
 					'name'          => '(orphan - class absent)',
-					'bundled'       => '-',
+					'bundled'       => $none,
 					'booted'        => 'no',
 					'disabled'      => $this->bool_label( AddonRegistry::is_disabled( $id ) ),
-					'compatible'    => '-',
-					'has_schema'    => '-',
-					'schema_target' => '-',
+					'compatible'    => $none,
+					'has_schema'    => $none,
+					'schema_target' => $none,
 					'schema_stored' => (string) AddonSchemaManager::get_stored_version( $id ),
-					'has_uninstall' => '-',
-					'has_custom'    => '-',
+					'has_uninstall' => $none,
+					'has_custom'    => $none,
 					'manifest'      => 'yes',
 				];
 			}
@@ -130,7 +135,7 @@ final class AddonCommand {
 		$default_fields = [ 'id', 'name', 'bundled', 'booted', 'disabled', 'compatible', 'has_schema', 'schema_target', 'schema_stored', 'has_uninstall', 'has_custom', 'manifest' ];
 
 		// Honour --fields=col1,col2 from CLI. format_items() doesn't read
-		// runtime args itself — the command has to plumb the value through.
+		// runtime args itself - the command has to plumb the value through.
 		$fields = $default_fields;
 		if ( ! empty( $assoc_args['fields'] ) ) {
 			$requested = array_filter( array_map( 'trim', explode( ',', (string) $assoc_args['fields'] ) ) );
@@ -143,7 +148,7 @@ final class AddonCommand {
 		}
 
 		if ( 'ids' === $format ) {
-			// format_items() can't render 'ids' from associative rows — it
+			// format_items() can't render 'ids' from associative rows - it
 			// stringifies each row ("Array to string conversion"). Emit the
 			// addon id column directly so `--format=ids` stays scriptable.
 			\WP_CLI::line( implode( ' ', wp_list_pluck( $values, 'id' ) ) );
@@ -230,7 +235,7 @@ final class AddonCommand {
 			return;
 		}
 
-		// Default branch — render as the standard CLI table.
+		// Default branch - render as the standard CLI table.
 		$rows = [];
 		foreach ( $info as $k => $v ) {
 			$rows[] = [
@@ -442,7 +447,7 @@ final class AddonCommand {
 	}
 
 	/**
-	 * Disable an addon — it will be skipped on every subsequent boot
+	 * Disable an addon - it will be skipped on every subsequent boot
 	 * until explicitly enabled again. Works for bundled and external
 	 * addons alike: disabling means disabling, no per-type safeguard.
 	 *
@@ -478,7 +483,7 @@ final class AddonCommand {
 
 	/**
 	 * Re-enable a previously disabled addon. No-op when the addon is
-	 * not in the disabled list. Always succeeds for valid ids — the
+	 * not in the disabled list. Always succeeds for valid ids - the
 	 * underlying option write is idempotent.
 	 *
 	 * ## OPTIONS

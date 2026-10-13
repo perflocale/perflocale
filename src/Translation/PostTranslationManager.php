@@ -176,7 +176,7 @@ final class PostTranslationManager {
 	 * @param string     $target_slug Target language slug.
 	 * @param bool       $copy_content Whether to copy content from source.
 	 * @param SourceType $source Provenance tag persisted on the new
-	 *     translation_links row. Manual is the default — the metabox /
+	 *     translation_links row. Manual is the default - the metabox /
 	 *     REST / CLI manual-translate flows pass nothing. Bulk-MT,
 	 *     auto-translate-on-save, and the abilities API pass a more
 	 *     specific value.
@@ -409,8 +409,8 @@ final class PostTranslationManager {
 		//
 		// For a post, starting empty is a defensible default: the translator
 		// writes fresh prose and an empty draft is simply unfinished. A
-		// template is not prose, it is STRUCTURE — the header part, the query
-		// loop, the 404 pattern — and the translatable part is the text sitting
+		// template is not prose, it is STRUCTURE - the header part, the query
+		// loop, the 404 pattern - and the translatable part is the text sitting
 		// inside that structure. Handing the operator a blank canvas asks them
 		// to rebuild the whole layout by hand before they can translate a word.
 		//
@@ -425,8 +425,8 @@ final class PostTranslationManager {
 		// looked broken.
 		//
 		// So the flag is overridden rather than respected for these two types.
-		// Every caller benefits — the Generate Missing Translations button, the
-		// REST/abilities API, WP-CLI — and none of them has a reason to want an
+		// Every caller benefits - the Generate Missing Translations button, the
+		// REST/abilities API, WP-CLI - and none of them has a reason to want an
 		// empty template.
 		if ( ! $copy_content ) {
 			$source_type = get_post_type( $source_id );
@@ -474,7 +474,7 @@ final class PostTranslationManager {
 		$content_source = $this->resolve_source_post( $source_id );
 
 		// The source post can vanish (hard-deleted) between the public
-		// method's validation and here. Nothing to copy from — fail
+		// method's validation and here. Nothing to copy from - fail
 		// gracefully so the caller can retry rather than fatal on a null
 		// property access below.
 		if ( ! $content_source instanceof \WP_Post ) {
@@ -505,6 +505,34 @@ final class PostTranslationManager {
 			'post_password' => $content_source->post_password,
 		];
 
+		// The group shares one value for each post column Sync Fields mirrors. A
+		// new translation starts with that value, so its first save mirrors
+		// nothing back over the other members.
+		$synced_columns = (array) $this->settings->get( 'sync_fields', [] );
+
+		foreach ( [ 'menu_order', 'comment_status', 'ping_status' ] as $column ) {
+			if ( in_array( $column, $synced_columns, true ) ) {
+				$new_post_data[ $column ] = 'menu_order' === $column ? (int) $content_source->menu_order : $content_source->{$column};
+			}
+		}
+
+		// Publish Date: the group's date is its default-language member's
+		// (ContentSync::sync_fields_to_post()), so a new translation starts
+		// with that date and its GMT date. Not when that member's date floats
+		// (a draft or pending post with no date set takes the current time on
+		// each save): the translation then keeps core's date, as the mirror
+		// moves no floating date either. The translation stays a draft or
+		// pending post, which core neither schedules nor publishes for its
+		// date.
+		$seeded_date = in_array( 'post_date', $synced_columns, true )
+			&& ! ContentSync::date_floats( $content_source )
+			&& $this->is_group_default_member( $content_source, $source_id );
+
+		if ( $seeded_date ) {
+			$new_post_data['post_date']     = $content_source->post_date;
+			$new_post_data['post_date_gmt'] = $content_source->post_date_gmt;
+		}
+
 		// Hierarchical types: attach the new translation to the PARENT'S
 		// translation in the SAME language - the mapping
 		// TermTranslationManager already applies to term parents. Without it
@@ -523,7 +551,7 @@ final class PostTranslationManager {
 			// parent is the subtler case: get_post() still returns a WP_Post,
 			// nothing unlinks a trashed post from its group (before_delete_post
 			// fires only on permanent delete), and WordPress renames a trashed
-			// post to `slug__trashed` — which the child would then inherit into
+			// post to `slug__trashed` - which the child would then inherit into
 			// its own public URL. Trashing is WordPress's default delete, so
 			// require a parent that is genuinely usable: present, not trashed,
 			// and of the same post type as the source's parent.
@@ -539,6 +567,17 @@ final class PostTranslationManager {
 
 		/** @hook perflocale/translation/post_data Filter the new translation post data before insertion. */
 		$new_post_data = (array) apply_filters( 'perflocale/translation/post_data', $new_post_data, $source_id, $target_slug );
+
+		// A filter that makes the new translation published and leaves the
+		// seeded date in the future would have core schedule it instead: the
+		// seeded date then stays out, and core dates it now.
+		if ( $seeded_date && 'publish' === ( $new_post_data['post_status'] ?? '' ) && ( $new_post_data['post_date_gmt'] ?? '' ) === $content_source->post_date_gmt ) {
+			$seeded_at = strtotime( $content_source->post_date_gmt );
+
+			if ( false !== $seeded_at && $seeded_at - time() >= MINUTE_IN_SECONDS ) {
+				unset( $new_post_data['post_date'], $new_post_data['post_date_gmt'] );
+			}
+		}
 
 		// Suppress auto-assign during translation creation - we'll link it properly below.
 		remove_action( 'save_post', [ \PerfLocale\Bootstrap::class, 'auto_assign_default_language' ], 5 );
@@ -557,12 +596,15 @@ final class PostTranslationManager {
 		// wp_slash: the copied title/content/excerpt come from get_post()
 		// (unslashed); wp_insert_post() unslashes internally, so a source
 		// containing backslashes would otherwise produce a corrupted copy.
-		$new_post_id = wp_insert_post( wp_slash( $new_post_data ), true );
+		// The hint and auto-assign are restored even when an insert listener
+		// throws, so later inserts in the process are not steered by them.
+		try {
+			$new_post_id = wp_insert_post( wp_slash( $new_post_data ), true );
+		} finally {
+			self::$creating_translation_lang_slug = null;
 
-		self::$creating_translation_lang_slug = null;
-
-		// Re-enable auto-assign.
-		add_action( 'save_post', [ \PerfLocale\Bootstrap::class, 'auto_assign_default_language' ], 5, 2 );
+			add_action( 'save_post', [ \PerfLocale\Bootstrap::class, 'auto_assign_default_language' ], 5, 2 );
+		}
 
 		if ( is_wp_error( $new_post_id ) || $new_post_id === 0 ) {
 			return false;
@@ -573,6 +615,8 @@ final class PostTranslationManager {
 		// draft is left behind. wp_insert_post lives in the wp_posts table
 		// which InnoDB handles in its own transaction context, so we trash
 		// it explicitly rather than relying on a wrapping transaction.
+		// A successful link has already invalidated the whole group's caches
+		// (link_object(), after its COMMIT).
 		$link_ok = $this->link_posts( $source_id, $new_post_id, $target_slug, $source );
 
 		if ( ! $link_ok ) {
@@ -582,17 +626,39 @@ final class PostTranslationManager {
 
 		$inserted = true;
 
-		// Flush the source object's translation cache so get_translations()
-		// returns the updated list immediately (not stale for up to 1 hour).
-		$source_group = $this->groups->find_for_object( $source_id, ObjectType::Post );
-
-		if ( $source_group ) {
-			$this->groups->invalidate_group_cache( (int) $source_group->id );
-		}
-
 		$this->finish_new_translation( $content_source, $new_post_id, $target_slug, $source_id );
 
 		return $new_post_id;
+	}
+
+	/**
+	 * Whether the post a new translation is copied from is its group's
+	 * default-language member, as ContentSync decides it for the mirror: with
+	 * no default language every member counts; a group whose default-language
+	 * member is gone has none; a source in no group yet joins one in its
+	 * detected language, the default when none is detected (link_posts()).
+	 *
+	 * @param \WP_Post $content_source Post the translation is copied from (resolve_source_post()).
+	 * @param int      $source_id      Post the translation was asked for.
+	 * @return bool
+	 */
+	private function is_group_default_member( \WP_Post $content_source, int $source_id ): bool {
+		$default = $this->languages->get_default();
+		$slug    = $default && isset( $default->slug ) && is_string( $default->slug ) ? $default->slug : '';
+
+		if ( '' === $slug ) {
+			return true;
+		}
+
+		$translations = $this->get_translations( $source_id );
+
+		if ( [] !== $translations ) {
+			return ( $translations[ $slug ] ?? 0 ) === $content_source->ID;
+		}
+
+		$language = $this->detect_post_language( $content_source->ID );
+
+		return null === $language || ( isset( $language->slug ) && $language->slug === $slug );
 	}
 
 	/**
@@ -726,7 +792,7 @@ final class PostTranslationManager {
 	 * is the post that gets copied: 0 when nothing would be copied (the source
 	 * is missing or an auto-draft, the target language is unknown, or a live
 	 * translation already exists and would simply be returned), otherwise the
-	 * resolved content source — the default-language member of the group, or
+	 * resolved content source - the default-language member of the group, or
 	 * `$source_id` itself. A link whose post is gone does not count as an
 	 * existing translation, exactly as in create_translation(), which unlinks
 	 * it and creates a fresh copy.
@@ -902,13 +968,28 @@ final class PostTranslationManager {
 			'_encloseme',
 			'_pingme',
 			'_thumbnail_id',
-			// Per-source copy-failure bookkeeping — copying it would surface a
+			// Per-source copy-failure bookkeeping - copying it would surface a
 			// stale failure notice on a freshly-created translation.
 			'_perflocale_meta_copy_errors',
 			// Keys the copy source's owner emptied. The new translation has not
 			// emptied anything, so it must still receive later seeds.
 			ContentSync::SEED_CLEARED_META,
+			// The copy source's own stale Sync Fields mark. The new translation
+			// starts with the copy source's values and is not marked.
+			ContentSync::SYNC_STALE_META,
+			// The Sync Fields values the copy source held before its stale
+			// mark was cleared; they describe that post's edit screen only.
+			ContentSync::SYNC_HELD_META,
 		];
+
+		// The SEO exclusion takes the post it is set on out of hreflang and
+		// sitemap alternates. A new translation is listed until its own editor
+		// sets the flag on it, unless the site's Sync Fields list the flag:
+		// the group then shares one value, and the new translation starts
+		// with it, so its first save mirrors nothing back over the group.
+		if ( ! in_array( \PerfLocale\Helper::SEO_EXCLUDE_META, (array) $this->settings->get( 'sync_fields', [] ), true ) ) {
+			$excluded[] = \PerfLocale\Helper::SEO_EXCLUDE_META;
+		}
 
 		/** @hook perflocale/translation/excluded_meta_keys Filter meta keys excluded from copying. */
 		$excluded = apply_filters( 'perflocale/translation/excluded_meta_keys', $excluded, $source_id );
@@ -946,9 +1027,9 @@ final class PostTranslationManager {
 					// Allow ONLY stdClass: it has no __wakeup/__destruct so it
 					// can't be a POP gadget (the object-injection risk that
 					// allowed_classes=false guards against), while letting
-					// object-typed builder payloads — Beaver Builder's
+					// object-typed builder payloads - Beaver Builder's
 					// _fl_builder_data / _fl_builder_data_settings are arrays of
-					// stdClass nodes — round-trip. allowed_classes=false turned
+					// stdClass nodes - round-trip. allowed_classes=false turned
 					// them into __PHP_Incomplete_Class, which threw the moment
 					// add_post_meta()'s wp_unslash tried to write a property,
 					// aborting the whole meta copy at the first BB key.
@@ -1145,13 +1226,13 @@ final class PostTranslationManager {
 			$lock_name,
 			30,
 			function () use ( $source_id, $target_id, $target_slug, $target_lang, $source ): bool {
-				// Re-read inside the lock — another worker may have
+				// Re-read inside the lock - another worker may have
 				// committed the group between the original
 				// find_for_object() at the top and us acquiring the
 				// lock. If so, link to its group; same code path as
 				// the existing-group branch. The top-of-method call
 				// memoized its null in the request-local $find_cache, so
-				// drop that entry first — otherwise the re-read returns the
+				// drop that entry first - otherwise the re-read returns the
 				// same stale null and creates a second group for this post.
 				$this->groups->invalidate_find_cache( $source_id, ObjectType::Post );
 				$double_check = $this->groups->find_for_object( $source_id, ObjectType::Post );
@@ -1169,7 +1250,7 @@ final class PostTranslationManager {
 					return $result !== false;
 				}
 
-				// True first translation — find the source language and create
+				// True first translation - find the source language and create
 				// a group. Guard against a cross-request race: if a worker died
 				// holding the lock and the source post was deleted before the
 				// next worker took over, creating a group pointing at it would
@@ -1189,7 +1270,7 @@ final class PostTranslationManager {
 				}
 
 				// Create group with the source post. The source row itself
-				// stays Manual — it represents the pre-translation post the
+				// stays Manual - it represents the pre-translation post the
 				// user authored manually. Only the target link inherits the
 				// caller-supplied $source tag.
 				$group_id = $this->groups->create_group(
@@ -1226,7 +1307,7 @@ final class PostTranslationManager {
 			return $lock_result;
 		}
 
-		// Lost the lock race — sibling worker is creating the same
+		// Lost the lock race - sibling worker is creating the same
 		// first group right now. Re-read once more: if it landed, link
 		// the target through the existing-group branch. Drop the memoized
 		// null first so the re-read reflects the sibling's committed group.
@@ -1372,6 +1453,28 @@ final class PostTranslationManager {
 	}
 
 	/**
+	 * Clear the cached hreflang of a post's group after its language changed
+	 * there, through CacheInvalidator.
+	 *
+	 * @param int             $post_id    Post whose language changed.
+	 * @param array<int, int> $member_ids Its group's members.
+	 * @return void
+	 */
+	private function clear_group_hreflang( int $post_id, array $member_ids ): void {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'cache_invalidator' ) ) {
+			return;
+		}
+
+		$invalidator = $plugin->get( 'cache_invalidator' );
+
+		if ( $invalidator instanceof \PerfLocale\Cache\CacheInvalidator ) {
+			$invalidator->clear_hreflang_after_member_change( $post_id, $member_ids );
+		}
+	}
+
+	/**
 	 * Swap a post's wrong-language terms for their siblings in its current
 	 * language, when the term swap service is loaded in this request.
 	 *
@@ -1455,7 +1558,7 @@ final class PostTranslationManager {
 				return false;
 			}
 
-			// $wpdb->update can also return 0 — TWO causes that look identical:
+			// $wpdb->update can also return 0 - TWO causes that look identical:
 			// (a) the link row was deleted between our conflict-check SELECT
 			// and this UPDATE → real failure (callers think the post
 			// moved to $lang but the row no longer exists).
@@ -1484,12 +1587,12 @@ final class PostTranslationManager {
 					// callers must not see this as success.
 					return false;
 				}
-				// Else: idempotent — language was already this value. Fall
+				// Else: idempotent - language was already this value. Fall
 				// through to the cache-invalidation + true return so the
 				// caller's "make this post be in $lang" expectation is met.
 			}
 
-			$this->groups->invalidate_group_cache( (int) $group->id );
+			$member_ids = $this->groups->invalidate_group_cache( (int) $group->id );
 
 			// The L1 memo still holds the PRIOR language for this post -
 			// invalidate_group_cache handles the group-scoped caches but
@@ -1513,6 +1616,10 @@ final class PostTranslationManager {
 				// unchanged, so without a new stamp the post stays in its old
 				// language's cached lists.
 				wp_cache_set_posts_last_changed();
+
+				// The group's pages list the post under its language. Outside a
+				// post save nothing else clears them.
+				$this->clear_group_hreflang( $post_id, $member_ids );
 			}
 
 			return true;
@@ -1534,7 +1641,7 @@ final class PostTranslationManager {
 			unset( self::$lang_cache[ self::lang_cache_key( $post_id ) ] );
 
 			// First-time language assignment to a published post moves it into
-			// a language-filtered archive — bump found_rows (no
+			// a language-filtered archive - bump found_rows (no
 			// transition_post_status fires on this REST/CLI path).
 			$this->maybe_flush_found_rows( $post_id );
 

@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Streams a full-site export to a file in the uploads directory.
  *
- * Sync `download()` path still works as-is — small admins clicking
+ * Sync `download()` path still works as-is - small admins clicking
  * "Download export" get an inline streaming response, no Jobs UI
  * involved. This job covers the OTHER pattern: kick off a background
  * export to disk + grab it from *PerfLocale → Jobs* when finished.
@@ -47,7 +47,7 @@ final class DataExportJob extends AbstractJob {
 	 * {@inheritDoc}
 	 *
 	 * The export streams; size is bounded by translation count. The
-	 * threshold is conservative — small sites complete in under a
+	 * threshold is conservative - small sites complete in under a
 	 * second and shouldn't be forced async.
 	 */
 	public function get_default_threshold(): int {
@@ -65,7 +65,7 @@ final class DataExportJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Estimate by counting translation_links rows — the dominant cost
+	 * Estimate by counting translation_links rows - the dominant cost
 	 * driver in an export.
 	 */
 	protected function args_size( array $args ): int {
@@ -130,7 +130,7 @@ final class DataExportJob extends AbstractJob {
 		 *                                     export file (inside uploads/).
 		 * @param int                $bytes    Size of the written file.
 		 * @param array<int,string>  $sections The section keys that were
-		 *                                     exported — a subset of
+		 *                                     exported - a subset of
 		 *                                     {@see DataExporter::SECTIONS}
 		 *                                     (settings, roles, languages,
 		 *                                     translations, strings). Empty
@@ -140,7 +140,7 @@ final class DataExportJob extends AbstractJob {
 		// A listener that throws must not cost us the record of the file we
 		// just wrote. Before this, an exception from a third-party
 		// backup/audit integration propagated out of execute(), the job was
-		// marked FAILED, and the result — including `path` — was never stored:
+		// marked FAILED, and the result - including `path` - was never stored:
 		// a complete export left on disk with nothing owning it, invisible to
 		// the Jobs screen and to the download endpoint, removed only by the
 		// 7-day age sweep. The export itself had already succeeded, so the

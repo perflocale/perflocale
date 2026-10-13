@@ -236,8 +236,8 @@ class PerfLocaleNeveSwitcherComponent extends \HFG\Core\Components\Abstract_Comp
 	 * @return void
 	 */
 	public function render_component() {
-		// Fall back to the plugin's global switcher settings — the same values
-		// add_settings() registers as control defaults — so an unsaved control
+		// Fall back to the plugin's global switcher settings - the same values
+		// add_settings() registers as control defaults - so an unsaved control
 		// renders what the customizer form displays. HFG's Manager::get
 		// short-circuits to any non-null default passed in and never consults
 		// the registered default, so the fallbacks here must match.
@@ -300,7 +300,7 @@ class PerfLocaleNeveSwitcherComponent extends \HFG\Core\Components\Abstract_Comp
 	 * Resolve a checkbox/toggle setting to a boolean.
 	 *
 	 * A toggle saved OFF is stored as '' (empty), which get_setting_value()'s
-	 * `! empty()` coercion cannot distinguish from an unsaved control — so once
+	 * `! empty()` coercion cannot distinguish from an unsaved control - so once
 	 * the plugin default is truthy, an explicit OFF would be silently overridden
 	 * back ON and the customizer control (bound to the raw mod) would disagree
 	 * with the frontend. Read the raw mod against a sentinel instead: a value

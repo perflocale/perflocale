@@ -77,18 +77,18 @@ final class PostListColumns {
 		// ⚠️ Do NOT read get_translatable_post_types() here, and do not move the
 		// per-post-type loop back into this method. This service boots from
 		// Plugin::boot() on `init:0`, several eager services before `addon_registry` (derive the position from the
-		// code, never restate it as a number — the old comment said TEN and drifted)
-		// — so at this point no addon has run boot() and none of their
+		// code, never restate it as a number - the old comment said TEN and drifted)
+		// - so at this point no addon has run boot() and none of their
 		// `perflocale/translatable_post_types` contributions exist yet. Reading
 		// the list here did two kinds of damage: the per-type hooks below were
-		// bound only for core types, AND — because Settings memoises the result
-		// once `plugins_loaded` has fired — the truncated list was frozen for the
+		// bound only for core types, AND - because Settings memoises the result
+		// once `plugins_loaded` has fired - the truncated list was frozen for the
 		// whole request, so every later consumer saw it too. On a site with
 		// Contact Form 7 the Translations screen offered no "Contact Forms" entry
 		// in its post-type filter at all, and WooCommerce products vanished from
 		// it unless they had also been ticked in Settings. Deferring to
 		// `admin_init` is what TermListColumns already does for the identical
-		// taxonomy hazard — keep the two symmetrical.
+		// taxonomy hazard - keep the two symmetrical.
 		add_action( 'admin_init', [ $this, 'register_post_type_column_hooks' ] );
 
 		// Language filter dropdown on post list screens.
@@ -103,7 +103,7 @@ final class PostListColumns {
 		add_action( 'save_post', [ $this, 'save_quick_edit_language' ], 15, 2 );
 
 		// Inline JS attached during enqueue phase (NOT admin_footer-edit.php
-		// — that fires after wp_print_footer_scripts has already emitted
+		// - that fires after wp_print_footer_scripts has already emitted
 		// the `perflocale-admin` script payload, so wp_add_inline_script()
 		// calls at that point are silently dropped).
 		add_action( 'admin_enqueue_scripts', [ $this, 'quick_edit_js' ] );
@@ -128,8 +128,8 @@ final class PostListColumns {
 
 			// Preserve the language filter in the status links
 			// (All | Published | Draft | ...). `views_edit-{$post_type}` has no
-			// un-suffixed variant — WP_List_Table::views() fires
-			// `views_{$screen->id}` — so this genuinely needs the resolved list.
+			// un-suffixed variant - WP_List_Table::views() fires
+			// `views_{$screen->id}` - so this genuinely needs the resolved list.
 			add_filter( "views_edit-{$post_type}", [ $this, 'append_lang_to_views' ] );
 		}
 	}
@@ -296,7 +296,7 @@ final class PostListColumns {
 
 		// The language/translations columns only register for translatable
 		// post types, so the batch preload has zero consumers on other list
-		// screens (Media Library, non-translatable CPTs) — skip the
+		// screens (Media Library, non-translatable CPTs) - skip the
 		// translation_links SELECT + cache churn there entirely.
 		$queried_type = $query->get( 'post_type' );
 		$types        = (array) ( ( $queried_type === '' || $queried_type === null || $queried_type === [] ) ? 'post' : $queried_type );
@@ -432,7 +432,7 @@ final class PostListColumns {
 				$flag = $flag !== '' ? $flag . ' ' : '';
 				echo '<span class="perflocale-badge perflocale-badge--green">' . esc_html( $flag . \PerfLocale\Helper::format_locale_as_bcp47( $post_lang->slug ) ) . '</span>';
 			} else {
-				echo '<span class="perflocale-badge perflocale-badge--none">&mdash;</span>';
+				echo '<span class="perflocale-badge perflocale-badge--none">-</span>';
 			}
 
 			echo '</div>';
@@ -477,7 +477,7 @@ final class PostListColumns {
 					echo esc_html( $slug_upper );
 					echo '</a>';
 				} else {
-					// ⚠️ The translation EXISTS — it just has no editor we can
+					// ⚠️ The translation EXISTS - it just has no editor we can
 					// link to (a non-public post type, or a user without
 					// edit_post on it). Previously nothing was echoed at all,
 					// so a translated row was indistinguishable from an
@@ -613,7 +613,7 @@ final class PostListColumns {
 		$manager = $this->get_manager();
 
 		if ( ! $manager->set_post_language( $post_id, $language ) ) {
-			// Quick Edit saves over AJAX — no admin_notices surface exists.
+			// Quick Edit saves over AJAX - no admin_notices surface exists.
 			// The row re-render shows the unchanged language (visible
 			// feedback); log the cause for the operator.
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; quick-edit has no notice surface.

@@ -53,7 +53,7 @@ final class StringRepository implements RepositoryInterface {
 	 * Resolve the full table name for the current blog.
 	 *
 	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly — capturing the name in the constructor would otherwise
+	 * correctly - capturing the name in the constructor would otherwise
 	 * pin this instance to whichever blog was active at construction.
 	 *
 	 * @return string
@@ -250,7 +250,7 @@ final class StringRepository implements RepositoryInterface {
 						'context'       => sanitize_text_field( $string['context'] ?? '' ),
 						// Store the original VERBATIM. It's a source-code gettext
 						// literal whose identity must equal the runtime msgid, and
-						// original_hash is computed from that raw value — so it is
+						// original_hash is computed from that raw value - so it is
 						// escaped on OUTPUT (esc_html/esc_attr/textContent in the
 						// strings admin), never sanitized on input. wp_kses_post
 						// here entity-encoded &/</> and stripped tags, corrupting
@@ -280,7 +280,7 @@ final class StringRepository implements RepositoryInterface {
 
 		// Map each string to its group ID. A single multi-row INSERT assigns
 		// its rows a contiguous block of auto-increment values, but the STEP
-		// between them is @@auto_increment_increment — which is > 1 on
+		// between them is @@auto_increment_increment - which is > 1 on
 		// multi-master clusters (Galera / Group Replication, where it equals
 		// the node count). Assuming a step of 1 there would link strings to
 		// nonexistent / wrong group_ids. Read the step once and apply it.
@@ -350,7 +350,7 @@ final class StringRepository implements RepositoryInterface {
 		$search      = sanitize_text_field( $args['search'] ?? '' );
 		$status      = sanitize_key( $args['status'] ?? '' );
 		$language_id = absint( $args['language_id'] ?? 0 );
-		// `absint()` accepts 0 — without the floor below, a caller that
+		// `absint()` accepts 0 - without the floor below, a caller that
 		// explicitly passes `limit=0` (or any non-positive) returns an
 		// empty result set even when data exists. Clamp non-positives to
 		// the default 100.
@@ -439,7 +439,7 @@ final class StringRepository implements RepositoryInterface {
 		$join = '';
 		// JOIN placeholders bind BEFORE the WHERE placeholders in the final
 		// SQL, so their values are collected separately and prepended to the
-		// WHERE values at prepare() time — appending them to $query_args (which
+		// WHERE values at prepare() time - appending them to $query_args (which
 		// already holds domain/context/search) would bind them out of order.
 		// Table names ride along as %i identifier placeholders (WP 6.2+) and
 		// are pushed at the exact position they appear in the assembled SQL.
@@ -451,7 +451,7 @@ final class StringRepository implements RepositoryInterface {
 
 			if ( $status === 'needs_update' ) {
 				// EXISTS (not INNER JOIN) so a string with needs_update links
-				// in several languages still returns once — a JOIN would
+				// in several languages still returns once - a JOIN would
 				// multiply the row and corrupt pagination/counts.
 				$where .= " AND EXISTS (
 					SELECT 1 FROM %i pl_fl
@@ -504,7 +504,7 @@ final class StringRepository implements RepositoryInterface {
 				if ( $status === 'translated' ) {
 					// Strings with at least one translation link in any
 					// language. EXISTS (not INNER JOIN) so a string translated
-					// into several languages still returns once — a JOIN would
+					// into several languages still returns once - a JOIN would
 					// multiply the row and corrupt pagination/counts.
 					$where .= " AND EXISTS (
 						SELECT 1 FROM %i pl_fl
@@ -882,7 +882,7 @@ final class StringRepository implements RepositoryInterface {
 
 		// ⚠️ And the links. Without this, deleting a string through the repository
 		// leaves `translation_links` rows pointing at an id that no longer exists
-		// — the orphan state the health checks and the `string-mode-db` suite
+		// - the orphan state the health checks and the `string-mode-db` suite
 		// exist to catch, produced by the plugin's own supported delete path.
 		// gc_stale_strings() already cascades to links; a single delete must
 		// agree with it.
@@ -957,11 +957,11 @@ final class StringRepository implements RepositoryInterface {
 		// admins editing the same setting within the same second) can both
 		// observe `$exists === null`, both proceed to insert NEW string
 		// rows with different hashes, and both call migrate_stale_translations()
-		// on the same $old_strings set — the second migration finds nothing
+		// on the same $old_strings set - the second migration finds nothing
 		// to move, leaving one of the two new strings dangling without its
 		// migrated translations.
 		//
-		// Lock per (domain, context) — registration within a domain is
+		// Lock per (domain, context) - registration within a domain is
 		// rare-but-bursty (theme/plugin init mass-registers strings at
 		// once), so the per-key lock keeps unrelated registrations
 		// uncontended. 5 s TTL covers the SELECT + INSERT + migrate roundtrip
@@ -1101,10 +1101,10 @@ final class StringRepository implements RepositoryInterface {
 		}
 
 		// Mark-phase gate. last_seen_at is bumped ONLY by a StringScanJob full
-		// scan (manual — there is no automatic scan), so it only signals
+		// scan (manual - there is no automatic scan), so it only signals
 		// liveness AFTER a scan has run. If no full scan has completed within
 		// the retention window, every row's last_seen_at is stale for reasons
-		// unrelated to the string being gone — deleting here would wipe strings
+		// unrelated to the string being gone - deleting here would wipe strings
 		// imported via PO/migration or registered once, that the operator
 		// simply never scanned. Skip the sweep until a fresh mark phase exists.
 		$last_full_scan = (int) get_option( 'perflocale_strings_last_full_scan', 0 );
@@ -1144,7 +1144,7 @@ final class StringRepository implements RepositoryInterface {
 		 * option (not only a filter) so an addon's protection survives its
 		 * own deactivation: strings owned by an inactive addon (e.g. an
 		 * add-on's dynamic domain) are kept alive only by that
-		 * addon's own touch cron, which stops with it — without a
+		 * addon's own touch cron, which stops with it - without a
 		 * persistent exclusion, a routine string scan plus 90 idle days
 		 * would silently delete the addon's entire translation corpus.
 		 *
@@ -1345,7 +1345,7 @@ final class StringRepository implements RepositoryInterface {
 			// Bind the id lists with %d placeholders (values are integers, but
 			// prepare() makes that explicit and scanner-verifiable). Table
 			// names bind with %i; only the generated placeholder lists are
-			// interpolated — hence the surrounding phpcs:disable.
+			// interpolated - hence the surrounding phpcs:disable.
 			$gid_list = array_values( array_unique( array_map( 'intval', $group_ids ) ) );
 			$gid_ph   = implode( ',', array_fill( 0, count( $gid_list ), '%d' ) );
 			$sid_ph   = implode( ',', array_fill( 0, count( $grouped_ids ), '%d' ) );
@@ -1389,7 +1389,7 @@ final class StringRepository implements RepositoryInterface {
 				// `type` mirrors the owning group's type (Schema.php:89). This
 				// path only ever links a string-type group, so the literal is
 				// safe and keeps the placeholder/arg counts unchanged. Omitting
-				// it would insert the schema DEFAULT '' — a row invisible to
+				// it would insert the schema DEFAULT '' - a row invisible to
 				// every type-qualified lookup.
 				$row_ph = implode( ',', array_fill( 0, count( $translated_langs ), "(%d, %d, %d, 'string', %s, %s)" ) );
 				$args   = [];
@@ -1413,7 +1413,7 @@ final class StringRepository implements RepositoryInterface {
 			}
 
 			// Move every existing translation row from each old string to
-			// the new one. One UPDATE per old string — already minimal.
+			// the new one. One UPDATE per old string - already minimal.
 			//
 			// A move that FAILS leaves that string's translations on the OLD
 			// string (move_translations() returns -1 and skips its own cleanup

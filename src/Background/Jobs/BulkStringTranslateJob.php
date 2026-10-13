@@ -27,13 +27,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Three selection modes:
  *
- *   1. `mode = 'ids'`    — operator selected specific rows via the admin
+ *   1. `mode = 'ids'`    - operator selected specific rows via the admin
  *                          checkbox column. `string_ids` carries the list.
- *   2. `mode = 'filter'` — apply every active filter on the strings page
+ *   2. `mode = 'filter'` - apply every active filter on the strings page
  *                          (domain, context, search, status) and translate
  *                          every row that matches. `filter` carries the
  *                          filter args.
- *   3. `mode = 'all'`    — translate every string in the table. Useful
+ *   3. `mode = 'all'`    - translate every string in the table. Useful
  *                          after a fresh scan when nothing is translated
  *                          yet.
  *
@@ -54,7 +54,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Source provenance: the translated VALUE goes to `string_translations`
  * (which has no provenance column of its own); the provenance lives on the
  * `translation_links` row this job upserts alongside it, as
- * `source = 'mt'` — {@see \PerfLocale\Enum\SourceType::MachineTranslation} —
+ * `source = 'mt'` - {@see \PerfLocale\Enum\SourceType::MachineTranslation} -
  * with `status = 'translated'`. That link row is not bookkeeping: the DB-mode
  * gettext map, the files-mode generator and the strings grid's status filter
  * all INNER JOIN it, so a value written without one is never served.
@@ -63,7 +63,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * `strings.group_id` is an unenforced FK that a scan, an import or a deleted
  * group can leave pointing at nothing (or at a live post/term group). Such a
  * string is therefore healed onto a fresh string-type group at the moment of
- * its first write — never up-front, and never counted as translated when the
+ * its first write - never up-front, and never counted as translated when the
  * heal fails. See {@see self::save_translation()}.
  *
  * @phpstan-type StringItem array{id: int, row: object, original: string, format: string, texts: array<int, string>, phs: array<int, array<int, string>>, numbers: array<int, int>|null, only: array<int, bool>, token: string}
@@ -117,7 +117,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Returns `string_count × target_lang_count` — the same product the
+	 * Returns `string_count × target_lang_count` - the same product the
 	 * threshold compares against.
 	 */
 	protected function args_size( array $args ): int {
@@ -150,7 +150,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Resolve the string IDs a dispatch with these args WOULD translate —
+	 * Resolve the string IDs a dispatch with these args WOULD translate -
 	 * public so the pre-dispatch budget gate and the /machine-translate/estimate
 	 * endpoint can estimate cost with the job's exact selection semantics
 	 * (mode=ids|filter|all, the skip-existing selection and the per-dispatch
@@ -169,7 +169,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 *
 	 * Filter mode is routed through StringRepository so every filter that
 	 * works on the admin page (domain, context, search + search_mode,
-	 * status, language_id) behaves identically here — no SQL drift.
+	 * status, language_id) behaves identically here - no SQL drift.
 	 *
 	 * With skip-existing (the default) `all` and `filter` select only rows
 	 * that still miss a translation in at least one target language, so each
@@ -350,7 +350,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$skipped    = 0;
 		// Rows skipped because a translation ALREADY exists for the target
 		// (the skip-existing branch). On a crash-resume that finds every row
-		// already persisted this is > 0 while $translated stays 0 — yet the
+		// already persisted this is > 0 while $translated stays 0 - yet the
 		// completion cache-bust/files-regen still has to run, or the prior
 		// run's writes stay invisible on the front end. Tracked separately
 		// from $skipped so pure empty-source/missing-row runs don't force a
@@ -360,11 +360,11 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$first_error        = '';
 		$breaker_stopped    = false;
 
-		// Throttle progress to ~100 callbacks total — see BulkTranslateJob
+		// Throttle progress to ~100 callbacks total - see BulkTranslateJob
 		// for the rationale; same shape. Count-based AND wall-clock-based: the
 		// progress callback is the ONLY place the job/type locks refresh and the
 		// cancel/pause probes run, and one BATCH_SIZE chunk can block for minutes
-		// under a rate-limited provider — a pure count-based gap (total/100) can
+		// under a rate-limited provider - a pure count-based gap (total/100) can
 		// then exceed the 1800s lock TTL and let a second same-type job reclaim
 		// the type lock mid-run. One microtime comparison per chunk is the cost.
 		// Per-string mode calls $progress directly after every provider call
@@ -387,7 +387,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$tick( 0 );
 
 		// try/finally: the $tick()/$progress() callbacks THROW JobCanceledException
-		// when the operator cancels — without the finally, a cancel at e.g. 80%
+		// when the operator cancels - without the finally, a cancel at e.g. 80%
 		// skipped the post-loop cache sync below, leaving every ALREADY-translated
 		// string invisible on the front end until the cache expired on its own.
 		try {
@@ -431,7 +431,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 						}
 
 						// Skip rule: existing non-empty translation for this
-						// (string, target language) — never overwrite a
+						// (string, target language) - never overwrite a
 						// human-edited translation with MT output.
 						if ( $skip_existing && ( $existing_for_chunk[ (int) $row->id ] ?? '' ) !== '' ) {
 							++$skipped;
@@ -527,8 +527,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 				}
 			}
 
-			// Final tick — ensures the UI sees 100% even when total isn't
-			// divisible by tick_every. Can throw on cancel too — the finally still runs.
+			// Final tick - ensures the UI sees 100% even when total isn't
+			// divisible by tick_every. Can throw on cancel too - the finally still runs.
 			$progress( $processed, $total );
 		} catch ( \PerfLocale\Background\JobCanceledException $e ) {
 			// The worker stores these counts on the canceled job.
@@ -538,7 +538,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 			// Runs on normal completion AND on cancel/exception: saving via the
 			// repository skips the cache invalidation the
 			// single-string admin path performs, so bust the per-language bulk
-			// translation cache here — otherwise the new strings stay invisible on
+			// translation cache here - otherwise the new strings stay invisible on
 			// the front end until the cache expires. In files mode also regenerate
 			// the `*.l10n.php` files, which are the source of truth there.
 			if ( $translated > 0 || $already_translated > 0 ) {
@@ -554,7 +554,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 				/**
 				 * Fires after a bulk string-translation job changes the
-				 * `string_translations` table — parity with the admin Strings
+				 * `string_translations` table - parity with the admin Strings
 				 * save (AdminController) and PO import (PoSync) paths so addons
 				 * that derive state from strings (e.g. per-language bundles)
 				 * invalidate it after bulk MT too.
@@ -1019,7 +1019,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		// this job counts as translated is a row the front end can
 		// actually serve. Anything it could not complete comes back
 		// as an operator-facing reason and the row is counted failed
-		// — a job that spends money must not report an attempt as a
+		// - a job that spends money must not report an attempt as a
 		// success. See the method for the ordering rules.
 		$save_error = $this->save_translation( $group_repo, $translation_repo, $item['row'], $language_id, $forms[0] );
 
@@ -1122,20 +1122,20 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 *
 	 *   1. When `strings.group_id` does not resolve to a string-type group,
 	 *      heal it onto a fresh one ({@see self::mint_string_group()}). That FK
-	 *      is unenforced and three shapes fail it — 0 (never grouped), an id
+	 *      is unenforced and three shapes fail it - 0 (never grouped), an id
 	 *      whose group row is gone, and an id that collides with a live
-	 *      post/term group — and a string link cannot legally hang off any of
+	 *      post/term group - and a string link cannot legally hang off any of
 	 *      them. The heal is deferred to here, the first write for the row,
 	 *      exactly as `AdminController::process_string_translations()` defers
 	 *      it: minting for every selected string would create thousands of
 	 *      groups on a site whose strings are mostly untranslated. A row whose
-	 *      group is already correct pays NO extra query for the test —
+	 *      group is already correct pays NO extra query for the test -
 	 *      `is_string_group()` is memoised per request, and this is the same
 	 *      call the link write made before, moved ahead of the value write.
 	 *   2. The `translation_links` row, BEFORE the value. The value alone is
 	 *      never served: the DB-mode gettext map, the files-mode generator
 	 *      fetch and the strings grid's status filter all INNER JOIN links
-	 *      through the group. The order is also the recovery contract — a value
+	 *      through the group. The order is also the recovery contract - a value
 	 *      with no link is skipped by the skip-existing branch on every later
 	 *      run and so stays unservable forever, whereas a link with no value is
 	 *      simply re-attempted next run and serves nothing in the meantime,
@@ -1194,7 +1194,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		);
 
 		if ( $linked === false ) {
-			// translation_links carries TWO unique keys — group_lang
+			// translation_links carries TWO unique keys - group_lang
 			// (group_id, language_id) AND object_lang (type, object_id,
 			// language_id). When a heal has just moved this string to a new
 			// group but an orphaned type='string' link for the same
@@ -1204,8 +1204,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 			// dead group, so upsert_link()'s own re-SELECT against the NEW
 			// group finds nothing and reports false.
 			//
-			// The stale row is unreachable debris — its group no longer exists
-			// or is no longer this string's — so drop it and retry once. Scoped
+			// The stale row is unreachable debris - its group no longer exists
+			// or is no longer this string's - so drop it and retry once. Scoped
 			// by type, exactly as DataImporter::reap_orphan_string_links()
 			// does: object_id is polymorphic and a post/term id collides freely
 			// with a string id.
@@ -1284,17 +1284,17 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * statements in the same order that
 	 * {@see \PerfLocale\Admin\AdminController::process_string_translations()}
 	 * and {@see \PerfLocale\Strings\TranslationFileGenerator::repair_orphaned_translations()}
-	 * shape (2) run — one INSERT of a `type = 'string'` group, one UPDATE
+	 * shape (2) run - one INSERT of a `type = 'string'` group, one UPDATE
 	 * moving the string onto it.
 	 *
 	 * Both statements are checked, because this job reports counts an operator
 	 * spends money against. A failed INSERT leaves the string exactly as it
-	 * was. A failed UPDATE — or a zero-row one, meaning the `strings` row went
-	 * away between the batch load and now — would leave the string still
+	 * was. A failed UPDATE - or a zero-row one, meaning the `strings` row went
+	 * away between the batch load and now - would leave the string still
 	 * pointing at the unusable id while a usable group sat under a different
 	 * one, so the group is reclaimed rather than widowed. Either way the caller
 	 * gets 0 and counts the row FAILED. The provider call for that row has
-	 * already been made and cannot be refunded — what this buys the operator is
+	 * already been made and cannot be refunded - what this buys the operator is
 	 * a truthful count and a first_error naming the row, instead of a success
 	 * tally for a translation nothing can serve.
 	 *
@@ -1321,7 +1321,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 		// insert_id is only read after a confirmed INSERT: on a failed one it
 		// can still hold a PRIOR row's id rather than 0, depending on the
-		// mysqli driver — the same reason StringRepository::bulk_insert()
+		// mysqli driver - the same reason StringRepository::bulk_insert()
 		// refuses to trust it when a group insert fails.
 		$group_id = (int) $wpdb->insert_id;
 

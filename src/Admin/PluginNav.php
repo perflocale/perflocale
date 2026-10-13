@@ -42,7 +42,7 @@ final class PluginNav {
 	];
 
 	/**
-	 * Per-page documentation URLs for the right-aligned Help tab —
+	 * Per-page documentation URLs for the right-aligned Help tab -
 	 * the same targets the pages' individual "Documentation" header
 	 * buttons pointed at before the shared strip replaced them.
 	 */
@@ -110,7 +110,7 @@ final class PluginNav {
 			$ordered = array_merge( $ordered, $registered, $tail );
 		}
 
-		// Route guard only — highlighting, not a security decision.
+		// Route guard only - highlighting, not a security decision.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$current = isset( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : '';
 

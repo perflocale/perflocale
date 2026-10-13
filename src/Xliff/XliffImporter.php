@@ -109,7 +109,7 @@ final class XliffImporter {
 		// Resolve the TARGET language from <xliff trgLang="...">. The unit id
 		// (post-{id}-{field}) is the SOURCE post id baked in at export time, so
 		// the translated <target> text must be written to the target-LANGUAGE
-		// translation of that source — NOT to the source post itself (which
+		// translation of that source - NOT to the source post itself (which
 		// would overwrite the original content with the translation).
 		$root        = $dom->getElementsByTagName( 'xliff' )->item( 0 );
 		$target_slug = $root instanceof \DOMElement ? $this->resolve_language_slug( $root->getAttribute( 'trgLang' ) ) : '';
@@ -145,8 +145,8 @@ final class XliffImporter {
 		// Per-target write buffer. One target post's validated, sanitised,
 		// UNSLASHED fields are held here until the loop reaches a different
 		// target (or ends), then written with ONE wp_update_post(). A post's
-		// title, content and excerpt used to cost a full save cycle each — one
-		// revision, one save_post chain, one sibling fan-out per FIELD — for a
+		// title, content and excerpt used to cost a full save cycle each - one
+		// revision, one save_post chain, one sibling fan-out per FIELD - for a
 		// row that ends up identical either way.
 		//
 		// Locals and a closure, never properties: this is per-import state, and
@@ -181,8 +181,11 @@ final class XliffImporter {
 			$pending_fields = [];
 			$pending_units  = [];
 
-			$postarr       = $held_fields;
-			$postarr['ID'] = $held_id;
+			// An empty page_template leaves the stored template alone: one the
+			// theme no longer has would stop the save before its hooks.
+			$postarr                  = $held_fields;
+			$postarr['ID']            = $held_id;
+			$postarr['page_template'] = '';
 
 			$result = wp_update_post( wp_slash( $postarr ), true );
 
@@ -361,8 +364,8 @@ final class XliffImporter {
 
 				case 'excerpt':
 					// Same trust model as `content` above, for the same reason: an
-					// excerpt legitimately carries markup — a WooCommerce product's
-					// short description is stored as `<p>…</p>` — and
+					// excerpt legitimately carries markup - a WooCommerce product's
+					// short description is stored as `<p>…</p>` - and
 					// sanitize_textarea_field() stripped every tag AND every %XX on
 					// the way back in, so an export/import round trip silently
 					// flattened it. kses keeps both.

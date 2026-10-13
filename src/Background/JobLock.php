@@ -20,28 +20,28 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Action Scheduler has native claim semantics, but {@see WpCronRunner}
  * does not. We add a lock unconditionally so the same code path works
- * for both runners — when AS is the runner, this is belt-and-braces
+ * for both runners - when AS is the runner, this is belt-and-braces
  * (AS won't double-claim, but if a user dispatches the same job from
  * both an admin button AND a cron tick somehow, the lock still blocks
  * the second invocation).
  *
  * Lock storage: a single `perflocale_job_lock_<id>` option, NOT
- * autoloaded. The option's value is `"<expiry>|<token>"` — see
+ * autoloaded. The option's value is `"<expiry>|<token>"` - see
  * {@see PerfLocale\Concurrency\Lock} for the same scheme. The token
  * lets {@see release()} and {@see refresh()} do conditional writes that
  * fail cleanly when another worker took over an expired lock; without
  * it the original holder's late release/refresh would clobber the new
  * holder's row.
  *
- * Atomicity comes from a raw `INSERT IGNORE` (fast path) — backed by
+ * Atomicity comes from a raw `INSERT IGNORE` (fast path) - backed by
  * `wp_options.option_name`'s UNIQUE constraint, so two concurrent
- * INSERTs cannot both succeed — and a conditional UPDATE for the
+ * INSERTs cannot both succeed - and a conditional UPDATE for the
  * expired-takeover path. It is deliberately NOT `add_option()`: that
  * emits `INSERT … ON DUPLICATE KEY UPDATE` and returns truthy for every
  * racing caller, which measured 30 "winners" out of a 30-way fork while
  * one row landed. See {@see cas_acquire()} before changing this.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class JobLock {
 
@@ -65,7 +65,7 @@ final class JobLock {
 	 * {@see refresh()} themselves inside their inner loops.
 	 *
 	 * The CAS-reclaim path catches dead locks safely (no double-execution
-	 * on lock expiry — the CAS reclaim is the ONLY way another worker
+	 * on lock expiry - the CAS reclaim is the ONLY way another worker
 	 * picks up a stale lock), but a too-low TTL means an alive but
 	 * blocked worker can have its lock stolen mid-run, leading to
 	 * parallel execution of a non-idempotent job. Default sized for the
@@ -75,7 +75,7 @@ final class JobLock {
 
 	/**
 	 * Stored-value separator between expiry timestamp and per-acquire
-	 * token. Fixed literal — never derived from input.
+	 * token. Fixed literal - never derived from input.
 	 */
 	private const DELIMITER = '|';
 
@@ -95,7 +95,7 @@ final class JobLock {
 	private static array $owned = [];
 
 	/**
-	 * Keys whose lease this process HELD and provably LOST — a conditional
+	 * Keys whose lease this process HELD and provably LOST - a conditional
 	 * refresh matched zero rows and the re-read showed a different value.
 	 *
 	 * {@see $owned} answers "do I hold it?". This answers "did I hold it and
@@ -104,7 +104,7 @@ final class JobLock {
 	 * look identical to one that never acquired in this request, so its next
 	 * heartbeat took the ownerless best-effort-overwrite path and stamped a NEW
 	 * token over the takeover winner's lease, and its `finally` release took the
-	 * forced-delete path and removed that lease outright — either way two
+	 * forced-delete path and removed that lease outright - either way two
 	 * workers could then run the same job, or the same job type.
 	 *
 	 * Cleared by {@see cas_acquire()} on a successful (re)acquire and by
@@ -128,7 +128,7 @@ final class JobLock {
 	 * Atomically acquire the lock for {@param string $job_id}.
 	 *
 	 * Strategy (see {@see cas_acquire()} for the statements):
-	 *   1. `INSERT IGNORE` — succeeds atomically iff no row exists. NOT
+	 *   1. `INSERT IGNORE` - succeeds atomically iff no row exists. NOT
 	 *      `add_option()`, which is not race-safe here.
 	 *   2. If the INSERT lost, run an atomic UPDATE that bumps
 	 *      `option_value` to our new expiry ONLY if the stored expiry is
@@ -155,7 +155,7 @@ final class JobLock {
 	 * (e.g. every batch) so the lock TTL doesn't expire mid-run on
 	 * legitimately long jobs.
 	 *
-	 * Does NOT generate a new token — the caller is presumed to still own
+	 * Does NOT generate a new token - the caller is presumed to still own
 	 * the lock. The conditional UPDATE here only matches when the stored
 	 * value is STILL the value we wrote at acquire time; if another worker
 	 * has already taken over (because we ran past our TTL), the UPDATE
@@ -190,7 +190,7 @@ final class JobLock {
 		}
 
 		if ( $owned_value === null ) {
-			// Refresh called without a prior acquire in THIS request — most
+			// Refresh called without a prior acquire in THIS request - most
 			// likely a long-running worker process where the static state
 			// was reset between batches. Fall back to a best-effort overwrite
 			// (matches the pre-token-guard behaviour) so we don't regress
@@ -236,7 +236,7 @@ final class JobLock {
 		// the stored value (a refresh in the same second as the acquire with
 		// an equal TTL yields the same "expiry|token" string, and MySQL
 		// reports identical-value UPDATEs as 0 affected). Re-read to tell
-		// them apart — dropping ownership on a no-op would turn release()
+		// them apart - dropping ownership on a no-op would turn release()
 		// into a silent no-op (its conditional DELETE requires the owned
 		// stamp) and leak the lock for the full TTL.
 		if ( self::current_value( $key ) === $new_value ) {
@@ -244,7 +244,7 @@ final class JobLock {
 			return;
 		}
 
-		// Lost ownership — log so the operator can spot the contention.
+		// Lost ownership - log so the operator can spot the contention.
 		// We intentionally don't throw; callers don't expect this method
 		// to fail mid-loop, and silently no-op'ing matches the historical
 		// behaviour better than aborting the whole job.
@@ -253,10 +253,10 @@ final class JobLock {
 			error_log( '[perflocale][job-lock] refresh() lost ownership of ' . $key . ' (another worker took over after TTL expiry)' );
 		}
 
-		// Also surface it in the admin Jobs log — error_log is frequently
+		// Also surface it in the admin Jobs log - error_log is frequently
 		// unreachable on managed hosting, and lock contention is exactly what
 		// an operator debugging a stalled or duplicated job needs to see.
-		JobState::append_log( $job_id, __( 'Lock refresh lost — another worker took over after the lock TTL expired.', 'perflocale' ) );
+		JobState::append_log( $job_id, __( 'Lock refresh lost - another worker took over after the lock TTL expired.', 'perflocale' ) );
 
 		unset( self::$owned[ $owned_key ] );
 		// Record that ownership was LOST, not merely absent. Clearing $owned
@@ -317,8 +317,8 @@ final class JobLock {
 		if ( $owned_value === null && $was_lost ) {
 			// This worker held the lease, lost it to a takeover, and is now
 			// unwinding through WorkerRegistry's `finally`. The forced delete
-			// below is safe for a caller that NEVER owned the lock — the key is
-			// namespaced to this job id, so nothing else can be holding it — but
+			// below is safe for a caller that NEVER owned the lock - the key is
+			// namespaced to this job id, so nothing else can be holding it - but
 			// here the ROW is somebody else's LIVE lease, and deleting it lets a
 			// third worker enter a job that is actively running. Operator cancel
 			// from REST/CLI is unaffected: it never refreshed, so it never
@@ -327,7 +327,7 @@ final class JobLock {
 		}
 
 		// Cross-request release (REST/CLI cancel) legitimately has no
-		// $owned_value — the lock was stamped by the worker's request, whose
+		// $owned_value - the lock was stamped by the worker's request, whose
 		// static state we cannot see. The per-job key is namespaced by this
 		// exact job id, so nothing else can be holding it: dropping it
 		// unconditionally frees the cancelled job instead of leaving the row
@@ -339,7 +339,7 @@ final class JobLock {
 
 	/**
 	 * Whether a (live, non-expired) lock currently exists for the job.
-	 * Inspection only — doesn't change state. Useful in tests + the
+	 * Inspection only - doesn't change state. Useful in tests + the
 	 * admin Jobs page (to show "another worker is running this").
 	 *
 	 * @param string $job_id Job identifier.
@@ -368,7 +368,7 @@ final class JobLock {
 	/**
 	 * Acquire the type-scoped lock so only one job of `$type` can run at a
 	 * time. Used by {@see WorkerRegistry::run()} to throttle dispatch
-	 * fan-out — if a user clicks "Scan strings" five times in a row, AS
+	 * fan-out - if a user clicks "Scan strings" five times in a row, AS
 	 * may spawn parallel workers and start five concurrent scans on the
 	 * same wp_options-backed StringRepository, producing deadlocks. With
 	 * this lock the first worker runs immediately; the other four
@@ -430,7 +430,7 @@ final class JobLock {
 			return false;
 		}
 
-		// Fast path — raw INSERT IGNORE, NOT add_option(). WP's add_option
+		// Fast path - raw INSERT IGNORE, NOT add_option(). WP's add_option
 		// uses `INSERT ... ON DUPLICATE KEY UPDATE option_name = VALUES(...)`
 		// which under N-way fork concurrency returns truthy for EVERY
 		// caller (the duplicate-update is a no-op but `affected_rows`
@@ -498,7 +498,7 @@ final class JobLock {
 	/**
 	 * Extend the per-type concurrency lock's TTL, keeping the same owner
 	 * token (conditional CAS). Called with the job's real lock TTL right
-	 * after the job is built, then periodically from the progress callback —
+	 * after the job is built, then periodically from the progress callback -
 	 * WITHOUT this a long job's type lock (acquired at the 1800s default and
 	 * never refreshed) expires mid-flight and a second same-type job can
 	 * reclaim it and run concurrently, breaking the max_concurrent=1 guarantee.
@@ -566,14 +566,14 @@ final class JobLock {
 		// "expiry|token" value whenever the two TTLs are equal, and MySQL
 		// reports identical-value UPDATEs as 0 affected. Misreading that as
 		// lost ownership drops the owned stamp, release_type()'s conditional
-		// DELETE stops matching, and the type lock leaks for the full TTL —
+		// DELETE stops matching, and the type lock leaks for the full TTL -
 		// deferring every same-type job with "worker busy" for up to 30 min.
 		if ( self::current_value( $key ) === $new_value ) {
 			self::$owned[ $owned_key ] = $new_value;
 			return true;
 		}
 
-		// Lost ownership of the type lock — drop our stale record so we don't
+		// Lost ownership of the type lock - drop our stale record so we don't
 		// keep trying to refresh a lock a different worker now owns, and mark it
 		// LOST so the ownerless overwrite above stays disabled for this key.
 		unset( self::$owned[ $owned_key ] );
@@ -635,13 +635,13 @@ final class JobLock {
 		}
 
 		if ( ! $wpdb instanceof \wpdb ) {
-			// Fallback when $wpdb isn't available — WP's own delete_option
+			// Fallback when $wpdb isn't available - WP's own delete_option
 			// always nukes the row.
 			delete_option( $key );
 			return;
 		}
 
-		// Conditional DELETE — only removes the row when the stored value
+		// Conditional DELETE - only removes the row when the stored value
 		// still matches what we stamped at acquire time.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->query(

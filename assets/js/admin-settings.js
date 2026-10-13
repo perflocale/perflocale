@@ -1,5 +1,5 @@
 /**
- * PerfLocale — admin Settings page progressive enhancements.
+ * PerfLocale - admin Settings page progressive enhancements.
  *
  * Switcher tab: rows tagged with `data-perflocale-show-when-display="<value>"`
  * are shown only when the Display Mode select matches `<value>`. No-ops on

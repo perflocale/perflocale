@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Every "conditionally async" operation (DataImport, migration importers,
  * bulk MT, etc.) extends this. Tier-1 ops (webhook delivery, exchange-rate
- * sync, etc.) bypass it entirely — they enqueue directly via the runner.
+ * sync, etc.) bypass it entirely - they enqueue directly via the runner.
  *
  * The base class defines:
  *   - Type slug (used to dispatch the worker hook).
@@ -30,10 +30,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Workers are STATELESS aside from the per-job JobState row (read inside
  * the worker hook). Anything cached on the instance lives only for the duration
- * of one execute() call — re-creation between dispatch and execution is
+ * of one execute() call - re-creation between dispatch and execution is
  * normal.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 abstract class AbstractJob {
 
@@ -42,7 +42,7 @@ abstract class AbstractJob {
 	 * name (`perflocale_job_run_<type>`) so each job type has its own
 	 * isolated callback.
 	 *
-	 * MUST be `[a-z0-9_]{1,40}` — used as part of a hook name and an option
+	 * MUST be `[a-z0-9_]{1,40}` - used as part of a hook name and an option
 	 * prefix, both of which are sensitive to weird characters.
 	 *
 	 * @return string
@@ -81,7 +81,7 @@ abstract class AbstractJob {
 	 * `$detail` is optional and may carry `stage` (a key logged once per
 	 * stage), `label` (the stage's display name) and `percent` (the overall
 	 * percent, used in place of processed / total). Workers should call it
-	 * periodically — every 1 second or every 50 items, whichever first.
+	 * periodically - every 1 second or every 50 items, whichever first.
 	 * Callers may pass a no-op for the sync path.
 	 *
 	 * @param array<string, mixed> $args     Worker args.
@@ -125,7 +125,7 @@ abstract class AbstractJob {
 
 	/**
 	 * How many "items" are in this args set. Default is 0 (always sync in
-	 * Auto mode) — override per-job to return the actual item count, byte
+	 * Auto mode) - override per-job to return the actual item count, byte
 	 * size, post count, whatever's the cost dimension.
 	 *
 	 * Compared against the threshold value to drive the Auto-mode decision.
@@ -145,7 +145,7 @@ abstract class AbstractJob {
 	 * a value comfortably larger than their worst-case duration so the
 	 * lock isn't reclaimed mid-flight by a second worker.
 	 *
-	 * Progress ticks also refresh the lock — workers that emit periodic
+	 * Progress ticks also refresh the lock - workers that emit periodic
 	 * progress can rely on the default. Workers that block for minutes
 	 * without a tick (slow HTTP, single-shot importer) need to bump this
 	 * to cover the worst-case run time, OR call {@see JobLock::refresh()}

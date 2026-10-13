@@ -185,7 +185,7 @@ final class BlockTranslateController extends RestController {
 	/**
 	 * Per-post permission gate for `/from-source`. Runs the MT cap check
 	 * first, then `edit_post` on the body's `target_post_id`. The full
-	 * read-cap check on the SOURCE sibling stays in the handler — the
+	 * read-cap check on the SOURCE sibling stays in the handler - the
 	 * sibling resolution requires DB work that this gate intentionally
 	 * doesn't replicate.
 	 *
@@ -626,7 +626,7 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'missing_params', __( 'target_post_id and target_lang are required.', 'perflocale' ), 400 );
 		}
 
-		// Cap block_path depth before any other work — protects walk_block_path()
+		// Cap block_path depth before any other work - protects walk_block_path()
 		// from pathological recursion and bounds the JSON body size we'll
 		// process for malicious / malformed clients.
 		if ( count( $block_path ) > self::MAX_BLOCK_PATH_DEPTH ) {
@@ -789,7 +789,7 @@ final class BlockTranslateController extends RestController {
 			return $limited;
 		}
 
-		// TM pre-flight per value — same filter as the regular translate
+		// TM pre-flight per value - same filter as the regular translate
 		// path: a phrase translated before costs no MT quota.
 		$translated = [];
 		$pending    = [];
@@ -947,7 +947,7 @@ final class BlockTranslateController extends RestController {
 	 * @return \WP_Error|null
 	 */
 	private function enforce_rate_limit( int $user_id ): ?\WP_Error {
-		// Delegates to the shared policy — see MachineTranslateController. The
+		// Delegates to the shared policy - see MachineTranslateController. The
 		// two copies had to agree on transient keys and lock name to share a
 		// budget at all; now they cannot disagree.
 		return MtRateLimiter::admit( $user_id );

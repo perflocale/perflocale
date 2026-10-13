@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * standalone AS plugin, or any other plugin that bundles AS).
  *
  * Inherits AS's native features:
- *   - Persistent claim / lock model — two cron processes can't pick up
+ *   - Persistent claim / lock model - two cron processes can't pick up
  *     the same action.
  *   - Built-in retry with exponential backoff on uncaught exceptions.
  *   - Admin UI at *Tools → Scheduled Actions* showing every action
@@ -42,13 +42,13 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 	 */
 	public function enqueue( string $hook, array $args, string $job_id ): string {
 		// as_enqueue_async_action() documents 0 as "there was an error scheduling
-		// the action" — AS not initialised, or a `pre_as_enqueue_async_action`
+		// the action" - AS not initialised, or a `pre_as_enqueue_async_action`
 		// short-circuit that returned a non-int. Ignoring it returned the
 		// PerfLocale job id regardless, so Dispatcher::enqueue() reported
 		// mode:queued for a job with no action behind it and the row sat in
 		// `queued` until the 6-hour stuck sweep force-failed it. Throw instead,
 		// so Dispatcher's existing catch deletes the orphaned JobState row and
-		// reports mode:error — the contract WpCronRunner already honours through
+		// reports mode:error - the contract WpCronRunner already honours through
 		// schedule_or_throw().
 		$action_id = as_enqueue_async_action( $hook, [ $job_id, $args ], self::GROUP );
 

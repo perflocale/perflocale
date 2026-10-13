@@ -235,7 +235,7 @@ final class ConditionalContent {
 	 * directly, so it is run through `wp_kses()` here instead of being
 	 * trusted. Plain `wp_kses_post()` is not usable: it strips `<iframe>`
 	 * (destroying every oEmbed), removes inline `<svg>` outright, and drops
-	 * `srcset`/`sizes` from responsive images — so the post allowlist is
+	 * `srcset`/`sizes` from responsive images - so the post allowlist is
 	 * extended with exactly the elements and attributes WordPress core's own
 	 * block renderers emit.
 	 *

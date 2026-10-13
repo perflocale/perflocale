@@ -10,6 +10,8 @@ declare( strict_types=1 );
 namespace PerfLocale\Frontend;
 
 use PerfLocale\Database\Repository\LanguageRepository;
+use PerfLocale\Router\LanguageRouter;
+use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -24,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Single-site, subdomain-multisite, and subdirectory-multisite installs all
  * route through the same `wp` action since the slug prefix is always the
- * first path segment after the home URL — `home_url('/')` already accounts
+ * first path segment after the home URL - `home_url('/')` already accounts
  * for the install's URL shape.
  */
 final class SlugRedirector {
@@ -54,12 +56,13 @@ final class SlugRedirector {
 
 	/**
 	 * If the current request path begins with a redirected (renamed) slug,
-	 * issue a 301 to the equivalent path under the new slug.
+	 * issue a 301 to the equivalent path under the new slug's language, in
+	 * that language's configured URL prefix.
 	 *
 	 * @return void
 	 */
 	public function maybe_redirect(): void {
-		// Skip: admin, REST, AJAX, CLI, cron — none use the slug prefix.
+		// Skip: admin, REST, AJAX, CLI, cron - none use the slug prefix.
 		if ( is_admin() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
 			return;
 		}
@@ -77,11 +80,12 @@ final class SlugRedirector {
 		// Slug-in-path redirects only make sense in subdirectory mode. In
 		// subdomain (`en.site.com`) and domain modes the slug isn't in the
 		// path, so a path segment that looks like a slug is just a regular
-		// path — running the redirector would produce false-positive 301s.
-		$plugin = \PerfLocale\Plugin::get_instance();
+		// path - running the redirector would produce false-positive 301s.
+		$plugin   = \PerfLocale\Plugin::get_instance();
+		$settings = $plugin->has( 'settings' ) ? $plugin->get( 'settings' ) : null;
 
-		if ( $plugin->has( 'settings' ) ) {
-			$mode = $plugin->get( 'settings' )->get_url_mode();
+		if ( $settings instanceof Settings ) {
+			$mode = $settings->get_url_mode();
 
 			// Only subdirectory mode puts the language slug in the path.
 			// Subdomain/domain carry it in the host and query mode in ?lang=,
@@ -104,7 +108,7 @@ final class SlugRedirector {
 		}
 
 		// Resolve the path relative to the install root. Read the raw `home`
-		// option, NOT home_url() — our home_url filter adds the default-
+		// option, NOT home_url() - our home_url filter adds the default-
 		// language prefix when hide_default_prefix=false, so concatenating the
 		// slug again would yield `/en-us/en-us/foo`. The raw option is the
 		// unfiltered root (`/`, or `/site2` on subdirectory multisite).
@@ -162,11 +166,40 @@ final class SlugRedirector {
 			return;
 		}
 
+		// The map may come from a cached options list older than its row.
+		// Redirect only from a prefix no active language serves to one an
+		// active language serves. The router has already loaded this map.
+		$lang_repo = $plugin->has( 'lang_repo' ) ? $plugin->get( 'lang_repo' ) : null;
+
+		if ( ! $lang_repo instanceof LanguageRepository ) {
+			return;
+		}
+
+		$live = $lang_repo->get_slug_map();
+
+		if ( isset( $live[ $candidate ] ) || ! isset( $live[ $new_slug ] ) ) {
+			return;
+		}
+
+		// A language's configured prefix is live as well: under the locale
+		// URL prefix format that is its locale form (`de-de`), which the
+		// router serves and to which it 301s the slug form, so a redirect
+		// away from it would loop. The router's own prefix map resolves it.
+		$router = $plugin->has( 'router' ) ? $plugin->get( 'router' ) : null;
+
+		if ( $router instanceof LanguageRouter && $settings instanceof Settings ) {
+			$served = $router->slug_for_path_prefix( $candidate );
+
+			if ( $served !== null && isset( $live[ $served ] ) && $settings->get_url_prefix( $live[ $served ] ) === $candidate ) {
+				return;
+			}
+		}
+
 		$tail = $m[2] ?? '';
 
 		// Strip the query component from $tail just in case parse_url
 		// surprises us. The path captured by the regex never contains a
-		// `?`, but belt-and-braces — concatenating an un-stripped tail
+		// `?`, but belt-and-braces - concatenating an un-stripped tail
 		// would produce `?utm=...?utm=...` if someone hand-crafted the URL.
 		$qpos = strpos( $tail, '?' );
 		if ( $qpos !== false ) {
@@ -188,7 +221,10 @@ final class SlugRedirector {
 		// default-prefix handler downstream.
 		$skip_prefix = $this->should_skip_prefix_for_default( $new_slug );
 
-		$prefix_segment = $skip_prefix ? '' : ( '/' . $new_slug );
+		// The target carries the new language's configured prefix, so a
+		// locale-format site gets no second 301 from slug form to locale form.
+		$new_prefix     = $settings instanceof Settings ? $settings->get_url_prefix( $live[ $new_slug ] ) : $new_slug;
+		$prefix_segment = $skip_prefix ? '' : ( '/' . $new_prefix );
 		$new_path       = rtrim( $home_path, '/' ) . $prefix_segment . $tail;
 
 		// When the result is empty (default-no-prefix + tail empty),
@@ -200,8 +236,8 @@ final class SlugRedirector {
 		$target = $new_path . ( $query_string !== '' ? '?' . $query_string : '' );
 
 		// Use `wp_safe_redirect` so the redirect map can never send a visitor
-		// off-site (it could not anyway — get_slug_redirects() values are
-		// pure slug strings — but defence in depth is cheap).
+		// off-site (it could not anyway - get_slug_redirects() values are
+		// pure slug strings - but defence in depth is cheap).
 		wp_safe_redirect( $target, 301 );
 		exit;
 	}
@@ -217,7 +253,7 @@ final class SlugRedirector {
 	 *
 	 * Repository + settings access happens through a fresh instance
 	 * because SlugRedirector itself is a stateless eager service that
-	 * doesn't get the DI container injected — and querying once per
+	 * doesn't get the DI container injected - and querying once per
 	 * 301-eligible request is negligible cost.
 	 *
 	 * @param string $new_slug Resolved target slug from the redirect map.
@@ -240,7 +276,7 @@ final class SlugRedirector {
 		// prefix appears in the path component. For `subdomain` /
 		// `domain` modes the slug never lived in the path, so
 		// prefix-stripping is meaningless (and would actually be wrong
-		// — we'd lose the `/en-us/` segment that other modes don't
+		// - we'd lose the `/en-us/` segment that other modes don't
 		// even have).
 		$mode = $settings->get_url_mode();
 

@@ -36,7 +36,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * So a translation is findable only if it is PUBLISHED, carries the `wp_theme`
  * term for the active stylesheet, and has a post_name DISTINCT from the source
- * — distinct because that slug is the only handle
+ * - distinct because that slug is the only handle
  * {@see \PerfLocale\Frontend\BlockTemplateTranslator} has to point the block at.
  *
  * Two plugin behaviours actively work against that, which is why this class
@@ -49,7 +49,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *      nothing would ever make the slug unique on its own.
  *   2. `Bootstrap::allow_translation_duplicate_slugs()` deliberately collapses
  *      WordPress's `-2` suffix back to the source slug for translations. That
- *      is correct for content — a German page should keep its own clean slug —
+ *      is correct for content - a German page should keep its own clean slug -
  *      and fatal here: two rows would answer the same `post_name__in`.
  *
  * `copy_taxonomy_terms()` is no help either: it copies only TRANSLATABLE
@@ -57,7 +57,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * ⚠️ THE FALLBACK GUARANTEE. A translation that is missing, draft, trashed or
  * wrongly shaped must render the ORIGINAL, never an empty area. That is not
- * enforced by a checklist here — it falls out of the data shape: core's query
+ * enforced by a checklist here - it falls out of the data shape: core's query
  * demands `post_status = publish` AND the `wp_theme` term, so anything this
  * class failed to finish simply is not found, and the resolver's own existence
  * check (see BlockTemplateTranslator) declines to rewrite. Both layers fail
@@ -105,7 +105,7 @@ final class BlockTemplateSupport {
 	 *
 	 * ⚠️ THIS MUST BE ANCHORED AND LANGUAGE-AWARE. It was originally a bare
 	 * `str_contains( $slug, '-pfl-' )`, and that deleted legitimate operator
-	 * templates from resolution — in EVERY language, including the default,
+	 * templates from resolution - in EVERY language, including the default,
 	 * on sites that had never enabled the feature. Reproduced: two identical
 	 * pages differing only in template slug,
 	 *
@@ -113,7 +113,7 @@ final class BlockTemplateSupport {
 	 *     wp-custom-template-pfl-demo -> template GONE, hierarchy falls through
 	 *
 	 * and because core builds `slug__not_in` from the rows it already found,
-	 * dropping the database row suppressed the same-named THEME FILE too — the
+	 * dropping the database row suppressed the same-named THEME FILE too - the
 	 * customisation and its fallback both vanished with no visible cause.
 	 * `page-pfl-x`, `category-pfl-x` and `header-pfl-department` all tripped it.
 	 *
@@ -171,7 +171,7 @@ final class BlockTemplateSupport {
 
 		// ⚠️ TRUNCATION COLLIDES. Two different sources of 185 and 184
 		// characters produced the SAME translation slug, and
-		// `wp_unique_post_slug()` does not dedupe `wp_template_part` — both rows
+		// `wp_unique_post_slug()` does not dedupe `wp_template_part` - both rows
 		// coexisted under one post_name and core's `posts_per_page => 1` picked
 		// one arbitrarily, so one template rendered another's translation.
 		// `Helper::truncate_slug()` also rtrim()s trailing hyphens, which adds a
@@ -242,7 +242,7 @@ final class BlockTemplateSupport {
 	 * ⭐ WHY TEMPLATES AUTO-CREATE WHEN NOTHING ELSE DOES.
 	 *
 	 * For posts and pages, minting a translation on every save would scatter drafts
-	 * nobody asked for — you translate the handful of pages you care about, not all
+	 * nobody asked for - you translate the handful of pages you care about, not all
 	 * of them. Templates are the opposite case on all three counts:
 	 *
 	 *   - The set is small and structural. A theme has a header, a footer, a 404 and
@@ -262,7 +262,7 @@ final class BlockTemplateSupport {
 	 * languages live, so it reflects the new set immediately.
 	 *
 	 * Each copy is seeded with the source's blocks (`$copy_content = true`). An empty
-	 * template is worse than none — publish one and the language loses its header and
+	 * template is worse than none - publish one and the language loses its header and
 	 * footer.
 	 *
 	 * A language whose translation of this template was left behind by "Reset to
@@ -334,7 +334,7 @@ final class BlockTemplateSupport {
 		// so nothing resolves to this row yet and there is nothing to translate.
 		//
 		// Fanning out from it is worse than useless. `create_block_template_translation()`
-		// falls back to the ACTIVE theme for a source with no term of its own —
+		// falls back to the ACTIVE theme for a source with no term of its own -
 		// deliberately, so an operator's explicit request cannot produce a term-less
 		// row core rejects outright. Here nobody asked, so that fallback would file
 		// every sibling under whichever theme happened to be active, taking identity
@@ -396,7 +396,7 @@ final class BlockTemplateSupport {
 			}
 		} catch ( \Throwable $e ) {
 			// A failure to seed one language must not take down the save the operator
-			// actually asked for — the template itself is already written by now.
+			// actually asked for - the template itself is already written by now.
 			// Swallowed deliberately and silently: this runs on every template save,
 			// including anonymous front-end ones that can reach save_post, so it is
 			// not a place to write to the PHP error log on a loop.
@@ -535,7 +535,7 @@ final class BlockTemplateSupport {
 		// A template's title is what the Site Editor and the Translations list
 		// show. Two rows called "Header" are indistinguishable, so say which is
 		// which even though translations are hidden from the Site Editor by
-		// default — an operator who opts back in should not see a duplicate.
+		// default - an operator who opts back in should not see a duplicate.
 		$title = (string) ( $data['post_title'] ?? '' );
 
 		if ( $title !== '' ) {
@@ -585,7 +585,7 @@ final class BlockTemplateSupport {
 		// the same thing while the source happens to belong to the theme that
 		// is active right now. Translate a template belonging to a DIFFERENT
 		// retained theme and the translation was filed under the active theme
-		// instead — inheriting identity from the request rather than from the
+		// instead - inheriting identity from the request rather than from the
 		// thing being translated. The area term twenty lines below has always
 		// been mirrored from the source; this is the same rule, and the
 		// asymmetry was the bug.
@@ -597,7 +597,7 @@ final class BlockTemplateSupport {
 		// child-theme form.
 		//
 		// The fallback is the ACTIVE theme, for a source with no term of its
-		// own — the old behaviour, kept so a malformed source cannot leave the
+		// own - the old behaviour, kept so a malformed source cannot leave the
 		// translation with no term at all, which core rejects outright.
 		$source_theme = get_the_terms( $source_id, 'wp_theme' );
 		$theme_name   = get_stylesheet();
@@ -609,7 +609,7 @@ final class BlockTemplateSupport {
 		wp_set_object_terms( $new_post_id, $theme_name, 'wp_theme', false );
 
 		// ⚠️ RE-ASSERT THE SLUG. With `default_translation_status = 'pending'`
-		// — a shipped option — core BLANKS `post_name` on insert in a context
+		// - a shipped option - core BLANKS `post_name` on insert in a context
 		// with no user (CLI, cron, the MT queue, a webhook: exactly the
 		// contexts this method's own docblock cites), and publishing later
 		// regenerates it from the title. Because the title was also rewritten

@@ -320,11 +320,11 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function get_settings_fields(): array {
-		// No user-configurable settings — ACF field auto-detection runs
+		// No user-configurable settings - ACF field auto-detection runs
 		// unconditionally on every translatable post type, which is the
 		// expected behaviour for an integration addon.
 		// Empty return means the auto-generated settings subtab won't
-		// surface this addon — there's nothing to configure.
+		// surface this addon - there's nothing to configure.
 		return [];
 	}
 
@@ -366,7 +366,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * Expand repeater / flexible-content sub-field keys to every row of the
 	 * source post.
 	 *
-	 * collect_translatable_fields() can only register row 0 — the meta-key set
+	 * collect_translatable_fields() can only register row 0 - the meta-key set
 	 * is post-type-scoped and can't know a given post's row count. ContentSync
 	 * copies keys verbatim, so without this rows 1+ of every repeater/flexible
 	 * field would be dropped from translations. The source post id is known
@@ -384,7 +384,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 		// Worklist expansion. A nested template like slides_0_buttons_0_label
 		// carries a "_0_" per repeater level; the old single-pass code found
 		// only the FIRST occurrence (expanding outer rows while pinning every
-		// inner row to 0) and never re-scanned the keys it generated — so
+		// inner row to 0) and never re-scanned the keys it generated - so
 		// inner rows 1..N and outer×inner combinations were silently dropped,
 		// leaving translations with untranslated or structurally-missing rows.
 		// Here each queue item carries a search OFFSET so the NEXT level's
@@ -413,7 +413,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
 			$pos = strpos( $key, '_0_', $off );
 			if ( $pos === false ) {
-				continue; // Fully concrete already — the original is re-added below.
+				continue; // Fully concrete already - the original is re-added below.
 			}
 
 			$prefix    = substr( $key, 0, $pos );  // Concrete container path.
@@ -466,7 +466,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * For a concrete post the keys come from concrete_mt_map(), which types
 	 * every flexible-content row by that row's own layout. Type-level queries
 	 * (post id 0, the cost estimate) return row-0 templates. Gated by the
-	 * mt_meta_custom_fields setting (opt-in — cost scales with structure).
+	 * mt_meta_custom_fields setting (opt-in - cost scales with structure).
 	 *
 	 * With a translation ID, a repeater or flexible-content row is listed only
 	 * while the translation's row at the same index still has the source row's
@@ -827,8 +827,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * Declare the MT destination format for an ACF meta key: 'text' for
 	 * text / textarea fields (plain-text destinations that must not carry
 	 * entity-escaped output), leaving wysiwyg (and every non-ACF key) on the
-	 * inherited 'html' default. Only ever UPGRADES a key to text — never the
-	 * reverse — so a wysiwyg field can never be mis-sent as plain text.
+	 * inherited 'html' default. Only ever UPGRADES a key to text - never the
+	 * reverse - so a wysiwyg field can never be mis-sent as plain text.
 	 *
 	 * A key of the source post that concrete_mt_map() resolved is typed by its
 	 * own row, so a name that is text in one flexible layout and wysiwyg in
@@ -1019,8 +1019,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * @param mixed               $post_id ACF post id. NOT always an int: acf_get_valid_post_id()
 	 *                                     returns 'options', "term_{$id}", "user_{$id}", "block_…"
 	 *                                     and null. Typing this `int` made PHP throw at argument
-	 *                                     binding — before this method's own early returns could
-	 *                                     run — turning a taxonomy archive or an options page into
+	 *                                     binding - before this method's own early returns could
+	 *                                     run - turning a taxonomy archive or an options page into
 	 *                                     an HTTP 500. Unused in the body; kept for the signature.
 	 * @param array<string,mixed> $field Field configuration.
 	 * @return mixed
@@ -1058,7 +1058,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
 			// Only swap in a translation the visitor is allowed to see. A
 			// translation still in draft/pending/private would otherwise be
-			// rendered on a public page in place of the published source —
+			// rendered on a public page in place of the published source -
 			// leaking unfinished content to anonymous visitors and linking to
 			// a URL they cannot open. Falling back to the source keeps the
 			// field populated with something public.
@@ -1093,8 +1093,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * @param mixed               $post_id ACF post id. NOT always an int: acf_get_valid_post_id()
 	 *                                     returns 'options', "term_{$id}", "user_{$id}", "block_…"
 	 *                                     and null. Typing this `int` made PHP throw at argument
-	 *                                     binding — before this method's own early returns could
-	 *                                     run — turning a taxonomy archive or an options page into
+	 *                                     binding - before this method's own early returns could
+	 *                                     run - turning a taxonomy archive or an options page into
 	 *                                     an HTTP 500. Unused in the body; kept for the signature.
 	 * @param array<string,mixed> $field Field configuration.
 	 * @return mixed
@@ -1150,8 +1150,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * @param mixed               $post_id ACF post id. NOT always an int: acf_get_valid_post_id()
 	 *                                     returns 'options', "term_{$id}", "user_{$id}", "block_…"
 	 *                                     and null. Typing this `int` made PHP throw at argument
-	 *                                     binding — before this method's own early returns could
-	 *                                     run — turning a taxonomy archive or an options page into
+	 *                                     binding - before this method's own early returns could
+	 *                                     run - turning a taxonomy archive or an options page into
 	 *                                     an HTTP 500. Unused in the body; kept for the signature.
 	 * @param array<string,mixed> $field Field configuration.
 	 * @return mixed

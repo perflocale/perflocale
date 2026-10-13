@@ -53,7 +53,7 @@
 		el.innerHTML =
 			'<span class="pl-fb-chip__grip" aria-hidden="true">⋮⋮</span>' +
 			// ⚠️ Touch devices have neither drag-and-drop nor arrow keys. Without
-			// these the chain can be built on a phone but never reordered — the
+			// these the chain can be built on a phone but never reordered - the
 			// reported bug. Hidden on fine-pointer devices by CSS.
 			'<span class="pl-fb-chip__move">' +
 				'<button type="button" class="pl-fb-chip__up">▲</button>' +

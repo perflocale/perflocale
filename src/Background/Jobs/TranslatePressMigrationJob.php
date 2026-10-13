@@ -79,7 +79,7 @@ final class TranslatePressMigrationJob extends AbstractJob {
 		}
 
 		// $table is the wpdb-prefixed `trp_original_strings` table name
-		// built above — class-controlled string, no user input.
+		// built above - class-controlled string, no user input.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		return (int) $wpdb->get_var(
 			$wpdb->prepare(

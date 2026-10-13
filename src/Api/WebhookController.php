@@ -72,7 +72,7 @@ final class WebhookController extends RestController {
 
 	/**
 	 * Bounded retry for the (non-blocking) webhook_queue lock. The critical
-	 * section is only ever a fast option write — never network I/O — so a
+	 * section is only ever a fast option write - never network I/O - so a
 	 * contended acquire clears within a millisecond or two; retrying a handful
 	 * of times reliably wins instead of dropping the caller's deliveries. The
 	 * uncontended path acquires on the first try with no wait.
@@ -93,7 +93,7 @@ final class WebhookController extends RestController {
 	 * so a bulk operation firing thousands of events in one request costs
 	 * ONE option write + ONE drainer event instead of N
 	 * wp_schedule_single_event() calls (each of which rewrites the whole
-	 * autoloaded `cron` option — quadratic, multi-MB).
+	 * autoloaded `cron` option - quadratic, multi-MB).
 	 *
 	 * @var array<int, array<int, mixed>>
 	 */
@@ -130,7 +130,7 @@ final class WebhookController extends RestController {
 	 * Times a single delivery may be re-enqueued because the per-webhook
 	 * circuit breaker was open when it fired. A deferral is not a failed
 	 * attempt (the POST was never made); this budget only bounds how long
-	 * an event circulates against a receiver that never recovers —
+	 * an event circulates against a receiver that never recovers -
 	 * ~5 × (cooldown 300s + jitter) ≈ 30 min before dead-lettering.
 	 */
 	private const MAX_BREAKER_DEFERRALS = 5;
@@ -435,7 +435,7 @@ final class WebhookController extends RestController {
 		// whose host AND port match the site's own `home` is allowed even when
 		// the port is not in the allowlist (wp-includes/http.php:665). A site
 		// served on, say, https://example.com:8443 with a webhook pointing back at
-		// itself therefore delivers today — and without the same exemption below
+		// itself therefore delivers today - and without the same exemption below
 		// this check would refuse it, and the delivery path treats a policy
 		// refusal as terminal, so every future event for that webhook would be
 		// recorded once and destroyed with no retry.
@@ -510,7 +510,7 @@ final class WebhookController extends RestController {
 		// checks below judge the address a socket would actually reach.
 		//
 		// This mirrors {@see \PerfLocale\MachineTranslation\AbstractProvider::validate_url()}
-		// exactly, and the two are meant to agree — that method's own comment
+		// exactly, and the two are meant to agree - that method's own comment
 		// names this one as its counterpart. Keep them in sync.
 		//
 		// Unwrapping rather than blanket-rejecting keeps the rule identical for
@@ -569,7 +569,7 @@ final class WebhookController extends RestController {
 			}
 		}
 
-		// Hostname — resolve via DNS and re-check the IP against the same
+		// Hostname - resolve via DNS and re-check the IP against the same
 		// private/reserved ranges. Uses gethostbyname() to mirror WP core's
 		// wp_http_validate_url() and avoid warnings on failure. Skipped for IP
 		// literals and once $safe is already false. gethostbyname() answers
@@ -587,7 +587,7 @@ final class WebhookController extends RestController {
 				//
 				// This is the one rejection that is NOT a statement about the
 				// URL. A SERVFAIL or a timeout says nothing about where the
-				// host points, and it recovers on its own — so the delivery
+				// host points, and it recovers on its own - so the delivery
 				// path treats it as retryable rather than destroying the event.
 				$reason = 'unresolvable';
 				$safe   = false;
@@ -615,7 +615,7 @@ final class WebhookController extends RestController {
 
 			foreach ( $aaaa as $ipv6 ) {
 				// The inner call writes its reason into ITS OWN by-ref parameter,
-				// which is discarded here — so without this the outer $reason
+				// which is discarded here - so without this the outer $reason
 				// stayed empty and the tail below labelled it 'rejected', telling
 				// the caller a site policy filter had refused their webhook when
 				// the truth is that the host's IPv6 address is private. Carry the
@@ -661,7 +661,7 @@ final class WebhookController extends RestController {
 			// and is delivered through the transport's own lookup.
 			$addresses = $safe ? $judged : [];
 		} elseif ( $reason === '' ) {
-			// Only reachable when a site's own filter flipped the verdict — every
+			// Only reachable when a site's own filter flipped the verdict - every
 			// check above now names its own reason, so an unset reason here means
 			// policy and nothing else. (It used to also catch the literal
 			// localhost branch, which reported "rejected by a site policy filter"
@@ -681,7 +681,7 @@ final class WebhookController extends RestController {
 	 * {@see \PerfLocale\MachineTranslation\AbstractProvider::resolve_aaaa()};
 	 * keep them in sync.
 	 *
-	 * @param string $host Hostname (never an IP literal — the caller checks first).
+	 * @param string $host Hostname (never an IP literal - the caller checks first).
 	 * @return array<int, string> IPv6 literals; empty when there are none or the
 	 *   lookup is unavailable.
 	 */
@@ -725,7 +725,35 @@ final class WebhookController extends RestController {
 	 * $_SERVER['HTTP_X_PERFLOCALE_SIGNATURE'] ?? ''
 	 * );
 	 *
-	 * Uses hash_equals() for a constant-time comparison.
+	 * Uses hash_equals() for a constant-time comparison. The signature covers
+	 * the raw request body only; the X-PerfLocale-* headers are not signed.
+	 * A valid signature alone does not tell a fresh request from a replayed
+	 * one, so a receiver should also check freshness and de-duplicate:
+	 *
+	 * Freshness. The signed body is a JSON object with `event`, `data` and
+	 * `timestamp`; `timestamp` is the UTC time the event fired, for example
+	 * `2026-10-08T09:30:00Z`. Rejecting a body whose timestamp lies outside a
+	 * window bounds how long a captured request can be replayed. The window
+	 * is the receiver's choice; 5 minutes is a common value. The timestamp is
+	 * the same on every attempt, and deliveries run from the background
+	 * queue, so a 5-minute window also rejects a third attempt (sent at least
+	 * 330 seconds after the first) and any delivery that the queue or an open
+	 * circuit breaker holds back for longer. A wider window keeps those.
+	 * Answer a stale body with a 4xx other than 401 or 403 (400, for
+	 * example): a 401 or 403 opens the breaker on the first answer and so
+	 * holds back the webhook's other deliveries too.
+	 *
+	 * Duplicates. Every attempt and every redelivery of one delivery carries
+	 * the same `X-PerfLocale-Delivery-ID` (`X-PerfLocale-Attempt` counts the
+	 * attempts). Keep each processed id at least as long as the window and
+	 * answer a repeat with a 2xx without acting on it again. The header is
+	 * not signed, so this removes the plugin's own repeats; the timestamp
+	 * window is what bounds a replay.
+	 *
+	 * Any answer outside 2xx counts as a failed attempt and is retried with
+	 * the same body, up to three attempts in all; a 401 or 403 also opens the
+	 * webhook's circuit breaker at once, which holds back its further
+	 * deliveries.
 	 *
 	 * @param string $payload Raw request body.
 	 * @param string $secret Shared secret.
@@ -804,7 +832,7 @@ final class WebhookController extends RestController {
 		// Read-modify-write `wp_options` is racy under concurrent admin
 		// requests: two near-simultaneous register_webhook calls would each
 		// read the pre-write list, append their own row, and the second
-		// write wins — losing the first registration silently. Serialize
+		// write wins - losing the first registration silently. Serialize
 		// the read+write through a short-lived lock.
 		$id       = wp_generate_uuid4();
 		$response = Lock::with(
@@ -885,15 +913,17 @@ final class WebhookController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function delete_webhook( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		$id = sanitize_text_field( $request->get_param( 'id' ) );
+		// The URL segment only: get_param() prefers a body or query `id`,
+		// which would name a different webhook than the route.
+		$id = sanitize_text_field( $request->get_url_params()['id'] ?? '' );
 
-		// Same race protection as register_webhook — concurrent deletes (or
+		// Same race protection as register_webhook - concurrent deletes (or
 		// a delete colliding with a register) would lose one operation.
 		$result = Lock::with(
 			'webhooks_write',
 			10,
 			function () use ( $id ): bool|string {
-				// Fresh DB read inside the lock — see register_webhook().
+				// Fresh DB read inside the lock - see register_webhook().
 				wp_cache_delete( self::OPTION_KEY, 'options' );
 				$webhooks = $this->get_stored_webhooks();
 
@@ -949,7 +979,7 @@ final class WebhookController extends RestController {
 	 */
 	public function fire_webhook( string $event, array $data ): void {
 		// Staging/development clones carry production webhook URLs in their
-		// cloned DB — fail closed so a clone never fires endpoints that
+		// cloned DB - fail closed so a clone never fires endpoints that
 		// belong to the production site. Opt back in via the
 		// perflocale/dispatch/allow_non_production filter.
 		if ( ! \PerfLocale\Helper::is_outbound_dispatch_allowed( 'webhooks' ) ) {
@@ -968,7 +998,7 @@ final class WebhookController extends RestController {
 		$data = self::filter_payload( $event, $data );
 
 		// On Action Scheduler each async action is its own table row, so
-		// per-webhook enqueue is already cheap — keep the direct path. On
+		// per-webhook enqueue is already cheap - keep the direct path. On
 		// plain WP-Cron, every wp_schedule_single_event rewrites the single
 		// autoloaded `cron` option, so a bulk fan-out is quadratic and
 		// bloats a per-pageview option; coalesce those into one queue.
@@ -983,7 +1013,7 @@ final class WebhookController extends RestController {
 			if ( $coalesce ) {
 				// Mint the delivery id HERE, once, and carry it on the queue
 				// entry so a redelivery (drain re-append after a mid-batch
-				// fatal) keeps the SAME X-PerfLocale-Delivery-ID — otherwise a
+				// fatal) keeps the SAME X-PerfLocale-Delivery-ID - otherwise a
 				// fresh id per drain would defeat receiver-side dedup and turn
 				// at-least-once into duplicate-delivery. The trailing blog id
 				// records where the event fired: the buffer flushes at shutdown
@@ -1042,6 +1072,7 @@ final class WebhookController extends RestController {
 					// autoload=no option: bust the object cache so we merge onto
 					// a fresh DB read, not a copy another process already grew.
 					wp_cache_delete( self::QUEUE_OPTION, 'options' );
+					self::forget_listed_absence( self::QUEUE_OPTION );
 					$queue = get_option( self::QUEUE_OPTION, [] );
 					$queue = is_array( $queue ) ? $queue : [];
 
@@ -1064,6 +1095,31 @@ final class WebhookController extends RestController {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Drop this request's `notoptions` when it lists $option.
+	 *
+	 * Called inside a lock, right before the locked read of a non-autoloaded
+	 * option whose row can be absent: the queue row is deleted every time
+	 * the queue drains, and the failure log has no row until the blog's
+	 * first successful delivery (seed_failure_log()) or recorded failure,
+	 * nor after other code deleted it. The lock leaves `notoptions` as it
+	 * is, so a request that read the option as absent, or deleted it, would
+	 * get that absence back after another request created the row, and its
+	 * write would replace that request's entries. Dropping `notoptions`
+	 * sends the read to the database. When `notoptions` does not list the
+	 * option, nothing is dropped.
+	 *
+	 * @param string $option Option name.
+	 * @return void
+	 */
+	private static function forget_listed_absence( string $option ): void {
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		if ( is_array( $notoptions ) && isset( $notoptions[ $option ] ) ) {
+			wp_cache_delete( 'notoptions', 'options' );
+		}
 	}
 
 	/**
@@ -1148,8 +1204,8 @@ final class WebhookController extends RestController {
 
 		// Group by the blog the event fired on. Each blog has its OWN webhook
 		// option, queue option, and cron; a delivery buffered while switched
-		// into another blog must land in THAT blog's queue, or its drainer —
-		// reading this blog's webhooks — would never find the uuid and would
+		// into another blog must land in THAT blog's queue, or its drainer -
+		// reading this blog's webhooks - would never find the uuid and would
 		// silently drop it. The trailing element (index 5) carries the blog id
 		// and is stripped before the delivery is written to the per-blog queue.
 		$by_blog = [];
@@ -1185,7 +1241,7 @@ final class WebhookController extends RestController {
 
 	/**
 	 * Merge one blog's coalesced deliveries into its queue and schedule a
-	 * drainer tick. MUST run in the target blog's context — the queue option
+	 * drainer tick. MUST run in the target blog's context - the queue option
 	 * and cron are per-blog.
 	 *
 	 * @param array<int, array<int, mixed>> $deliveries Queue-shaped delivery tuples.
@@ -1199,11 +1255,11 @@ final class WebhookController extends RestController {
 		// Locked read-modify-write with bounded retry: a drainer or a second
 		// flush in a parallel request would otherwise interleave read/write and
 		// drop deliveries. If the (non-blocking) lock cannot be acquired at all,
-		// fall back to the pre-coalescing path — one DELIVERY_HOOK event per
+		// fall back to the pre-coalescing path - one DELIVERY_HOOK event per
 		// delivery. This runs ON the shutdown hook, where "restore the buffer
 		// and re-arm shutdown" is a dead end (a callback added to the hook
 		// currently executing may never fire, or could loop); the per-delivery
-		// path is lock-free (no shared queue option), so nothing is lost — it
+		// path is lock-free (no shared queue option), so nothing is lost - it
 		// merely forfeits the coalescing win in this extreme edge (~200 ms of
 		// continuous queue-lock contention).
 		$written = self::run_under_queue_lock(
@@ -1246,12 +1302,12 @@ final class WebhookController extends RestController {
 	public function drain_webhooks(): void {
 		// CLAIM a batch atomically: take it out of the shared queue under the
 		// lock so a concurrent drainer/flush can't double-dispatch or clobber
-		// the write. Dispatch happens OUTSIDE the lock — each deliver_webhook
+		// the write. Dispatch happens OUTSIDE the lock - each deliver_webhook
 		// is a blocking POST, and holding the lock across them would stall
 		// every other queue op. run_under_queue_lock retries a contended
 		// (non-blocking) lock rather than giving up; if it can't acquire at
 		// all we simply don't claim (the queue is untouched, a later tick
-		// handles it) — never a silent loss.
+		// handles it) - never a silent loss.
 		$batch = [];
 		$more  = false;
 
@@ -1321,7 +1377,7 @@ final class WebhookController extends RestController {
 			unset( $pending[ $i ] );
 		}
 
-		$pending = []; // Whole batch handled — nothing for the shutdown handler.
+		$pending = []; // Whole batch handled - nothing for the shutdown handler.
 
 		if ( $more && ! wp_next_scheduled( self::DRAIN_HOOK ) ) {
 			BackgroundEvents::enqueue( self::DRAIN_HOOK, [] );
@@ -1446,8 +1502,8 @@ final class WebhookController extends RestController {
 		//
 		// A resolver that could not answer says nothing about where the host
 		// points and recovers on its own, so that case goes through the same
-		// retry ladder as an HTTP 5xx. A policy rejection — a private address,
-		// a scheme we cannot deliver, a site filter saying no — is a statement
+		// retry ladder as an HTTP 5xx. A policy rejection - a private address,
+		// a scheme we cannot deliver, a site filter saying no - is a statement
 		// about the URL, will be just as true in thirty seconds, and is
 		// recorded once and dropped.
 		$url           = (string) ( $webhook['url'] ?? '' );
@@ -1486,7 +1542,7 @@ final class WebhookController extends RestController {
 				}
 
 				// Scheduler refused the retry, so this is the last chance to
-				// leave a durable record — same reasoning as the branches below.
+				// leave a durable record - same reasoning as the branches below.
 				$this->record_failure(
 					$webhook_id,
 					$event,
@@ -1514,7 +1570,7 @@ final class WebhookController extends RestController {
 		// the skip in the permanent failure log so the admin can see
 		// "circuit_open" entries instead of silent drops. Per-webhook
 		// key (not per-URL) so two webhooks pointing at the same host
-		// have independent breakers — one operator's broken target
+		// have independent breakers - one operator's broken target
 		// doesn't pause another's deliveries.
 		$breaker_key = 'webhook_' . $webhook_id;
 
@@ -1523,7 +1579,7 @@ final class WebhookController extends RestController {
 			$cooldown = (int) ( $status['cooldown_remaining'] ?? 0 );
 
 			// Defer, don't drop: an open breaker means the receiver is down
-			// RIGHT NOW — the event is still deliverable once it recovers.
+			// RIGHT NOW - the event is still deliverable once it recovers.
 			// Re-enqueue past the cooldown (same attempt number; this is a
 			// deferral, not a failed attempt), bounded by a deferral budget
 			// so a permanently-dead receiver still dead-letters instead of
@@ -1540,7 +1596,7 @@ final class WebhookController extends RestController {
 				// pre_schedule_event veto, a duplicate) produced NO retry and NO
 				// record: the delivery simply vanished. Fall through to the
 				// durable failure log instead, which is bounded and already
-				// exists — deliberately NOT a synchronous retry or a busy wait.
+				// exists - deliberately NOT a synchronous retry or a busy wait.
 				$deferred = BackgroundEvents::enqueue(
 					self::RETRY_HOOK,
 					[ $webhook_id, $event, $data, $timestamp, $attempt, $delivery_id, $breaker_deferrals + 1 ],
@@ -1639,7 +1695,7 @@ final class WebhookController extends RestController {
 
 		// Categorise the failure for the breaker. 401/403 from the
 		// receiver means the webhook secret rotation broke the auth or
-		// the operator misconfigured signing — no amount of retries
+		// the operator misconfigured signing - no amount of retries
 		// fixes that, so trip on the first hit. Other failures
 		// accumulate toward the default threshold.
 		$failure_reason = match ( true ) {
@@ -1660,7 +1716,7 @@ final class WebhookController extends RestController {
 			// against the same receiver doesn't pile every retry at exactly
 			// `base_delay` seconds later. Deterministic delays produce a
 			// thundering herd on the receiver as soon as it recovers from
-			// whatever transient error caused the failure — self-inflicted
+			// whatever transient error caused the failure - self-inflicted
 			// DDoS. Half-base spread is wide enough to flatten the curve
 			// without pushing any single retry far from its target slot.
 			try {
@@ -1710,15 +1766,15 @@ final class WebhookController extends RestController {
 	private function record_failure( string $webhook_id, string $event, string $timestamp, string $error ): void {
 		// Defense-in-depth: bound $error to a known-safe shape before it
 		// hits the log. Callers only ever pass `$response->get_error_message()`
-		// (WP_Error message — cURL/WordPress text) or `sprintf('HTTP %d', $code)`,
+		// (WP_Error message - cURL/WordPress text) or `sprintf('HTTP %d', $code)`,
 		// neither of which contains secrets, response bodies, or the
 		// destination URL. The log is surfaced to every manage_options account
 		// on the site by the PerfLocale webhook-delivery card in Site Health
 		// (SiteHealth::test_webhook_failures), so future
 		// refactors that widen $error to include receiver response bodies
-		// — which can echo back partial HMAC signatures, request IDs that
+		// - which can echo back partial HMAC signatures, request IDs that
 		// leak internal infrastructure, or credentials a misconfigured
-		// receiver pasted into its error path — must NOT silently land
+		// receiver pasted into its error path - must NOT silently land
 		// here. Allow-list to the two documented shapes; anything else
 		// gets the generic placeholder so future-you sees it and updates
 		// the contract deliberately.
@@ -1743,7 +1799,7 @@ final class WebhookController extends RestController {
 		// deliveries failing in the same tick don't both read the pre-write
 		// log, both append their own entry, and lose one record on the
 		// second update_option().
-		// Lock::with() returns null when it could not take the lock — it is a
+		// Lock::with() returns null when it could not take the lock - it is a
 		// NON-BLOCKING mutex, so contention means the critical section never ran.
 		// Discarding that meant a real delivery failure could go unrecorded while
 		// the admin failure log showed nothing at all. Log the miss instead of
@@ -1756,6 +1812,7 @@ final class WebhookController extends RestController {
 			// a lock miss: Lock::with() returns the callback's value, and
 			// null only when it never ran.
 			function () use ( $webhook_id, $event, $timestamp, $error ): bool {
+				self::forget_cached_log();
 				$log = get_option( self::FAILURES_KEY, [] );
 
 				if ( ! is_array( $log ) ) {
@@ -1794,6 +1851,60 @@ final class WebhookController extends RestController {
 	}
 
 	/**
+	 * Drop this request's cached copies of the failure log before a locked
+	 * read of it.
+	 *
+	 * The log is not autoloaded, so get_option() keeps the row it read under
+	 * the option's own key for the rest of the request. A request that
+	 * delivers several webhooks (a drain batch, or a WP-Cron run that fires
+	 * several due retries) would otherwise read that copy inside the lock
+	 * after another request had recorded or cleared a failure since, and its
+	 * write would replace that change. The copy under the option's own key is
+	 * dropped, and `notoptions` when it lists the log (see
+	 * forget_listed_absence()), so the read goes to the database. Called
+	 * under the failure-log lock only.
+	 *
+	 * @return void
+	 */
+	private static function forget_cached_log(): void {
+		wp_cache_delete( self::FAILURES_KEY, 'options' );
+		self::forget_listed_absence( self::FAILURES_KEY );
+	}
+
+	/**
+	 * Create the failure log row as an empty list, autoload off.
+	 *
+	 * Called under the failure-log lock by clear_failure() when its read
+	 * finds no row, so the first successful delivery on a blog creates the
+	 * row. With the row present, no request lists the log in `notoptions`,
+	 * and forget_listed_absence() drops nothing on later deliveries.
+	 *
+	 * get_option() also returns the default for a failed SELECT or a
+	 * `notoptions` copy that lists a row created since, and add_option()'s
+	 * INSERT ... ON DUPLICATE KEY UPDATE would then replace the stored log.
+	 * One direct SELECT confirms the row is absent first; nothing is written
+	 * when that SELECT finds the row or fails.
+	 *
+	 * @return void
+	 */
+	private static function seed_failure_log(): void {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- existence check that bypasses the options caches on purpose.
+		$exists = $wpdb->get_var( $wpdb->prepare( 'SELECT 1 FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, self::FAILURES_KEY ) );
+
+		if ( null !== $exists || '' !== $wpdb->last_error ) {
+			return;
+		}
+
+		add_option( self::FAILURES_KEY, [], '', false );
+	}
+
+	/**
 	 * Remove all failure log entries for a webhook that just succeeded.
 	 *
 	 * @param string $webhook_id Webhook UUID.
@@ -1807,7 +1918,14 @@ final class WebhookController extends RestController {
 			'webhook_failure_log',
 			5,
 			function () use ( $webhook_id ): bool {
-				$log = get_option( self::FAILURES_KEY, [] );
+				self::forget_cached_log();
+				$log = get_option( self::FAILURES_KEY, null );
+
+				if ( null === $log ) {
+					self::seed_failure_log();
+
+					return true;
+				}
 
 				if ( ! is_array( $log ) || empty( $log ) ) {
 					return true;

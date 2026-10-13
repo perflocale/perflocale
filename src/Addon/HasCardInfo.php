@@ -40,9 +40,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                            through sanitize_key() before use.
  *
  * Returning an empty array is the same as not implementing the interface
- * at all — every default applies.
+ * at all - every default applies.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface HasCardInfo {
 

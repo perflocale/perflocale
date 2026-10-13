@@ -68,7 +68,7 @@
 		var activeIndex = -1;
 		var visibleCount = payloads.length;
 
-		// Field references — resolved once. We don't re-query per click.
+		// Field references - resolved once. We don't re-query per click.
 		var fields = {
 			slug:    document.getElementById( 'perflocale-slug' ),
 			locale:  document.getElementById( 'perflocale-locale' ),
@@ -84,7 +84,7 @@
 			list.hidden = false;
 			combo.classList.add( 'is-open' );
 			// aria-expanded belongs on the role="combobox" element (the input),
-			// not the wrapper — screen readers ignore it on the un-roled div.
+			// not the wrapper - screen readers ignore it on the un-roled div.
 			input.setAttribute( 'aria-expanded', 'true' );
 		}
 
@@ -100,7 +100,7 @@
 				return;
 			}
 			if ( visibleCount === 0 ) {
-				status.textContent = i18n.noMatches || 'No languages match — try a different search.';
+				status.textContent = i18n.noMatches || 'No languages match - try a different search.';
 				status.style.display = 'block';
 			} else {
 				status.style.display = 'none';
@@ -167,7 +167,7 @@
 				// Point the combobox at the active option so AT announces it.
 				input.setAttribute( 'aria-activedescendant', el.id );
 
-				// Scroll into view only if needed — avoid the jumpy "always
+				// Scroll into view only if needed - avoid the jumpy "always
 				// scroll" feel.
 				var elTop = el.offsetTop;
 				var elBottom = elTop + el.offsetHeight;
@@ -226,7 +226,7 @@
 
 			// Mirror the visible label back into the combo input so the
 			// user sees what they picked.
-			input.value = p.rawName + ' — ' + p.rawNative;
+			input.value = p.rawName + ' - ' + p.rawNative;
 			close();
 		}
 
@@ -235,7 +235,7 @@
 				selectPayload( payloads[ activeIndex ] );
 				return;
 			}
-			// No keyboard highlight — pick the first visible row if any.
+			// No keyboard highlight - pick the first visible row if any.
 			var visible = visibleIndices();
 			if ( visible.length > 0 ) {
 				selectPayload( payloads[ visible[ 0 ] ] );

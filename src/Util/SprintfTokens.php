@@ -22,10 +22,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  * indices, in the translation).
  *
  * Lives in PerfLocale\Util because it's a generic string-parsing
- * utility — nothing about it is multilingual-specific.
+ * utility - nothing about it is multilingual-specific.
  *
  * @internal Implementation detail. The public surface is the static
- *           extract() method below — third-party code that needs this
+ *           extract() method below - third-party code that needs this
  *           parser should call it directly; everything else may change.
  */
 final class SprintfTokens {

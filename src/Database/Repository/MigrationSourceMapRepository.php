@@ -55,7 +55,7 @@ final class MigrationSourceMapRepository {
 	 * Resolve the full table name for the current blog.
 	 *
 	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly — capturing the name in the constructor would otherwise pin
+	 * correctly - capturing the name in the constructor would otherwise pin
 	 * this instance to whichever blog was active at construction. Same rule
 	 * as every sibling repository; today's callers build the repo inside the
 	 * blog they operate on, so this is the convention holding rather than a

@@ -58,7 +58,7 @@ final class PrivacyIntegration {
 	 *     (Screen Options).
 	 *
 	 * Public so {@see \PerfLocale\Database\SiteCleanup} can reuse the same
-	 * list on full uninstall — keeping the two flows from drifting apart
+	 * list on full uninstall - keeping the two flows from drifting apart
 	 * silently when a new admin-UI preference is added.
 	 *
 	 * @var array<int, string>
@@ -154,7 +154,7 @@ final class PrivacyIntegration {
 		$data = [];
 		$page = max( 1, $page );
 
-		// The preferences are a fixed, small set — emit on page 1 only.
+		// The preferences are a fixed, small set - emit on page 1 only.
 		// WordPress merges items that share an item_id, so repeating them on
 		// later pages would duplicate their fields in the export.
 		if ( 1 === $page ) {
@@ -183,7 +183,7 @@ final class PrivacyIntegration {
 			}
 		}
 
-		// Background jobs this user dispatched — the eraser zeroes
+		// Background jobs this user dispatched - the eraser zeroes
 		// `created_by` on these rows, so the access request must surface
 		// them too. A chained job (a site-wide machine translation, for one)
 		// writes a row per chunk, so one user can own more rows than a page
@@ -246,7 +246,7 @@ final class PrivacyIntegration {
 	 *
 	 * Returns integer counts (not bools) in the `items_removed` and
 	 * `items_retained` fields. WP's privacy controller accepts both forms
-	 * — counts are more accurate and the admin UI aggregates them across
+	 * - counts are more accurate and the admin UI aggregates them across
 	 * pages.
 	 *
 	 * @param string $email_address Subject's email.
@@ -266,7 +266,7 @@ final class PrivacyIntegration {
 		}
 
 		// 1. Anonymise queued / running / recently-finished background jobs
-		// dispatched by this user. JobState options carry `created_by` —
+		// dispatched by this user. JobState options carry `created_by` -
 		// zeroing it makes pending runs fail their cap re-validation, which
 		// is the right behavior for an erased user. Null means the UPDATE
 		// failed and the rows still carry the user's ID.
@@ -274,7 +274,7 @@ final class PrivacyIntegration {
 		$jobs_failed     = null === $jobs_result;
 		$jobs_anonymised = (int) $jobs_result;
 
-		// 2. Delete every PerfLocale user-meta entry — these are pure UI
+		// 2. Delete every PerfLocale user-meta entry - these are pure UI
 		// state, no shared-history concern. Runs even when step 1 failed.
 		$meta_deleted = 0;
 
@@ -341,7 +341,7 @@ final class PrivacyIntegration {
 	 *
 	 * Splits patterns into "always-safe" (email + login, both unique by WP
 	 * design) and "uniqueness-gated" (display_name, full name, individual
-	 * first/last name — only included when no other user on the site shares
+	 * first/last name - only included when no other user on the site shares
 	 * the value). Skips anything < 4 chars throughout.
 	 *
 	 * Public: an add-on reuses the exact same pattern set for

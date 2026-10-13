@@ -2,7 +2,7 @@
  * PerfLocale - WP Dashboard widget (translation overview).
  *
  * Self-contained (no dependency on admin.css variables) since it loads
- * on the Dashboard screen only. Pure CSS coverage bar — no JS.
+ * on the Dashboard screen only. Pure CSS coverage bar - no JS.
  */
 
 .perflocale-dashwidget__stats {

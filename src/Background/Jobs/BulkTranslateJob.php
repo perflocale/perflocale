@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Dispatched from the Translations admin page bulk-action handler. Below
  * the threshold the work runs inline so the operator sees counts on the
  * redirect; above it, control returns immediately and the worker hook
- * grinds through the matrix in the background — visible under PerfLocale
+ * grinds through the matrix in the background - visible under PerfLocale
  * → Jobs.
  *
  * Args shape:
@@ -41,9 +41,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                                screen's bulk action).
  *
  * Skip rule: a (source, target) pair is skipped when the source already
- * has a translation in that target language — no overwrites.
+ * has a translation in that target language - no overwrites.
  *
- * args_size() returns `count(source_ids) * count(target_lang_ids)` — the
+ * args_size() returns `count(source_ids) * count(target_lang_ids)` - the
  * total number of provider calls this dispatch will potentially fan out
  * to. That matches what an operator intuits as "how big is this job"
  * and pairs naturally with the per-job threshold setting.
@@ -134,7 +134,7 @@ final class BulkTranslateJob extends AbstractJob {
 	 *
 	 * @param array<string, mixed> $args     `source_ids` + `target_lang_ids`
 	 *                                       per the class-level docblock.
-	 * @param callable             $progress `function(int, int): void` —
+	 * @param callable             $progress `function(int, int): void` -
 	 *                                       reports (processed, total).
 	 * @return array<string, mixed> `created`, `skipped` (of which
 	 *                               `skipped_permission` were refused for
@@ -285,7 +285,7 @@ final class BulkTranslateJob extends AbstractJob {
 		// Bulk-prime the L1 translation cache for the sources in one SELECT.
 		// A slice primes the window its pairs can reach, from its first pair.
 		// Without this, get_translation_id() inside the inner loop pays the
-		// cold-path cost (~1-2 ms) on every first hit per source — N source
+		// cold-path cost (~1-2 ms) on every first hit per source - N source
 		// posts × that cost is wasted work on sites above the
 		// eager-link-map cap. Below the cap this is a no-op (eager map
 		// serves these in µs).
@@ -340,7 +340,7 @@ final class BulkTranslateJob extends AbstractJob {
 		// Count-based AND wall-clock-based: the progress callback is the ONLY
 		// place the job/type locks refresh and the cancel/pause probes run.
 		// Under a slow provider (~93-600s per failed row) a pure count-based
-		// gap (total/100 rows) can exceed the 1800s lock TTL — the type lock
+		// gap (total/100 rows) can exceed the 1800s lock TTL - the type lock
 		// gets reclaimed mid-run and a second same-type job starts
 		// concurrently. One microtime comparison per row is the entire cost.
 		$tick_every   = max( 1, (int) floor( $total / 100 ) );
@@ -365,7 +365,7 @@ final class BulkTranslateJob extends AbstractJob {
 
 		// Suspend the eager link map for the loop: every created link
 		// invalidates it, and the next row's get_translation_id read would
-		// otherwise rebuild-and-persist the WHOLE map — O(rows × map size).
+		// otherwise rebuild-and-persist the WHOLE map - O(rows × map size).
 		// Readers fall back to the JOIN path while suspended; one
 		// invalidation after the loop leaves the next request to rebuild a
 		// fresh map once.
@@ -373,7 +373,7 @@ final class BulkTranslateJob extends AbstractJob {
 
 		// ⭐ SOURCE-BOUNDARY YIELD. SiteTranslateJob needs to stop on a wall
 		// clock while keeping a resumable, source-atomic cursor. It used to get
-		// that by calling execute() ONCE PER SOURCE — which re-ran everything
+		// that by calling execute() ONCE PER SOURCE - which re-ran everything
 		// above per source and measured 10.55x slower on an all-skip chunk
 		// (120ms/274 queries -> 1,267ms/1,809 queries for 50 sources), because
 		// each call rebuilt the service objects, re-primed, recomputed the
@@ -468,7 +468,7 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * The bulk row loop — split from execute() so the eager-link-map
+	 * The bulk row loop - split from execute() so the eager-link-map
 	 * suspension can wrap it in a single try/finally.
 	 *
 	 * @param array<int,int>            $source_ids  Source post IDs.
@@ -506,8 +506,8 @@ final class BulkTranslateJob extends AbstractJob {
 	 */
 	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, object $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk' ): bool {
 		// `perflocale_use_mt` is the capability that authorises SPENDING the
-		// provider; `perflocale_manage_translations` — the one WorkerRegistry
-		// re-validates at worker time — only authorises running the job. A queued
+		// provider; `perflocale_manage_translations` - the one WorkerRegistry
+		// re-validates at worker time - only authorises running the job. A queued
 		// bulk run can sit for hours, so evaluate the MT capability here instead
 		// of trusting the dispatch-time decision. Evaluated ONCE (the identity
 		// cannot change inside the loop) and folded into the existing per-row
@@ -517,7 +517,7 @@ final class BulkTranslateJob extends AbstractJob {
 
 		// Say WHY the run did nothing. Without this the job completes with every
 		// row "skipped" and an empty error, which reads as "there was nothing to
-		// translate" rather than "the dispatching user lost the capability" — the
+		// translate" rather than "the dispatching user lost the capability" - the
 		// operator has no way to tell those apart from the Jobs page or the REST
 		// detail endpoint.
 		if ( ! $can_use_mt && $first_error === '' ) {
@@ -544,7 +544,7 @@ final class BulkTranslateJob extends AbstractJob {
 				$processed          += count( $targets );
 				$tick( $processed );
 
-				// A source skipped for permissions is still FULLY processed —
+				// A source skipped for permissions is still FULLY processed -
 				// the cursor must pass it or the chain re-reads it forever.
 				$cursor = (int) $source_id;
 
@@ -654,12 +654,12 @@ final class BulkTranslateJob extends AbstractJob {
 				 * Match WordPress's `pre_*` filter convention: return `null`
 				 * (the default) to let the regular flow run. Return ANY other
 				 * value to skip the default `TranslationService::translate_post()`
-				 * call for this row — the returned value is treated as the
+				 * call for this row - the returned value is treated as the
 				 * row's result:
 				 *
-				 *   - `[ 'post_id' => int ]`      — counted as `created`.
-				 *   - `'skip'` or any non-array   — counted as `skipped`.
-				 *   - `false`                     — counted as `skipped`.
+				 *   - `[ 'post_id' => int ]`      - counted as `created`.
+				 *   - `'skip'` or any non-array   - counted as `skipped`.
+				 *   - `false`                     - counted as `skipped`.
 				 *
 				 * Useful for per-row policy decisions: skip products on a
 				 * lock-list, route specific languages through a different
@@ -768,7 +768,7 @@ final class BulkTranslateJob extends AbstractJob {
 				 *                            success). Empty array on failure.
 				 * @param array  $context     Row metadata. Includes `error`
 				 *                            (string, empty on success),
-				 *                            `short_circuited` (bool — was
+				 *                            `short_circuited` (bool - was
 				 *                            this from before_translate?),
 				 *                            and the keys passed to the
 				 *                            before_translate filter.
@@ -791,7 +791,7 @@ final class BulkTranslateJob extends AbstractJob {
 				$tick( $processed );
 			}
 
-			// Every target for this source has been attempted — only now is it
+			// Every target for this source has been attempted - only now is it
 			// safe to move the cursor past it.
 			$cursor = (int) $source_id;
 

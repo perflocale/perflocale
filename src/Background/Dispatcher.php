@@ -31,7 +31,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * `(string $job_id, array $args)` and handles cap re-validation, locking,
  * retries, and state transitions.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class Dispatcher {
 
@@ -79,7 +79,7 @@ final class Dispatcher {
 		 * quotas, A/B rollout gates, monitoring-driven kill switches.
 		 *
 		 * Distinct from `perflocale/jobs/threshold/<type>` which only
-		 * decides sync-vs-async — `should_dispatch` is the kill switch.
+		 * decides sync-vs-async - `should_dispatch` is the kill switch.
 		 *
 		 * @hook  perflocale/jobs/should_dispatch
 		 * @since 1.0.0
@@ -147,7 +147,7 @@ final class Dispatcher {
 			];
 		}
 
-		// Reject oversized args before they reach JobState::create — the
+		// Reject oversized args before they reach JobState::create - the
 		// args array is persisted in the `args` LONGTEXT column of the
 		// per-job row, which must not grow by megabytes per call.
 		$encoded = wp_json_encode( $args );
@@ -248,7 +248,7 @@ final class Dispatcher {
 			// JobState::create uses an atomic INSERT IGNORE against the jobs
 			// table's UNIQUE uuid key and returns
 			// false on the astronomically rare UUID collision. Retry up to
-			// three times with fresh UUIDs before giving up — collisions
+			// three times with fresh UUIDs before giving up - collisions
 			// indicate either a broken entropy source or someone re-creating
 			// the same job_id manually, both of which should surface as a
 			// hard error rather than silently re-using an unrelated row.
@@ -290,7 +290,7 @@ final class Dispatcher {
 
 		// If the runner blows up before scheduling the worker event (AS
 		// table corrupted, wp_cron option write failed, etc.), the
-		// JobState row would survive with no worker event waiting — a
+		// JobState row would survive with no worker event waiting - a
 		// stuck queued row visible on the Jobs page until the GC's 6-hour
 		// stuck-sweep marks it failed. That's a slow path; clean up at
 		// the dispatch site instead so the failure is visible immediately
@@ -318,7 +318,7 @@ final class Dispatcher {
 		) {
 			JobState::append_log(
 				$job_id,
-				__( 'DISABLE_WP_CRON is set — this job needs an external cron trigger (system cron hitting wp-cron.php) to run.', 'perflocale' )
+				__( 'DISABLE_WP_CRON is set - this job needs an external cron trigger (system cron hitting wp-cron.php) to run.', 'perflocale' )
 			);
 		}
 
@@ -384,7 +384,7 @@ final class Dispatcher {
 
 	/**
 	 * Run the job inline and capture the result. The progress callback is
-	 * a no-op in sync mode — sync callers expect a single result, not a
+	 * a no-op in sync mode - sync callers expect a single result, not a
 	 * progress stream.
 	 *
 	 * @param AbstractJob          $job
@@ -420,7 +420,7 @@ final class Dispatcher {
 	/**
 	 * Bounded recursion to measure the deepest nested-array path in
 	 * `$args`. Caps at 64 to keep the probe itself from blowing PHP's
-	 * stack — `array_depth(...) > $cap` short-circuits as soon as we
+	 * stack - `array_depth(...) > $cap` short-circuits as soon as we
 	 * exceed the threshold the caller cares about.
 	 *
 	 * @param mixed $value

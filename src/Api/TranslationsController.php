@@ -51,7 +51,7 @@ final class TranslationsController extends RestController {
 					// target_lang sanitize mirrors create_translation()'s
 					// sanitize_key. NOT marked required: the handler returns a
 					// specific 'missing_lang' error we must preserve.
-					// copy_content is left undeclared — the handler uses a (bool)
+					// copy_content is left undeclared - the handler uses a (bool)
 					// cast, which differs from REST boolean coercion for values
 					// like '0'.
 					'args'                => [
@@ -192,7 +192,7 @@ final class TranslationsController extends RestController {
 	}
 
 	/**
-	 * POST /translations/bulk-translate — subset or site-wide MT dispatch.
+	 * POST /translations/bulk-translate - subset or site-wide MT dispatch.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response|\WP_Error
@@ -227,7 +227,7 @@ final class TranslationsController extends RestController {
 				global $wpdb;
 				$post_types = array_values( array_filter( array_map( 'sanitize_key', (array) ( $request->get_param( 'post_types' ) ?: [ 'post', 'page' ] ) ) ) );
 // ⭐ Parity: the ONE definition of what site-translate may act on lives in
-				// Settings::get_site_translate_post_types() — the translatable list
+				// Settings::get_site_translate_post_types() - the translatable list
 				// narrowed to registered types. The old `public + show_ui` whitelist
 				// excluded every addon type (CF7, WPForms, product_variation) and
 				// included public types nobody marked translatable.
@@ -276,7 +276,7 @@ final class TranslationsController extends RestController {
 		if ( $site_wide ) {
 			$post_types = array_values( array_filter( array_map( 'sanitize_key', (array) ( $request->get_param( 'post_types' ) ?: [ 'post', 'page' ] ) ) ) );
 // ⭐ Parity: the ONE definition of what site-translate may act on lives in
-				// Settings::get_site_translate_post_types() — the translatable list
+				// Settings::get_site_translate_post_types() - the translatable list
 				// narrowed to registered types. The old `public + show_ui` whitelist
 				// excluded every addon type (CF7, WPForms, product_variation) and
 				// included public types nobody marked translatable.
@@ -349,7 +349,7 @@ final class TranslationsController extends RestController {
 			return $base;
 		}
 
-		// Path segments only — get_param() prefers GET over URL params, so a
+		// Path segments only - get_param() prefers GET over URL params, so a
 		// stray query arg could point the capability check at a DIFFERENT
 		// object than the one the handler will act on.
 		$type = sanitize_key( $request->get_url_params()['type'] ?? '' );
@@ -381,7 +381,7 @@ final class TranslationsController extends RestController {
 			);
 		}
 
-		// type=string: the cap check above is sufficient — strings have
+		// type=string: the cap check above is sufficient - strings have
 		// no per-object owner; `perflocale_translate` is the gate.
 		return true;
 	}
@@ -389,11 +389,17 @@ final class TranslationsController extends RestController {
 	/**
 	 * Get all translations for an object.
 	 *
+	 * Every language is listed with whether it has a translation. A sibling
+	 * the current user may neither read nor edit
+	 * ({@see \PerfLocale\Helper::user_can_view_object()}) is listed by language
+	 * and existence only: its `post_id`, `status`, `status_label`,
+	 * `post_status` and `edit_url` are null.
+	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response
 	 */
 	public function get_translations( \WP_REST_Request $request ): \WP_REST_Response {
-		// Path segments only — must match what object_permissions_check saw.
+		// Path segments only - must match what object_permissions_check saw.
 		$type = sanitize_key( $request->get_url_params()['type'] ?? '' );
 		$id   = absint( $request->get_url_params()['id'] ?? 0 );
 
@@ -446,7 +452,7 @@ final class TranslationsController extends RestController {
 		// Batch-prime the WP post cache for all translation IDs in one query.
 		// This eliminates N per-language get_post() queries. The source $id
 		// is always appended below, so the array is guaranteed non-empty by
-		// the time we prime — no empty() guard needed.
+		// the time we prime - no empty() guard needed.
 		$all_translation_ids = array_filter( array_map( 'intval', array_values( $translations ) ) );
 
 		if ( ! in_array( $id, $all_translation_ids, true ) ) {
@@ -489,6 +495,13 @@ final class TranslationsController extends RestController {
 			// Use pre-computed status (avoids duplicate DB lookups).
 			$status_obj = $status_cache[ $lang->slug ] ?? null;
 
+			// A sibling the user may not see: language and existence only.
+			if ( $translated_post && (int) $translated_id !== $id && ! \PerfLocale\Helper::user_can_view_object( (int) $translated_id ) ) {
+				$translated_id   = null;
+				$translated_post = null;
+				$status_obj      = null;
+			}
+
 			$result[] = [
 				'slug'            => $lang->slug,
 				// Canonical BCP 47 form, used by editor-sidebar.js for
@@ -508,9 +521,9 @@ final class TranslationsController extends RestController {
 				// written once when the translation is created and is not
 				// maintained afterwards, so a live translation can still read
 				// `empty`. Consumers that need to tell the operator whether a
-				// translation is actually IN USE — the Site Editor panel most of
+				// translation is actually IN USE - the Site Editor panel most of
 				// all, where a draft template is silently ignored and the source
-				// renders instead — need the post's own status.
+				// renders instead - need the post's own status.
 				'post_status'     => $translated_post ? $translated_post->post_status : null,
 				'edit_url'        => $translated_post ? ( \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id ) ?: null ) : null,
 			];
@@ -535,11 +548,18 @@ final class TranslationsController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function create_translation( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		// `id` is a path segment (must match object_permissions_check);
+		// `type` and `id` are path segments (must match object_permissions_check);
 		// target_lang / copy_content are legitimately body params.
+		$type        = $request->get_url_params()['type'] ?? '';
 		$id          = absint( $request->get_url_params()['id'] ?? 0 );
 		$target_lang = sanitize_key( $request->get_param( 'target_lang' ) ?? '' );
 		$copy        = (bool) $request->get_param( 'copy_content' );
+
+		// The translation is created from the post `id` names, so any other
+		// type would create a translation of a post the caller did not name.
+		if ( 'post' !== $type ) {
+			return $this->error( 'unsupported_type', __( 'Only post translations can be created here.', 'perflocale' ) );
+		}
 
 		// Verify the user can edit the source post.
 		if ( ! \PerfLocale\Helper::user_can_edit_object( $id ) ) {
@@ -681,11 +701,18 @@ final class TranslationsController extends RestController {
 	 */
 	public function update_translation( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
 		// Read the path segments explicitly: get_param() prefers GET over URL
-		// params, and `lang` is the plugin's own public routing query var — a
+		// params, and `lang` is the plugin's own public routing query var - a
 		// stray ?lang= on the request must not shadow the route and mutate a
 		// different language's translation.
+		$type = $request->get_url_params()['type'] ?? '';
 		$id   = absint( $request->get_url_params()['id'] ?? 0 );
 		$lang = sanitize_key( $request->get_url_params()['lang'] ?? '' );
+
+		// The route acts on the post translation graph only: `id` is read as a
+		// post id, so any other type would change a post the caller did not name.
+		if ( 'post' !== $type ) {
+			return $this->error( 'unsupported_type', __( 'Only post translations can be changed here.', 'perflocale' ) );
+		}
 
 		$manager       = $this->get_manager();
 		$translated_id = $manager->get_translation_id( $id, $lang );
@@ -720,7 +747,7 @@ final class TranslationsController extends RestController {
 			$requested_status = sanitize_key( $request->get_param( 'status' ) );
 			$status_obj       = get_post_status_object( $requested_status );
 
-			// An UNREGISTERED status is ignored, not rejected — the other
+			// An UNREGISTERED status is ignored, not rejected - the other
 			// fields in the same request still apply. That leniency is the
 			// documented contract; turning it into a 400 would be an API
 			// change. Nothing is written for an unknown status, so no
@@ -763,7 +790,7 @@ final class TranslationsController extends RestController {
 
 				// THE POLICY THIS ENDPOINT IMPLEMENTS: it sets EDITORIAL statuses
 				// only. Editorial means anything a person picks in a status
-				// dropdown — draft, pending, a workflow plugin's "in review", a
+				// dropdown - draft, pending, a workflow plugin's "in review", a
 				// custom public or private state. It does NOT mean the statuses
 				// core registers with `internal => true`, which are lifecycle
 				// bookkeeping and are never a legitimate target here.
@@ -791,7 +818,7 @@ final class TranslationsController extends RestController {
 				// Anything publicly visible, privately published, or scheduled is a
 				// publish action. `public` also covers custom statuses registered by
 				// other plugins, so this needs no allowlist. `draft` and `pending`
-				// are deliberately NOT gated here — drafting is the translator's job.
+				// are deliberately NOT gated here - drafting is the translator's job.
 				$is_publish_transition = ! empty( $status_obj->public )
 					|| ! empty( $status_obj->private )
 					|| 'future' === $requested_status;
@@ -810,16 +837,19 @@ final class TranslationsController extends RestController {
 
 		if ( ! empty( $update_data ) ) {
 			$update_data['ID'] = $translated_id;
+			// An empty page_template leaves the stored template alone: one the
+			// theme no longer has would stop the save before its hooks.
+			$update_data['page_template'] = '';
 			// wp_slash: wp_update_post() unslashes internally, and REST params arrive
-			// UNSLASHED — without this, every backslash in the submitted content
+			// UNSLASHED - without this, every backslash in the submitted content
 			// (Windows paths, LaTeX, code snippets) is silently stripped.
 			$result            = wp_update_post( wp_slash( $update_data ), true );
 
 			if ( is_wp_error( $result ) ) {
 				// A refusal caused by the CLIENT'S OWN status value is a 4xx, not
 				// a 5xx. The gate above admits any registered, non-internal
-				// editorial status — including the protected workflow states other
-				// plugins register, which is deliberate — but WordPress itself can
+				// editorial status - including the protected workflow states other
+				// plugins register, which is deliberate - but WordPress itself can
 				// still refuse one (a status hidden from both admin lists is the
 				// case that surfaced this). Reporting the server as broken for a
 				// value the caller chose sends clients into retry loops and buries
@@ -857,10 +887,16 @@ final class TranslationsController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function delete_translation( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		// Path segments only — see update_translation(): a stray ?lang= must
+		// Path segments only - see update_translation(): a stray ?lang= must
 		// never redirect a force-delete onto a different language's post.
+		$type = $request->get_url_params()['type'] ?? '';
 		$id   = absint( $request->get_url_params()['id'] ?? 0 );
 		$lang = sanitize_key( $request->get_url_params()['lang'] ?? '' );
+
+		// Post translations only: the delete below removes a post for good.
+		if ( 'post' !== $type ) {
+			return $this->error( 'unsupported_type', __( 'Only post translations can be changed here.', 'perflocale' ) );
+		}
 
 		$manager       = $this->get_manager();
 		$translated_id = $manager->get_translation_id( $id, $lang );

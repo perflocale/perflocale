@@ -72,7 +72,7 @@ final class MultiCurrency {
 		// and otherwise bypass convert_price(), so the customer would be charged
 		// base-currency NUMBERS relabelled into the per-language currency. Convert
 		// them so the whole order is consistent. (Cart fees added programmatically
-		// by other plugins stay in the base currency — there is no
+		// by other plugins stay in the base currency - there is no
 		// accumulation-safe filter to scale them; this is the documented limit.)
 		add_filter( 'woocommerce_package_rates', [ $this, 'convert_shipping_rates' ], 100 );
 		add_filter( 'woocommerce_cart_shipping_packages', [ $this, 'add_currency_to_shipping_packages' ] );
@@ -81,7 +81,7 @@ final class MultiCurrency {
 		// Minimum/maximum spend thresholds are validated by WC_Discounts in the
 		// BASE currency (get_minimum_amount()/get_maximum_amount()), so without
 		// converting them a "min spend 50 EUR" coupon compares 50 against a cart
-		// total already displayed/charged in the switched currency — rejecting
+		// total already displayed/charged in the switched currency - rejecting
 		// (or wrongly accepting) valid coupons. Unlike the discount amount these
 		// apply to percentage coupons too, so there is no discount-type gate.
 		add_filter( 'woocommerce_coupon_get_minimum_amount', [ $this, 'convert_coupon_threshold' ], 10, 2 );
@@ -250,7 +250,7 @@ final class MultiCurrency {
 	 * @return bool
 	 */
 	private static function is_zero_decimal_currency( string $code ): bool {
-		// ISO-4217 currencies with 0 minor units — same set WooCommerce treats
+		// ISO-4217 currencies with 0 minor units - same set WooCommerce treats
 		// as zero-decimal in get_currencies()/format.
 		static $zero = [
 			'BIF',
@@ -328,7 +328,7 @@ final class MultiCurrency {
 	 *
 	 * WC computes package rates fresh from the shipping-zone settings (base
 	 * currency) and caches the RESULT per package, so multiplying here applies
-	 * exactly once per (currency, package) — no accumulation. The currency is
+	 * exactly once per (currency, package) - no accumulation. The currency is
 	 * folded into the package hash by add_currency_to_shipping_packages() so a
 	 * language switch can't reuse the prior currency's cached rates.
 	 *
@@ -583,7 +583,7 @@ final class MultiCurrency {
 	 *
 	 * Reads from `perflocale_settings.wc_currencies` (the canonical
 	 * storage). Returns an empty array when the settings service is
-	 * unavailable — callers downstream gate on emptiness.
+	 * unavailable - callers downstream gate on emptiness.
 	 *
 	 * @return array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool, display: string, position: string}>
 	 */
@@ -602,7 +602,7 @@ final class MultiCurrency {
 				$stored = $from_settings;
 			}
 		} catch ( \Throwable $e ) {
-			// Settings service not available during early bootstrap —
+			// Settings service not available during early bootstrap -
 			// return empty so callers fall through to defaults.
 			unset( $e );
 		}
@@ -653,9 +653,9 @@ final class MultiCurrency {
 			}
 
 			// A language priced in the store's BASE currency is by definition
-			// 1:1. Sync skips those codes, so any rate sitting here is stale —
+			// 1:1. Sync skips those codes, so any rate sitting here is stale -
 			// left over from before the language was switched to the base, or
-			// baked into wc_currencies by a settings save — and would silently
+			// baked into wc_currencies by a settings save - and would silently
 			// mark every price up or down. Applied after the auto-rate merge so
 			// it overrides both sources.
 			if ( $base_currency !== '' && $code === $base_currency ) {

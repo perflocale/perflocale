@@ -30,7 +30,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * table-name length ≤ 64 (MySQL limit) even on multisite subsites whose
  * prefix runs up to 16 chars (e.g. wp_123456_).
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface HasSchema {
 

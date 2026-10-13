@@ -59,7 +59,7 @@ final class GoogleProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch(). Google's own docs recommend
 	 *   format=text for plain text: format=html returns entity-escaped
 	 *   output (&#39;, &amp;).
@@ -122,7 +122,7 @@ final class GoogleProvider extends AbstractProvider {
 	 * is per-character regardless, so batching is pure latency + cost-
 	 * overhead reduction (no per-call TCP/TLS handshake on each string).
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch().
 	 *
 	 * @throws \RuntimeException When Google Translate batch returns an unexpected response or all retries fail.

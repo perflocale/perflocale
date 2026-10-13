@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   genuinely shared across the entry points that call it. A new entry point
  *   calls admit() rather than carrying its own copy.
  *
- * IMPORTANT: admit() is not a query — it INCREMENTS both counters when it
+ * IMPORTANT: admit() is not a query - it INCREMENTS both counters when it
  * allows. Call it exactly once per translation request, at the point the
  * request is about to proceed.
  */
@@ -58,9 +58,9 @@ final class MtRateLimiter {
 	 *
 	 * Returns the stored window only when it is an array whose `count` is a
 	 * non-negative integer, whose `window_start` is a plausible integer
-	 * timestamp, and whose window has not expired. Everything else — a missing
+	 * timestamp, and whose window has not expired. Everything else - a missing
 	 * key, a string, an array, a boolean, a float, a negative or future
-	 * timestamp, an expired window — yields a fresh zeroed window.
+	 * timestamp, an expired window - yields a fresh zeroed window.
 	 *
 	 * Integer-typed on the way out so callers can compare and increment without
 	 * casting, and the cap is always checked against a real count.
@@ -129,7 +129,7 @@ final class MtRateLimiter {
 
 		/**
 		 * Filter the site-wide hourly MT request ceiling. Applies across
-		 * ALL users summed together — bounds the total provider-quota burn
+		 * ALL users summed together - bounds the total provider-quota burn
 		 * a hostile editor or compromised account can cause within an hour.
 		 * Set to 0 to disable the site cap (per-user cap still applies).
 		 *
@@ -139,7 +139,7 @@ final class MtRateLimiter {
 		$site_limit = (int) apply_filters( 'perflocale/mt/rate_limit_site', 5000 );
 
 		if ( $limit <= 0 && $site_limit <= 0 ) {
-			return null; // Both caps disabled — no throttling.
+			return null; // Both caps disabled - no throttling.
 		}
 
 		$window   = HOUR_IN_SECONDS;

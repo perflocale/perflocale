@@ -38,28 +38,28 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Each breaker's state lives in a per-key transient
  * `perflocale_breaker_{key}`. Transients give us free TTL handling and
  * automatic object-cache integration. Cache eviction "forgets" the
- * breaker state — that's acceptable: it just means one extra failed call
+ * breaker state - that's acceptable: it just means one extra failed call
  * before the breaker re-opens, never a stuck-open situation that
  * eats good traffic forever.
  *
  * ## Filters
  *
- *   - `perflocale/breaker/disabled` (bool, default false) — global
+ *   - `perflocale/breaker/disabled` (bool, default false) - global
  *     kill-switch. When true, `is_open()` always returns false and
  *     `record_failure()` is a no-op. Useful for ops to temporarily
  *     disable circuit-breaker behaviour while debugging.
  *
- *   - `perflocale/breaker/threshold/{key}` (int, default 5) — number of
+ *   - `perflocale/breaker/threshold/{key}` (int, default 5) - number of
  *     failures within the window that trips the breaker.
  *
- *   - `perflocale/breaker/window_seconds/{key}` (int, default 300) —
+ *   - `perflocale/breaker/window_seconds/{key}` (int, default 300) -
  *     how far back to count failures. A failure older than this resets
  *     the counter.
  *
- *   - `perflocale/breaker/cooldown_seconds/{key}` (int, default 300) —
+ *   - `perflocale/breaker/cooldown_seconds/{key}` (int, default 300) -
  *     OPEN duration before the breaker probes again.
  *
- *   - `perflocale/breaker/probe_lease_seconds` (int, key-aware) — how long
+ *   - `perflocale/breaker/probe_lease_seconds` (int, key-aware) - how long
  *     the single HALF_OPEN probe holds its turn. Defaults to the breaker's
  *     own cooldown, clamped to 30-300s.
  *
@@ -67,7 +67,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * variant (no `{key}` suffix) so site owners can tune all breakers at
  * once or just one specific breaker.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class Breaker {
 
@@ -87,7 +87,7 @@ final class Breaker {
 	private const PROBE_LOCK_PREFIX = 'breaker_probe_';
 
 	/**
-	 * Defaults — every per-key filter falls back to these if no per-key
+	 * Defaults - every per-key filter falls back to these if no per-key
 	 * value is wired up.
 	 */
 	private const DEFAULT_THRESHOLD = 5;
@@ -110,7 +110,7 @@ final class Breaker {
 	 * and returns false (allow the probe). The transition is persisted
 	 * so subsequent concurrent calls inside the same cooldown-expiry
 	 * window don't all see HALF_OPEN simultaneously and probe in
-	 * parallel — only the FIRST is_open() call after cooldown promotes
+	 * parallel - only the FIRST is_open() call after cooldown promotes
 	 * to HALF_OPEN; concurrent calls happening at the SAME microsecond
 	 * may all see the transition, which is an acceptable rare race
 	 * (worst case: N parallel probes against a degraded provider).
@@ -132,7 +132,7 @@ final class Breaker {
 		}
 
 		if ( $state['state'] === self::STATE_HALF_OPEN ) {
-			// Probe state — exactly ONE caller may go through. Everyone else
+			// Probe state - exactly ONE caller may go through. Everyone else
 			// keeps getting the refusal until that probe reports back.
 			return ! self::claim_probe( $key );
 		}
@@ -156,12 +156,12 @@ final class Breaker {
 	 * The state transient alone cannot enforce "one probe": every caller
 	 * that reads HALF_OPEN reads the same value and lets itself through, so
 	 * N concurrent callers all probed a provider that had just failed hard
-	 * enough to open the breaker — N paid calls, N timeouts, and N chances
+	 * enough to open the breaker - N paid calls, N timeouts, and N chances
 	 * to re-open it. The lease is a {@see Lock} row: `INSERT IGNORE` on the
 	 * options unique key, so InnoDB picks exactly one winner, and the TTL
 	 * means a probe that dies without reporting cannot wedge the breaker.
 	 *
-	 * Only reachable in HALF_OPEN — the CLOSED hot path returns before it,
+	 * Only reachable in HALF_OPEN - the CLOSED hot path returns before it,
 	 * so a healthy provider pays nothing for this.
 	 *
 	 * @param string $key Breaker key.
@@ -243,7 +243,7 @@ final class Breaker {
 		$now   = time();
 
 		if ( $state['state'] === self::STATE_HALF_OPEN ) {
-			// Probe failed — straight back to OPEN with fresh cooldown.
+			// Probe failed - straight back to OPEN with fresh cooldown.
 			self::write_state(
 				$key,
 				[
@@ -260,7 +260,7 @@ final class Breaker {
 		}
 
 		if ( $state['state'] === self::STATE_OPEN ) {
-			// Already open — bump last_failure for diagnostics but don't
+			// Already open - bump last_failure for diagnostics but don't
 			// extend the cooldown. is_open() guards against new calls
 			// reaching this path under normal use.
 			$state['last_failure'] = $now;
@@ -274,7 +274,7 @@ final class Breaker {
 		// hung/rate-limited provider costs 93-600s wall-clock PER failed
 		// call (retries × timeout + Retry-After sleeps), so anchoring the
 		// window at first_failure meant the counter reset before it could
-		// ever reach the threshold — the breaker could mathematically never
+		// ever reach the threshold - the breaker could mathematically never
 		// open for exactly the slow-failure storms it exists to stop.
 		// Consecutive failures each within one window of the previous keep
 		// accumulating; a success still clears the counter via
@@ -282,12 +282,12 @@ final class Breaker {
 		$window = self::window_seconds( $key );
 
 		// One atomic DB statement decides "new streak" vs "+1" and returns the
-		// committed count — never `++$state['failures']`. A provider outage
+		// committed count - never `++$state['failures']`. A provider outage
 		// fails many in-flight requests at once; deriving the count from the
 		// serialized state transient lost those concurrent increments (every
 		// worker read the same stale value and overwrote its peers), so the
 		// counter never reached the threshold and the breaker stayed CLOSED
-		// through the exact storm it exists to stop — the plugin kept spending
+		// through the exact storm it exists to stop - the plugin kept spending
 		// its full retry budget (up to 3 tries + backoff + Retry-After sleeps)
 		// against a dead endpoint.
 		$stale = ( 0 === $state['last_failure'] || ( $now - $state['last_failure'] ) > $window );
@@ -311,7 +311,7 @@ final class Breaker {
 			// decided by the database, but the state transient is a blind
 			// whole-array write. During a failure storm a caller whose count
 			// stayed below the threshold can land its write AFTER a peer that
-			// crossed it, replacing `open` with a stale `closed/n` — and the
+			// crossed it, replacing `open` with a stale `closed/n` - and the
 			// breaker that had just tripped starts forwarding calls again.
 			// The re-read in the elseif above stands this caller down when
 			// someone already opened it. Not a CAS (transients offer none),
@@ -327,7 +327,7 @@ final class Breaker {
 	 * Record a successful call. In CLOSED state this clears any
 	 * accumulated failure counter (so a single hiccup doesn't take the
 	 * breaker halfway to OPEN forever). In HALF_OPEN state this
-	 * transitions back to CLOSED — the probe worked, normal operation
+	 * transitions back to CLOSED - the probe worked, normal operation
 	 * resumes.
 	 *
 	 * @param string $key Breaker key.
@@ -341,7 +341,7 @@ final class Breaker {
 		$state = self::read_state( $key );
 
 		if ( $state['state'] === self::STATE_CLOSED && $state['failures'] === 0 ) {
-			// Nothing to clear — most calls hit this path. Skip the
+			// Nothing to clear - most calls hit this path. Skip the
 			// write to keep the hot path free of option_update traffic.
 			return;
 		}
@@ -353,7 +353,7 @@ final class Breaker {
 
 	/**
 	 * Force the breaker back to fully-closed state. Intended for the
-	 * Site Health "Reset" action — admin override after the operator
+	 * Site Health "Reset" action - admin override after the operator
 	 * has manually verified the downstream is healthy.
 	 *
 	 * @param string $key Breaker key.
@@ -374,10 +374,10 @@ final class Breaker {
 	 * active breakers regardless of where transient state actually
 	 * lives (wp_options on a vanilla install, Redis/Memcached when an
 	 * external object cache is wired up). Without this index, list_all()
-	 * scanning wp_options sees nothing on a Redis install — transients
+	 * scanning wp_options sees nothing on a Redis install - transients
 	 * bypass wp_options when an external cache is active.
 	 *
-	 * Stored as a flat sanitised-key array. Capped at 200 entries —
+	 * Stored as a flat sanitised-key array. Capped at 200 entries -
 	 * matches the previous wp_options scan cap and protects against
 	 * a misbehaving caller that creates one breaker per request.
 	 * autoload=no because list_all() is admin/Site-Health only.
@@ -390,8 +390,8 @@ final class Breaker {
 	 * when transient storage is opaque (Redis). Idempotent.
 	 *
 	 * Deliberately lock-free: this runs on the record_failure() hot path
-	 * (every external-service failure). The index is observability-only —
-	 * the breaker STATE lives in transients — and a lost write under a
+	 * (every external-service failure). The index is observability-only -
+	 * the breaker STATE lives in transients - and a lost write under a
 	 * concurrent first-failure self-heals on the next failure AND is
 	 * covered by list_all()'s wp_options fallback scan on non-Redis
 	 * installs. Serialising it isn't worth the per-failure DB round-trips.
@@ -406,7 +406,7 @@ final class Breaker {
 			return;
 		}
 
-		// Cap at 200 — same ceiling list_all() always honoured. Drop the
+		// Cap at 200 - same ceiling list_all() always honoured. Drop the
 		// oldest entry on overflow rather than refusing the write.
 		if ( count( $index ) >= 200 ) {
 			array_shift( $index );
@@ -460,7 +460,7 @@ final class Breaker {
 	 * Returns rows keyed by the breaker name (without the prefix), each
 	 * value the {@see status()} array. The scan is bounded: at most 200
 	 * rows. Real installs have a handful (one per provider, one per
-	 * webhook, etc.) — this cap protects against a misconfigured loop
+	 * webhook, etc.) - this cap protects against a misconfigured loop
 	 * that creates breakers per request.
 	 *
 	 * @return array<string, array<string, mixed>>
@@ -471,7 +471,7 @@ final class Breaker {
 		// {@see write_state()} call adds the key; {@see reset()} removes it.
 		// On a vanilla install transients also exist in wp_options, but
 		// on Redis/Memcached installs the index is the only enumeration
-		// source — a raw wp_options scan would return nothing.
+		// source - a raw wp_options scan would return nothing.
 		$index = (array) get_option( self::INDEX_OPTION, [] );
 
 		// Defensive secondary scan: any orphaned wp_options transient
@@ -556,7 +556,7 @@ final class Breaker {
 	 * statement, under the InnoDB row lock. Splitting them is what made the
 	 * breaker unreliable: whether to reset or increment was decided from the
 	 * state transient, so a burst of simultaneous failures all read
-	 * `last_failure = 0`, all concluded "new streak", and all wrote 1 —
+	 * `last_failure = 0`, all concluded "new streak", and all wrote 1 -
 	 * the counter never climbed to the threshold and the breaker stayed
 	 * CLOSED through the outage it exists to stop.
 	 *
@@ -580,7 +580,7 @@ final class Breaker {
 		if ( ! $wpdb instanceof \wpdb ) {
 			// No database (early boot, or a unit-test harness with stubbed
 			// storage): fall back to counting from the state transient. That
-			// is the pre-atomic behaviour — it can still lose a concurrent
+			// is the pre-atomic behaviour - it can still lose a concurrent
 			// increment, but a breaker that counts imperfectly beats one that
 			// never counts at all.
 			return $stale ? 1 : max( 1, $current + 1 );
@@ -612,7 +612,7 @@ final class Breaker {
 			)
 		);
 
-		// Read back through raw SQL — the row was written with raw SQL, so the
+		// Read back through raw SQL - the row was written with raw SQL, so the
 		// options cache still holds the pre-increment value.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$committed = (string) $wpdb->get_var(
@@ -686,7 +686,7 @@ final class Breaker {
 
 		if ( false === set_transient( self::TRANSIENT_PREFIX . $sanitized, $state, $ttl ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic; the breaker can't hold open across requests if its state won't persist.
-			error_log( 'PerfLocale Breaker: failed to persist circuit state for "' . $sanitized . '" — the breaker will not hold open across requests until the transient store recovers.' );
+			error_log( 'PerfLocale Breaker: failed to persist circuit state for "' . $sanitized . '" - the breaker will not hold open across requests until the transient store recovers.' );
 		}
 
 		self::index_add( $sanitized );
@@ -731,7 +731,7 @@ final class Breaker {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/breaker/cooldown_seconds returned %s — must be an int (seconds). Falling back to the plugin default.', 'perflocale' ),
+						__( 'A hook on perflocale/breaker/cooldown_seconds returned %s - must be an int (seconds). Falling back to the plugin default.', 'perflocale' ),
 						get_debug_type( $generic_raw )
 					)
 				),
@@ -747,7 +747,7 @@ final class Breaker {
 				esc_html(
 					sprintf(
 						/* translators: 1: breaker key, 2: offending return type. */
-						__( 'A hook on perflocale/breaker/cooldown_seconds/%1$s returned %2$s — must be an int (seconds). Falling back to the generic cooldown.', 'perflocale' ),
+						__( 'A hook on perflocale/breaker/cooldown_seconds/%1$s returned %2$s - must be an int (seconds). Falling back to the generic cooldown.', 'perflocale' ),
 						$key,
 						get_debug_type( $per_key_raw )
 					)

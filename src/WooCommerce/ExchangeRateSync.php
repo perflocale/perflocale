@@ -133,15 +133,90 @@ final class ExchangeRateSync {
 			add_action( 'admin_notices', [ $this, 'maybe_render_stale_notice' ] );
 		}
 
-		// Ensure the cron is scheduled on first load. Reconciliation costs an
-		// Action Scheduler table query when auto-sync is on (or an unschedule
-		// sweep when off), so it only runs in write contexts — admin, AJAX,
-		// cron, REST, WP-CLI. The authoritative scheduling paths are the
-		// settings-update hook above and activation; this boot-time call is a
-		// self-heal for lost schedules, and plain frontend GETs never pay it.
+		// The boot-time check of the schedule (reconcile_on_boot()) runs in
+		// write contexts only (admin, AJAX, cron, REST, WP-CLI), so plain
+		// frontend GETs never pay it, and at init priority 20, after
+		// action_scheduler_init: before it BackgroundEvents can neither see
+		// nor write Action Scheduler and picks WP-Cron. The authoritative
+		// scheduling path is the settings-update hook above. Action Scheduler
+		// 3.9.3+ fires action_scheduler_ensure_recurring_actions once a day,
+		// and that verifies its copy of the event.
 		if ( \PerfLocale\Helper::is_write_context() ) {
-			$this->ensure_scheduled();
+			if ( did_action( 'init' ) && ! doing_action( 'init' ) ) {
+				$this->reconcile_on_boot();
+			} else {
+				add_action(
+					'init',
+					function (): void {
+						$this->reconcile_on_boot();
+					},
+					20
+				);
+			}
+
+			add_action(
+				'action_scheduler_ensure_recurring_actions',
+				function (): void {
+					$this->ensure_scheduled();
+				}
+			);
 		}
+	}
+
+	/**
+	 * Check the schedule once per write-context boot.
+	 *
+	 * With auto-sync off a WP-Cron copy is cleared; an Action Scheduler copy
+	 * is removed by the settings save that turned auto-sync off
+	 * (maybe_reschedule()).
+	 *
+	 * With Action Scheduler as the engine only a WP-Cron copy is looked for,
+	 * in the cron option every request loads. Such a copy is a duplicate that
+	 * runs the sync a second time each interval. The Action Scheduler copy is
+	 * checked (one query) and scheduled if missing, and the WP-Cron copy is
+	 * cleared only once Action Scheduler holds the event: when Action
+	 * Scheduler refuses it, the WP-Cron copy keeps the sync running and the
+	 * next write-context boot tries again. With WP-Cron as the engine, a boot
+	 * that finds no WP-Cron copy runs ensure_scheduled(), which schedules the
+	 * event unless an engine holds it. While the event is where the engine
+	 * keeps it, this runs no query.
+	 *
+	 * @return void
+	 */
+	private function reconcile_on_boot(): void {
+		if ( ! (bool) $this->settings->get( 'wc_exchange_rate_auto', false ) ) {
+			wp_clear_scheduled_hook( self::CRON_HOOK );
+			return;
+		}
+
+		$wp_cron = wp_next_scheduled( self::CRON_HOOK );
+
+		if ( BackgroundEvents::is_action_scheduler_engine() ) {
+			if ( false === $wp_cron ) {
+				return;
+			}
+
+			// BackgroundEvents::is_scheduled() counts the WP-Cron copy too,
+			// so the check here asks Action Scheduler alone.
+			$held = BackgroundEvents::is_scheduled_in_action_scheduler( self::CRON_HOOK );
+
+			if ( ! $held ) {
+				$this->schedule_event();
+				$held = BackgroundEvents::is_scheduled_in_action_scheduler( self::CRON_HOOK );
+			}
+
+			if ( $held ) {
+				wp_clear_scheduled_hook( self::CRON_HOOK );
+			}
+
+			return;
+		}
+
+		if ( false !== $wp_cron ) {
+			return;
+		}
+
+		$this->ensure_scheduled();
 	}
 
 	/**
@@ -183,7 +258,7 @@ final class ExchangeRateSync {
 	 * from a provider registered through `exchange_rate_providers` and then
 	 * selected in settings, or straight from the `exchange_rates_fetched`
 	 * filter. No provider ships with the plugin, so a site that enables
-	 * auto-sync without wiring either seam can never complete a sync — and
+	 * auto-sync without wiring either seam can never complete a sync - and
 	 * must be told that, rather than sent to check WP-Cron.
 	 *
 	 * @return bool True when a sync could actually fetch something.
@@ -352,6 +427,16 @@ final class ExchangeRateSync {
 			return;
 		}
 
+		$this->schedule_event();
+	}
+
+	/**
+	 * Schedule the recurring sync at the configured interval, in the engine
+	 * BackgroundEvents picks.
+	 *
+	 * @return bool Whether the scheduler admitted the event.
+	 */
+	private function schedule_event(): bool {
 		$interval = (string) $this->settings->get( 'wc_exchange_rate_interval', 'daily' );
 
 		if ( ! isset( self::INTERVALS[ $interval ] ) ) {
@@ -362,7 +447,7 @@ final class ExchangeRateSync {
 		// when loaded (more reliable than WP-Cron on low-traffic stores -
 		// AS persists scheduled actions and catches up after missed runs).
 		// WP-Cron is used as fallback when AS isn't available.
-		BackgroundEvents::enqueue_recurring(
+		return BackgroundEvents::enqueue_recurring(
 			self::CRON_HOOK,
 			time(),
 			$this->interval_seconds( $interval ),
@@ -428,7 +513,7 @@ final class ExchangeRateSync {
 
 		// Circuit breaker: if recent fetches failed enough to trip the
 		// breaker, skip this tick. The breaker covers the FX provider
-		// only — config errors below (no API key, no targets) bypass
+		// only - config errors below (no API key, no targets) bypass
 		// it because those are operator misconfigurations that retrying
 		// won't fix. Default threshold of 3 failures opens for 5min
 		// (so a daily-cron sync only loses one tick per breaker cycle);
@@ -451,7 +536,7 @@ final class ExchangeRateSync {
 		// the upstream provider (double-billing the quota), both write
 		// to RATES_OPTION (race-free thanks to update_option being
 		// atomic, but wasteful), and both fire the synced action twice.
-		// 5min lock TTL is more than enough — the full fetch + parse
+		// 5min lock TTL is more than enough - the full fetch + parse
 		// path runs in well under a second even with a slow provider.
 		$result = \PerfLocale\Concurrency\Lock::with(
 			'exchange_rate_sync',
@@ -472,8 +557,8 @@ final class ExchangeRateSync {
 	 * RATES_OPTION is written wholesale, so before this a provider reply that
 	 * omitted a currency deleted that currency's rate: MultiCurrency reads it
 	 * with `isset()`, so the language silently fell back to an unconverted 1.0
-	 * price. Partial replies are ordinary — a free-tier plan, a per-symbol quota,
-	 * a currency temporarily unquoted — so the omission has to mean "unchanged",
+	 * price. Partial replies are ordinary - a free-tier plan, a per-symbol quota,
+	 * a currency temporarily unquoted - so the omission has to mean "unchanged",
 	 * not "gone".
 	 *
 	 * A carried rate is only kept when it is still provably meaningful:
@@ -499,9 +584,20 @@ final class ExchangeRateSync {
 	 * @return array<string, float> Fresh rates, plus any still-valid carried ones.
 	 */
 	private function carry_forward_rates( array $fresh, array $currencies, string $base_currency ): array {
+		// This runs under the sync lock, which leaves this request's
+		// `notoptions` as it is. When it lists either option, the reads below
+		// would return that absence even after another request's sync has
+		// created the row; dropping `notoptions` then sends them to the
+		// database. Otherwise nothing is dropped.
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		if ( is_array( $notoptions ) && ( isset( $notoptions[ self::LAST_SYNC_OPTION ] ) || isset( $notoptions[ self::RATES_OPTION ] ) ) ) {
+			wp_cache_delete( 'notoptions', 'options' );
+		}
+
 		$last = (array) get_option( self::LAST_SYNC_OPTION, [] );
 
-		// Base changed (or was never recorded) — discard the lot rather than
+		// Base changed (or was never recorded) - discard the lot rather than
 		// mixing two bases in one map, which would misprice silently.
 		if ( (string) ( $last['base'] ?? '' ) !== $base_currency ) {
 			return $fresh;
@@ -532,7 +628,7 @@ final class ExchangeRateSync {
 				continue;
 			}
 
-			// Repointed at a different currency since that rate was fetched —
+			// Repointed at a different currency since that rate was fetched -
 			// carrying it would price the language with another currency's rate.
 			if ( ! isset( $previous_codes[ $slug ] ) || (string) $previous_codes[ $slug ] !== $code ) {
 				continue;
@@ -590,7 +686,7 @@ final class ExchangeRateSync {
 		// provider registered through `exchange_rate_providers` (which gets
 		// this class's caching, breaker and key handling) OR straight from
 		// the `exchange_rates_fetched` filter. Only abort when NEITHER seam
-		// is wired — otherwise a site that supplies rates purely through the
+		// is wired - otherwise a site that supplies rates purely through the
 		// filter could never sync, because the filter runs further down.
 		$has_rate_filter = has_filter( 'perflocale/woocommerce/exchange_rates_fetched' );
 
@@ -647,7 +743,7 @@ final class ExchangeRateSync {
 
 			$has_non_base = true;
 
-			// Skip manual-rate currencies — the overrides loop below discards the
+			// Skip manual-rate currencies - the overrides loop below discards the
 			// provider feed for them anyway, so fetching them only burns provider
 			// quota (and risks a rate-limit lockout) for no benefit.
 			if ( empty( $config['manual_rate'] ) ) {
@@ -657,7 +753,7 @@ final class ExchangeRateSync {
 
 		if ( empty( $target_codes ) ) {
 			// $has_non_base distinguishes "every non-base currency is manual" (a
-			// valid config — nothing to fetch) from "no non-base currency at all".
+			// valid config - nothing to fetch) from "no non-base currency at all".
 			if ( $has_non_base ) {
 				// All rates are manual: record a successful sync so is_stale()
 				// doesn't warn forever, and skip the pointless provider request
@@ -697,7 +793,7 @@ final class ExchangeRateSync {
 
 		if ( empty( $rates ) ) {
 			$this->log_sync_error( 'No rates returned from ' . ( $provider['name'] ?? ( $provider_id !== '' ? $provider_id : 'the exchange_rates_fetched filter' ) ) );
-			// Provider failure — feed the breaker so a persistently-broken
+			// Provider failure - feed the breaker so a persistently-broken
 			// provider trips after the configured threshold.
 			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'fetch_empty' );
 			return [];
@@ -740,7 +836,7 @@ final class ExchangeRateSync {
 
 			// Rates come from a site-registered provider or filter, so they are
 			// arbitrary input. A bare (float) cast turns 'unavailable' into 0.0
-			// and '4,2513' into 4.0 — both of which then silently price every
+			// and '4,2513' into 4.0 - both of which then silently price every
 			// product wrong (0, or off by ~100x). Reject anything non-numeric
 			// or non-positive instead of persisting it.
 			if ( ! is_scalar( $raw ) || ! is_numeric( $raw ) ) {
@@ -775,7 +871,7 @@ final class ExchangeRateSync {
 			);
 		}
 
-		// Every target currency came back invalid — that is a provider fault,
+		// Every target currency came back invalid - that is a provider fault,
 		// not a success, so feed the breaker rather than recording a clean run.
 		if ( $rate_overrides === [] && $rejected !== [] ) {
 			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'fetch_invalid' );
@@ -791,7 +887,7 @@ final class ExchangeRateSync {
 			// A provider reply that omits some currencies used to WIPE them:
 			// this option was overwritten wholesale, so a language whose code
 			// was missing from one response silently lost its rate and fell
-			// back to 1.0 — every price in that language shown unconverted.
+			// back to 1.0 - every price in that language shown unconverted.
 			// Carry the untouched ones forward instead.
 			$rate_overrides = $this->carry_forward_rates( $rate_overrides, $currencies, $base_currency );
 
@@ -915,12 +1011,12 @@ final class ExchangeRateSync {
 			error_log( 'PerfLocale Exchange Rate Sync: ' . $message ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
 
-		// Store last error for display in the admin UI. Not autoloaded — it's
+		// Store last error for display in the admin UI. Not autoloaded - it's
 		// read only on the admin settings screen, never on the front end.
 		//
 		// ⚠️ WRITE ONLY WHEN THE MESSAGE IS NEW OR HAS CHANGED.
 		//
-		// The plugin ships NO exchange-rate providers — `self::PROVIDERS` is empty
+		// The plugin ships NO exchange-rate providers - `self::PROVIDERS` is empty
 		// by design, because rates come from the
 		// `perflocale/woocommerce/exchange_rate_providers` or
 		// `..._exchange_rates_fetched` filters. A site that has wired neither
@@ -928,11 +1024,11 @@ final class ExchangeRateSync {
 		// run and this option was being rewritten each time: a recurring write
 		// recording a condition that never changes. It also broke any
 		// "this request wrote nothing" assertion whenever cron happened to fire
-		// during the measured window — child HTTP requests do not inherit
+		// during the measured window - child HTTP requests do not inherit
 		// DISABLE_WP_CRON.
 		//
 		// Scheduling is deliberately NOT touched. Cron is only re-armed by
-		// maybe_reschedule() on `perflocale/settings/updated` — a SETTINGS save —
+		// maybe_reschedule() on `perflocale/settings/updated` - a SETTINGS save -
 		// but wiring a rate source is a CODE change that fires no settings update.
 		// Unscheduling on "no source configured" would therefore leave a developer
 		// who correctly registers the filter with a silently dead sync, which is a

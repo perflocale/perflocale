@@ -215,7 +215,7 @@ a.perflocale-badge:focus {
 
 /* Up/down reorder buttons. Hidden by default: on a pointer device the drag
    handle above is the affordance, and showing both would be noise. CSS is the
-   right switch here rather than PHP — wp_is_mobile() reads the user agent,
+   right switch here rather than PHP - wp_is_mobile() reads the user agent,
    which says nothing about the width the page is actually being rendered at. */
 .perflocale-lang-item__move {
 	display: none;
@@ -481,15 +481,20 @@ a.perflocale-mb__status:hover {
 /* ==========================================================================
  Strings Page
  ========================================================================== */
-/* Pagination — matches WP admin style. Scoped to PerfLocale list pages
+/* Pagination - matches WP admin style. Scoped to PerfLocale list pages
    so the styling doesn't leak into core list tables (Posts, Pages, etc.).
-   Add new list-page wrap classes here when creating one — every selector
+   Add new list-page wrap classes here when creating one - every selector
    in this block needs the same comma-separated entry. */
 .perflocale-strings-page .tablenav{
 	margin: 12px 0;
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
+
+	/* Core gives every .tablenav a fixed 32px height above 782px. This row
+	   wraps, so its height follows its content: a wrapped pagination line
+	   stays inside the row instead of covering the table below it. */
+	height: auto;
 
 	/* The mobile block below stacks this row at 782px, but between there and
 	   roughly 900px the filters and the pagination still do not fit side by
@@ -647,7 +652,7 @@ a.perflocale-mb__status:hover {
    opposite the bulkactions block on the left. */
 .perflocale-str-toolbar__count--inline {
 	/* Plain inline-block so the text node between </strong> and "items"
-	   keeps its whitespace — inline-flex collapsed it into "34items". */
+	   keeps its whitespace - inline-flex collapsed it into "34items". */
 	display: inline-block;
 	margin-left: auto;
 	font-size: 14px;
@@ -740,11 +745,11 @@ a.perflocale-mb__status:hover {
 
 .perflocale-str-mt-toolbar__status.is-error   { color: #d63638; }
 
-/* Shared empty-state look — applied as a <td class="perflocale-empty-row">
+/* Shared empty-state look - applied as a <td class="perflocale-empty-row">
    inside a table tbody (Translations). The two
    classes resolve to the same visual so the empty state is consistent
    across every admin list page. Text aligns left (matching the rest of
-   the table column-content) rather than centered — center-aligned text
+   the table column-content) rather than centered - center-aligned text
    inside a wide table makes the message look like a floating tooltip
    detached from the table grid. */
 .perflocale-str-empty {
@@ -768,7 +773,7 @@ a.perflocale-mb__status:hover {
 }
 
 /*
- * Language column header layout — shared by StringsPage (per-string
+ * Language column header layout - shared by StringsPage (per-string
  * translation matrix) and TranslationsPage (per-post translation status
  * grid). Renders inline: flag + native-name on a single row. Native
  * name truncates with ellipsis when the column is narrow, so the
@@ -1041,12 +1046,12 @@ a.perflocale-mb__status:hover {
  a button lines up correctly on WP 6.x's Fresh admin scheme but drops the
  icon low on WP 7.0's Modern scheme (Modern raised the button line-height).
 
- inline-flex + align-items:center is theme-agnostic — alignment depends on
+ inline-flex + align-items:center is theme-agnostic - alignment depends on
  the flex container's cross-axis, not the inherited text baseline. The size
  modifiers (--md, --sm) downscale the default 20×20 dashicon to the sizes
  we want inside admin buttons; without them the icon overpowers the text.
  ========================================================================== */
-/* Chained selectors lift specificity to 0,2,0 — matching WP core's
+/* Chained selectors lift specificity to 0,2,0 - matching WP core's
  * `.wrap .page-title-action` and `.wrap .add-new-h2`, which would
  * otherwise win the cascade and keep `display: inline-block`. The
  * three-pronged selector covers every host element we attach to: the
@@ -1065,7 +1070,7 @@ a.perflocale-btn-icon,
 /* WP 7's `.wp-core-ui .button .dashicons { line-height: 1.9 }` rule has
  * specificity 0,3,0 and would otherwise inflate our flex-aligned icon
  * boxes to ~30 px (1.9 × 16 px font), shoving the icon off the baseline.
- * Chaining our class twice + the element selector gives 0,4,0 — beating
+ * Chaining our class twice + the element selector gives 0,4,0 - beating
  * WP's rule on raw specificity, no `!important` needed. The chained
  * class is a no-op when the element only carries it once. */
 .perflocale-btn-icon.perflocale-btn-icon .dashicons.dashicons {
@@ -1150,7 +1155,7 @@ a.perflocale-btn-icon,
 	font-weight: 700;
 	letter-spacing: 0.02em;
 	/* Multi-character codes like EN-GB, ZH-CN, PT-BR were wrapping
-	   inside the pill on narrow editor sidebars — `nowrap` keeps them
+	   inside the pill on narrow editor sidebars - `nowrap` keeps them
 	   on one line and `flex-shrink: 0` stops the surrounding flex row
 	   from squeezing the pill below its content width. */
 	white-space: nowrap;
@@ -1163,7 +1168,7 @@ a.perflocale-btn-icon,
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
-	/* Flex shrinkability — without `min-width: 0` on a flex item, the
+	/* Flex shrinkability - without `min-width: 0` on a flex item, the
 	   content's intrinsic width acts as the floor and ellipsis never
 	   kicks in. With it, long names like "English (United Kingdom)"
 	   gracefully truncate instead of pushing the slug pill to wrap. */
@@ -1290,7 +1295,7 @@ a.perflocale-panel-status:hover {
 	line-height: 1;
 }
 
-/* Tone palette — pastel fill + saturated text for AA contrast. */
+/* Tone palette - pastel fill + saturated text for AA contrast. */
 .perflocale-status-badge--empty        { background: #f0f0f1; color: #50575e; }
 
 .perflocale-status-badge--published    { background: #edfaef; color: #00623a; }
@@ -1313,7 +1318,7 @@ a.perflocale-status-badge--pending:focus      { background: #f8e9b8; }
 a.perflocale-status-badge--needs-update:hover,
 a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 
-/* Empty-state row — shared across every admin list table (Assignments,
+/* Empty-state row - shared across every admin list table (Assignments,
    Translations). Matches the .perflocale-str-empty div style
    above for visual consistency. */
 .perflocale-empty-row {
@@ -1347,7 +1352,7 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 /* ============================================================
    Bulk-actions UI (Translations admin page).
    Uses HTML5 form="..." attribute to bind checkboxes/buttons
-   to a form declared elsewhere in the document — keeps per-row
+   to a form declared elsewhere in the document - keeps per-row
    action <form>s from being illegally nested inside a wrapper.
    ============================================================ */
 .perflocale-bulkactions {
@@ -1519,7 +1524,7 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 	outline-offset: -2px;
 }
 
-/* PerfLocale data tables on mobile — keeps all cells visible (overrides
+/* PerfLocale data tables on mobile - keeps all cells visible (overrides
  * WP's hide-non-primary mobile rule) and relies on the
  * `.perflocale-table-responsive` wrapper for horizontal scroll. The
  * `:not([style*="display:none"])` qualifier preserves the inline
@@ -1527,7 +1532,7 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
  * columns. */
 @media screen and (max-width: 782px) {
 	/* Restore the ROWS first. WordPress sets `.wp-list-table tr { display: flex }`
-	 * at this width, and a flex container blockifies its children — so the
+	 * at this width, and a flex container blockifies its children - so the
 	 * `table-cell` below could never take effect while the row stayed flex, and
 	 * every cell rendered as a full-width block. That is what turned these
 	 * tables into a vertical stack of unlabelled fragments on a phone: the
@@ -1597,14 +1602,14 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 			font-size: 13px;
 		}
 
-	/* ⚠️ `normal`, NOT `nowrap`, and this is the rule that decides it — a
+	/* ⚠️ `normal`, NOT `nowrap`, and this is the rule that decides it - a
 	   lower-specificity attempt in admin-translations.css lost to this one and
 	   looked like it had no effect at all. Status labels are TRANSLATED: sized
 	   for English, "Needs Update" already clipped, and a German equivalent
 	   clips much harder. A two-line pill is better than a truncated one.
 	   The label needs BOTH releases below, because a flex item will not shrink
 	   under its min-content width and min-content for wrapped text is its
-	   longest word — measured, that word alone was wider than the cell. */
+	   longest word - measured, that word alone was wider than the cell. */
 	.perflocale-table-responsive .perflocale-translations-table .perflocale-status-badge {
 			min-width: 0;
 			max-width: 100%;
@@ -1743,7 +1748,7 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 
 	/* The pinned columns cover the start edge of the scrollport, and the
 	   browser parks a newly focused control exactly there when it scrolls it
-	   into view — so tabbing back into a status badge or a translation input
+	   into view - so tabbing back into a status badge or a translation input
 	   that is off to the left lands it completely underneath the pinned band,
 	   focused but invisible. WCAG 2.2 SC 2.4.11. 208px clears the widest band
 	   (32 checkbox + 168 identity) with a little air; scroll-margin sits on the
@@ -1834,7 +1839,7 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
  Rendered by Admin\PluginNav on every plugin page except Settings (which
  keeps its own per-section strip; those rules live above, scoped to
  .perflocale-settings). Same underline treatment, but this strip stays
- visible on mobile — wrapping down to 481px, scrolling below that — so
+ visible on mobile - wrapping down to 481px, scrolling below that - so
  its sticky offset tracks the admin bar: 32px desktop, 46px <=782px, 0
  below 600px where core un-fixes the bar.
  ========================================================================== */
@@ -1852,7 +1857,7 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 
 /* An OPEN popover must clear the sticky strip above.
    The strip is z-index 10 and the Export/Import panels were z-index 10 too, so
-   the winner was decided by DOM order — and the strip is rendered AFTER the page
+   the winner was decided by DOM order - and the strip is rendered AFTER the page
    header holding the buttons, so it painted over the open panel and hid those
    controls behind the tabs.
    Lifting the <details> rather than the panel keeps the summary and its panel in
@@ -1955,7 +1960,7 @@ details[data-perflocale-popover][open] {
 			padding: 10px 10px;
 
 			/* The scroll container clips the -1px overhang, which would cut
-			 * the active underline to a sliver — keep tabs inside the box. */
+			 * the active underline to a sliver - keep tabs inside the box. */
 			margin-bottom: 0;
 		}
 }
@@ -1969,7 +1974,7 @@ details[data-perflocale-popover][open] {
    COULD NOT BE MADE RESPONSIVE: an inline `style` beats any stylesheet rule
    short of !important, so no media query could move it. Measured before the
    move, the 270px Export panel opened at x=202 on a 360px phone and ran
-   **112px off the right edge** (82px at 390px) — the panel in the bug report.
+   **112px off the right edge** (82px at 390px) - the panel in the bug report.
    The Import panel escaped only by luck, being anchored further left. */
 .perflocale-popover {
 	position: relative;
@@ -1996,7 +2001,7 @@ details[data-perflocale-popover][open] {
 	min-width: 280px;
 }
 
-/* Phone — anchoring to the summary cannot work: the button sits wherever the
+/* Phone - anchoring to the summary cannot work: the button sits wherever the
    header flex line puts it, so any fixed panel width will overhang on one side
    or the other. Pin the panel to the VIEWPORT instead and let it span the
    available width. `position: fixed` needs no knowledge of the anchor, which is
@@ -2004,7 +2009,7 @@ details[data-perflocale-popover][open] {
    header because the header is at the top of the page on a phone.
 
    ⚠️ `left`/`right` with `width: auto` (rather than `width: 100%`) is what makes
-   both edges honoured — `100%` would resolve against the containing block and
+   both edges honoured - `100%` would resolve against the containing block and
    reintroduce the overhang. */
 @media screen and (max-width: 600px) {
 	.perflocale-popover[open] > .perflocale-popover__panel,

@@ -70,7 +70,7 @@
 }
 
 /* Action row sits beneath the chip/overwrite row. Status text on the
-   left, buttons on the right — single flex row with a wrap fallback. */
+   left, buttons on the right - single flex row with a wrap fallback. */
 .perflocale-str-mt-toolbar__action-row {
 	display: flex;
 	flex-wrap: wrap;
@@ -88,7 +88,7 @@
 	flex: 0 0 auto;
 }
 
-/* Check-column tightening — WP defaults give it 2.2em which feels
+/* Check-column tightening - WP defaults give it 2.2em which feels
    roomy next to the dense Strings table. */
 .perflocale-str-edit-table .check-column {
 	width: 32px;
@@ -196,7 +196,7 @@
 /* Per-cell overlay icons sitting in the top-right of an input wrap. The
    needs-update warning sits at right:32px (just to the left of the
    expand-editor button); the AI quality score pill sits to the left of
-   needs-update when both are visible — the `right:52px` modifier on the
+   needs-update when both are visible - the `right:52px` modifier on the
    element wins over the default `right:32px`. */
 .perflocale-str-needs-update {
 	position: absolute;
@@ -429,7 +429,7 @@
 	font-weight: 600;
 }
 
-/* The leading icon dot — pure CSS, scales with chip color via currentColor. */
+/* The leading icon dot - pure CSS, scales with chip color via currentColor. */
 .perflocale-str-modal__ph-icon {
 	display: inline-block;
 	width: 10px;
@@ -516,7 +516,7 @@
 }
 
 /* Apply button picks up a small warning dot when validation flags an
-   issue. The dot is purely informational — clicking still allows save
+   issue. The dot is purely informational - clicking still allows save
    after a confirm dialog (placeholder collapses are sometimes valid). */
 .perflocale-str-modal__footer .button-primary.has-warning {
 	position: relative;

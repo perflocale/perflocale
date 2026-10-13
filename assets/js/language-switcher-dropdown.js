@@ -1,5 +1,5 @@
 /**
- * PerfLocale Language Switcher — dropdown keyboard, click, and event
+ * PerfLocale Language Switcher - dropdown keyboard, click, and event
  * handling.
  *
  * Public events fired on the switcher `<nav>` (all bubble):

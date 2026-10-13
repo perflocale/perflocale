@@ -26,6 +26,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class SettingsPage {
 
 	/**
+	 * Machine-translation key settings rendered as password inputs: never
+	 * printed into the form, and kept when the input is submitted empty.
+	 */
+	private const MT_SECRET_KEYS = [ 'mt_deepl_api_key', 'mt_google_api_key', 'mt_microsoft_api_key', 'mt_libre_api_key', 'mt_agency_api_key' ];
+
+	/**
 	 * Plugin settings.
 	 *
 	 * @var Settings
@@ -124,7 +130,7 @@ final class SettingsPage {
 		// Conditional-field show/hide for the auto-generated addon
 		// settings subtab. Enqueued unconditionally on the Settings page
 		// because the user can navigate between subtabs without a page
-		// reload (well — currently they do reload, but enqueuing here
+		// reload (well - currently they do reload, but enqueuing here
 		// keeps the asset available wherever the form might render). The
 		// script no-ops gracefully when no addon form is present.
 		wp_enqueue_script(
@@ -227,7 +233,7 @@ final class SettingsPage {
 
 			<?php
 			// Addon-settings saves (Settings → Addons → <addon> subtab) redirect
-			// back HERE with perflocale_msg — the flash renderer on the Addons
+			// back HERE with perflocale_msg - the flash renderer on the Addons
 			// LIST page never runs for this screen, so without this block a
 			// successful save showed no feedback at all.
 			// phpcs:disable WordPress.Security.NonceVerification.Recommended -- read-only flash params on a redirect.
@@ -392,7 +398,7 @@ final class SettingsPage {
 	 *   - Stored rows of languages that are not active have no row on the
 	 *     form and are kept (see merge_language_map()).
 	 *
-	 * Returned shape: `[ slug => "AA,BB,CC" ]` — same shape the existing
+	 * Returned shape: `[ slug => "AA,BB,CC" ]` - same shape the existing
 	 * runtime expects.
 	 *
 	 * @param mixed $input Raw POSTed value (expected: assoc array).
@@ -429,7 +435,7 @@ final class SettingsPage {
 			}
 
 			// Drop slugs the user can't actually have configured (active
-			// list is the truth — no mapping for inactive / removed
+			// list is the truth - no mapping for inactive / removed
 			// languages is meaningful).
 			if ( ! isset( $active_slugs[ $slug ] ) ) {
 				continue;
@@ -663,7 +669,7 @@ final class SettingsPage {
 		// before reaching this method, but we re-check here so static
 		// analysers (Plugin Check, wporg-pluginchecker) see a nonce gate
 		// adjacent to the $_POST reads instead of relying on the caller.
-		// Removing this would still be safe — defense in depth, not the
+		// Removing this would still be safe - defense in depth, not the
 		// authoritative gate.
 		$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
 		if ( ! wp_verify_nonce( $nonce, 'perflocale_save_settings' ) ) {
@@ -707,7 +713,7 @@ final class SettingsPage {
 
 							foreach ( $raw as $slug => $row ) {
 								// Keys are language slugs and arrive from the POST
-								// body too — sanitize them, not just the row values.
+								// body too - sanitize them, not just the row values.
 								// Settings::sanitize_language_fallbacks() re-checks
 								// on write; this keeps intake clean as well.
 								$slug = sanitize_key( (string) $slug );
@@ -748,7 +754,7 @@ final class SettingsPage {
 
 						foreach ( $raw as $slug => $v ) {
 							// Keys are language slugs and arrive from the POST
-							// body too — sanitize them, not just the values.
+							// body too - sanitize them, not just the values.
 							$slug = sanitize_key( (string) $slug );
 
 							if ( $slug === '' ) {
@@ -772,7 +778,7 @@ final class SettingsPage {
 				),
 				// Rendered only inside `if ( edge_integration_enabled() )`, so on a
 				// save with the edge worker off the checkbox was never printed and
-				// isset() reads false — clearing a setting the operator could not
+				// isset() reads false - clearing a setting the operator could not
 				// see. Mirror the renderer's gate and keep the stored value.
 				'redirect_edge_hint_enabled' => $this->settings->edge_integration_enabled()
 					? isset( $_POST['redirect_edge_hint_enabled'] )
@@ -811,7 +817,7 @@ final class SettingsPage {
 			],
 			// The renderer returns early when machine translation is OFF
 			// (render_machine_translation_tab), so the enabling save posts
-			// ONLY mt_enabled — every other control below was never printed.
+			// ONLY mt_enabled - every other control below was never printed.
 			// Extracting them anyway turned "not rendered" into "operator
 			// cleared it": mt_auto_translate_languages in particular became
 			// the explicit no-language scope, so auto-translate silently did
@@ -842,7 +848,7 @@ final class SettingsPage {
 					$default = $router->get_default_language();
 					$active  = [];
 
-					// The default language is the MT source, never a target —
+					// The default language is the MT source, never a target -
 					// the UI renders no checkbox for it, so it must not count
 					// toward the "every target checked" comparison below.
 					foreach ( $router->get_active_languages() as $l ) {
@@ -854,8 +860,8 @@ final class SettingsPage {
 					$subset = array_values( array_intersect( $posted, $active ) );
 
 					// All targets unchecked = auto-MT nowhere. [] is taken
-					// (it means "all"), so store the reserved sentinel — a
-					// scope that matches no language — instead of silently
+					// (it means "all"), so store the reserved sentinel - a
+					// scope that matches no language - instead of silently
 					// flipping the admin's "none" back into "all".
 					if ( $subset === [] && $active !== [] ) {
 						return [ \PerfLocale\Settings::MT_SCOPE_NONE ];
@@ -903,7 +909,7 @@ final class SettingsPage {
 				// Validate against the theme's REGISTERED locations so a
 				// crafted POST can't persist arbitrary strings.
 				// Whitelist against the theme's REGISTERED location keys
-				// VERBATIM — core stores nav-menu slugs case-sensitively
+				// VERBATIM - core stores nav-menu slugs case-sensitively
 				// (a theme may register `headerMenu`), and sanitize_key()
 				// would lowercase them so the array_intersect never matched,
 				// silently dropping the operator's choice. The intersect is
@@ -927,7 +933,7 @@ final class SettingsPage {
 				'cache_object_enabled'    => isset( $_POST['cache_object_enabled'] ),
 				'cache_preload_slugs'     => isset( $_POST['cache_preload_slugs'] ),
 				'string_translation_mode' => isset( $_POST['string_translation_mode'] ) ? sanitize_text_field( wp_unslash( $_POST['string_translation_mode'] ) ) : 'files',
-				// Background-processing settings — whitelist values explicitly
+				// Background-processing settings - whitelist values explicitly
 				// so an attacker can't post arbitrary keys that would survive
 				// sanitisation only because Settings::DEFAULTS[$key] is a string.
 				'background_processing'   => isset( $_POST['background_processing'] ) && in_array( $_POST['background_processing'], [ 'auto', 'always', 'never' ], true )
@@ -945,7 +951,7 @@ final class SettingsPage {
 				// registered job types (self::background_job_types()) so an
 				// attacker can't POST arbitrary keys that would persist via
 				// the array setting. Zero or missing values drop back to the
-				// job's default (we don't store zero — that would force every
+				// job's default (we don't store zero - that would force every
 				// dispatch async).
 				'background_thresholds'   => $this->extract_background_thresholds(),
 				'background_paused'       => isset( $_POST['background_paused'] ),
@@ -978,6 +984,15 @@ final class SettingsPage {
 			default => $values         = [],
 		};
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
+
+		// The key inputs render empty, so an empty one keeps the stored key.
+		if ( $tab === 'machine-translation' ) {
+			foreach ( self::MT_SECRET_KEYS as $secret ) {
+				if ( isset( $values[ $secret ] ) && $values[ $secret ] === '' ) {
+					unset( $values[ $secret ] );
+				}
+			}
+		}
 
 		// Allow external addons to provide their sanitized values.
 		if ( empty( $values ) ) {
@@ -1013,7 +1028,7 @@ final class SettingsPage {
 		// listing-page sync was actually for.
 		$subtabs['machine-translation'] = __( 'Machine Translation', 'perflocale' );
 
-		// WooCommerce subtab — needs the WC plugin active AND the
+		// WooCommerce subtab - needs the WC plugin active AND the
 		// WooCommerce addon not in the operator-controlled disabled
 		// list. Disabling the addon hides the subtab so the operator
 		// isn't configuring features that won't run.
@@ -1040,7 +1055,7 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Auto-generated subtab IDs — one per registered addon that exposes
+	 * Auto-generated subtab IDs - one per registered addon that exposes
 	 * user-editable fields. Used by {@see get_addon_subtabs()} to merge
 	 * registry-derived subtabs into the static list, AND by
 	 * {@see render_addons_tab()} to route those subtabs to the auto-
@@ -1062,7 +1077,7 @@ final class SettingsPage {
 			return [];
 		}
 
-		// Skip addons the operator has explicitly disabled — their
+		// Skip addons the operator has explicitly disabled - their
 		// settings subtab would just confuse: "why am I configuring an
 		// addon that isn't running?" When the user re-enables, the
 		// subtab comes back automatically.
@@ -1158,7 +1173,7 @@ final class SettingsPage {
 			return;
 		}
 
-		// A subtab was named in the URL but is not available — say so instead of
+		// A subtab was named in the URL but is not available - say so instead of
 		// silently showing a different one, which reads as "my settings vanished".
 		if ( $requested !== '' && $requested !== $subtab ) {
 			?>
@@ -1167,7 +1182,7 @@ final class SettingsPage {
 					<?php
 					printf(
 						/* translators: 1: requested addon subtab slug, 2: label of the subtab shown instead */
-						esc_html__( 'There are no settings for %1$s on this site — it is turned off or not installed. Showing %2$s instead.', 'perflocale' ),
+						esc_html__( 'There are no settings for %1$s on this site - it is turned off or not installed. Showing %2$s instead.', 'perflocale' ),
 						'<code>' . esc_html( $requested ) . '</code>',
 						'<strong>' . esc_html( (string) ( $subtabs[ $subtab ] ?? $subtab ) ) . '</strong>'
 					);
@@ -1262,13 +1277,13 @@ final class SettingsPage {
 	 * addon class. The addon owns the entire bespoke UI (pages section,
 	 * products section, emails section, per-language exchange-rate
 	 * matrix, auto-sync controls, provider-conditional API keys,
-	 * sync-now button) — SettingsPage just routes the subtab to it.
+	 * sync-now button) - SettingsPage just routes the subtab to it.
 	 *
 	 * The match() in render_addons_tab() calls this for the
 	 * 'woocommerce' subtab. WC isn't part of the auto-addon-subtab
 	 * pipeline because its data still lives in `perflocale_settings.wc_*`
 	 * keys (read by ExchangeRateSync, EmailTranslation, MultiCurrency,
-	 * the REST APIs, etc.) — so it shares the main settings form's
+	 * the REST APIs, etc.) - so it shares the main settings form's
 	 * save handler instead of admin-post.php → handle_save_addon_settings.
 	 *
 	 * Falls back to a "WooCommerce not active" notice when the WC plugin
@@ -1291,7 +1306,7 @@ final class SettingsPage {
 			}
 		}
 
-		// WC addon isn't registered (WooCommerce plugin not active) —
+		// WC addon isn't registered (WooCommerce plugin not active) -
 		// render a "not active" notice in the subtab body.
 		?>
 		<tr>
@@ -1453,10 +1468,10 @@ final class SettingsPage {
 						<span class="description">(example.com/page?lang=en)</span>
 					</label>
 					<p class="description">
-						<?php echo esc_html__( 'Query parameter mode works with every permalink structure — including Plain — and every server. The default language always uses clean URLs without the parameter.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Query parameter mode works with every permalink structure - including Plain - and every server. The default language always uses clean URLs without the parameter.', 'perflocale' ); ?>
 					</p>
 					<p class="description" style="margin-top:6px;">
-						<?php echo esc_html__( 'Subdirectory needs no DNS work and concentrates SEO value on one hostname; subdomain and domain-per-language require DNS, a TLS certificate, and — on multisite — every language hostname registered as a site.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Subdirectory needs no DNS work and concentrates SEO value on one hostname; subdomain and domain-per-language require DNS, a TLS certificate, and - on multisite - every language hostname registered as a site.', 'perflocale' ); ?>
 						<a href="https://perflocale.com/docs/url-routing/#url-structure" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the four URL modes', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 				</fieldset>
@@ -1576,7 +1591,7 @@ final class SettingsPage {
 
 		<?php
 		// Redirect-priority editor. The drag-to-reorder UI is shown only when
-		// 2+ redirect mechanisms are enabled — with a single mechanism there is
+		// 2+ redirect mechanisms are enabled - with a single mechanism there is
 		// nothing to order. When exactly one is on, the saved order is still
 		// round-tripped via hidden inputs so re-enabling a second mechanism
 		// later restores the admin's chosen order instead of reverting it.
@@ -1729,7 +1744,7 @@ final class SettingsPage {
 					echo wp_kses_post(
 						sprintf(
 							/* translators: %s: default language name (e.g. "English (US)"). */
-							__( 'The default language (<strong>%s</strong>) is intentionally not mappable here &mdash; visitors whose country doesn&rsquo;t match any other mapping already stay on the default, so an explicit mapping for it would over-redirect.', 'perflocale' ),
+							__( 'The default language (<strong>%s</strong>) is intentionally not mappable here - visitors whose country doesn&rsquo;t match any other mapping already stay on the default, so an explicit mapping for it would over-redirect.', 'perflocale' ),
 							esc_html( $default_label )
 						)
 					);
@@ -1741,7 +1756,7 @@ final class SettingsPage {
 					echo wp_kses_post(
 						sprintf(
 							/* translators: 1: default language name (e.g. "Arabic"), 2: default language locale (e.g. "ar"). */
-							__( 'Your default language (<strong>%1$s</strong>, locale <code>%2$s</code>) doesn&rsquo;t carry a country in its locale &mdash; that&rsquo;s fine. Visitors from any country that isn&rsquo;t mapped to a different language above will stay on the default automatically. <strong>You don&rsquo;t need a country code for the default</strong>; the default IS the catch-all.', 'perflocale' ),
+							__( 'Your default language (<strong>%1$s</strong>, locale <code>%2$s</code>) doesn&rsquo;t carry a country in its locale - that&rsquo;s fine. Visitors from any country that isn&rsquo;t mapped to a different language above will stay on the default automatically. <strong>You don&rsquo;t need a country code for the default</strong>; the default IS the catch-all.', 'perflocale' ),
 							esc_html( $default_label ),
 							esc_html( $default_locale !== '' ? $default_locale : $geo_default_slug )
 						)
@@ -1762,7 +1777,7 @@ final class SettingsPage {
 						// Locale-derived suggestion: `en_US` → `US`. Used only
 						// as the input PLACEHOLDER (so the user sees what
 						// would be auto-derived at runtime if they leave the
-						// row blank) — never pre-filled into the value, so
+						// row blank) - never pre-filled into the value, so
 						// the saved option stays small and the auto-derive
 						// path is the single source of truth.
 						$locale_parts     = explode( '_', (string) ( $gl->locale ?? '' ) );
@@ -1911,7 +1926,7 @@ final class SettingsPage {
 			<td>
 				<label>
 					<input type="checkbox" name="disable_language_cookie" value="1" <?php checked( (bool) $this->settings->get( 'disable_language_cookie' ) ); ?>>
-					<?php echo esc_html__( 'Cookieless mode — never set the language-preference cookie (perflocale_lang).', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Cookieless mode - never set the language-preference cookie (perflocale_lang).', 'perflocale' ); ?>
 				</label>
 				<p class="description"><?php echo esc_html__( 'For strict GDPR / cookie-consent setups. Language routing keeps working (it is URL-based); you lose "remember my language" on non-prefixed URLs, and the automatic first-visit redirects (browser language, GeoIP, edge hint) do not run, because without the cookie they would redirect the visitor again on every page. A consent plugin can also gate the cookie via the perflocale/privacy/consent_given filter.', 'perflocale' ); ?></p>
 			</td>
@@ -1961,7 +1976,7 @@ final class SettingsPage {
 	 * ⭐ WHY ONE CHECKBOX, NOT TWO. They are two storage types behind ONE
 	 * feature. A block theme's page layout is a `wp_template` and its header is
 	 * a `wp_template_part`, so enabling either alone produces a HALF-translated
-	 * page — the body in German above an English header — which reads as a bug
+	 * page - the body in German above an English header - which reads as a bug
 	 * rather than as a setting the operator chose. Offering "Templates" and
 	 * "Template Parts" as separate checkboxes also names WordPress's storage
 	 * rather than the thing the operator is looking for, which is full site
@@ -1996,13 +2011,13 @@ final class SettingsPage {
 	private function translation_tab_post_types(): array {
 		$all_post_types = get_post_types( [ 'public' => true ], 'objects' );
 
-		// ⚠️ `attachment` is public, so it lands in that list — but PerfLocale
+		// ⚠️ `attachment` is public, so it lands in that list - but PerfLocale
 		// does not translate media by DUPLICATING attachment posts. Media is
 		// translated in place by {@see \PerfLocale\Translation\MediaTranslationManager},
 		// which stores per-language alt text, captions and descriptions as
 		// language-suffixed meta on the SAME attachment. The plugin already
-		// refuses the type everywhere it matters — `get_site_translate_post_types()`
-		// skips it explicitly (Settings.php:1237) — so offering the checkbox
+		// refuses the type everywhere it matters - `get_site_translate_post_types()`
+		// skips it explicitly (Settings.php:1237) - so offering the checkbox
 		// only let an operator turn on something no code implements, while
 		// language-scoping every front-end attachment query as a side effect.
 		// Removing it takes no feature away: media translation is unaffected.
@@ -2012,7 +2027,7 @@ final class SettingsPage {
 		//
 		// ⚠️ This is a curated allowlist, NOT get_post_types( [ 'public' => false ] ).
 		// That call returns `revision`, `nav_menu_item`, `wp_global_styles`,
-		// `oembed_cache` and friends — checkboxes that would either do nothing or
+		// `oembed_cache` and friends - checkboxes that would either do nothing or
 		// do harm.
 		//
 		// A type earns its place here only once something rewrites or serves its
@@ -2028,7 +2043,7 @@ final class SettingsPage {
 		// ⚠️ THE HISTORY MATTERS, because a previous attempt shipped a checkbox
 		// that BROKE working templates. Marking the type translatable made
 		// `PostQueryFilter` hide the customised template on every non-default
-		// language — it was dropped for being LINKED, not for being TRANSLATED,
+		// language - it was dropped for being LINKED, not for being TRANSLATED,
 		// so it happened even with no translation present, and core silently
 		// fell back to the theme FILE. That is closed by
 		// `PostQueryFilter::never_scoped_post_types()`, proven with a control
@@ -2051,7 +2066,7 @@ final class SettingsPage {
 			$non_public_object = get_post_type_object( (string) $non_public_name );
 
 			// Skip anything not registered on this site, and anything that is
-			// actually public — it is already in the list above and must not
+			// actually public - it is already in the list above and must not
 			// appear twice with two checkboxes writing the same key.
 			if ( $non_public_object && empty( $non_public_object->public ) ) {
 				$non_public_types[ $non_public_object->name ] = $non_public_object;
@@ -2364,7 +2379,7 @@ final class SettingsPage {
 					// list above: "Patterns" and "Posts" are not comparable choices,
 					// and a flat list invites an operator to tick something whose
 					// consequences they cannot see. Collapsed by default so the
-					// common case — the operator only wants posts and pages — is
+					// common case - the operator only wants posts and pages - is
 					// unchanged.
 					?>
 					<details class="perflocale-settings__advanced-types">
@@ -2375,7 +2390,7 @@ final class SettingsPage {
 						<fieldset>
 							<?php
 							foreach ( $non_public_types as $npt ) :
-								// The two block-template types share ONE control below —
+								// The two block-template types share ONE control below -
 								// see pair_block_template_types().
 								if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $npt->name ) ) {
 									continue;
@@ -2387,11 +2402,11 @@ final class SettingsPage {
 								</label>
 								<?php if ( 'wp_block' === $npt->name ) : ?>
 									<span class="description">
-										&mdash; <?php echo esc_html__( 'synced patterns; each language gets its own copy, and pages using the pattern show the right one automatically.', 'perflocale' ); ?>
+										- <?php echo esc_html__( 'synced patterns; each language gets its own copy, and pages using the pattern show the right one automatically.', 'perflocale' ); ?>
 									</span>
 								<?php elseif ( 'wp_navigation' === $npt->name ) : ?>
 									<span class="description">
-										&mdash; <?php echo esc_html__( 'menus in block themes. Link addresses are already translated without this; switch it on to translate the menu labels too.', 'perflocale' ); ?>
+										- <?php echo esc_html__( 'menus in block themes. Link addresses are already translated without this; switch it on to translate the menu labels too.', 'perflocale' ); ?>
 									</span>
 								<?php endif; ?>
 								<br>
@@ -2418,7 +2433,7 @@ final class SettingsPage {
 		// ⭐ ITS OWN ROW, NOT BURIED UNDER "Advanced content types".
 		//
 		// Full site editing is not an obscure storage type an expert goes
-		// looking for — on a block theme it is where the header, footer and
+		// looking for - on a block theme it is where the header, footer and
 		// page layouts live, so it is the FIRST thing many operators will want
 		// after posts and pages. Hiding it behind a collapsed <details> meant
 		// the feature was effectively undiscoverable, which is most of the
@@ -2440,10 +2455,10 @@ final class SettingsPage {
 						<?php echo esc_html__( 'Translate block theme templates and template parts', 'perflocale' ); ?>
 					</label>
 					<p class="description">
-						<?php echo esc_html__( 'Text you typed directly into a block theme\'s templates and template parts — a header, footer, or 404 page. Both are switched on together: translating a page layout without its header leaves a half-translated page.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Text you typed directly into a block theme\'s templates and template parts - a header, footer, or 404 page. Both are switched on together: translating a page layout without its header leaves a half-translated page.', 'perflocale' ); ?>
 					</p>
 					<p class="description">
-						<?php echo esc_html__( 'Templates you have not customised are unaffected — their text already follows the theme\'s own translations. The Site Editor always shows and saves the original.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Templates you have not customised are unaffected - their text already follows the theme\'s own translations. The Site Editor always shows and saves the original.', 'perflocale' ); ?>
 					</p>
 				</fieldset>
 			</td>
@@ -2496,7 +2511,7 @@ final class SettingsPage {
 					<input type="checkbox" name="sync_term_hierarchy" value="1" <?php checked( $sync_term_hierarchy ); ?>>
 					<?php echo esc_html__( 'Keep category/term parent structure identical across languages (parents mapped to each language\'s own translated terms).', 'perflocale' ); ?>
 				</label>
-				<p class="description"><?php echo esc_html__( 'Uncheck to allow deliberately different category trees per language — e.g. a smaller, flatter catalog in one market. Term names, slugs, and descriptions are always translator-owned.', 'perflocale' ); ?></p>
+				<p class="description"><?php echo esc_html__( 'Uncheck to allow deliberately different category trees per language - e.g. a smaller, flatter catalog in one market. Term names, slugs, and descriptions are always translator-owned.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 		<tr>
@@ -2507,7 +2522,7 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Allow post and term slugs to be translated per language.', 'perflocale' ); ?>
 				</label>
 				<p class="description" style="margin-top:6px;">
-					<?php echo esc_html__( 'Term archives use the clean per-language slug PerfLocale records — German stays at /de/tutorials/ rather than the unique tutorials-de the database needed — but the plugin does not translate slugs for you.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Term archives use the clean per-language slug PerfLocale records - German stays at /de/tutorials/ rather than the unique tutorials-de the database needed - but the plugin does not translate slugs for you.', 'perflocale' ); ?>
 					<a href="https://perflocale.com/docs/url-routing/#translated-slugs" target="_blank" rel="noopener"><?php echo esc_html__( 'How display slugs work', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
@@ -2680,7 +2695,7 @@ final class SettingsPage {
 					<option value="libretranslate" <?php selected( $mt_provider, 'libretranslate' ); ?>><?php echo esc_html__( 'LibreTranslate', 'perflocale' ); ?></option>
 					<option value="external_agency" <?php selected( $mt_provider, 'external_agency' ); ?>><?php echo esc_html__( 'External Agency', 'perflocale' ); ?></option>
 					<?php
-					// WP 7.0 AI Client option — show only when the host has the API
+					// WP 7.0 AI Client option - show only when the host has the API
 					// loaded (or has plugged in a custom resolver via
 					// perflocale/mt/wp_ai_client_resolver). Falls back to listing it
 					// disabled so users on older WP versions can see the option but
@@ -2770,7 +2785,7 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Show the bulk MT-translate toolbar on the Strings admin page.', 'perflocale' ); ?>
 				</label>
 				<p class="description">
-					<?php echo esc_html__( 'Lets translators MT-translate selected, filtered, or every string in a single dispatch (up to 5,000 strings per run). Disable to keep MT available for per-row edits only — useful when controlling provider costs.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Lets translators MT-translate selected, filtered, or every string in a single dispatch (up to 5,000 strings per run). Disable to keep MT available for per-row edits only - useful when controlling provider costs.', 'perflocale' ); ?>
 				</p>
 			</td>
 		</tr>
@@ -2795,7 +2810,7 @@ final class SettingsPage {
 				<input type="number" id="perflocale-mt-char-limit" name="mt_monthly_char_limit" value="<?php echo absint( $char_limit ); ?>" class="regular-text" min="0" step="1000">
 				<p class="description"><?php echo esc_html__( 'Maximum characters to send to the translation API per month. Set to 0 for unlimited.', 'perflocale' ); ?></p>
 				<p class="description" style="margin-top:6px;">
-					<?php echo esc_html__( 'This is the only ceiling on what your translation provider can bill you in a month — 0 means unlimited, which with auto-translate on publish leaves the spend uncapped.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'This is the only ceiling on what your translation provider can bill you in a month - 0 means unlimited, which with auto-translate on publish leaves the spend uncapped.', 'perflocale' ); ?>
 					<a href="https://perflocale.com/docs/machine-translation/#char-limit" target="_blank" rel="noopener"><?php echo esc_html__( 'What happens when the cap is reached', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 			</td>
@@ -3093,7 +3108,7 @@ final class SettingsPage {
 		$arrow_style       = (string) $this->settings->get( 'switcher_arrow_style' );
 		$trigger_format    = (string) $this->settings->get( 'switcher_trigger_format' );
 		$auto_insert       = (bool) $this->settings->get( 'switcher_auto_insert', true );
-		// Stored verbatim (case-sensitive) — nav-menu location slugs can be
+		// Stored verbatim (case-sensitive) - nav-menu location slugs can be
 		// mixed-case; lowercasing here would break the checked() match.
 		$menu_locations    = array_map( 'strval', (array) $this->settings->get( 'switcher_menu_locations', [] ) );
 		?>
@@ -3336,7 +3351,7 @@ final class SettingsPage {
 						<?php echo esc_html__( 'Loads translations from the database on demand via gettext filter. No file generation needed - useful for development or read-only file systems.', 'perflocale' ); ?>
 					</p>
 					<p class="description" style="margin-top:6px;">
-						<?php echo esc_html__( 'Keep Files unless your filesystem is read-only or the translations directory is not writable — that is the only reason to choose Database.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Keep Files unless your filesystem is read-only or the translations directory is not writable - that is the only reason to choose Database.', 'perflocale' ); ?>
 						<a href="https://perflocale.com/docs/production-tuning/#string-mode" target="_blank" rel="noopener"><?php echo esc_html__( 'Which storage mode to use', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 				</fieldset>
@@ -3443,7 +3458,7 @@ final class SettingsPage {
 						<?php esc_html_e( 'Never', 'perflocale' ); ?>
 					</label>
 					<p class="description" style="margin: 0 0 0 24px;">
-						<?php esc_html_e( 'Always run inline. Not recommended on large sites — long operations can time out.', 'perflocale' ); ?>
+						<?php esc_html_e( 'Always run inline. Not recommended on large sites - long operations can time out.', 'perflocale' ); ?>
 					</p>
 				</fieldset>
 				<p class="description" style="margin-top: 10px;">
@@ -3466,7 +3481,7 @@ final class SettingsPage {
 				<fieldset>
 					<label style="display:block; margin-bottom:6px;">
 						<input type="radio" name="background_engine" value="auto" <?php checked( $engine, 'auto' ); ?>>
-						<?php esc_html_e( 'Auto — use Action Scheduler', 'perflocale' ); ?>
+						<?php esc_html_e( 'Auto - use Action Scheduler', 'perflocale' ); ?>
 					</label>
 					<p class="description" style="margin: 0 0 10px 24px;">
 						<?php
@@ -3532,7 +3547,7 @@ final class SettingsPage {
 				// selector, and this table sits inside a form-table cell), so
 				// the three columns stack and the header row is stranded above
 				// them as three loose words. Rather than fight that, the CSS
-				// leans into it and turns each row into a card — but a stacked
+				// leans into it and turns each row into a card - but a stacked
 				// cell needs to say what it is, and a CSS `content:` string
 				// cannot be translated. Hence the attribute.
 				$bg_label_default  = __( 'Default', 'perflocale' );
@@ -3617,7 +3632,7 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Also let them create and machine-translate content', 'perflocale' ); ?>
 				</label>
 				<p class="description" style="margin-top:6px;">
-					<?php echo esc_html__( 'Adds two abilities that WRITE: create a translation, and machine-translate a post. Machine translation spends your provider quota, so an agent could use it without you seeing the request. Off by default for that reason — turn it on if you are deliberately automating translation through an agent.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Adds two abilities that WRITE: create a translation, and machine-translate a post. Machine translation spends your provider quota, so an agent could use it without you seeing the request. Off by default for that reason - turn it on if you are deliberately automating translation through an agent.', 'perflocale' ); ?>
 				</p>
 			</td>
 		</tr>
@@ -3688,7 +3703,7 @@ final class SettingsPage {
 					<input type="checkbox" name="delete_data_on_uninstall" value="1" <?php checked( (bool) $this->settings->get( 'delete_data_on_uninstall' ) ); ?>>
 					<?php echo esc_html__( 'Delete all plugin data when uninstalling', 'perflocale' ); ?>
 				</label>
-				<p class="description"><?php echo wp_kses( __( 'When enabled, deleting the plugin will remove all translation data, languages, settings, and database tables. When disabled, your data is preserved for reinstallation. This is a one-shot teardown setting — toggle it before deleting the plugin from <em>Plugins → Installed Plugins</em>.', 'perflocale' ), [ 'em' => [] ] ); ?></p>
+				<p class="description"><?php echo wp_kses( __( 'When enabled, deleting the plugin will remove all translation data, languages, settings, and database tables. When disabled, your data is preserved for reinstallation. This is a one-shot teardown setting - toggle it before deleting the plugin from <em>Plugins → Installed Plugins</em>.', 'perflocale' ), [ 'em' => [] ] ); ?></p>
 			</td>
 		</tr>
 		<?php
@@ -3942,7 +3957,7 @@ final class SettingsPage {
 		<tr>
 			<th scope="row"><?php echo esc_html__( 'Import', 'perflocale' ); ?></th>
 			<td>
-				<p class="description" style="margin-top:0;"><?php echo esc_html__( 'Restore data from a PerfLocale JSON export file. Large imports run in the background — track progress under PerfLocale → Jobs.', 'perflocale' ); ?></p>
+				<p class="description" style="margin-top:0;"><?php echo esc_html__( 'Restore data from a PerfLocale JSON export file. Large imports run in the background - track progress under PerfLocale → Jobs.', 'perflocale' ); ?></p>
 
 				<form method="post" enctype="multipart/form-data" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=export-import' ) ); ?>" style="margin-top:8px;">
 					<?php wp_nonce_field( 'perflocale_import_data' ); ?>
@@ -3982,10 +3997,10 @@ final class SettingsPage {
 
 					<p class="description" style="margin-top:0;">
 						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale tables before loading, so anything the uploaded bundle does not carry is gone, and applies the file\'s settings, add-on settings, add-on list and roles. Merge only adds rows and never changes this site\'s configuration.', 'perflocale' ); ?>
-						<a href="https://perflocale.com/docs/export-import/#merge-vs-replace" target="_blank" rel="noopener"><?php echo esc_html__( 'Merge vs Replace — what Replace clears', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+						<a href="https://perflocale.com/docs/export-import/#merge-vs-replace" target="_blank" rel="noopener"><?php echo esc_html__( 'Merge vs Replace - what Replace clears', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 					<p class="description" style="margin-top:0;">
-						<?php echo esc_html__( 'Tip: re-importing the same backup in Merge mode creates fresh translation_groups rows (the table has no natural key) — the matching links de-duplicate via their object_lang (type, object_id, language_id) UNIQUE key, so the duplicate groups are linked to nothing and are swept at the end of every Merge import. For deterministic re-imports use Replace mode.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Tip: re-importing the same backup in Merge mode creates fresh translation_groups rows (the table has no natural key) - the matching links de-duplicate via their object_lang (type, object_id, language_id) UNIQUE key, so the duplicate groups are linked to nothing and are swept at the end of every Merge import. For deterministic re-imports use Replace mode.', 'perflocale' ); ?>
 					</p>
 
 					<fieldset style="margin:12px 0;">
@@ -4104,8 +4119,13 @@ final class SettingsPage {
 	 * When the value comes from getenv() or a defined PHP constant, the
 	 * input is disabled and shows the source so the admin knows their edit
 	 * here would be ignored anyway. Both sources share one canonical name
-	 * (see Settings::CONSTANT_MAP) — the env var and the constant use the
+	 * (see Settings::CONSTANT_MAP) - the env var and the constant use the
 	 * same uppercase string (e.g. PERFLOCALE_DEEPL_API_KEY).
+	 *
+	 * A key stored in the database is never printed: the password input
+	 * renders empty, with a masked placeholder when a key is stored, and an
+	 * empty submission keeps the stored key ({@see self::MT_SECRET_KEYS}).
+	 * A `url` field prints its value.
 	 *
 	 * @param string $key Setting key (e.g., 'mt_deepl_api_key').
 	 * @param string $id HTML input ID.
@@ -4142,10 +4162,12 @@ final class SettingsPage {
 			</p>
 			<?php
 		} else {
-			$input_type = $type === 'url' ? 'url' : 'password';
-			$escaped    = $type === 'url' ? esc_url( $value ) : esc_attr( $value );
+			$is_url      = $type === 'url';
+			$input_type  = $is_url ? 'url' : 'password';
+			$escaped     = $is_url ? esc_url( $value ) : '';
+			$placeholder = ! $is_url && $value !== '' ? str_repeat( '*', 20 ) : '';
 			?>
-			<input type="<?php echo esc_attr( $input_type ); ?>" id="<?php echo esc_attr( $id ); ?>" name="<?php echo esc_attr( $key ); ?>" value="<?php echo esc_attr( $escaped ); ?>" class="regular-text" autocomplete="off">
+			<input type="<?php echo esc_attr( $input_type ); ?>" id="<?php echo esc_attr( $id ); ?>" name="<?php echo esc_attr( $key ); ?>" value="<?php echo esc_attr( $escaped ); ?>" placeholder="<?php echo esc_attr( $placeholder ); ?>" class="regular-text" autocomplete="off">
 			<?php if ( $const_name !== '' ) : ?>
 				<p class="description">
 					<?php

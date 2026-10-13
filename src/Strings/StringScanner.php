@@ -43,7 +43,7 @@ final class StringScanner {
 	 */
 	private const PATTERNS = [
 		// Matches the simple i18n functions: __, _e, esc_html__, esc_attr__, esc_html_e, esc_attr_e.
-		// Also matches single-argument calls — domain defaults to 'default'.
+		// Also matches single-argument calls - domain defaults to 'default'.
 		'simple'         => '/\b(?:__|_e|esc_html__|esc_attr__|esc_html_e|esc_attr_e)\s*\(\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*(?:,\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*)?\)/s',
 
 		// Matches the context-aware i18n functions: _x, _ex, esc_html_x, esc_attr_x.
@@ -126,15 +126,15 @@ final class StringScanner {
 		// ⚠️ Exclusions are relative to the REQUESTED ROOT, never the absolute
 		// path. The regex is a segment match like `/(?:vendor|tests|test|build)/`,
 		// and matching it against the full realpath means an installation that
-		// merely LIVES below a directory of that name — `/var/www/test/`,
-		// `/srv/build/`, a checkout under `dist/` — has every one of its files
+		// merely LIVES below a directory of that name - `/var/www/test/`,
+		// `/srv/build/`, a checkout under `dist/` - has every one of its files
 		// excluded and scans silently return "found 0": a readable file yields
 		// a string through scan_file() while scan() on its own directory finds
 		// nothing.
 		//
-		// Anchoring to the scan root keeps every intentional exclusion working —
+		// Anchoring to the scan root keeps every intentional exclusion working -
 		// a `vendor/` or `tests/` directory INSIDE the tree being scanned is still
-		// skipped — while removing a rule nobody meant: that the name of a parent
+		// skipped - while removing a rule nobody meant: that the name of a parent
 		// directory you did not ask to scan can disable scanning entirely.
 		$scan_root = realpath( $directory );
 		$scan_root = false === $scan_root ? '' : rtrim( $scan_root, '/' );
@@ -158,7 +158,7 @@ final class StringScanner {
 		 * bigger PHP memory peaks. Clamped to 50–5000.
 		 *
 		 * Note: the 'batch_size' argument to scan() takes precedence over
-		 * this filter — when the caller explicitly passes a batch size,
+		 * this filter - when the caller explicitly passes a batch size,
 		 * that's respected. The filter only affects callers using the
 		 * default (e.g. StringScanJob).
 		 *
@@ -209,7 +209,7 @@ final class StringScanner {
 				}
 
 				// Skip excluded paths (single regex check instead of loop),
-				// measured from the scan root — see $scan_root above.
+				// measured from the scan root - see $scan_root above.
 				if ( '' !== $exclusion_regex ) {
 					$relative = $filepath;
 
@@ -333,7 +333,7 @@ final class StringScanner {
 		$strings       = [];
 		$line_offsets  = $this->build_line_offsets( $content );
 
-		// Simple i18n functions — __, _e, esc_html__, esc_attr__, esc_html_e, esc_attr_e.
+		// Simple i18n functions - __, _e, esc_html__, esc_attr__, esc_html_e, esc_attr_e.
 		if ( preg_match_all( self::PATTERNS['simple'], $content, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE ) ) {
 			foreach ( $matches as $match ) {
 				$text         = $this->decode_captured( $match, 1, 2 );
@@ -358,7 +358,7 @@ final class StringScanner {
 			}
 		}
 
-		// Context-aware i18n functions — _x, _ex, esc_html_x, esc_attr_x.
+		// Context-aware i18n functions - _x, _ex, esc_html_x, esc_attr_x.
 		if ( preg_match_all( self::PATTERNS['context'], $content, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE ) ) {
 			foreach ( $matches as $match ) {
 				$text         = $this->decode_captured( $match, 1, 2 );
@@ -502,9 +502,9 @@ final class StringScanner {
 	 * The regexes capture a single-quoted body in one group and a
 	 * double-quoted body in the next; exactly one participates per argument
 	 * (offset !== -1 under PREG_OFFSET_CAPTURE). A blanket stripslashes()
-	 * mis-decodes both styles — it strips the backslash off escape sequences
+	 * mis-decodes both styles - it strips the backslash off escape sequences
 	 * a single-quoted literal keeps verbatim, and turns a double-quoted "\n"
-	 * into "n" instead of a newline — so the stored "original" no longer
+	 * into "n" instead of a newline - so the stored "original" no longer
 	 * hashes the same as the text gettext receives at runtime.
 	 *
 	 * @param array<int, array{0: string, 1: int}> $match  One PREG_SET_ORDER match.
@@ -585,7 +585,7 @@ final class StringScanner {
 	 * Encode a Unicode codepoint as UTF-8 without mbstring.
 	 *
 	 * Replaces `mb_chr()`, which WordPress only polyfills from 7.1 and which
-	 * is absent entirely on a PHP build without the mbstring extension — this
+	 * is absent entirely on a PHP build without the mbstring extension - this
 	 * plugin supports WordPress 6.4+, so depending on it would break string
 	 * scanning on older or minimal hosts. The plugin already avoids `mb_chr()`
 	 * the same way in {@see \PerfLocale\Helper::country_code_to_emoji()}.
@@ -688,7 +688,7 @@ final class StringScanner {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/strings/scanner/excluded_paths returned %s — must be an array of path-prefix strings. Falling back to the default exclusion list.', 'perflocale' ),
+						__( 'A hook on perflocale/strings/scanner/excluded_paths returned %s - must be an array of path-prefix strings. Falling back to the default exclusion list.', 'perflocale' ),
 						get_debug_type( $excluded )
 					)
 				),

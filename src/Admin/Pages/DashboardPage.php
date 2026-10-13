@@ -160,7 +160,7 @@ final class DashboardPage {
 	}
 
 	/**
-	 * Overview — languages, content counts, and overall progress as
+	 * Overview - languages, content counts, and overall progress as
 	 * native form-table rows (the Settings page's label/value layout).
 	 *
 	 * @param array<int, object> $languages          Active languages.
@@ -280,7 +280,7 @@ final class DashboardPage {
 	}
 
 	/**
-	 * Translation Progress — one native table per post type with a
+	 * Translation Progress - one native table per post type with a
 	 * per-language completion row.
 	 *
 	 * @param array<int, string>                                 $post_types        Translatable post types.
@@ -309,7 +309,7 @@ final class DashboardPage {
 		<?php
 
 		// Two different reasons land here and they need different advice. The
-		// message used to say "no published content" in both cases — so a site
+		// message used to say "no published content" in both cases - so a site
 		// with plenty of posts but only one language was told to go and publish
 		// something, which would not have helped and was not true.
 		if ( $non_default_langs === [] ) {
@@ -393,10 +393,10 @@ final class DashboardPage {
 										<span class="perflocale-dash-table__pct"><?php echo esc_html( $pct . '%' ); ?></span>
 									</div>
 								</td>
-								<td class="perflocale-dash-table__num"><?php echo $translated > 0 ? esc_html( number_format_i18n( $translated ) ) : '<span class="perflocale-dash-table__zero">&#8212;</span>'; ?></td>
-								<td class="perflocale-dash-table__num"><?php echo $drafts > 0 ? esc_html( number_format_i18n( $drafts ) ) : '<span class="perflocale-dash-table__zero">&#8212;</span>'; ?></td>
-								<td class="perflocale-dash-table__num"><?php echo $pending > 0 ? '<span class="perflocale-dash-table__attn">' . esc_html( number_format_i18n( $pending ) ) . '</span>' : '<span class="perflocale-dash-table__zero">&#8212;</span>'; ?></td>
-								<td class="perflocale-dash-table__num"><?php echo $outdated > 0 ? '<span class="perflocale-dash-table__warn">' . esc_html( number_format_i18n( $outdated ) ) . '</span>' : '<span class="perflocale-dash-table__zero">&#8212;</span>'; ?></td>
+								<td class="perflocale-dash-table__num"><?php echo $translated > 0 ? esc_html( number_format_i18n( $translated ) ) : '<span class="perflocale-dash-table__zero">0</span>'; ?></td>
+								<td class="perflocale-dash-table__num"><?php echo $drafts > 0 ? esc_html( number_format_i18n( $drafts ) ) : '<span class="perflocale-dash-table__zero">0</span>'; ?></td>
+								<td class="perflocale-dash-table__num"><?php echo $pending > 0 ? '<span class="perflocale-dash-table__attn">' . esc_html( number_format_i18n( $pending ) ) . '</span>' : '<span class="perflocale-dash-table__zero">0</span>'; ?></td>
+								<td class="perflocale-dash-table__num"><?php echo $outdated > 0 ? '<span class="perflocale-dash-table__warn">' . esc_html( number_format_i18n( $outdated ) ) . '</span>' : '<span class="perflocale-dash-table__zero">0</span>'; ?></td>
 							</tr>
 						<?php endforeach; ?>
 					</tbody>
@@ -410,7 +410,7 @@ final class DashboardPage {
 	}
 
 	/**
-	 * Right-hand rail — maintenance actions, shortcuts, and resources as
+	 * Right-hand rail - maintenance actions, shortcuts, and resources as
 	 * compact panels.
 	 *
 	 * @return void

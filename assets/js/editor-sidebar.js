@@ -28,7 +28,7 @@
 
 	function PerfLocalePanel() {
 		// Per-post sync opt-out flag, read/written through the registered
-		// REST meta (all hooks at top level — React rules of hooks).
+		// REST meta (all hooks at top level - React rules of hooks).
 		var postMeta = useSelect( function ( select ) {
 			return select( 'core/editor' ).getEditedPostAttribute( 'meta' );
 		}, [] );
@@ -52,13 +52,13 @@
 
 		// In-flight request token shared across every fetchTranslations()
 		// call site (mount, post-assign, post-publish, etc.). When a new
-		// call starts, the prior request's response is discarded — that
+		// call starts, the prior request's response is discarded - that
 		// way a slow in-flight request can't overwrite the state with
 		// stale data after a faster follow-up has already settled. The
 		// alternative AbortController approach isn't portable across all
 		// `apiFetch` middleware chains; an "is this still the latest?"
 		// token works everywhere. Stored in a ref so it persists across
-		// re-renders — a plain `var` would reset to 0 every render and the
+		// re-renders - a plain `var` would reset to 0 every render and the
 		// stale-response guard would never actually discard an older fetch.
 		var fetchTokenRef = useRef( 0 );
 
@@ -152,7 +152,7 @@
 				setBusySlug( null );
 				if ( response && response.edit_url ) {
 					// A window.open() here runs in the apiFetch continuation,
-					// past the click's user-activation window — Safari blocks
+					// past the click's user-activation window - Safari blocks
 					// the popup. A snackbar action opens the tab from a fresh
 					// user click, which is never blocked.
 					wp.data.dispatch( 'core/notices' ).createNotice(
@@ -272,7 +272,7 @@
 				: null;
 
 			// The opt-out toggles render only when the post type's meta is
-			// registered for REST (postMeta is an object then) — they mirror
+			// registered for REST (postMeta is an object then) - they mirror
 			// the classic metabox checkboxes, same meta keys, same semantics.
 			var syncOptoutToggle = null;
 
@@ -363,5 +363,42 @@
 		}
 
 		return next( options );
+	} );
+
+	// After a save, say when its Sync Fields did not reach some translations
+	// because the user may not edit them. The save's REST response carries
+	// the count as perflocale_sync_skipped (0 when none), which the editor
+	// keeps on the current post record.
+	var wasSaving = false;
+
+	wp.data.subscribe( function() {
+		var editor = wp.data.select( 'core/editor' );
+
+		if ( ! editor || ! editor.isSavingPost ) {
+			return;
+		}
+
+		var saving = editor.isSavingPost() && ! editor.isAutosavingPost();
+
+		if ( wasSaving && ! saving && editor.didPostSaveRequestSucceed() ) {
+			var skipped = parseInt( editor.getCurrentPost().perflocale_sync_skipped, 10 ) || 0;
+			var notices = wp.data.dispatch( 'core/notices' );
+
+			if ( skipped > 0 ) {
+				notices.createNotice(
+					'warning',
+					wp.i18n.sprintf(
+						/* translators: %d: number of translations. */
+						wp.i18n._n( 'Sync Fields were not copied to %d translation that you cannot edit.', 'Sync Fields were not copied to %d translations that you cannot edit.', skipped, 'perflocale' ),
+						skipped
+					),
+					{ id: 'perflocale-sync-skipped', isDismissible: true }
+				);
+			} else {
+				notices.removeNotice( 'perflocale-sync-skipped' );
+			}
+		}
+
+		wasSaving = saving;
 	} );
 } )();

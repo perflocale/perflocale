@@ -123,7 +123,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
 	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context — where Yoast's canonical filter still fires for its own
+	 * context - where Yoast's canonical filter still fires for its own
 	 * metabox/analysis passes but there is no fallback render to pin.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
@@ -182,7 +182,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 
 		// Include all language terms in Yoast taxonomy sitemaps.
 		// Sitemap predicate is request-constant (REQUEST_URI is fixed before
-		// plugins_loaded) — register the get_terms_args callback only on
+		// plugins_loaded) - register the get_terms_args callback only on
 		// sitemap requests instead of no-op dispatching on every term query.
 		if ( $this->is_sitemap_request() ) {
 			add_filter( 'get_terms_args', [ $this, 'include_all_languages_in_sitemap' ] );
@@ -256,7 +256,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Machine-translatable SEO meta: titles/descriptions/social text ONLY.
-	 * The focus keyword is deliberately excluded — keyword targeting in the
+	 * The focus keyword is deliberately excluded - keyword targeting in the
 	 * target language is a human decision (add it back via this same filter
 	 * if a site wants it). Gated by the mt_meta_seo setting.
 	 *
@@ -265,7 +265,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	/**
-	 * The Yoast meta keys this addon machine-translates — all plain-text SEO
+	 * The Yoast meta keys this addon machine-translates - all plain-text SEO
 	 * fields, so all route to the provider's text mode via mt_meta_key_format().
 	 */
 	private const MT_TEXT_KEYS = [
@@ -319,7 +319,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	 * Whether the current request renders an XML sitemap.
 	 *
 	 * REQUEST_URI is fixed before plugins_loaded, so the verdict is
-	 * request-constant — used both to gate the get_terms_args registration
+	 * request-constant - used both to gate the get_terms_args registration
 	 * and inside the callback for callers that invoke it directly.
 	 *
 	 * @return bool
@@ -345,7 +345,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	 * object as the third argument. We store the mapping so
 	 * add_sitemap_alternates() can resolve the correct object type, and
 	 * {@see pin_untranslated_loc()} first pins the loc of an object that has
-	 * no translation links — so the map is keyed by the URL Yoast will
+	 * no translation links - so the map is keyed by the URL Yoast will
 	 * actually render.
 	 *
 	 * @param array<string, mixed> $url_data Sitemap entry data array.
@@ -361,7 +361,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 		// class-taxonomy-sitemap-provider.php:297 and
 		// class-author-sitemap-provider.php:200. An earlier callback returning
 		// `false` therefore reaches us as a bool, and this callback runs at
-		// PHP_INT_MAX — after every other one. Declaring `array`/`object` here
+		// PHP_INT_MAX - after every other one. Declaring `array`/`object` here
 		// made PHP throw at argument binding, before the body's own guards could
 		// run, turning any site that excludes a sitemap entry into a fatal.
 		// Anything we do not recognise goes back exactly as it came in.
@@ -398,10 +398,10 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	 * Pin an unlinked entry's loc to the default language's URL shape.
 	 *
 	 * The twin of the guard core's SitemapIntegration applies to its own
-	 * entries — which Yoast's sitemap replaces wholesale. Only objects with NO
+	 * entries - which Yoast's sitemap replaces wholesale. Only objects with NO
 	 * translation links qualify: those are default-language content by
 	 * definition, whereas a linked object's loc already names its own
-	 * language. That guard is also what makes the pin safe — not the URL
+	 * language. That guard is also what makes the pin safe - not the URL
 	 * mode: pin_sitemap_url_to_default() strips a language prefix from any
 	 * URL it is handed, so in path-based modes it comes out a no-op only
 	 * because an unlinked object's loc has no prefix to strip. The
@@ -652,7 +652,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		// Active languages only. get_slug_map() is the bootstrap bundle's
-		// active-only slug -> row hash — the same source core's hreflang and
+		// active-only slug -> row hash - the same source core's hreflang and
 		// sitemap paths filter on. find_by_slug() resolves DEACTIVATED
 		// languages too, which would advertise them as alternates; the map
 		// lookup is also O(1) instead of a per-sibling cache descent.
@@ -667,7 +667,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 			}
 
 			// Only published translations belong in the sitemap as hreflang
-			// alternates — skip draft/pending/private/trash (matches the
+			// alternates - skip draft/pending/private/trash (matches the
 			// AIOSEO/SEOPress addons).
 			if ( $object_type === \PerfLocale\Enum\ObjectType::Post && get_post_status( (int) $link->object_id ) !== 'publish' ) {
 				continue;
@@ -701,7 +701,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 			++$count;
 		}
 
-		// A lone self-referencing alternate is meaningless hreflang noise — an
+		// A lone self-referencing alternate is meaningless hreflang noise - an
 		// alternates set needs at least two members (self + a sibling). Emit
 		// nothing when only one language survived the publish filter.
 		return $count > 1 ? $xml : '';

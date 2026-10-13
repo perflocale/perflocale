@@ -1,6 +1,6 @@
 <?php
 /**
- * Opt-in interface — addons that need a minimum PerfLocale version.
+ * Opt-in interface - addons that need a minimum PerfLocale version.
  *
  * @package PerfLocale
  */
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * The check uses PHP's {@see version_compare()} with the `<` operator, so
  * the string should be a SemVer-ish triple ("1.4.0", "2.0.0-beta1", etc.).
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface HasVersionRequirement {
 

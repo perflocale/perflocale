@@ -18,17 +18,17 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * The string values are persisted in the `translation_links.status` column.
  * Some cases are referenced via this enum (`TranslationStatus::X->value`)
- * and others via raw string literals in SQL builders — both paths are
+ * and others via raw string literals in SQL builders - both paths are
  * canonical and the two MUST agree. Removing any case is a schema-level
  * change: existing rows may carry that value.
  *
  * Usage map:
- *   - Published, Empty, NeedsUpdate — referenced via enum AND raw strings
+ *   - Published, Empty, NeedsUpdate - referenced via enum AND raw strings
  *     throughout the codebase (active hot paths).
- *   - Draft        — referenced via the enum in the Polylang/WPML
+ *   - Draft        - referenced via the enum in the Polylang/WPML
  *                    importers and via raw `'draft'` string literals
  *                    elsewhere.
- *   - Pending      — never stored by the plugin; effective() derives it
+ *   - Pending      - never stored by the plugin; effective() derives it
  *                    from a linked post in `pending` (Pending Review).
  *
  * The stored value is written when a link is created and is not maintained
@@ -43,14 +43,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 enum TranslationStatus: string {
 
 	/**
-	 * Translator is still working on it — `wp_posts.post_status='draft'`
+	 * Translator is still working on it - `wp_posts.post_status='draft'`
 	 * is the typical paired post status. Referenced via the enum in the
 	 * importers and via raw `'draft'` string literals elsewhere.
 	 */
 	case Draft = 'draft';
 
 	/**
-	 * Submitted to a reviewer / editor — awaiting approval before
+	 * Submitted to a reviewer / editor - awaiting approval before
 	 * publish: the linked post is in `pending` (Pending Review).
 	 * Derived by effective(); not stored by the plugin.
 	 */

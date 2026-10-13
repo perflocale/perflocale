@@ -76,7 +76,7 @@ final class JobsPage {
 				'ago'         => __( 'ago', 'perflocale' ),
 				'isMultisite' => is_multisite(),
 				'i18n'        => [
-					'pollPaused'    => __( 'Live updates paused after repeated errors — reload the page to resume.', 'perflocale' ),
+					'pollPaused'    => __( 'Live updates paused after repeated errors - reload the page to resume.', 'perflocale' ),
 					'id'            => __( 'ID', 'perflocale' ),
 					'type'          => __( 'Type', 'perflocale' ),
 					'engine'        => __( 'Engine', 'perflocale' ),
@@ -111,10 +111,10 @@ final class JobsPage {
 	 * @return void
 	 */
 	public function render(): void {
-		// list_active_summary() omits args/result/log — the admin table
-		// renders inline only the small columns; the inspect-on-click
-		// modal calls GET /jobs/{id} which uses JobState::get() for full
-		// detail.
+		// list_active_summary() omits args, result and log. The kept-rows
+		// warning reads the results it needs in one batch below; a row's
+		// Details toggle fetches GET /jobs/{id}, which reads the full row
+		// through JobState::get().
 		$jobs = JobState::list_active_summary();
 
 		// Only a supervisor sees every user's jobs; everyone else sees the
@@ -127,12 +127,22 @@ final class JobsPage {
 			);
 		}
 
+		// The kept-rows warning needs the result of each displayed row that
+		// shows it: one batched read for all of them, none when no row does.
+		$kept_ids = [];
+		foreach ( $jobs as $kept_id => $summary ) {
+			if ( self::shows_kept( $summary['status'] ?? '', $summary['type'] ?? '' ) ) {
+				$kept_ids[] = (string) $kept_id;
+			}
+		}
+		$results = JobState::results( $kept_ids );
+
 		$engine = JobRunnerFactory::pick()->get_engine_name();
 		$as_url = '';
 
 		if ( $engine === 'action_scheduler' && function_exists( 'admin_url' ) ) {
 			// Action Scheduler's Tools → Scheduled Actions screen has no
-			// `group` URL filter — passing one is silently ignored. Use the
+			// `group` URL filter - passing one is silently ignored. Use the
 			// `s` (search) param instead, which AS exposes as a real form
 			// field and matches against hook + group + args. "perflocale"
 			// matches our group name AND our hook prefix, so it narrows the
@@ -207,7 +217,7 @@ final class JobsPage {
 					</thead>
 					<tbody>
 						<?php foreach ( $jobs as $job_id => $row ) : ?>
-							<?php $this->render_row( (string) $job_id, $row ); ?>
+							<?php $this->render_row( (string) $job_id, $row, $results[ (string) $job_id ] ?? [] ); ?>
 						<?php endforeach; ?>
 					</tbody>
 				</table>
@@ -240,8 +250,8 @@ final class JobsPage {
 	 *
 	 * Lists the recurring schedulers that live outside the Jobs queue
 	 * (exchange-rate sync, lock cleanup, jobs GC) so the operator can see
-	 * all of the plugin's background work in one place — next run, engine,
-	 * status — without needing to dig into Tools → Scheduled Actions or
+	 * all of the plugin's background work in one place - next run, engine,
+	 * status - without needing to dig into Tools → Scheduled Actions or
 	 * wp_options['cron'].
 	 *
 	 * @return void
@@ -284,7 +294,7 @@ final class JobsPage {
 				'hook'             => 'perflocale_jobs_watchdog',
 				'args'             => $blog_arg,
 				'label'            => __( 'Background-jobs watchdog', 'perflocale' ),
-				'description'      => __( 'Hourly stuck-job sweep — force-fails workers whose status hasn\'t moved for hours.', 'perflocale' ),
+				'description'      => __( 'Hourly stuck-job sweep - force-fails workers whose status hasn\'t moved for hours.', 'perflocale' ),
 				'interval_seconds' => HOUR_IN_SECONDS,
 			],
 		];
@@ -333,7 +343,7 @@ final class JobsPage {
 			];
 		}
 
-		// WP-Cron drift detection — only show the warning when the
+		// WP-Cron drift detection - only show the warning when the
 		// engine is actually WP-Cron. Action Scheduler doesn't drift the
 		// same way (it persists and catches up via WP-Heartbeat-fired
 		// runner), so the banner would be a false alarm on AS-backed
@@ -350,7 +360,7 @@ final class JobsPage {
 		// defines `DISABLE_WP_CRON` and we're scheduling onto WP-Cron,
 		// the events sit in `wp_options['cron']` forever until something
 		// fires `wp-cron.php` externally (server cron, uptime monitor,
-		// SaaS pinger). Action Scheduler isn't affected — it runs on
+		// SaaS pinger). Action Scheduler isn't affected - it runs on
 		// its own claim loop. So only show this banner when:
 		// 1. The constant is truthy.
 		// 2. The plugin is on the wp_cron engine right now.
@@ -562,13 +572,26 @@ final class JobsPage {
 	}
 
 	/**
+	 * Whether a row shows how many created translations kept the source
+	 * language: a finished job of a type in KEPT_RESULT_TYPES.
+	 *
+	 * @param mixed $status Job status.
+	 * @param mixed $type   Job type slug.
+	 * @return bool
+	 */
+	private static function shows_kept( $status, $type ): bool {
+		return 'complete' === $status && in_array( $type, self::KEPT_RESULT_TYPES, true );
+	}
+
+	/**
 	 * Render a single job row.
 	 *
-	 * @param string               $job_id
-	 * @param array<string, mixed> $row Active-index summary row.
+	 * @param string                   $job_id
+	 * @param array<string, mixed>     $row    Active-index summary row.
+	 * @param array<int|string, mixed> $result The job's decoded result when the row shows the kept count, else [].
 	 * @return void
 	 */
-	private function render_row( string $job_id, array $row ): void {
+	private function render_row( string $job_id, array $row, array $result = [] ): void {
 		$status     = (string) ( $row['status'] ?? 'unknown' );
 		$type       = (string) ( $row['type'] ?? '' );
 		$progress   = (int) ( $row['progress'] ?? 0 );
@@ -587,16 +610,12 @@ final class JobsPage {
 		];
 		$status_label  = $status_labels[ $status ] ?? $status;
 
-		// Surface the error message inline on failed rows so the operator can
-		// triage without hitting the REST endpoint or wp-cli. The active-index
-		// row doesn't carry the error (it'd bloat the autoloaded option), so
-		// pull from the per-job option — but only for failed rows so we don't
-		// add a query per row on the typical case.
+		// The summary row carries the error. A failed row shows it inline so
+		// the operator can triage without the REST endpoint or WP-CLI.
 		$error_full  = '';
 		$error_short = '';
 		if ( $status === 'failed' ) {
-			$detail = JobState::get( $job_id );
-			$err    = (string) ( $detail['error'] ?? '' );
+			$err = (string) ( $row['error'] ?? '' );
 			if ( $err !== '' ) {
 				$error_full  = $err;
 				$error_short = mb_strlen( $err ) > 140
@@ -609,9 +628,7 @@ final class JobsPage {
 		// stayed in the source language; only those job types read the result.
 		$kept          = 0;
 		$first_warning = '';
-		if ( $status === 'complete' && in_array( $type, self::KEPT_RESULT_TYPES, true ) ) {
-			$detail        = JobState::get( $job_id );
-			$result        = is_array( $detail ) ? (array) ( $detail['result'] ?? [] ) : [];
+		if ( self::shows_kept( $status, $type ) ) {
 			$kept          = max( 0, (int) ( $result['kept'] ?? 0 ) );
 			$first_warning = $kept > 0 ? trim( (string) ( $result['first_warning'] ?? '' ) ) : '';
 		}
@@ -670,7 +687,7 @@ final class JobsPage {
 							__( '%s ago', 'perflocale' ),
 							human_time_diff( $updated_at )
 						)
-						: '—'
+						: '-'
 				);
 				?>
 			</td>

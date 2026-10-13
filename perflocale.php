@@ -3,7 +3,7 @@
  * Plugin Name: PerfLocale
  * Plugin URI: https://perflocale.com
  * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs, and keep your site fast.
- * Version: 1.0.7
+ * Version: 1.0.7.1
  * Requires at least: 6.4
  * Tested up to: 7.1
  * Requires PHP: 8.1
@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ---- Plugin constants ----
 
-define( 'PERFLOCALE_VERSION', '1.0.7' );
+define( 'PERFLOCALE_VERSION', '1.0.7.1' );
 define( 'PERFLOCALE_FILE', __FILE__ );
 define( 'PERFLOCALE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );
@@ -33,9 +33,9 @@ define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );
 // already defines every column and index (including the polymorphic
 // translation_links.type + composite object_lang UNIQUE, the object_lookup
 // per-object index, and the CLDR plural extra_forms column). No migrate_to_N
-// methods exist — a future schema change bumps this and adds one; the
+// methods exist - a future schema change bumps this and adds one; the
 // dispatcher in Migrator picks it up. NOTE: dbDelta can ADD indexes but can
-// never RESHAPE one under an existing name — an index reshape needs a
+// never RESHAPE one under an existing name - an index reshape needs a
 // migrate_to_N that drops the old index first.
 define( 'PERFLOCALE_DB_VERSION', 1 );
 
@@ -204,7 +204,7 @@ register_activation_hook(
 			// Refuse the activation if any site could not be set up. wp_die()
 			// here stops core before it records the plugin as network-active,
 			// so PerfLocale never runs on a network with sites that have no
-			// tables or no language — a state nothing repairs on its own:
+			// tables or no language - a state nothing repairs on its own:
 			// Migrator retries only the tables, and only on admin, REST and CLI
 			// requests. (A missing settings row is not checked: it reads as the
 			// defaults.) Every site is still set up as far as it can be:
@@ -253,7 +253,7 @@ add_action(
 	'wp_initialize_site',
 	static function ( WP_Site $new_site ): void {
 		// wp_initialize_site fires whenever a subsite is created via
-		// wp_insert_site() — including programmatic/CLI/REST contexts where
+		// wp_insert_site() - including programmatic/CLI/REST contexts where
 		// wp-admin/includes/plugin.php (which defines is_plugin_active_for_network)
 		// is not loaded. Load it on demand to avoid a fatal.
 		if ( ! function_exists( 'is_plugin_active_for_network' ) ) {
@@ -359,12 +359,12 @@ add_action(
 
 // Multisite: clean up when a site is permanently deleted from the network.
 // FORCES a full purge regardless of the `delete_data_on_uninstall` setting.
-// Reason: blog deletion is irreversible — WP drops the blog's posts /
+// Reason: blog deletion is irreversible - WP drops the blog's posts /
 // options / attachments along with the wp_blogs row. Keeping plugin tables
 // (`wp_<id>_perflocale_*`) for a no-longer-existing blog is just orphan
 // data. The `delete_data_on_uninstall` preference applies to plugin
 // UNINSTALL (a reversible action where the operator might want to keep
-// data for a later reinstall) — it does NOT apply to blog DELETION,
+// data for a later reinstall) - it does NOT apply to blog DELETION,
 // where nothing else survives anyway.
 add_action(
 	'wp_uninitialize_site',
@@ -380,7 +380,7 @@ add_action(
 			restore_current_blog();
 		}
 	},
-	// Priority 5 — BELOW core's own wp_uninitialize_site table-dropper (which
+	// Priority 5 - BELOW core's own wp_uninitialize_site table-dropper (which
 	// registers at priority 10 in ms-default-filters.php). Core drops the
 	// deleted blog's wp_<id>_options / postmeta / termmeta, so PerfLocale must
 	// run FIRST while those are still readable: full_purge() reads addon
@@ -437,7 +437,7 @@ if ( ! function_exists( 'perflocale' ) ) {
 	 * perflocale()->is_rtl() → false
 	 * perflocale()->switcher() → "<nav>...</nav>"
 	 *
-	 * @api  Stable API surface — semver-bound; safe for themes, addons,
+	 * @api  Stable API surface - semver-bound; safe for themes, addons,
 	 *       and external plugins to depend on. Returns the {@see \PerfLocale\Helper}
 	 *       singleton whose public methods are themselves semver-bound.
 	 *

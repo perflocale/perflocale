@@ -20,12 +20,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Translates a curated set of meta fields from a source post onto its
- * translation sibling — SEO titles/descriptions, ACF/MetaBox/Pods text
+ * translation sibling - SEO titles/descriptions, ACF/MetaBox/Pods text
  * fields, and anything an addon registers on the dedicated registry filter.
  *
- * DESIGN CONTRACTS (each one is load-bearing — see docs/mt-scopes-plan.md §4):
+ * DESIGN CONTRACTS (each one is load-bearing - see docs/mt-scopes-plan.md §4):
  *
- * - The key registry is `perflocale/mt/translatable_meta_keys` — a SEPARATE,
+ * - The key registry is `perflocale/mt/translatable_meta_keys` - a SEPARATE,
  *   curated filter. It must NEVER be fed from get_translatable_meta_keys():
  *   that list contains structural keys (ACF repeater counts, flexible-content
  *   layouts), URLs/emails, serialized blobs, and SEO focus keywords, all of
@@ -49,12 +49,12 @@ if ( ! defined( 'ABSPATH' ) ) {
  * - Keys matching the sensitive-meta patterns (the same list that keeps them
  *   out of a new translation's copied meta) are dropped from the registry,
  *   whichever addon registered them.
- * - MIRROR keys (builder layout JSON — source-owned, overwritten on every
+ * - MIRROR keys (builder layout JSON - source-owned, overwritten on every
  *   sync) are excluded at runtime, not just by list curation.
  * - Placeholder tokens (%s, {var}, %%sitename%%-style SEO template tags via
  *   the inline-HTML regex) are masked before MT and must survive; a
  *   translation that drops one is REJECTED and the source value kept.
- * - Writes are wp_slash()ed — update_post_meta unslashes internally and would
+ * - Writes are wp_slash()ed - update_post_meta unslashes internally and would
  *   otherwise strip backslashes (documented corruption class).
  * - A meta failure NEVER fails the post translation: failures land in the
  *   `_perflocale_meta_mt_errors` breadcrumb + an action, and the loop moves on.
@@ -113,7 +113,7 @@ final class MetaTranslator {
 		 * Register ONLY leaf text values a human translator would rewrite:
 		 * plain text, textarea, and rich-text fields. Never structural keys
 		 * (counts, layouts), URLs/emails, serialized arrays, or SEO focus
-		 * keywords — those belong on perflocale/translatable_meta_keys (the
+		 * keywords - those belong on perflocale/translatable_meta_keys (the
 		 * seed/copy list), not here.
 		 *
 		 * @hook perflocale/mt/translatable_meta_keys
@@ -192,7 +192,7 @@ final class MetaTranslator {
 		$cleared = ContentSync::seed_cleared_keys( $translation_id );
 
 		// Collect the translatable (key, source value) pairs under the
-		// ownership rule. Only single-value string meta qualifies — array or
+		// ownership rule. Only single-value string meta qualifies - array or
 		// serialized values are structural by definition here.
 		$to_translate = [];
 		$target_rows  = [];
@@ -220,7 +220,7 @@ final class MetaTranslator {
 
 			if ( count( $rows ) > 1 || ( is_string( $target_val ) && $target_val !== '' && $target_val !== $source_val ) ) {
 				// Translator-owned value, or several rows rather than one
-				// value — never overwrite.
+				// value - never overwrite.
 				++$result['skipped'];
 				continue;
 			}
@@ -230,7 +230,7 @@ final class MetaTranslator {
 		}
 
 		if ( $to_translate === [] ) {
-			// Nothing to do and nothing failed — clear any stale breadcrumb
+			// Nothing to do and nothing failed - clear any stale breadcrumb
 			// from a previous failure (every value is now translator-owned
 			// or empty; the earlier outage is resolved from this post's view).
 			delete_post_meta( $translation_id, self::ERRORS_META_KEY );
@@ -283,7 +283,7 @@ final class MetaTranslator {
 		// title/description, an ACF text field) is translated in the provider's
 		// TEXT mode and sanitised as text, while HTML-bearing keys (an ACF
 		// wysiwyg field) keep HTML mode + the allowlist sanitiser. Default is
-		// 'html' so an undeclared / third-party key behaves exactly as before —
+		// 'html' so an undeclared / third-party key behaves exactly as before -
 		// a key is only routed to text when an addon affirmatively declares it.
 		$keys_by_format = [];
 		foreach ( $ordered_keys as $key ) {
@@ -297,7 +297,7 @@ final class MetaTranslator {
 			 * Return 'text' for plain-text meta (SEO title/description, plain
 			 * custom fields) so the provider is called in text mode and the
 			 * result is not entity-escaped; 'html' (default) for markup-bearing
-			 * meta. Unknown keys stay 'html' — the historical behaviour.
+			 * meta. Unknown keys stay 'html' - the historical behaviour.
 			 *
 			 * @hook perflocale/mt/meta_key_format
 			 * @param string $format    'html' (default) or 'text'.

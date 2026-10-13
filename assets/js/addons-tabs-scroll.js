@@ -1,10 +1,10 @@
 /**
- * Addons page — scroll indicator for the filter tab strip.
+ * Addons page - scroll indicator for the filter tab strip.
  *
  * The strip is one non-wrapping row (see assets/css/admin-addons.css for why),
  * so on a narrow screen it scrolls sideways. The native scrollbar cannot be the
  * affordance for that: iOS and Android draw scrollbars as transient overlays
- * that disappear at rest, and iOS ignores ::-webkit-scrollbar entirely — so on
+ * that disappear at rest, and iOS ignores ::-webkit-scrollbar entirely - so on
  * exactly the devices that need the hint there is nothing to see. The CSS hides
  * the native bar and this draws a small one that behaves the same everywhere.
  *

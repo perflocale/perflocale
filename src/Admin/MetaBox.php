@@ -26,6 +26,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class MetaBox {
 
 	/**
+	 * Query argument of the edit screen's redirect after a save whose Sync
+	 * Fields did not reach some translations, and of the post list's after
+	 * such a Bulk Edit; see add_sync_skipped_arg() and
+	 * add_bulk_sync_skipped_arg().
+	 */
+	public const SYNC_SKIPPED_ARG = 'perflocale_sync_skipped';
+
+	/**
 	 * @var CacheManager
 	 */
 	private readonly CacheManager $cache;
@@ -51,11 +59,15 @@ final class MetaBox {
 		add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
 		add_action( 'admin_notices', [ $this, 'maybe_show_meta_copy_errors' ] );
 		add_action( 'admin_notices', [ $this, 'maybe_show_language_save_error' ] );
+		add_action( 'admin_notices', [ $this, 'maybe_show_sync_skipped' ] );
+		add_filter( 'redirect_post_location', [ $this, 'add_sync_skipped_arg' ], 10, 2 );
+		add_filter( 'wp_redirect', [ $this, 'add_bulk_sync_skipped_arg' ], 10, 1 );
+		add_filter( 'removable_query_args', [ $this, 'remove_sync_skipped_arg' ] );
 		// NOTE: the `_perflocale_meta_copy_errors` save_post cleanup is
 		// registered in Bootstrap at always-loaded scope (NOT here),
 		// because MetaBox itself is admin-only (registered behind
 		// `is_admin() && ! wp_doing_ajax()`) and the meta needs to clear
-		// on REST API saves (block editor) and WP-CLI saves too — neither
+		// on REST API saves (block editor) and WP-CLI saves too - neither
 		// of which loads MetaBox. See Bootstrap::register_post_meta_cleanup_hooks().
 		add_action( 'admin_footer-post.php', [ $this, 'inject_term_language_badges' ] );
 		add_action( 'admin_footer-post-new.php', [ $this, 'inject_term_language_badges' ] );
@@ -85,14 +97,14 @@ final class MetaBox {
 	 *                       (it is whatever the caller handed
 	 *                       `wp_terms_checklist()`, BEFORE core's own
 	 *                       `wp_parse_args()`), and `wp_parse_args()` also
-	 *                       accepts an object — so anything can arrive.
+	 *                       accepts an object - so anything can arrive.
 	 * @param int   $post_id Post ID the checklist is for.
 	 * @return mixed The args, language-scoped when they were an array,
 	 *               otherwise returned exactly as received.
 	 */
 	public function filter_terms_checklist_by_language( $args, int $post_id ) {
 		// `wp_terms_checklist( $post_id, 'taxonomy=category' )` is a documented,
-		// supported call — core's own filter docblock says `array|string $args`
+		// supported call - core's own filter docblock says `array|string $args`
 		// and its `wp_parse_args()` takes a query string or an object too. An
 		// `array` type declaration turned any such caller into a TypeError at
 		// argument binding, before this method's own guards could run. Hand a
@@ -242,9 +254,9 @@ final class MetaBox {
 
 		$post_lang = $manager->detect_post_language( $post->ID );
 
-		// ⭐ The language list is SHARED. Every other place this panel appears —
+		// ⭐ The language list is SHARED. Every other place this panel appears -
 		// the block-editor sidebar, the Site Editor sidebar, and a host plugin's
-		// own editor screen via TranslationsPanel::mount() — renders the same
+		// own editor screen via TranslationsPanel::mount() - renders the same
 		// rows from the same code, so a change to a row is a change everywhere
 		// instead of a change in one of four near-identical copies.
 		//
@@ -288,7 +300,7 @@ final class MetaBox {
 			echo '<div class="perflocale-mb-footer">';
 			echo '<label style="display:flex;gap:6px;align-items:flex-start;">';
 			echo '<input type="checkbox" name="perflocale_sync_optout" value="yes"' . checked( $optout, true, false ) . ' style="margin-top:2px;">';
-			echo '<span>' . esc_html__( 'Independent across languages — do not sync this post\'s shared fields (featured image, configured sync fields) with its translations, in either direction.', 'perflocale' ) . '</span>';
+			echo '<span>' . esc_html__( 'Independent across languages - do not sync this post\'s shared fields (featured image, configured sync fields) with its translations, in either direction.', 'perflocale' ) . '</span>';
 			echo '</label>';
 			// Marker so programmatic saves that never render this box cannot
 			// clear the flag (an unchecked checkbox is indistinguishable from
@@ -297,7 +309,7 @@ final class MetaBox {
 			echo '</div>';
 		}
 
-		// Per-post SEO opt-out — drops this translation from hreflang tags
+		// Per-post SEO opt-out - drops this translation from hreflang tags
 		// and sitemap alternate links. Rendered for products too (unlike the
 		// sync opt-out above, no other UI owns this flag).
 		$seo_excluded = get_post_meta( $post->ID, \PerfLocale\Helper::SEO_EXCLUDE_META, true ) === 'yes';
@@ -305,7 +317,7 @@ final class MetaBox {
 		echo '<div class="perflocale-mb-footer">';
 		echo '<label style="display:flex;gap:6px;align-items:flex-start;">';
 		echo '<input type="checkbox" name="perflocale_seo_exclude" value="yes"' . checked( $seo_excluded, true, false ) . ' style="margin-top:2px;">';
-		echo '<span>' . esc_html__( 'Hide from hreflang and sitemap alternates — search engines will not be told this translation is an alternate of its siblings.', 'perflocale' ) . '</span>';
+		echo '<span>' . esc_html__( 'Hide from hreflang and sitemap alternates - search engines will not be told this translation is an alternate of its siblings.', 'perflocale' ) . '</span>';
 		echo '</label>';
 		echo '<input type="hidden" name="perflocale_seo_exclude_present" value="1">';
 		echo '</div>';
@@ -335,6 +347,15 @@ final class MetaBox {
 			return;
 		}
 
+		// The form belongs to the post being edited. Another post saved in the
+		// same request (a translation the sync writes, a stub created on
+		// publish) keeps its own values.
+		$form_post = isset( $_POST['post_ID'] ) && is_scalar( $_POST['post_ID'] ) ? absint( $_POST['post_ID'] ) : 0;
+
+		if ( $form_post !== $post_id ) {
+			return;
+		}
+
 		if ( ! current_user_can( 'edit_post', $post_id ) ) {
 			return;
 		}
@@ -343,7 +364,7 @@ final class MetaBox {
 			return;
 		}
 
-		// Sync opt-out checkbox — only when the box that renders it actually
+		// Sync opt-out checkbox - only when the box that renders it actually
 		// submitted (marker present), so REST/CLI saves never clear the flag.
 		if ( isset( $_POST['perflocale_sync_optout_present'] ) ) {
 			if ( isset( $_POST['perflocale_sync_optout'] ) ) {
@@ -353,7 +374,7 @@ final class MetaBox {
 			}
 		}
 
-		// SEO-exclude checkbox — same marker guard. Stale hreflang transients
+		// SEO-exclude checkbox - same marker guard. Stale hreflang transients
 		// are cleared by CacheInvalidator::on_save_post (post + siblings) on
 		// this same save request, so no extra invalidation is needed here.
 		if ( isset( $_POST['perflocale_seo_exclude_present'] ) ) {
@@ -370,7 +391,7 @@ final class MetaBox {
 			$manager = new PostTranslationManager( $this->cache, \PerfLocale\Plugin::get_instance()->get( 'settings' ) );
 
 			if ( ! $manager->set_post_language( $post_id, $language ) ) {
-				// Surface the failure to the user who just clicked Update —
+				// Surface the failure to the user who just clicked Update -
 				// without this, the editor silently shows the OLD language
 				// on next load and the user assumes their choice stuck.
 				// Same one-shot transient pattern as maybe_show_language_save_error.
@@ -381,7 +402,7 @@ final class MetaBox {
 						'perflocale_lang_save_error_' . $user_id,
 						sprintf(
 							/* translators: 1: post ID, 2: language slug. */
-							__( 'PerfLocale could not save the language selection ("%2$s") for post %1$d. The language may have been deleted, or a database error occurred — please try again.', 'perflocale' ),
+							__( 'PerfLocale could not save the language selection ("%2$s") for post %1$d. The language may have been deleted, or a database error occurred - please try again.', 'perflocale' ),
 							$post_id,
 							$language
 						),
@@ -397,7 +418,7 @@ final class MetaBox {
 	 * One-shot error notice when a post or term language save failed.
 	 *
 	 * Written by save_meta_box() here and TermMetaBox::save_term_language()
-	 * — both funnel through the same per-user transient so this single
+	 * - both funnel through the same per-user transient so this single
 	 * renderer covers post AND term screens (admin_notices fires on both).
 	 *
 	 * @return void
@@ -420,6 +441,95 @@ final class MetaBox {
 		printf(
 			'<div class="notice notice-error is-dismissible"><p>%s</p></div>',
 			esc_html( (string) $message )
+		);
+	}
+
+	/**
+	 * Edit-screen save: the redirect back to the editor carries the number
+	 * of translations the save's Sync Fields did not reach because the
+	 * saver may not edit them, counting those where a value would have
+	 * changed (ContentSync::skipped_siblings()).
+	 *
+	 * @param string|mixed $location Redirect URL.
+	 * @param int|mixed    $post_id  Saved post.
+	 * @return string|mixed
+	 */
+	public function add_sync_skipped_arg( mixed $location = '', mixed $post_id = 0 ): mixed {
+		if ( ! is_string( $location ) || ! is_numeric( $post_id ) ) {
+			return $location;
+		}
+
+		$count = \PerfLocale\Translation\ContentSync::skipped_siblings( (int) $post_id );
+
+		return $count > 0 ? add_query_arg( self::SYNC_SKIPPED_ARG, $count, $location ) : $location;
+	}
+
+	/**
+	 * Bulk Edit on a post list: the redirect back to the list carries the
+	 * number of translations the edited posts' Sync Fields did not reach
+	 * because the user may not edit them, counting those where a value would
+	 * have changed (ContentSync::bulk_skipped()). After any bulk action the
+	 * argument is first removed from the redirect, which core builds from
+	 * the list's own address, so an earlier count is not shown again. Every
+	 * other redirect is left alone.
+	 *
+	 * @param string|mixed $location Redirect URL.
+	 * @return string|mixed
+	 */
+	public function add_bulk_sync_skipped_arg( mixed $location = '' ): mixed {
+		$count = \PerfLocale\Translation\ContentSync::bulk_skipped();
+
+		if ( null === $count || ! is_string( $location ) ) {
+			return $location;
+		}
+
+		$location = remove_query_arg( self::SYNC_SKIPPED_ARG, $location );
+
+		return $count > 0 && did_action( 'bulk_edit_posts' ) > 0 ? add_query_arg( self::SYNC_SKIPPED_ARG, $count, $location ) : $location;
+	}
+
+	/**
+	 * Core removes the notice argument from the address bar once shown.
+	 *
+	 * @param array<int, string>|mixed $args Removable query arguments.
+	 * @return array<int, string>|mixed
+	 */
+	public function remove_sync_skipped_arg( mixed $args = [] ): mixed {
+		if ( is_array( $args ) ) {
+			$args[] = self::SYNC_SKIPPED_ARG;
+		}
+
+		return $args;
+	}
+
+	/**
+	 * Warning after an edit-screen save, or a Bulk Edit on a post list,
+	 * whose Sync Fields did not reach some translations because the user may
+	 * not edit them. Display only: the count comes from the redirect of that
+	 * save.
+	 *
+	 * @return void
+	 */
+	public function maybe_show_sync_skipped(): void {
+		if ( ! in_array( $GLOBALS['pagenow'] ?? '', [ 'post.php', 'edit.php' ], true ) ) {
+			return;
+		}
+
+		$count = isset( $_GET[ self::SYNC_SKIPPED_ARG ] ) && is_string( $_GET[ self::SYNC_SKIPPED_ARG ] ) ? absint( wp_unslash( $_GET[ self::SYNC_SKIPPED_ARG ] ) ) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only: a number shown back to the user who saved.
+
+		if ( $count <= 0 ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning is-dismissible"><p>%s</p></div>',
+			esc_html(
+				sprintf(
+					/* translators: %d: number of translations. */
+					_n( 'Sync Fields were not copied to %d translation that you cannot edit.', 'Sync Fields were not copied to %d translations that you cannot edit.', $count, 'perflocale' ),
+					$count
+				)
+			)
 		);
 	}
 
@@ -465,7 +575,7 @@ final class MetaBox {
 
 		// State change moved to clear_meta_copy_errors_on_save (save_post
 		// hook). The notice persists across views until the user takes a
-		// real save action — better educational UX and removes the
+		// real save action - better educational UX and removes the
 		// "GET-driven state change" pattern entirely from this callback.
 
 		$step_label_map = [

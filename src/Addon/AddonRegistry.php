@@ -66,7 +66,7 @@ final class AddonRegistry {
 
 	/**
 	 * Addons whose own is_compatible() said no (or a site filter said no for
-	 * them). Keyed by addon ID; the value is always true — the addon decides
+	 * them). Keyed by addon ID; the value is always true - the addon decides
 	 * WHY and this registry does not second-guess it.
 	 *
 	 * Distinct from $version_mismatches, which is specifically "needs a newer
@@ -245,7 +245,7 @@ final class AddonRegistry {
 		if ( did_action( 'plugins_loaded' ) ) {
 			$this->discover_and_boot();
 			// plugins_loaded already passed, so the boot_pending(99) fallback
-			// below will never fire — this immediate pass is the only one, and
+			// below will never fire - this immediate pass is the only one, and
 			// any later registration genuinely cannot be booted.
 			$this->final_boot_done = true;
 		} else {
@@ -313,7 +313,7 @@ final class AddonRegistry {
 
 		foreach ( $bootable_ids as $id ) {
 			if ( ! isset( $manifest[ $id ] ) ) {
-				// Stale entry — cache references an addon that no longer exists
+				// Stale entry - cache references an addon that no longer exists
 				// in the manifest (rare: only happens if PerfLocale itself was
 				// updated to remove an addon while the cache is still warm).
 				continue;
@@ -321,7 +321,7 @@ final class AddonRegistry {
 
 			if ( isset( $this->addons[ $id ] ) ) {
 				// Theme addons boot early and register their instance at
-				// plugins_loaded:15 — that instance is authoritative, and a
+				// plugins_loaded:15 - that instance is authoritative, and a
 				// second construction here would only trip duplicate guard #4.
 				continue;
 			}
@@ -372,7 +372,7 @@ final class AddonRegistry {
 	private static function resolve_bootable_ids( array $manifest ): array {
 		// This list is ALWAYS computed. It used to be memoised in a 12-hour
 		// transient on sites with a persistent object cache, and that cache was
-		// removed deliberately — it could not win enough to justify what it
+		// removed deliberately - it could not win enough to justify what it
 		// risked.
 		//
 		// WHAT IT COST. A cache hit returned the stored id list and never called
@@ -382,7 +382,7 @@ final class AddonRegistry {
 		// hours: the integration for that plugin silently did not load, the
 		// Addons page still said "Active" (its check asks only whether the host
 		// plugin is present), and nothing anywhere reported a problem. Nothing
-		// downstream could recover it either — boot_pending() only boots addons
+		// downstream could recover it either - boot_pending() only boots addons
 		// already registered, and on a real request it never runs at all, since
 		// Bootstrap hooks the whole boot on init:0 (Bootstrap::init()) and
 		// discovery has already set $final_boot_done by then.
@@ -395,7 +395,7 @@ final class AddonRegistry {
 		// About three microseconds per request. And the comparison only gets
 		// worse for the cache as Redis gets slower, because the cache path is
 		// TWO network round trips while computing is pure PHP with no I/O at
-		// all — a site whose object cache is not on a local socket pays more to
+		// all - a site whose object cache is not on a local socket pays more to
 		// read the answer than to work it out.
 		//
 		// Three microseconds is not worth a twelve-hour window in which an
@@ -425,7 +425,7 @@ final class AddonRegistry {
 	/**
 	 * Invalidate the bootable-addons cache. Hooked to plugin/theme
 	 * lifecycle events that could flip a compat closure's result. Safe to
-	 * call repeatedly — extra calls only force rebuilds, never staleness.
+	 * call repeatedly - extra calls only force rebuilds, never staleness.
 	 *
 	 * Public so the WP-CLI helper can force a rebuild from the cache flush
 	 * command and so a misbehaving environment can trigger one from the
@@ -450,25 +450,25 @@ final class AddonRegistry {
 
 	/**
 	 * Register addon-bootable-cache invalidation hooks. Called once from
-	 * Bootstrap::init at plugin load — runs in every context, since plugin
+	 * Bootstrap::init at plugin load - runs in every context, since plugin
 	 * activations can happen via admin, CLI, multisite network admin, etc.
 	 *
 	 * @return void
 	 */
 	public static function register_cache_invalidation(): void {
-		// Plugin/theme activation surface — anything that toggles whether
+		// Plugin/theme activation surface - anything that toggles whether
 		// an integration target's class/function exists.
 		add_action( 'activated_plugin', [ self::class, 'flush_bootable_cache' ] );
 		add_action( 'deactivated_plugin', [ self::class, 'flush_bootable_cache' ] );
 		add_action( 'switch_theme', [ self::class, 'flush_bootable_cache' ] );
 
-		// Plugin update completion — the new version might define / un-define
+		// Plugin update completion - the new version might define / un-define
 		// a class our compat closure looks for.
 		add_action( 'upgrader_process_complete', [ self::class, 'flush_bootable_cache' ] );
 
 		// Multisite: a plugin can be activated network-wide or per-blog.
 		// Both routes raise `activated_plugin`, but a network-wide flip on
-		// blog N still leaves blog M's transient untouched — flush all on
+		// blog N still leaves blog M's transient untouched - flush all on
 		// network activation so every blog rebuilds on next request.
 		add_action( 'activate_plugin', [ self::class, 'flush_bootable_cache' ] );
 		add_action( 'deactivate_plugin', [ self::class, 'flush_bootable_cache' ] );
@@ -487,7 +487,7 @@ final class AddonRegistry {
 		$id = $addon->get_id();
 
 		// (1) Invalid addon ID: the canonical contract is
-		// AddonSchemaManager::ADDON_ID_PATTERN (2-16 char [a-z0-9_-] slug) —
+		// AddonSchemaManager::ADDON_ID_PATTERN (2-16 char [a-z0-9_-] slug) -
 		// the same pattern gates settings, the disabled list, schema
 		// migrations, and the uninstall manifest. Enforcing it here means an
 		// out-of-contract ID fails fast at registration instead of booting
@@ -510,7 +510,7 @@ final class AddonRegistry {
 		// (2) Late registration: gate on $final_boot_done, NOT on a non-empty
 		// $booted map. The first boot pass (plugins_loaded:20) populates
 		// $booted, but boot_pending() at priority 99 is specifically there to
-		// boot addons registered in the 21-98 window — keying this guard on
+		// boot addons registered in the 21-98 window - keying this guard on
 		// "$booted is non-empty" would reject exactly those and make the
 		// fallback dead code. Only reject once the final pass has run.
 		if ( $this->final_boot_done ) {
@@ -519,7 +519,7 @@ final class AddonRegistry {
 				esc_html(
 					sprintf(
 						/* translators: %s is the addon ID. */
-						__( 'Addon "%s" was registered AFTER the perflocale/addons/register action fired — its boot() will never be called. Hook your registration on perflocale/addons/register (or earlier).', 'perflocale' ),
+						__( 'Addon "%s" was registered AFTER the perflocale/addons/register action fired - its boot() will never be called. Hook your registration on perflocale/addons/register (or earlier).', 'perflocale' ),
 						$id
 					)
 				),
@@ -556,7 +556,7 @@ final class AddonRegistry {
 				esc_html(
 					sprintf(
 						/* translators: %s is the addon ID. */
-						__( 'Addon "%s" is already registered. Registering twice would overwrite the prior instance — second-call ignored.', 'perflocale' ),
+						__( 'Addon "%s" is already registered. Registering twice would overwrite the prior instance - second-call ignored.', 'perflocale' ),
 						$id
 					)
 				),
@@ -570,7 +570,7 @@ final class AddonRegistry {
 		// checks in production would only burn cycles to report nothing. The
 		// outer guard keeps prod boot cost at one `defined()` check per addon
 		// (~50 ns × N addons) while still surfacing real contract violations
-		// in dev. Checks 1-4 above don't get this gate — they have behavioural
+		// in dev. Checks 1-4 above don't get this gate - they have behavioural
 		// side effects (return early) that must run in production too.
 		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 			// (5) Empty get_name(): breaks Site Health "addon health" cards
@@ -581,7 +581,7 @@ final class AddonRegistry {
 					esc_html(
 						sprintf(
 							/* translators: %s is the addon ID. */
-							__( 'Addon "%s" returned an empty AddonInterface::get_name() — admin UI rows + Site Health cards rely on it. Provide a human-readable name.', 'perflocale' ),
+							__( 'Addon "%s" returned an empty AddonInterface::get_name() - admin UI rows + Site Health cards rely on it. Provide a human-readable name.', 'perflocale' ),
 							$id
 						)
 					),
@@ -600,7 +600,7 @@ final class AddonRegistry {
 					esc_html(
 						sprintf(
 							/* translators: 1: addon ID, 2: offending version string. */
-							__( 'Addon "%1$s" returned get_version()="%2$s" — must be a dot-version string (e.g. 1.0.0 or 1.0.0-beta). Compatibility gates via version_compare() will silently treat it as invalid.', 'perflocale' ),
+							__( 'Addon "%1$s" returned get_version()="%2$s" - must be a dot-version string (e.g. 1.0.0 or 1.0.0-beta). Compatibility gates via version_compare() will silently treat it as invalid.', 'perflocale' ),
 							$id,
 							$version
 						)
@@ -618,7 +618,7 @@ final class AddonRegistry {
 					esc_html(
 						sprintf(
 							/* translators: 1: addon ID, 2: offending return type. */
-							__( 'Addon "%1$s" returned get_required_plugins() = %2$s — must be an array of plugin-file strings (or empty array).', 'perflocale' ),
+							__( 'Addon "%1$s" returned get_required_plugins() = %2$s - must be an array of plugin-file strings (or empty array).', 'perflocale' ),
 							$id,
 							get_debug_type( $required )
 						)
@@ -676,7 +676,7 @@ final class AddonRegistry {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/addons/registered returned %s — must be an array<string, AddonInterface>. Falling back to the unfiltered registration map.', 'perflocale' ),
+						__( 'A hook on perflocale/addons/registered returned %s - must be an array<string, AddonInterface>. Falling back to the unfiltered registration map.', 'perflocale' ),
 						get_debug_type( $filtered )
 					)
 				),
@@ -714,7 +714,7 @@ final class AddonRegistry {
 			}
 
 			// Operator-controlled enable/disable. Any addon in the disabled
-			// list is skipped at boot — bundled and external alike. The
+			// list is skipped at boot - bundled and external alike. The
 			// old "bundled addons can't be disabled without a filter
 			// override" safeguard was confusing UX: clicking Disable in
 			// the admin wrote the option but boot still honoured the
@@ -736,8 +736,8 @@ final class AddonRegistry {
 			 * yet, so a callback cannot key on them.
 			 *
 			 * False skips the boot for this request only. The addon is
-			 * reported as disabled by filter — not incompatible, not
-			 * quarantined — its failure counter is untouched, and the
+			 * reported as disabled by filter - not incompatible, not
+			 * quarantined - its failure counter is untouched, and the
 			 * disabled list behind the Addons page switch is not changed.
 			 * True boots an addon that list turns off. Quarantined addons
 			 * are skipped before this filter runs.
@@ -764,7 +764,7 @@ final class AddonRegistry {
 			// bytes. That was wrong once anything other than the Addons page read
 			// it: Site Health now runs in WordPress's weekly cron check, where
 			// is_admin() is false, so the addon card saw an empty list and wrote a
-			// GREEN result over the amber one an admin visit had produced — the
+			// GREEN result over the amber one an admin visit had produced - the
 			// very "issue count of zero on a site with a problem" symptom that
 			// running on cron was meant to fix. `wp perflocale addon` has the same
 			// problem: WP-CLI is not an admin request either, so its
@@ -794,15 +794,15 @@ final class AddonRegistry {
 
 				if ( ! $compatible ) {
 					// Record it. This used to be a bare `continue`, so an addon
-					// that declared itself incompatible — a host plugin below the
+					// that declared itself incompatible - a host plugin below the
 					// version it needs, a missing dependency, a site filter saying
-					// no — vanished with no trace anywhere: the Addons page still
+					// no - vanished with no trace anywhere: the Addons page still
 					// badged it Active because that badge asks "is the host plugin
 					// present?", and the Site Health addon card reported every
 					// addon booting fine because it only counts quarantined ones.
 					// The operator's integration was simply not running.
 					//
-					// Recorded in EVERY context, deliberately — see the note on
+					// Recorded in EVERY context, deliberately - see the note on
 					// version_mismatches above. Site Health reads this from the
 					// weekly cron run, where is_admin() is false.
 					$this->incompatible[ $id ] = true;
@@ -822,7 +822,7 @@ final class AddonRegistry {
 				// file and a parse error. Recording that forever means the
 				// site owner carries a red notice about a problem that fixed
 				// itself on the next request, and the only way out is a WP-CLI
-				// command they may not have. Scoped to the `boot` stage — a
+				// command they may not have. Scoped to the `boot` stage - a
 				// failed migration or uninstall is a different fact that a
 				// successful boot does not invalidate.
 				//
@@ -855,7 +855,7 @@ final class AddonRegistry {
 				$failure_changed = true;
 
 				// Persist the message so the Addons admin page can surface
-				// it inline on the card — operators no longer need to SSH
+				// it inline on the card - operators no longer need to SSH
 				// + tail error_log to find out why a card reads "Quarantined".
 				AddonMigrationErrors::record(
 					$id,
@@ -883,10 +883,13 @@ final class AddonRegistry {
 	 */
 	private const FAILURE_OPTION = 'perflocale_addon_failures';
 
+	// The bundled add-on whose settings fields are all stored globally.
+	private const GLOBAL_SETTINGS_ONLY = 'woocommerce';
+
 	/**
 	 * Transient name for the cached "which addons should boot" decision.
 	 *
-	 * LEGACY. Nothing writes or reads this any more — resolve_bootable_ids()
+	 * LEGACY. Nothing writes or reads this any more - resolve_bootable_ids()
 	 * always computes the list (see the note there for the measurements and the
 	 * twelve-hour silent-failure window that removing it closed). The constant
 	 * and the delete in flush_bootable_cache() are kept so that a site upgrading
@@ -977,7 +980,7 @@ final class AddonRegistry {
 
 		// Drop the boot records too. This is the operator saying "I have dealt
 		// with it, try again"; leaving the red notice standing after that is
-		// just a stale claim, and it is the notice — not the counter — that
+		// just a stale claim, and it is the notice - not the counter - that
 		// they can actually see. Other stages are left alone: a failed
 		// migration is not retried by un-quarantining.
 		AddonMigrationErrors::clear_stage( $id, 'boot' );
@@ -1008,7 +1011,7 @@ final class AddonRegistry {
 	 * an external plugin via the perflocale/addons/register action.
 	 *
 	 * Useful for CLI tooling and admin UI that needs to surface "this
-	 * addon ships with PerfLocale itself" — bundled addons need --force
+	 * addon ships with PerfLocale itself" - bundled addons need --force
 	 * to disable, and external addons honour the disabled list without
 	 * any filter override.
 	 *
@@ -1052,7 +1055,7 @@ final class AddonRegistry {
 	 * Option key storing the operator-controlled disabled-addon list.
 	 *
 	 * Format: indexed array of addon IDs. Empty array (the default) means
-	 * "boot every compatible addon" — the historic behaviour.
+	 * "boot every compatible addon" - the historic behaviour.
 	 */
 	private const DISABLED_OPTION = 'perflocale_disabled_addons';
 
@@ -1065,7 +1068,7 @@ final class AddonRegistry {
 	 * Defensive normalisation: a direct DB write outside our own setter
 	 * could leave junk in the option (nulls, numbers, malformed strings).
 	 * We coerce to strings, drop anything that doesn't match the
-	 * canonical addon-id pattern, then dedupe — guaranteeing the boot
+	 * canonical addon-id pattern, then dedupe - guaranteeing the boot
 	 * loop's `in_array(..., true)` comparisons always run against valid
 	 * ids and that one bad direct-DB write can't put empty-string entries
 	 * into the bootable cache.
@@ -1093,7 +1096,7 @@ final class AddonRegistry {
 	/**
 	 * Hard cap on the serialised size of the disabled-addons option. The
 	 * option is autoloaded, so anything stored here is deserialised on
-	 * every request — a malicious or buggy caller mustn't be able to grow
+	 * every request - a malicious or buggy caller mustn't be able to grow
 	 * it without bound. 4 KiB comfortably fits hundreds of well-formed
 	 * addon ids (16-char regex × ~150 = 2.4 KiB before overhead). Any
 	 * write that would push past the cap is rejected, returns false, and
@@ -1113,7 +1116,7 @@ final class AddonRegistry {
 	 */
 	private const DISABLED_LOCK_NAME = 'addon_disabled_write';
 
-	/** Short TTL — the work inside is a single update_option call. */
+	/** Short TTL - the work inside is a single update_option call. */
 	private const DISABLED_LOCK_TTL = 10;
 
 	/**
@@ -1154,7 +1157,7 @@ final class AddonRegistry {
 		if ( ! AddonSchemaManager::validate_addon_id( $id ) ) {
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected — invalid addon_id "%s"', substr( $id, 0, 64 ) ) );
+				error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected - invalid addon_id "%s"', substr( $id, 0, 64 ) ) );
 			}
 			return false;
 		}
@@ -1163,7 +1166,7 @@ final class AddonRegistry {
 			self::DISABLED_LOCK_NAME,
 			self::DISABLED_LOCK_TTL,
 			static function () use ( $id, $disabled ): bool {
-				// Re-read the option inside the lock — otherwise this request
+				// Re-read the option inside the lock - otherwise this request
 				// mutates the list it loaded at bootstrap and overwrites any
 				// commit another request made since. The option is
 				// autoloaded, so get_option() answers from this request's
@@ -1208,7 +1211,7 @@ final class AddonRegistry {
 						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 						error_log(
 							sprintf(
-								'PerfLocale AddonRegistry::set_disabled rejected — disabled-list would exceed %d bytes (current %d)',
+								'PerfLocale AddonRegistry::set_disabled rejected - disabled-list would exceed %d bytes (current %d)',
 								self::DISABLED_OPTION_MAX_BYTES,
 								strlen( $serialised )
 							)
@@ -1225,7 +1228,7 @@ final class AddonRegistry {
 				if ( ! update_option( self::DISABLED_OPTION, $current, true ) && $current !== $before ) {
 					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-						error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected — the options write for "%s" was refused', $id ) );
+						error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected - the options write for "%s" was refused', $id ) );
 					}
 					return false;
 				}
@@ -1234,18 +1237,18 @@ final class AddonRegistry {
 		);
 
 		// Lock::with() returns null when the lock is already held (acquire()
-		// fails at once, no wait) — surface as a transient failure so
+		// fails at once, no wait) - surface as a transient failure so
 		// callers (admin handler / CLI) can react.
 		if ( $result === null ) {
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected — lock contention on "%s"', $id ) );
+				error_log( sprintf( 'PerfLocale AddonRegistry::set_disabled rejected - lock contention on "%s"', $id ) );
 			}
 			return false;
 		}
 
 		if ( $result === true ) {
-			// Flush the bootable-IDs transient — the disabled flag
+			// Flush the bootable-IDs transient - the disabled flag
 			// changes whether an addon should boot next request. Doing
 			// this OUTSIDE the lock is fine: the transient is a cache
 			// invalidation signal, not authoritative state.
@@ -1259,7 +1262,7 @@ final class AddonRegistry {
 	 * Replace the entire disabled-addon list in one write.
 	 *
 	 * Unlike {@see set_disabled()} (which toggles one id), this overwrites
-	 * the whole list — used by the data importer to restore an exported
+	 * the whole list - used by the data importer to restore an exported
 	 * operator intent. An empty array means "nothing disabled" and is a
 	 * valid, meaningful state (must be stored literally, not skipped).
 	 *
@@ -1291,7 +1294,7 @@ final class AddonRegistry {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				error_log(
 					sprintf(
-						'PerfLocale AddonRegistry::set_disabled_list rejected — list would exceed %d bytes (got %d)',
+						'PerfLocale AddonRegistry::set_disabled_list rejected - list would exceed %d bytes (got %d)',
 						self::DISABLED_OPTION_MAX_BYTES,
 						strlen( $serialised )
 					)
@@ -1318,7 +1321,7 @@ final class AddonRegistry {
 				if ( ! update_option( self::DISABLED_OPTION, $normalised, true ) && $stored !== $normalised ) {
 					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected — the options write was refused' );
+						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected - the options write was refused' );
 					}
 					return false;
 				}
@@ -1349,7 +1352,7 @@ final class AddonRegistry {
 	 * settings option, but ONLY on the addon's first successful boot.
 	 *
 	 * "First" is detected by the absence of any entry for `$id` in the
-	 * settings option — so:
+	 * settings option - so:
 	 *   • Fresh install / brand-new addon         → seed runs once.
 	 *   • Subsequent boots                        → no-op (entry exists).
 	 *   • User opened the admin form and saved
@@ -1362,7 +1365,7 @@ final class AddonRegistry {
 	 *     for marginal benefit.
 	 *
 	 * Each field's `default` value is only written if the field's `type`
-	 * declares a default — hidden/addon-managed fields with no default
+	 * declares a default - hidden/addon-managed fields with no default
 	 * are skipped so addons that use 'hidden' as opaque scratch space
 	 * don't get stuck with a generic init value.
 	 *
@@ -1377,6 +1380,11 @@ final class AddonRegistry {
 	 * @return void
 	 */
 	private function maybe_seed_defaults( AddonInterface $addon, string $id ): void {
+		// The bundled add-on GLOBAL_SETTINGS_ONLY names has nothing to seed.
+		if ( self::GLOBAL_SETTINGS_ONLY === $id && ( $this->bundled[ $id ] ?? null ) === $addon ) {
+			return;
+		}
+
 		try {
 			$fields = $addon->get_settings_fields();
 		} catch ( \Throwable $e ) {
@@ -1403,7 +1411,7 @@ final class AddonRegistry {
 		// Compute the seedable set BEFORE any I/O: for addons whose fields
 		// are all global-storage (e.g. WooCommerce) $defaults is permanently
 		// empty, and bailing here means those addons never trigger the
-		// perflocale_addon_settings option read (autoload=off — one
+		// perflocale_addon_settings option read (autoload=off - one
 		// options-table SELECT per request on non-object-cache sites when
 		// this seeding pass is the request's only reader).
 		$defaults = [];
@@ -1414,7 +1422,7 @@ final class AddonRegistry {
 			}
 
 			// 'global'-storage fields live in `perflocale_settings`, not
-			// here — seeding them would create a stale duplicate copy
+			// here - seeding them would create a stale duplicate copy
 			// that confuses `wp perflocale addon settings get` and never
 			// converges with the live value.
 			if ( AddonSettings::is_global_storage( $field ) ) {
@@ -1431,7 +1439,7 @@ final class AddonRegistry {
 		}
 
 		// Only seed if the addon has no entry yet. AddonSettings::get_addon
-		// returns [] for both "missing" and "empty" — both are the seed
+		// returns [] for both "missing" and "empty" - both are the seed
 		// trigger here, which is fine (see method docblock).
 		$existing = AddonSettings::get_addon( $id );
 
@@ -1448,7 +1456,7 @@ final class AddonRegistry {
 			 * successful boot. Use this for one-shot first-activation
 			 * work (welcome email, sample-data import, telemetry opt-in
 			 * prompt). Will NOT fire on subsequent boots even if the
-			 * user clears all settings — re-firing would require an
+			 * user clears all settings - re-firing would require an
 			 * explicit AddonSettings::forget($id) call.
 			 *
 			 * @hook perflocale/addon/seeded Fires after auto-seed on first boot.

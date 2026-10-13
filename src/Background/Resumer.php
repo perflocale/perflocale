@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * {@see \PerfLocale\Deactivator} unschedules every `perflocale_job_run_<type>`
  * hook so a deactivated plugin doesn't leave cron events firing against
  * missing callbacks. The JobState rows in the plugin's `jobs` table,
- * though, intentionally survive — the operator's job history shouldn't
+ * though, intentionally survive - the operator's job history shouldn't
  * vanish on deactivate.
  *
  * The consequence: after reactivate, any rows that were `queued` or
@@ -122,7 +122,7 @@ final class Resumer {
 			}
 
 			// Re-load the full per-job row to get hook + args. Skip if the
-			// row vanished between the listing and now — the normal GC's
+			// row vanished between the listing and now - the normal GC's
 			// stuck-job sweep tidies anything left behind on the next tick.
 			$state = JobState::get( (string) $job_id );
 
@@ -138,8 +138,8 @@ final class Resumer {
 			}
 
 			// Skip if a worker event already exists (e.g. a fresh admin
-			// dispatch ran before the Resumer). Probe BOTH engines — the
-			// operator may have switched background_engine while deactivated —
+			// dispatch ran before the Resumer). Probe BOTH engines - the
+			// operator may have switched background_engine while deactivated -
 			// and BOTH arg shapes (base + the multisite blog-id sentinel that
 			// Dispatcher::enqueue injects), or a probe with stripped args would
 			// miss the scheduled event and duplicate the job.
@@ -221,14 +221,14 @@ final class Resumer {
 
 			// Flip running → queued before scheduling so the Jobs page
 			// reflects reality (no worker is actually mid-run). Does NOT
-			// bump attempts — the previous run didn't fail on its own
+			// bump attempts - the previous run didn't fail on its own
 			// merits, it was killed by the operator deactivating.
 			if ( $status === 'running' ) {
 				JobState::reset_for_retry( (string) $job_id );
 			}
 
 			// Inject the blog-id sentinel so the worker can switch_to_blog
-			// before reading state — same as a fresh Dispatcher::enqueue.
+			// before reading state - same as a fresh Dispatcher::enqueue.
 			// `$blog_id` was already captured above for the dedupe probe.
 			$worker_args = WorkerRegistry::with_blog_sentinel( $args, $blog_id );
 

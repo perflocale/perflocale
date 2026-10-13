@@ -2,7 +2,7 @@
  * Shared admin progressive enhancement helpers, delegated at document
  * level so they cover elements added after page load.
  *
- * Triggered via data attributes (no inline JS in PHP — keeps the plugin
+ * Triggered via data attributes (no inline JS in PHP - keeps the plugin
  * compliant with the no-inline-scripts repo rule):
  *
  *   data-perflocale-confirm="message"
@@ -53,7 +53,7 @@
 		navigator.clipboard.writeText( value ).then( function () {
 			flash( el );
 		} ).catch( function () {
-			// Silent — user can still select+copy manually.
+			// Silent - user can still select+copy manually.
 		} );
 	}
 
@@ -93,7 +93,7 @@
 		// A form.submit() whose navigation never completes would otherwise
 		// strand the button disabled with its label swapped and its icon gone.
 		// pageshow fires when the browser restores the frozen page from
-		// bfcache (Back navigation) — the common way such a button reappears.
+		// bfcache (Back navigation) - the common way such a button reappears.
 		window.addEventListener( 'pageshow', function () {
 			var busy = document.querySelectorAll( '[data-perflocale-submit-busy]' );
 			for ( var i = 0; i < busy.length; i++ ) {
@@ -113,7 +113,7 @@
 			el.disabled = true;
 
 			// An unsaved-changes guard can cancel the navigation ("Stay"), which
-			// fires no pageshow — the button would stay disabled with its icon
+			// fires no pageshow - the button would stay disabled with its icon
 			// gone until a manual reload. A cancelled navigation never sent the
 			// request, so re-enabling is safe there; pagehide cancels the timer
 			// whenever the page really is leaving, so a committed navigation

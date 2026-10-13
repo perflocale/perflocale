@@ -93,7 +93,7 @@ final class HreflangManager {
 		$current = $plugin->get( 'router' )->get_current_language();
 
 		if ( $current && ! empty( $current->locale ) ) {
-			// `<html lang="…">` follows BCP 47 — same canonical form as
+			// `<html lang="…">` follows BCP 47 - same canonical form as
 			// hreflang (lowercase language + UPPERCASE region).
 			$lang     = \PerfLocale\Helper::format_locale_as_bcp47( (string) $current->locale );
 			$new_attr = 'lang="' . esc_attr( $lang ) . '"';

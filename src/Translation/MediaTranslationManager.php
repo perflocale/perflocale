@@ -67,7 +67,7 @@ final class MediaTranslationManager {
 	/**
 	 * Per-request memo of "is the current language the default?", used by the
 	 * hot filter_thumbnail_id() path. A class static (not a function-static)
-	 * so reset_registered() can clear it on switch_blog — the current language
+	 * so reset_registered() can clear it on switch_blog - the current language
 	 * differs per blog, so a stale value would mis-route thumbnail IDs.
 	 *
 	 * @var bool|null
@@ -145,7 +145,7 @@ final class MediaTranslationManager {
 
 		// The per-language Description the media edit form solicits was
 		// write-without-read: no visitor surface ever served it. Attachment
-		// pages render the attachment's post_content — swap it for the
+		// pages render the attachment's post_content - swap it for the
 		// current-language description there (priority 8, before wpautop),
 		// and mirror it into REST media payloads for view contexts.
 		add_filter( 'the_content', [ $this, 'filter_attachment_page_description' ], 8 );
@@ -171,7 +171,7 @@ final class MediaTranslationManager {
 		// pointed at it. Core does exactly that for its own key two lines after
 		// this action fires, with a delete_metadata() call on `_thumbnail_id`.
 		// Our overrides are a parallel set of the same assignment and need the
-		// same retraction — see prune_thumbnail_overrides() for what a leftover
+		// same retraction - see prune_thumbnail_overrides() for what a leftover
 		// row does to the front end.
 		add_action( 'delete_attachment', [ $this, 'prune_thumbnail_overrides' ] );
 	}
@@ -180,7 +180,7 @@ final class MediaTranslationManager {
 	 * Filter image alt text for current language.
 	 *
 	 * @param array<string, string> $attr       Image attributes.
-	 * @param mixed                 $attachment Attachment post — NOT guaranteed to be a
+	 * @param mixed                 $attachment Attachment post - NOT guaranteed to be a
 	 *                                          WP_Post. Core builds it with an unchecked
 	 *                                          `get_post( $attachment_id )` at
 	 *                                          wp-includes/media.php:1176 and never
@@ -189,7 +189,7 @@ final class MediaTranslationManager {
 	 *                                          whenever the documented `image_downsize`
 	 *                                          preempt filter satisfies the entry gate for
 	 *                                          an id with no post row. Typing this
-	 *                                          `\WP_Post` threw at ARGUMENT BINDING — a
+	 *                                          `\WP_Post` threw at ARGUMENT BINDING - a
 	 *                                          white screen on any page rendering that
 	 *                                          image, before the guards below could run.
 	 * @return array<string, string>
@@ -251,7 +251,7 @@ final class MediaTranslationManager {
 		// Written only by save_translation_fields(), which runs the value
 		// through sanitize_textarea_field(). Escaped again on the way out
 		// (escape late) so this filter can never emit markup regardless of what
-		// wrote the row — the same value is esc_html()'d on the REST branch.
+		// wrote the row - the same value is esc_html()'d on the REST branch.
 		// esc_html() does not double-encode existing entities and leaves
 		// newlines intact, so wpautop at priority 10 still builds paragraphs.
 		$translated = (string) get_post_meta( $post->ID, '_perflocale_description_' . $lang_slug, true );
@@ -262,7 +262,7 @@ final class MediaTranslationManager {
 	/**
 	 * Mirror the per-language caption/description into REST media payloads.
 	 *
-	 * View contexts only — the editor (context=edit) must keep the raw
+	 * View contexts only - the editor (context=edit) must keep the raw
 	 * source values it writes back.
 	 *
 	 * @param mixed $response REST response.
@@ -324,7 +324,7 @@ final class MediaTranslationManager {
 
 		$translated = get_post_meta( $attachment_id, '_perflocale_caption_' . $lang_slug, true );
 
-		// Escape late — core echoes this filter's return value unescaped in
+		// Escape late - core echoes this filter's return value unescaped in
 		// the_post_thumbnail_caption(), and the same meta is esc_html()'d on
 		// the REST branch below.
 		return $translated !== '' ? esc_html( (string) $translated ) : $caption;
@@ -336,14 +336,14 @@ final class MediaTranslationManager {
 	 * `$meta` is deliberately untyped. `wp_prepare_attachment_for_js()` passes
 	 * the return of `wp_get_attachment_metadata()` straight through, and that
 	 * is `false` whenever the attachment has no usable `_wp_attachment_metadata`
-	 * row — an attachment created by `wp_insert_attachment()` alone (what most
+	 * row - an attachment created by `wp_insert_attachment()` alone (what most
 	 * importers and sideloaders do), or a document whose file was already gone
 	 * when metadata generation ran, which stores an empty array that
 	 * `wp_get_attachment_metadata()` reports as `false`. An `array` hint made
 	 * PHP throw a TypeError at ARGUMENT BINDING, before this method's own body
 	 * could guard anything, so `admin-ajax.php?action=query-attachments`
-	 * returned a 500 and the media library — the Media page, the block editor's
-	 * image block, and this plugin's own per-language featured-image picker —
+	 * returned a 500 and the media library - the Media page, the block editor's
+	 * image block, and this plugin's own per-language featured-image picker -
 	 * rendered zero attachments for the whole site. The value is never read
 	 * here; it is accepted and ignored so the filter is transparent whatever
 	 * core hands it.
@@ -456,13 +456,13 @@ final class MediaTranslationManager {
 	 *   - wp-admin/includes/ajax-actions.php `$_REQUEST['attachments'][ $id ]`
 	 *   - wp-admin/includes/post.php      `$post_data['attachments'][ $id ] ?? array()`
 	 *
-	 * and none of them checks the element's type — `empty()` is the only
+	 * and none of them checks the element's type - `empty()` is the only
 	 * gate. A request that posts `attachments[123]=foo` therefore arrives
 	 * here as a string, which an `array` type declaration rejects at
 	 * argument binding, before any guard in the body can run: an uncaught
 	 * TypeError out of wp_ajax_save_attachment_compat() / edit_post(), i.e.
 	 * a 500 on saving media. Accept whatever the caller has and return
-	 * `$post` UNCHANGED when there are no fields to read — never a coerced
+	 * `$post` UNCHANGED when there are no fields to read - never a coerced
 	 * copy, since this filter's return value IS the post data core then
 	 * writes.
 	 *
@@ -673,7 +673,7 @@ final class MediaTranslationManager {
 			}
 
 			// Suppress the metabox entirely when there's nothing meaningful to
-			// render for this post — a registered box with an "every language
+			// render for this post - a registered box with an "every language
 			// already translated" placeholder just steals visual real estate.
 			// The placeholder stays a fallback (resolve_panel_languages()
 			// returning [] mid-render).
@@ -711,7 +711,7 @@ final class MediaTranslationManager {
 		if ( $languages === [] ) {
 			?>
 			<p class="description" style="margin-top:0;">
-				<?php echo esc_html__( 'Every language already has its own translation of this post — each translation manages its own featured image. No per-language override needed here.', 'perflocale' ); ?>
+				<?php echo esc_html__( 'Every language already has its own translation of this post - each translation manages its own featured image. No per-language override needed here.', 'perflocale' ); ?>
 			</p>
 			<?php
 			return;
@@ -766,7 +766,7 @@ final class MediaTranslationManager {
 	 * Decide which languages to surface as rows in the per-language Featured
 	 * Image panel for a given post.
 	 *
-	 * Policy — hide a language row iff at least one of:
+	 * Policy - hide a language row iff at least one of:
 	 *
 	 * 1) A SIBLING translation post in that language exists (different
 	 *    object_id, same group). The sibling has its own _thumbnail_id, so
@@ -898,6 +898,15 @@ final class MediaTranslationManager {
 			return;
 		}
 
+		// The form belongs to the post being edited. Another post saved in the
+		// same request (a translation the sync writes, a stub created on
+		// publish) keeps its own overrides.
+		$form_post = isset( $_POST['post_ID'] ) && is_scalar( $_POST['post_ID'] ) ? absint( $_POST['post_ID'] ) : 0;
+
+		if ( $form_post !== $post_id ) {
+			return;
+		}
+
 		if ( ! current_user_can( 'edit_post', $post_id ) ) {
 			return;
 		}
@@ -949,7 +958,7 @@ final class MediaTranslationManager {
 			// picker only ever offers `library: { type: 'image' }`, and core's
 			// own set_post_thumbnail() refuses anything wp_get_attachment_image()
 			// can't render, so a PDF or a .zip arriving here came from a forged
-			// POST, not the UI — and storing it would give that language a
+			// POST, not the UI - and storing it would give that language a
 			// featured image that silently renders nothing while every other
 			// language keeps its image. The test is positive-evidence-only: an
 			// attachment with no declared MIME type (an odd import, an offloaded
@@ -969,21 +978,21 @@ final class MediaTranslationManager {
 	 * Retract every per-language featured-image override that pointed at an
 	 * attachment being deleted.
 	 *
-	 * Core guarantees this for its own key — `wp_delete_attachment()` runs
+	 * Core guarantees this for its own key - `wp_delete_attachment()` runs
 	 * `delete_metadata( 'post', null, '_thumbnail_id', $post_id, true )`
 	 * immediately after firing `delete_attachment`, so deleting an image
 	 * un-assigns it as a featured image everywhere. `_perflocale_thumbnail_*`
 	 * is the same assignment held under a per-language key, and without the
 	 * same retraction the row survives the attachment: filter_thumbnail_id()
 	 * then keeps returning the dead ID for that language, get_the_post_thumbnail()
-	 * resolves it to nothing, and the page loses its featured image ENTIRELY —
+	 * resolves it to nothing, and the page loses its featured image ENTIRELY -
 	 * while every other language still renders the post's perfectly good
 	 * default. Measured on a real site: `/de/<post>/` went from one
 	 * `wp-post-image` to zero, `/` was unaffected, and nothing in the editor
 	 * hinted at why. Deleting media is an everyday action.
 	 *
 	 * Iterating language rows rather than pattern-matching the meta key keeps
-	 * this to core's metadata API — the object cache and the delete_post_meta
+	 * this to core's metadata API - the object cache and the delete_post_meta
 	 * hooks stay correct for free, and no new raw query joins the plugin. One
 	 * indexed lookup per configured language is spent against a
 	 * wp_delete_attachment() call that already runs dozens of queries on the
@@ -992,7 +1001,7 @@ final class MediaTranslationManager {
 	 * deactivated language's override becomes live again the moment it is
 	 * switched back on, so its rows must be retracted too.
 	 *
-	 * @param mixed $attachment_id Attachment ID as core passed it — `wp_delete_attachment()`
+	 * @param mixed $attachment_id Attachment ID as core passed it - `wp_delete_attachment()`
 	 *                             forwards its own argument untouched, so a caller that
 	 *                             handed it a numeric string arrives here as one.
 	 * @return void
@@ -1015,9 +1024,9 @@ final class MediaTranslationManager {
 
 			// Same call shape core uses for `_thumbnail_id`: delete every
 			// post's row for this key whose value is the departing attachment.
-			// The `$object_id` argument is inert under `$delete_all` — core
+			// The `$object_id` argument is inert under `$delete_all` - core
 			// absint()s it (null and 0 both become 0) before the row lookup,
-			// which reads meta_key + meta_value only — so 0 is passed here
+			// which reads meta_key + meta_value only - so 0 is passed here
 			// rather than core's null purely to satisfy the int type hint.
 			delete_metadata( 'post', 0, self::THUMBNAIL_OVERRIDE_PREFIX . $slug, $attachment_id, true );
 		}

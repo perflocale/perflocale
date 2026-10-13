@@ -18,10 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Translate EVERY (selected) post on the site — as a chain of bounded chunks.
+ * Translate EVERY (selected) post on the site - as a chain of bounded chunks.
  *
  * Args are the SELECTION QUERY, never ID lists (job args are capped at 100 KB
- * JSON, ~12k IDs — a selection query scales to any site size):
+ * JSON, ~12k IDs - a selection query scales to any site size):
  *
  *   {
  *     post_types:      string[]  (default ['post','page'])
@@ -41,9 +41,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * completes when the selection runs dry.
  *
  * Resumability falls out of the design: a retry-from-zero re-skips finished
- * pairs at ZERO provider cost — the skip-existing rule returns before the
+ * pairs at ZERO provider cost - the skip-existing rule returns before the
  * provider is ever reached, so a re-run over an already-translated selection
- * makes no API calls at all — and the cursor bounds each execution's runtime
+ * makes no API calls at all - and the cursor bounds each execution's runtime
  * under the job lock TTL. Cancel is cooperative per chunk. Canceling a
  * queued chunk stops the chain, since each chunk only enqueues the next one
  * from inside its own running execute(). Canceling a running chunk stops it
@@ -56,7 +56,7 @@ final class SiteTranslateJob extends AbstractJob {
 
 	/**
 	 * Upper bound on source IDs fetched per execution. This is a FETCH cap,
-	 * not the work bound — see CHUNK_SECONDS.
+	 * not the work bound - see CHUNK_SECONDS.
 	 */
 	private const CHUNK_SIZE = 100;
 
@@ -67,7 +67,7 @@ final class SiteTranslateJob extends AbstractJob {
 	 * it is deliberately described that way. The check runs AFTER a source
 	 * completes, so one execution can overshoot by up to a whole source: with a
 	 * 0.02 s budget and ten languages at 25 ms per pair, a measured execution
-	 * ran 835 ms. A pair-level checkpoint would not fix this either — nothing
+	 * ran 835 ms. A pair-level checkpoint would not fix this either - nothing
 	 * here can interrupt a provider call that is already in flight.
 	 *
 	 * The alternative, persisting an in-source target position, was considered
@@ -82,7 +82,7 @@ final class SiteTranslateJob extends AbstractJob {
 	 *  1. A source count is wrong by a factor of the language count. The old
 	 *     `CHUNK_SIZE = 100` bounded SOURCES and then handed all of them plus
 	 *     EVERY target language to BulkTranslateJob, so a 10-language site ran
-	 *     1,000 pairs in one execution — ~28 s of stub work at the measured
+	 *     1,000 pairs in one execution - ~28 s of stub work at the measured
 	 *     28.3 ms/pair, and hours of it under machine translation.
 	 *  2. A pair count cannot fix the MT case either: one provider call is
 	 *     0.2-2 s, so 100 MT pairs is 20-200 s. Only a clock bounds both.
@@ -120,7 +120,7 @@ final class SiteTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Always async — a site-wide run never belongs in a web request.
+	 * Always async - a site-wide run never belongs in a web request.
 	 * (args_size is pinned above every realistic threshold.)
 	 *
 	 * @return int
@@ -140,7 +140,7 @@ final class SiteTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Always async — the recursive chunk chain would otherwise run the WHOLE
+	 * Always async - the recursive chunk chain would otherwise run the WHOLE
 	 * site inside the triggering web request and time out (no JobState row, no
 	 * cancel, cursor lost). The `never` background-processing setting is
 	 * deliberately ignored for this operator-explicit action, and args_size()
@@ -148,7 +148,7 @@ final class SiteTranslateJob extends AbstractJob {
 	 * AbstractJob::should_run_async() short-circuits `never` to inline BEFORE
 	 * the size comparison.
 	 *
-	 * @param array<string, mixed> $args     Unused — the decision is unconditional.
+	 * @param array<string, mixed> $args     Unused - the decision is unconditional.
 	 * @param Settings             $settings Unused.
 	 * @return bool
 	 */
@@ -243,7 +243,7 @@ final class SiteTranslateJob extends AbstractJob {
 				throw new \RuntimeException( esc_html__( 'Could not read the next batch of posts from the database. Nothing was skipped; a retry resumes from the same point.', 'perflocale' ) );
 			}
 
-			// Selection ran dry — the chain is complete.
+			// Selection ran dry - the chain is complete.
 			return [
 				'created' => 0,
 				'skipped' => 0,
@@ -254,7 +254,7 @@ final class SiteTranslateJob extends AbstractJob {
 
 		// Run the chunk through the proven per-pair pipeline INLINE (same
 		// skip-existing, per-row edit-cap re-check, and error accounting as
-		// the admin bulk action) — but ONE SOURCE AT A TIME, so the wall-clock
+		// the admin bulk action) - but ONE SOURCE AT A TIME, so the wall-clock
 		// budget can stop the execution at a source boundary.
 		//
 		// ⭐ The cursor invariant: it only ever advances past a source whose
@@ -288,7 +288,7 @@ final class SiteTranslateJob extends AbstractJob {
 		// The translations themselves survived and were skipped on retry, but
 		// the run reported the wrong creations and re-walked finished work.
 		//
-		// Treat an operator stop as an explicit, resumable outcome — while
+		// Treat an operator stop as an explicit, resumable outcome - while
 		// letting JobCanceledException (which EXTENDS RuntimeException) keep
 		// propagating, because cancel must still cancel.
 		$last_done = $after_id;
@@ -352,7 +352,7 @@ final class SiteTranslateJob extends AbstractJob {
 		// ⚠️ Reconcile the total before finishing. The chunk total is computed
 		// from every FETCHED source, so a budget stop after one source used to
 		// complete the worker row at progress=100 while still advertising
-		// total=500 — "100%, 10/500". Report what was actually attempted; the
+		// total=500 - "100%, 10/500". Report what was actually attempted; the
 		// chain's remaining work is represented by the cursor, not by an
 		// inflated denominator on a finished row.
 		$attempted = (int) ( $chunk_result['processed'] ?? 0 );
@@ -365,12 +365,12 @@ final class SiteTranslateJob extends AbstractJob {
 
 		// NOTE: a budget stop is deliberately NOT signalled here. The chain
 		// always re-enqueues, and terminates when the NEXT execution's keyset
-		// page comes back empty — the same termination rule as before, so a
+		// page comes back empty - the same termination rule as before, so a
 		// short execution and a full one are indistinguishable downstream.
 
 		// A chunk that produced NOTHING but failures means every pair is
 		// hitting the same wall (bogus language id, provider outage, breaker
-		// open) — chaining on would grind through the whole site repeating
+		// open) - chaining on would grind through the whole site repeating
 		// the failure. Stop with a resumable cursor instead.
 		if ( (int) ( $chunk_result['failed'] ?? 0 ) > 0
 			&& (int) ( $chunk_result['created'] ?? 0 ) === 0
@@ -390,7 +390,7 @@ final class SiteTranslateJob extends AbstractJob {
 		}
 
 		// Stop the chain when the monthly cap is already exhausted: every
-		// further translate_post would throw pre-API anyway — ending here
+		// further translate_post would throw pre-API anyway - ending here
 		// turns silent churn into an explicit, resumable stop (re-dispatch
 		// after raising the limit picks up at this cursor).
 		$settings = new Settings();

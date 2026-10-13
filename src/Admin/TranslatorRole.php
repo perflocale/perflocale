@@ -225,7 +225,7 @@ final class TranslatorRole {
 	 * `perflocale_caps_version` option; install_caps() runs whenever
 	 * the stored value is lower.
 	 *
-	 * Unlike PERFLOCALE_DB_VERSION, this is NOT a migration system —
+	 * Unlike PERFLOCALE_DB_VERSION, this is NOT a migration system -
 	 * there are no per-version cap migration methods. The install
 	 * routine is idempotent (the Translator role gets only the delta
 	 * between its filtered defaults and the ledger of what was last
@@ -248,7 +248,7 @@ final class TranslatorRole {
 	 *     reviewer role can be given approve rights without the broader
 	 *     `perflocale_manage_translations` cap.
 	 */
-	private const CAPS_VERSION = 4;
+	public const CAPS_VERSION = 4;
 
 	/**
 	 * Create the Translator role and add capabilities to existing roles.
@@ -257,7 +257,7 @@ final class TranslatorRole {
 	 * current. Callable in two contexts:
 	 *
 	 *   - Activation: Activator::activate() calls this so a fresh install
-	 *     has the caps in place before any request is served. Required —
+	 *     has the caps in place before any request is served. Required -
 	 *     without it, the very first /wp-admin redirect after activation
 	 *     hits a stale `WP_User->$allcaps` cache and 403s.
 	 *   - admin_init: covers plugin upgrades (new caps in a later
@@ -270,7 +270,7 @@ final class TranslatorRole {
 	 * survive a deactivate/activate cycle.
 	 *
 	 * Multisite: caller is responsible for `switch_to_blog()` when running
-	 * across sites — see Activator::activate_for_network() and the
+	 * across sites - see Activator::activate_for_network() and the
 	 * Bootstrap `wp_initialize_site` handler.
 	 *
 	 * @return void
@@ -728,7 +728,7 @@ final class TranslatorRole {
 				$role->remove_cap( $cap );
 			}
 
-			// Retired capabilities too — otherwise a site that installed an
+			// Retired capabilities too - otherwise a site that installed an
 			// older build keeps them on the role forever.
 			foreach ( self::LEGACY_CAPABILITIES as $cap ) {
 				$role->remove_cap( $cap );

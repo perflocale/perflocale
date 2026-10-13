@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * path instead of {@see JobState::mark_failed()} + retry-with-backoff.
  *
  * Long-running jobs that periodically call `$progress($processed, $total)`
- * get the cancel signal for free — the next progress tick throws. Jobs
+ * get the cancel signal for free - the next progress tick throws. Jobs
  * that don't call progress (sub-second work) finish naturally; the
  * cancellation arrives too late to interrupt them, which is fine.
  *

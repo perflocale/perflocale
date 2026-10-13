@@ -63,7 +63,7 @@ final class PerfLocaleBricks implements \PerfLocale\Addon\AddonInterface {
 	public function boot( \PerfLocale\Plugin $plugin ): void {
 		// Register Bricks meta keys as translatable.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		// ⚠️ Only the TEXT-FREE keys mirror — see add_mirror_keys() for what is on
+		// ⚠️ Only the TEXT-FREE keys mirror - see add_mirror_keys() for what is on
 		// that list and why the builder document is not. A mirror is
 		// bidirectional, so mirroring a document that carries the user's words
 		// destroys translated text in both directions.
@@ -85,8 +85,8 @@ final class PerfLocaleBricks implements \PerfLocale\Addon\AddonInterface {
 	 * Rebuild Bricks' generated CSS for a translation whose layout just changed.
 	 *
 	 * ⚠️ BEST EFFORT, AND DELIBERATELY SO. Bricks is a commercial theme and is
-	 * not installed in any of this project's test environments, so — unlike the
-	 * elementor / oxygen / oxygen6 / beaver-builder twins — this handler could
+	 * not installed in any of this project's test environments, so - unlike the
+	 * elementor / oxygen / oxygen6 / beaver-builder twins - this handler could
 	 * not be exercised against the real host. Rather than guess at an API and
 	 * risk a fatal on someone's live site, every call below is gated behind
 	 * `is_callable()` and the method degrades to doing nothing at all, which is
@@ -164,7 +164,7 @@ final class PerfLocaleBricks implements \PerfLocale\Addon\AddonInterface {
 	 * A continuous mirror is bidirectional in ContentSync ("any group member's
 	 * save propagates group-wide"), so mirroring a builder document that carries
 	 * headings, paragraphs and button labels destroys translated text in BOTH
-	 * directions — a translator's save overwrites the source, and the next source
+	 * directions - a translator's save overwrites the source, and the next source
 	 * save overwrites the translation. That was reproduced end to end for
 	 * Elementor on 4.2.1 and 4.1.3, and observed for Beaver Builder on a replica;
 	 * every builder here stores text the same way, so all of them were moved.
@@ -182,7 +182,7 @@ final class PerfLocaleBricks implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	public function add_mirror_keys( array $keys, string $post_type ): array {
-		// NOT the element trees — `_bricks_page_content`, `_bricks_page_content_2`,
+		// NOT the element trees - `_bricks_page_content`, `_bricks_page_content_2`,
 		// `_bricks_page_header_2` and `_bricks_page_footer_2` all carry the text
 		// a translator types.
 		$keys[] = '_bricks_page_settings';
@@ -205,7 +205,7 @@ final class PerfLocaleBricks implements \PerfLocale\Addon\AddonInterface {
 		// class of layout structure as the content tree above; without them a
 		// translated header/footer template diverges from the source after
 		// edits. (_bricks_template_settings holds display CONDITIONS, not
-		// layout — deliberately not mirrored, or siblings would fight over the
+		// layout - deliberately not mirrored, or siblings would fight over the
 		// same targeting.)
 		$keys[] = '_bricks_page_header_2';
 		$keys[] = '_bricks_page_footer_2';

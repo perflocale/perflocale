@@ -1,13 +1,13 @@
 /**
- * PerfLocale — WooCommerce settings subtab JS.
+ * PerfLocale - WooCommerce settings subtab JS.
  *
  * Two interactive widgets on the WooCommerce subtab:
  *
- *   1. "Sync Now" button — POST to admin-ajax.php
+ *   1. "Sync Now" button - POST to admin-ajax.php
  *      (action=perflocale_sync_exchange_rates), update the per-language
  *      rate inputs from the response, render status message.
  *
- *   2. "Create Page Translations" button — POST to admin-ajax.php
+ *   2. "Create Page Translations" button - POST to admin-ajax.php
  *      (action=perflocale_create_wc_pages), drive a progress bar while
  *      it runs, render the per-page status table on completion.
  *
@@ -212,7 +212,7 @@
 							var st    = parts[ 1 ] || '';
 							var isNew = st.indexOf( 'created' ) !== -1;
 							var color = isNew ? '#00a32a' : '#6b7280';
-							var icon  = isNew ? '&#10003;' : '&#8212;';
+							var icon  = isNew ? '&#10003;' : '-';
 							html += '<tr><td style="padding:4px 8px;">' + escapeHtml( label ) + '</td>';
 							html += '<td style="padding:4px 8px;color:' + color + ';white-space:nowrap;">' + icon + ' ' + escapeHtml( st ) + '</td></tr>';
 						} );

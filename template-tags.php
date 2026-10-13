@@ -114,8 +114,8 @@ function perflocale_get_languages(): array {
 /**
  * Get the translated permalink for a post in a specific language.
  *
- * Accepts whatever `get_permalink()` accepts — a post ID, a WP_Post, or null
- * for the current post — because that is what it hands the value to, and a
+ * Accepts whatever `get_permalink()` accepts - a post ID, a WP_Post, or null
+ * for the current post - because that is what it hands the value to, and a
  * template that passes `$post` or `get_queried_object()` must not fatal on
  * the way in. Anything that does not resolve to a post yields an empty
  * string, the same as an unknown ID.

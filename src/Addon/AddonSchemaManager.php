@@ -281,7 +281,7 @@ final class AddonSchemaManager {
 	 * (prepare() cannot bind identifiers), which strips characters like the
 	 * hyphen in addon ids such as "my-addon". Without sanitizing here too,
 	 * DROP/count/exists would look for the un-stripped name and never match the
-	 * table that was actually created — leaking orphan tables on uninstall.
+	 * table that was actually created - leaking orphan tables on uninstall.
 	 *
 	 * @param string $addon_id Addon identifier.
 	 * @param string $short_name Short table name.

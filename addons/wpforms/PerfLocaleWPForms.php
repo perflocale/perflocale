@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * Translates form field labels, descriptions, placeholders, choices, the
  * submit button text and the confirmation message per language by reading them
- * from the duplicated (translated) form post — the WPForms CPT is registered as
+ * from the duplicated (translated) form post - the WPForms CPT is registered as
  * translatable, so a translation is a copy of the form the user edits in the
  * native builder.
  *
@@ -83,7 +83,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/translatable_post_types', [ $this, 'add_post_types' ] );
 
 		// ...but never language-scope it. The visitor-facing paths are safe on
-		// their own — `[wpforms id="123"]` and the block both resolve through
+		// their own - `[wpforms id="123"]` and the block both resolve through
 		// `WPFormsForm_Handler::get_single()`, which ends in
 		// `get_post( absint( $id ) )` (includes/class-form.php:294), a direct
 		// row read the query filter never sees. The LIST path is not:
@@ -101,7 +101,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 		// widget's form picker reads "No forms".
 		//
 		// Editor-facing rather than visitor-facing, so this is a low-severity
-		// member of the class — but the registration costs nothing and scoping
+		// member of the class - but the registration costs nothing and scoping
 		// this type protects nothing, since forms are resolved by id and the
 		// translation is swapped in at render time by translate_form_data()
 		// via a link-table lookup, never a WP_Query.
@@ -116,7 +116,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 		//
 		// WPForms registers its type with `'capability_type' => 'wpforms_form'` and
 		// `'map_meta_cap' => false` (wpforms-lite/includes/class-form.php:102-103) and
-		// then adds no `map_meta_cap` filter anywhere — `src/Access/Capabilities.php`
+		// then adds no `map_meta_cap` filter anywhere - `src/Access/Capabilities.php`
 		// in Lite is a stub returning `manage_options`. Core therefore maps
 		// `current_user_can( 'edit_post', $form_id )` to the PRIMITIVE capability
 		// `edit_wpforms_form`, which no role holds, so the answer was `false` for
@@ -136,7 +136,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 		// called directly rather than through `wpforms_current_user_can()`.
 		add_filter( 'perflocale/object/user_can', [ $this, 'answer_object_permission' ], 10, 4 );
 
-		// A Translations box in WPForms' own form builder — another screen none of the
+		// A Translations box in WPForms' own form builder - another screen none of the
 		// existing panels reach: the builder is a custom admin page, `wpforms` is
 		// registered `show_ui => false` so there is no post.php screen and no metabox,
 		// and `wp.plugins.registerPlugin` does not exist there.
@@ -145,8 +145,8 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 			// and receives ( WP_Post $form, string $panel_slug )
 			// (includes/admin/builder/panels/class-base.php:291).
 			//
-			// ⚠️ It fires for EVERY panel that has a sidebar — fields, settings,
-			// revisions, payments, providers — so an unguarded mount would render the
+			// ⚠️ It fires for EVERY panel that has a sidebar - fields, settings,
+			// revisions, payments, providers - so an unguarded mount would render the
 			// box five times in one page. The resolver returns 0 for every panel but
 			// Settings, and the renderer draws nothing for an id <= 0. Settings is the
 			// right home: it is the form-level configuration panel, the analogue of the
@@ -171,7 +171,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 			// (includes/admin/builder/class-builder.php:282). A stylesheet enqueued the
 			// ordinary way is silently dropped and the box renders unstyled, with no
 			// error. Adding the handle to the host's own documented allowlist filter is
-			// the supported way in — and is why the enqueue below can stay ordinary.
+			// the supported way in - and is why the enqueue below can stay ordinary.
 			add_filter(
 				'wpforms_admin_builder_allowed_common_wp_admin_styles',
 				static function ( $handles ): array {
@@ -190,7 +190,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 * Answer whether the current user may act on a WPForms form.
 	 *
 	 * Only ever consulted when core has already said NO, and only for this addon's own
-	 * post type — so it can widen access for `wpforms` and can never revoke access core
+	 * post type - so it can widen access for `wpforms` and can never revoke access core
 	 * granted for anything else. Callers apply their own `perflocale_translate` or
 	 * per-object checks as well, so it never hands translation rights to a user who
 	 * has none.
@@ -324,7 +324,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 * feeds this filter the raw return of WPForms_Form_Handler::get()
 	 * (includes/class-process.php:2096), and that method returns the boolean
 	 * `false` whenever the posted form id resolves to no readable form
-	 * (includes/class-form.php:245) — a trashed, deleted or unknown form. An
+	 * (includes/class-form.php:245) - a trashed, deleted or unknown form. An
 	 * `array` declaration would make that a TypeError raised during argument
 	 * binding, before the is_admin() early return below, instead of WPForms'
 	 * own error response.
@@ -358,7 +358,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 			return $form_data;
 		}
 
-		// Default language renders the original strings — skip the per-field
+		// Default language renders the original strings - skip the per-field
 		// meta lookups entirely.
 		$default = $router->get_default_language();
 		if ( $default && $slug === $default->slug ) {
@@ -372,10 +372,10 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		// Resolve the translated (duplicated) form and read its translated field
-		// strings — rather than never-written per-field meta. The duplicate has
+		// strings - rather than never-written per-field meta. The duplicate has
 		// the same field IDs, so merge by id and keep the original form id +
 		// structure so submissions still route to the source form. (Construct the
-		// manager directly — it is not a registered container service.)
+		// manager directly - it is not a registered container service.)
 		$manager       = new \PerfLocale\Translation\PostTranslationManager( $plugin->get( 'cache' ), $plugin->get( 'settings' ) );
 		$translated_id = $manager->get_translation_id( $form_id, $slug );
 
@@ -440,8 +440,8 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 * Swap the confirmation message for the visitor's language at submit time.
 	 *
 	 * Only `message`-type confirmations are touched. Everything else in the
-	 * form data — notifications, spam settings, the form id submissions route
-	 * to — is returned untouched, so a translated form stays on one pipeline.
+	 * form data - notifications, spam settings, the form id submissions route
+	 * to - is returned untouched, so a translated form stays on one pipeline.
 	 *
 	 * @param mixed $form_data Form data as WPForms decoded it; `false` or `[]`
 	 *                         when post_content is empty or malformed.
@@ -496,8 +496,8 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Which language the submission was made in, or '' to keep the source message.
 	 *
-	 * On a normal submit the router already knows. On AJAX — which every form
-	 * built from a WPForms template uses — the request is to admin-ajax.php, so
+	 * On a normal submit the router already knows. On AJAX - which every form
+	 * built from a WPForms template uses - the request is to admin-ajax.php, so
 	 * the URL carries no language and the language cookie is not guaranteed to
 	 * be set. WPForms posts the embedding post id and trusts it itself to set
 	 * the global $post; here it is only cast to an int and resolved through the

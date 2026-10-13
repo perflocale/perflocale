@@ -11,7 +11,7 @@
  * is chunked and budget-bounded: it stops BETWEEN blogs rather than being
  * killed inside one, and leaves a resume marker so a network too large for
  * one request can be finished by re-installing the plugin and deleting it
- * again WITHOUT activating it — core runs this file for an installed,
+ * again WITHOUT activating it - core runs this file for an installed,
  * inactive plugin, and the next pass carries on from the marker. From
  * WP-CLI, `wp plugin uninstall perflocale` finishes it in one pass.
  * See SiteCleanup::purge_network().
@@ -33,7 +33,7 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 $perflocale_includes = [
 	__DIR__ . '/src/Admin/TranslatorRole.php',
 	__DIR__ . '/src/Database/Schema.php',
-	// PrivacyIntegration MUST load before SiteCleanup — SiteCleanup's
+	// PrivacyIntegration MUST load before SiteCleanup - SiteCleanup's
 	// USER_META_KEYS class constant is aliased to
 	// PrivacyIntegration::USER_META_KEYS at class-definition time, so
 	// PHP needs the PrivacyIntegration class available the moment
@@ -54,7 +54,7 @@ $perflocale_includes = [
 	__DIR__ . '/src/Addon/AddonInterface.php',
 	// ⚠️ THE FULL CLOSURE, not "one more require". AddonUninstaller::plan()
 	// calls AddonSchemaManager::validate_addon_id() as its FIRST statement, and
-	// that class was missing here — so the entire manifest-driven addon purge
+	// that class was missing here - so the entire manifest-driven addon purge
 	// threw "class not found" and the throw was swallowed, leaving addon tables
 	// and options behind on every uninstall with no error anywhere. Same shape
 	// as the PrivacyIntegration load-order note above.
@@ -69,7 +69,7 @@ $perflocale_includes = [
 	// PurgeResult is the SAME BUG a second time: uninstall() constructs it on
 	// every exit path and returns it, so without this line the purge throws
 	// after the deletions and the documented perflocale/addon/uninstalled
-	// action never fires — swallowed by the catch in SiteCleanup. A class this
+	// action never fires - swallowed by the catch in SiteCleanup. A class this
 	// file does not require is only as safe as the last person who checked;
 	// the reachable set is asserted, not eyeballed.
 	__DIR__ . '/src/Addon/AddonMigrationErrors.php',
@@ -102,7 +102,7 @@ function perflocale_should_delete_data(): bool {
 	return \PerfLocale\Database\SiteCleanup::blog_wants_data_deleted();
 }
 
-// Bail out cleanly if the SiteCleanup class never loaded — happens on
+// Bail out cleanly if the SiteCleanup class never loaded - happens on
 // hosts that wiped the plugin directory before triggering uninstall.
 // In that case there is nothing useful we can do without our own code.
 if ( ! class_exists( \PerfLocale\Database\SiteCleanup::class ) ) {
@@ -154,7 +154,7 @@ if ( is_multisite() ) {
 	// marker itself, so deleting it after an interrupted pass would throw away
 	// the one record of which blogs are still to do.
 	if ( $perflocale_sweep['complete'] ) {
-		// Every network of the installation, not only the calling one — see
+		// Every network of the installation, not only the calling one - see
 		// the method.
 		\PerfLocale\Database\SiteCleanup::purge_network_scope();
 	} else {
@@ -164,7 +164,7 @@ if ( is_multisite() ) {
 		//
 		// The two causes need different advice. Running out of budget needs
 		// only another pass; a site that FAILED needs its cause fixed first,
-		// or the next pass fails on it again — and under WP-CLI there is no
+		// or the next pass fails on it again - and under WP-CLI there is no
 		// budget at all, so "ran out of time" would be simply untrue. A pass
 		// that did both gets the failure advice: it is the one that blocks.
 		if ( $perflocale_sweep['list_error'] ) {

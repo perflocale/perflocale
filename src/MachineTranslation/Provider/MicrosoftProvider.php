@@ -59,7 +59,7 @@ final class MicrosoftProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch(). Maps to Azure's textType
 	 *   (plain|html).
 	 *
@@ -127,7 +127,7 @@ final class MicrosoftProvider extends AbstractProvider {
 	 * with the loop, a mid-batch failure discards translations Azure has
 	 * already billed, and the caller's re-run bills them a second time.
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch(). Maps to Azure's textType
 	 *   (plain|html).
 	 *
@@ -161,7 +161,7 @@ final class MicrosoftProvider extends AbstractProvider {
 
 		// Split into API-compliant chunks, preserving each text's index so
 		// the results can be reassembled in the caller's order. An oversized
-		// single text gets a chunk of its own — it would exceed the ceiling
+		// single text gets a chunk of its own - it would exceed the ceiling
 		// on the per-text path too, so the failure mode is unchanged.
 		$chunks      = [];
 		$current     = [];

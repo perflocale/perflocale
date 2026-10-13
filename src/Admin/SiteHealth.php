@@ -23,7 +23,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * - Status tab - individual tests (good/recommended/critical) covering
  * the configuration + runtime states that matter for translation to
- * actually work. All tests are "direct" (synchronous) and cheap.
+ * actually work. The language-pack test is asynchronous: the Status screen
+ * runs it through admin-ajax after rendering, and the weekly scheduled
+ * check calls it directly. Every other test is "direct" (synchronous) and
+ * cheap.
  * - Info tab - a dedicated `perflocale` section with a diagnostic dump
  * of the whole translation stack. Useful for support tickets.
  *
@@ -103,6 +106,22 @@ final class SiteHealth {
 	 * Anything beyond the cap is reported as unchecked, never as resolving.
 	 */
 	private const MAX_HOST_PROBES = 20;
+
+	/**
+	 * Shape of a locale that the language-pack test puts into its suggested
+	 * WP-CLI command, the shape WordPress.org locales have and
+	 * `wp perflocale languages add` accepts: de_DE, de_DE_formal, pt_PT_ao90,
+	 * ca_valencia, fi, ary. The command is meant to be pasted into a shell,
+	 * and a locale stored through the admin form or an import can hold any
+	 * text, so a locale of another shape is listed but left out of it.
+	 */
+	private const CLI_LOCALE = '/\A[a-z]{2,3}(?:_[A-Za-z0-9]{2,8})*\z/';
+
+	/**
+	 * Name of the language-pack test as core's Site Health script sends it:
+	 * the admin-ajax action is "health-check-" followed by this.
+	 */
+	private const LANGUAGE_PACKS_ACTION = 'perflocale-language-packs';
 
 	/**
 	 * Stuck-translation age threshold. Translations whose row was created
@@ -223,6 +242,12 @@ final class SiteHealth {
 		add_action( 'perflocale/strings/changed', [ $this, 'flush_counts_cache' ] );
 
 		add_action( 'admin_notices', [ $this, 'render_leftover_notice' ] );
+
+		// The Status screen runs the language-pack test through this
+		// admin-ajax action (an asynchronous test, see register_tests()).
+		if ( wp_doing_ajax() ) {
+			add_action( 'wp_ajax_health-check-' . self::LANGUAGE_PACKS_ACTION, [ $this, 'ajax_language_packs' ] );
+		}
 	}
 
 	// -------------------------------------------------------------------------
@@ -354,7 +379,220 @@ final class SiteHealth {
 			$tests['direct'][ $id ] = $entry;
 		}
 
+		// Asynchronous: it reads translation file listings and core's update
+		// data, so the Status screen renders without waiting for it. The
+		// screen's script posts to admin-ajax.php with the action
+		// "health-check-" . $test; core's weekly scheduled check calls
+		// async_direct_test instead.
+		$tests['async']['perflocale_language_packs'] = [
+			'label'             => __( 'PerfLocale language packs', 'perflocale' ),
+			'test'              => self::LANGUAGE_PACKS_ACTION,
+			'has_rest'          => false,
+			'async_direct_test' => [ $this, 'test_language_packs' ],
+		];
+
 		return $tests;
+	}
+
+	/**
+	 * Admin-ajax endpoint of the language-pack test, with the nonce and
+	 * capability checks of core's own Site Health ajax tests.
+	 *
+	 * @return void
+	 */
+	public function ajax_language_packs(): void {
+		check_ajax_referer( 'health-check-site-status' );
+
+		if ( ! current_user_can( 'view_site_health_checks' ) ) {
+			wp_send_json_error();
+		}
+
+		wp_send_json_success( $this->test_language_packs() );
+	}
+
+	/**
+	 * Are the WordPress.org language packs of the site's languages installed?
+	 *
+	 * Visitors of a language see English text wherever WordPress, the theme
+	 * or a plugin has no translation for its locale, and WordPress installs
+	 * language packs only for the locales it is installed in. Every active
+	 * PerfLocale language of this site is checked by its locale (en_US
+	 * excepted); LanguagePacks::report() says what is read and what each
+	 * state means.
+	 *
+	 * Recommended when a WordPress pack is not installed, when WordPress.org
+	 * has no WordPress translation for a locale (known only while core's
+	 * `available_translations` list is cached), or when a theme or plugin pack
+	 * is waiting on Dashboard > Updates. Theme and plugin packs the last update
+	 * check did not offer, and kinds without update data, are listed without
+	 * changing the status.
+	 *
+	 * @return array<mixed>
+	 */
+	public function test_language_packs(): array {
+		$id     = 'perflocale_language_packs';
+		$plugin = Plugin::get_instance();
+		$cache  = $plugin->has( 'cache' ) ? $plugin->get( 'cache' ) : null;
+
+		if ( ! $cache instanceof \PerfLocale\Cache\CacheManager ) {
+			return $this->pass(
+				$id,
+				__( 'Language pack check skipped', 'perflocale' ),
+				__( 'Service container not fully booted - check again after the page loads.', 'perflocale' )
+			);
+		}
+
+		$repo    = new \PerfLocale\Database\Repository\LanguageRepository( $cache );
+		$labels  = [];
+		$locales = [];
+
+		foreach ( $repo->get_active() as $language ) {
+			$locale = isset( $language->locale ) && is_string( $language->locale ) ? $language->locale : '';
+
+			if ( '' === $locale || 'en_US' === $locale ) {
+				continue;
+			}
+
+			$name              = isset( $language->name ) && is_string( $language->name ) && '' !== $language->name ? $language->name : $locale;
+			$labels[ $locale ] = esc_html( $name ) . ' (' . esc_html( $locale ) . ')';
+			$locales[]         = $locale;
+		}
+
+		if ( [] === $locales ) {
+			return $this->pass(
+				$id,
+				__( 'No site language needs a language pack', 'perflocale' ),
+				esc_html__( 'Every active language uses the en_US locale, the language WordPress is written in.', 'perflocale' )
+			);
+		}
+
+		$report       = LanguagePacks::report( $locales );
+		$core_missing = [];
+		$core_absent  = [];
+		$core_ok      = [];
+		$offered      = [];
+		$not_offered  = [];
+
+		foreach ( $report['locales'] as $locale => $row ) {
+			$label    = $labels[ $locale ] ?? esc_html( $locale );
+			$findings = LanguagePacks::findings( $row );
+
+			if ( LanguagePacks::INSTALLED === $findings['core'] ) {
+				$core_ok[] = $label;
+			} elseif ( LanguagePacks::NOT_AVAILABLE === $findings['core'] ) {
+				$core_absent[] = $label;
+			} elseif ( LanguagePacks::MISSING === $findings['core'] ) {
+				$core_missing[] = $locale;
+			}
+
+			$ready = LanguagePacks::OFFERED === $findings['core'] ? [ esc_html__( 'WordPress', 'perflocale' ) ] : [];
+			$none  = [];
+
+			foreach ( $findings['offered'] as $item ) {
+				$ready[] = esc_html( $item['name'] );
+			}
+
+			foreach ( $findings['not_offered'] as $item ) {
+				$none[] = esc_html( $item['name'] );
+			}
+
+			if ( [] !== $ready ) {
+				$offered[] = $label . ': ' . implode( ', ', $ready );
+			}
+
+			if ( [] !== $none ) {
+				$not_offered[] = $label . ': ' . implode( ', ', $none );
+			}
+		}
+
+		$updates_url = LanguagePacks::updates_url();
+		$desc        = '';
+
+		if ( [] !== $core_missing ) {
+			$missing_labels = [];
+			$cli_locales    = [];
+
+			foreach ( $core_missing as $locale ) {
+				$missing_labels[] = $labels[ $locale ] ?? esc_html( $locale );
+
+				if ( 1 === preg_match( self::CLI_LOCALE, $locale ) ) {
+					$cli_locales[] = $locale;
+				}
+			}
+
+			$settings_link = '<a href="' . esc_url( admin_url( 'options-general.php' ) ) . '">' . esc_html__( 'Settings → General', 'perflocale' ) . '</a>';
+
+			if ( [] !== $cli_locales ) {
+				$install = sprintf(
+					/* translators: 1: "Settings → General" link, 2: WP-CLI command */
+					esc_html__( 'To install one, choose it as Site Language in %1$s and save, then set the Site Language back. With WP-CLI: %2$s. WordPress then offers the theme and plugin packs for the language on Dashboard → Updates.', 'perflocale' ),
+					$settings_link,
+					'<code>wp language core install ' . esc_html( implode( ' ', $cli_locales ) ) . '</code>'
+				);
+			} else {
+				$install = sprintf(
+					/* translators: %s: "Settings → General" link */
+					esc_html__( 'To install one, choose it as Site Language in %s and save, then set the Site Language back. WordPress then offers the theme and plugin packs for the language on Dashboard → Updates.', 'perflocale' ),
+					$settings_link
+				);
+			}
+
+			$desc .= '<p><strong>' . esc_html__( 'The WordPress language pack is not installed for:', 'perflocale' ) . '</strong> ' . implode( ', ', $missing_labels ) . '</p>';
+			$desc .= '<p>' . $install . ' ' . esc_html__( 'A language missing from the Site Language list has no WordPress translation on WordPress.org; check its locale.', 'perflocale' ) . '</p>';
+		}
+
+		if ( [] !== $core_absent ) {
+			$desc .= '<p><strong>' . esc_html__( 'WordPress.org has no WordPress translation for:', 'perflocale' ) . '</strong> ' . implode( ', ', $core_absent ) . '</p>';
+			$desc .= '<p>' . sprintf(
+				/* translators: %s: "PerfLocale → Languages" link */
+				esc_html__( 'Check the locale of these languages in %s.', 'perflocale' ),
+				'<a href="' . esc_url( admin_url( 'admin.php?page=perflocale-languages' ) ) . '">' . esc_html__( 'PerfLocale → Languages', 'perflocale' ) . '</a>'
+			) . '</p>';
+		}
+
+		if ( [] !== $offered ) {
+			$desc .= '<p><strong>' . esc_html__( 'Ready to install on Dashboard → Updates:', 'perflocale' ) . '</strong> ' . implode( '; ', $offered ) . '</p>';
+		}
+
+		$problem = '' !== $desc;
+		$info    = '';
+
+		if ( [] !== $not_offered ) {
+			$info .= '<p><strong>' . sprintf(
+				/* translators: %s: date and time of WordPress's last update check */
+				esc_html__( 'Not offered at the last update check (%s):', 'perflocale' ),
+				esc_html( LanguagePacks::checked_at( $report['last_checked'] ) )
+			) . '</strong> ' . implode( '; ', $not_offered ) . '</p>';
+			$info .= '<p>' . esc_html__( 'WordPress.org has no pack for these, unless the language was installed after that check: Dashboard → Updates checks again.', 'perflocale' ) . '</p>';
+		}
+
+		if ( ! $report['checked']['theme'] && ! $report['checked']['plugin'] ) {
+			$info .= '<p>' . esc_html__( 'Theme and plugin packs were not checked: WordPress has no update data yet. Dashboard → Updates runs the update check.', 'perflocale' ) . '</p>';
+		} elseif ( ! $report['checked']['theme'] || ! $report['checked']['plugin'] ) {
+			$info .= '<p>' . esc_html__( 'Some theme or plugin packs were not checked: WordPress has no update data for them yet. Dashboard → Updates runs the update check.', 'perflocale' ) . '</p>';
+		}
+
+		$actions = '' !== $desc . $info ? sprintf(
+			'<p><a href="%1$s">%2$s</a></p>',
+			esc_url( $updates_url ),
+			esc_html__( 'Open Dashboard → Updates', 'perflocale' )
+		) : '';
+
+		if ( $problem ) {
+			return $this->recommended(
+				$id,
+				__( 'Language packs are missing for some site languages', 'perflocale' ),
+				'<p>' . esc_html__( 'Visitors see English text where a language pack is missing.', 'perflocale' ) . '</p>' . $desc . $info,
+				$actions
+			);
+		}
+
+		return $this->pass(
+			$id,
+			__( 'Language packs are installed for the site languages', 'perflocale' ),
+			'<p><strong>' . esc_html__( 'The WordPress language pack is installed for:', 'perflocale' ) . '</strong> ' . implode( ', ', $core_ok ) . '</p>' . $info,
+			$actions
+		);
 	}
 
 	// -------------------------------------------------------------------------
@@ -371,7 +609,7 @@ final class SiteHealth {
 		// installed-or-not guard: it looks at one table out of nine, and usually
 		// looks at none at all because a sticky autoloaded option short-circuits
 		// it. That is right for a guard consulted on every request and wrong for
-		// a card that claims "translation storage is healthy" — a partial restore,
+		// a card that claims "translation storage is healthy" - a partial restore,
 		// a half-finished migration or a support step that dropped one table left
 		// the option in place and the card green.
 		//
@@ -509,7 +747,7 @@ final class SiteHealth {
 
 		// Plain permalinks: the language prefix is parsed from the raw request
 		// URI (no rewrite rules involved) and object URLs use the ?p= form, so
-		// the plugin works — PROVIDED the web server routes prefixed paths like
+		// the plugin works - PROVIDED the web server routes prefixed paths like
 		// /de/ to WordPress. nginx catch-all configs do; Apache without the
 		// standard WordPress .htaccess block returns a server-level 404 before
 		// PHP runs. Pretty permalinks make WordPress maintain that routing
@@ -1062,7 +1300,7 @@ final class SiteHealth {
 
 		// Quarantine is only ONE way an integration ends up not running. An addon
 		// that reported itself incompatible, or that needs a newer PerfLocale
-		// than the one installed, is skipped just as silently — and this card used
+		// than the one installed, is skipped just as silently - and this card used
 		// to answer "all active integrations are booting without errors" in both
 		// cases, because it only ever counted quarantined ones.
 		$incompatible = method_exists( $registry, 'get_incompatible_ids' )
@@ -1085,7 +1323,7 @@ final class SiteHealth {
 
 			foreach ( $incompatible as $id ) {
 				$skipped .= sprintf(
-					'<li><code>%s</code> — %s</li>',
+					'<li><code>%s</code> - %s</li>',
 					esc_html( $id ),
 					esc_html__( 'reported itself incompatible with this site', 'perflocale' )
 				);
@@ -1093,7 +1331,7 @@ final class SiteHealth {
 
 			foreach ( $outdated as $id => $required ) {
 				$skipped .= sprintf(
-					'<li><code>%1$s</code> — %2$s</li>',
+					'<li><code>%1$s</code> - %2$s</li>',
 					esc_html( (string) $id ),
 					esc_html( sprintf(
 						/* translators: %s: the PerfLocale version the addon requires. */
@@ -1110,7 +1348,7 @@ final class SiteHealth {
 					'<p>%1$s</p><ul>%2$s</ul><p>%3$s</p>',
 					esc_html__( 'These integrations were skipped at load, so the features they add are not active:', 'perflocale' ),
 					$skipped,
-					esc_html__( 'This is not an error — it is how PerfLocale avoids running an integration against a version it does not support. Updating the plugin it integrates with, or PerfLocale itself, is usually what clears it.', 'perflocale' )
+					esc_html__( 'This is not an error - it is how PerfLocale avoids running an integration against a version it does not support. Updating the plugin it integrates with, or PerfLocale itself, is usually what clears it.', 'perflocale' )
 				)
 			);
 		}
@@ -1202,7 +1440,7 @@ final class SiteHealth {
 		);
 
 		// Red only once requests are ACTUALLY being refused. The cap is a number
-		// the operator chose, and enforcement blocks at 100% — so 95% of it was
+		// the operator chose, and enforcement blocks at 100% - so 95% of it was
 		// reporting critical while nothing had failed, on the same panel where a
 		// completely dead MT pipeline used to report merely `recommended`. That
 		// inversion is what teaches people to ignore red.
@@ -1221,7 +1459,7 @@ final class SiteHealth {
 				// Honest about WHEN it bites: enforcement blocks at 100%, not at the
 				// 95% that turns this card amber. Saying requests "will fail" at 95%
 				// is a claim the code does not make for another 5% of headroom.
-				$formatted . '<br>' . esc_html__( 'Translation requests are still being sent. They stop once the limit is reached — raise it in Settings → Addons → Machine Translation, or wait for the monthly reset.', 'perflocale' )
+				$formatted . '<br>' . esc_html__( 'Translation requests are still being sent. They stop once the limit is reached - raise it in Settings → Addons → Machine Translation, or wait for the monthly reset.', 'perflocale' )
 			);
 		}
 
@@ -1246,7 +1484,7 @@ final class SiteHealth {
 	 * Aggregate circuit-breaker status across all wired callsites: MT providers
 	 * ({@see \PerfLocale\MachineTranslation\AbstractProvider}), webhook
 	 * delivery ({@see \PerfLocale\Api\WebhookController}), WooCommerce FX sync
-	 * and geo-IP providers. Those four are the whole list — nothing else in the
+	 * and geo-IP providers. Those four are the whole list - nothing else in the
 	 * plugin opens a breaker.
 	 *
 	 * Three states surfaced as Site Health categories:
@@ -1263,7 +1501,7 @@ final class SiteHealth {
 	 */
 	public function test_circuit_breakers(): array {
 		// Class may not yet be autoloaded on tiny pre-init Site Health
-		// probes — defensive guard so the test is a clean no-op.
+		// probes - defensive guard so the test is a clean no-op.
 		if ( ! class_exists( '\\PerfLocale\\Concurrency\\Breaker' ) ) {
 			return $this->pass(
 				'perflocale_circuit_breakers',
@@ -1299,7 +1537,7 @@ final class SiteHealth {
 		}
 
 		if ( $open !== [] ) {
-			$desc  = '<p>' . esc_html__( 'One or more circuit breakers are OPEN — calls to the listed external services are being refused to prevent piling retries onto a failing dependency.', 'perflocale' ) . '</p>';
+			$desc  = '<p>' . esc_html__( 'One or more circuit breakers are OPEN - calls to the listed external services are being refused to prevent piling retries onto a failing dependency.', 'perflocale' ) . '</p>';
 			$desc .= '<ul>';
 			foreach ( $open as $key => $status ) {
 				$reason    = (string) ( $status['reason'] ?? 'unknown' );
@@ -1307,7 +1545,7 @@ final class SiteHealth {
 				$reset_url = self::breaker_reset_url( $key );
 
 				$desc .= sprintf(
-					'<li><code>%1$s</code> — %2$s (%3$s) — %4$s</li>',
+					'<li><code>%1$s</code> - %2$s (%3$s) - %4$s</li>',
 					esc_html( $key ),
 					esc_html(
 						sprintf(
@@ -1393,7 +1631,7 @@ final class SiteHealth {
 	 * Build a nonce-protected admin-post URL the operator can hit to
 	 * force-close one breaker. Returns empty string when the current
 	 * user lacks the manage cap so the link doesn't render at all
-	 * (defence-in-depth — the handler also checks).
+	 * (defence-in-depth - the handler also checks).
 	 *
 	 * @param string $key Breaker key.
 	 * @return string
@@ -1423,7 +1661,7 @@ final class SiteHealth {
 	public function test_fx_stale(): array {
 		// Ask about WooCommerce, not about PerfLocale's own class. The guard used
 		// to be class_exists( ExchangeRateSync::class ), which is one of THIS
-		// plugin's classes and is therefore always autoloadable — so the branch
+		// plugin's classes and is therefore always autoloadable - so the branch
 		// never ran, and a site with no WooCommerce at all was told its exchange
 		// rates were stale.
 		if ( ! class_exists( 'WooCommerce' ) || ! class_exists( '\\PerfLocale\\WooCommerce\\ExchangeRateSync' ) ) {
@@ -1492,7 +1730,7 @@ final class SiteHealth {
 			// Severity depends on whether money is actually affected. With
 			// auto-sync on, no rate source and at least one language priced in a
 			// NON-base currency, MultiCurrency has no rate to apply and the
-			// foreign price is charged at the base-currency number — a store
+			// foreign price is charged at the base-currency number - a store
 			// selling in EUR from a USD base takes 20 EUR for a 20 USD product.
 			// That is a money defect and belongs in red. With every language on
 			// the base currency (or none configured) nothing is mispriced and
@@ -1521,7 +1759,7 @@ final class SiteHealth {
 				// critical on a store that is priced correctly: with no rate
 				// source, MultiCurrency falls back to the stored exchange_rate
 				// (src/WooCommerce/MultiCurrency.php), so a language sitting at a
-				// hand-entered 1.18 converts fine — its rate may be going stale,
+				// hand-entered 1.18 converts fine - its rate may be going stale,
 				// which is what the staleness card below is for, but nothing is
 				// being charged at the wrong number.
 				if (
@@ -1543,7 +1781,7 @@ final class SiteHealth {
 						'<p>%1$s</p><p>%2$s</p>',
 						sprintf(
 							/* translators: 1: comma-separated currency codes, 2: the store's base currency, 3: time since last sync. */
-							esc_html__( 'Automatic exchange-rate sync is on but no rate source is configured, and %1$s are priced against a %2$s base with no manual rate set. Those prices are being charged at the base-currency figure — a %2$s amount taken as though it were the customer\'s currency (last sync: %3$s).', 'perflocale' ),
+							esc_html__( 'Automatic exchange-rate sync is on but no rate source is configured, and %1$s are priced against a %2$s base with no manual rate set. Those prices are being charged at the base-currency figure - a %2$s amount taken as though it were the customer\'s currency (last sync: %3$s).', 'perflocale' ),
 							'<code>' . esc_html( implode( ', ', array_keys( $foreign ) ) ) . '</code>',
 							'<code>' . esc_html( $base ) . '</code>',
 							'<code>' . esc_html( $last_sync ) . '</code>'
@@ -1595,7 +1833,7 @@ final class SiteHealth {
 	 * reset (switch_blog), and each fallback in the current language's
 	 * chain adds one more map. At an estimated ~200 bytes/entry serialized
 	 * that is 4-10 MB at 20k-50k rows, and the unserialized in-request
-	 * footprint is several times larger. Files mode avoids this — it serves
+	 * footprint is several times larger. Files mode avoids this - it serves
 	 * opcache-compiled, per-domain .l10n.php files. We RECOMMEND switching
 	 * (never auto-switch: files mode needs a writable uploads dir, and DB
 	 * mode is a legitimate choice on read-only filesystems).
@@ -1633,7 +1871,7 @@ final class SiteHealth {
 		// The heaviest single language decides the verdict. That query
 		// (GROUP BY on an unindexed LONGTEXT predicate) full-scans the very
 		// large table this check targets, and Site Health runs direct tests
-		// synchronously on every status render — so cache it for an hour.
+		// synchronously on every status render - so cache it for an hour.
 		$max_rows = get_transient( 'perflocale_string_blob_max' );
 
 		if ( false === $max_rows ) {
@@ -1810,7 +2048,7 @@ final class SiteHealth {
 			}
 
 			// Total rows in `string_translations`. The difference between this
-			// and `compilable_translations` is the orphan count — surfaced as a
+			// and `compilable_translations` is the orphan count - surfaced as a
 			// separate diagnostic so users know something needs cleanup instead
 			// of staring at a button that does nothing.
 			$total_st_rows = (int) $wpdb->get_var(
@@ -1858,7 +2096,7 @@ final class SiteHealth {
 		);
 
 		// Case 1: no compilable translations and no files. If there are
-		// orphan rows, tell the user — plain English, one number, one
+		// orphan rows, tell the user - plain English, one number, one
 		// button. The "Regenerate translation files" action self-heals
 		// orphans before generating, so a single click fixes both the
 		// stranded data AND the missing files.
@@ -1980,7 +2218,7 @@ final class SiteHealth {
 	 * @return array<string, mixed>
 	 */
 	public function test_db_version(): array {
-		// Scope note: this card checks the stamped SCHEMA VERSION only — whether
+		// Scope note: this card checks the stamped SCHEMA VERSION only - whether
 		// the database has been migrated as far as the running code expects. It
 		// deliberately does not inspect table structure; the tables themselves are
 		// covered by test_tables_exist(), which asks the server about all nine.
@@ -2247,7 +2485,7 @@ final class SiteHealth {
 		$provider = (string) $settings->get_mt_provider();
 
 		// Credentials before connectivity. A resolvable host proves nothing when
-		// the provider has no key: the request is never made — TranslationService
+		// the provider has no key: the request is never made - TranslationService
 		// throws at get_provider() first. Nothing used to check this, so a site
 		// with MT switched on and the key never saved (or revoked) showed a green
 		// reachability card, a green usage card and a green jobs card while every
@@ -2286,7 +2524,7 @@ final class SiteHealth {
 								? esc_html__( 'Machine translation is enabled but no provider is selected, so every translation request fails before it is sent.', 'perflocale' )
 								: sprintf(
 									/* translators: %s: the selected machine-translation provider slug. */
-									esc_html__( 'Machine translation is enabled and set to %s, but that provider has no API credential saved — so every translation request fails before it is sent.', 'perflocale' ),
+									esc_html__( 'Machine translation is enabled and set to %s, but that provider has no API credential saved - so every translation request fails before it is sent.', 'perflocale' ),
 									'<code>' . esc_html( $provider ) . '</code>'
 								),
 							esc_html__( 'Add the credential under PerfLocale → Settings → Addons → Machine Translation, or turn machine translation off so queued jobs stop retrying.', 'perflocale' )
@@ -2316,8 +2554,8 @@ final class SiteHealth {
 		}
 
 		// Cache the lookup. gethostbyname() is blocking and has no timeout of its
-		// own — it obeys the resolver's, which on a container with no working DNS
-		// is seconds — and this ran on EVERY load of the Status tab, measured at
+		// own - it obeys the resolver's, which on a container with no working DNS
+		// is seconds - and this ran on EVERY load of the Status tab, measured at
 		// ~21ms warm and multiple seconds cold. The answer does not change often
 		// enough to justify paying that repeatedly.
 		//
@@ -2400,7 +2638,7 @@ final class SiteHealth {
 		}
 
 		// The generator writes .l10n.php bundles into
-		// uploads/perflocale/translations/ (Helper::uploads_translations_dir) —
+		// uploads/perflocale/translations/ (Helper::uploads_translations_dir) -
 		// NOT 'perflocale-languages/', which is only an admin-page slug and no
 		// filesystem code ever touches. Probing the real dir (or its writable
 		// parent when it doesn't exist yet) is what actually gates files mode.
@@ -2504,7 +2742,7 @@ final class SiteHealth {
 	 *     stale lock rows accumulate, completed jobs never get pruned).
 	 *   - With WP-Cron forced or AS unavailable AND DISABLE_WP_CRON is on,
 	 *     warn that an external cron is needed to drain the queue.
-	 *   - Queue isn't paused (informational — not a real problem, just
+	 *   - Queue isn't paused (informational - not a real problem, just
 	 *     surfaces an operator-set state so it shows up in support
 	 *     pastes when someone asks "why aren't my jobs running").
 	 *
@@ -2523,7 +2761,7 @@ final class SiteHealth {
 
 		// Jobs that RAN and FAILED. Nothing counted these, and the neighbouring
 		// "stuck translations" card needs a job to sit untouched for seven days
-		// before it says anything — so a pipeline that was failing every single
+		// before it says anything - so a pipeline that was failing every single
 		// job (a revoked machine-translation key is the common one) reported green
 		// on every card for a week. A revoked key is invisible to the credential
 		// check too, because the key is still present; the only honest signal is
@@ -2569,7 +2807,7 @@ final class SiteHealth {
 				)
 			);
 
-			// Everything failing is a different problem from some things failing —
+			// Everything failing is a different problem from some things failing -
 			// but "everything" needs a sample worth the word. On a quiet site a
 			// single failed job and no completed ones satisfied `0 === $recent_ok`
 			// and produced a red "Every background job is failing", which is a
@@ -2605,7 +2843,7 @@ final class SiteHealth {
 				return $this->critical(
 					'perflocale_bg_jobs_health',
 					__( 'Every background job is failing', 'perflocale' ),
-					$body . '<p>' . esc_html__( 'No job has completed in the last 24 hours. If machine translation is configured, check that its API credential is still valid — a revoked key fails every request while still looking present in the settings.', 'perflocale' ) . '</p>'
+					$body . '<p>' . esc_html__( 'No job has completed in the last 24 hours. If machine translation is configured, check that its API credential is still valid - a revoked key fails every request while still looking present in the settings.', 'perflocale' ) . '</p>'
 				);
 			}
 
@@ -2632,12 +2870,12 @@ final class SiteHealth {
 				__( 'WP-Cron is disabled and jobs are queued in WP-Cron', 'perflocale' ),
 				// Name the real reason the engine is wp_cron. When the operator has
 				// set the background engine to "Force WP-Cron", Action Scheduler is
-				// deliberately bypassed even when it IS installed — so the old
+				// deliberately bypassed even when it IS installed - so the old
 				// advice to "install WooCommerce or the Action Scheduler plugin"
 				// sent them to install something they already had, and would have
 				// changed nothing.
 				( 'force_wp_cron' === (string) $plugin->get( 'settings' )->get( 'background_engine', '' ) )
-					? __( 'Background jobs are queued in WP-Cron because the background engine is set to "Force WP-Cron", and DISABLE_WP_CRON is also set — so nothing will run them. Either point a system cron at wp-cron.php every minute, or change the background engine back to automatic in Settings → Performance so Action Scheduler can be used when it is available.', 'perflocale' )
+					? __( 'Background jobs are queued in WP-Cron because the background engine is set to "Force WP-Cron", and DISABLE_WP_CRON is also set - so nothing will run them. Either point a system cron at wp-cron.php every minute, or change the background engine back to automatic in Settings → Performance so Action Scheduler can be used when it is available.', 'perflocale' )
 					: __( 'Background jobs are enqueued in WP-Cron but DISABLE_WP_CRON is set. Configure an external system cron to hit wp-cron.php every minute, install WooCommerce or the Action Scheduler plugin, or jobs will sit in the queue indefinitely.', 'perflocale' )
 			);
 		}
@@ -2744,7 +2982,7 @@ final class SiteHealth {
 		//     tally read 2, and a site genuinely missing a language could reach
 		//     the expected total and report green.
 		//   * With seo_hreflang_placement = both, the SAME language is emitted in
-		//     the body AND as a Link header, and the two tallies were added — so
+		//     the body AND as a Link header, and the two tallies were added - so
 		//     the count could reach or exceed the language total no matter what
 		//     was actually missing.
 		//
@@ -2760,7 +2998,7 @@ final class SiteHealth {
 		}
 		// HreflangTags emits its Link headers with $replace = false, so
 		// wp_remote_retrieve_header() can hand back either a single string or an
-		// array of them depending on how many were sent — normalise both shapes.
+		// array of them depending on how many were sent - normalise both shapes.
 		$link_header = wp_remote_retrieve_header( $response, 'link' );
 		$link_values = is_array( $link_header ) ? $link_header : ( '' !== (string) $link_header ? [ (string) $link_header ] : [] );
 
@@ -2822,7 +3060,7 @@ final class SiteHealth {
 			// NOT a fault on its own. HreflangTags only emits a language that
 			// actually has a translation of the page being rendered, so a site
 			// that is mid-translation legitimately shows fewer links than it has
-			// active languages — and this card used to sit permanently orange
+			// active languages - and this card used to sit permanently orange
 			// telling those owners to go looking for a caching bug. Report the
 			// gap as information, and name the real explanation first.
 			return $this->pass(
@@ -2843,8 +3081,8 @@ final class SiteHealth {
 			sprintf(
 				/* translators: %d: number of hreflang alternate links found. */
 				_n(
-					'The homepage rendered %d hreflang alternate link — search engines can discover the translated languages.',
-					'The homepage rendered %d hreflang alternate links — search engines can discover the translated languages.',
+					'The homepage rendered %d hreflang alternate link - search engines can discover the translated languages.',
+					'The homepage rendered %d hreflang alternate links - search engines can discover the translated languages.',
 					$count,
 					'perflocale'
 				),
@@ -2862,13 +3100,13 @@ final class SiteHealth {
 	 *
 	 * `$info` is deliberately untyped. WordPress does `$info = apply_filters(
 	 * 'debug_information', $info ); return $info;` and never re-validates the
-	 * result, so a third-party callback written like an action — edit the array,
-	 * forget the `return` — hands the NEXT callback null. Core survives that
+	 * result, so a third-party callback written like an action - edit the array,
+	 * forget the `return` - hands the NEXT callback null. Core survives that
 	 * (site-health-info.php's foreach warns and renders nothing); an `array`
 	 * hint here would make PHP throw a TypeError at ARGUMENT BINDING, before any
 	 * guard in this body could run, turning somebody else's missing `return`
 	 * into a fatal on Tools -> Site Health with PerfLocale's name on it. The
-	 * guard returns the value UNCHANGED — coercing it to an array would hide the
+	 * guard returns the value UNCHANGED - coercing it to an array would hide the
 	 * other plugin's bug and silently drop whatever the previous callbacks had
 	 * assembled.
 	 *
@@ -3177,7 +3415,7 @@ final class SiteHealth {
 		$fields['wp_cron_disabled'] = [
 			'label' => __( 'WP-Cron disabled', 'perflocale' ),
 			'value' => defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON
-				? __( 'Yes (affects scheduled FX sync, webhook delivery, and background jobs when Action Scheduler is not loaded — make sure an external cron hits wp-cron.php)', 'perflocale' )
+				? __( 'Yes (affects scheduled FX sync, webhook delivery, and background jobs when Action Scheduler is not loaded - make sure an external cron hits wp-cron.php)', 'perflocale' )
 				: __( 'No', 'perflocale' ),
 		];
 
@@ -3189,8 +3427,9 @@ final class SiteHealth {
 		$bg_as_loaded  = \PerfLocale\Background\JobRunnerFactory::action_scheduler_available();
 		$bg_paused     = (bool) $settings->get( 'background_paused', false );
 		$bg_processing = (string) $settings->get( 'background_processing', 'auto' );
-		$bg_index      = (array) get_option( 'perflocale_active_jobs', [] );
-		$bg_active     = count( $bg_index );
+		$bg_counts     = Schema::tables_exist()
+			? \PerfLocale\Background\JobState::count_by_status( [ 'queued', 'running' ] )
+			: null;
 
 		$fields['bg_engine']     = [
 			'label' => __( 'Background jobs: engine', 'perflocale' ),
@@ -3202,12 +3441,12 @@ final class SiteHealth {
 		];
 		$fields['bg_active']     = [
 			'label' => __( 'Background jobs: active queue depth', 'perflocale' ),
-			'value' => (string) $bg_active . __( ' (bounded to 50)', 'perflocale' ),
+			'value' => null === $bg_counts ? __( 'unknown', 'perflocale' ) : (string) array_sum( $bg_counts ),
 		];
 
 		// ---- PHP extensions ----
 		// The Info tab is what owners are told to copy into a support thread, and
-		// it recorded no extension state at all — so the single most common
+		// it recorded no extension state at all - so the single most common
 		// question about a formatting or import report ("is intl loaded on that
 		// host?", "did the XLIFF import fail because dom is missing?") could not
 		// be answered from the artefact itself. One line, every optional
@@ -3226,7 +3465,7 @@ final class SiteHealth {
 		// ---- Migration importer batch sizes ----
 		// Resolve each importer's batch_size filter so support threads see the
 		// effective value (helps diagnose "my import is OOMing" or
-		// "my import is slow" — both usually trace back to a filter override).
+		// "my import is slow" - both usually trace back to a filter override).
 		$mig_wpml = (int) apply_filters( 'perflocale/migration/wpml/batch_size', 100 );
 		$mig_pll  = (int) apply_filters( 'perflocale/migration/polylang/batch_size', 100 );
 		$mig_tp   = (int) apply_filters( 'perflocale/migration/translatepress/batch_size', 50 );
@@ -3334,7 +3573,7 @@ final class SiteHealth {
 	 *
 	 * The arms mirror that method's four keys exactly; anything else falls
 	 * through to the raw key rather than being silently mislabelled. (A
-	 * 'memory' arm survived here after translation memory was removed —
+	 * 'memory' arm survived here after translation memory was removed -
 	 * a label in the POT for a feature the plugin does not ship.)
 	 *
 	 * @param string $key Counts key.
@@ -3395,7 +3634,7 @@ final class SiteHealth {
 	 *
 	 * `WebhookController::record_failure()` has always written a capped log to
 	 * `perflocale_webhook_failures`, and until this test NOTHING in the shipped
-	 * plugin ever read it — there is no Webhooks admin screen, and the only other
+	 * plugin ever read it - there is no Webhooks admin screen, and the only other
 	 * reference is SiteCleanup deleting the option on uninstall. So a webhook
 	 * that exhausted its retries, or whose address was refused by the
 	 * delivery-time safety check, disappeared in silence: the receiver simply
@@ -3467,7 +3706,7 @@ final class SiteHealth {
 
 		foreach ( $by_hook as $hook => $count ) {
 			$items .= sprintf(
-				'<li><code>%1$s</code> — %2$s</li>',
+				'<li><code>%1$s</code> - %2$s</li>',
 				esc_html( $hook ),
 				esc_html( sprintf(
 					/* translators: %d: number of failed deliveries for one webhook. */
@@ -3524,13 +3763,13 @@ final class SiteHealth {
 		}
 
 		// Oxygen 6 / Breakdance is a special case and used to be looked up under
-		// BREAKDANCE_DB_VERSION, which does not exist in the plugin at all — so
+		// BREAKDANCE_DB_VERSION, which does not exist in the plugin at all - so
 		// every Oxygen 6 support report claimed "Builder detected: none" on a
 		// site that was entirely built with one. What the plugin really declares
 		// (checked against Oxygen 6.1.3) is:
 		//
 		//   plugin.php:41  const __BREAKDANCE_VERSION = '6.1.3';   // a top-level
-		//                  const, not define() — defined() sees both
+		//                  const, not define() - defined() sees both
 		//   plugin.php:16  define( 'BREAKDANCE_MODE', 'oxygen' );  // 'oxygen'
 		//                  when shipped as Oxygen, absent/other for Breakdance
 		//
@@ -3578,7 +3817,7 @@ final class SiteHealth {
 		// sentinel, the 'empty' string sentinel (written when a build proved the
 		// map genuinely empty, so a real emptiness is never confused with a
 		// failed read), or is absent. The is_array() guard below is what makes
-		// the string forms safe — do not remove it. Casting
+		// the string forms safe - do not remove it. Casting
 		// the array form to string would throw an "Array to string conversion"
 		// warning on every Status load AND collapse the byte count to strlen(
 		// "Array") = 5, which permanently dead-ends the size-envelope branch
@@ -3658,7 +3897,7 @@ final class SiteHealth {
 
 		$missing = [];
 		foreach ( array_keys( $expects ) as $hook ) {
-			// Any-args, both engines — see test_bg_jobs_health().
+			// Any-args, both engines - see test_bg_jobs_health().
 			if ( ! \PerfLocale\Background\BackgroundEvents::is_scheduled( $hook ) ) {
 				$missing[] = $hook;
 			}
@@ -3671,7 +3910,7 @@ final class SiteHealth {
 		// on a page view; it does NOT stop wp-cron.php running due events when
 		// something else calls it. `DISABLE_WP_CRON = true` plus a system crontab
 		// hitting wp-cron.php is the RECOMMENDED production setup, and this
-		// branch used to report it as critical — telling the best-configured
+		// branch used to report it as critical - telling the best-configured
 		// sites their background jobs "cannot run" while the jobs ran fine. A
 		// red card that is wrong on the correct configuration teaches owners to
 		// ignore the panel.
@@ -3712,14 +3951,14 @@ final class SiteHealth {
 				);
 			}
 
-			// Events are current, so something IS running them — almost always
+			// Events are current, so something IS running them - almost always
 			// the operator's own cron. Say what was actually observed rather
 			// than implying the setup is broken.
 			if ( $missing === [] ) {
 				return $this->pass(
 					$id,
 					__( 'PerfLocale cron schedules are healthy', 'perflocale' ),
-					esc_html__( 'DISABLE_WP_CRON is set and Action Scheduler is not available, but every PerfLocale recurring event is scheduled and none is overdue — so an external cron is reaching wp-cron.php as intended. This is the recommended production setup.', 'perflocale' )
+					esc_html__( 'DISABLE_WP_CRON is set and Action Scheduler is not available, but every PerfLocale recurring event is scheduled and none is overdue - so an external cron is reaching wp-cron.php as intended. This is the recommended production setup.', 'perflocale' )
 				);
 			}
 		}
@@ -3780,7 +4019,7 @@ final class SiteHealth {
 			// Age the rows against the DATABASE clock, not PHP's. This column
 			// is stamped by MySQL (`ON UPDATE CURRENT_TIMESTAMP`) in the DB
 			// server's timezone, so comparing it with a gmdate() string
-			// mis-ages every row by the server's UTC offset — on a DB several
+			// mis-ages every row by the server's UTC offset - on a DB several
 			// hours behind UTC, rows updated moments ago count as "stuck".
 			// DATE_SUB(NOW(), ...) keeps both sides in the same clock whatever
 			// that timezone is.
@@ -3840,7 +4079,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Detect orphan translation rows — translation_links rows whose target
+	 * Detect orphan translation rows - translation_links rows whose target
 	 * post/term has been deleted out from under PerfLocale (typically by a
 	 * direct DB import, a destructive plugin, or a manual `DELETE FROM
 	 * wp_posts`). LEFT JOIN + IS NULL is heavy enough to warrant the
@@ -4045,7 +4284,7 @@ final class SiteHealth {
 		 * condition, so give them a way to stop paying for it.
 		 *
 		 * Returning false disables only the MEASUREMENT. The check still
-		 * appears, and still tells you to add the server rule — a filter must
+		 * appears, and still tells you to add the server rule - a filter must
 		 * not be able to turn a real exposure green, only to stop testing for
 		 * it. Verify the rule yourself if you turn this off.
 		 *
@@ -4062,7 +4301,7 @@ final class SiteHealth {
 			return $this->recommended(
 				$id,
 				__( 'PerfLocale export exposure check is disabled', 'perflocale' ),
-				esc_html__( 'The active check has been switched off on this site, so PerfLocale has not verified whether export files are reachable over the web. If this site runs on nginx or Caddy, add the export deny rule from the installation notes and confirm it yourself — .htaccess alone does not protect that directory on those servers.', 'perflocale' )
+				esc_html__( 'The active check has been switched off on this site, so PerfLocale has not verified whether export files are reachable over the web. If this site runs on nginx or Caddy, add the export deny rule from the installation notes and confirm it yourself - .htaccess alone does not protect that directory on those servers.', 'perflocale' )
 			);
 		}
 
@@ -4166,7 +4405,7 @@ final class SiteHealth {
 			return $this->recommended(
 				$id,
 				__( 'PerfLocale export exposure could not be checked', 'perflocale' ),
-				esc_html__( 'The site could not make a request to itself, so PerfLocale could not verify whether exports are reachable over the web. That is common on hosts that block loopback requests and is not itself evidence of a problem — but it is not evidence of safety either, and .htaccess does not protect this directory on nginx or Caddy. Add the export deny rule from the installation notes.', 'perflocale' )
+				esc_html__( 'The site could not make a request to itself, so PerfLocale could not verify whether exports are reachable over the web. That is common on hosts that block loopback requests and is not itself evidence of a problem - but it is not evidence of safety either, and .htaccess does not protect this directory on nginx or Caddy. Add the export deny rule from the installation notes.', 'perflocale' )
 			);
 		}
 

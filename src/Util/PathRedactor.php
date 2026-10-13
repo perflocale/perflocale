@@ -34,7 +34,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * recognised extension are matched, so ordinary prose is left alone.
  * Multi-line safe, and never returns a string longer than the input.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class PathRedactor {
 

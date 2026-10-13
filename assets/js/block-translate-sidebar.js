@@ -116,7 +116,7 @@
 
 		var providerSuffix = providerLabel() ? ' · ' + providerLabel() : '';
 
-		// SIBLING MODE — single "Fill all from source" button. The sibling's
+		// SIBLING MODE - single "Fill all from source" button. The sibling's
 		// own language is the only sensible target; pulling from anywhere
 		// other than the configured source post would defeat the purpose.
 		if ( IS_SIBLING && SOURCE_POST_ID > 0 && SIBLING_SOURCE_LANG && SOURCE ) {
@@ -128,7 +128,7 @@
 				if ( typeof window.perflocaleBlockTranslate.fillAllFromSource !== 'function' ) {
 					wp.data.dispatch( 'core/notices' ).createNotice(
 						'error',
-						__( 'Sibling fill-from-source not available — reload the editor.', 'perflocale' ),
+						__( 'Sibling fill-from-source not available - reload the editor.', 'perflocale' ),
 						{ type: 'snackbar', isDismissible: true }
 					);
 					return;
@@ -192,7 +192,7 @@
 			);
 		}
 
-		// SOURCE MODE — multi-target MT buttons (original behaviour).
+		// SOURCE MODE - multi-target MT buttons (original behaviour).
 		var targets = LANGUAGES.filter( function ( l ) { return l.slug && l.slug !== SOURCE; } );
 
 		if ( ! targets.length ) {
@@ -213,10 +213,10 @@
 				return;
 			}
 
-			// Confirm — destructive, applies translations IN-PLACE in the
+			// Confirm - destructive, applies translations IN-PLACE in the
 			// open editor. Cmd+Z still reverses each block individually.
 			// Resolve the BCP 47 form (e.g. en-GB) of the target slug from the
-			// payload shipped via wp_localize_script — falls back to the
+			// payload shipped via wp_localize_script - falls back to the
 			// uppercased slug if this language isn't in LANGUAGES (stale ID).
 			var targetMeta = LANGUAGES.find( function ( l ) { return l.slug === targetSlug; } );
 			var targetTag  = ( targetMeta && targetMeta.bcp47 ) || targetSlug.toUpperCase();

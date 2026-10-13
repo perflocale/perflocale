@@ -33,7 +33,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  *   AddonSettings::get( 'woocommerce', 'wc_email_translation', true );
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class AddonSettings {
 
@@ -58,12 +58,12 @@ final class AddonSettings {
 	/**
 	 * Lock name for serialised writes. Wraps every persist() so two
 	 * concurrent saves to different addon entries can't race on the shared
-	 * option — without it the second write would clobber the first.
+	 * option - without it the second write would clobber the first.
 	 */
 	private const LOCK_NAME = 'addon_settings_write';
 
 	/**
-	 * Lock TTL — short because persist() is essentially a single
+	 * Lock TTL - short because persist() is essentially a single
 	 * update_option call. 10 s leaves headroom for slow DBs but won't
 	 * deadlock a misbehaving caller for long.
 	 */
@@ -89,7 +89,7 @@ final class AddonSettings {
 	/**
 	 * Read a single setting for an addon.
 	 *
-	 * Returns `$default` when the addon id is malformed — same return path
+	 * Returns `$default` when the addon id is malformed - same return path
 	 * as "not stored", so callers don't have to special-case invalid ids.
 	 *
 	 * @param string $addon_id The addon's get_id() value.
@@ -142,7 +142,7 @@ final class AddonSettings {
 	 * Read multiple settings for one addon in a single call.
 	 *
 	 * Cleaner than chained {@see get()} calls when an addon needs
-	 * several of its own settings at once — and slightly cheaper because
+	 * several of its own settings at once - and slightly cheaper because
 	 * the in-memory cache is looked up once instead of once per key.
 	 *
 	 * Defaults are matched per-key from the supplied `$defaults` map; if
@@ -189,7 +189,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Write a single setting for an addon. Use sparingly — the admin form
+	 * Write a single setting for an addon. Use sparingly - the admin form
 	 * handler writes the whole addon group at once via {@see set_addon()},
 	 * which is cheaper.
 	 *
@@ -316,7 +316,7 @@ final class AddonSettings {
 				// (e.g. a per-language matrix uses nested input names).
 				// Callback signature mirrors render_callback:
 				// ($addon_id, $field_key, $field_def, $raw)
-				// — the callback is responsible for reading from $_POST
+				// - the callback is responsible for reading from $_POST
 				// itself when its POST shape doesn't fit the canonical
 				// settings[$field_key] slot. Missing callback → signal
 				// "no sanitize" so the caller can preserve existing
@@ -372,7 +372,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * True if a field declares `'storage' => 'global'` — its value is
+	 * True if a field declares `'storage' => 'global'` - its value is
 	 * stored in the main `perflocale_settings` option, not in
 	 * `perflocale_addon_settings`. The framework MUST NOT seed defaults
 	 * for, render via auto-form, save through the auto-form handler, or
@@ -480,7 +480,7 @@ final class AddonSettings {
 	public static function render_form( string $addon_id, array $editable_fields, array $values, string $form_action ): void {
 		// Pre-build the value map used for show_if evaluation. Stored
 		// values win, but any field with a declared `default` falls back
-		// to that default when no stored value exists — otherwise a
+		// to that default when no stored value exists - otherwise a
 		// freshly-installed addon with no auto-seed yet would evaluate
 		// every show_if against null and hide every dependent row.
 		$eval_values = $values;
@@ -604,7 +604,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Apply a mutator to the latest stored value and persist the result —
+	 * Apply a mutator to the latest stored value and persist the result -
 	 * the WHOLE thing under a Lock::with() so two concurrent writes to
 	 * different addons can't race on the shared option (the second one
 	 * would otherwise read a stale snapshot from cache and clobber the
@@ -630,6 +630,20 @@ final class AddonSettings {
 				// raw option is the only way to guarantee we mutate the
 				// latest-committed state.
 				wp_cache_delete( self::OPTION, 'options' );
+
+				// The lock leaves this request's `notoptions` as it is. When
+				// it lists the option (this request read it before the row
+				// existed), the read below would return that absence even
+				// after another request has created the row, and the write
+				// would replace that request's entries. Dropping `notoptions`
+				// then sends the read to the database; when it does not list
+				// the option, nothing is dropped.
+				$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+				if ( is_array( $notoptions ) && isset( $notoptions[ self::OPTION ] ) ) {
+					wp_cache_delete( 'notoptions', 'options' );
+				}
+
 				$current   = (array) get_option( self::OPTION, [] );
 				$old_entry = (array) ( $current[ $addon_id ] ?? [] );
 
@@ -637,7 +651,7 @@ final class AddonSettings {
 				$new_entry = (array) ( $next[ $addon_id ] ?? [] );
 
 				// Cap PER-ADDON to bound worst-case autoloaded-option growth.
-				// Reject the write entirely on overflow — better to drop the
+				// Reject the write entirely on overflow - better to drop the
 				// commit (and surface it to the operator via log) than to
 				// silently grow an option that slows every request forever.
 				if ( isset( $next[ $addon_id ] ) ) {
@@ -663,7 +677,7 @@ final class AddonSettings {
 				 * pending save with both old and proposed values in hand.
 				 *
 				 * IMPORTANT: do NOT call AddonSettings::set / set_addon /
-				 * forget from this listener — the write lock is non-
+				 * forget from this listener - the write lock is non-
 				 * reentrant and your write will time out at 10 s. For
 				 * cross-addon write reactions, hook the after-save action
 				 * (which still fires inside the lock but represents work
@@ -700,7 +714,7 @@ final class AddonSettings {
 				 * Fires inside the storage lock, immediately after the
 				 * option commits, or after a save that changed nothing.
 				 * Not fired when the write was refused. Same reentrancy
-				 * caveat as before_save — listeners must not call
+				 * caveat as before_save - listeners must not call
 				 * AddonSettings writers synchronously.
 				 *
 				 * @hook perflocale/addon/settings/after_save
@@ -715,7 +729,7 @@ final class AddonSettings {
 		);
 
 		// Lock::with() returns null when the lock couldn't be acquired
-		// within the TTL — treat that as a transient failure so the
+		// within the TTL - treat that as a transient failure so the
 		// caller can decide to retry / report.
 		if ( $result === null ) {
 			self::log_rejection( 'persist', $addon_id, 'lock_contention' );
@@ -741,7 +755,7 @@ final class AddonSettings {
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		error_log(
 			sprintf(
-				'PerfLocale AddonSettings::%s rejected for addon_id=%s — %s',
+				'PerfLocale AddonSettings::%s rejected for addon_id=%s - %s',
 				$op,
 				$addon_id === '' ? '(empty)' : substr( $addon_id, 0, 64 ),
 				$reason

@@ -26,20 +26,20 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  *   - `get_edit_post_link()` builds from the post type's `_edit_link`, which
  *     WordPress only populates when `show_ui` is true. For `wpcf7_contact_form`,
- *     `wpforms` and `product_variation` it returns null — and the Classic Editor
+ *     `wpforms` and `product_variation` it returns null - and the Classic Editor
  *     plugin then filters that empty string into the RELATIVE href
  *     `?classic-editor`, which a browser resolves against whatever page it is
  *     on. That is worse than a dead link: it looks real, and it silently
  *     navigated users back to admin.php with no error.
  *   - `get_permalink()` returns a URL for a non-viewable type too
- *     (`/wpcf7_contact_form/contact-form-1/`), which 404s — so an emptiness
+ *     (`/wpcf7_contact_form/contact-form-1/`), which 404s - so an emptiness
  *     check cannot tell a real link from a dead one.
  *
  * Both helpers below therefore refuse anything that is not an absolute http(s)
  * URL, and expose a filter so an addon can point its own type at the editor or
  * front-end route that actually owns it.
  *
- * Callers must treat '' as "render no link" — never as an error. A translation
+ * Callers must treat '' as "render no link" - never as an error. A translation
  * with no reachable editor is a normal state, not a failure.
  */
 final class ObjectLinks {
@@ -71,7 +71,7 @@ final class ObjectLinks {
 		 * Filter the admin URL used to edit a translatable object.
 		 *
 		 * Return an absolute admin URL for a post type whose editor is not
-		 * WordPress's own — a form builder, a page builder — or '' to render
+		 * WordPress's own - a form builder, a page builder - or '' to render
 		 * the object without a link rather than with a broken one.
 		 *
 		 * @hook perflocale/admin/edit_post_link Filter the edit URL for a translatable object.

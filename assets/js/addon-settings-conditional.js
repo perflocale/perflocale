@@ -1,5 +1,5 @@
 /**
- * PerfLocale — auto-addon settings form: conditional field visibility.
+ * PerfLocale - auto-addon settings form: conditional field visibility.
  *
  * Each row in the auto-generated addon settings form may carry a
  * `data-perflocale-show-if='{json}'` attribute. The JSON encodes the same
@@ -19,14 +19,14 @@
  *       ]}
  *
  * PHP sets the initial display state at render time; this script keeps it
- * in sync as the user toggles driver fields. No FOUC — the initial render
+ * in sync as the user toggles driver fields. No FOUC - the initial render
  * is already correct from the server.
  */
 ( function () {
 	'use strict';
 
 	// Loose equality (mirrors PHP's `!=`) so '1' matches `true`, '0' matches
-	// `false`, "" matches null/undefined — the conventions checkbox-style
+	// `false`, "" matches null/undefined - the conventions checkbox-style
 	// fields produce in the DOM differ from the canonical booleans stored
 	// server-side, and we want the same answer in both places.
 	function looseEq( a, b ) {
@@ -41,7 +41,7 @@
 			};
 			return toBool( a ) === toBool( b );
 		}
-		// String compare for everything else — Number → "1" === "1".
+		// String compare for everything else - Number → "1" === "1".
 		return String( a ) === String( b );
 	}
 
@@ -58,7 +58,7 @@
 			return spec.rules.every( function ( r ) { return evaluate( r, values ); } );
 		}
 
-		// Simple form — every key must equal its expected value.
+		// Simple form - every key must equal its expected value.
 		for ( var key in spec ) {
 			if ( ! Object.prototype.hasOwnProperty.call( spec, key ) ) { continue; }
 			if ( ! looseEq( values[ key ], spec[ key ] ) ) {
@@ -73,7 +73,7 @@
 		// Driver inputs may be tagged either with the canonical
 		// `data-perflocale-field-name` attribute (new auto-addon forms)
 		// OR carry their identity via the standard HTML `name` attribute
-		// (legacy settings markup like the WC tab). Read both — the
+		// (legacy settings markup like the WC tab). Read both - the
 		// canonical attribute wins when both are present.
 		var inputs = container.querySelectorAll( '[data-perflocale-field-name], input[name], select[name], textarea[name]' );
 
@@ -108,7 +108,7 @@
 			try {
 				spec = JSON.parse( raw );
 			} catch ( e ) {
-				return; // Malformed JSON — leave row alone.
+				return; // Malformed JSON - leave row alone.
 			}
 
 			row.style.display = evaluate( spec, values ) ? '' : 'none';
@@ -118,7 +118,7 @@
 	// Collect every container that holds at least one show_if row. We
 	// look at FORM ancestors first (auto-addon settings forms, the WC
 	// settings tab's outer form, anything else that follows the same
-	// pattern); for show_if rows outside of any form (rare — but possible
+	// pattern); for show_if rows outside of any form (rare - but possible
 	// on custom admin screens) we fall back to a synthetic "document"
 	// container that watches all bubbling change/input events from the
 	// page root.
@@ -130,7 +130,7 @@
 		var seen       = [];
 
 		rows.forEach( function ( row ) {
-			// Nearest <form> if any — same form contains the driver inputs
+			// Nearest <form> if any - same form contains the driver inputs
 			// 99% of the time, so scoping reduces unnecessary recalcs.
 			var form = row.closest( 'form' );
 			var container = form || document;
@@ -151,7 +151,7 @@
 			// after dynamic field injections from plugins / browser extensions).
 			applyVisibility( container );
 
-			// Single delegated listener — change events bubble.
+			// Single delegated listener - change events bubble.
 			container.addEventListener( 'change', function () {
 				applyVisibility( container );
 			} );

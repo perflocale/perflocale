@@ -118,7 +118,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * @param string $format Destination format hint: 'html' (default) or
 	 *   'text'. In HTML mode the MT APIs entity-escape markup-significant
 	 *   characters in their output (&amp;, &#39;), which is wrong for
-	 *   plain-text destinations like post titles — those callers pass
+	 *   plain-text destinations like post titles - those callers pass
 	 *   'text'. The parameter is deliberately NOT on ProviderInterface:
 	 *   adding it there would fatal third-party implementations, whereas
 	 *   an extra positional arg to an implementation without it is simply
@@ -163,7 +163,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// breaker for this provider, throw immediately so callers can
 		// route to a fallback (TM cache, "service unavailable" UI, etc.)
 		// without burning 3 retries × 7-30s on a known-bad endpoint.
-		// `mt_{provider_id}` is the canonical breaker key — matches what
+		// `mt_{provider_id}` is the canonical breaker key - matches what
 		// Site Health card surfaces and what the global classify_error()
 		// path in WpAiClientProvider feeds into.
 		$breaker_key = 'mt_' . $this->get_id();
@@ -213,8 +213,8 @@ abstract class AbstractProvider implements ProviderInterface {
 			$args['redirection'] = 0;
 		}
 
-		// Bound the response body. Nothing above limits how much a provider — or
-		// a proxy, or a captive portal answering for one — may send back, and
+		// Bound the response body. Nothing above limits how much a provider - or
+		// a proxy, or a captive portal answering for one - may send back, and
 		// wp_remote_request() buffers the WHOLE body in memory before this method
 		// sees a byte, so a runaway reply is a PHP fatal in the middle of a bulk
 		// run. Size the cap FROM THE REQUEST rather than pinning a constant: a
@@ -226,11 +226,11 @@ abstract class AbstractProvider implements ProviderInterface {
 		// DeepL /usage).
 		//
 		// Two consequences to know about. (1) A body over the cap is TRUNCATED
-		// SILENTLY — WpOrg\Requests\Transport\Curl::stream_body() stops storing
+		// SILENTLY - WpOrg\Requests\Transport\Curl::stream_body() stops storing
 		// bytes but still reports the full length, so there is no transport-level
 		// error. The truncated body then fails JSON decoding, which is how an
 		// oversized response surfaces: as a parse error, not as an OOM. That is
-		// the intended trade. (2) The cap bounds MEMORY, not transfer time — a
+		// the intended trade. (2) The cap bounds MEMORY, not transfer time - a
 		// slow trickle is still the `timeout` argument's job. Set if-absent, so the
 		// request_args filter below can raise or remove it for an odd endpoint.
 		if ( ! isset( $args['limit_response_size'] ) ) {
@@ -307,7 +307,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			// Rate limit hit - wait and retry. Cap the upstream Retry-After
 			// at a sensible ceiling so a malicious / buggy provider returning
 			// e.g. `Retry-After: 86400` cannot block this PHP worker for ~24h
-			// per retry attempt. 300s default — matches what real providers
+			// per retry attempt. 300s default - matches what real providers
 			// (DeepL, OpenAI, Azure) advise during sustained overload, so
 			// legitimate long-backoff hints aren't truncated into a quick
 			// retry that re-trips the breaker. Filterable.
@@ -381,13 +381,13 @@ abstract class AbstractProvider implements ProviderInterface {
 			}
 		}
 
-		// All retries exhausted — record one failure with the most
+		// All retries exhausted - record one failure with the most
 		// telling category we saw. Auth errors get a one-shot trip so a
 		// rotated/revoked API key takes the provider OUT immediately
 		// instead of after 5 more retries × 7-30s each.
 		// Only provider-health signals count toward the breaker: auth (revoked
 		// key), rate_limit (429), transient (5xx / network). A per-request 4xx
-		// such as 400 "unsupported language pair" is specific to that request —
+		// such as 400 "unsupported language pair" is specific to that request -
 		// recording it would let a batch of unsupported-language calls trip the
 		// breaker and take the whole provider offline for unrelated, valid
 		// requests. The exception is still thrown either way so the caller
@@ -519,8 +519,8 @@ abstract class AbstractProvider implements ProviderInterface {
 		// Fast path: known public MT providers skip the slow gethostbyname()
 		// step. Their hostnames are operator-controlled (wp-config / settings).
 		// The hard-coded localhost/loopback check above ALWAYS runs and is not
-		// filterable; everything below this point — the IPv4/IPv6 private-range
-		// gates and the DNS resolution — is skipped for a listed entry. Be
+		// filterable; everything below this point - the IPv4/IPv6 private-range
+		// gates and the DNS resolution - is skipped for a listed entry. Be
 		// precise about that when reading it as a security boundary: a match
 		// here returns, so an IP LITERAL added to the list is not re-checked
 		// against the private-range gates either. That is deliberate: the list
@@ -571,7 +571,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// both spellings of the same address: a mapped PUBLIC IPv4 still passes
 		// exactly as the bare form does.
 		// Gated on FILTER_FLAG_IPV6 first so inet_pton() only ever sees a
-		// literal it can parse — same shape as the fc00::/fe80:: byte check
+		// literal it can parse - same shape as the fc00::/fe80:: byte check
 		// further down.
 		if ( Helper::is_ipv6( $host_ip ) ) {
 			$host_bin = inet_pton( $host_ip );
@@ -659,7 +659,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// as a literal URL would, so the two spellings of one address can never
 		// drift apart. An IP literal returns before the DNS branch, so the
 		// recursion is exactly one level deep. A host on
-		// perflocale/mt/trusted_hosts returned long before this point — that
+		// perflocale/mt/trusted_hosts returned long before this point - that
 		// documented full exemption is still the way to reach an internal
 		// endpoint.
 		foreach ( self::resolve_aaaa( $host ) as $ipv6 ) {
@@ -698,12 +698,12 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * refusing every provider URL there would take machine translation offline
 	 * on those sites. The result is cached for the same 5 minutes as the A
 	 * record, so a slow or broken resolver is paid once per host per window
-	 * rather than once per request — and hosts on the trusted list, and every
+	 * rather than once per request - and hosts on the trusted list, and every
 	 * IP literal, return before this is ever called.
 	 *
 	 * Mirrored in {@see \PerfLocale\Api\WebhookController}; keep them in sync.
 	 *
-	 * @param string $host Hostname (never an IP literal — the caller returns first).
+	 * @param string $host Hostname (never an IP literal - the caller returns first).
 	 * @return array<int, string> IPv6 literals; empty when there are none or the
 	 *   lookup is unavailable.
 	 */
@@ -743,7 +743,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * do: OpenAI's 401 body is literally `Incorrect API key provided:
 	 * sk-…`, and a misbehaving proxy can echo an Authorization header. The
 	 * text eventually reaches the admin UI via the RuntimeException thrown
-	 * below — and, for a background job, is persisted on the job row that
+	 * below - and, for a background job, is persisted on the job row that
 	 * the Jobs page and the REST detail endpoint render. Masking long
 	 * alphanumeric runs is a cheap defense in depth: anything that looks
 	 * like a 24+ character credential gets replaced with "[REDACTED]".
@@ -751,8 +751,8 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * untouched.
 	 *
 	 * `protected` rather than private because providers that do NOT route
-	 * through make_request() — {@see \PerfLocale\MachineTranslation\Provider\WpAiClientProvider},
-	 * which is invoked through a PHP callback — have to apply the same
+	 * through make_request() - {@see \PerfLocale\MachineTranslation\Provider\WpAiClientProvider},
+	 * which is invoked through a PHP callback - have to apply the same
 	 * masking to the upstream message themselves.
 	 *
 	 * The rule itself lives in {@see \PerfLocale\Util\SecretMasker} so the
@@ -774,7 +774,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * 12 months, so retaining 13 is sufficient.
 	 *
 	 * Scheduled weekly from Bootstrap (`perflocale_mt_usage_gc` event,
-	 * per-blog). Idempotent — safe to re-run.
+	 * per-blog). Idempotent - safe to re-run.
 	 *
 	 * @return int Number of options deleted.
 	 */
@@ -851,7 +851,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// INSERT … ON DUPLICATE KEY UPDATE option_value = option_value + N is
 		// the whole operation under the row lock: the row is created with $chars
 		// if absent, or has $chars ADDED if present. Note we can NOT use
-		// add_option() to pre-create the row — modern WP's add_option issues
+		// add_option() to pre-create the row - modern WP's add_option issues
 		// `ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)`, so a
 		// concurrent add_option('0') would RESET a row another worker had
 		// already incremented. autoload 'no' keeps it out of alloptions on every
@@ -872,7 +872,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// committed total instead of a stale per-process value.
 		// The raw INSERT bypasses add_option(), so when this month's row is
 		// being CREATED the option name is still listed in the persistent
-		// 'notoptions' cache (a prior get_option() miss put it there) — and a
+		// 'notoptions' cache (a prior get_option() miss put it there) - and a
 		// stale notoptions entry makes every later get_option() return the
 		// default 0 REGARDLESS of the DB value, silently disabling the monthly
 		// cap. Mirror core add_option()'s cache maintenance: drop the name from
@@ -896,7 +896,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	 *
 	 * RFC 7231 §7.1.3 allows both an integer (delta-seconds) and an
 	 * HTTP-date form ("Wed, 21 Oct 2026 07:28:00 GMT"). A naive int-cast
-	 * collapses the date form to 0 — letting the request retry immediately
+	 * collapses the date form to 0 - letting the request retry immediately
 	 * after a 429, which is the opposite of what the upstream asked for.
 	 *
 	 * @param mixed $header Raw header value (string or empty).
@@ -909,12 +909,12 @@ abstract class AbstractProvider implements ProviderInterface {
 
 		$trimmed = trim( $header );
 
-		// Delta-seconds form — pure integer string.
+		// Delta-seconds form - pure integer string.
 		if ( Helper::is_ascii_digits( $trimmed ) ) {
 			return (int) $trimmed;
 		}
 
-		// HTTP-date form — fall back to strtotime + diff against now.
+		// HTTP-date form - fall back to strtotime + diff against now.
 		$ts = strtotime( $trimmed );
 		if ( false === $ts ) {
 			return 0;

@@ -39,13 +39,13 @@ final class XliffController extends RestController {
 				'permission_callback' => [ $this, 'export_permissions_check' ],
 				// Documentation + defense-in-depth. source_lang/target_lang
 				// sanitize_callbacks mirror export()'s sanitize_key exactly;
-				// post_ids stays a bare array (export() maps absint over it —
+				// post_ids stays a bare array (export() maps absint over it -
 				// no scalar sanitizer applies). Not required: the permission
 				// gate already rejects an empty/invalid post_ids set.
 				'args'                => [
 					// post_ids: documentation only, no strict type. export()
 					// does array_map( 'absint', (array) $post_ids ), so a scalar
-					// is accepted and wrapped — declaring type=array would newly
+					// is accepted and wrapped - declaring type=array would newly
 					// reject that currently-valid shape.
 					'post_ids'    => [
 						'description' => __( 'IDs of the source posts to export.', 'perflocale' ),

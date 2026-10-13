@@ -263,7 +263,7 @@ final class TranslationFileLoader {
 		}
 
 		if ( strpos( $value, "\0" ) === false ) {
-			// 2-form language / no extra forms — the value IS form 1.
+			// 2-form language / no extra forms - the value IS form 1.
 			return $value;
 		}
 
@@ -303,13 +303,13 @@ final class TranslationFileLoader {
 	 * Keying by the raw `domain|context|text` composite (the exact pre-image
 	 * StringRepository::compute_hash() would feed to SHA-256, same '|'
 	 * separator) keeps identical identity semantics while removing a full
-	 * SHA-256 from every __()/_e()/_x()/_n() call — the hottest per-request
+	 * SHA-256 from every __()/_e()/_x()/_n() call - the hottest per-request
 	 * path (500–1500 gettext fires per translated page). The in-memory writer
 	 * (load_translations), the on-disk writer (TranslationFileGenerator's
 	 * combined bundle), and the reader (get_translation) all share this one
 	 * helper so the key expressions can never drift. Combined bundles PERSIST
 	 * these keys, so any format change must bump
-	 * TranslationFileGenerator::COMBINED_VERSION — a stale-format bundle is
+	 * TranslationFileGenerator::COMBINED_VERSION - a stale-format bundle is
 	 * then rejected and rebuilt instead of silently missing every lookup.
 	 *
 	 * @param string $domain  Text domain.
@@ -361,7 +361,7 @@ final class TranslationFileLoader {
 		// generation, or a legacy install).
 		$manifest = get_option( TranslationFileGenerator::MANIFEST_OPTION );
 
-		// Equals TranslationFileGenerator::combined_basename( $locale ) —
+		// Equals TranslationFileGenerator::combined_basename( $locale ) -
 		// derived from $suffix to avoid a second sanitize_file_name() call.
 		$combined_name = TranslationFileGenerator::COMBINED_PREFIX . $suffix;
 
@@ -370,7 +370,7 @@ final class TranslationFileLoader {
 		// include (an OPcache-shared array) replaces the per-domain walk
 		// below. That walk pays is_string + explode + concat + hash-insert
 		// per message on every non-default-language request and is O(total
-		// strings) — the dominant files-mode cost at the scale files mode is
+		// strings) - the dominant files-mode cost at the scale files mode is
 		// chosen for. The bundle is trusted only when the manifest lists it:
 		// the generator deletes a stale bundle before touching any per-domain
 		// file and writes the manifest last, so listed + present ⟹ current.
@@ -458,7 +458,7 @@ final class TranslationFileLoader {
 			$basename = basename( $file );
 
 			// The combined bundle shares the locale suffix (so locale-wide
-			// cleanup globs catch it) but is not a per-domain file — reaching
+			// cleanup globs catch it) but is not a per-domain file - reaching
 			// here means it wasn't trusted above, so don't parse it at all.
 			if ( $basename === $combined_name ) {
 				continue;
@@ -473,7 +473,7 @@ final class TranslationFileLoader {
 			$file_real = realpath( $file );
 
 			if ( $file_real === false || $dir_real === false ) {
-				continue; // Broken symlink or missing parent &mdash; skip silently.
+				continue; // Broken symlink or missing parent - skip silently.
 			}
 
 			// Strict prefix check: the resolved file must sit inside the
@@ -504,7 +504,7 @@ final class TranslationFileLoader {
 				// Parse context from key format: context\x04original. A purely
 				// numeric source key (e.g. '42') is stored by PHP as an int
 				// array key, so guard str_contains() on is_string() and stringify
-				// the key below — the read side (get_translation) always passes a
+				// the key below - the read side (get_translation) always passes a
 				// string $text, so the write key must stringify to match, never skip.
 				$context = '';
 

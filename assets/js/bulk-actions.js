@@ -69,7 +69,7 @@
 
 		function syncDropdowns( source ) {
 			if ( ! primary ) return;
-			// Mirror is optional — pages without a bottom bulk-actions bar
+			// Mirror is optional - pages without a bottom bulk-actions bar
 			// (e.g. Translations) skip the cross-sync but still need to
 			// reveal the right secondary input on every change.
 			if ( mirror ) {
@@ -92,7 +92,7 @@
 		showSecondary( primary ? primary.value : '' );
 
 		// Select-all checkbox(es). There may be one in the header AND one in
-		// the footer — keep them in sync with each other and with each row
+		// the footer - keep them in sync with each other and with each row
 		// checkbox bound to this form.
 		var selectAlls = document.querySelectorAll( '[data-perflocale-bulk-select-all]' );
 		var rowCheckboxes = function () {

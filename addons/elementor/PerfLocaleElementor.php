@@ -71,7 +71,7 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 		// translated at render)". The second half of that sentence is FALSE for
 		// Elementor: `_elementor_data` is not a layout skeleton, it is the JSON
 		// document holding every widget's heading, paragraph, button label and alt
-		// text, and nothing in this plugin translates it at render time — the only
+		// text, and nothing in this plugin translates it at render time - the only
 		// Elementor hook registered anywhere is `elementor/widgets/register`, which
 		// adds a language switcher widget.
 		//
@@ -91,7 +91,7 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 		// The cost, accepted deliberately: a later structural edit to the source no
 		// longer propagates to existing translations. Propagating layout without
 		// destroying translated text needs an Elementor-aware JSON merge that can
-		// tell a layout node from a localisable value — a raw whole-document mirror
+		// tell a layout node from a localisable value - a raw whole-document mirror
 		// cannot give you both. Losing automatic layout updates is the lesser harm.
 		//
 		// Note this is also what the host expects: Elementor's own Polylang
@@ -108,7 +108,7 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 		// `add_meta_keys()` below says `_elementor_css` is "deliberately NOT" copied,
 		// and that was never true. The seed path is
 		// `PostTranslationManager::copy_post_meta()`, which is a BLANKET copy of every
-		// meta row on the source minus an eight-key blocklist — not an allowlist built
+		// meta row on the source minus an eight-key blocklist - not an allowlist built
 		// from `translatable_meta_keys`. So leaving a key out of that filter excludes
 		// it from nothing, and a new translation was born holding the SOURCE's compiled
 		// CSS status, rendered-HTML cache and asset list.
@@ -119,8 +119,8 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 		// IDs), and whose `_elementor_element_cache` serves the source language's
 		// rendered HTML until that cache expires.
 		//
-		// The list is Elementor's OWN — the exclusions it applies when a post is
-		// duplicated (elementor/includes/compatibility.php, yoast_duplicate_post()) —
+		// The list is Elementor's OWN - the exclusions it applies when a post is
+		// duplicated (elementor/includes/compatibility.php, yoast_duplicate_post()) -
 		// rather than one guessed here.
 		//
 		// ⚠️ `_elementor_template_type` is deliberately NOT excluded even though
@@ -160,13 +160,13 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 	 */
 	public function add_meta_keys( array $keys, string $post_type ): array {
 		$keys[] = '_elementor_data';
-		// `_elementor_css` is not listed here — it is a generated per-post CSS cache
+		// `_elementor_css` is not listed here - it is a generated per-post CSS cache
 		// whose rules are scoped to the SOURCE post's element IDs, so a sibling holding
 		// it serves wrong-ID CSS.
 		//
 		// ⚠️ Leaving it out of THIS filter does not prevent the copy. The seed path is
 		// a blanket copy of every meta row minus a small blocklist, so exclusion has
-		// to be stated explicitly — see
+		// to be stated explicitly - see
 		// exclude_generated_caches(), registered on
 		// `perflocale/translation/excluded_meta_keys` in boot().
 
@@ -206,13 +206,13 @@ final class PerfLocaleElementor implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Keep Elementor's GENERATED caches out of a new translation.
 	 *
-	 * These describe the SOURCE post — its compiled CSS, its rendered HTML, its asset
+	 * These describe the SOURCE post - its compiled CSS, its rendered HTML, its asset
 	 * dependency list, its editor screenshot. None of them is content, every one of
 	 * them is rebuilt on demand from `_elementor_data`, and each is keyed to the
 	 * source's element IDs, so copying them onto a sibling is never right.
 	 *
 	 * Mirrors {@see self::invalidate_generated_caches()}, which drops the same family
-	 * after a layout mirror — this is the create-time half of the same rule.
+	 * after a layout mirror - this is the create-time half of the same rule.
 	 *
 	 * @param array<int, string> $excluded  Meta keys already excluded from copying.
 	 * @param int                $source_id Post being copied from.

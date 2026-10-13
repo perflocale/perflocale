@@ -17,8 +17,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Computes the character volume a bulk MT operation is ABOUT to send —
- * before any provider spend — so confirm dialogs can show real numbers and
+ * Computes the character volume a bulk MT operation is ABOUT to send -
+ * before any provider spend - so confirm dialogs can show real numbers and
  * the dispatch-time budget gate can veto over-cap jobs up front.
  *
  * Estimates are SQL reads (CHAR_LENGTH sums, and per-row lengths for meta
@@ -29,8 +29,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * masking and provider-side tag wrapping (DeepL) shift billed characters
  * slightly, "Do not translate" blocks and meta values made only of
  * placeholders are counted although they are not sent, and the
- * skip-existing subtraction mirrors — but does not atomically reserve
- * against — the jobs' own skip rules. Enforcement truth remains the atomic
+ * skip-existing subtraction mirrors - but does not atomically reserve
+ * against - the jobs' own skip rules. Enforcement truth remains the atomic
  * monthly usage counter.
  */
 final class CostEstimator {
@@ -101,7 +101,7 @@ final class CostEstimator {
 		// Optional meta volume: the values MetaTranslator actually sends. Keys
 		// come from its own key resolution (the registry minus credential-named
 		// keys and Sync Fields mirror keys), resolved once per post TYPE (the
-		// registry's per-post expansions are ignored here — estimate-grade
+		// registry's per-post expansions are ignored here - estimate-grade
 		// approximation). Per (post, key) only the first row counts, as
 		// get_post_meta( …, true ) reads it, and only when it is a non-blank
 		// string: serialized arrays and objects are never sent.
@@ -162,7 +162,7 @@ final class CostEstimator {
 			}
 		}
 
-		// Which (source, language) pairs already exist — the job skips them.
+		// Which (source, language) pairs already exist - the job skips them.
 		// One join across the translation graph: every sibling language of
 		// every source post's group.
 		$links_table  = Schema::table( 'translation_links' );

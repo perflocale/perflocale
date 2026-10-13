@@ -37,7 +37,7 @@
 	// ─── Unsaved-edit protection ──────────────────────────────────────
 	// Hand-typed translations live in .perflocale-str-input fields until
 	// "Save Translations" posts them. This file's own MT flow reloads or
-	// navigates away — silently destroying those edits — and pagination/
+	// navigates away - silently destroying those edits - and pagination/
 	// sort links do the same. defaultValue is the server-rendered value,
 	// so value !== defaultValue is exactly "typed but unsaved".
 	function hasDirtyEdits() {
@@ -61,13 +61,13 @@
 	} );
 
 	// The GET forms on this screen (search, filter) navigate away and discard
-	// the typed edits with no server-side persistence — exactly the loss the
+	// the typed edits with no server-side persistence - exactly the loss the
 	// pagination links already warn about, so let the guard fire for them.
 	// Of the POST forms only the ones that actually LEAVE the page may disarm
 	// the guard: Save persists the edits and Import is a deliberate replace.
 	// Export streams a .po download and the page stays put, so suppressing on
-	// it would disarm the guard for the rest of the page's life — nothing
-	// re-arms it, since pageshow only fires on a real load / bfcache restore —
+	// it would disarm the guard for the rest of the page's life - nothing
+	// re-arms it, since pageshow only fires on a real load / bfcache restore -
 	// and the next pagination click would then discard typed edits silently.
 	document.addEventListener( 'submit', function ( ev ) {
 		var form = ev.target;
@@ -154,7 +154,7 @@
 			countEl.textContent = '(' + n + ')';
 		}
 		// Hide the button entirely when there's nothing to act on, rather
-		// than showing it greyed out — the disabled state in the toolbar
+		// than showing it greyed out - the disabled state in the toolbar
 		// reads as "broken" to users on first encounter.
 		if ( btnIds ) {
 			btnIds.hidden = ( n === 0 );
@@ -192,7 +192,7 @@
 		} );
 	}
 
-	// Event delegation on the table — survives any future re-render.
+	// Event delegation on the table - survives any future re-render.
 	document.addEventListener( 'change', function ( e ) {
 		if ( e.target && e.target.classList && e.target.classList.contains( 'perflocale-str-mt-cb' ) ) {
 			updateSelectedCount();
@@ -272,14 +272,14 @@
 
 			if ( data.mode === 'async' ) {
 				setStatus( i18n.queued || 'Queued.', 'success' );
-				// Hand off to Jobs page so the user sees live progress —
+				// Hand off to Jobs page so the user sees live progress -
 				// unless it would destroy typed-but-unsaved translations.
 				if ( hasDirtyEdits() ) {
 					// Staying on the page: the "Redirecting…" text would be wrong.
-					setStatus( i18n.dirtyStay || 'Job started — your unsaved edits were kept; save them, then check the Jobs page.', 'success' );
+					setStatus( i18n.dirtyStay || 'Job started - your unsaved edits were kept; save them, then check the Jobs page.', 'success' );
 					// The user stays on the page to save; release the busy
 					// state so a second batch can be dispatched. setBusy(false)
-					// only re-enables the buttons — the status text survives.
+					// only re-enables the buttons - the status text survives.
 					setBusy( false );
 					return;
 				}
@@ -380,7 +380,7 @@
 		var targets = collectTargetIds();
 		if ( targets.length === 0 ) { setStatus( i18n.pickTargets, 'error' ); return; }
 
-		// Whole-table count, not the filtered subset — Translate-all
+		// Whole-table count, not the filtered subset - Translate-all
 		// ignores any active filter on purpose.
 		var total  = parseInt( toolbar.getAttribute( 'data-perflocale-grand-total' ) || toolbar.getAttribute( 'data-perflocale-total' ) || '0', 10 );
 		var prompt = format( i18n.confirmAll || '', [ total, collectTargetNames().join( ', ' ) ] );

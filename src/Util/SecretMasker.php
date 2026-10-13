@@ -20,12 +20,12 @@ if ( ! defined( 'ABSPATH' ) ) {
  * The rule matches the SAFE shape rather than the unsafe one: a 24+ character
  * run of `[A-Za-z0-9_-]` survives only when it looks like a lowercase
  * snake_case identifier (letter-initial, `word_word_word`, each segment at
- * most 16 characters) — which is what this plugin's hook, filter and
+ * most 16 characters) - which is what this plugin's hook, filter and
  * capability names look like. Everything else is redacted, so hex digests,
  * UUIDs, `sk-…` keys and all-letter base62 tokens fail closed even when they
  * contain no digit.
  *
- * @api  Stable addon-facing API surface — semver-bound; safe for 3rd-party addons to depend on.
+ * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class SecretMasker {
 

@@ -2,7 +2,7 @@
  * Drag-and-drop file uploader.
  *
  * Used by the PO import disclosure on the Strings page and the CSV import
- * disclosure on the Glossary page. Conditionally enqueued — only on those
+ * disclosure on the Glossary page. Conditionally enqueued - only on those
  * two screens.
  */
 

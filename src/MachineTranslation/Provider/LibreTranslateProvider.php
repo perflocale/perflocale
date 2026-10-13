@@ -46,7 +46,7 @@ final class LibreTranslateProvider extends AbstractProvider {
 	 *
 	 * Self-hosted LibreTranslate instances often don't require a key, so an
 	 * empty result here is normal. The configured URL is the actual gating
-	 * signal — see is_configured(). Resolved transparently as env var →
+	 * signal - see is_configured(). Resolved transparently as env var →
 	 * PHP constant → database via Settings::get() (see CONSTANT_MAP:
 	 * PERFLOCALE_LIBRE_API_KEY ↔ mt_libre_api_key).
 	 *
@@ -59,7 +59,7 @@ final class LibreTranslateProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch().
 	 *
 	 * @throws \RuntimeException When the LibreTranslate API returns an unexpected response or all retries fail.

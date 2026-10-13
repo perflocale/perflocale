@@ -400,8 +400,8 @@ final class ContentChangeDetector {
 	 *
 	 * `flag_translations()` stamps `needs_update` on every sibling whenever the
 	 * SOURCE changes, and until now nothing in the plugin ever cleared it
-	 * again. `TranslationGroupRepository::update_link_status()` — the only
-	 * status-write entry point — shipped with no production caller at all, and
+	 * again. `TranslationGroupRepository::update_link_status()` - the only
+	 * status-write entry point - shipped with no production caller at all, and
 	 * no `transition_post_status` handler writes link status either. The result
 	 * was a one-way door: once a translation was flagged, the red badge on the
 	 * Translations screen was permanent, even after the translation had been
@@ -411,7 +411,7 @@ final class ContentChangeDetector {
 	 *
 	 * The signal acted on here is the strongest one available without inventing
 	 * new UI: this object is NOT the source, and its own content hash just
-	 * moved — somebody edited the translation. That is exactly the action the
+	 * moved - somebody edited the translation. That is exactly the action the
 	 * badge was asking for.
 	 *
 	 * Deliberately narrow:
@@ -424,13 +424,15 @@ final class ContentChangeDetector {
 	 *     re-flagged `needs_update` between the two was overwritten with
 	 *     `published`, and so was an unrelated subsystem's `pending`. The
 	 *     precondition passed to update_link_status() is what actually makes
-	 *     the claim true — the SELECT is now only a fast path that skips the
+	 *     the claim true - the SELECT is now only a fast path that skips the
 	 *     UPDATE on the overwhelming majority of saves, where the row reads
 	 *     `empty` or `published` and there is no badge to retire;
 	 *   - the caller has already established `post_status === 'publish'` (and
 	 *     terms have no status), so `published` is the correct landing state;
 	 *   - a no-op when the object carries no link row (language id 0), which is
-	 *     the unmanaged/source-by-convention case.
+	 *     the unmanaged/source-by-convention case;
+	 *   - a post marked stale by ContentSync keeps the status until a person's
+	 *     save clears the mark (ContentSync::keeps_needs_update()).
 	 *
 	 * @param int        $object_id Post or term ID, per $type.
 	 * @param ObjectType $type      Which id-space $object_id belongs to.
@@ -451,7 +453,7 @@ final class ContentChangeDetector {
 
 		// Fast path only. The correctness of "touch nothing but a flagged row"
 		// rests on the precondition handed to update_link_status() below, not
-		// on this read — see the ⚠️ note in the docblock. What this buys is
+		// on this read - see the ⚠️ note in the docblock. What this buys is
 		// skipping the UPDATE entirely on the ordinary save, where the row
 		// reads `empty` or `published` and there is no badge to retire.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -470,23 +472,31 @@ final class ContentChangeDetector {
 			return;
 		}
 
+		// A translation whose Sync Fields a save of its group skipped keeps
+		// "needs update" until a person's save clears the mark
+		// (ContentSync::SYNC_STALE_META); its changed content settles every
+		// content flag up to the link's last write.
+		if ( $type === ObjectType::Post && ContentSync::keeps_needs_update( $object_id ) ) {
+			return;
+		}
+
 		// Routed through the repository rather than a direct UPDATE so the
 		// per-object cache AND the eager link map are both invalidated and
-		// `perflocale/translation/status_changed` fires — a bare UPDATE here
+		// `perflocale/translation/status_changed` fires - a bare UPDATE here
 		// would leave the switcher and hreflang reading a stale status.
 		//
 		// Constructed from the injected CacheManager rather than fetched from
 		// the container (as flag_translations() does): the container's get()
 		// returns an untyped object, which costs a `method.notFound` that the
 		// gate's static-analysis step counts as fatal-class. Same repository,
-		// same cache, same invalidation — just a type PHPStan can see.
+		// same cache, same invalidation - just a type PHPStan can see.
 		$repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $this->cache );
 
 		// The status read above is the PRECONDITION, not just a guard: passing
 		// it back means the UPDATE matches only while the row still reads
 		// `needs_update`, so a write that landed in between wins instead of
 		// being silently overwritten. A false return here is the expected,
-		// correct outcome in that case — the newer status stands.
+		// correct outcome in that case - the newer status stands.
 		$repo->update_link_status(
 			$object_id,
 			$language_id,
@@ -510,11 +520,17 @@ final class ContentChangeDetector {
 
 		$links_table = Schema::table( 'translation_links' );
 
-		// Update all links in this group EXCEPT the source post.
+		// Update all links in this group EXCEPT the source post. The write
+		// time always moves past the value the link held, also within the
+		// same second: a translation's stale mark stores the link's write
+		// time, and clearing the mark restores its status only while that
+		// time is unchanged (ContentSync::SYNC_STALE_META), so no content
+		// flag can leave it equal.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->query(
 			$wpdb->prepare(
-				"UPDATE %i SET status = 'needs_update', updated_at = NOW()
+				"UPDATE %i SET status = 'needs_update',
+				updated_at = GREATEST( NOW(), COALESCE( updated_at + INTERVAL 1 SECOND, NOW() ) )
 				WHERE group_id = %d AND object_id != %d",
 				$links_table,
 				(int) $group->id,

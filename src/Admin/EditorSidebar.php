@@ -36,7 +36,7 @@ final class EditorSidebar {
 	 *
 	 * Templates and template parts cannot be opened in the post editor, so
 	 * before this they were the only translatable objects with no in-editor way
-	 * to see or reach their translations — which is exactly where the question
+	 * to see or reach their translations - which is exactly where the question
 	 * arises, since a template's translations are otherwise invisible until you
 	 * leave for the Translations screen.
 	 *
@@ -46,10 +46,12 @@ final class EditorSidebar {
 	 * whichever entity happened to be open first. Only the static configuration
 	 * is passed across; the script subscribes to `core/editor` for the rest.
 	 *
-	 * Reads through the existing `perflocale/v1/translations/post/<id>` route,
-	 * which already gates on `edit_post` for the specific object — so this adds
-	 * no new capability surface, and a user who cannot edit a template cannot
-	 * enumerate its translations either.
+	 * Reads and creates through the existing `perflocale/v1/translations/post/<id>`
+	 * route, the one the post-editor panel uses. It requires `perflocale_translate`
+	 * and `edit_post` for the specific object, and a create also the copy source's
+	 * edit and read rights and its type's create capability - so this adds no new
+	 * capability surface, and a user who cannot edit a template cannot enumerate
+	 * or create its translations either.
 	 *
 	 * @return void
 	 */
@@ -67,8 +69,8 @@ final class EditorSidebar {
 			)
 		);
 
-		// Nothing the Site Editor edits is translatable on this site — for
-		// example Full Site Editing is off — so ship no script at all.
+		// Nothing the Site Editor edits is translatable on this site - for
+		// example Full Site Editing is off - so ship no script at all.
 		if ( $site_editor_types === [] ) {
 			return;
 		}
@@ -76,7 +78,7 @@ final class EditorSidebar {
 		wp_enqueue_script(
 			'perflocale-site-editor-sidebar',
 			PERFLOCALE_URL . 'assets/js/site-editor-sidebar.js',
-			[ 'wp-plugins', 'wp-editor', 'wp-element', 'wp-data', 'wp-api-fetch', 'wp-i18n' ],
+			[ 'wp-plugins', 'wp-editor', 'wp-element', 'wp-data', 'wp-api-fetch', 'wp-i18n', 'wp-notices' ],
 			PERFLOCALE_VERSION,
 			true
 		);
@@ -96,10 +98,18 @@ final class EditorSidebar {
 					'trashed'       => __( 'Trashed', 'perflocale' ),
 					'none'          => __( 'None', 'perflocale' ),
 					'edit'          => __( 'Edit', 'perflocale' ),
+					'create'        => __( 'Create', 'perflocale' ),
+					'created'       => __( 'Translation created.', 'perflocale' ),
+					'createError'   => __( 'Failed to create translation.', 'perflocale' ),
 					'loading'       => __( 'Loading...', 'perflocale' ),
 					'loadError'     => __( 'Could not load translations.', 'perflocale' ),
 					'draftHint'     => __( 'Not used until published - the original renders instead.', 'perflocale' ),
 					'notCustomised' => __( 'This still comes from the theme. Save a change to customise it, then its translations appear here.', 'perflocale' ),
+					/* translators: %s: language name, for example "English". */
+					'renameMenu'    => __( 'The %s menu still has the original name. Rename it in its language: screen readers read the menu name aloud to visitors.', 'perflocale' ),
+					/* translators: %s: language name, for example "English". */
+					'renamePattern' => __( 'The %s pattern still has the original name. Rename it in its language, so the pattern lists tell them apart.', 'perflocale' ),
+					'close'         => __( 'Close', 'perflocale' ),
 				],
 			]
 		);
@@ -121,7 +131,7 @@ final class EditorSidebar {
 		$screen = get_current_screen();
 
 		// The Site Editor is a different editor with a different screen base and
-		// a different lifecycle — the edited entity changes without a reload —
+		// a different lifecycle - the edited entity changes without a reload -
 		// so it gets its own, much smaller panel rather than being forced
 		// through this one.
 		if ( $screen && $screen->base === 'site-editor' ) {
@@ -161,7 +171,7 @@ final class EditorSidebar {
 
 		// Load the JS translations for this handle. Without it the wp.i18n.__()
 		// strings in the script file stay untranslated no matter what a
-		// translator supplies — WordPress only wires a script's JSON language
+		// translator supplies - WordPress only wires a script's JSON language
 		// pack when the handle is registered here. No-ops until a language pack
 		// exists, so it is safe on a fresh install.
 		wp_set_script_translations( 'perflocale-editor-sidebar', 'perflocale' );
@@ -234,7 +244,7 @@ final class EditorSidebar {
 		// Build a compact language map mirroring what block-toolbar receives:
 		// just enough for the sidebar to render the "Translate to X" buttons.
 		// Plugin::get() throws on missing services, so the truthy check on its
-		// return value is statically dead — use has() to gate.
+		// return value is statically dead - use has() to gate.
 		$plugin_for_repo = \PerfLocale\Plugin::get_instance();
 		$lang_repo       = $plugin_for_repo->has( 'cache' )
 			? new \PerfLocale\Database\Repository\LanguageRepository( $plugin_for_repo->get( 'cache' ) )
@@ -322,7 +332,7 @@ final class EditorSidebar {
 
 		// Load the JS translations for this handle. Without it the wp.i18n.__()
 		// strings in the script file stay untranslated no matter what a
-		// translator supplies — WordPress only wires a script's JSON language
+		// translator supplies - WordPress only wires a script's JSON language
 		// pack when the handle is registered here. No-ops until a language pack
 		// exists, so it is safe on a fresh install.
 		wp_set_script_translations( 'perflocale-block-translate-sidebar', 'perflocale' );

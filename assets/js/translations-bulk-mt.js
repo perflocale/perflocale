@@ -1,5 +1,5 @@
 /**
- * Translations page — MT cost estimates.
+ * Translations page - MT cost estimates.
  *
  * Two responsibilities, both estimate-first so no provider spend happens
  * without the operator seeing real numbers:
@@ -7,7 +7,7 @@
  * 1. Bulk action confirm: when the "Translate via <provider>" bulk action is
  *    applied, fetch a character/cost estimate for the checked rows and ask
  *    for confirmation before the form actually submits. If the estimate
- *    endpoint is unreachable the flow degrades to a plain confirm — the
+ *    endpoint is unreachable the flow degrades to a plain confirm - the
  *    feature never hard-depends on it.
  *
  * 2. "Translate the entire site" panel: the Start button stays disabled
@@ -54,7 +54,7 @@
 		var metaToggle = document.querySelector( '[data-perflocale-bulk-meta]' );
 		if ( ! form || ! select ) { return; }
 
-		// The meta toggle only matters for the MT action — show it then.
+		// The meta toggle only matters for the MT action - show it then.
 		if ( metaToggle ) {
 			var syncMetaVisibility = function () {
 				metaToggle.hidden = select.value !== 'mt_translate';
@@ -115,7 +115,7 @@
 				if ( proceed ) {
 					confirmed = true;
 					form.submit();
-					return; // keep disabled — the page is navigating.
+					return; // keep disabled - the page is navigating.
 				}
 				unbusy();
 			} ).catch( function () {
@@ -147,7 +147,7 @@
 			};
 		}
 
-		// Any selection change invalidates the previous estimate — and any
+		// Any selection change invalidates the previous estimate - and any
 		// estimate still in flight: without the token, a response computed
 		// for the OLD selection would land after the change, print stale
 		// numbers, and re-enable Start for a selection that was never
@@ -180,7 +180,7 @@
 			} ).then( function ( est ) {
 				estBtn.disabled = false;
 				if ( token !== estToken ) {
-					return; // Selection changed mid-flight — estimate is stale.
+					return; // Selection changed mid-flight - estimate is stale.
 				}
 				if ( est.would_exceed ) {
 					result.textContent = ( cfg.i18n.overBudget || '' ).replace( '%1$s', fmt( est.chars ) ).replace( '%2$s', fmt( est.monthly_remaining ) );

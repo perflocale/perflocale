@@ -146,7 +146,7 @@
 	 * Result memoized per blockName because the registered schema is
 	 * effectively immutable for the lifetime of the page.
 	 *
-	 * Inclusion rules (conservative — false positives on text translation
+	 * Inclusion rules (conservative - false positives on text translation
 	 * are worse than false negatives):
 	 *   - type: 'rich-text' (RichTextData)               → include
 	 *   - type: 'string' AND source: 'html'              → include (HTML body)
@@ -166,7 +166,7 @@
 	// schema marks them `source: 'attribute'` (i.e. they map to an HTML
 	// attribute rather than HTML body content).
 	//
-	// Rationale: `source: 'attribute'` covers two very different cases —
+	// Rationale: `source: 'attribute'` covers two very different cases -
 	//   - URL-like values (href, src, target, rel) → must NOT translate
 	//   - User-visible accessibility text (alt, title, placeholder,
 	//     aria-label, caption summary) → SHOULD translate
@@ -300,7 +300,7 @@
 		// block translation is a separate, recursive concern.
 		//
 		// MUST stay in sync with BlockAttributeSource::chain() in
-		// src/Translation/BlockAttributeSource.php — both sides walk the same
+		// src/Translation/BlockAttributeSource.php - both sides walk the same
 		// per-block chain server- and client-side. Drift = "Fill in from
 		// source" reading different attributes from the source block than
 		// the editor writes.
@@ -568,7 +568,7 @@
 		for ( var i = 0; i < leaves.length; i++ ) {
 			if ( typeof translations[ i ] !== 'string' ) { continue; }
 			// An empty translation for a leaf that had text is a provider
-			// failure for that entry — writing it would blank the block's
+			// failure for that entry - writing it would blank the block's
 			// content. Skip it; the applied count (and the toast built from
 			// it) then reflects only real writes.
 			if ( translations[ i ] === '' ) { continue; }
@@ -650,7 +650,7 @@
 			var options = { type: 'snackbar', isDismissible: true };
 
 			// A stable id makes core/notices REPLACE the previous notice with
-			// the same id instead of stacking a new snackbar — used by the
+			// the same id instead of stacking a new snackbar - used by the
 			// chunked batch translator's progress updates.
 			if ( id ) { options.id = id; }
 
@@ -823,7 +823,7 @@
 
 				var fullToast = sprintf(
 					/* translators: %s: target language label e.g. "French (FR)" */
-					__( 'Filled in from source — %s', 'perflocale' ),
+					__( 'Filled in from source - %s', 'perflocale' ),
 					formatLangLabel( targetLang )
 				);
 				if ( srcLabel ) { fullToast += ' · ' + srcLabel; }
@@ -886,7 +886,7 @@
 					// Source label: "DeepL", "translation memory", etc.
 					// `data.source === 'tm'` is set by the controller when a
 					// pre-flight TM lookup returned an exact match
-					// 2.3) — surface that to the user so they know the
+					// 2.3) - surface that to the user so they know the
 					// translation was free vs MT-quota-consuming.
 					var srcLabel = '';
 					if ( data.source === 'tm' ) {
@@ -944,7 +944,7 @@
 	var utf8Encoder = ( typeof TextEncoder !== 'undefined' ) ? new TextEncoder() : null;
 
 	function utf8Length( s ) {
-		// Fallback doubles the UTF-16 unit count — a safe overestimate that
+		// Fallback doubles the UTF-16 unit count - a safe overestimate that
 		// only makes chunks smaller, never over the server cap.
 		return utf8Encoder ? utf8Encoder.encode( s ).length : s.length * 2;
 	}
@@ -993,7 +993,7 @@
 		}
 
 		if ( mtBatchInFlight ) {
-			notice( __( 'A translation batch is already running — wait for it to finish.', 'perflocale' ), 'warning' );
+			notice( __( 'A translation batch is already running - wait for it to finish.', 'perflocale' ), 'warning' );
 			onClose && onClose();
 			return;
 		}
@@ -1254,12 +1254,12 @@
 					// edited is a translation (not the source), replace the
 					// multi-target dropdown with a SINGLE "Fill in from
 					// <source-lang> source" action. This matches the user's
-					// mental model: "I'm in the FR sibling — translating to
+					// mental model: "I'm in the FR sibling - translating to
 					// DE here doesn't make sense; what I want is to pull
 					// the corresponding EN paragraph and translate it to FR".
 					//
 					// Source posts (post.language === default) keep the
-					// original multi-target dropdown — that's where the
+					// original multi-target dropdown - that's where the
 					// fan-out / preview workflow lives.
 					if ( IS_SIBLING && SOURCE_POST_ID > 0 ) {
 						var sourceLangLabel = formatLangLabel( SOURCE_LANG );
@@ -1326,7 +1326,7 @@
 								onClick: function () {
 									// Re-collect at click-time in case the editor
 									// state changed (block added/removed) between
-									// menu-render and click. Cheap — ~microseconds
+									// menu-render and click. Cheap - ~microseconds
 									// even for large posts.
 									translateBlocksWithMt(
 										collectTranslatableBlocks( props.clientId ),

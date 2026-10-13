@@ -53,7 +53,7 @@ final class DeepLProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch(). The text path omits
 	 *   tag_handling so DeepL treats the payload as raw text and returns
 	 *   unescaped output.
@@ -137,7 +137,7 @@ final class DeepLProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') — see
+	 * @param string $format Destination format hint ('html'|'text') - see
 	 *   AbstractProvider::translate_batch().
 	 *
 	 * @throws \RuntimeException When DeepL batch returns an unexpected response or all retries fail.
@@ -163,7 +163,7 @@ final class DeepLProvider extends AbstractProvider {
 
 		// See note in translate(): wrap each text in a neutral parent tag so
 		// DeepL's v2 tag-handling parser doesn't reject plain-text inputs.
-		// The wrap exists solely for that parser — the text path (no
+		// The wrap exists solely for that parser - the text path (no
 		// tag_handling) sends the payload untouched.
 		$request_texts = $is_html
 			? array_map( [ self::class, 'wrap_for_tag_handling' ], $filtered )
@@ -246,7 +246,7 @@ final class DeepLProvider extends AbstractProvider {
 		}
 
 		// Track usage once for the whole batch, counted on the filtered
-		// texts — what was actually sent.
+		// texts - what was actually sent.
 		$total_chars = 0;
 		foreach ( $filtered as $text ) {
 			$total_chars += mb_strlen( (string) $text );
@@ -302,7 +302,7 @@ final class DeepLProvider extends AbstractProvider {
 	 * DeepL supports formality for a subset of target languages and rejects
 	 * the whole request with HTTP 400 when it is sent for any other target.
 	 * The documented way to express "use it where available" is the
-	 * `prefer_` prefix, which DeepL ignores instead of erroring — so a
+	 * `prefer_` prefix, which DeepL ignores instead of erroring - so a
 	 * site-wide setting can't hard-fail translations into, say, English.
 	 * Hard-coding the supported-language list here would drift as DeepL
 	 * adds languages.
@@ -404,7 +404,7 @@ final class DeepLProvider extends AbstractProvider {
 	 *
 	 * NOTE: This wrap is DeepL-specific. Google (`format=html`),
 	 * Microsoft (`textType=html`), and LibreTranslate (`format=html`)
-	 * accept plain-text inputs without a parent element — only DeepL's
+	 * accept plain-text inputs without a parent element - only DeepL's
 	 * v2 parser has the "text without parent" restriction. Adding the
 	 * same wrap to those providers would add latency for no benefit and
 	 * risk leakage if their decoders ever escape the tag literally.
@@ -416,7 +416,7 @@ final class DeepLProvider extends AbstractProvider {
 	 * DeepL with `tag_handling=html`. v2 of DeepL's parser rejects inputs
 	 * that don't have a parent tag (plain-text post titles, single-word
 	 * excerpts, etc.) with `'text without parent'`. Wrapping makes every
-	 * input — plain-text or HTML — have one consistent root.
+	 * input - plain-text or HTML - have one consistent root.
 	 *
 	 * @param string $text Source text.
 	 * @return string Wrapped text.

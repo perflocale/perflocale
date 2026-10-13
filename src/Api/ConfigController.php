@@ -25,9 +25,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * ## Public by default
  *
- * The endpoint is public — all the data it returns is already visible
+ * The endpoint is public - all the data it returns is already visible
  * in the rendered HTML (hreflang tags, language switcher, URL prefixes)
- * — but it's gated behind the `edge_integration_enabled` setting so
+ * - but it's gated behind the `edge_integration_enabled` setting so
  * sites that don't use an edge runtime don't expose an extra surface.
  *
  * **The response NEVER contains:** API keys, machine-translation provider
@@ -115,7 +115,7 @@ final class ConfigController extends RestController {
 	 * Default: public read. The payload contains only non-sensitive routing
 	 * + language metadata (slugs, locales, URL mode, default language) that
 	 * is already observable from the rendered HTML, hreflang tags, and
-	 * public language switcher — there is nothing to gate by default.
+	 * public language switcher - there is nothing to gate by default.
 	 *
 	 * Site owners who want to restrict it (private staging, IP allowlist,
 	 * Application-Password auth, mTLS proxy, etc.) filter this callback:
@@ -134,7 +134,7 @@ final class ConfigController extends RestController {
 		 * Filter the permission_callback for the edge-worker config endpoint.
 		 *
 		 * Default is `true` (public read). The endpoint exposes only data
-		 * that is already observable from the rendered site — see the class
+		 * that is already observable from the rendered site - see the class
 		 * docblock for the non-sensitive invariant. Return `false`, a
 		 * `WP_Error`, or the result of `current_user_can()` to restrict.
 		 *
@@ -149,7 +149,7 @@ final class ConfigController extends RestController {
 		);
 
 		// Type-safety contract: filter must return bool or WP_Error. A
-		// non-conformant return is a definite developer mistake — silently
+		// non-conformant return is a definite developer mistake - silently
 		// coercing to true would defeat the gate; coercing to false would
 		// 403 every edge worker. Surface the bug + fall back to the safe
 		// default (preserve the documented public-read behavior).
@@ -159,7 +159,7 @@ final class ConfigController extends RestController {
 				esc_html(
 					sprintf(
 						/* translators: %s is the offending return type. */
-						__( 'A hook on perflocale/edge_worker/config_permission_callback returned %s — must be bool or WP_Error. Falling back to the default public-read permission.', 'perflocale' ),
+						__( 'A hook on perflocale/edge_worker/config_permission_callback returned %s - must be bool or WP_Error. Falling back to the default public-read permission.', 'perflocale' ),
 						get_debug_type( $allowed )
 					)
 				),

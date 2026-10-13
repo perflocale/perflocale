@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Replaces variable-interpolation tokens and inline HTML with opaque
  * sentinels before MT, restoring them verbatim after.
  *
- * MT providers routinely garble `%s`, `%1$d`, `{name}`, `<a>...</a>` —
+ * MT providers routinely garble `%s`, `%1$d`, `{name}`, `<a>...</a>` -
  * "Pay %s now" can come back as "Pague ahora %s" (reordered, sometimes
  * fine) or "Pague %S ahora" (mangled, never fine). Same with HTML.
  *
@@ -38,7 +38,7 @@ final class PlaceholderMasker {
 	/**
 	 * SEO template variables, double-percent (Yoast/SEOPress style):
 	 * `%%sitename%%`, `%%sep%%`, `%%title%%`. MUST be masked before
-	 * PRINTF_RE — its `%%` (escaped percent) rule would otherwise mask only
+	 * PRINTF_RE - its `%%` (escaped percent) rule would otherwise mask only
 	 * the DELIMITERS and leave the variable name exposed for the provider
 	 * to translate (observed live: DeepL turned %%sitename%% into
 	 * %%Webseitenname%%, which the SEO plugin can no longer resolve).
@@ -56,7 +56,7 @@ final class PlaceholderMasker {
 	/**
 	 * printf-style placeholders: `%s`, `%d`, `%1$s`, `%2$d`, `%%`, etc.
 	 *
-	 * Matches `%[1$]?[sdfgxXcouebE%]` — covers the common formats WP
+	 * Matches `%[1$]?[sdfgxXcouebE%]` - covers the common formats WP
 	 * gettext strings use without overmatching English text containing
 	 * literal `%`.
 	 */
@@ -114,14 +114,14 @@ final class PlaceholderMasker {
 	 * Restore placeholders into $text using the list returned by mask().
 	 *
 	 * MT engines can:
-	 *   - Re-order sentinels (`[[PFL_PH_1]]` before `[[PFL_PH_0]]`) — fine,
+	 *   - Re-order sentinels (`[[PFL_PH_1]]` before `[[PFL_PH_0]]`) - fine,
 	 *     the indexed lookup still maps each to the correct value.
 	 *   - Capitalise sentinels (rare; LibreTranslate has been observed
-	 *     uppercasing) — we match case-insensitively.
-	 *   - Insert whitespace inside the brackets — strip extra whitespace
+	 *     uppercasing) - we match case-insensitively.
+	 *   - Insert whitespace inside the brackets - strip extra whitespace
 	 *     during the match.
 	 *   - DROP a sentinel (very rare; usually means the source text was
-	 *     truncated by a glossary rule) — restoration leaves the missing
+	 *     truncated by a glossary rule) - restoration leaves the missing
 	 *     placeholder unfilled in the output; caller decides whether to
 	 *     accept the result or fall back to source.
 	 *
@@ -147,7 +147,7 @@ final class PlaceholderMasker {
 	/**
 	 * Verify a translated string preserves every placeholder from its
 	 * source. Used by the bulk-translate job to reject MT output that
-	 * dropped a `%s` or HTML tag — silently shipping the broken output
+	 * dropped a `%s` or HTML tag - silently shipping the broken output
 	 * would put a malformed gettext string in front of every visitor.
 	 *
 	 * @param string $source      Original source text.

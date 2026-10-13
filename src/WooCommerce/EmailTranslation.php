@@ -166,7 +166,7 @@ final class EmailTranslation {
 		// language too.
 		add_action( 'woocommerce_email_header', [ $this, 'switch_locale_for_email' ], 5, 2 );
 
-		// The body is done — but do NOT restore yet. woocommerce_email_footer
+		// The body is done - but do NOT restore yet. woocommerce_email_footer
 		// fires from inside get_content(), which WC_Email::send() calls BEFORE
 		// get_headers(), get_attachments() and wp_mail(). Restoring here meant
 		// the From-name, every wp_mail filter, the attachment names and (on a
@@ -175,7 +175,7 @@ final class EmailTranslation {
 		// customer's. Just record that a restore is owed.
 		add_action( 'woocommerce_email_footer', [ $this, 'mark_restore_pending' ], 99 );
 
-		// Plain-text emails have no footer action either — restore after
+		// Plain-text emails have no footer action either - restore after
 		// the send completes so a multi-email request (order status
 		// cascade) can switch fresh per email.
 		add_action( 'woocommerce_email_sent', [ $this, 'restore_locale' ], 99, 0 );
@@ -268,7 +268,7 @@ final class EmailTranslation {
 
 		// save_meta_data(), not save(). A full save() inside woocommerce_new_order
 		// writes the order table again, bumps date_modified and dispatches a
-		// nested woocommerce_update_order — on the checkout path, for one meta
+		// nested woocommerce_update_order - on the checkout path, for one meta
 		// row. save_meta_data() writes just that row through the data store,
 		// which does its own postmeta backfill when HPOS compatibility mode is on.
 		$order->save_meta_data();
@@ -420,7 +420,7 @@ final class EmailTranslation {
 		}
 
 		// The subject filter is the FIRST per-email hook WC fires with the
-		// order in hand — switching here covers every email type,
+		// order in hand - switching here covers every email type,
 		// including plain text (whose templates never fire
 		// woocommerce_email_header).
 		$this->switch_locale_for_order( $order, $for_shop, $key );
@@ -583,7 +583,7 @@ final class EmailTranslation {
 	 * The default is WooCommerce's own answer: `is_customer_email()`. An email
 	 * addressed to the customer gets the customer's language; one addressed to
 	 * the shop gets the shop's. Of the nine order emails this class hooks,
-	 * `new_order`, `cancelled_order` and `failed_order` go to the store admin —
+	 * `new_order`, `cancelled_order` and `failed_order` go to the store admin -
 	 * and until 1.0.3 those were rendered in the CUSTOMER's language, so a shop
 	 * whose orders came from three countries received its own notifications in
 	 * three languages. WooCommerce gates its own locale switch the same way
@@ -593,7 +593,7 @@ final class EmailTranslation {
 	 * Filterable rather than hard-coded because the plugin already lets a site
 	 * ADD email ids through `perflocale/woocommerce/translatable_email_ids`, and
 	 * a hard `is_customer_email()` test would silently overrule anyone who added
-	 * an admin email there on purpose — a shop with per-language fulfilment
+	 * an admin email there on purpose - a shop with per-language fulfilment
 	 * staff being the obvious case. The two filters now compose: one chooses
 	 * WHICH emails are handled, this one chooses WHOSE language they use.
 	 *
@@ -619,7 +619,7 @@ final class EmailTranslation {
 	 * Switch locale AND router language to an order's language for the
 	 * duration of an email render.
 	 *
-	 * Anchored from the subject filter (which fires for EVERY email type —
+	 * Anchored from the subject filter (which fires for EVERY email type -
 	 * the woocommerce_email_header action only exists in HTML templates,
 	 * so plain-text bodies used to render in the triggering request's
 	 * locale) and kept on the header action for third-party emails that
@@ -672,7 +672,7 @@ final class EmailTranslation {
 
 		// switch_to_locale() MUST run BEFORE the router override. WP core
 		// short-circuits (`if ( $current_locale === $locale ) return false;`)
-		// whenever determine_locale() already equals the target — and the
+		// whenever determine_locale() already equals the target - and the
 		// router drives the `locale` filter, so overriding it first made the
 		// switch a guaranteed no-op: no text domain was ever reloaded and the
 		// email rendered in the TRIGGERING request's language instead of the
@@ -688,7 +688,7 @@ final class EmailTranslation {
 		// pushing a stack frame when the locale has no installed language pack,
 		// or already equals determine_locale(). Assuming a push happened meant
 		// restore_previous_locale() later popped a frame somebody else had
-		// pushed — WooCommerce's own wc_switch_to_site_locale(), typically —
+		// pushed - WooCommerce's own wc_switch_to_site_locale(), typically -
 		// leaving the rest of the request in a locale nobody chose. Reachable
 		// today on any store with a language whose pack is not installed.
 		$this->locale_switched = switch_to_locale( $locale );
@@ -704,7 +704,7 @@ final class EmailTranslation {
 				$this->router_overridden        = true;
 			}
 		} catch ( \Throwable $e ) {
-			// Router unavailable (partial boot) — the locale switch alone
+			// Router unavailable (partial boot) - the locale switch alone
 			// still fixes the gettext strings.
 			unset( $e );
 		}
@@ -725,7 +725,7 @@ final class EmailTranslation {
 	/**
 	 * Note that the email body has finished rendering.
 	 *
-	 * Hooked to woocommerce_email_footer, which fires inside get_content() —
+	 * Hooked to woocommerce_email_footer, which fires inside get_content() -
 	 * i.e. before get_headers(), get_attachments() and wp_mail(). The actual
 	 * restore is deferred to woocommerce_email_sent so the whole send happens in
 	 * the order's language; this only records that one is owed, which is what
@@ -930,7 +930,7 @@ final class EmailTranslation {
 			if ( is_admin() && ! wp_doing_ajax() ) {
 				// Cast here, not at the tail return: the router's getter is typed
 				// mixed, and a second un-narrowed return would add an occurrence
-				// to the PHPStan baseline's return.type pattern — one of the three
+				// to the PHPStan baseline's return.type pattern - one of the three
 				// identifiers the release gate's static-analysis step greps for.
 				return (string) $slug;
 			}

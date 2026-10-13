@@ -178,14 +178,14 @@ final class XliffExporter {
 		// The allowed set is XML 1.0's Char production verbatim:
 		// #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF].
 		// The last alternative was missing, so every supplementary-plane
-		// character — emoji, rare CJK, Deseret, Gothic, mathematical
-		// alphanumerics — was silently deleted from the export. The result
+		// character - emoji, rare CJK, Deseret, Gothic, mathematical
+		// alphanumerics - was silently deleted from the export. The result
 		// stayed well-formed, which is exactly why a well-formedness check
 		// never caught it. U+FFFE / U+FFFF remain excluded, as XML requires.
 		//
 		// Not wp_check_invalid_utf8(): without $strip it returns '' for the WHOLE
 		// string when any byte is invalid, so one bad byte anywhere in a title or
-		// body exported that entire field as an empty CDATA — silently, in a
+		// body exported that entire field as an empty CDATA - silently, in a
 		// still-well-formed document, and a partial re-import could then write
 		// the emptiness back. Its $strip branch is not usable either: on the
 		// declared 6.4 floor it returns iconv()'s false on PHP 8, and this file
@@ -195,7 +195,7 @@ final class XliffExporter {
 		// So drop only the offending bytes. One pass: the alternation captures a
 		// VALID sequence into group 1 and is replaced by itself, while any other
 		// single byte matches the trailing `.` with group 1 empty and is replaced
-		// by nothing. No /u modifier, which is the point — a /u pattern cannot run
+		// by nothing. No /u modifier, which is the point - a /u pattern cannot run
 		// on invalid input at all. Every valid sequence survives, astral-plane
 		// characters included.
 		$text = (string) preg_replace(

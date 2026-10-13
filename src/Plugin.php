@@ -23,7 +23,7 @@ final class Plugin {
 
 	/**
 	 * Stable service-ID constants for the most-used DI services. Addons
-	 * should prefer these over magic strings — the constants are part of
+	 * should prefer these over magic strings - the constants are part of
 	 * the @api surface and won't be renamed across minor versions, but the
 	 * string values may change in major versions if the service is split.
 	 *
@@ -142,7 +142,7 @@ final class Plugin {
 	}
 
 	// ─────────────────────────────────────────────────────────────────
-	// Typed accessors — IDE-autocomplete + type-safe lookups for the
+	// Typed accessors - IDE-autocomplete + type-safe lookups for the
 	// most-used services. Addons can call these instead of `get( '…' )`
 	// to get the right return type without casting. Marked @api: stable
 	// across the 1.x line.
