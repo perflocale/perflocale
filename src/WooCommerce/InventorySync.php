@@ -56,6 +56,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * that one stock. Order items, downloads and refunds keep the copy bought.
  *
  * Meta written directly, without a WooCommerce save, is not seen.
+ *
+ * @internal Internal to PerfLocale; not a public API.
  */
 final class InventorySync {
 
@@ -172,12 +174,66 @@ final class InventorySync {
 	/**
 	 * Constructor.
 	 *
-	 * @param CacheManager $cache Cache manager.
+	 * @param CacheManager                                                                     $cache            Cache manager.
+	 * @param int|null                                                                         $copy_link_mark   TranslationGroupRepository::link_changes() to start the copy-map mark at; null: now.
+	 * @param array<int, array{0: \WeakReference<\WP_REST_Request>, 1: bool, 2: int, 3: bool}> $store_api_frames Store API frames already open (InventorySyncHooks::enter_store_api_request()).
+	 * @param int                                                                              $catalog_stock_id A catalog limit's stock id already noted (InventorySyncHooks::mark_catalog_limits()).
+	 * @param bool                                                                             $catalog_limits   Whether a catalog limit is being computed (InventorySyncHooks::mark_catalog_limits()).
 	 */
-	public function __construct( CacheManager $cache ) {
+	public function __construct( CacheManager $cache, ?int $copy_link_mark = null, array $store_api_frames = [], int $catalog_stock_id = 0, bool $catalog_limits = false ) {
 		$this->cache            = $cache;
+		$this->copy_link_mark   = $copy_link_mark ?? \PerfLocale\Database\Repository\TranslationGroupRepository::link_changes();
+		$this->store_api_frames = $store_api_frames;
+		$this->catalog_stock_id = $catalog_stock_id;
+		$this->catalog_limits   = $catalog_limits;
 		$this->flow_claims      = new \WeakMap();
 		$this->structural_saves = new \WeakMap();
+	}
+
+	/**
+	 * Hooks are attached by InventorySyncHooks::register(), which the
+	 * WooCommerce add-on calls; this method attaches nothing.
+	 *
+	 * @deprecated 1.0.7.2 Use InventorySyncHooks::register().
+	 *
+	 * @return void
+	 */
+	public function register_hooks(): void {
+		_deprecated_function( __METHOD__, '1.0.7.2', esc_html( InventorySyncHooks::class . '::register()' ) );
+	}
+
+	/**
+	 * See InventorySyncHooks::is_display_cart_read().
+	 *
+	 * @param \WP_REST_Request $request Store API request.
+	 * @return bool
+	 */
+	public static function is_display_cart_read( \WP_REST_Request $request ): bool {
+		return InventorySyncHooks::is_display_cart_read( $request );
+	}
+
+	/**
+	 * See InventorySyncHooks::open_store_api_frame().
+	 *
+	 * @param mixed $response Result so far, returned untouched.
+	 * @param mixed $handler  Route handler.
+	 * @param mixed $request  Request being dispatched.
+	 * @return mixed
+	 */
+	public function open_store_api_frame( mixed $response, mixed $handler = null, mixed $request = null ): mixed {
+		return InventorySyncHooks::open_store_api_frame( $response, $handler, $request );
+	}
+
+	/**
+	 * See InventorySyncHooks::close_store_api_frame().
+	 *
+	 * @param mixed $response Result to send, returned untouched.
+	 * @param mixed $handler  Route handler.
+	 * @param mixed $request  Request being dispatched.
+	 * @return mixed
+	 */
+	public function close_store_api_frame( mixed $response, mixed $handler = null, mixed $request = null ): mixed {
+		return InventorySyncHooks::close_store_api_frame( $response, $handler, $request );
 	}
 
 	/**
@@ -304,9 +360,9 @@ final class InventorySync {
 
 	/**
 	 * Store API requests running now, innermost last: the request (held
-	 * weakly), whether it is a display cart read (is_display_cart_read()),
+	 * weakly), whether it is a display cart read (InventorySyncHooks::is_display_cart_read()),
 	 * the blog it runs on, and whether core's REST server dispatched it
-	 * (open_store_api_frame()) rather than WooCommerce's hydration.
+	 * (InventorySyncHooks::open_store_api_frame()) rather than WooCommerce's hydration.
 	 *
 	 * @var array<int, array{0: \WeakReference<\WP_REST_Request>, 1: bool, 2: int, 3: bool}>
 	 */
@@ -398,6 +454,28 @@ final class InventorySync {
 	 * @var array<int, array{at: float, vsig: string, copy: string, made: bool, rows: array<int, mixed>}>
 	 */
 	private array $copy_reads = [];
+
+	/**
+	 * The epochs this request first read of each blog, from the store or
+	 * from what it primed (read_copy_maps(), stored_first_siblings()), and
+	 * read again whenever an order's stock mirror found them changed
+	 * (match_with_current_epochs()), per blog. The copy-map epoch is null
+	 * until this request reads it. Removed when this process retires the
+	 * copy maps itself (delete_copy_map_epoch()).
+	 *
+	 * @var array<int, array{vsig: string, copy: string|null}>
+	 */
+	private array $epochs_seen = [];
+
+	/**
+	 * Both epochs as read for the order stock change running now
+	 * (InventorySyncHooks::order_stock_change()), per blog, with the number of
+	 * that change and how many of its line items had finished when they were
+	 * read or last taken (current_epochs()).
+	 *
+	 * @var array<int, array{frame: int, step: int, vsig: string, copy: string}>
+	 */
+	private array $order_epochs = [];
 
 	/**
 	 * How many times this process renewed a blog's copy-map epoch or
@@ -914,207 +992,6 @@ final class InventorySync {
 	}
 
 	/**
-	 * Register hooks.
-	 *
-	 * @return void
-	 */
-	public function register_hooks(): void {
-		// Observe WooCommerce's own stock statement so the sibling mirror can
-		// replay a RELATIVE change instead of an absolute snapshot - two
-		// concurrent sales of two language siblings used to lose a decrement.
-		// Priority 1: read WooCommerce's statement before another plugin can
-		// rewrite it. The callback returns the query untouched.
-		add_filter( 'woocommerce_update_product_stock_query', [ $this, 'capture_stock_operation' ], 1, 4 );
-
-		// wc_update_product_stock() announces its statement with these; a
-		// direct data-store call does not, and is not captured. Last, so the
-		// note is taken right before WooCommerce's own statement runs.
-		add_action( 'woocommerce_product_before_set_stock', [ $this, 'expect_stock_operation' ], PHP_INT_MAX, 1 );
-		add_action( 'woocommerce_variation_before_set_stock', [ $this, 'expect_stock_operation' ], PHP_INT_MAX, 1 );
-
-		// Sync after WooCommerce saves all product meta.
-		add_action( 'woocommerce_process_product_meta', [ $this, 'sync_product_fields' ], 100, 1 );
-
-		// Sync when saved via WooCommerce REST API (programmatic / bulk edits).
-		add_action( 'woocommerce_rest_insert_product_object', [ $this, 'sync_on_rest_save' ], 10, 1 );
-
-		// A variation created or saved changes its parent's children or their
-		// attributes, so that parent's variation map is built again when next
-		// needed (an import or a batch that creates the copies' variations in
-		// one process).
-		add_action( 'woocommerce_new_product_variation', [ $this, 'forget_variation_map' ], 10, 2 );
-		add_action( 'woocommerce_update_product_variation', [ $this, 'forget_variation_map' ], 10, 2 );
-
-		// The stock groups (stock_group()) and the variation matches are
-		// built from which variations a copy parent has, their attributes
-		// and status, and which copies manage stock or opt out. A change of
-		// any of those in this process drops them for the blog; a stock-only
-		// save keeps them. WooCommerce's saves, direct meta writes, status
-		// changes, deletions and product type changes are each seen. The
-		// epoch renewals they mark are completed at shutdown.
-		add_action( 'woocommerce_before_product_object_save', [ $this, 'note_structural_save' ], PHP_INT_MAX, 1 );
-		add_action( 'woocommerce_after_product_object_save', [ $this, 'forget_after_structural_save' ], 10, 1 );
-		add_action( 'woocommerce_product_type_changed', [ $this, 'forget_stock_matches' ], 10, 0 );
-		add_action( 'added_post_meta', [ $this, 'forget_after_meta_change' ], 10, 3 );
-		add_action( 'updated_post_meta', [ $this, 'forget_after_meta_change' ], 10, 3 );
-		add_action( 'deleted_post_meta', [ $this, 'forget_after_meta_change' ], 10, 3 );
-		add_action( 'transition_post_status', [ $this, 'forget_after_status_change' ], 10, 3 );
-		add_action( 'deleted_post', [ $this, 'forget_after_post_deleted' ], 10, 2 );
-		add_action( 'shutdown', [ $this, 'renew_pending_epochs' ], PHP_INT_MAX, 0 );
-
-		// The stored copy maps (stored_variation_copies()) check every
-		// product fact by value; which attribute term reads as which
-		// translation group they take from the copy-map epoch, which these
-		// renew. In every request context: a cron event run inside a
-		// visitor's request can link or edit a term too. Each callback
-		// returns at once for any other taxonomy or object type.
-		$this->copy_link_mark = \PerfLocale\Database\Repository\TranslationGroupRepository::link_changes();
-		add_action( 'perflocale/cache/flush_object', [ $this, 'renew_copy_map_after_term_flush' ], 10, 2 );
-		add_action( 'perflocale/cache/flush_translations', [ $this, 'renew_copy_map_epoch' ], 10, 0 );
-		add_action( 'edit_terms', [ $this, 'note_term_slug' ], 10, 2 );
-		add_action( 'edited_term', [ $this, 'renew_copy_map_after_term_edit' ], 10, 3 );
-		add_action( 'delete_term', [ $this, 'renew_copy_map_after_term_delete' ], 5, 3 );
-		add_action( 'woocommerce_attribute_updated', [ $this, 'renew_copy_map_epoch' ], 10, 0 );
-		add_action( 'woocommerce_attribute_deleted', [ $this, 'renew_copy_map_epoch' ], 10, 0 );
-		add_action( 'set_object_terms', [ $this, 'forget_after_product_type_terms' ], 10, 6 );
-
-		// Which data stores read variations is a per-blog answer.
-		add_action( 'switch_blog', [ $this, 'forget_store_verdicts' ], 10, 0 );
-
-		// Sync stock when WooCommerce changes it via orders (purchase, cancel, refund).
-		// These fire from wc_update_product_stock(), not from the admin product editor.
-		// Without these, buying from the EN store reduces EN stock but DE/FR keep old values.
-		add_action( 'woocommerce_product_set_stock', [ $this, 'sync_on_stock_change' ], 10, 1 );
-		add_action( 'woocommerce_variation_set_stock', [ $this, 'sync_on_stock_change' ], 10, 1 );
-
-		// The copies are one stock before payment too. WooCommerce counts a
-		// pending order's stock hold only against the id it holds, which
-		// would leave every other language free to sell the same unit. Its
-		// one hold-sum query feeds the cart checks, the Store API, the
-		// checkout's own hold and pay-for-order. A Store API read of the cart
-		// is the exception (see is_display_cart_read() and
-		// in_display_cart_read()).
-		add_filter( 'woocommerce_query_for_reserved_stock', [ $this, 'group_reserved_stock_query' ], 10, 3 );
-
-		// A Store API read of the cart shows figures and holds nothing, so it
-		// gets WooCommerce's own: every REST GET or HEAD of the cart, from any
-		// page (the Mini-Cart's refresh, and the cart and checkout pages' own
-		// refreshes after their first render), and the server-side hydration
-		// of the cart on pages other than the cart and checkout pages (the
-		// Mini-Cart and the product blocks' cart state). The first render of
-		// the cart and checkout pages, every cart change, the checkout's hold
-		// and pay-for-order count every copy. Every Store API request is
-		// framed, so a write or a checkout nested in a read still counts every
-		// copy.
-		add_filter( 'rest_request_before_callbacks', [ $this, 'open_store_api_frame' ], 10, 3 );
-		add_filter( 'rest_request_after_callbacks', [ $this, 'close_store_api_frame' ], 10, 3 );
-
-		// Once a stock hold for an order starts, every later hold-sum query of
-		// the request counts every copy.
-		add_filter( 'woocommerce_order_hold_stock_minutes', [ $this, 'note_stock_hold' ], PHP_INT_MIN, 1 );
-
-		// The Store API asks the same query for the quantity limit of every
-		// stock-managed product in its product data (product blocks, the
-		// products route), where no money is at stake. There it stays
-		// WooCommerce's own unless a shop opts in; a cart line's limit still
-		// counts every copy. The minimum is filtered right before the limit
-		// is computed and the maximum right after.
-		add_filter( 'woocommerce_store_api_product_quantity_minimum', [ $this, 'mark_catalog_limits' ], PHP_INT_MAX, 3 );
-		add_filter( 'woocommerce_store_api_product_quantity_maximum', [ $this, 'unmark_catalog_limits' ], PHP_INT_MIN, 1 );
-
-		// WooCommerce adds up a cart's quantities per stock id, which would
-		// pass a cart holding two language copies of an item with one unit
-		// left. Classic cart and checkout, the Store API cart and checkout,
-		// and adding to the cart; each refuses with WooCommerce's own notice.
-		add_filter( 'woocommerce_cart_item_required_stock_is_not_enough', [ $this, 'cart_item_group_stock_short' ], 10, 3 );
-		add_action( 'woocommerce_store_api_validate_cart_item', [ $this, 'validate_store_api_cart_item' ], 10, 2 );
-		add_filter( 'woocommerce_add_to_cart_validation', [ $this, 'validate_add_to_cart_group_stock' ], 10, 4 );
-
-		// A sold-individually product is one unit per order, and its language
-		// copies are one product. WooCommerce looks for the same cart id only,
-		// so the other language's copy went into the same cart. Adding it on
-		// the classic form, the Store API cart and checkout, and the classic
-		// cart and checkout now refuse or correct that with WooCommerce's own
-		// notice. WooCommerce fires the first filter for a sold-individually
-		// product only; the other two read one product flag per line.
-		add_filter( 'woocommerce_add_to_cart_sold_individually_found_in_cart', [ $this, 'sold_individually_found_in_cart' ], 10, 3 );
-		add_action( 'woocommerce_store_api_validate_cart_item', [ $this, 'validate_store_api_sold_individually' ], 10, 2 );
-		add_action( 'woocommerce_check_cart_items', [ $this, 'merge_sold_individually_copies' ], 0, 0 );
-
-		// Admin variations panel + REST variation saves: sync the edited
-		// variation's shared fields (price / stock flags / dimensions / SKU)
-		// to the attribute-matched variation on each sibling-language parent,
-		// then roll the sibling parents' derived aggregates (price range,
-		// stock status) up via WC_Product_Variable::sync(). Priority 20 so WC
-		// has persisted the variation's own meta for this save first. The
-		// order-driven stock path above stays separate - it fires from
-		// wc_update_product_stock(), not from these save flows.
-		add_action( 'woocommerce_save_product_variation', [ $this, 'sync_variation_fields' ], 20, 1 );
-		add_action( 'woocommerce_rest_insert_product_variation_object', [ $this, 'sync_on_rest_variation_save' ], 10, 1 );
-
-		// Variations-tab BULK actions (set/adjust prices, sale dates, toggles,
-		// dimensions) run plain CRUD saves and never fire
-		// woocommerce_save_product_variation - only this dedicated hook. One
-		// handler per bulk action; the sibling-parent rollup is amortised to
-		// once per bulk run instead of once per variation.
-		add_action( 'woocommerce_bulk_edit_variations', [ $this, 'sync_after_bulk_variation_edit' ], 20, 4 );
-
-		// Products-list Quick Edit and Bulk Edit save via CRUD and never fire
-		// woocommerce_process_product_meta - without these hooks a price /
-		// SKU / dimension change made there silently diverges across
-		// languages (stock quantity alone propagated, via the set_stock
-		// hooks). Both fire after the CRUD save has persisted the meta.
-		add_action( 'woocommerce_product_quick_edit_save', [ $this, 'sync_on_quick_or_bulk_edit' ], 10, 1 );
-		add_action( 'woocommerce_product_bulk_edit_save', [ $this, 'sync_on_quick_or_bulk_edit' ], 10, 1 );
-
-		// "In stock?" on a variable product that does not manage stock is
-		// saved on each child variation before the parent action above
-		// fires. WooCommerce fires this only when a variation's status really
-		// changed; the callback records the variation for the parent handler
-		// and returns at once outside Quick/Bulk Edit.
-		add_action( 'woocommerce_variation_set_stock_status', [ $this, 'note_quick_edit_child' ], 10, 3 );
-
-		// CSV importer rows (products AND variations) - an imported price
-		// list otherwise updates only the imported language's products.
-		add_action( 'woocommerce_product_import_inserted_product_object', [ $this, 'sync_on_import' ], 10, 2 );
-
-		// Any other update of an existing product or variation through
-		// WooCommerce (custom code, another plugin). The data store reports
-		// which props really changed while it saves; the handler records the
-		// matching shared keys there and copies them once the save has
-		// finished. A create fires woocommerce_new_product[_variation]
-		// instead, which drops the record. Every save on the order path
-		// leaves note_crud_update() before any I/O.
-		add_action( 'woocommerce_product_object_updated_props', [ $this, 'note_crud_update' ], 10, 2 );
-		add_action( 'woocommerce_update_product', [ $this, 'sync_after_crud_update' ], 10, 1 );
-		add_action( 'woocommerce_update_product_variation', [ $this, 'sync_after_crud_update' ], 10, 1 );
-		add_action( 'woocommerce_new_product', [ $this, 'forget_crud_update' ], 10, 1 );
-		add_action( 'woocommerce_new_product_variation', [ $this, 'forget_crud_update' ], 10, 1 );
-
-		// A save recorded inside a flow with its own sync (OWN_SYNC_FLOWS)
-		// waits until that flow's own handlers above have run. Last on each
-		// flow's closing action. The two ajax flows end in wp_die(), so theirs
-		// is the action WooCommerce fires after its save loop.
-		add_action( 'woocommerce_process_product_meta', [ $this, 'flush_crud_updates' ], PHP_INT_MAX, 0 );
-		add_action( 'woocommerce_product_bulk_and_quick_edit', [ $this, 'flush_crud_updates' ], PHP_INT_MAX, 0 );
-		add_action( 'woocommerce_ajax_save_product_variations', [ $this, 'flush_crud_updates' ], PHP_INT_MAX, 0 );
-		add_action( 'woocommerce_bulk_edit_variations', [ $this, 'flush_crud_updates' ], PHP_INT_MAX, 0 );
-		add_action( 'perflocale/translation/created', [ $this, 'finish_translation_flow' ], PHP_INT_MAX, 2 );
-
-		// The REST API and the CSV importer hand the object they are about to
-		// save through these filters and sync it themselves right after (the
-		// handlers above). The claim must run last, so the object claimed is
-		// the one WooCommerce saves whatever another filter returns.
-		add_filter( 'woocommerce_rest_pre_insert_product_object', [ $this, 'claim_for_flow' ], PHP_INT_MAX, 1 );
-		add_filter( 'woocommerce_rest_pre_insert_product_variation_object', [ $this, 'claim_for_flow' ], PHP_INT_MAX, 1 );
-		add_filter( 'woocommerce_product_import_pre_insert_product_object', [ $this, 'claim_for_flow' ], PHP_INT_MAX, 1 );
-
-		// NB: the shared SKUs this sync writes stay saveable because the WC
-		// addon exempts translation siblings from WC's unique-SKU (and GTIN)
-		// validation - PerfLocaleWooCommerce::allow_translation_duplicate_sku.
-	}
-
-	/**
 	 * Sync every variation touched by a Variations-tab bulk action, rolling
 	 * the sibling parents up once at the end.
 	 *
@@ -1524,13 +1401,9 @@ final class InventorySync {
 	public const SYNC_OPTOUT_META = '_perflocale_sync_optout';
 
 	/**
-	 * Post meta on a translated variable product whose LOCAL (non-taxonomy)
-	 * attribute options were machine-translated: attribute key => [ translated
-	 * option => original option ]. Variation matching across languages reads a
-	 * translated local value as the original, so stock, price and field sync
-	 * keep pairing the variations after their options are translated.
+	 * See InventorySyncHooks::LOCAL_ATTR_SOURCE_META.
 	 */
-	public const LOCAL_ATTR_SOURCE_META = '_perflocale_local_attr_source';
+	public const LOCAL_ATTR_SOURCE_META = InventorySyncHooks::LOCAL_ATTR_SOURCE_META;
 
 	/**
 	 * Attribute-signature => variation-id maps of sibling parents, per blog and
@@ -2131,14 +2004,17 @@ final class InventorySync {
 	 *
 	 * Where the copies come from: when this request's stock check (the cart
 	 * or checkout check that came before the order) already read the
-	 * variation's stored copy map, the map is still fresh and valid and it
-	 * names every copy parent, the copies are the ones the map names
+	 * variation's stored copy map, the map is still fresh and valid, both
+	 * epochs read again from the store are the ones the map was read with,
+	 * and it names every copy parent, the copies are the ones the map names
 	 * (held_variation_copies()); otherwise each copy parent is matched as
-	 * above. Either way the stock, the stock management and the opt-out are
-	 * read live. Like the stock check, an order that takes its copies from
-	 * the stored map does not see translation links of attribute terms
-	 * changed directly in the database until the cache is cleared (see
-	 * copy_maps_enabled()).
+	 * above, and when an epoch moved since this request first read it, what
+	 * the request read and kept of the copy parents is dropped before the
+	 * match (match_with_current_epochs()). Either way the stock, the stock
+	 * management and the opt-out are read live. Like the stock check, an
+	 * order that takes its copies from the stored map does not see
+	 * translation links of attribute terms changed directly in the database
+	 * until the cache is cleared (see copy_maps_enabled()).
 	 *
 	 * @param \WC_Product_Variation $variation Variation whose stock changed.
 	 * @return void
@@ -2175,25 +2051,31 @@ final class InventorySync {
 		// copy map (read by the stock check made earlier in this request),
 		// used only when the map names every copy parent: then no copy parent
 		// is matched below. Otherwise every copy parent is matched.
-		$held = is_int( $variation_id ) ? $this->held_variation_copies( $variation_id ) : [];
+		$epochs       = null;
+		$held         = is_int( $variation_id ) ? $this->held_variation_copies( $variation_id, $epochs ) : [];
+		$copy_parents = is_array( $parent_sibs ) ? array_values( array_diff( wp_parse_id_list( wp_list_pluck( $parent_sibs, 'object_id' ) ), wp_parse_id_list( [ $parent_id ] ) ) ) : [];
 
 		if ( [] !== $held ) {
-			$copy_parents = is_array( $parent_sibs ) ? array_values( array_diff( wp_parse_id_list( wp_list_pluck( $parent_sibs, 'object_id' ) ), wp_parse_id_list( [ $parent_id ] ) ) ) : [];
+			$want_parents = $copy_parents;
 			$held_parents = array_keys( $held );
 
-			sort( $copy_parents );
+			sort( $want_parents );
 			sort( $held_parents );
 
-			if ( $copy_parents !== $held_parents ) {
+			if ( $want_parents !== $held_parents ) {
 				$held = [];
 			}
 		}
 
 		if ( [] === $held ) {
+			// What this request read and kept of the copy parents, dropped
+			// when another process changed a match since (an epoch moved).
+			$this->match_with_current_epochs( $copy_parents, $epochs );
+
 			// What the match of each copy parent below reads, and what comparing
 			// the source's attributes with theirs reads, read for all of them at
 			// once.
-			$this->prime_copy_parents( is_array( $parent_sibs ) ? array_values( array_diff( wp_parse_id_list( wp_list_pluck( $parent_sibs, 'object_id' ) ), wp_parse_id_list( [ $parent_id ] ) ) ) : [], $source, is_array( $attributes ) ? array_map( 'strval', array_keys( $attributes ) ) : [] );
+			$this->prime_copy_parents( $copy_parents, $source, is_array( $attributes ) ? array_map( 'strval', array_keys( $attributes ) ) : [] );
 
 			$src_attrs = $this->normalise_variation_attrs( $attributes, $source );
 		} else {
@@ -2474,29 +2356,11 @@ final class InventorySync {
 	}
 
 	/**
-	 * Whether a Store API request is a display read of the cart: GET or HEAD
-	 * on the cart route or a route under it, versioned or not, while
-	 * WooCommerce's is_cart() and is_checkout() are both false. That is every
-	 * REST read of the cart, whichever page sent it (a REST request renders
-	 * no page), and the server-side hydration of the cart route on any page
-	 * but the cart and checkout pages. The method is the effective one, so a
-	 * POST sent with a method override is a write.
-	 *
-	 * @param \WP_REST_Request $request Store API request.
-	 * @return bool
-	 */
-	public static function is_display_cart_read( \WP_REST_Request $request ): bool {
-		return in_array( $request->get_method(), [ 'GET', 'HEAD' ], true )
-			&& 1 === preg_match( '#^/wc/store(?:/v[0-9]+)?/cart(?:/|$)#', $request->get_route() )
-			&& function_exists( 'is_cart' ) && function_exists( 'is_checkout' ) && ! is_cart() && ! is_checkout();
-	}
-
-	/**
 	 * Note that a Store API request starts running.
 	 *
 	 * @param \WP_REST_Request $request      The request.
-	 * @param bool             $display_read Whether it is a display cart read (is_display_cart_read()).
-	 * @param bool             $rest         Whether core's REST server dispatches it (open_store_api_frame()).
+	 * @param bool             $display_read Whether it is a display cart read (InventorySyncHooks::is_display_cart_read()).
+	 * @param bool             $rest         Whether core's REST server dispatches it (InventorySyncHooks::open_store_api_frame()).
 	 * @return void
 	 */
 	public function enter_store_api_request( \WP_REST_Request $request, bool $display_read, bool $rest = false ): void {
@@ -2519,48 +2383,6 @@ final class InventorySync {
 				return;
 			}
 		}
-	}
-
-	/**
-	 * Open the frame of a Store API request dispatched by the REST server.
-	 *
-	 * Filters `rest_request_before_callbacks`, which core fires for every
-	 * request it runs a route callback for.
-	 *
-	 * @param mixed $response Result so far, returned untouched.
-	 * @param mixed $handler  Route handler.
-	 * @param mixed $request  Request being dispatched.
-	 * @return mixed
-	 */
-	public function open_store_api_frame( mixed $response, mixed $handler = null, mixed $request = null ): mixed {
-		unset( $handler );
-
-		if ( $request instanceof \WP_REST_Request && str_starts_with( $request->get_route(), '/wc/store/' ) ) {
-			$this->enter_store_api_request( $request, self::is_display_cart_read( $request ), true );
-		}
-
-		return $response;
-	}
-
-	/**
-	 * Close the frame opened for the same request.
-	 *
-	 * Filters `rest_request_after_callbacks`, which core fires for every
-	 * request that fired the opening filter and returned.
-	 *
-	 * @param mixed $response Result to send, returned untouched.
-	 * @param mixed $handler  Route handler.
-	 * @param mixed $request  Request being dispatched.
-	 * @return mixed
-	 */
-	public function close_store_api_frame( mixed $response, mixed $handler = null, mixed $request = null ): mixed {
-		unset( $handler );
-
-		if ( $request instanceof \WP_REST_Request && [] !== $this->store_api_frames ) {
-			$this->leave_store_api_request( $request );
-		}
-
-		return $response;
 	}
 
 	/**
@@ -2717,6 +2539,21 @@ final class InventorySync {
 		}
 
 		return $minimum;
+	}
+
+	/**
+	 * Set the stock id of the catalog limit being computed, for an instance
+	 * built while InventorySyncHooks::mark_catalog_limits() ran the
+	 * `perflocale/woocommerce/count_shared_holds_in_catalog` filter: the note
+	 * then belongs to this instance, as it would had the instance existed.
+	 *
+	 * @internal
+	 *
+	 * @param int $stock_id Stock id.
+	 * @return void
+	 */
+	public function note_catalog_stock_id( int $stock_id ): void {
+		$this->catalog_stock_id = $stock_id;
 	}
 
 	/**
@@ -3100,9 +2937,12 @@ final class InventorySync {
 	 * that notice. Only where that check is hooked (the Store API unhooks it
 	 * and reports the same cart through validate_store_api_sold_individually()).
 	 *
+	 * @param array<mixed>|null $lines The cart's lines as WC_Cart::get_cart() returned them in this check
+	 *                                 (InventorySyncHooks::merge_sold_individually_copies()), or null to read
+	 *                                 them here.
 	 * @return void
 	 */
-	public function merge_sold_individually_copies(): void {
+	public function merge_sold_individually_copies( ?array $lines = null ): void {
 		if ( ! function_exists( 'WC' ) || ! WC()->cart instanceof \WC_Cart ) {
 			return;
 		}
@@ -3113,7 +2953,7 @@ final class InventorySync {
 			return;
 		}
 
-		foreach ( $cart->get_cart() as $key => $line ) {
+		foreach ( $lines ?? $cart->get_cart() as $key => $line ) {
 			$product = $line['data'] ?? null;
 
 			if ( ! $product instanceof \WC_Product || ! $product->is_sold_individually() ) {
@@ -4018,7 +3858,7 @@ final class InventorySync {
 			return;
 		}
 
-		if ( str_starts_with( $meta_key, 'attribute_' ) || '_product_attributes' === $meta_key || self::LOCAL_ATTR_SOURCE_META === $meta_key ) {
+		if ( InventorySyncHooks::is_structural_meta_key( $meta_key ) ) {
 			$this->forget_stock_matches();
 		} elseif ( isset( self::STOCK_SHARING_META[ $meta_key ] ) ) {
 			unset( $this->stock_groups[ get_current_blog_id() ] );
@@ -4846,6 +4686,8 @@ final class InventorySync {
 		$verify  = [];
 		$rebuild = [];
 
+		$this->note_epochs_seen( $blog, $epoch, null );
+
 		foreach ( $parent_ids as $parent_id ) {
 			$parent_id = (int) $parent_id;
 
@@ -4925,7 +4767,13 @@ final class InventorySync {
 		}
 
 		if ( '' === $epoch ) {
-			set_transient( self::STORED_MAP_EPOCH, wp_generate_uuid4(), MONTH_IN_SECONDS );
+			$made = wp_generate_uuid4();
+
+			set_transient( self::STORED_MAP_EPOCH, $made, MONTH_IN_SECONDS );
+
+			if ( isset( $this->epochs_seen[ $blog ] ) && '' === $this->epochs_seen[ $blog ]['vsig'] ) {
+				$this->epochs_seen[ $blog ]['vsig'] = $made;
+			}
 		}
 
 		foreach ( $rebuild as $parent_id => [ $set, $state, $stored ] ) {
@@ -5198,6 +5046,8 @@ final class InventorySync {
 				'made' => false,
 				'rows' => [],
 			];
+
+			$this->note_epochs_seen( $blog, $view['vsig'], $view['copy'] );
 		} elseif ( [] !== $ids ) {
 			$got = $this->read_transients( array_values( $ids ), false );
 		} else {
@@ -5215,8 +5065,14 @@ final class InventorySync {
 		// A missing or unreadable epoch is made here; nothing is stored with
 		// it until this process reads it again from the store.
 		if ( $create && null === self::copy_epoch_time( $view['copy'] ) ) {
+			if ( isset( $this->epochs_seen[ $blog ] ) && $this->epochs_seen[ $blog ]['copy'] === $view['copy'] ) {
+				$this->epochs_seen[ $blog ]['copy'] = null;
+			}
+
 			$view['copy'] = wp_generate_uuid4() . '|' . time();
 			$view['made'] = true;
+
+			$this->note_epochs_seen( $blog, $view['vsig'], $view['copy'] );
 
 			if ( ! self::write_transient_rows( self::COPY_MAP_EPOCH, $view['copy'], MONTH_IN_SECONDS ) ) {
 				set_transient( self::COPY_MAP_EPOCH, $view['copy'], MONTH_IN_SECONDS );
@@ -5355,17 +5211,30 @@ final class InventorySync {
 	 * The copies of a source variation from its stored copy map, only when
 	 * this request already read that map and the read is still fresh (the
 	 * cart's stock check reads it before the order reduces the stock), so the
-	 * answer costs no read. Copy parent id => copy variation id; empty when
-	 * the map is not held, not valid now, or the maps are off. The order
-	 * trusts the map under the same freshness rule as the cart check: the
-	 * view of the epochs is used for up to COPY_EPOCH_REREAD seconds, and the
-	 * map is checked again by value (stored_variation_copies()).
+	 * answer costs no read of the map. Copy parent id => copy variation id;
+	 * empty when the map is not held, not valid now, or the maps are off.
+	 * The view is used for up to COPY_EPOCH_REREAD seconds and the map is
+	 * checked again by value (stored_variation_copies()); then both epochs
+	 * are read again from the store, past this process's copies, because a
+	 * structural change made by another process since the view was read
+	 * (another child of a copy parent given the source's signature, a term
+	 * link moved) retires an epoch without changing anything the check by
+	 * value reads. When either epoch differs from the view, the view is
+	 * marked old (the next read of the maps goes to the store) and nothing
+	 * is held: the order matches the copy parents afresh. That read is one
+	 * multi-get with a persistent object cache, else one options query, once
+	 * per order stock change (current_epochs()).
 	 *
-	 * @param int $variation_id Source variation id.
+	 * @param int                                    $variation_id Source variation id.
+	 * @param array{vsig: string, copy: string}|null $epochs       Receives both epochs when they were read
+	 *                                                             here, else null.
+	 * @param-out array{vsig: string, copy: string}|null $epochs
 	 * @return array<int, int>
 	 */
-	private function held_variation_copies( int $variation_id ): array {
-		$view = $this->copy_reads[ get_current_blog_id() ] ?? null;
+	private function held_variation_copies( int $variation_id, ?array &$epochs = null ): array {
+		$blog   = get_current_blog_id();
+		$view   = $this->copy_reads[ $blog ] ?? null;
+		$epochs = null;
 
 		if ( null === $view || microtime( true ) - $view['at'] > self::COPY_EPOCH_REREAD || ! array_key_exists( $variation_id, $view['rows'] ) || false === $view['rows'][ $variation_id ] ) {
 			return [];
@@ -5373,7 +5242,156 @@ final class InventorySync {
 
 		[ $stored ] = $this->stored_variation_copies( $variation_id );
 
-		return is_array( $stored ) ? $stored : [];
+		// A hit was checked against the view read_copy_maps() left.
+		if ( ! is_array( $stored ) || ! array_key_exists( $blog, $this->copy_reads ) ) {
+			return [];
+		}
+
+		$view   = $this->copy_reads[ $blog ];
+		$epochs = $this->current_epochs();
+
+		if ( $epochs['vsig'] !== $view['vsig'] || $epochs['copy'] !== $view['copy'] ) {
+			$this->copy_reads[ $blog ]['at'] = 0.0;
+
+			return [];
+		}
+
+		return $stored;
+	}
+
+	/**
+	 * Both epochs of the current blog read from the store, past this process's
+	 * copies (one multi-get with a persistent object cache, else one options
+	 * query). Inside an order stock change (InventorySyncHooks::order_stock_change())
+	 * they are read once for the order: the stock change of each next line
+	 * item of the same blog takes that read, after WooCommerce finished the
+	 * line item before it (InventorySyncHooks::order_stock_step()). A stock
+	 * change with no line item finished since the read or its last use (one
+	 * outside the line loop, in a frame no closing action ended) reads afresh.
+	 *
+	 * @return array{vsig: string, copy: string}
+	 */
+	private function current_epochs(): array {
+		$blog  = get_current_blog_id();
+		$frame = InventorySyncHooks::order_stock_change();
+		$held  = $this->order_epochs[ $blog ] ?? null;
+
+		$step  = InventorySyncHooks::order_stock_step();
+
+		if ( 0 !== $frame && null !== $held && $frame === $held['frame'] && $step > $held['step'] ) {
+			$this->order_epochs[ $blog ]['step'] = $step;
+
+			return [
+				'vsig' => $held['vsig'],
+				'copy' => $held['copy'],
+			];
+		}
+
+		$now    = $this->read_transients( [ self::STORED_MAP_EPOCH, self::COPY_MAP_EPOCH ], true );
+		$vsig   = $now[ self::STORED_MAP_EPOCH ] ?? false;
+		$copy   = $now[ self::COPY_MAP_EPOCH ] ?? false;
+		$epochs = [
+			'vsig' => is_string( $vsig ) ? $vsig : '',
+			'copy' => is_string( $copy ) ? $copy : '',
+		];
+
+		if ( 0 !== $frame ) {
+			$this->order_epochs[ $blog ] = [
+				'frame' => $frame,
+				'step'  => $step,
+			] + $epochs;
+		}
+
+		return $epochs;
+	}
+
+	/**
+	 * Note the epochs this request read of a blog (epochs_seen): the first
+	 * pair read is kept, and a copy-map epoch not read before is added.
+	 *
+	 * @param int         $blog Blog id.
+	 * @param string      $vsig STORED_MAP_EPOCH as read ('' when missing).
+	 * @param string|null $copy COPY_MAP_EPOCH as read ('' when missing), or null when not read.
+	 * @return void
+	 */
+	private function note_epochs_seen( int $blog, string $vsig, ?string $copy ): void {
+		if ( ! isset( $this->epochs_seen[ $blog ] ) ) {
+			$this->epochs_seen[ $blog ] = [
+				'vsig' => $vsig,
+				'copy' => $copy,
+			];
+		} elseif ( null === $this->epochs_seen[ $blog ]['copy'] && null !== $copy ) {
+			$this->epochs_seen[ $blog ]['copy'] = $copy;
+		}
+	}
+
+	/**
+	 * Before an order's stock mirror matches the copy parents
+	 * (sync_variation_stock()), when this request read an epoch earlier
+	 * (epochs_seen): read both epochs again, past this process's copies
+	 * (or take the pair held_variation_copies() just read, or the one read
+	 * for the order's stock change: current_epochs()), and when either
+	 * differs from what this request read, drop the blog's match memos and
+	 * this process's copies of the posts and meta of the copy parents and
+	 * their children, then read those posts and meta again for all of them
+	 * at once. A structural change made by another process during this
+	 * request (another child given the source's signature, a term link
+	 * moved) retires an epoch there, while the memos and copies this
+	 * request's stock check built still show the old match; the order then
+	 * matches as a fresh request would. With a persistent object cache the
+	 * copies are deleted from it too. A request that read no epoch reads
+	 * nothing here, and an unchanged pair drops nothing. The pair read here
+	 * is what the next order of the request is compared with.
+	 *
+	 * @param array<int, int>                        $copy_parents The source parent's linked products.
+	 * @param array{vsig: string, copy: string}|null $epochs       Both epochs as held_variation_copies() read them
+	 *                                                             for this order, or null.
+	 * @return void
+	 */
+	private function match_with_current_epochs( array $copy_parents, ?array $epochs ): void {
+		$blog = get_current_blog_id();
+		$seen = $this->epochs_seen[ $blog ] ?? null;
+
+		if ( null === $seen ) {
+			return;
+		}
+
+		$epochs ??= $this->current_epochs();
+
+		if ( $epochs['vsig'] === $seen['vsig'] && ( null === $seen['copy'] || $epochs['copy'] === $seen['copy'] ) ) {
+			$this->epochs_seen[ $blog ]['copy'] = $epochs['copy'];
+
+			return;
+		}
+
+		$this->epochs_seen[ $blog ] = $epochs;
+
+		unset( $this->stock_groups[ $blog ], self::$canonical_attr_memo[ $blog ], self::$variation_maps[ $blog ], self::$first_matches[ $blog ], self::$variation_dups[ $blog ], self::$match_unique[ $blog ] );
+
+		if ( isset( $this->copy_reads[ $blog ] ) ) {
+			$this->copy_reads[ $blog ]['at'] = 0.0;
+		}
+
+		$ids = [ $copy_parents ];
+
+		foreach ( $copy_parents as $copy_parent ) {
+			$set = $this->sibling_children( (int) $copy_parent, false );
+
+			if ( null !== $set ) {
+				$ids[] = $set['children'];
+			}
+		}
+
+		$ids = array_values( array_unique( array_merge( ...$ids ) ) );
+
+		if ( [] === $ids ) {
+			return;
+		}
+
+		wp_cache_delete_multiple( $ids, 'posts' );
+		wp_cache_delete_multiple( $ids, 'post_meta' );
+
+		_prime_post_caches( $ids, false, true );
 	}
 
 	/**
@@ -5769,7 +5787,7 @@ final class InventorySync {
 		$blog = get_current_blog_id();
 
 		$this->copy_renewals[ $blog ] = ( $this->copy_renewals[ $blog ] ?? 0 ) + 1;
-		unset( $this->copy_reads[ $blog ] );
+		unset( $this->copy_reads[ $blog ], $this->epochs_seen[ $blog ], $this->order_epochs[ $blog ] );
 
 		if ( ! self::delete_transient_rows( self::COPY_MAP_EPOCH ) ) {
 			delete_transient( self::COPY_MAP_EPOCH );

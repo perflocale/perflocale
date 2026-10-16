@@ -41,17 +41,81 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	];
 
 	/**
-	 * Constructor.
+	 * Constructor. Runs at widgets_init (init:1) on every request. The name
+	 * and description are translated where something can show them: the
+	 * admin, the Customizer, REST and WP-CLI, and any request where the theme
+	 * has classic widget areas and one of them holds the widget (a theme's
+	 * sidebar filters, the legacy widget block and the_widget() read them
+	 * from the registered widget). Elsewhere, including every block theme,
+	 * they stay untranslated, and the page view neither loads the plugin's
+	 * catalog for them nor reads the sidebars.
 	 */
 	public function __construct() {
+		$labels = \PerfLocale\Helper::shows_registration_labels() || is_customize_preview();
+
 		parent::__construct(
 			'perflocale_switcher',
-			__( 'Language Switcher', 'perflocale' ),
+			$labels ? __( 'Language Switcher', 'perflocale' ) : 'Language Switcher',
 			[
-				'description'                 => __( 'Display a language switcher with flags, names, or dropdown.', 'perflocale' ),
+				'description'                 => $labels
+					? __( 'Display a language switcher with flags, names, or dropdown.', 'perflocale' )
+					: 'Display a language switcher with flags, names, or dropdown.',
 				'customize_selective_refresh' => true,
 			]
 		);
+
+		if ( ! $labels ) {
+			add_action( 'widgets_init', [ $this, 'translate_labels_where_placed' ], 99, 0 );
+		}
+	}
+
+	/**
+	 * `widgets_init` callback at priority 99, after themes register their
+	 * widget areas and before core registers the widget's instances (100),
+	 * which copies the name and description: on a theme with classic widget
+	 * areas (register_sidebar() adds the `widgets` theme support) where a
+	 * sidebar holds the widget, the translated name and description.
+	 *
+	 * @return void
+	 */
+	public function translate_labels_where_placed(): void {
+		if ( ! current_theme_supports( 'widgets' ) || ! self::is_in_a_sidebar() ) {
+			return;
+		}
+
+		$this->name                          = __( 'Language Switcher', 'perflocale' );
+		$this->widget_options['description'] = __( 'Display a language switcher with flags, names, or dropdown.', 'perflocale' );
+	}
+
+	/**
+	 * Whether a sidebar (not the inactive widgets) holds an instance of this
+	 * widget, read from the stored `sidebars_widgets` option alone. The option
+	 * is autoloaded, so the read makes no query, and it runs none of the
+	 * `sidebars_widgets` filters, which may depend on the page being parsed.
+	 * Read only on a theme with classic widget areas.
+	 *
+	 * @return bool
+	 */
+	private static function is_in_a_sidebar(): bool {
+		$sidebars = get_option( 'sidebars_widgets', [] );
+
+		if ( ! is_array( $sidebars ) ) {
+			return false;
+		}
+
+		foreach ( $sidebars as $sidebar => $widgets ) {
+			if ( ! is_array( $widgets ) || 'wp_inactive_widgets' === $sidebar || str_starts_with( (string) $sidebar, 'orphaned_widgets' ) ) {
+				continue;
+			}
+
+			foreach ( $widgets as $widget_id ) {
+				if ( is_string( $widget_id ) && str_starts_with( $widget_id, 'perflocale_switcher-' ) ) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	/**

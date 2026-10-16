@@ -269,6 +269,22 @@ a.perflocale-switcher-block__item:hover {
 	}
 }
 
+/* Without scripting the dropdown cannot open: the trigger is hidden and the
+   language links show in place as a plain list, each one a Tab stop. */
+@media (scripting: none) {
+	.perflocale-dd__trigger {
+		display: none;
+	}
+
+	.perflocale-dd__panel {
+		display: flex;
+		flex-wrap: wrap;
+		position: static;
+		min-width: 0;
+		box-shadow: none;
+	}
+}
+
 /* Floating switcher (Customizer-driven overlay).
  * Chrome is fully static; position comes from one of four modifier classes
  * matching the user's choice in the Customizer. The --with-admin-bar

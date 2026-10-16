@@ -160,6 +160,9 @@ final class SettingsPage {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
 		$message = isset( $_GET['settings-updated'] ) ? sanitize_text_field( wp_unslash( $_GET['settings-updated'] ) ) : '';
 
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$address_refused = isset( $_GET['mt-address-refused'] );
+
 		?>
 		<div class="wrap perflocale-settings">
 			<h1><?php echo esc_html__( 'PerfLocale Settings', 'perflocale' ); ?></h1>
@@ -173,6 +176,13 @@ final class SettingsPage {
 				<?php // A save that wpdb refused. It reported success before this existed. ?>
 				<div class="notice notice-error is-dismissible">
 					<p><?php echo esc_html__( 'Settings could not be saved. The database refused the write, which usually means one value is too long for its column or contains characters it cannot store. Your previous settings are unchanged.', 'perflocale' ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $address_refused ) : ?>
+				<?php // A provider address change Settings::update() refused (multisite, key supplied from outside the database). ?>
+				<div class="notice notice-warning is-dismissible">
+					<p><?php echo esc_html__( "This provider's key is set by the network administrator; ask them to change the address.", 'perflocale' ); ?></p>
 				</div>
 			<?php endif; ?>
 
@@ -986,6 +996,8 @@ final class SettingsPage {
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
 
 		// The key inputs render empty, so an empty one keeps the stored key.
+		// A changed provider address clears its stored key unless a new key is
+		// typed: Settings::update() applies that rule for every writer.
 		if ( $tab === 'machine-translation' ) {
 			foreach ( self::MT_SECRET_KEYS as $secret ) {
 				if ( isset( $values[ $secret ] ) && $values[ $secret ] === '' ) {

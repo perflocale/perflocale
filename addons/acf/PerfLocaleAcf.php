@@ -205,7 +205,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
 		$id = ( 'post' === ( $decoded['type'] ?? '' ) && is_numeric( $decoded['id'] ?? null ) ) ? (int) $decoded['id'] : 0;
 
-		if ( $id <= 0 || \PerfLocale\Translation\PostTranslationManager::is_creating() || \PerfLocale\Translation\ContentSync::is_page_view() ) {
+		if ( $id <= 0 || \PerfLocale\Translation\PostTranslationManager::is_creating() || \PerfLocale\Translation\SyncMeta::is_page_view() ) {
 			return $value;
 		}
 

@@ -314,14 +314,31 @@ final class LanguageSwitcherBlock {
 		// callback's cost (~150-400 µs/request total).
 		add_filter( 'register_block_type_args', [ $this, 'apply_setting_defaults' ], 10, 2 );
 
-		register_block_type(
-			PERFLOCALE_DIR . 'blocks/language-switcher',
-			[
-				'render_callback' => [ $this, 'render_block_callback' ],
-			]
-		);
+		// Only the call that adds the metadata filter removes it, in finally:
+		// a PerfLocale block registered inside another one's registration
+		// leaves the outer call's filter in place, and a throwing callback
+		// leaves no filter behind.
+		$strip = ! \PerfLocale\Helper::shows_registration_labels()
+			&& false === has_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
 
-		remove_filter( 'register_block_type_args', [ $this, 'apply_setting_defaults' ], 10 );
+		if ( $strip ) {
+			add_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
+		}
+
+		try {
+			register_block_type(
+				PERFLOCALE_DIR . 'blocks/language-switcher',
+				[
+					'render_callback' => [ $this, 'render_block_callback' ],
+				]
+			);
+		} finally {
+			if ( $strip ) {
+				remove_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
+			}
+
+			remove_filter( 'register_block_type_args', [ $this, 'apply_setting_defaults' ], 10 );
+		}
 	}
 
 	/**
@@ -985,7 +1002,6 @@ final class LanguageSwitcherBlock {
 					'href'     => $url,
 					'class'    => $option_class,
 					'role'     => 'option',
-					'tabindex' => '-1',
 					'hreflang' => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
 					'lang'     => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
 				];

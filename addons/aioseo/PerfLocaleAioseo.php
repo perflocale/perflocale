@@ -147,7 +147,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 		// A field a person empties stays empty: its clear is recorded in the
 		// post's seed-cleared marker, which machine translation and the seed
 		// honour.
-		\PerfLocale\Translation\ContentSync::track_seed_clears( $this->add_meta_keys( [], '' ) );
+		\PerfLocale\Translation\SyncMeta::track_seed_clears( $this->add_meta_keys( [], '' ) );
 
 		// AIOSEO renders from its own `aioseo_posts` table, not from the
 		// `_aioseo_*` post-meta mirror that PerfLocale translates, so a

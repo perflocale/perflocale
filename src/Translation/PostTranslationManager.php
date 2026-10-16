@@ -973,13 +973,13 @@ final class PostTranslationManager {
 			'_perflocale_meta_copy_errors',
 			// Keys the copy source's owner emptied. The new translation has not
 			// emptied anything, so it must still receive later seeds.
-			ContentSync::SEED_CLEARED_META,
+			SyncMeta::SEED_CLEARED_META,
 			// The copy source's own stale Sync Fields mark. The new translation
 			// starts with the copy source's values and is not marked.
-			ContentSync::SYNC_STALE_META,
+			SyncMeta::SYNC_STALE_META,
 			// The Sync Fields values the copy source held before its stale
 			// mark was cleared; they describe that post's edit screen only.
-			ContentSync::SYNC_HELD_META,
+			SyncMeta::SYNC_HELD_META,
 		];
 
 		// The SEO exclusion takes the post it is set on out of hreflang and

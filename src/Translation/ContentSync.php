@@ -77,6 +77,12 @@ final class ContentSync {
 	private const DEFERRED_CAP = 200;
 
 	/**
+	 * Most compare-and-set attempts of one change or delete of a post's
+	 * stale mark (change_stale_mark(), delete_stale_mark()).
+	 */
+	private const STALE_MARK_ATTEMPTS = 3;
+
+	/**
 	 * Depth of sibling writes ContentSync itself is making. Meta writes seen
 	 * while it is above zero are the sync's own and start nothing.
 	 *
@@ -118,15 +124,6 @@ final class ContentSync {
 	 * @var bool
 	 */
 	private bool $shutdown_hooked = false;
-
-	/**
-	 * Meta keys whose clears the meta-API watcher records in the seed-cleared
-	 * marker (key => true), registered by integrations whose host plugin
-	 * writes the keys itself; see track_seed_clears().
-	 *
-	 * @var array<string, true>
-	 */
-	private static array $clear_tracked = [];
 
 	/**
 	 * Posts a person is editing in this request ("{blog_id}:{post_id}" =>
@@ -198,8 +195,9 @@ final class ContentSync {
 	/**
 	 * The stale mark a person's save in this request clears, as it read at
 	 * the save's `save_post` ("{blog_id}:{post_id}" => mark), until that
-	 * save's sync has run. That sync clears it (settle_stale_mark()) and
-	 * names it in the held-values row it writes (held_mark_id()).
+	 * save's sync has run. That sync clears it (settle_stale_mark()), adds
+	 * the pending Sync Fields its row held when deleted, and names it in the
+	 * held-values row it writes (held_mark_id()).
 	 *
 	 * @var array<string, array{status: string, at: string, pending: list<string>}>
 	 */
@@ -247,6 +245,19 @@ final class ContentSync {
 	 * @var array<string, array<string, array<int|string, mixed>|bool>|false>
 	 */
 	private static array $person_writes = [];
+
+	/**
+	 * Stale marks (SYNC_STALE_META) read in this request, "{blog_id}:{post_id}"
+	 * => the mark as stale_mark() returns it, null for a post with no mark.
+	 * A post's entry is dropped by every write of its mark in this process
+	 * (forget_stale_mark()) and by `clean_post_cache`; a change or delete of
+	 * the mark reads its rows from the table itself (change_stale_mark(),
+	 * delete_stale_mark()).
+	 * Past DEFERRED_CAP posts the oldest entry is dropped.
+	 *
+	 * @var array<string, array{status: string, at: string, pending: list<string>}|null>
+	 */
+	private static array $stale_marks = [];
 
 	/**
 	 * Constructor.
@@ -319,36 +330,28 @@ final class ContentSync {
 		add_action( 'add_post_meta', [ $this, 'note_meta_add' ], 10, 3 );
 		add_action( 'update_post_meta', [ $this, 'note_meta_update' ], 10, 4 );
 		add_action( 'delete_post_meta', [ $this, 'note_meta_delete' ], 10, 3 );
+
+		// A post whose caches core drops reads its stale mark again.
+		add_action( 'clean_post_cache', [ $this, 'forget_cleaned_post' ], 10, 1 );
 	}
 
 	/**
-	 * Whether this request is a front-end page view: a GET or HEAD request
-	 * outside admin, AJAX, cron, REST and WP-CLI. Meta written while a page
-	 * is viewed (a view counter, a cached value) is not an edit: it starts no
-	 * sync and records no clear. The post's next save syncs every field.
+	 * See SyncMeta::is_page_view().
 	 *
 	 * @return bool
 	 */
 	public static function is_page_view(): bool {
-		$method = isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
-
-		return ( 'GET' === $method || 'HEAD' === $method ) && ! \PerfLocale\Helper::is_write_context();
+		return SyncMeta::is_page_view();
 	}
 
 	/**
-	 * Record clears of these meta keys in the seed-cleared marker whenever
-	 * they are written through the meta API. For integrations whose host
-	 * plugin stores its fields with plain meta writes (SEO plugins).
+	 * See SyncMeta::track_seed_clears().
 	 *
 	 * @param array<int, mixed> $keys Meta keys.
 	 * @return void
 	 */
 	public static function track_seed_clears( array $keys ): void {
-		foreach ( $keys as $key ) {
-			if ( is_string( $key ) && $key !== '' ) {
-				self::$clear_tracked[ $key ] = true;
-			}
-		}
+		SyncMeta::track_seed_clears( $keys );
 	}
 
 	/**
@@ -493,14 +496,14 @@ final class ContentSync {
 	 * @return int
 	 */
 	private function tracked_write( mixed $object_id, mixed $meta_key ): int {
-		if ( ! is_string( $meta_key ) || ! isset( self::$clear_tracked[ $meta_key ] ) || ! is_numeric( $object_id ) || (int) $object_id <= 0 ) {
+		if ( ! is_string( $meta_key ) || ! SyncMeta::is_seed_clear_tracked( $meta_key ) || ! is_numeric( $object_id ) || (int) $object_id <= 0 ) {
 			return 0;
 		}
 
 		$post_id = (int) $object_id;
 
 		if ( self::$writing > 0 || PostTranslationManager::is_creating()
-			|| isset( $this->deleting[ $this->state_key( $post_id ) ] ) || self::is_page_view() ) {
+			|| isset( $this->deleting[ $this->state_key( $post_id ) ] ) || SyncMeta::is_page_view() ) {
 			return 0;
 		}
 
@@ -1591,7 +1594,8 @@ final class ContentSync {
 	 * save of that post would write them. Seed-only keys are left to the
 	 * next save. The sync's own writes to siblings, everything written
 	 * while a translation is being created, the meta removed with a
-	 * deleted post and writes made during a page view start nothing.
+	 * deleted post and writes made during a page view start nothing. Any
+	 * write of a stale mark drops that post's read mark (forget_stale_mark()).
 	 *
 	 * @param int|int[]|mixed $meta_ids  Meta ID(s) written (unused).
 	 * @param int|mixed       $object_id Post ID.
@@ -1599,6 +1603,12 @@ final class ContentSync {
 	 * @return void
 	 */
 	public function on_meta_write( mixed $meta_ids = 0, mixed $object_id = 0, mixed $meta_key = '' ): void {
+		// Core passes no post for a delete across all posts: every read
+		// mark is dropped.
+		if ( self::SYNC_STALE_META === $meta_key ) {
+			self::forget_stale_mark( is_numeric( $object_id ) ? (int) $object_id : 0 );
+		}
+
 		if ( self::$writing > 0 || ! is_string( $meta_key ) || ! is_numeric( $object_id ) || (int) $object_id <= 0 ) {
 			return;
 		}
@@ -1607,7 +1617,7 @@ final class ContentSync {
 
 		$field = $this->configured_field_for_meta_key( $meta_key );
 
-		if ( $field === null || PostTranslationManager::is_creating() || self::is_page_view() ) {
+		if ( $field === null || PostTranslationManager::is_creating() || SyncMeta::is_page_view() ) {
 			return;
 		}
 
@@ -1657,70 +1667,24 @@ final class ContentSync {
 	}
 
 	/**
-	 * Per-post opt-out meta flag - the same key (and the same symmetric
-	 * semantics) as WooCommerce's InventorySync: a flagged post is removed
-	 * from the sync graph in BOTH directions. It neither receives mirror or
-	 * seed writes nor pushes its own fields onto siblings, while the REST of
-	 * the group keeps syncing among themselves. Set from the Translations
-	 * metabox / Gutenberg panel checkbox (or the WooCommerce Advanced-tab
-	 * checkbox on products, which writes the identical key).
+	 * See SyncMeta::SYNC_OPTOUT_META.
 	 */
-	public const SYNC_OPTOUT_META = '_perflocale_sync_optout';
+	public const SYNC_OPTOUT_META = SyncMeta::SYNC_OPTOUT_META;
 
 	/**
-	 * Meta keys whose value a person deliberately emptied on this post, one
-	 * row per key (the row's value is the key). Written by the Meta Box and
-	 * ACF integrations and, for the keys given to track_seed_clears(), by the
-	 * meta-API watcher, only while a person edits the post (see
-	 * record_seed_clear()). Without it an emptied field reads as "never set": the
-	 * next save of the default-language member seeds it again when its rows
-	 * are gone, and machine translation fills it when it is empty. Consulted
-	 * only when a seed is about to be written, so a sibling holding rows pays
-	 * nothing. Machine translation honours it too.
+	 * See SyncMeta::SEED_CLEARED_META.
 	 */
-	public const SEED_CLEARED_META = '_perflocale_seed_cleared';
+	public const SEED_CLEARED_META = SyncMeta::SEED_CLEARED_META;
 
 	/**
-	 * A translation whose Sync Fields differ from its group's: a save that
-	 * gave the group's original new values skipped it because the saver may
-	 * not edit it, or its own save could not give the group's original its
-	 * new values for the same reason (sync_siblings()). One row, whose value
-	 * holds the status its translation link held before it was set to "needs
-	 * update" (`status`; `needs_update` when the link already read that) and
-	 * the link's write time after the mark (`at`), and the Sync Fields a
-	 * person's save that would have cleared the mark changed while another
-	 * request held the post's lock (`pending`, keep_pending_changes()), which
-	 * the save that clears it copies too. Clearing the mark gives the link
-	 * back that status only while its write time is still `at`: a content
-	 * change of the group's original that flagged the translation
-	 * after the mark (ContentChangeDetector::flag_translations()) moves that
-	 * time past the value it held, also within the same second, and its
-	 * "needs update" then stays. While the mark is set, the translation's own
-	 * saves copy none of its Sync Fields to the group, so its values never
-	 * replace the group's. A person who may edit it and the group's original
-	 * saving it from an editing screen (is_person_editing()) clears the mark
-	 * (person_save_clears_stale()), once that save's sync holds the post's
-	 * lock (settle_stale_mark()). That save copies to the group only the
-	 * Sync Fields the person changed in it, and the translation takes the
-	 * group's current values for the others (sync_cleared()).
+	 * See SyncMeta::SYNC_STALE_META.
 	 */
-	public const SYNC_STALE_META = '_perflocale_sync_stale';
+	public const SYNC_STALE_META = SyncMeta::SYNC_STALE_META;
 
 	/**
-	 * The Sync Fields values a person's save that cleared a translation's
-	 * stale mark replaced with the group's (sync_cleared()): `mark` names the
-	 * cleared mark (held_mark_id()), `values` maps each replaced field to a
-	 * hash of the value the translation held before (held_value()), so the
-	 * row stays small whatever the size of a field. The block editor's meta
-	 * boxes still show those values: their form, rendered while the mark was
-	 * set, carries the mark's name (render_held_field()), and each meta-box
-	 * request it sends after a save counts a field it sends back unchanged as
-	 * not changed by the person (held_form_save()). One row per post,
-	 * replaced by the post's next clearing save and removed when the post is
-	 * marked stale again, as no meta-box request can use it then; written
-	 * only by clearing saves.
+	 * See SyncMeta::SYNC_HELD_META.
 	 */
-	public const SYNC_HELD_META = '_perflocale_sync_held';
+	public const SYNC_HELD_META = SyncMeta::SYNC_HELD_META;
 
 	/**
 	 * Name of the block editor meta-box form field that carries the stale
@@ -1746,7 +1710,7 @@ final class ContentSync {
 
 	/**
 	 * The link status a post's stale mark (SYNC_STALE_META) restores, or null
-	 * when the post is not marked. Read from the post's meta cache.
+	 * when the post is not marked (stale_mark()).
 	 *
 	 * @param int $post_id Post ID.
 	 * @return string|null
@@ -1762,19 +1726,90 @@ final class ContentSync {
 	 * the link's write time it was set at ('' when not known) and the Sync
 	 * Fields a person's save changed while it could not clear the mark
 	 * (keep_pending_changes()), or null when the post is not marked. Read
-	 * from the post's meta cache.
+	 * once per request from the post's meta cache, then from the marks read
+	 * in this request ($stale_marks).
 	 *
 	 * @param int $post_id Post ID.
 	 * @return array{status: string, at: string, pending: list<string>}|null
 	 */
 	private static function stale_mark( int $post_id ): ?array {
-		$rows = get_post_meta( $post_id, self::SYNC_STALE_META, false );
+		$key = get_current_blog_id() . ':' . $post_id;
+
+		if ( array_key_exists( $key, self::$stale_marks ) ) {
+			return self::$stale_marks[ $key ];
+		}
+
+		if ( count( self::$stale_marks ) >= self::DEFERRED_CAP ) {
+			unset( self::$stale_marks[ array_key_first( self::$stale_marks ) ] );
+		}
+
+		self::$stale_marks[ $key ] = self::read_stale_mark( $post_id );
+
+		return self::$stale_marks[ $key ];
+	}
+
+	/**
+	 * Drop a post's read stale mark (stale_mark()) on the current blog, or
+	 * every read mark when no post is given: its next read reads the meta
+	 * cache.
+	 *
+	 * @param int $post_id Post ID, 0 for every post.
+	 * @return void
+	 */
+	private static function forget_stale_mark( int $post_id ): void {
+		if ( $post_id > 0 ) {
+			unset( self::$stale_marks[ get_current_blog_id() . ':' . $post_id ] );
+		} else {
+			self::$stale_marks = [];
+		}
+	}
+
+	/**
+	 * `clean_post_cache`: a post whose caches core drops reads its stale mark
+	 * again.
+	 *
+	 * @param int|mixed $post_id Post ID.
+	 * @return void
+	 */
+	public function forget_cleaned_post( mixed $post_id = 0 ): void {
+		if ( self::$stale_marks !== [] && is_numeric( $post_id ) && (int) $post_id > 0 ) {
+			self::forget_stale_mark( (int) $post_id );
+		}
+	}
+
+	/**
+	 * A post's stale mark as the post's meta cache holds it (stale_mark()).
+	 * Read straight from that cache when core has loaded it (the edit screen
+	 * and a save load it first): the key is private, so no `get_post_metadata`
+	 * filter runs for it. Otherwise read with get_post_meta(), which loads it.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return array{status: string, at: string, pending: list<string>}|null
+	 */
+	private static function read_stale_mark( int $post_id ): ?array {
+		$meta = wp_cache_get( $post_id, 'post_meta' );
+
+		if ( is_array( $meta ) ) {
+			$rows = $meta[ self::SYNC_STALE_META ] ?? [];
+			$rows = is_array( $rows ) ? array_map( static fn( $row ) => is_string( $row ) ? maybe_unserialize( $row ) : $row, $rows ) : [];
+		} else {
+			$rows = get_post_meta( $post_id, self::SYNC_STALE_META, false );
+		}
 
 		if ( ! is_array( $rows ) || $rows === [] ) {
 			return null;
 		}
 
-		$mark    = reset( $rows );
+		return self::parse_stale_mark( reset( $rows ) );
+	}
+
+	/**
+	 * A stale mark's stored value in the form stale_mark() returns.
+	 *
+	 * @param mixed $mark Unserialized value of the mark's row.
+	 * @return array{status: string, at: string, pending: list<string>}
+	 */
+	private static function parse_stale_mark( mixed $mark ): array {
 		$status  = is_array( $mark ) ? ( $mark['status'] ?? '' ) : $mark;
 		$at      = is_array( $mark ) ? ( $mark['at'] ?? '' ) : '';
 		$pending = is_array( $mark ) && is_array( $mark['pending'] ?? null ) ? array_values( array_filter( $mark['pending'], 'is_string' ) ) : [];
@@ -1787,25 +1822,110 @@ final class ContentSync {
 	}
 
 	/**
-	 * Write a post's stale mark.
+	 * Set the link status and write time a post's stale mark stores, keeping
+	 * the Sync Fields it holds as pending (change_stale_mark()). A post with
+	 * no mark is left unmarked.
 	 *
-	 * @param int                $post_id Post ID.
-	 * @param string             $status  Link status the mark restores.
-	 * @param string             $at      Link write time the mark was set at, '' when not known.
-	 * @param array<int, string> $pending Sync Fields kept for the save that clears the mark; none when empty.
+	 * @param int    $post_id Post ID.
+	 * @param string $status  Link status the mark restores.
+	 * @param string $at      Link write time the mark was set at, '' when not known.
 	 * @return void
 	 */
-	private static function write_stale_mark( int $post_id, string $status, string $at, array $pending = [] ): void {
-		$mark = [
-			'status' => $status,
-			'at'     => $at,
-		];
+	private static function write_stale_mark( int $post_id, string $status, string $at ): void {
+		self::change_stale_mark(
+			$post_id,
+			static function ( array $mark ) use ( $status, $at ): ?array {
+				if ( $status === $mark['status'] && $at === $mark['at'] ) {
+					return null;
+				}
 
-		if ( $pending !== [] ) {
-			$mark['pending'] = $pending;
+				$mark['status'] = $status;
+				$mark['at']     = $at;
+
+				return $mark;
+			}
+		);
+	}
+
+	/**
+	 * Change a post's stale mark with a compare-and-set on its row.
+	 *
+	 * The mark's row is read from the table, $transform gives the mark after
+	 * the change, and the UPDATE matches only while the row (its meta_id)
+	 * still holds exactly the value read. So a change another request made
+	 * in between, such as a Sync Field it kept as pending
+	 * (keep_pending_changes()), is not overwritten: the row is read again and
+	 * $transform applied to it again, a bounded number of times. Nothing is
+	 * ever inserted: once the mark's row is gone (the mark was cleared),
+	 * the post stays unmarked. The post's meta cache is dropped, and after a
+	 * write the posts last_changed stamp is renewed, as update_post_meta()
+	 * does.
+	 *
+	 * @param int      $post_id   Post ID.
+	 * @param callable $transform Given the mark as read, returns the mark after the change, or null
+	 *                            when nothing is to change.
+	 * @phpstan-param callable(array{status: string, at: string, pending: list<string>}): (array{status: string, at: string, pending: list<string>}|null) $transform
+	 * @return bool True once the row holds the changed mark, or nothing had
+	 *              to change; false when the post has no mark or after the
+	 *              bounded attempts.
+	 */
+	private static function change_stale_mark( int $post_id, callable $transform ): bool {
+		global $wpdb;
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+
+		$done = false;
+
+		for ( $attempt = 0; $attempt < self::STALE_MARK_ATTEMPTS; $attempt++ ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The mark's row itself, past the meta cache, for the compare-and-set below.
+			$row = $wpdb->get_row( $wpdb->prepare( 'SELECT meta_id, meta_value FROM %i WHERE post_id = %d AND meta_key = %s ORDER BY meta_id LIMIT 1', $wpdb->postmeta, $post_id, self::SYNC_STALE_META ) );
+
+			if ( ! is_object( $row ) || ! isset( $row->meta_id, $row->meta_value ) || ! is_numeric( $row->meta_id ) || ! is_string( $row->meta_value ) ) {
+				break;
+			}
+
+			$meta_id = (int) $row->meta_id;
+			$read    = $row->meta_value;
+			$after   = $transform( self::parse_stale_mark( maybe_unserialize( $read ) ) );
+
+			if ( null === $after ) {
+				$done = true;
+				break;
+			}
+
+			$mark = [
+				'status' => $after['status'],
+				'at'     => $after['at'],
+			];
+
+			if ( $after['pending'] !== [] ) {
+				$mark['pending'] = $after['pending'];
+			}
+
+			$value = maybe_serialize( $mark );
+
+			if ( $value === $read ) {
+				$done = true;
+				break;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set write of the mark; the post's meta cache is dropped below.
+			$affected = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET meta_value = %s WHERE meta_id = %d AND meta_value = CAST(%s AS BINARY)', $wpdb->postmeta, $value, $meta_id, $read ) ?? '' );
+
+			if ( 1 === $affected ) {
+				$done = true;
+				wp_cache_set_posts_last_changed();
+				break;
+			}
 		}
 
-		update_post_meta( $post_id, self::SYNC_STALE_META, $mark );
+		wp_cache_delete( $post_id, 'post_meta' );
+		self::forget_stale_mark( $post_id );
+
+		return $done;
 	}
 
 	/**
@@ -1877,7 +1997,6 @@ final class ContentSync {
 
 		// The held-values row of a mark cleared earlier serves no form once
 		// the post is marked again: its next clearing save writes its own.
-		// Read from the meta cache stale_mark() filled.
 		if ( [] !== get_post_meta( $post_id, self::SYNC_HELD_META, false ) ) {
 			delete_post_meta( $post_id, self::SYNC_HELD_META );
 		}
@@ -1897,6 +2016,7 @@ final class ContentSync {
 				],
 				true
 			);
+			self::forget_stale_mark( $post_id );
 			return;
 		}
 
@@ -1911,6 +2031,7 @@ final class ContentSync {
 			],
 			true
 		);
+		self::forget_stale_mark( $post_id );
 
 		if ( $repo->update_link_status( $post_id, $lang_id, $needs, '', \PerfLocale\Enum\ObjectType::Post, $status ) ) {
 			// The write stamps the link with the current time. When the
@@ -1927,6 +2048,7 @@ final class ContentSync {
 
 		if ( null === $live ) {
 			delete_post_meta( $post_id, self::SYNC_STALE_META );
+			self::forget_stale_mark( $post_id );
 			return;
 		}
 
@@ -1950,20 +2072,28 @@ final class ContentSync {
 	 * the mark stored, while the link still reads "needs update" and was not
 	 * written since the mark (its write time is still the mark's). A link
 	 * written since, as a content change of the group's original does, keeps
-	 * "needs update"; so does one whose mark has no known write time.
+	 * "needs update"; so does one whose mark has no known write time. The
+	 * mark's rows are deleted with a compare-and-set (delete_stale_mark()), and
+	 * the link is given its status back only when this call deleted a row: a
+	 * mark another request cleared first had its link restored there.
 	 *
 	 * @param int                                                      $post_id Post ID.
 	 * @param array{status: string, at: string, pending: list<string>} $mark    The post's stale mark.
-	 * @return void
+	 * @return list<string> The Sync Fields the deleted rows kept as pending
+	 *                      changes, as they held them when deleted.
 	 */
-	private static function clear_stale( int $post_id, array $mark ): void {
-		delete_post_meta( $post_id, self::SYNC_STALE_META );
+	private static function clear_stale( int $post_id, array $mark ): array {
+		$pending = self::delete_stale_mark( $post_id );
+
+		if ( null === $pending ) {
+			return [];
+		}
 
 		$needs   = \PerfLocale\Enum\TranslationStatus::NeedsUpdate->value;
 		$restore = $mark['status'];
 
 		if ( $needs === $restore || '' === $mark['at'] || null === \PerfLocale\Enum\TranslationStatus::tryFrom( $restore ) ) {
-			return;
+			return $pending;
 		}
 
 		$link = self::own_link( $post_id );
@@ -1971,12 +2101,89 @@ final class ContentSync {
 		if ( null !== $link ) {
 			\PerfLocale\Plugin::get_instance()->group_repo()->update_link_status( $post_id, $link['language_id'], $restore, '', \PerfLocale\Enum\ObjectType::Post, $needs, $mark['at'] );
 		}
+
+		return $pending;
+	}
+
+	/**
+	 * Delete a post's stale mark rows with a compare-and-set on each row.
+	 *
+	 * The rows are read from the table and each is deleted only while it
+	 * (its meta_id) still holds exactly the value read. A row another request
+	 * changed in between, such as one a save refused the post's lock added a
+	 * pending Sync Field to (keep_pending_changes()), is read again and its
+	 * pending fields are returned too, a bounded number of times; after that
+	 * the rows are deleted by meta_id alone. The post's meta cache is
+	 * dropped, and after a delete the posts last_changed stamp is renewed, as
+	 * delete_post_meta() does.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return list<string>|null The Sync Fields the deleted rows kept as
+	 *                           pending, or null when no row was deleted
+	 *                           (the post had no mark).
+	 */
+	private static function delete_stale_mark( int $post_id ): ?array {
+		global $wpdb;
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+
+		$pending = [];
+		$deleted = false;
+
+		for ( $attempt = 0; $attempt <= self::STALE_MARK_ATTEMPTS; $attempt++ ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The mark's rows themselves, past the meta cache, for the compare-and-set below.
+			$rows   = $wpdb->get_results( $wpdb->prepare( 'SELECT meta_id, meta_value FROM %i WHERE post_id = %d AND meta_key = %s ORDER BY meta_id', $wpdb->postmeta, $post_id, self::SYNC_STALE_META ) );
+			$missed = false;
+
+			foreach ( is_array( $rows ) ? $rows : [] as $row ) {
+				if ( ! isset( $row->meta_id, $row->meta_value ) || ! is_numeric( $row->meta_id ) || ! is_string( $row->meta_value ) ) {
+					continue;
+				}
+
+				$read    = $row->meta_value;
+				$pending = array_values( array_unique( array_merge( $pending, self::parse_stale_mark( maybe_unserialize( $read ) )['pending'] ) ) );
+
+				if ( $attempt < self::STALE_MARK_ATTEMPTS ) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set delete of the mark; the post's meta cache is dropped below.
+					$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_id = %d AND meta_value = CAST(%s AS BINARY)', $wpdb->postmeta, (int) $row->meta_id, $read ) ?? '' );
+				} else {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Last attempt: the row by meta_id; the post's meta cache is dropped below.
+					$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_id = %d', $wpdb->postmeta, (int) $row->meta_id ) ?? '' );
+				}
+
+				if ( 1 === $affected ) {
+					$deleted = true;
+				} elseif ( 0 === $affected ) {
+					$missed = true;
+				}
+			}
+
+			if ( ! $missed ) {
+				break;
+			}
+		}
+
+		wp_cache_delete( $post_id, 'post_meta' );
+		self::forget_stale_mark( $post_id );
+
+		if ( ! $deleted ) {
+			return null;
+		}
+
+		wp_cache_set_posts_last_changed();
+
+		return $pending;
 	}
 
 	/**
 	 * Clear the stale mark a person's save clears (person_save_clears_stale()),
 	 * as it read at that save's `save_post`, and give the translation link
-	 * back the status the mark stored (clear_stale()). When the same save
+	 * back the status the mark stored (clear_stale()). The pending Sync
+	 * Fields the deleted rows held are added to the mark this save clears,
+	 * so its sync copies them too (sync_cleared()). When the same save
 	 * changed the post's content while the mark held its "needs update"
 	 * (keeps_needs_update()), that change then settles the link as it does
 	 * on any translation whose content changed: a link that still reads
@@ -1993,7 +2200,14 @@ final class ContentSync {
 			return;
 		}
 
-		self::clear_stale( $post_id, $mark );
+		// A Sync Field a save refused the post's lock kept with the mark after
+		// this save read it (keep_pending_changes()) is read from the row it
+		// deletes and counts as changed by this save too (sync_cleared()).
+		$pending = array_values( array_unique( array_merge( $mark['pending'], self::clear_stale( $post_id, $mark ) ) ) );
+
+		if ( $pending !== $mark['pending'] ) {
+			self::$cleared_marks[ $key ]['pending'] = $pending;
+		}
 
 		if ( ! isset( self::$settled_content[ $key ] ) ) {
 			return;
@@ -2016,7 +2230,7 @@ final class ContentSync {
 	 * group's original. A person's save that clears the mark
 	 * (person_save_clears_stale()) syncs once it is complete and is not held
 	 * back: its sync clears the mark (sync_cleared(), settle_stale_mark()).
-	 * Read from the meta cache the opt-out check fills.
+	 * The mark is read once per request (stale_mark()).
 	 *
 	 * @param int $post_id Post being saved.
 	 * @return bool
@@ -2241,7 +2455,7 @@ final class ContentSync {
 		$at     = null === $live ? $mark['at'] : $live['updated_at'];
 
 		if ( [ $status, $at ] !== [ $mark['status'], $mark['at'] ] ) {
-			self::write_stale_mark( $post_id, $status, $at, $mark['pending'] );
+			self::write_stale_mark( $post_id, $status, $at );
 		}
 
 		$key = get_current_blog_id() . ':' . $post_id;
@@ -2620,8 +2834,10 @@ final class ContentSync {
 	 * mark stays. The Sync Fields that save changed (changed_in_save()) are
 	 * kept with the mark (`pending`), so the save that clears it copies them
 	 * to the group as well (sync_cleared()) and the person's change is not
-	 * replaced by the group's value. The mark is read from the database
-	 * first, so a mark another request cleared meanwhile is not written back.
+	 * replaced by the group's value. The fields are added to the mark as its
+	 * row holds it, with a compare-and-set (change_stale_mark()): a field
+	 * another such save added meanwhile stays, and a mark another request
+	 * cleared meanwhile is not written back.
 	 *
 	 * @param int      $post_id Post saved.
 	 * @param \WP_Post $post    Post object.
@@ -2650,25 +2866,20 @@ final class ContentSync {
 			return;
 		}
 
-		wp_cache_delete( $post_id, 'post_meta' );
-		$mark = self::stale_mark( $post_id );
+		self::change_stale_mark(
+			$post_id,
+			static function ( array $mark ) use ( $changed ): ?array {
+				$pending = array_values( array_unique( array_merge( $mark['pending'], $changed ) ) );
 
-		if ( null === $mark ) {
-			return;
-		}
+				if ( $pending === $mark['pending'] ) {
+					return null;
+				}
 
-		$pending = array_values( array_unique( array_merge( $mark['pending'], $changed ) ) );
+				$mark['pending'] = $pending;
 
-		if ( $pending === $mark['pending'] ) {
-			return;
-		}
-
-		try {
-			++self::$writing;
-			self::write_stale_mark( $post_id, $mark['status'], $mark['at'], $pending );
-		} finally {
-			--self::$writing;
-		}
+				return $mark;
+			}
+		);
 	}
 
 	/**

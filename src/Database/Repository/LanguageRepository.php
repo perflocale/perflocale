@@ -761,8 +761,8 @@ final class LanguageRepository implements RepositoryInterface {
 	 * written. With $confirm_unchanged that is settled only on a value read
 	 * from the row itself, so a cached copy that already holds the change
 	 * still costs one read of the row; without it the cached copy's answer
-	 * stands, which costs nothing (a prune of a slug the map has no entry
-	 * for).
+	 * stands, which costs nothing (the prune of a slug that becomes live,
+	 * drop_stale_slug_redirect()).
 	 *
 	 * @param callable $transform         Returns the map after the change, given the map as read.
 	 * @param bool     $confirm_unchanged Whether an unchanged map read from the cached copy is confirmed
@@ -2019,8 +2019,10 @@ final class LanguageRepository implements RepositoryInterface {
 		// entries are dropped - old URLs then fall through to normal routing.
 		// The write is the compare-and-set of write_slug_redirects(), so a
 		// cached copy older than the row cannot write back entries the row
-		// no longer has or drop redirects recorded since; nothing is written
-		// while the map read first has no entry naming the slug.
+		// no longer has or drop redirects recorded since. A cached copy with
+		// no entry naming the slug is confirmed against the row (one read of
+		// it), as a redirect to the slug recorded since that copy was loaded
+		// is in the row only.
 		$deleted_slug = is_string( $language->slug ) ? $language->slug : '';
 		$wrote        = false;
 
@@ -2037,7 +2039,7 @@ final class LanguageRepository implements RepositoryInterface {
 
 				return $pruned;
 			},
-			false,
+			true,
 			$wrote
 		);
 

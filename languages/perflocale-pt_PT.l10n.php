@@ -1,0 +1,3 @@
+<?php
+defined( 'ABSPATH' ) || exit;
+return ['domain'=>'perflocale','plural-forms'=>'nplurals=2; plural=n != 1;','language'=>'pt_PT','project-id-version'=>'PerfLocale 1.0.7.1','pot-creation-date'=>'2026-10-13T08:58:43+00:00','po-revision-date'=>'2026-10-13 09:30+0000','messages'=>['Language switcher'=>'Escolha de idioma','No languages configured.'=>'Nenhum idioma configurado.','Choose language, currently %s'=>'Escolher idioma, idioma em uso: %s']];

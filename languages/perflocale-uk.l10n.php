@@ -1,0 +1,3 @@
+<?php
+defined( 'ABSPATH' ) || exit;
+return ['domain'=>'perflocale','plural-forms'=>'nplurals=3; plural=(n % 10 == 1 && n % 100 != 11) ? 0 : ((n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)) ? 1 : 2);','language'=>'uk','project-id-version'=>'PerfLocale 1.0.7.1','pot-creation-date'=>'2026-10-13T08:58:43+00:00','po-revision-date'=>'2026-10-13 09:30+0000','messages'=>['Language switcher'=>'Перемикач мов','No languages configured.'=>'Мови не налаштовано.','Choose language, currently %s'=>'Вибрати мову, поточна: %s']];

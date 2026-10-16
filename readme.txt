@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.7.1.1
+Stable tag: 1.0.7.2
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -207,6 +207,13 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
+= 1.0.7.2 =
+* Security hardening.
+* Most visitor pages load less plugin code, and the plugin's own translations load when a page shows PerfLocale text instead of at start-up; sites without an opcode cache gain the most.
+* The language switcher ships translated into 24 languages; regional variants such as de_AT, de_CH, nl_BE, fr_CA, es_MX and pt_AO use the closest bundled language.
+* Language switcher: a dropdown that a window resize hides closes and stops following the page, and its links work without JavaScript.
+* WooCommerce shared stock, Sync Fields and slug redirects stay consistent when two edits happen at the same time; saving a post makes fewer cache reads.
+
 = 1.0.7.1.1 =
 * Block editor: saving a post or page no longer ends in an error, and the "View Post" link appears again after publishing.
 
@@ -235,6 +242,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.7.2 =
+Security hardening. Less code on visitor pages, the language switcher in 24 languages, and more reliable stock, Sync Fields and slug redirects under concurrent edits.
 
 = 1.0.7.1.1 =
 Fixes an error after every save in the block editor.

@@ -4,8 +4,18 @@
  *
  * Public events fired on the switcher `<nav>` (all bubble):
  *   - `perflocale:switcher:open`     (after open, not cancelable)
- *   - `perflocale:switcher:close`    (after close, not cancelable)
+ *   - `perflocale:switcher:close`    (after close, not cancelable). Also fires
+ *     when the trigger of an open dropdown stops being displayed (a responsive
+ *     header hides it, or it is removed); the script moves no focus then. A
+ *     listener that wants to move focus reads, at dispatch time,
+ *     `! e.detail.trigger.getClientRects().length` (the trigger is hidden) and
+ *     `e.detail.nav.contains( document.activeElement )` (focus is inside).
  *   - `perflocale:switcher:navigate` (before option-click navigation, cancelable)
+ *
+ * The server renders the language links without a tabindex, so with scripting
+ * off (the `scripting: none` block in frontend.css shows them as a plain list)
+ * each link is a Tab stop. Set-up takes them out of the Tab order: with the
+ * script the list is a listbox driven by the arrow keys.
  */
 ( function () {
 	'use strict';
@@ -64,7 +74,16 @@
 	}
 
 	function startLivePositioning( nav, btn, panel ) {
-		var reposition = function () { positionPanel( btn, panel ); };
+		var reposition = function () {
+			// No layout box: display:none on the trigger or an ancestor, or
+			// the trigger was removed. The ResizeObserver reports exactly this
+			// (a 0x0 size); scroll and resize cover browsers without it.
+			if ( ! btn.getClientRects().length ) {
+				closeHidden( nav, btn, panel );
+				return;
+			}
+			positionPanel( btn, panel );
+		};
 
 		window.addEventListener( 'scroll',  reposition, { capture: true, passive: true } );
 		window.addEventListener( 'resize',  reposition );
@@ -81,6 +100,29 @@
 			window.removeEventListener( 'resize', reposition );
 			if ( ro ) { ro.disconnect(); }
 		} );
+	}
+
+	// An open dropdown whose trigger lost its layout box closes through the
+	// normal close path (aria-expanded, open class, handlers, close event).
+	// Focus is left where it is: the trigger has no box to take it, and which
+	// visible control stands in for this switcher is the theme's knowledge.
+	function closeHidden( nav, btn, panel ) {
+		if ( panel.classList.contains( OPEN_CLASS ) ) {
+			close( nav, btn, panel, false );
+		}
+	}
+
+	// Language links stay out of the Tab order while the script manages
+	// focus. A tabindex set through the perflocale/switcher/link_attrs filter
+	// is kept.
+	function removeOptionsFromTabOrder( panel ) {
+		var options = panel.querySelectorAll( '[role=option]' );
+
+		for ( var i = 0; i < options.length; i++ ) {
+			if ( ! options[ i ].hasAttribute( 'tabindex' ) ) {
+				options[ i ].setAttribute( 'tabindex', '-1' );
+			}
+		}
 	}
 
 	function stopLivePositioning( nav ) {
@@ -128,6 +170,7 @@
 	}
 
 	function open( nav, btn, panel, focusFirstOption ) {
+		removeOptionsFromTabOrder( panel );
 		closeAllExcept( nav );
 		panel.classList.add( OPEN_CLASS );
 		btn.setAttribute( 'aria-expanded', 'true' );
@@ -167,6 +210,7 @@
 		}
 
 		setupRegistry.set( nav, true );
+		removeOptionsFromTabOrder( panel );
 
 		panel.addEventListener( 'click', function ( e ) {
 			var option = e.target.closest( '.perflocale-dd__option' );

@@ -2367,7 +2367,7 @@ final class Bootstrap {
 				$early_optout = Helper::is_write_context();
 
 				foreach ( $plugin->get( 'settings' )->get_translatable_post_types() as $post_type ) {
-					register_post_meta( $post_type, Translation\ContentSync::SYNC_OPTOUT_META, $flag_args );
+					register_post_meta( $post_type, Translation\SyncMeta::SYNC_OPTOUT_META, $flag_args );
 					register_post_meta( $post_type, Helper::SEO_EXCLUDE_META, $flag_args );
 
 					if ( $early_optout && is_string( $post_type ) ) {
@@ -4777,7 +4777,7 @@ final class Bootstrap {
 		}
 
 		$meta = $request->get_param( 'meta' );
-		$key  = Translation\ContentSync::SYNC_OPTOUT_META;
+		$key  = Translation\SyncMeta::SYNC_OPTOUT_META;
 
 		if ( ! is_array( $meta ) || ! array_key_exists( $key, $meta ) ) {
 			return $prepared_post;

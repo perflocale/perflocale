@@ -295,7 +295,7 @@ final class MetaBox {
 		// Advanced-tab checkbox owns the same meta key there, and rendering
 		// both would double the control on one screen.
 		if ( ! in_array( $post->post_type, [ 'product', 'product_variation' ], true ) ) {
-			$optout = get_post_meta( $post->ID, \PerfLocale\Translation\ContentSync::SYNC_OPTOUT_META, true ) === 'yes';
+			$optout = get_post_meta( $post->ID, \PerfLocale\Translation\SyncMeta::SYNC_OPTOUT_META, true ) === 'yes';
 
 			echo '<div class="perflocale-mb-footer">';
 			echo '<label style="display:flex;gap:6px;align-items:flex-start;">';
@@ -368,9 +368,9 @@ final class MetaBox {
 		// submitted (marker present), so REST/CLI saves never clear the flag.
 		if ( isset( $_POST['perflocale_sync_optout_present'] ) ) {
 			if ( isset( $_POST['perflocale_sync_optout'] ) ) {
-				update_post_meta( $post_id, \PerfLocale\Translation\ContentSync::SYNC_OPTOUT_META, 'yes' );
+				update_post_meta( $post_id, \PerfLocale\Translation\SyncMeta::SYNC_OPTOUT_META, 'yes' );
 			} else {
-				delete_post_meta( $post_id, \PerfLocale\Translation\ContentSync::SYNC_OPTOUT_META );
+				delete_post_meta( $post_id, \PerfLocale\Translation\SyncMeta::SYNC_OPTOUT_META );
 			}
 		}
 

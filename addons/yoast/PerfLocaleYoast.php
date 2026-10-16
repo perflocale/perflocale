@@ -152,7 +152,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 		// A field a person empties stays empty: its clear is recorded in the
 		// post's seed-cleared marker, which machine translation and the seed
 		// honour.
-		\PerfLocale\Translation\ContentSync::track_seed_clears( $this->add_meta_keys( [], '' ) );
+		\PerfLocale\Translation\SyncMeta::track_seed_clears( $this->add_meta_keys( [], '' ) );
 
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so Yoast's own og:locale already reflects the current language.

@@ -43,11 +43,11 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	private int $store_api_cart_depth = 0;
 
 	/**
-	 * The Inventory Sync service, or null when the sync is off.
+	 * Whether boot() attached Inventory Sync's hooks (InventorySyncHooks::register()).
 	 *
-	 * @var \PerfLocale\WooCommerce\InventorySync|null
+	 * @var bool
 	 */
-	private ?\PerfLocale\WooCommerce\InventorySync $inventory_sync = null;
+	private bool $inventory_sync_registered = false;
 
 	/**
 	 * Current-language sibling data of each cart line, for the open Store API
@@ -300,9 +300,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 		// Inventory sync - keep stock, SKU, price, weight in sync across variants.
 		if ( (bool) $settings->get( 'wc_sync_stock', true ) ) {
-			$sync = new \PerfLocale\WooCommerce\InventorySync( $plugin->get( 'cache' ) );
-			$sync->register_hooks();
-			$this->inventory_sync = $sync;
+			\PerfLocale\WooCommerce\InventorySyncHooks::register( $plugin->get( 'cache' ) );
+			$this->inventory_sync_registered = true;
 
 			// Per-product opt-out checkbox (product data → Advanced): lets a
 			// merchant give ONE language's product independent prices/stock
@@ -2636,7 +2635,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * as WooCommerce would. The window closes in `finally`, so a handler or a
 	 * later filter that throws cannot leave the mappers attached for the rest
 	 * of the page. Inventory Sync's frame for the request (see
-	 * InventorySync::enter_store_api_request()) closes in the same `finally`.
+	 * InventorySyncHooks::enter_store_api_request()) closes in the same
+	 * `finally`; with Inventory Sync off, neither is touched.
 	 *
 	 * @param mixed $result  Result so far; anything but null is passed through.
 	 * @param mixed $request Request built for the hydrated path.
@@ -2654,13 +2654,15 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		$this->open_store_api_cart_window( null, $handler, $request );
 
 		try {
-			if ( null !== $this->inventory_sync ) {
-				$this->inventory_sync->enter_store_api_request( $request, \PerfLocale\WooCommerce\InventorySync::is_display_cart_read( $request ) );
+			if ( $this->inventory_sync_registered ) {
+				\PerfLocale\WooCommerce\InventorySyncHooks::enter_store_api_request( $request, \PerfLocale\WooCommerce\InventorySyncHooks::is_display_cart_read( $request ) );
 			}
 
 			return call_user_func( $handler['callback'], $request );
 		} finally {
-			$this->inventory_sync?->leave_store_api_request( $request );
+			if ( $this->inventory_sync_registered ) {
+				\PerfLocale\WooCommerce\InventorySyncHooks::leave_store_api_request( $request );
+			}
 			$this->close_store_api_cart_window( null, $handler, $request );
 		}
 	}

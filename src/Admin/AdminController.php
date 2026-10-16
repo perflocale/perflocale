@@ -288,6 +288,10 @@ final class AdminController {
 			'settings-updated' => $settings_saved ? 'true' : 'false',
 		];
 
+		if ( [] !== \PerfLocale\Settings::last_update_refused_addresses() ) {
+			$redirect_args['mt-address-refused'] = '1';
+		}
+
 		if ( in_array( $tab, $addon_subtabs, true ) ) {
 			$redirect_args['tab']    = 'addons';
 			$redirect_args['subtab'] = $tab;

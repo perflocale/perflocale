@@ -109,12 +109,27 @@ final class ConditionalContent {
 	 * @return void
 	 */
 	public function register_block(): void {
-		register_block_type(
-			PERFLOCALE_DIR . 'blocks/if-language',
-			[
-				'render_callback' => [ $this, 'render_block' ],
-			]
-		);
+		// Only the call that adds the metadata filter removes it, in finally
+		// (see LanguageSwitcherBlock::register_block()).
+		$strip = ! \PerfLocale\Helper::shows_registration_labels()
+			&& false === has_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
+
+		if ( $strip ) {
+			add_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
+		}
+
+		try {
+			register_block_type(
+				PERFLOCALE_DIR . 'blocks/if-language',
+				[
+					'render_callback' => [ $this, 'render_block' ],
+				]
+			);
+		} finally {
+			if ( $strip ) {
+				remove_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
+			}
+		}
 	}
 
 	/**

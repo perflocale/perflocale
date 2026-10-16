@@ -799,7 +799,7 @@ final class CacheManager {
 		if ( function_exists( 'wp_autoload_values_to_autoload' ) ) {
 			$autoload_on = [ 'yes', 'on', 'auto-on', 'auto' ];
 			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- core's filter, applied as wp_autoload_values_to_autoload() applies it.
-			$autoload_on = array_intersect( (array) apply_filters( 'wp_autoload_values_to_autoload', $autoload_on ), $autoload_on );
+			$autoload_on = array_intersect( array_filter( (array) apply_filters( 'wp_autoload_values_to_autoload', $autoload_on ), 'is_string' ), $autoload_on );
 		}
 
 		// delete_option() adds a deleted name to notoptions from WordPress 6.7,

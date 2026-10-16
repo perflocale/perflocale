@@ -25,7 +25,18 @@ if ( ! defined( 'ABSPATH' ) ) {
  * `lang_dir_for_domain` filter (WordPress 6.6+). This class answers only a
  * false for its domain and one of its locales, with its own folder. So an
  * installed language pack is loaded instead of the bundled file, as a whole,
- * and a locale without a bundled file stays in English.
+ * and a locale without a bundled file stays in English, unless FALLBACKS
+ * names a bundled locale of the same language for it.
+ *
+ * For such a variant (nl_BE, de_CH, fr_CA, es_MX, ...) with no language pack
+ * of its own, WordPress answers false, or the plugin's folder where it knows
+ * that folder (6.8+, see below) and found no file of the variant there. The
+ * class then answers its folder and, through `load_textdomain_mofile`,
+ * hands WordPress the bundled catalog of the base locale in place of the
+ * variant's file name. That second filter is hooked only when a variant was
+ * answered, so a request in a bundled locale or in English runs no callback
+ * of it. A language pack for the variant itself is found by WordPress in
+ * WP_LANG_DIR/plugins first and is kept.
  *
  * WordPress 6.8+ already knows the folder of a plugin activated on the site
  * (its Domain Path header), so there `lang_dir_for_domain` receives that
@@ -45,9 +56,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * plugin, Windows paths). Any other folder, or a list another callback
  * already returned, is passed through unchanged.
  *
- * Neither filter reads anything: the folder of a listed locale is returned
- * as it is, the file names come from LOCALES, and WordPress opens a file
- * only when a string of the domain is translated in that locale.
+ * No filter reads anything: the folder of a listed locale is returned as it
+ * is, the file names come from LOCALES and FALLBACKS, and WordPress opens a
+ * file only when a string of the domain is translated in that locale.
  *
  * @internal Not part of the public API.
  */
@@ -59,7 +70,29 @@ final class BundledTranslations {
 	 *
 	 * @var list<string>
 	 */
-	public const LOCALES = [ 'ar', 'bg_BG', 'de_DE', 'es_ES', 'fi', 'fr_FR', 'hi_IN', 'it_IT', 'ja', 'nl_NL', 'pt_BR', 'ru_RU', 'sv_SE' ];
+	public const LOCALES = [ 'ar', 'bg_BG', 'cs_CZ', 'de_DE', 'es_ES', 'fa_IR', 'fi', 'fr_FR', 'hi_IN', 'id_ID', 'it_IT', 'ja', 'ko_KR', 'nl_NL', 'pl_PL', 'pt_BR', 'pt_PT', 'ru_RU', 'sv_SE', 'tr_TR', 'uk', 'vi', 'zh_CN', 'zh_TW' ];
+
+	/**
+	 * Bundled locale used for a locale with no catalog and no language pack
+	 * of its own. A key that ends in `_` stands for every locale of that
+	 * language. Portuguese has no such key: pt_PT_ao90 and pt_AO read the
+	 * European Portuguese catalog (pt_PT), and no locale reads pt_BR's in
+	 * place of its own.
+	 *
+	 * @var array<string, string>
+	 */
+	public const FALLBACKS = [
+		'nl_BE'          => 'nl_NL',
+		'nl_NL_formal'   => 'nl_NL',
+		'de_DE_formal'   => 'de_DE',
+		'de_AT'          => 'de_DE',
+		'de_CH'          => 'de_DE',
+		'de_CH_informal' => 'de_DE',
+		'fr_'            => 'fr_FR',
+		'es_'            => 'es_ES',
+		'pt_PT_ao90'     => 'pt_PT',
+		'pt_AO'          => 'pt_PT',
+	];
 
 	/**
 	 * Text domain of the catalogs.
@@ -90,18 +123,36 @@ final class BundledTranslations {
 	private array $locales;
 
 	/**
+	 * Base locale for a locale with no catalog in the folder, by locale or
+	 * by language prefix (a key that ends in `_`).
+	 *
+	 * @var array<string, string>
+	 */
+	private array $fallbacks;
+
+	/**
+	 * Catalog to load in place of a variant's file name, by the .mo path
+	 * WordPress builds from the folder this class answered.
+	 *
+	 * @var array<string, string>
+	 */
+	private array $mofiles = [];
+
+	/**
 	 * Constructor.
 	 *
-	 * @param string   $domain  Text domain of the catalogs.
-	 * @param string   $dir     Folder of the catalogs.
-	 * @param string[] $locales Locales with a catalog in the folder.
-	 * @param string[] $aliases Other spellings of the same folder.
+	 * @param string                $domain    Text domain of the catalogs.
+	 * @param string                $dir       Folder of the catalogs.
+	 * @param string[]              $locales   Locales with a catalog in the folder.
+	 * @param string[]              $aliases   Other spellings of the same folder.
+	 * @param array<string, string> $fallbacks Base locale by locale or language prefix (see FALLBACKS).
 	 */
-	public function __construct( string $domain, string $dir, array $locales, array $aliases = [] ) {
-		$this->domain  = $domain;
-		$this->dir     = rtrim( $dir, '/' ) . '/';
-		$this->locales = array_fill_keys( $locales, true );
-		$this->dirs    = [ $this->dir => true ];
+	public function __construct( string $domain, string $dir, array $locales, array $aliases = [], array $fallbacks = [] ) {
+		$this->domain    = $domain;
+		$this->dir       = rtrim( $dir, '/' ) . '/';
+		$this->locales   = array_fill_keys( $locales, true );
+		$this->dirs      = [ $this->dir => true ];
+		$this->fallbacks = $fallbacks;
 
 		foreach ( $aliases as $alias ) {
 			if ( '' !== $alias ) {
@@ -134,7 +185,7 @@ final class BundledTranslations {
 			$aliases[] = WP_PLUGIN_DIR . '/' . dirname( plugin_basename( $plugin_file ) ) . '/languages';
 		}
 
-		( new self( 'perflocale', $plugin_dir . 'languages', self::LOCALES, $aliases ) )->register();
+		( new self( 'perflocale', $plugin_dir . 'languages', self::LOCALES, $aliases, self::FALLBACKS ) )->register();
 	}
 
 	/**
@@ -185,7 +236,15 @@ final class BundledTranslations {
 
 	/**
 	 * The catalog folder when WordPress found no folder for the domain and a
-	 * listed locale; otherwise the path unchanged.
+	 * listed locale; otherwise the path unchanged, except for a variant.
+	 *
+	 * A variant is a locale with no catalog in the folder whose base locale
+	 * (FALLBACKS) has one. When WordPress found nothing for it, or found only
+	 * the catalog folder in one of its spellings (WordPress 6.8+ answers the
+	 * Domain Path folder for any locale it has no file for), the catalog
+	 * folder is returned and the base catalog is queued for
+	 * filter_mofile(). A folder WordPress found elsewhere (a language pack
+	 * of the variant) is kept.
 	 *
 	 * @param mixed $path   Folder WordPress found for the domain and locale, or false.
 	 * @param mixed $domain Text domain.
@@ -193,10 +252,65 @@ final class BundledTranslations {
 	 * @return mixed
 	 */
 	public function filter_lang_dir( mixed $path, mixed $domain, mixed $locale ): mixed {
-		if ( false !== $path || $domain !== $this->domain || ! is_string( $locale ) || ! isset( $this->locales[ $locale ] ) ) {
+		if ( $domain !== $this->domain || ! is_string( $locale ) ) {
 			return $path;
 		}
 
+		if ( isset( $this->locales[ $locale ] ) ) {
+			return false === $path ? $this->dir : $path;
+		}
+
+		$base = $this->base_locale( $locale );
+
+		if ( null === $base || ( false !== $path && ( ! is_string( $path ) || ! isset( $this->dirs[ rtrim( $path, '/' ) . '/' ] ) ) ) ) {
+			return $path;
+		}
+
+		if ( [] === $this->mofiles ) {
+			add_filter( 'load_textdomain_mofile', [ $this, 'filter_mofile' ], 10, 2 );
+		}
+
+		$this->mofiles[ $this->dir . $this->domain . '-' . $locale . '.mo' ] = $this->dir . $this->domain . '-' . $base . '.mo';
+
 		return $this->dir;
+	}
+
+	/**
+	 * The base locale's catalog in place of the file name WordPress built
+	 * for a variant in the catalog folder (see filter_lang_dir()). WordPress
+	 * derives the .l10n.php name from this path. Any other file: unchanged.
+	 *
+	 * @param mixed $mofile Path of the .mo file WordPress is about to load.
+	 * @param mixed $domain Text domain.
+	 * @return mixed
+	 */
+	public function filter_mofile( mixed $mofile, mixed $domain ): mixed {
+		if ( $domain !== $this->domain || ! is_string( $mofile ) ) {
+			return $mofile;
+		}
+
+		return $this->mofiles[ $mofile ] ?? $mofile;
+	}
+
+	/**
+	 * The bundled locale FALLBACKS names for a locale, or null.
+	 *
+	 * @param string $locale Locale with no catalog in the folder.
+	 * @return string|null
+	 */
+	private function base_locale( string $locale ): ?string {
+		$base = $this->fallbacks[ $locale ] ?? null;
+
+		if ( null === $base ) {
+			$cut = strpos( $locale, '_' );
+
+			if ( false === $cut ) {
+				return null;
+			}
+
+			$base = $this->fallbacks[ substr( $locale, 0, $cut + 1 ) ] ?? null;
+		}
+
+		return null !== $base && isset( $this->locales[ $base ] ) ? $base : null;
 	}
 }

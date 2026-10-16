@@ -1116,6 +1116,45 @@ final class Helper {
 	}
 
 	/**
+	 * Whether this request can show the labels PerfLocale registers at init (a
+	 * block's title, description and keywords; the widget's name and
+	 * description): an admin screen, a REST request (the editors read block
+	 * types and widget types through REST) or WP-CLI. Elsewhere PerfLocale
+	 * registers its blocks without their text domain
+	 * (block_metadata_without_textdomain()) and, unless a sidebar holds it,
+	 * its widget with untranslated labels, so a page view does not load the
+	 * plugin's catalog for labels nobody sees.
+	 *
+	 * @return bool
+	 */
+	public static function shows_registration_labels(): bool {
+		return is_admin() || self::is_rest_request() || ( defined( 'WP_CLI' ) && WP_CLI );
+	}
+
+	/**
+	 * `block_type_metadata` callback for PerfLocale's own block registrations
+	 * on requests that do not show block labels (shows_registration_labels()):
+	 * the metadata of perflocale/language-switcher and perflocale/if-language
+	 * in the perflocale text domain without `textdomain`, the only key core
+	 * reads to translate the labels and to attach translations to the editor
+	 * script. Every other block's metadata, including a block another plugin
+	 * registers from a metadata hook while PerfLocale's block registers, is
+	 * returned unchanged.
+	 *
+	 * @param array<string, mixed> $metadata Block metadata from block.json.
+	 * @return array<string, mixed>
+	 */
+	public static function block_metadata_without_textdomain( array $metadata ): array {
+		if ( isset( $metadata['name'], $metadata['textdomain'] )
+			&& 'perflocale' === $metadata['textdomain']
+			&& in_array( $metadata['name'], [ 'perflocale/language-switcher', 'perflocale/if-language' ], true ) ) {
+			unset( $metadata['textdomain'] );
+		}
+
+		return $metadata;
+	}
+
+	/**
 	 * Whether the current request is a REST API request - usable at BOOT time.
 	 *
 	 * The `REST_REQUEST` constant is only defined on `parse_request` (deep
@@ -1135,9 +1174,10 @@ final class Helper {
 			return true;
 		}
 
-		// The `?rest_route=` form works on any permalink structure and is set
-		// before parse_request, so it's the most reliable early signal.
-		if ( ! empty( $_GET['rest_route'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		// The `rest_route` query variable works on any permalink structure and
+		// is set before parse_request, so it's the most reliable early signal.
+		// Core reads it from the query string or the POST body.
+		if ( ! empty( $_GET['rest_route'] ) || ! empty( $_POST['rest_route'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.NonceVerification.Missing
 			return true;
 		}
 
@@ -1161,7 +1201,12 @@ final class Helper {
 			return false;
 		}
 
-		return (bool) preg_match( '#(^|/)' . preg_quote( $prefix, '#' ) . '(/|$)#', $path );
+		// Core matches the rewrite rules against the path as sent and, failing
+		// that, against urldecode() of it, so a percent-encoded prefix
+		// (/%77p-json/...) is a REST request too.
+		$pattern = '#(^|/)' . preg_quote( $prefix, '#' ) . '(/|$)#';
+
+		return (bool) preg_match( $pattern, $path ) || (bool) preg_match( $pattern, urldecode( $path ) );
 	}
 
 	/**

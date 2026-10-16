@@ -633,7 +633,25 @@ final class Settings {
 	 */
 	private static bool $last_update_was_noop = false;
 
+	/**
+	 * Set by {@see update()}; read by {@see last_update_refused_addresses()}.
+	 *
+	 * @var array<int, string>
+	 */
+	private static array $last_update_refused = [];
+
+	/**
+	 * Machine-translation provider address setting => the key setting sent to
+	 * that address.
+	 */
+	private const MT_KEY_FOR_URL = [
+		'mt_libre_url'  => 'mt_libre_api_key',
+		'mt_agency_url' => 'mt_agency_api_key',
+	];
+
 	public function update( array $values ): bool {
+		self::$last_update_refused = [];
+
 		$sanitized = $this->sanitize( $values );
 
 		// Lock the read-modify-write so two concurrent saves (admin + admin, or
@@ -665,8 +683,11 @@ final class Settings {
 				wp_cache_delete( self::OPTION_KEY, 'options' );
 				wp_cache_delete( 'alloptions', 'options' );
 
-				$current = $this->load();
-				$merged  = array_merge( $current, $sanitized );
+				$current                 = $this->load();
+				[ $sanitized, $refused ] = $this->apply_provider_address_rules( $current, $sanitized );
+				$merged                  = array_merge( $current, $sanitized );
+
+				self::$last_update_refused = $refused;
 
 				// autoload='yes' - the ~4 KB blob is read on nearly every request
 				// (frontend language routing, hreflang, URL rewriting) so paying for
@@ -721,6 +742,61 @@ final class Settings {
 		do_action( 'perflocale/settings/updated', $result['merged'], $result['current'] );
 
 		return (bool) $result['ok'];
+	}
+
+	/**
+	 * The provider address settings (mt_libre_url, mt_agency_url) whose change
+	 * the most recent {@see update()} refused: on a multisite network, the
+	 * address of a provider whose key is supplied by wp-config.php, the
+	 * environment or the Connectors API, changed by a user who is not a super
+	 * admin ({@see apply_provider_address_rules()}).
+	 *
+	 * @return array<int, string>
+	 */
+	public static function last_update_refused_addresses(): array {
+		return self::$last_update_refused;
+	}
+
+	/**
+	 * A machine-translation key goes only to the provider address it was
+	 * entered for. Every writer goes through here (the settings form, the
+	 * settings import, WP-CLI). For each provider address the update changes
+	 * (an address supplied from outside the database never reaches here:
+	 * sanitize() drops it):
+	 * - a key stored in the database is cleared unless the same update
+	 *   carries a non-empty key;
+	 * - a key supplied by wp-config.php, the environment or the Connectors
+	 *   API is the network's on a multisite network: only a super admin or
+	 *   WP-CLI may change the address it is sent to, and anyone else's change
+	 *   is dropped (the stored address stays). Its stored copy is left alone.
+	 *
+	 * @param array<string, mixed> $current   Stored settings, read inside the update's lock.
+	 * @param array<string, mixed> $sanitized The update's sanitized values.
+	 * @return array{0: array<string, mixed>, 1: array<int, string>} The values to merge, and the refused address settings.
+	 */
+	private function apply_provider_address_rules( array $current, array $sanitized ): array {
+		$refused = [];
+
+		foreach ( self::MT_KEY_FOR_URL as $url_key => $secret_key ) {
+			if ( ! array_key_exists( $url_key, $sanitized ) || $sanitized[ $url_key ] === ( $current[ $url_key ] ?? '' ) ) {
+				continue;
+			}
+
+			if ( $this->is_overridden( $secret_key ) ) {
+				if ( is_multisite() && ! ( defined( 'WP_CLI' ) && WP_CLI ) && ! is_super_admin() ) {
+					unset( $sanitized[ $url_key ] );
+					$refused[] = $url_key;
+				}
+
+				continue;
+			}
+
+			if ( '' === ( $sanitized[ $secret_key ] ?? '' ) ) {
+				$sanitized[ $secret_key ] = '';
+			}
+		}
+
+		return [ $sanitized, $refused ];
 	}
 
 	/**
