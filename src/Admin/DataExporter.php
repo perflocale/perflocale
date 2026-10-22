@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin;
 
+use PerfLocale\Database\DataRegistry;
 use PerfLocale\Database\Schema;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -56,6 +57,7 @@ final class DataExporter {
 		'disabled_addons',
 		'roles',
 		'data',
+		'addon_groups',
 	];
 
 	/**
@@ -75,104 +77,168 @@ final class DataExporter {
 	public const CREDENTIAL_KEY_PATTERN = '/_api_?key|_secret|_password|_credentials?|_encrypted|_token(?:_|$)|_auth(?:_|$)|_key$/i';
 
 	/**
-	 * Available export sections with labels and associated tables.
-	 *
-	 * The optional `type_scope` key narrows a table the section SHARES with
-	 * another section down to the slice it owns: table => the value of that
-	 * table's polymorphic `type` column. Only id-keyed tables can be
-	 * scoped (every shared table has an `id` primary key). A table claimed
-	 * WITHOUT a scope by any selected section is always exported whole - the
-	 * widest claim wins - so a full bundle is byte-for-byte what it was
-	 * before scoping existed.
+	 * A URL query parameter name that carries a credential: a whole name,
+	 * optionally after a prefix ending in `_` or `-` (`api_key`, `x-api-key`,
+	 * `access_token`, `client_secret`, `sig`, `code`). A camelCase name is
+	 * matched in its snake_case form (`accessToken` as `access_Token`).
 	 */
-	public const SECTIONS = [
-		'settings'     => [
-			'label'  => 'Settings',
-			'tables' => [],
-		],
-		'roles'        => [
-			'label'  => 'Roles & Capabilities',
-			'tables' => [],
-		],
-		'languages'    => [
-			'label'  => 'Languages',
-			'tables' => [ 'languages' ],
-		],
-		'translations' => [
-			'label'  => 'Translation Links',
-			'tables' => [ 'translation_groups', 'translation_links' ],
-		],
-		'strings'      => [
-			'label'      => 'String Translations',
-			// `strings` holds the source rows; `string_translations` holds the
-			// actual per-language translated values (string_id, language_id,
-			// translation). Exporting only `strings` would drop every
-			// translation on import - the most painful possible silent data
-			// loss for a multilingual plugin. Both must travel together.
-			//
-			// `translation_groups` travels with them because a
-			// `strings.group_id` is a reference INTO that table, and without
-			// the parent rows a strings-only bundle restores strings whose
-			// group_id names a group id from the SOURCE site: dangling on a
-			// fresh target, and - since the id-space is shared with post and
-			// term groups - silently adopted by an unrelated post group when
-			// the ids happen to overlap.
-			//
-			// Not every `strings.group_id` resolves, though, and this section
-			// does not assume it does. A scanner-created string keeps the
-			// group id it was stamped with even after sweep_orphan_groups()
-			// reclaims that group for owning no string, so on a site that has
-			// run a string scan the DANGLING ids are typically the large
-			// majority - a group id that resolves is the exception, not the
-			// rule. Those rows export and import with their dangling id
-			// intact and carrying the groups changes nothing for them. What
-			// the parent rows buy is the minority that DO still resolve:
-			// those keep their real group instead of landing on whatever the
-			// target happens to store under that id. Either way, a string
-			// that actually carries translations is re-grouped on arrival by
-			// repair_orphaned_translations().
-			'tables'     => [ 'translation_groups', 'strings', 'string_translations' ],
-			// `translation_groups` is POLYMORPHIC (post, term and string rows
-			// share one table and one id-space) and it is also the
-			// `translations` section's table, so a strings-only bundle may
-			// only carry the type='string' slice it owns. Exporting the whole
-			// table here would make "replace my strings" wipe and overwrite
-			// every post and term group on the target site. When both sections
-			// are selected the unscoped claim from `translations` wins and the
-			// table exports whole.
-			//
-			// The per-language `translation_links` rows are deliberately NOT
-			// carried. WHICH string in WHICH language a link stands for is fully
-			// derivable from (strings, string_translations), and
-			// TranslationFileGenerator::repair_orphaned_translations() - which
-			// DataImporter runs after every merge import and after any replace
-			// import that landed strings - re-creates one link per
-			// (group, language) pair that has a translation row but no link.
-			// Only pairs whose string sits in a live type='string' group are
-			// re-linked; a string whose group_id dangles is first given a
-			// fresh group by the same pass, and only when it has at least one
-			// translation to justify the group.
-			//
-			// What a link ALSO holds and nothing can derive is its own `status`
-			// and `source`, so a rebuilt link comes back 'published'/'manual':
-			// on a CROSS-site restore a string the source site had flagged
-			// `needs_update` (StringRepository's list filter reads that column)
-			// arrives unflagged. That is the accepted v1 trade. A same-site
-			// restore keeps its real statuses because the wipe is scoped to
-			// `translation_groups` and never touches the links at all; carrying
-			// them would instead mean scoping a SECOND wipe at the shared links
-			// table, for rows the repair can already rebuild.
-			'type_scope' => [ 'translation_groups' => 'string' ],
-		],
-		'slugs'        => [
-			'label'  => 'Slug Translations',
-			'tables' => [ 'slug_translations' ],
-		],
-		'hashes'       => [
-			'label'  => 'Content Hashes',
-			'tables' => [ 'content_hashes' ],
-		],
-	];
+	private const CREDENTIAL_QUERY_PATTERN = '/^(?:[a-z0-9]+[_-])*(?:api[_-]?key|apikey|key|token|auth|authorization|secret|password|passwd|pass|pwd|sig|signature|code|credentials?)$/i';
+
+	/**
+	 * Export sections with their labels and tables, from the data registry
+	 * (DataRegistry::sections(), in the order of the export screen).
+	 *
+	 * The optional `type_scope` narrows a table a section SHARES with another
+	 * section down to the slice it owns: table => the value of that table's
+	 * polymorphic `type` column. A table claimed WITHOUT a scope by any
+	 * selected section is exported whole - the widest claim wins. String
+	 * Translations carries the type='string' slice of `translation_groups`
+	 * (its strings' groups) next to `strings` and `string_translations`, and
+	 * not the string links, which TranslationFileGenerator::repair_orphaned_translations()
+	 * rebuilds on import. Media, Menus, Item flags and Add-on data hold no
+	 * table: their options and meta travel as row lists (ExportItems).
+	 *
+	 * @return array<string, array{label: string, tables: list<string>, type_scope?: array<string, string>}>
+	 */
+	public static function sections(): array {
+		return DataRegistry::sections();
+	}
+
+	/**
+	 * Tables whose rows name a post or term by `object_id`, and the column
+	 * that says which (`post`, `term`; a `string` row has no fingerprint):
+	 * the registry's `object_ref:<type column>` columns.
+	 *
+	 * @return array<string, string> Table => type column.
+	 */
+	public static function fingerprint_columns(): array {
+		$out = [];
+
+		foreach ( DataRegistry::import_tables() as $table ) {
+			foreach ( DataRegistry::table_columns( $table ) as $class ) {
+				if ( 0 === strpos( $class, 'object_ref:' ) ) {
+					$out[ $table ] = substr( $class, strlen( 'object_ref:' ) );
+				}
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The options or meta of one kind that a set of sections carries as row
+	 * lists, from the registry: [ kind, name (with {lang} or {id}), the
+	 * object it sits on or null, the merge rule, the import sanitizer an
+	 * add-on's entry declares or null, the name's regular expression ].
+	 * Entries that travel under their own
+	 * envelope key (settings, roles) are not among them.
+	 *
+	 * @param string             $kind     `option`, `post_meta`, `term_meta` or `order_meta`.
+	 * @param array<int, string> $sections Section keys.
+	 * @return array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5: string}>
+	 */
+	public static function row_list_items( string $kind, array $sections ): array {
+		$out = [];
+
+		foreach ( $sections as $section ) {
+			foreach ( DataRegistry::section_entries( (string) $section, $kind ) as $id => $entry ) {
+				if ( isset( DataRegistry::ENVELOPE_KEYS[ $id ] ) ) {
+					continue;
+				}
+
+				$out[] = self::item( $kind, (string) $id, $entry );
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The options or meta of one kind that one add-on part carries, in the
+	 * shape of {@see self::row_list_items()}.
+	 *
+	 * @param string $kind `option`, `post_meta`, `term_meta` or `order_meta`.
+	 * @param string $part Part key (DataRegistry::addon_parts()).
+	 * @return array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5: string}>
+	 */
+	public static function part_items( string $kind, string $part ): array {
+		$out = [];
+
+		foreach ( DataRegistry::addon_parts()[ $part ]['entries'] ?? [] as $id => $entry ) {
+			if ( $kind === $entry['kind'] ) {
+				$out[] = self::item( $kind, (string) $id, $entry );
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * One registry entry as a row list item.
+	 *
+	 * @param string               $kind  Entry kind.
+	 * @param string               $id    Entry id.
+	 * @param array<string, mixed> $entry Entry.
+	 * @return array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5: string}
+	 */
+	private static function item( string $kind, string $id, array $entry ): array {
+		$import = is_array( $entry['import'] ?? null ) ? $entry['import'] : [];
+		$name   = Typed::str( $entry['name'] ?? '' );
+
+		return [ $kind, $name, isset( $import['object'] ) ? Typed::str( $import['object'] ) : null, isset( $import['merge'] ) ? Typed::str( $import['merge'] ) : null, DataRegistry::import_sanitizer( $id ), DataRegistry::to_regex( $name ) ];
+	}
+
+	/**
+	 * The add-on data that has its own checkbox on the export and import
+	 * screens: group part (`<owner>/<group id>`) => label.
+	 *
+	 * @return array<string, string>
+	 */
+	public static function addon_groups(): array {
+		return DataRegistry::addon_groups();
+	}
+
+	/**
+	 * Whether a value has the shape of an add-on data choice: `addon_data`
+	 * (the shared checkbox) or a group part (`<owner>/<group id>`).
+	 *
+	 * @param string $choice Value.
+	 * @return bool
+	 */
+	public static function is_addon_choice( string $choice ): bool {
+		if ( DataRegistry::ADDON_SECTION === $choice ) {
+			return true;
+		}
+
+		$parsed = DataRegistry::parse_part_member( DataRegistry::part_member( $choice, DataRegistry::ROW_LISTS['option'] ) );
+
+		return null !== $parsed && str_contains( $parsed[0], '/' );
+	}
+
+	/**
+	 * The add-on parts an export carries, in registry order: the parts
+	 * without a group when the sections include Add-on data, and the chosen
+	 * group parts.
+	 *
+	 * @param array<int, string>      $sections Section keys.
+	 * @param array<int, string>|null $groups   Group parts (DataRegistry::addon_groups() keys), or null for
+	 *                                          every group when the sections include Add-on data.
+	 * @return list<string>
+	 */
+	public static function export_parts( array $sections, ?array $groups ): array {
+		$shared = in_array( DataRegistry::ADDON_SECTION, $sections, true );
+		$out    = [];
+
+		foreach ( DataRegistry::addon_parts() as $part => $p ) {
+			$chosen = null === $p['group'] || null === $groups ? $shared : in_array( $part, $groups, true );
+
+			if ( $chosen ) {
+				$out[] = (string) $part;
+			}
+		}
+
+		return $out;
+	}
 
 	/**
 	 * Maximum nesting depth {@see self::redact_credentials()} walks before it
@@ -224,14 +290,17 @@ final class DataExporter {
 	 * should use {@see self::write_to_file()} instead - that path returns
 	 * without exiting so the caller can log, verify, and clean up.
 	 *
-	 * @param array<int, string> $sections Section keys to export. Empty = all.
+	 * @param array<int, string>      $sections Section keys to export. Empty, with no group either, = all.
+	 * @param array<int, string>|null $groups   Add-on group parts to export (DataRegistry::addon_groups()
+	 *                                          keys), or null for every group when the sections include
+	 *                                          Add-on data.
 	 * @return void Dies after sending the file.
 	 * @throws \Throwable Re-raised for any non-RuntimeException failure, so a
 	 *                    bug in our code or in a hooked third party is not
 	 *                    disguised as an aborted-export envelope.
 	 */
-	public function download( array $sections = [] ): void {
-		$sections = $this->normalize_sections( $sections );
+	public function download( array $sections = [], ?array $groups = null ): void {
+		[ $sections, $groups ] = $this->normalize_sections( $sections, $groups );
 		$filename = 'perflocale-export-' . gmdate( 'Y-m-d-His' ) . '.json';
 
 		header( 'Content-Type: application/json; charset=utf-8' );
@@ -246,7 +315,7 @@ final class DataExporter {
 		}
 
 		try {
-			$this->write_to( $out, $sections );
+			$this->write_to( $out, $sections, $groups );
 		} catch ( \Throwable $e ) {
 			// A table read failed mid-stream (see export_table()). Headers
 			// and part of the body are already sent, so there is no clean
@@ -314,13 +383,16 @@ final class DataExporter {
 	 * `export-network` commands) key on that return value.
 	 *
 	 * @param string             $path Destination file path.
-	 * @param array<int, string> $sections Section keys to export. Empty = all.
+	 * @param array<int, string>      $sections Section keys to export. Empty, with no group either, = all.
+	 * @param array<int, string>|null $groups   Add-on group parts to export (DataRegistry::addon_groups()
+	 *                                          keys), or null for every group when the sections include
+	 *                                          Add-on data.
 	 * @return int|false Bytes written, or false on failure.
 	 * @throws \Throwable Re-raised for any non-RuntimeException failure; also
 	 *                    random_bytes() if the CSPRNG is unavailable.
 	 */
-	public function write_to_file( string $path, array $sections = [] ) {
-		$sections = $this->normalize_sections( $sections );
+	public function write_to_file( string $path, array $sections = [], ?array $groups = null ) {
+		[ $sections, $groups ] = $this->normalize_sections( $sections, $groups );
 
 		// Sibling temp, same directory, so rename() below is a same-filesystem
 		// move and never a cross-device copy. Same shape as
@@ -346,7 +418,7 @@ final class DataExporter {
 		self::track_temp_file( $tmp );
 
 		try {
-			$this->write_to( $out, $sections );
+			$this->write_to( $out, $sections, $groups );
 		} catch ( \Throwable $e ) {
 			// export_table() throws on a failed read rather than closing a
 			// half-read table cleanly. Nothing was published, so the only
@@ -502,13 +574,19 @@ final class DataExporter {
 	}
 
 	/**
-	 * Ensure `$sections` is the full list when the caller passed an empty array.
+	 * Every section and every group when the caller chose neither a section
+	 * nor a group; otherwise what the caller chose.
 	 *
-	 * @param array<int, string> $sections Raw section keys.
-	 * @return array<int, string>
+	 * @param array<int, string>      $sections Raw section keys.
+	 * @param array<int, string>|null $groups   Group parts, or null.
+	 * @return array{0: array<int, string>, 1: array<int, string>|null}
 	 */
-	private function normalize_sections( array $sections ): array {
-		return empty( $sections ) ? array_keys( self::SECTIONS ) : $sections;
+	private function normalize_sections( array $sections, ?array $groups ): array {
+		if ( empty( $sections ) && empty( $groups ) ) {
+			return [ array_keys( self::sections() ), null ];
+		}
+
+		return [ $sections, null === $groups ? null : array_values( $groups ) ];
 	}
 
 	/**
@@ -524,9 +602,10 @@ final class DataExporter {
 	 * 1. It RECURSES, so a credential key is stripped however deep its addon
 	 *    nests it.
 	 * 2. It looks at VALUES, not only keys, for `scheme://user:pass@host`
-	 *    userinfo. `mt_libre_url` / `mt_agency_url` are ordinary URL settings
-	 *    matching no credential name, and `esc_url_raw()` keeps both the
-	 *    `:` and the `@`.
+	 *    userinfo and for a query parameter named like a credential
+	 *    ({@see self::CREDENTIAL_QUERY_PATTERN}). `mt_libre_url` /
+	 *    `mt_agency_url` are ordinary URL settings matching no credential
+	 *    name, and `esc_url_raw()` keeps the `:`, the `@` and the query.
 	 *
 	 * Both cases OMIT the key rather than rewriting the value, and that is
 	 * deliberate. `Settings::update()` merges (`array_merge( $current,
@@ -563,7 +642,7 @@ final class DataExporter {
 				continue;
 			}
 
-			if ( is_string( $value ) && self::has_url_userinfo( $value ) ) {
+			if ( is_string( $value ) && ( self::has_url_userinfo( $value ) || self::has_url_query_credential( $value ) ) ) {
 				unset( $settings[ $key ] );
 			}
 		}
@@ -600,6 +679,41 @@ final class DataExporter {
 
 		return ( isset( $parts['user'] ) && $parts['user'] !== '' )
 			|| ( isset( $parts['pass'] ) && $parts['pass'] !== '' );
+	}
+
+	/**
+	 * Does this value parse as a URL whose query names a credential?
+	 *
+	 * As strict as {@see self::has_url_userinfo()}: the WHOLE trimmed value
+	 * must parse as a URL, and a parameter name must match
+	 * {@see self::CREDENTIAL_QUERY_PATTERN}.
+	 *
+	 * @param string $value Raw setting value.
+	 * @return bool
+	 */
+	private static function has_url_query_credential( string $value ): bool {
+		$value = trim( $value );
+
+		if ( $value === '' || ! str_contains( $value, '?' ) || ! str_contains( $value, '://' ) ) {
+			return false;
+		}
+
+		$parts = wp_parse_url( $value );
+
+		if ( ! is_array( $parts ) || ! isset( $parts['scheme'], $parts['host'], $parts['query'] ) ) {
+			return false;
+		}
+
+		foreach ( explode( '&', (string) $parts['query'] ) as $pair ) {
+			$name = rawurldecode( (string) strstr( $pair . '=', '=', true ) );
+			$name = (string) preg_replace( '/(?<=[a-z0-9])(?=[A-Z])/', '_', $name );
+
+			if ( '' !== $name && 1 === preg_match( self::CREDENTIAL_QUERY_PATTERN, $name ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -682,9 +796,10 @@ final class DataExporter {
 	 * Captures:
 	 * - The Translator role's full capabilities map (in case an admin added
 	 *   custom caps via User Role Editor or similar).
-	 * - PerfLocale-prefixed caps granted to administrator + editor (lets
-	 *   us restore custom grants - e.g. an admin who gave Editors
-	 *   `perflocale_manage_languages`).
+	 * - PerfLocale-prefixed caps granted to the roles grant_roles() lists
+	 *   (administrator, editor, the `perflocale/roles/cap_roles` roles and
+	 *   the Shop Manager), so custom grants come back - e.g. an admin who
+	 *   gave Editors `perflocale_manage_languages`.
 	 * - The `perflocale_caps_version` option so the importer can decide
 	 *   whether `ensure_roles_exist()` should re-run on next admin_init.
 	 *
@@ -698,11 +813,13 @@ final class DataExporter {
 		$translator      = get_role( TranslatorRole::ROLE_SLUG );
 
 		if ( $translator instanceof \WP_Role ) {
-			$translator_caps = array_map( static fn( $v ) => (bool) $v, (array) $translator->capabilities );
+			foreach ( (array) $translator->capabilities as $cap => $grant ) {
+				$translator_caps[ (string) $cap ] = (bool) $grant;
+			}
 		}
 
 		$role_grants = [];
-		foreach ( [ 'administrator', 'editor' ] as $role_slug ) {
+		foreach ( self::grant_roles() as $role_slug ) {
 			$role = get_role( $role_slug );
 
 			if ( ! $role instanceof \WP_Role ) {
@@ -726,6 +843,23 @@ final class DataExporter {
 			'translator'   => $translator_caps,
 			'role_grants'  => $role_grants,
 		];
+	}
+
+	/**
+	 * The roles whose PerfLocale capabilities the Roles section carries:
+	 * administrator and editor, every role the site lists in
+	 * `perflocale/roles/cap_roles`, and WooCommerce's Shop Manager (its grant
+	 * record travels with the section). The importer restores grants for the
+	 * same list.
+	 *
+	 * @return array<int, string>
+	 */
+	public static function grant_roles(): array {
+		/** This filter is documented in src/Admin/TranslatorRole.php */
+		$roles = (array) apply_filters( 'perflocale/roles/cap_roles', [ 'administrator', 'editor' ] );
+		$roles = array_merge( [ 'administrator', 'editor' ], array_map( static fn( $r ): string => sanitize_key( Typed::str( $r ) ), $roles ), [ 'shop_manager' ] );
+
+		return array_values( array_unique( array_filter( $roles ) ) );
 	}
 
 	/**
@@ -878,15 +1012,16 @@ final class DataExporter {
 	/**
 	 * Shared streaming logic used by download() and write_to_file().
 	 *
-	 * @param resource           $out Output stream.
-	 * @param array<int, string> $sections Normalized section keys (non-empty).
+	 * @param resource                $out      Output stream.
+	 * @param array<int, string>      $sections Normalized section keys.
+	 * @param array<int, string>|null $groups   Group parts, or null (see export_parts()).
 	 * @return void
 	 * @throws \RuntimeException Propagated from {@see self::export_table()} when a
 	 *                           batch read fails, and from {@see self::write_chunk()}
 	 *                           when a stream write is refused or short. Both
 	 *                           callers catch it.
 	 */
-	private function write_to( $out, array $sections ): void {
+	private function write_to( $out, array $sections, ?array $groups = null ): void {
 		// phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming to a JSON output stream; WP_Filesystem has no streaming API and download() targets php://output.
 
 		self::write_chunk( $out, "{\n" );
@@ -896,6 +1031,15 @@ final class DataExporter {
 		self::write_chunk( $out, '"exported_at": "' . gmdate( 'c' ) . '",' . "\n" );
 		self::write_chunk( $out, '"site_url": ' . self::encode_or_fail( self::site_address(), 'site_url' ) . ',' . "\n" );
 		self::write_chunk( $out, '"sections": ' . self::encode_or_fail( $sections, 'sections' ) . ',' . "\n" );
+
+		// The add-on parts: each travels as its own row lists in `data`. The
+		// group parts are named, with their labels, next to `sections`.
+		$parts  = self::export_parts( $sections, $groups );
+		$labels = array_intersect_key( DataRegistry::addon_groups(), array_flip( $parts ) );
+
+		if ( [] !== $labels ) {
+			self::write_chunk( $out, '"' . DataRegistry::ADDON_GROUPS_KEY . '": ' . self::encode_or_fail( $labels, DataRegistry::ADDON_GROUPS_KEY ) . ',' . "\n" );
+		}
 
 		if ( in_array( 'settings', $sections, true ) ) {
 			$settings = get_option( 'perflocale_settings', [] );
@@ -935,39 +1079,44 @@ final class DataExporter {
 			self::write_chunk( $out, '"roles": ' . self::encode_or_fail( self::snapshot_roles(), 'roles' ) . ',' . "\n" );
 		}
 
-		$tables = [];
-		$scopes = [];
+		[ $tables, $scopes ] = self::tables_for( $sections );
 
-		foreach ( $sections as $section ) {
-			if ( ! isset( self::SECTIONS[ $section ] ) ) {
-				continue;
-			}
+		// The options and meta the sections carry (ExportItems), as row
+		// lists after the tables, then each add-on part's own row lists. An
+		// importer that does not know a list skips it.
+		$items   = DataRegistry::section_row_lists( ...array_values( array_map( 'strval', $sections ) ) );
+		$members = [];
 
-			foreach ( self::SECTIONS[ $section ]['tables'] as $table_name ) {
-				$tables[] = $table_name;
-
-				$scope = self::SECTIONS[ $section ]['type_scope'][ $table_name ] ?? null;
-
-				// Widest claim wins, whatever order the sections arrived in: a
-				// section that asks for the table without a type scope needs
-				// every row, so its null overrides any narrower claim and can
-				// never be overridden by one.
-				if ( $scope === null || ! array_key_exists( $table_name, $scopes ) ) {
-					$scopes[ $table_name ] = $scope;
-				}
+		foreach ( $parts as $part ) {
+			foreach ( DataRegistry::part_row_lists( $part ) as $list ) {
+				$members[] = [ $part, $list ];
 			}
 		}
 
-		$tables = array_unique( $tables );
-
 		self::write_chunk( $out, '"data": {' . "\n" );
 
-		$table_count = count( $tables );
+		$table_count = count( $tables ) + count( $items ) + count( $members );
 		$i           = 0;
 
 		foreach ( $tables as $table_name ) {
 			$is_last = ( $i === $table_count - 1 );
 			$this->export_table( $out, $table_name, $is_last, $scopes[ $table_name ] ?? null );
+			++$i;
+		}
+
+		$shared = array_values( array_diff( $sections, [ DataRegistry::ADDON_SECTION ] ) );
+
+		foreach ( $items as $pseudo ) {
+			$is_last = ( $i === $table_count - 1 );
+			$kind    = (string) array_search( $pseudo, DataRegistry::ROW_LISTS, true );
+			self::export_item_rows( $out, $pseudo, $pseudo, self::row_list_items( $kind, $shared ), $is_last );
+			++$i;
+		}
+
+		foreach ( $members as [ $part, $pseudo ] ) {
+			$is_last = ( $i === $table_count - 1 );
+			$kind    = (string) array_search( $pseudo, DataRegistry::ROW_LISTS, true );
+			self::export_item_rows( $out, DataRegistry::part_member( $part, $pseudo ), $pseudo, self::part_items( $kind, $part ), $is_last );
 			++$i;
 		}
 
@@ -1024,11 +1173,10 @@ final class DataExporter {
 				continue;
 			}
 
-			$encoded = wp_json_encode( $payload );
-
-			if ( $encoded === false ) {
-				continue;
-			}
+			// Encoded with the same lossless rule as every core section: a
+			// section that cannot be encoded stops the export rather than
+			// being dropped or written with its bad bytes replaced.
+			$encoded = self::encode_or_fail( $payload, 'add-on section ' . $name );
 
 			self::write_chunk( $out, ',' . "\n" );
 			// Encode the KEY too so a name with a quote/backslash can never
@@ -1042,13 +1190,161 @@ final class DataExporter {
 	}
 
 	/**
+	 * The tables a set of sections exports, and the type scope of each.
+	 *
+	 * @param array<int, string> $sections Section keys.
+	 * @return array{0: array<int, string>, 1: array<string, string|null>} Tables in export order; table => type scope (null = whole table).
+	 */
+	private static function tables_for( array $sections ): array {
+		$tables = [];
+		$scopes = [];
+
+		$all = self::sections();
+
+		foreach ( $sections as $section ) {
+			if ( ! isset( $all[ $section ] ) ) {
+				continue;
+			}
+
+			foreach ( $all[ $section ]['tables'] as $table_name ) {
+				$tables[] = $table_name;
+
+				$scope = $all[ $section ]['type_scope'][ $table_name ] ?? null;
+
+				// Widest claim wins, whatever order the sections arrived in: a
+				// section that asks for the table without a type scope needs
+				// every row, so its null overrides any narrower claim and can
+				// never be overridden by one.
+				if ( $scope === null || ! array_key_exists( $table_name, $scopes ) ) {
+					$scopes[ $table_name ] = $scope;
+				}
+			}
+		}
+
+		return [ array_values( array_unique( $tables ) ), $scopes ];
+	}
+
+	/**
+	 * About how many bytes an export of these sections would write.
+	 *
+	 * Each table's row count times the average encoded size of its first 200
+	 * rows: two queries per table, for the Export & Import screen, which warns
+	 * when the export would be larger than this site accepts for an import.
+	 *
+	 * @param array<int, string> $sections Section keys. Empty = all.
+	 * @return int
+	 */
+	public function estimate_bytes( array $sections = [] ): int {
+		$wpdb = Typed::wpdb();
+
+		[ $tables, $scopes ] = self::tables_for( $this->normalize_sections( $sections, null )[0] );
+
+		// The envelope, settings and roles: small next to any table.
+		$total = 8192;
+
+		foreach ( $tables as $table_name ) {
+			$full_table = Schema::table( $table_name );
+			$scope      = $scopes[ $table_name ] ?? null;
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$count = null === $scope
+				? $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $full_table ) )
+				: $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE type = %s', $full_table, $scope ) );
+			$count = is_numeric( $count ) ? (int) $count : 0;
+
+			if ( $count <= 0 ) {
+				continue;
+			}
+
+			$sample = null === $scope
+				? $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i LIMIT 200', $full_table ), ARRAY_A )
+				: $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i WHERE type = %s LIMIT 200', $full_table, $scope ), ARRAY_A );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			if ( ! is_array( $sample ) || [] === $sample ) {
+				continue;
+			}
+
+			$bytes = 0;
+
+			foreach ( $sample as $row ) {
+				$bytes += strlen( (string) wp_json_encode( $row ) ) + 2;
+			}
+
+			$total += (int) ceil( $bytes / count( $sample ) * $count );
+		}
+
+		return $total;
+	}
+
+	/**
+	 * Write one row list of options or meta (see ExportItems).
+	 *
+	 * @param resource                                                                                             $out     Output stream.
+	 * @param string                                                                                               $member  The `data` member it is written as.
+	 * @param string                                                                                               $pseudo  Row list (ROW_LISTS value).
+	 * @param array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5: string}> $items   The items it carries.
+	 * @param bool                                                                                                 $is_last Whether this is the last member of `data`.
+	 * @return void
+	 * @throws \RuntimeException When a read fails or a row cannot be encoded.
+	 */
+	private static function export_item_rows( $out, string $member, string $pseudo, array $items, bool $is_last ): void {
+		self::write_chunk( $out, self::encode_or_fail( $member, 'row list name' ) . ': [' . "\n" );
+
+		$first = true;
+
+		foreach ( ExportItems::export_rows( $pseudo, $items ) as $row ) {
+			self::write_chunk( $out, ( $first ? '' : ',' . "\n" ) . self::encode_or_fail( $row, $member . ' row' ) );
+			$first = false;
+		}
+
+		self::write_chunk( $out, "\n" . ']' . ( $is_last ? '' : ',' ) . "\n" );
+	}
+
+	/**
+	 * Add each row's object fingerprint (ObjectFingerprint::FIELD).
+	 *
+	 * @param array<int, array<string, mixed>> $rows        Rows of one batch.
+	 * @param string                           $type_column The column that says whether `object_id` is a post or a term.
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function with_fingerprints( array $rows, string $type_column ): array {
+		$ids = [];
+
+		foreach ( $rows as $row ) {
+			$kind = ObjectFingerprint::kind( $row[ $type_column ] ?? null );
+
+			if ( '' !== $kind && is_numeric( $row['object_id'] ?? null ) ) {
+				$ids[ $kind ][] = (int) $row['object_id'];
+			}
+		}
+
+		$found = [];
+
+		foreach ( $ids as $kind => $list ) {
+			$found[ $kind ] = ObjectFingerprint::for_ids( $kind, $list );
+		}
+
+		foreach ( $rows as $i => $row ) {
+			$kind = ObjectFingerprint::kind( $row[ $type_column ] ?? null );
+			$id   = is_numeric( $row['object_id'] ?? null ) ? (int) $row['object_id'] : 0;
+
+			if ( '' !== $kind && isset( $found[ $kind ][ $id ] ) ) {
+				$rows[ $i ][ ObjectFingerprint::FIELD ] = $found[ $kind ][ $id ];
+			}
+		}
+
+		return $rows;
+	}
+
+	/**
 	 * Export a single table in batches.
 	 *
 	 * @param resource    $out Output stream.
 	 * @param string      $table_name Short table name (without prefix).
 	 * @param bool        $is_last Whether this is the last table.
 	 * @param string|null $type_scope Emit only the rows whose polymorphic `type`
-	 *                                column holds this value (see SECTIONS);
+	 *                                column holds this value (see sections());
 	 *                                null emits the whole table.
 	 * @return void
 	 * @throws \RuntimeException When a batch SELECT fails. A partial table must
@@ -1092,6 +1388,7 @@ final class DataExporter {
 		 */
 		$batch_size = (int) apply_filters( 'perflocale/export/batch_size', self::BATCH_SIZE, $table_name );
 		$batch_size = max( 50, min( 10000, $batch_size ) );
+		$fp_column  = self::fingerprint_columns()[ $table_name ] ?? null;
 
 		do {
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -1176,6 +1473,14 @@ final class DataExporter {
 						)
 					)
 				);
+			}
+
+			// Rows that name a post or term by ID carry that object's
+			// fingerprint, so an import can tell when the ID names a
+			// different object (see ObjectFingerprint). One query per kind
+			// and batch.
+			if ( null !== $fp_column && [] !== $rows ) {
+				$rows = self::with_fingerprints( Typed::rows( $rows ), $fp_column );
 			}
 
 			foreach ( $rows as $row ) {

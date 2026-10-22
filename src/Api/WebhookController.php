@@ -153,6 +153,15 @@ final class WebhookController extends RestController {
 	];
 
 	/**
+	 * The event names a webhook may subscribe to.
+	 *
+	 * @return array<int, string>
+	 */
+	public static function valid_events(): array {
+		return self::VALID_EVENTS;
+	}
+
+	/**
 	 * Wire the webhook dispatcher to the plugin's translation/content hooks.
 	 *
 	 * Registered once from Bootstrap so every relevant plugin action
@@ -337,6 +346,29 @@ final class WebhookController extends RestController {
 	 * @return bool|\WP_Error
 	 */
 	public function register_permissions_check( \WP_REST_Request $request ): bool|\WP_Error {
+		if ( ! self::user_can_register( $request ) ) {
+			return new \WP_Error(
+				'rest_forbidden',
+				self::register_denied_message(),
+				[ 'status' => rest_authorization_required_code() ]
+			);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether the current user may register webhooks: the capability
+	 * {@see self::register_permissions_check()} requires. The import and the
+	 * listing ask it too, with a registration request built here when there
+	 * is none.
+	 *
+	 * @param \WP_REST_Request|null $request The registration request, or null.
+	 * @return bool
+	 */
+	public static function user_can_register( ?\WP_REST_Request $request = null ): bool {
+		$fallback = is_multisite() ? 'manage_network_options' : 'manage_options';
+
 		/**
 		 * Capability required to register an outbound webhook.
 		 *
@@ -347,26 +379,47 @@ final class WebhookController extends RestController {
 		 */
 		$capability = (string) apply_filters(
 			'perflocale/webhooks/register_capability',
-			is_multisite() ? 'manage_network_options' : 'manage_options',
-			$request
+			$fallback,
+			$request ?? new \WP_REST_Request( 'POST', '/perflocale/v1/webhooks' )
 		);
 
 		// A filter that returns nothing usable must not open the route.
 		if ( '' === $capability ) {
-			$capability = is_multisite() ? 'manage_network_options' : 'manage_options';
+			$capability = $fallback;
 		}
 
-		if ( ! current_user_can( $capability ) ) {
-			return new \WP_Error(
-				'rest_forbidden',
-				is_multisite()
-					? __( 'Registering a webhook requires network administrator permissions.', 'perflocale' )
-					: __( 'You do not have permission to perform this action.', 'perflocale' ),
-				[ 'status' => rest_authorization_required_code() ]
-			);
+		return current_user_can( $capability );
+	}
+
+	/**
+	 * The message for a user {@see self::user_can_register()} refuses.
+	 *
+	 * @return string
+	 */
+	public static function register_denied_message(): string {
+		return is_multisite()
+			? __( 'Registering a webhook requires network administrator permissions.', 'perflocale' )
+			: __( 'You do not have permission to perform this action.', 'perflocale' );
+	}
+
+	/**
+	 * A webhook address as shown to a user who may not register webhooks:
+	 * scheme, host and port, with any path or query replaced by `[REDACTED]`.
+	 *
+	 * @param string $url Stored address.
+	 * @return string
+	 */
+	public static function redacted_url( string $url ): string {
+		$parts = wp_parse_url( $url );
+
+		if ( ! is_array( $parts ) || ! isset( $parts['scheme'], $parts['host'] ) ) {
+			return '[REDACTED]';
 		}
 
-		return true;
+		$out  = $parts['scheme'] . '://' . $parts['host'] . ( isset( $parts['port'] ) ? ':' . $parts['port'] : '' );
+		$rest = ( $parts['path'] ?? '' ) . ( isset( $parts['query'] ) ? '?' . $parts['query'] : '' );
+
+		return $out . ( '' === $rest || '/' === $rest ? $rest : '/[REDACTED]' );
 	}
 
 	/**
@@ -690,7 +743,7 @@ final class WebhookController extends RestController {
 			return [];
 		}
 
-		$cache_key = 'perflocale_dns6_' . md5( $host );
+		$cache_key = 'perflocale_dns6_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host );
 		$cached    = get_transient( $cache_key );
 
 		if ( is_array( $cached ) ) {
@@ -893,11 +946,18 @@ final class WebhookController extends RestController {
 	 */
 	public function get_webhooks( \WP_REST_Request $request ): \WP_REST_Response {
 		$webhooks = $this->get_stored_webhooks();
+		$full_url = self::user_can_register();
 
-		// Strip secrets from the response.
+		// Strip secrets from the response. A user who may not register
+		// webhooks sees each address without its path and query.
 		$safe = array_map(
-			static function ( array $hook ): array {
+			static function ( array $hook ) use ( $full_url ): array {
 				unset( $hook['secret'] );
+
+				if ( ! $full_url ) {
+					$hook['url'] = self::redacted_url( $hook['url'] );
+				}
+
 				return $hook;
 			},
 			array_values( $webhooks )

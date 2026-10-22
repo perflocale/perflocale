@@ -2216,10 +2216,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			$request_uri = isset( $_SERVER['REQUEST_URI'] )
 				? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) )
 				: '';
-			$is_sitemap  = (bool) preg_match(
-				'/sitemap[^\\/]*\.xml|[?&]sitemap(_n|-stylesheet|-subtype)?=/',
-				$request_uri
-			);
+			$is_sitemap  = \PerfLocale\Helper::is_sitemap_uri( $request_uri )
+				|| 1 === preg_match( '/[?&]sitemap(?:_n|-stylesheet|-subtype)?=/', $request_uri );
 		}
 
 		return $is_sitemap;
@@ -4900,6 +4898,15 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 
 			if ( ! \PerfLocale\Translation\PlaceholderMasker::preserves_placeholders( $descriptions[ $vid ], $restored ) ) {
 				$errors[] = 'placeholder lost';
+				continue;
+			}
+
+			// A description in block markup keeps its block structure, as
+			// post content does; the variation keeps its description otherwise.
+			$structure = \PerfLocale\MachineTranslation\BlockStructureGuard::mismatch( $descriptions[ $vid ], $restored );
+
+			if ( '' !== $structure ) {
+				$errors[] = $structure;
 				continue;
 			}
 

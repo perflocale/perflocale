@@ -26,6 +26,18 @@
 	var config = perflocaleEditor || {};
 	var i18n = config.i18n || {};
 
+	// Why machine translation was not saved, by the Create action for this
+	// translation or by auto-translate on publish for this post: the server
+	// hands the text over once, when the editor opens the post. Shown as
+	// plain text.
+	if ( config.mtCreateNotice ) {
+		wp.data.dispatch( 'core/notices' ).createNotice(
+			'warning',
+			String( config.mtCreateNotice ),
+			{ id: 'perflocale-mt-create', isDismissible: true }
+		);
+	}
+
 	function PerfLocalePanel() {
 		// Per-post sync opt-out flag, read/written through the registered
 		// REST meta (all hooks at top level - React rules of hooks).

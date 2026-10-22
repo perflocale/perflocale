@@ -51,6 +51,11 @@ final class PoSync {
 	private const CTX_DOMAIN_SEP = '|';
 
 	/**
+	 * PO entries per batch whose held translations are read together.
+	 */
+	private const HELD_BATCH = 250;
+
+	/**
 	 * Fold a non-default text domain into the PO entry's msgctxt.
 	 *
 	 * PO entries are keyed by (context, msgid) only - the domain is otherwise
@@ -605,6 +610,9 @@ final class PoSync {
 
 		$group_repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $cache_service );
 
+		// Failed queries before the replace transaction (Schema::transaction_lost()).
+		$tx_errors = Schema::query_error_count();
+
 		if ( $replace ) {
 			// Wrap the destructive DELETE + the re-insert loop below in ONE
 			// transaction so a mid-import fatal (timeout/OOM) rolls back to the
@@ -676,10 +684,46 @@ final class PoSync {
 		// by an outer handler (REST, CLI, a job worker) would otherwise leave
 		// the transaction open for whatever runs next on that connection to
 		// commit - publishing the wipe without the re-import.
+		//
+		// What each string held in this language before its row is written:
+		// the rows below are counted inserted / updated / unchanged against it,
+		// the same way on every database (an upsert's affected-row count is
+		// 1, 2 or 0 on MySQL but 1 for all three on the SQLite integration).
+		// A replace import starts from an emptied language and keeps what it
+		// wrote. Any other import reads, before each batch of entries writes,
+		// what that batch's strings hold, and drops it after the batch.
+		$held    = [];
+		$entries = array_values( (array) $po->entries );
+
+		// A replace import writes inside a transaction, where no statement may
+		// fail: on the SQLite Database Integration a failed statement ends the
+		// transaction (the wipe and every earlier write roll back) and the
+		// statements after it commit one by one. So in replace mode a failed
+		// write stops the import at once - the next statement is the ROLLBACK -
+		// instead of skipping the entry and going on.
+		$abort_replace = static function () use ( &$result, $wpdb, $lang ): void {
+			if ( $wpdb instanceof \wpdb ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
+				$wpdb->query( 'ROLLBACK' );
+			}
+
+			$result['errors'][]  = __( 'Replace import rolled back: the database refused a write, so nothing was changed.', 'perflocale' );
+			$result['imported']  = 0;
+			$result['inserted']  = 0;
+			$result['updated']   = 0;
+			$result['unchanged'] = 0;
+
+			self::flush_language_caches( $lang );
+		};
+
 		try {
 
 			// Iterate entries. PO::$entries is keyed by Translation_Entry::key().
-			foreach ( (array) $po->entries as $entry ) {
+			foreach ( $entries as $index => $entry ) {
+				if ( ! $replace && 0 === $index % self::HELD_BATCH ) {
+					$held = self::held_translations( $strings_table, $st_table, $lang, array_slice( $entries, $index, self::HELD_BATCH ) );
+				}
+
 				if ( ! $entry instanceof \Translation_Entry ) {
 					continue;
 				}
@@ -780,6 +824,7 @@ final class PoSync {
 					// group translated for this language or the imported text is
 					// never served.
 					// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$lookup_errors   = Schema::query_error_count();
 					$string_row      = $wpdb->get_row(
 						$wpdb->prepare(
 							'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
@@ -828,6 +873,13 @@ final class PoSync {
 						$string_group_id = $string_row ? (int) $string_row->group_id : 0;
 					}
 
+					// A failed lookup ends a replace import before any write
+					// (the lookups run no hook, so a new failed query is theirs).
+					if ( $replace && Schema::transaction_lost( $tx_errors, Schema::query_error_count() > $lookup_errors ) ) {
+						$abort_replace();
+						return $result;
+					}
+
 					// True only when THIS iteration minted the group it is about to
 					// link under, so it is known to be `type = 'string'` without
 					// re-reading it. Every other path - an existing row, or the
@@ -863,15 +915,17 @@ final class PoSync {
 									'domain'        => $domain,
 									'original_hash' => StringRepository::compute_hash( $domain, $context, $singular ),
 									'group_id'      => $group_id,
-									'created_at'    => current_time( 'mysql', true ),
 								],
-								[ '%s', '%s', '%s', '%s', '%d', '%s' ]
+								[ '%s', '%s', '%s', '%s', '%d' ]
 							);
 
 							if ( false !== $inserted && (int) $wpdb->insert_id > 0 ) {
 								$string_id       = (int) $wpdb->insert_id;
 								$string_group_id = $group_id;
 								$group_verified  = true;
+							} elseif ( $replace ) {
+								$abort_replace();
+								return $result;
 							} else {
 								// Lost the UNIQUE-hash race: drop the orphan group and
 								// recover the existing row by its canonical hash.
@@ -887,6 +941,11 @@ final class PoSync {
 								$string_group_id = $string_row ? (int) $string_row->group_id : 0;
 							}
 						}
+					}
+
+					if ( $string_id <= 0 && $replace ) {
+						$abort_replace();
+						return $result;
 					}
 
 					if ( $string_id <= 0 ) {
@@ -921,8 +980,18 @@ final class PoSync {
 						$string_id,
 						$string_group_id,
 						(int) $lang->id,
-						$group_verified
+						$group_verified,
+						$replace
 					);
+
+					// The link write runs perflocale/translation/linked listeners:
+					// a failed query of theirs can have ended the transaction as
+					// well (Schema::transaction_lost(): on SQLite any, on MySQL a
+					// deadlock).
+					if ( $replace && Schema::transaction_lost( $tx_errors, $link_error !== '' ) ) {
+						$abort_replace();
+						return $result;
+					}
 
 					if ( $link_error !== '' ) {
 						++$result['skipped'];
@@ -932,22 +1001,10 @@ final class PoSync {
 
 					// Upsert the translation.
 					//
-					// MySQL's INSERT…ON DUPLICATE KEY UPDATE returns affected_rows:
-					// 0 - duplicate matched, the UPDATE clause's columns ended
-					// up with their existing values (no actual write)
-					// 1 - fresh insert
-					// 2 - duplicate matched and values changed (real update)
-					//
-					// IMPORTANT: we deliberately do NOT include `updated_at` in
-					// the UPDATE clause. The schema declares
-					// `updated_at … ON UPDATE CURRENT_TIMESTAMP`, which fires
-					// only when at least one OTHER column actually changes. If
-					// we wrote `updated_at = VALUES(updated_at)` here, MySQL
-					// would always count the row as updated (because the
-					// timestamp differs every call), and we couldn't distinguish
-					// "really updated" from "no-op upsert" - every re-import of
-					// the same PO would report "N updated" instead of "N already
-					// up to date".
+					// `updated_at` is deliberately NOT in the MySQL UPDATE clause:
+					// the schema declares `updated_at … ON UPDATE CURRENT_TIMESTAMP`,
+					// which moves it only when another column changes (on SQLite,
+					// Schema::touch_write_time() writes the same).
 					// Plural forms 2..N (Polish/Russian/Arabic) ride on this row as
 					// JSON extra_forms; NULL for every other row. ONLY a genuine
 					// msgid_plural entry is authoritative about those forms -
@@ -975,27 +1032,42 @@ final class PoSync {
 					// clears) instead of the column's real "no extra forms" state.
 					// A genuine $extra_json is a non-empty JSON array literal, so
 					// the '' → NULL mapping can never hit a real value.
-					$now = current_time( 'mysql', true );
+					//
+					// updated_at is left to the column (DEFAULT / ON UPDATE
+					// CURRENT_TIMESTAMP), the database clock every other writer of
+					// string_translations uses; Site Health reads it back with
+					// UNIX_TIMESTAMP() in that clock.
 					// `string_translations` has exactly ONE unique key - PRIMARY
 					// (string_id, language_id) - so this upsert can only ever
-					// collide on the pair it is addressing, and affected_rows is a
-					// trustworthy inserted/updated/no-op signal. (The polymorphic
+					// collide on the pair it is addressing. The polymorphic
 					// `translation_links` table, written above, carries two, which
 					// is why its write goes through link_string_translation()
-					// rather than a bare upsert.)
+					// rather than a bare upsert.
+					$touch = \PerfLocale\Database\Schema::touch_write_time(
+						$authoritative
+							? [ [ 'extra_forms', 'VALUES(extra_forms)', 'text_null' ], [ 'translation', 'VALUES(translation)', 'text' ] ]
+							: [ [ 'translation', 'VALUES(translation)', 'text' ] ]
+					);
+					// A string the batch read did not cover: one created by this
+					// entry holds nothing yet; one found by the line-ending
+					// fallback or after losing the creation race is read here.
+					if ( ! $replace && ! array_key_exists( $string_id, $held ) ) {
+						$held[ $string_id ] = $group_verified ? null : self::held_translation( $st_table, $lang, $string_id );
+					}
+
+					// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- $touch is Schema::touch_write_time(): column names and VALUES() only, '' on MySQL.
 					$upsert = $wpdb->query(
 						$wpdb->prepare(
-							"INSERT INTO %i (string_id, language_id, translation, extra_forms, updated_at)
-						 VALUES (%d, %d, %s, NULLIF(%s, ''), %s)
+							"INSERT INTO %i (string_id, language_id, translation, extra_forms)
+						 VALUES (%d, %d, %s, NULLIF(%s, ''))
 						 ON DUPLICATE KEY UPDATE
 							extra_forms = IF(%d, VALUES(extra_forms), extra_forms),
-							translation = VALUES(translation)",
+							translation = VALUES(translation)" . $touch,
 							$st_table,
 							$string_id,
 							(int) $lang->id,
 							$msgstr,
 							$extra_json,
-							$now,
 							$authoritative ? 1 : 0
 						)
 					);
@@ -1004,18 +1076,21 @@ final class PoSync {
 					if ( $upsert !== false ) {
 						++$result['imported'];
 
-						switch ( (int) $upsert ) {
-							case 1:
-								++$result['inserted'];
-								break;
-							case 2:
-								++$result['updated'];
-								break;
-							case 0:
-							default:
-								++$result['unchanged'];
-								break;
+						$was      = $held[ $string_id ] ?? null;
+						$now_held = [
+							sha1( $msgstr ),
+							$authoritative ? ( null === $extra_json ? null : sha1( (string) $extra_json ) ) : ( $was[1] ?? null ),
+						];
+
+						if ( null === $was ) {
+							++$result['inserted'];
+						} elseif ( $was === $now_held ) {
+							++$result['unchanged'];
+						} else {
+							++$result['updated'];
 						}
+
+						$held[ $string_id ] = $now_held;
 					} else {
 						++$result['skipped'];
 						self::log_db_error( 'saving a translation', (string) $wpdb->last_error );
@@ -1069,6 +1144,15 @@ final class PoSync {
 		// against false only: the statement returns 0 on success. The message
 		// does not claim nothing changed, because a connection lost during the
 		// COMMIT can hide one that landed; re-running a replace is safe.
+		// A failed query anywhere in the import that ended the transaction
+		// (Schema::transaction_lost()) has rolled the wipe back too: report it
+		// rather than COMMIT.
+		if ( $replace && Schema::transaction_lost( $tx_errors ) ) {
+			$abort_replace();
+
+			return $result;
+		}
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
 		if ( $replace && false === $wpdb->query( 'COMMIT' ) ) {
 			// Read before the ROLLBACK, which clears it.
@@ -1358,6 +1442,7 @@ final class PoSync {
 	 * @param int                                                        $group_id    The string's group id; updated in place when healed, so the caller's later forms reuse it.
 	 * @param int                                                        $language_id Target language id.
 	 * @param bool                                                       $verified    True when the caller minted this exact group as `type = 'string'` moments ago, so the type probe can be skipped.
+	 * @param bool                                                       $in_transaction True inside a replace import's transaction: a failed link write is returned at once, with no retry (no statement may run after a failure there).
 	 * @return string Empty string on success; otherwise the operator-facing reason nothing was linked.
 	 */
 	private static function link_string_translation(
@@ -1365,15 +1450,20 @@ final class PoSync {
 		int $string_id,
 		int &$group_id,
 		int $language_id,
-		bool $verified = false
+		bool $verified = false,
+		bool $in_transaction = false
 	): string {
 		global $wpdb;
 
 		$original_group_id = $group_id;
 		$minted_group_id   = 0;
 
+		if ( $verified ) {
+			\PerfLocale\Database\Repository\TranslationGroupRepository::remember_string_group( $group_id );
+		}
+
 		if ( ! $verified && ! $group_repo->is_string_group( $group_id ) ) {
-			$group_id        = self::mint_string_group( $string_id );
+			$group_id        = self::mint_string_group( $string_id, $in_transaction );
 			$minted_group_id = $group_id;
 
 			if ( $group_id === 0 ) {
@@ -1395,8 +1485,17 @@ final class PoSync {
 			$string_id,
 			$language_id,
 			'translated',
-			\PerfLocale\Enum\SourceType::Manual
+			\PerfLocale\Enum\SourceType::Manual,
+			$in_transaction
 		);
+
+		if ( $linked === false && $in_transaction ) {
+			return sprintf(
+				/* translators: %d: id of the row in the plugin's strings table. */
+				__( 'Could not link string #%d to the target language; its translation was not imported. Re-run the import to retry.', 'perflocale' ),
+				$string_id
+			);
+		}
 
 		if ( $linked === false ) {
 			// Second line of defence behind upsert_link()'s own object_lang
@@ -1473,10 +1572,12 @@ final class PoSync {
 	 * one, so the group is reclaimed rather than widowed. Either way the caller
 	 * gets 0 and reports the entry skipped.
 	 *
-	 * @param int $string_id Row in the `strings` table to repair.
+	 * @param int  $string_id      Row in the `strings` table to repair.
+	 * @param bool $in_transaction True inside a replace import's transaction: a failed write is not
+	 *                             followed by the clean-up DELETE (the caller rolls back).
 	 * @return int New group id, or 0 when the repair could not be completed.
 	 */
-	private static function mint_string_group( int $string_id ): int {
+	private static function mint_string_group( int $string_id, bool $in_transaction = false ): int {
 		if ( $string_id <= 0 ) {
 			return 0;
 		}
@@ -1513,6 +1614,13 @@ final class PoSync {
 		);
 
 		if ( ! is_int( $updated ) || $updated < 1 ) {
+			// Inside a transaction a FAILED update is followed by nothing: the
+			// caller's ROLLBACK removes the group (no statement may follow a
+			// failure there, see import_from_file()).
+			if ( false === $updated && $in_transaction ) {
+				return 0;
+			}
+
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reclaiming the group this method just created, by primary key.
 			$wpdb->delete( Schema::table( 'translation_groups' ), [ 'id' => $group_id ], [ '%d' ] );
 
@@ -1632,5 +1740,137 @@ final class PoSync {
 				'extra_forms' => $extra,
 			],
 		];
+	}
+
+	/**
+	 * What the strings of a batch of PO entries hold in a language, per string
+	 * id: a SHA-1 of the translation and of the plural extra forms (null when
+	 * there are none), or null for a string that holds no translation in the
+	 * language. One read by the entries' source hashes; a string that does not
+	 * exist yet is absent from the map.
+	 *
+	 * @param string                   $strings_table The strings table.
+	 * @param string                   $st_table      The string_translations table.
+	 * @param object                   $lang          The language row.
+	 * @param array<int|string, mixed> $entries       The batch's PO entries.
+	 * @return array<int, array{0: string, 1: string|null}|null>
+	 */
+	private static function held_translations( string $strings_table, string $st_table, object $lang, array $entries ): array {
+		global $wpdb;
+
+		$language_id = self::language_id( $lang );
+
+		if ( ! $wpdb instanceof \wpdb || $language_id <= 0 ) {
+			return [];
+		}
+
+		$hashes = [];
+
+		foreach ( $entries as $entry ) {
+			if ( ! $entry instanceof \Translation_Entry || ! is_string( $entry->singular ) || $entry->singular === '' ) {
+				continue;
+			}
+
+			$domain = self::extract_domain( is_string( $entry->extracted_comments ) ? $entry->extracted_comments : '' );
+			$forms  = self::entry_to_forms( $entry, $entry->singular, is_string( $entry->context ) ? $entry->context : '', $domain );
+
+			foreach ( $forms as $form ) {
+				if ( $form['translation'] !== '' ) {
+					$hashes[ StringRepository::compute_hash( $domain, $form['context'], $form['original'] ) ] = true;
+				}
+			}
+		}
+
+		if ( $hashes === [] ) {
+			return [];
+		}
+
+		$hashes = array_keys( $hashes );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One read per batch of an import; tables bound with %i, one %s placeholder per hash.
+		$rows = (array) $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT s.id AS string_id, st.string_id AS held_id, st.translation, st.extra_forms
+				 FROM %i s
+				 LEFT JOIN %i st ON st.string_id = s.id AND st.language_id = %d
+				 WHERE s.original_hash IN (' . implode( ', ', array_fill( 0, count( $hashes ), '%s' ) ) . ')',
+				$strings_table,
+				$st_table,
+				$language_id,
+				...$hashes
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		$held = [];
+
+		foreach ( $rows as $row ) {
+			$string_id = $row['string_id'] ?? null;
+
+			if ( ! is_numeric( $string_id ) ) {
+				continue;
+			}
+
+			$held[ (int) $string_id ] = null === ( $row['held_id'] ?? null ) ? null : self::held_pair( $row );
+		}
+
+		return $held;
+	}
+
+	/**
+	 * What one string holds in a language, as held_translations() reports it.
+	 *
+	 * @param string $st_table  The string_translations table.
+	 * @param object $lang      The language row.
+	 * @param int    $string_id The string id.
+	 * @return array{0: string, 1: string|null}|null
+	 */
+	private static function held_translation( string $st_table, object $lang, int $string_id ): ?array {
+		global $wpdb;
+
+		$language_id = self::language_id( $lang );
+
+		if ( ! $wpdb instanceof \wpdb || $language_id <= 0 ) {
+			return null;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- A primary-key read before one import write; the table is bound with %i.
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				'SELECT translation, extra_forms FROM %i WHERE string_id = %d AND language_id = %d',
+				$st_table,
+				$string_id,
+				$language_id
+			),
+			ARRAY_A
+		);
+
+		return is_array( $row ) ? self::held_pair( $row ) : null;
+	}
+
+	/**
+	 * A language row's id, 0 when it has none.
+	 *
+	 * @param object $lang The language row.
+	 * @return int
+	 */
+	private static function language_id( object $lang ): int {
+		$id = get_object_vars( $lang )['id'] ?? null;
+
+		return is_numeric( $id ) ? (int) $id : 0;
+	}
+
+	/**
+	 * The SHA-1 pair of a string_translations row.
+	 *
+	 * @param array<mixed> $row The row, with translation and extra_forms.
+	 * @return array{0: string, 1: string|null}
+	 */
+	private static function held_pair( array $row ): array {
+		$translation = $row['translation'] ?? '';
+		$extra       = $row['extra_forms'] ?? null;
+
+		return [ sha1( is_string( $translation ) ? $translation : '' ), is_string( $extra ) ? sha1( $extra ) : null ];
 	}
 }

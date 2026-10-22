@@ -3,17 +3,27 @@
  * the Appearance > Menus settings sidebar.
  *
  * The legend label, options HTML, linked-menus HTML, and description are
- * provided by window.perflocaleMenuLang (seeded by wp_add_inline_script
- * 'before'). Pre-rendered HTML is required because the per-language
- * <option> labels and the per-language <select> blocks come from server-
- * side data.
+ * the JSON in the data-perflocale-menu-lang attribute of
+ * #perflocale-menu-lang-data (MenuManager::print_menu_language_data()).
+ * Pre-rendered HTML is required because the per-language <option> labels
+ * and the per-language <select> blocks come from server-side data.
  */
 ( function () {
+	function readData() {
+		var el = document.getElementById( 'perflocale-menu-lang-data' );
+		if ( ! el ) { return null; }
+		try {
+			return JSON.parse( el.getAttribute( 'data-perflocale-menu-lang' ) || 'null' );
+		} catch ( e ) {
+			return null;
+		}
+	}
+
 	function inject() {
-		if ( ! window.perflocaleMenuLang ) { return; }
+		var data = readData();
+		if ( ! data ) { return; }
 		if ( document.querySelector( '.perflocale-menu-lang-settings' ) ) { return; }
 
-		var data = window.perflocaleMenuLang;
 		var wrapper = document.createElement( 'fieldset' );
 		wrapper.className = 'menu-settings-group perflocale-menu-lang-settings';
 
@@ -24,8 +34,14 @@
 
 		var langWrap = document.createElement( 'p' );
 		langWrap.className = 'menu-settings-input-container perflocale-menu-lang-row';
+		var label = document.createElement( 'label' );
+		label.htmlFor = 'perflocale-menu-language-select';
+		label.className = 'screen-reader-text';
+		label.textContent = data.legendLabel || '';
+		langWrap.appendChild( label );
 		var select = document.createElement( 'select' );
 		select.name = 'perflocale_menu_language';
+		select.id = 'perflocale-menu-language-select';
 		select.className = 'perflocale-menu-lang-select';
 		select.innerHTML = data.langOptions || '';
 		langWrap.appendChild( select );

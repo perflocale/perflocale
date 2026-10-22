@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.7.2
+Stable tag: 1.0.7.3
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -207,6 +207,18 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
+= 1.0.7.3 =
+* Security hardening.
+* Machine translation: a result that breaks the source's block structure is never saved, block comments and shortcode tags are held back from the provider, and the editor says why a translation was not saved. A translation someone edits while machine translation runs keeps their edit. New `wp perflocale damaged-blocks` finds translations damaged earlier.
+* Export & Import: media texts, classic menu languages, item flags, add-on data, language-code redirects, webhooks and Translator permissions travel in an export; large files upload and import in pieces; an import gives each post the values the file holds.
+* Site Editor: translated templates and template parts use their language's menu and synced pattern translations.
+* Large sites do less work: sitemaps, ACF, Meta Box and Pods reference fields, block references, XLIFF export, the Polylang import and the strings repair read and write in batches.
+* Pods: relationship fields show the translations on translated pages, also in shortcodes, blocks and display().
+* Clear Cache clears PerfLocale's caches only, no longer the whole object cache.
+* Safer Polylang, WPML and TranslatePress imports, clearer XLIFF import errors and Jobs notices, and accessible labels on four admin controls.
+* Editors of a taxonomy with its own permissions can set a term's language.
+* SQLite fixes, Meta Box fields on translated pages, and a new `wp perflocale stock-drift` check for WooCommerce stock.
+
 = 1.0.7.2 =
 * Security hardening.
 * Most visitor pages load less plugin code, and the plugin's own translations load when a page shows PerfLocale text instead of at start-up; sites without an opcode cache gain the most.
@@ -242,6 +254,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.7.3 =
+Security hardening. Machine translations that would break block markup are no longer saved, a more complete and safer Export & Import, Site Editor menus and patterns per language, and less work on large sites.
 
 = 1.0.7.2 =
 Security hardening. Less code on visitor pages, the language switcher in 24 languages, and more reliable stock, Sync Fields and slug redirects under concurrent edits.

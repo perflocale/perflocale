@@ -1151,40 +1151,7 @@ final class LanguagesPage {
 							</div>
 						<?php endforeach; ?>
 						<?php
-						// JS: when the user types a region-qualified slug
-						// (`ar-ma`), reveal the checkbox whose
-						// data-perflocale-rename-prefix matches the
-						// language part (everything before the first `-`).
-						// Other bare-language candidates stay hidden so
-						// the form only nudges about the directly relevant
-						// rename - surfacing all candidates at once would
-						// feel pushy.
-						wp_add_inline_script(
-							'perflocale-admin',
-							'(function(){' .
-								'var slug=document.getElementById("perflocale-slug");' .
-								'var boxes=document.querySelectorAll("[data-perflocale-rename-prefix]");' .
-								'if(!slug||!boxes.length)return;' .
-								'function update(){' .
-									'var v=(slug.value||"").toLowerCase();' .
-									'var dash=v.indexOf("-");' .
-									'var prefix=dash>0?v.slice(0,dash):"";' .
-									'boxes.forEach(function(b){' .
-										'b.style.display=prefix && b.getAttribute("data-perflocale-rename-prefix")===prefix?"block":"none";' .
-										// Reset checkbox when hidden so an
-										// unticked-but-stale state can\'t
-										// be submitted by accident.
-										'if(b.style.display==="none"){' .
-											'var cb=b.querySelector(\'input[type="checkbox"]\');' .
-											'if(cb)cb.checked=false;' .
-										'}' .
-									'});' .
-								'}' .
-								'slug.addEventListener("input",update);' .
-								'slug.addEventListener("change",update);' .
-								'update();' .
-							'})();'
-						);
+						\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-language-rename-hint', 'language-rename-hint.js' );
 						?>
 					<?php endif; ?>
 

@@ -139,7 +139,9 @@ final class TranslationService {
 	 * Derived from WordPress' own post allowlist by SUBTRACTION rather than
 	 * hand-rolled, so it tracks core instead of drifting from it. Core already
 	 * excludes script, iframe, embed, style, link, form, input and select; on
-	 * top of that this drops `object`, `textarea` and `button`, and adds
+	 * top of that this drops `object` and `textarea`, limits `button` to the
+	 * attributes the core/button block saves on its <button> element (type,
+	 * class, id, style, title) plus dir, lang and aria-label, and adds
 	 * `source` (core omits it, but the core/video and core/audio blocks emit
 	 * it). A hand-maintained list silently stripped figure, figcaption, video,
 	 * audio, dl/dt/dd, caption, colgroup, details/summary and the sectioning
@@ -161,7 +163,23 @@ final class TranslationService {
 
 		// Tags core permits that a machine-translation response has no
 		// legitimate reason to introduce.
-		unset( $allowed['object'], $allowed['textarea'], $allowed['button'] );
+		unset( $allowed['object'], $allowed['textarea'] );
+
+		// The core/button block can save a <button> element. Only the
+		// attributes that block writes are kept, so a response cannot add
+		// form, popover, command or event behaviour to it.
+		$allowed['button'] = [
+			'type'       => [
+				'values' => [ 'button', 'submit', 'reset' ],
+			],
+			'class'      => true,
+			'id'         => true,
+			'style'      => true,
+			'title'      => true,
+			'dir'        => true,
+			'lang'       => true,
+			'aria-label' => true,
+		];
 
 		$allowed['source'] = [
 			'src'    => true,
@@ -193,19 +211,6 @@ final class TranslationService {
 		return $this->providers;
 	}
 
-	/**
-	 * Translate an entire post to a target language.
-	 *
-	 * Translates title, content, and excerpt. Creates the translation
-	 * post if it doesn't exist, or updates it if it does.
-	 *
-	 * @param int $post_id Source post ID.
-	 * @param string $target_lang Target language slug.
-	 * @param string $provider_id Provider ID (empty = default).
-	 * @return array{post_id: int, title: string, content: string, excerpt: string}
-	 *
-	 * @throws \RuntimeException On translation failure.
-	 */
 	/**
 	 * Whether at least one provider has an API key / URL configured.
 	 *
@@ -356,7 +361,13 @@ final class TranslationService {
 			);
 		}
 
-		$translated = $provider->translate( $text, $source_lang, $target_lang, $fast_fail );
+		// Shortcode tags are held back from the provider and put back.
+		$shortcodes = ShortcodeMask::mask( $text );
+		$translated = $provider->translate( null === $shortcodes ? $text : $shortcodes->text(), $source_lang, $target_lang, $fast_fail );
+
+		if ( null !== $shortcodes && '' !== trim( $translated ) ) {
+			$translated = $shortcodes->restore( $translated );
+		}
 
 		// Same kses allowlist translate_post() runs on every block - keeps
 		// provider output from smuggling scripts / iframes into a block
@@ -491,7 +502,22 @@ final class TranslationService {
 			);
 		}
 
-		$translated = $provider->translate_batch( $non_empty, $source_lang, $target_lang, $fast_fail, $format );
+		// Shortcode tags in an html text are held back from the provider and
+		// put back.
+		$shortcodes = [];
+		$sent       = $non_empty;
+
+		if ( 'html' === $format ) {
+			foreach ( $non_empty as $i => $t ) {
+				$shortcodes[ $i ] = ShortcodeMask::mask( (string) $t );
+
+				if ( null !== $shortcodes[ $i ] ) {
+					$sent[ $i ] = $shortcodes[ $i ]->text();
+				}
+			}
+		}
+
+		$translated = $provider->translate_batch( $sent, $source_lang, $target_lang, $fast_fail, $format );
 
 		// Defend against partial provider failure: some providers / network paths
 		// will return a SHORTER array than we sent (truncated response, partial
@@ -510,6 +536,12 @@ final class TranslationService {
 					)
 				)
 			);
+		}
+
+		foreach ( $shortcodes as $i => $held ) {
+			if ( null !== $held && isset( $translated[ $i ] ) && '' !== trim( (string) $translated[ $i ] ) ) {
+				$translated[ $i ] = $held->restore( (string) $translated[ $i ] );
+			}
 		}
 
 		// Sanitize per entry, in the same order.
@@ -546,8 +578,26 @@ final class TranslationService {
 		return $result;
 	}
 
-	public function translate_post( int $post_id, string $target_lang, string $provider_id = '', bool $fast_fail = false, bool $include_meta = false ): array {
-		$post = get_post( $post_id );
+	/**
+	 * Translate an entire post to a target language.
+	 *
+	 * Translates title, content, and excerpt. Creates the translation
+	 * post if it doesn't exist, or updates it if it does.
+	 *
+	 * @param int       $post_id      Source post ID.
+	 * @param string    $target_lang  Target language slug.
+	 * @param string    $provider_id  Provider ID (empty = default).
+	 * @param bool      $fast_fail    Fail on the first provider error instead of retrying.
+	 * @param bool      $include_meta Translate the registered meta fields too.
+	 * @param bool      $inserted     Set to true when this call inserted the translation post,
+	 *                                false when it updated one that existed.
+	 * @return array<string, mixed> post_id, title, content, excerpt, and warnings, kept, meta when they apply.
+	 *
+	 * @throws \RuntimeException On translation failure.
+	 */
+	public function translate_post( int $post_id, string $target_lang, string $provider_id = '', bool $fast_fail = false, bool $include_meta = false, bool &$inserted = false ): array {
+		$inserted = false;
+		$post     = get_post( $post_id );
 
 		if ( ! $post ) {
 			throw new \RuntimeException(
@@ -599,6 +649,13 @@ final class TranslationService {
 		do_action( 'perflocale/machine_translation/before', $post_id, $provider->get_id() );
 
 		try {
+			// The translation's text as it is before the provider is asked. A
+			// person can save the translation while the provider works; it is
+			// written over only while it still holds this text.
+			$manager       = new PostTranslationManager( $this->cache, $this->settings );
+			$translated_id = $manager->get_translation_id( $post_id, $target_lang );
+			$target_before = $translated_id ? self::stored_text( (int) $translated_id ) : null;
+
 			$texts = [
 				$post->post_title,
 				$post->post_content,
@@ -640,33 +697,54 @@ final class TranslationService {
 				? []
 				: $provider->translate_batch( $plain_inputs, $source_lang, $target_lang, $fast_fail, 'text' );
 
+			// Shortcode tags and block delimiters do not go to the provider:
+			// each is replaced by a placeholder it cannot change. Text that
+			// lives only in a block comment's attributes travels as extra
+			// segments after the content.
 			$content_src = (string) ( $texts[1] ?? '' );
+			$shortcodes  = '' === $content_src ? null : ShortcodeMask::mask( $content_src );
+			$content_in  = null === $shortcodes ? $content_src : $shortcodes->text();
+			$mask        = '' === $content_in ? null : BlockDelimiterMask::mask( $content_in );
+			$html_in     = null === $mask ? [ $content_in ] : array_merge( [ $mask->text() ], $mask->segment_texts() );
 			$html_out    = '' === $content_src
 				? [ '' ]
-				: $provider->translate_batch( [ $content_src ], $source_lang, $target_lang, $fast_fail, 'html' );
+				: $provider->translate_batch( $html_in, $source_lang, $target_lang, $fast_fail, 'html' );
 
 			// A well-behaved provider returns exactly one translation per input,
 			// in order. A short/long response would scramble the positional
 			// [title, content, excerpt] mapping below (or silently blank fields
 			// via ?? ''), shipping corrupted content. Treat a length mismatch as
 			// a provider-contract failure rather than persisting garbage.
-			if ( count( $plain_out ) !== count( $plain_inputs ) || count( $html_out ) !== 1 ) {
+			if ( count( $plain_out ) !== count( $plain_inputs ) || count( $html_out ) !== count( $html_in ) ) {
 				throw new \RuntimeException(
 					esc_html(
 						sprintf(
 							/* translators: 1: provider id, 2: expected count, 3: actual count. */
 							__( 'Translation provider "%1$s" returned %3$d segments for %2$d inputs; aborting to avoid corrupting the translation.', 'perflocale' ),
 							$provider->get_id(),
-							count( $plain_inputs ) + 1,
+							count( $plain_inputs ) + count( $html_in ),
 							count( $plain_out ) + count( $html_out )
 						)
 					)
 				);
 			}
 
+			// A placeholder lost, repeated or invented fails the item here. An
+			// empty answer is left to the empty-field handling below, which
+			// keeps the existing content and says so.
+			$content_out = (string) $html_out[0];
+
+			if ( null !== $mask && '' !== trim( $content_out ) ) {
+				$content_out = $mask->restore( $content_out, array_map( 'strval', array_slice( $html_out, 1 ) ) );
+			}
+
+			if ( null !== $shortcodes && '' !== trim( $content_out ) ) {
+				$content_out = $shortcodes->restore( $content_out );
+			}
+
 			// Reassemble the positional [title, content, excerpt] triple the
 			// downstream filter/sanitize steps are contracted to.
-			$translated = [ '', (string) $html_out[0], '' ];
+			$translated = [ '', $content_out, '' ];
 
 			foreach ( $plain_slots as $i => $slot ) {
 				$translated[ $slot ] = (string) ( $plain_out[ $i ] ?? '' );
@@ -731,10 +809,32 @@ final class TranslationService {
 				'excerpt' => \PerfLocale\Helper::sanitize_plain_textarea_field( $translated[2] ?? '' ),
 			];
 
-			// Create or update the translation post.
-			$manager       = new PostTranslationManager( $this->cache, $this->settings );
-			$translated_id = $manager->get_translation_id( $post_id, $target_lang );
+			// Block content must come back with the source's block structure.
+			// A changed or cut-off delimiter would be saved as a lost block,
+			// block markup shown as text, or a block without its attributes,
+			// so the item fails here and nothing is written: an existing
+			// translation keeps its content, and no translation is created.
+			// Empty content is left to the empty-field handling below.
+			if ( '' !== trim( $result['content'] ) ) {
+				$structure = BlockStructureGuard::mismatch( (string) $post->post_content, $result['content'] );
 
+				if ( '' !== $structure ) {
+					throw new NotSavedException( esc_html( $structure ) );
+				}
+
+				// wp_kses() re-serializes block attributes (a bare `&` becomes
+				// `&amp;`); the delimiters the mask wrote back and the source's
+				// own delimiters are put back as they were.
+				if ( null !== $mask ) {
+					$result['content'] = BlockDelimiterMask::keep_delimiters(
+						$result['content'],
+						is_string( $translated[1] ?? null ) ? $translated[1] : '',
+						$mask->trusted() + BlockDelimiterMask::delimiter_texts( (string) $post->post_content )
+					);
+				}
+			}
+
+			// Create or update the translation post.
 			// Never persist an empty FIELD over source text that wasn't empty.
 			// The count-shape guards upstream only compare array LENGTHS, so a
 			// provider returning "" - or an allowlist that strips a body made
@@ -815,20 +915,41 @@ final class TranslationService {
 					unset( $update_fields[ $column ] );
 				}
 
-				$update_result = wp_update_post(
-					// wp_slash: provider output is unslashed; wp_update_post()
-					// unslashes internally, so backslashes in machine-translated
-					// content (code samples, paths) would be silently stripped.
-					wp_slash( $update_fields ),
-					true
+				// Someone saved the translation while the provider worked: the
+				// saved text stays. Checked here, and again by the guard right
+				// before the row is written.
+				$conflict = static fn(): NotSavedException => new NotSavedException(
+					esc_html__( 'Not saved: someone edited the translation while the provider was translating it, so their edit was kept.', 'perflocale' )
 				);
+
+				if ( self::stored_text( (int) $translated_id ) !== $target_before ) {
+					throw $conflict();
+				}
+
+				$guard = self::guard_text( (int) $translated_id, $target_before );
+
+				try {
+					$update_result = wp_update_post(
+						// wp_slash: provider output is unslashed; wp_update_post()
+						// unslashes internally, so backslashes in machine-translated
+						// content (code samples, paths) would be silently stripped.
+						wp_slash( $update_fields ),
+						true
+					);
+				} finally {
+					$stopped = $guard();
+				}
+
+				if ( $stopped && is_wp_error( $update_result ) ) {
+					throw $conflict();
+				}
 
 				if ( is_wp_error( $update_result ) ) {
 					throw new \RuntimeException( $update_result->get_error_message() );
 				}
 			} else {
-				$inserted      = false;
-				$translated_id = $manager->create_translation( $post_id, $target_lang, false, \PerfLocale\Enum\SourceType::MachineTranslation, $inserted );
+				$created       = false;
+				$translated_id = $manager->create_translation( $post_id, $target_lang, false, \PerfLocale\Enum\SourceType::MachineTranslation, $created );
 
 				if ( ! $translated_id ) {
 					// create_translation can return false on race or invalid
@@ -848,11 +969,14 @@ final class TranslationService {
 				// person's work that the callers' overwrite checks never saw.
 				// The write below also skips the update branch's empty-field
 				// guard, so such a translation is left as it is.
-				if ( ! $inserted ) {
+				if ( true !== $created ) {
 					throw new \RuntimeException(
 						esc_html__( 'This translation already exists, so the machine translation was not written to it.', 'perflocale' )
 					);
 				}
+
+				$inserted = true;
+				$new_row  = self::stored_text( (int) $translated_id, true );
 
 				$update_result = wp_update_post(
 					// wp_slash: provider output is unslashed; wp_update_post()
@@ -873,6 +997,15 @@ final class TranslationService {
 				);
 
 				if ( is_wp_error( $update_result ) ) {
+					// The translation this call inserted holds none of the
+					// machine translation. Linked, a later run would take it as
+					// translated and skip it, so it is removed again while its
+					// whole row is still as it was inserted.
+					if ( null !== $new_row && self::stored_text( (int) $translated_id, true ) === $new_row ) {
+						wp_delete_post( (int) $translated_id, true );
+						$inserted = false;
+					}
+
 					throw new \RuntimeException( $update_result->get_error_message() );
 				}
 			}
@@ -917,6 +1050,99 @@ final class TranslationService {
 			// taken the entry already.
 			\PerfLocale\Translation\BlockSkipFilter::discard_stash( [ $post->post_title, $post->post_content, $post->post_excerpt ] );
 		}
+	}
+
+	/**
+	 * A post's title, content and excerpt (or its whole row) as the database
+	 * holds them now, not as a cache in this process last saw them.
+	 *
+	 * @param int  $post_id   Post ID.
+	 * @param bool $whole_row Every column of the row, not only the three text columns.
+	 * @return array<string, string>|null Null when the post has no row or the read failed.
+	 */
+	private static function stored_text( int $post_id, bool $whole_row = false ): ?array {
+		/**
+		 * WordPress database.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		$row = $whole_row
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The stored row: another request may have saved it.
+			? $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM %i WHERE ID = %d', $wpdb->posts, $post_id ), ARRAY_A )
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The stored row: another request may have saved it.
+			: $wpdb->get_row( $wpdb->prepare( 'SELECT post_title, post_content, post_excerpt FROM %i WHERE ID = %d', $wpdb->posts, $post_id ), ARRAY_A );
+
+		if ( ! is_array( $row ) || '' !== $wpdb->last_error ) {
+			return null;
+		}
+
+		$text = [];
+
+		foreach ( $whole_row ? array_keys( $row ) : [ 'post_title', 'post_content', 'post_excerpt' ] as $column ) {
+			$value                    = $row[ $column ] ?? null;
+			$text[ (string) $column ] = is_scalar( $value ) ? (string) $value : '';
+		}
+
+		return $text;
+	}
+
+	/**
+	 * Hold a post's text to what it was while wp_update_post() saves it.
+	 *
+	 * Right before the posts-table UPDATE of that save (after the
+	 * wp_insert_post_data filters and the pre_post_update actions have run),
+	 * the stored title, content and excerpt are read again. When they differ
+	 * from $expected the UPDATE is not sent: wpdb returns false for an empty
+	 * query, and wp_update_post() returns its 'db_update_error' before any
+	 * after-save hook. Only the main UPDATE of a save of this post is checked
+	 * (armed by its pre_post_update, disarmed by the check).
+	 *
+	 * @param int                        $post_id  Post being saved.
+	 * @param array<string, string>|null $expected stored_text() before the save.
+	 * @return \Closure(): bool Removes the guard; true when it stopped the UPDATE.
+	 */
+	private static function guard_text( int $post_id, ?array $expected ): \Closure {
+		$armed   = false;
+		$stopped = false;
+		$arm     = static function ( $id ) use ( $post_id, &$armed ): void {
+			if ( is_numeric( $id ) && (int) $id === $post_id ) {
+				$armed = true;
+			}
+		};
+		$check   = static function ( $query ) use ( $post_id, $expected, &$armed, &$stopped ) {
+			/**
+			 * WordPress database.
+			 *
+			 * @var \wpdb $wpdb
+			 */
+			global $wpdb;
+
+			if ( ! $armed || ! is_string( $query ) || ! str_starts_with( $query, 'UPDATE `' . $wpdb->posts . '` SET ' ) || 1 !== preg_match( "/ WHERE `ID` = '?" . $post_id . "'?\\z/", $query ) ) {
+				return $query;
+			}
+
+			$armed = false;
+
+			if ( self::stored_text( $post_id ) === $expected ) {
+				return $query;
+			}
+
+			$stopped = true;
+
+			return '';
+		};
+
+		add_action( 'pre_post_update', $arm, PHP_INT_MAX, 1 );
+		add_filter( 'query', $check, PHP_INT_MAX, 1 );
+
+		return static function () use ( $arm, $check, &$stopped ): bool {
+			remove_action( 'pre_post_update', $arm, PHP_INT_MAX );
+			remove_filter( 'query', $check, PHP_INT_MAX );
+
+			return $stopped;
+		};
 	}
 
 	/**

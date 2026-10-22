@@ -729,17 +729,39 @@ final class TermTranslationManager {
 				return false;
 			}
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$updated = $wpdb->update(
-				$links_table,
-				[ 'language_id' => (int) $lang->id ],
-				[
-					'group_id'  => (int) $group->id,
-					'object_id' => $term_id,
-				],
-				[ '%d' ],
-				[ '%d', '%d' ]
-			);
+			$new_lang = (int) $lang->id;
+			$group_id = (int) $group->id;
+			$touch    = \PerfLocale\Database\Schema::touch_write_time( [ [ 'language_id', '%d', 'int' ] ] );
+
+			if ( '' === $touch || ! $wpdb instanceof \wpdb ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$updated = $wpdb->update(
+					$links_table,
+					[ 'language_id' => $new_lang ],
+					[
+						'group_id'  => $group_id,
+						'object_id' => $term_id,
+					],
+					[ '%d' ],
+					[ '%d', '%d' ]
+				);
+			} else {
+				// SQLite: the same write with the write time the column's
+				// ON UPDATE CURRENT_TIMESTAMP gives on MySQL, the assignment
+				// Schema::touch_write_time() returns for language_id written out.
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$updated = $wpdb->query(
+					$wpdb->prepare(
+						'UPDATE %i SET language_id = %d, updated_at = CASE WHEN language_id = %d THEN updated_at ELSE NOW() END WHERE group_id = %d AND object_id = %d',
+						$links_table,
+						$new_lang,
+						$new_lang,
+						$group_id,
+						$term_id
+					) ?? ''
+				);
+				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			}
 
 			// Same return-value gauntlet as PostTranslationManager::set_post_language.
 			// $wpdb->update can return:

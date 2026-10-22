@@ -1970,22 +1970,8 @@ final class SiteHealth {
 		$generator = new \PerfLocale\Strings\TranslationFileGenerator( $plugin->get( 'cache' ) );
 		$files_dir = $generator->get_translations_dir();
 
-		$files       = is_dir( $files_dir ) ? glob( $files_dir . '/*.l10n.php' ) : [];
-		$file_count  = is_array( $files ) ? count( $files ) : 0;
-		$oldest_file = 0;
-
-		if ( $file_count > 0 ) {
-			$oldest_file = PHP_INT_MAX;
-			foreach ( $files as $f ) {
-				$mtime = (int) filemtime( $f );
-				if ( $mtime > 0 && $mtime < $oldest_file ) {
-					$oldest_file = $mtime;
-				}
-			}
-			if ( $oldest_file === PHP_INT_MAX ) {
-				$oldest_file = 0;
-			}
-		}
+		$files      = is_dir( $files_dir ) ? glob( $files_dir . '/*.l10n.php' ) : [];
+		$file_count = is_array( $files ) ? count( $files ) : 0;
 
 		// "Translations exist" here MUST match what the generator can actually
 		// write, so it mirrors the generator's JOIN walk:
@@ -1999,10 +1985,10 @@ final class SiteHealth {
 		// strings-changed) instead of re-running them on every Status load.
 		$cached = get_transient( self::FILES_TRANSIENT );
 
-		if ( is_array( $cached ) && isset( $cached['compilable'], $cached['total_st'], $cached['newest'], $cached['per_language'] ) && is_array( $cached['per_language'] ) ) {
+		if ( is_array( $cached ) && isset( $cached['compilable'], $cached['total_st'], $cached['newest_by_language'], $cached['per_language'] ) && is_array( $cached['per_language'] ) && is_array( $cached['newest_by_language'] ) ) {
 			$compilable_translations = (int) $cached['compilable'];
 			$total_st_rows           = (int) $cached['total_st'];
-			$newest_translation      = (int) $cached['newest'];
+			$newest_by_language      = $cached['newest_by_language'];
 			$per_language            = $cached['per_language'];
 		} else {
 			global $wpdb;
@@ -2020,10 +2006,14 @@ final class SiteHealth {
 			// generator never writes a file for: the total counts every row
 			// (the orphan diagnostic compares it with all of
 			// string_translations), the per-language counts only the rows
-			// that produce a file.
+			// that produce a file. The same walk gives each language's newest
+			// translation for the staleness check, as a Unix time:
+			// UNIX_TIMESTAMP() reads the column in the database session's
+			// time zone, the clock every writer of the column uses
+			// (DEFAULT / ON UPDATE CURRENT_TIMESTAMP).
 			$compiled_rows = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT l.language_id AS lid, LEFT( s.domain, 1 ) = '_' AS is_internal, COUNT(*) AS cnt FROM %i s
+					"SELECT l.language_id AS lid, LEFT( s.domain, 1 ) = '_' AS is_internal, COUNT(*) AS cnt, UNIX_TIMESTAMP( MAX( st.updated_at ) ) AS newest FROM %i s
 					INNER JOIN %i g ON g.id = s.group_id AND g.type = 'string'
 					INNER JOIN %i l ON l.group_id = s.group_id
 					INNER JOIN %i st ON st.string_id = s.id AND st.language_id = l.language_id
@@ -2038,12 +2028,18 @@ final class SiteHealth {
 
 			$compilable_translations = 0;
 			$per_language            = [];
+			$newest_by_language      = [];
 
 			foreach ( (array) $compiled_rows as $compiled_row ) {
-				$compilable_translations += (int) $compiled_row->cnt;
+				$row   = is_object( $compiled_row ) ? get_object_vars( $compiled_row ) : [];
+				$count = is_numeric( $row['cnt'] ?? null ) ? (int) $row['cnt'] : 0;
+				$lid   = is_numeric( $row['lid'] ?? null ) ? (int) $row['lid'] : 0;
 
-				if ( ! (int) $compiled_row->is_internal ) {
-					$per_language[ (int) $compiled_row->lid ] = (int) $compiled_row->cnt;
+				$compilable_translations += $count;
+
+				if ( empty( $row['is_internal'] ) ) {
+					$per_language[ $lid ]       = $count;
+					$newest_by_language[ $lid ] = is_numeric( $row['newest'] ?? null ) ? (int) $row['newest'] : 0;
 				}
 			}
 
@@ -2058,29 +2054,15 @@ final class SiteHealth {
 				)
 			);
 
-			// Newest row across the compilable set (for staleness check).
-			$newest_translation = (int) $wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT UNIX_TIMESTAMP(MAX(st.updated_at)) FROM %i s
-					INNER JOIN %i g ON g.id = s.group_id AND g.type = 'string'
-					INNER JOIN %i l ON l.group_id = s.group_id
-					INNER JOIN %i st ON st.string_id = s.id AND st.language_id = l.language_id
-					WHERE st.translation <> ''",
-					$strings_table,
-					$groups_table,
-					$links_table,
-					$st_table
-				)
-			);
 			// phpcs:enable
 
 			set_transient(
 				self::FILES_TRANSIENT,
 				[
-					'compilable'   => $compilable_translations,
-					'total_st'     => $total_st_rows,
-					'newest'       => $newest_translation,
-					'per_language' => $per_language,
+					'compilable'         => $compilable_translations,
+					'total_st'           => $total_st_rows,
+					'newest_by_language' => $newest_by_language,
+					'per_language'       => $per_language,
 				],
 				self::COUNTS_TTL
 			);
@@ -2131,26 +2113,51 @@ final class SiteHealth {
 		// generator compiles, but no file on disk carries its locale. The
 		// default language is never compiled (it serves source strings), so
 		// it is not checked.
+		//
+		// The same walk collects, per language, its newest compiled file:
+		// a generation run compiles every file of the languages it covers
+		// and rewrites only the files whose content changed, so a language
+		// is current when its newest file is not older than its newest
+		// translation. Comparing across languages, or with a language's
+		// oldest file, reported a language whose file was current as stale.
 		$missing = [];
+		$stale   = [];
 
 		foreach ( (array) $plugin->get( 'lang_repo' )->get_active() as $language ) {
 			if ( ! is_object( $language ) || ! empty( $language->is_default ) || empty( $language->locale ) ) {
 				continue;
 			}
 
-			if ( (int) ( $per_language[ (int) $language->id ] ?? 0 ) <= 0 ) {
+			$language_id = (int) $language->id;
+
+			if ( (int) ( $per_language[ $language_id ] ?? 0 ) <= 0 ) {
 				continue;
 			}
 
-			$suffix = '-' . sanitize_file_name( (string) $language->locale ) . '.l10n.php';
+			$name        = (string) $language->name;
+			$locale      = (string) $language->locale;
+			$suffix      = '-' . sanitize_file_name( $locale ) . '.l10n.php';
+			$newest_file = 0;
 
 			foreach ( is_array( $files ) ? $files : [] as $file ) {
 				if ( str_ends_with( (string) $file, $suffix ) ) {
-					continue 2;
+					$newest_file = max( $newest_file, (int) filemtime( (string) $file ) );
 				}
 			}
 
-			$missing[] = sprintf( '%1$s (%2$s)', (string) $language->name, (string) $language->locale );
+			if ( $newest_file > 0 ) {
+				$newest_row = $newest_by_language[ $language_id ] ?? 0;
+				$newest_row = is_numeric( $newest_row ) ? (int) $newest_row : 0;
+
+				// A short grace window for the files written in the same request as the row.
+				if ( $newest_row > 0 && ( $newest_row - $newest_file ) > 60 ) {
+					$stale[] = [ $name, $locale, $newest_row, $newest_file ];
+				}
+
+				continue;
+			}
+
+			$missing[] = sprintf( '%1$s (%2$s)', $name, $locale );
 		}
 
 		if ( $missing !== [] ) {
@@ -2166,26 +2173,27 @@ final class SiteHealth {
 			);
 		}
 
-		// Case 3: files exist; check staleness (newest translation newer
-		// than oldest file by more than a short grace window).
-		if ( $newest_translation > 0 && $oldest_file > 0 && ( $newest_translation - $oldest_file ) > 60 ) {
+		// Case 3: a language's newest translation is newer than that
+		// language's newest compiled file.
+		if ( $stale !== [] ) {
+			$format = get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T';
+			$lines  = [];
+
+			foreach ( $stale as [ $stale_name, $stale_locale, $newest_row, $newest_file ] ) {
+				$lines[] = sprintf(
+					/* translators: 1: language name, 2: locale, 3: newest translation absolute time, 4: newest file absolute time */
+					__( '%1$s (%2$s): newest translation %3$s, newest compiled file %4$s.', 'perflocale' ),
+					$stale_name,
+					$stale_locale,
+					(string) wp_date( $format, $newest_row ),
+					(string) wp_date( $format, $newest_file )
+				);
+			}
+
 			return $this->recommended(
 				'perflocale_translation_files',
 				__( 'Translation files are stale', 'perflocale' ),
-				sprintf(
-					esc_html(
-						/* translators: 1: count, 2: newest translation absolute time, 3: oldest file absolute time */
-						_n(
-							'%1$d compiled file on disk, but the newest translation row (%2$s) is newer than the oldest file (%3$s). Regenerate so the file cache reflects the current DB state.',
-							'%1$d compiled files on disk, but the newest translation row (%2$s) is newer than the oldest file (%3$s). Regenerate so the file cache reflects the current DB state.',
-							$file_count,
-							'perflocale'
-						)
-					),
-					$file_count,
-					esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T', $newest_translation ) ),
-					esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T', $oldest_file ) )
-				),
+				'<p>' . esc_html__( 'These languages have translations newer than their compiled files. Regenerate so the file cache reflects the current DB state.', 'perflocale' ) . '</p><ul><li>' . implode( '</li><li>', array_map( 'esc_html', $lines ) ) . '</li></ul>',
 				$regen_link
 			);
 		}
@@ -2562,7 +2570,7 @@ final class SiteHealth {
 		// Both outcomes are cached, and that is deliberate: the failing case is
 		// the expensive one, so caching only successes would leave the slow path
 		// slow. The TTL is short enough that a fixed firewall shows up quickly.
-		$dns_key  = 'perflocale_sh_mt_dns_' . md5( $host );
+		$dns_key  = 'perflocale_sh_mt_dns_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host );
 		$resolved = get_transient( $dns_key );
 
 		if ( ! is_string( $resolved ) || '' === $resolved ) {

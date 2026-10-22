@@ -53,6 +53,13 @@ final class EditorSidebar {
 	 * capability surface, and a user who cannot edit a template cannot enumerate
 	 * or create its translations either.
 	 *
+	 * The same script adds a notice to a Navigation block or synced pattern in
+	 * a translated template or template part when the block still names the
+	 * original-language menu or pattern, with an Open or Create link to its
+	 * translation in that language, and a Publish action for a draft or
+	 * pending menu translation (the Site Editor has no status control for
+	 * menus; the action saves the status through core's own route).
+	 *
 	 * @return void
 	 */
 	private function enqueue_site_editor_sidebar(): void {
@@ -78,7 +85,7 @@ final class EditorSidebar {
 		wp_enqueue_script(
 			'perflocale-site-editor-sidebar',
 			PERFLOCALE_URL . 'assets/js/site-editor-sidebar.js',
-			[ 'wp-plugins', 'wp-editor', 'wp-element', 'wp-data', 'wp-api-fetch', 'wp-i18n', 'wp-notices' ],
+			[ 'wp-plugins', 'wp-editor', 'wp-element', 'wp-data', 'wp-api-fetch', 'wp-i18n', 'wp-notices', 'wp-hooks', 'wp-compose', 'wp-block-editor', 'wp-components' ],
 			PERFLOCALE_VERSION,
 			true
 		);
@@ -110,6 +117,14 @@ final class EditorSidebar {
 					/* translators: %s: language name, for example "English". */
 					'renamePattern' => __( 'The %s pattern still has the original name. Rename it in its language, so the pattern lists tell them apart.', 'perflocale' ),
 					'close'         => __( 'Close', 'perflocale' ),
+					/* translators: 1: language name of the original menu, for example "English"; 2: language name of the open template part, for example "Deutsch". */
+					'sharedMenu'    => __( 'This menu is shared with %1$s. Edit its %2$s translation instead.', 'perflocale' ),
+					/* translators: 1: language name of the original pattern, for example "English"; 2: language name of the open template part, for example "Deutsch". */
+					'sharedPattern' => __( 'This pattern is shared with %1$s. Edit its %2$s translation instead.', 'perflocale' ),
+					'open'          => __( 'Open', 'perflocale' ),
+					'publish'       => __( 'Publish', 'perflocale' ),
+					'publishedNote' => __( 'Translation published.', 'perflocale' ),
+					'publishError'  => __( 'Could not publish the translation.', 'perflocale' ),
 				],
 			]
 		);
@@ -193,6 +208,7 @@ final class EditorSidebar {
 				'nonce'           => wp_create_nonce( 'wp_rest' ),
 				'postId'          => get_the_ID(),
 				'postType'        => $screen->post_type,
+				'mtCreateNotice' => MtCreateNotice::editor_message( (int) get_the_ID() ),
 				'i18n'            => [
 					'panelTitle'     => __( 'Translations', 'perflocale' ),
 					'create'         => __( 'Create', 'perflocale' ),

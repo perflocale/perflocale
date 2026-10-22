@@ -56,6 +56,71 @@ final class CacheManager {
 	];
 
 	/**
+	 * The transients flush_all() keeps, as name prefixes: the records whose
+	 * loss changes what the plugin does, not only how fast it does it. A
+	 * notice waiting for one user's next screen, the user an auto-translate
+	 * job reports to, a rate-limit window, a breaker state and the flag that
+	 * keeps the files-mode loader retrying are not cache, and one user's
+	 * Clear cache, import or WP-CLI flush must not take them from another.
+	 *
+	 * The data registry decides: this list equals
+	 * DataRegistry::flush_kept_transient_prefixes() (the LIKE prefix of every
+	 * transient it classes STATE), which the release gate's rule E13 and the
+	 * unit tests check. A new state transient is declared there with class
+	 * STATE and its prefix added here.
+	 *
+	 * @var list<string>
+	 */
+	public const FLUSH_KEPT_TRANSIENTS = [
+		'perflocale_breaker_',
+		'perflocale_bulk_mt_error_',
+		'perflocale_bulk_mt_warning_',
+		'perflocale_import_notice_',
+		'perflocale_lang_save_error_',
+		'perflocale_mt_create_notice_',
+		'perflocale_mt_publisher_',
+		'perflocale_mt_rl_',
+		'perflocale_po_import_result_',
+		'perflocale_scan_queued_notice_',
+		'perflocale_scan_result_',
+		'perflocale_strings_regenerating',
+	];
+
+	/**
+	 * The fixed-name transients flush_all() deletes by name when a persistent
+	 * object cache holds the transients: there they live only in its
+	 * `transient` group, which the wp_options sweep does not reach and which
+	 * cannot be searched by prefix. Without an object cache the sweep deletes
+	 * them with every other `perflocale_*` row.
+	 *
+	 * The data registry decides: this list equals
+	 * DataRegistry::flush_deleted_transient_names() (every core transient of
+	 * class DERIVED or LEGACY whose name has no placeholder), which the unit
+	 * tests check. The DERIVED transients whose names carry a placeholder are
+	 * reached another way: the DNS answers through flush_scoped_hash(), the
+	 * WooCommerce variation and copy maps through their epochs (in this
+	 * list), and the `perflocale_{group}_*` and `perflocale_{md5}` rows are
+	 * written only without an object cache.
+	 *
+	 * @var list<string>
+	 */
+	public const FLUSH_DELETED_TRANSIENTS = [
+		'perflocale_bootable_addons',
+		'perflocale_exports_exposed',
+		'perflocale_mt_wp_ai_ready',
+		'perflocale_rewrites_verified',
+		'perflocale_site_health_counts',
+		'perflocale_site_health_files',
+		'perflocale_site_health_hreflang',
+		'perflocale_site_health_mt_scoring',
+		'perflocale_site_health_orphans',
+		'perflocale_site_health_stuck',
+		'perflocale_string_blob_max',
+		'perflocale_vcopy_epoch',
+		'perflocale_vsig_epoch',
+	];
+
+	/**
 	 * Maximum number of entries in the L1 static cache.
 	 * 5000 accommodates sites with many translated strings (3000+ gettext calls/page)
 	 * without triggering frequent eviction.
@@ -105,6 +170,56 @@ final class CacheManager {
 	private static array $gen_memo = [];
 
 	/**
+	 * Option counting the announced per-entry invalidations (delete(),
+	 * delete_many(), delete_existing(), delete_autoloaded_options()) of each
+	 * blog, which no generation records: refresh_if_changed() reads it with
+	 * the generations. Not autoloaded; named under the generation prefix so
+	 * the checkpoint's one query reads it.
+	 */
+	private const CHANGES_OPTION = 'perflocale_cgen__changes';
+
+	/**
+	 * Blogs with per-entry invalidations this process has not announced yet
+	 * (announce_changes() raises their change counters).
+	 *
+	 * @var array<int, true>
+	 */
+	private static array $changes_pending = [];
+
+	/**
+	 * Whether announce_changes() is registered as a shutdown function.
+	 *
+	 * @var bool
+	 */
+	private static bool $announce_registered = false;
+
+	/**
+	 * The change counter of each blog as this process's last checkpoint read
+	 * it.
+	 *
+	 * @var array<int, int>
+	 */
+	private static array $changes_seen = [];
+
+	/**
+	 * How many times this process raised each blog's change counter since its
+	 * last checkpoint read it. The next checkpoint counts these raises as its
+	 * own, not as another process's change.
+	 *
+	 * @var array<int, int>
+	 */
+	private static array $changes_own = [];
+
+	/**
+	 * Blogs on which this process's own generation bump read back a value
+	 * that also holds another process's bump, by blog id. The bump moved this
+	 * process's memo past that change, so the next checkpoint reports it.
+	 *
+	 * @var array<int, true>
+	 */
+	private static array $bumped_past = [];
+
+	/**
 	 * How many times wp_load_alloptions() had run in this process (the
 	 * did_filter() count of its pre_wp_load_alloptions filter) when
 	 * flush_runtime() last emptied the runtime object cache, or null when it
@@ -113,6 +228,14 @@ final class CacheManager {
 	 * @var int|null
 	 */
 	private static ?int $runtime_flushed_at = null;
+
+	/**
+	 * Whether the object-cache drop-in empties its runtime cache itself
+	 * (drop_in_flushes_runtime()), or null before the first check.
+	 *
+	 * @var bool|null
+	 */
+	private static ?bool $drop_in_flushes_runtime = null;
 
 	/**
 	 * Autoloaded options whose row delete_autoloaded_options() found absent
@@ -568,6 +691,21 @@ final class CacheManager {
 	 * @return void
 	 */
 	public function delete( string $key, string $group = self::GROUP ): void {
+		$this->evict( $key, $group );
+
+		self::note_change();
+	}
+
+	/**
+	 * Delete a value from all cache layers without announcing a change: for
+	 * a read result that must not stay cached (a failed load), where the
+	 * stored data did not change.
+	 *
+	 * @param string $key Cache key.
+	 * @param string $group Cache group.
+	 * @return void
+	 */
+	public function evict( string $key, string $group = self::GROUP ): void {
 		$full_key = $this->make_static_key( $group, $key );
 
 		unset( $this->static_cache[ $full_key ] );
@@ -605,6 +743,8 @@ final class CacheManager {
 		if ( $keys === [] ) {
 			return;
 		}
+
+		self::note_change();
 
 		$l2_keys = [];
 		$names   = [];
@@ -689,6 +829,8 @@ final class CacheManager {
 		if ( $keys === [] ) {
 			return;
 		}
+
+		self::note_change();
 
 		$l2_keys = [];
 
@@ -963,6 +1105,8 @@ final class CacheManager {
 	 * @return void
 	 */
 	public static function delete_autoloaded_options( array $names ): void {
+		self::note_change();
+
 		$absent = [];
 
 		foreach ( $names as $name ) {
@@ -1081,6 +1225,264 @@ final class CacheManager {
 	}
 
 	/**
+	 * Release posts a loop has finished with from this process's runtime
+	 * object cache, so a loop over many posts holds one batch at a time.
+	 * Nothing is invalidated: a persistent backend keeps every entry and no
+	 * last_changed key moves.
+	 *
+	 * Without a persistent object cache the posts are deleted from the
+	 * in-memory cache, which is all that cache is. A
+	 * persistent cache offers no way to drop one key from memory only, so
+	 * its runtime copies are dropped together, and only when the drop-in
+	 * implements wp_cache_flush_runtime() itself: core's stand-in for a
+	 * drop-in without one calls wp_cache_flush(), which empties the
+	 * persistent cache.
+	 *
+	 * @param array<int, int> $post_ids Posts the loop has finished with.
+	 * @return void
+	 */
+	public static function release_runtime_posts( array $post_ids ): void {
+		if ( ! wp_using_ext_object_cache() ) {
+			if ( $post_ids !== [] ) {
+				wp_cache_delete_multiple( $post_ids, 'posts' );
+			}
+
+			return;
+		}
+
+		if ( self::drop_in_flushes_runtime() ) {
+			self::flush_runtime();
+		}
+	}
+
+	/**
+	 * Whether the object-cache drop-in empties its runtime cache itself: it
+	 * supports 'flush_runtime' and defines wp_cache_flush_runtime(), which
+	 * is then not core's cache-compat.php stand-in.
+	 *
+	 * @return bool
+	 */
+	private static function drop_in_flushes_runtime(): bool {
+		if ( self::$drop_in_flushes_runtime === null ) {
+			self::$drop_in_flushes_runtime = false;
+
+			if ( function_exists( 'wp_cache_supports' ) && wp_cache_supports( 'flush_runtime' ) && function_exists( 'wp_cache_flush_runtime' ) ) {
+				$file = ( new \ReflectionFunction( 'wp_cache_flush_runtime' ) )->getFileName();
+
+				self::$drop_in_flushes_runtime = is_string( $file ) && basename( $file ) !== 'cache-compat.php';
+			}
+		}
+
+		return self::$drop_in_flushes_runtime;
+	}
+
+	/**
+	 * Record that this process dropped cached entries of the current blog.
+	 * No query: announce_changes() raises the blog's change counter once the
+	 * invalidations are done, at this process's next checkpoint
+	 * (refresh_if_changed()), at the end of a background job's run, or when
+	 * the request ends. A later group flush of the same blog announces them
+	 * instead (bump_generation()).
+	 *
+	 * @return void
+	 */
+	private static function note_change(): void {
+		self::$changes_pending[ is_multisite() ? get_current_blog_id() : 0 ] = true;
+
+		// WordPress's fatal error handler is a shutdown function registered
+		// before this one; when it shows its error page, wp_die() ends the
+		// process before later shutdown functions run, so the page's
+		// arguments filter announces first.
+		if ( ! self::$announce_registered ) {
+			self::$announce_registered = true;
+			register_shutdown_function( [ self::class, 'announce_at_shutdown' ] );
+			add_filter( 'wp_php_error_args', [ self::class, 'announce_before_error_page' ], 10, 1 );
+		}
+	}
+
+	/**
+	 * The shutdown announcement. An entry dropped by a shutdown function
+	 * that runs after this one registers it again, so that change is
+	 * announced too.
+	 *
+	 * @internal Public only for register_shutdown_function().
+	 *
+	 * @return void
+	 */
+	public static function announce_at_shutdown(): void {
+		self::$announce_registered = false;
+
+		self::announce_changes();
+	}
+
+	/**
+	 * Announce before WordPress's fatal error page ends the process.
+	 *
+	 * @internal Public only for the wp_php_error_args filter.
+	 *
+	 * @param mixed $args The error page's arguments, returned unchanged.
+	 * @return mixed
+	 */
+	public static function announce_before_error_page( mixed $args ): mixed {
+		self::announce_changes();
+
+		return $args;
+	}
+
+	/**
+	 * Raise the change counter of each blog this process dropped cached
+	 * entries of since the last announcement, one write per blog, so another
+	 * long-running process's next checkpoint sees invalidations no generation
+	 * records. Runs after the invalidations it announces: at this process's
+	 * checkpoints, at the end of a background job's run and when the request
+	 * ends. A blog whose write fails stays pending for the next announcement.
+	 *
+	 * @return bool Whether every pending blog was announced.
+	 */
+	public static function announce_changes(): bool {
+		global $wpdb;
+
+		if ( self::$changes_pending === [] ) {
+			return true;
+		}
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		$autoload = function_exists( 'wp_determine_option_autoload_value' ) ? 'off' : 'no';
+		$all      = true;
+
+		foreach ( array_keys( self::$changes_pending ) as $blog ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic counter; read only by refresh_if_changed().
+			$raised = $wpdb->query( $wpdb->prepare( "INSERT INTO %i (option_name, option_value, autoload) VALUES (%s, '1', %s) ON DUPLICATE KEY UPDATE option_value = option_value + 1", 0 === $blog ? $wpdb->options : $wpdb->get_blog_prefix( $blog ) . 'options', self::CHANGES_OPTION, $autoload ) ?? '' );
+
+			if ( false === $raised ) {
+				$all = false;
+
+				continue;
+			}
+
+			unset( self::$changes_pending[ $blog ] );
+			self::$changes_own[ $blog ] = ( self::$changes_own[ $blog ] ?? 0 ) + 1;
+		}
+
+		return $all;
+	}
+
+	/**
+	 * Bring this process up to date with what other processes changed, when
+	 * they changed anything PerfLocale caches. For long-running processes
+	 * only, at their checkpoints (between batches and items of a WP-CLI
+	 * command or a background job); never on a page request, which is too
+	 * short for another process's change to matter.
+	 *
+	 * A PerfLocale write that changes cached data bumps a group generation
+	 * (perflocale_cgen_<group>; a settings save bumps the languages group) or
+	 * drops single entries, which raises the blog's change counter once the
+	 * writing process announces it (announce_changes()). This process first
+	 * announces its own dropped entries, so its own raises are counted as its
+	 * own. It keeps the generations it read (the per-process memo) and an
+	 * in-memory copy of the autoloaded options, so without a checkpoint it
+	 * serves what it read first for as long as it runs. One query reads this blog's generations; when one this process
+	 * uses differs, the memo takes the database values, the
+	 * in-memory caches go (this object's static cache, the per-request memos
+	 * a blog switch resets, Bootstrap::reset_static_state(), the routing
+	 * memos and the runtime object cache) and the next reads load the
+	 * current data. Nothing changed: nothing is dropped.
+	 *
+	 * @return bool Whether another process changed anything.
+	 */
+	public static function refresh_if_changed(): bool {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		self::announce_changes();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The generations as committed, past every in-process copy.
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT option_name, option_value FROM %i WHERE option_name LIKE %s', $wpdb->options, $wpdb->esc_like( self::GEN_OPTION_PREFIX ) . '%' ), ARRAY_A );
+
+		// A failed read changes nothing: the next checkpoint compares with
+		// the last reading that succeeded.
+		if ( null === $rows || '' !== $wpdb->last_error ) {
+			return false;
+		}
+
+		$committed = [];
+
+		foreach ( $rows as $row ) {
+			if ( isset( $row['option_name'], $row['option_value'] ) && is_string( $row['option_name'] ) && is_numeric( $row['option_value'] ) ) {
+				$committed[ substr( $row['option_name'], strlen( self::GEN_OPTION_PREFIX ) ) ] = (int) $row['option_value'];
+			}
+		}
+
+		// A group this process has not used yet holds nothing in memory: it
+		// takes the committed generation without counting as a change. The
+		// change counter compares with the previous checkpoint's reading plus
+		// the raises this process made since.
+		$blog    = is_multisite() ? get_current_blog_id() : 0;
+		$changed = false;
+		$changes = $committed[ substr( self::CHANGES_OPTION, strlen( self::GEN_OPTION_PREFIX ) ) ] ?? 0;
+
+		if ( isset( self::$changes_seen[ $blog ] ) && self::$changes_seen[ $blog ] + ( self::$changes_own[ $blog ] ?? 0 ) !== $changes ) {
+			$changed = true;
+		}
+
+		self::$changes_seen[ $blog ] = $changes;
+		unset( self::$changes_own[ $blog ] );
+
+		if ( isset( self::$bumped_past[ $blog ] ) ) {
+			$changed = true;
+			unset( self::$bumped_past[ $blog ] );
+		}
+
+		foreach ( self::GROUPS as $group ) {
+			$memo_key = $blog . ':' . $group;
+			$now      = $committed[ $group ] ?? 0;
+
+			if ( isset( self::$gen_memo[ $memo_key ] ) && self::$gen_memo[ $memo_key ] !== $now ) {
+				$changed = true;
+			}
+
+			self::$gen_memo[ $memo_key ] = $now;
+		}
+
+		if ( ! $changed ) {
+			return false;
+		}
+
+		self::flush_runtime();
+
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( $plugin->has( 'cache' ) ) {
+			$cache = $plugin->get( 'cache' );
+
+			if ( $cache instanceof self ) {
+				$cache->reset_static();
+			}
+		}
+
+		\PerfLocale\Bootstrap::reset_static_state();
+		\PerfLocale\Router\UrlConverter::reset_static_caches();
+		\PerfLocale\Router\SlugManager::reset_static_caches();
+
+		/**
+		 * Fires when a long-running process's checkpoint found data another
+		 * process changed and dropped its in-memory copies
+		 * (CacheManager::refresh_if_changed()).
+		 *
+		 * @hook perflocale/cache/refreshed
+		 */
+		do_action( 'perflocale/cache/refreshed' );
+
+		return true;
+	}
+
+	/**
 	 * Whether flush_runtime() emptied the runtime object cache and nothing in
 	 * this process has loaded the autoloaded options list since.
 	 *
@@ -1156,13 +1558,37 @@ final class CacheManager {
 	}
 
 	/**
-	 * Instance shim for the static generation bump (used by flush_*()).
+	 * The md5 that ends the name of a transient keyed by a runtime value (a
+	 * host name; the DNS answers are `perflocale_dns_` and this hash): a
+	 * hash of the value and the default group's generation. flush_all()
+	 * bumps that generation, so it retires every such name on any backend,
+	 * including a persistent object cache, where a transient cannot be found
+	 * by prefix. The generation is an autoloaded option, memoised per
+	 * process, so the name costs no query.
+	 *
+	 * @param string $value The value the transient is keyed by.
+	 * @return string
+	 */
+	public static function flush_scoped_hash( string $value ): string {
+		return md5( self::l2_generation( self::GROUP ) . '|' . $value );
+	}
+
+	/**
+	 * The generation bump of the group flushes (flush_*(), invalidate_group()).
+	 *
+	 * A written bump also announces the entries this process dropped on this
+	 * blog before it: a checkpoint compares every generation of self::GROUPS,
+	 * so their change counter write is not needed. The group flushes run
+	 * after their writes commit; a bump made inside a transaction (the eager
+	 * link map's) goes through bump_group_generation() and announces nothing.
 	 *
 	 * @param string $group Cache group.
 	 * @return void
 	 */
 	private function bump_generation( string $group ): void {
-		self::bump_group_generation( $group );
+		if ( self::bump_group_generation( $group ) && in_array( $group, self::GROUPS, true ) ) {
+			unset( self::$changes_pending[ is_multisite() ? get_current_blog_id() : 0 ] );
+		}
 	}
 
 	/**
@@ -1172,13 +1598,15 @@ final class CacheManager {
 	 * autoloaded option, so there is no instance state to keep in sync.
 	 *
 	 * @param string $group Cache group.
-	 * @return void
+	 * @return bool Whether the increment was written.
 	 */
-	public static function bump_group_generation( string $group ): void {
+	public static function bump_group_generation( string $group ): bool {
 		global $wpdb;
 
 		$option   = self::GEN_OPTION_PREFIX . $group;
-		$memo_key = ( is_multisite() ? get_current_blog_id() : 0 ) . ':' . $group;
+		$blog     = is_multisite() ? get_current_blog_id() : 0;
+		$memo_key = $blog . ':' . $group;
+		$previous = self::$gen_memo[ $memo_key ] ?? null;
 
 		// Increment in the DB, never memo+1. l2_generation() pins the
 		// generation for the whole PHP process, so a long-lived worker
@@ -1197,7 +1625,7 @@ final class CacheManager {
 		// l2_generation() costs no query on the read path (see its docblock);
 		// the ON DUPLICATE branch must not touch the autoload column.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->query(
+		$bumped = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
 				 VALUES (%s, '1', 'yes')
@@ -1219,7 +1647,13 @@ final class CacheManager {
 		wp_cache_delete( 'alloptions', 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 
+		if ( null !== $previous && $committed !== $previous + 1 ) {
+			self::$bumped_past[ $blog ] = true;
+		}
+
 		self::$gen_memo[ $memo_key ] = $committed;
+
+		return false !== $bumped;
 	}
 
 	/**
@@ -1241,7 +1675,7 @@ final class CacheManager {
 		);
 
 		// L2: generation bump - reliable on every backend.
-		self::bump_group_generation( $group );
+		$this->bump_generation( $group );
 
 		// L3: without a persistent object cache, values live as transients in
 		// wp_options (generation-versioning only covers L2). Drop this group's
@@ -1276,39 +1710,65 @@ final class CacheManager {
 	 * wp_cache_delete() calls are pure memory ops without a drop-in and keep
 	 * same-request get_transient() reads coherent after the raw SQL.
 	 *
-	 * @param string $transient_prefix Transient-name prefix, i.e. the option
-	 *                                 name WITHOUT its `_transient_` prefix.
+	 * Names under a $keep prefix are left alone, value and timeout row alike:
+	 * one `NOT LIKE` per kept prefix in the same two statements, so a kept
+	 * name is neither deleted nor dropped from any cache.
+	 *
+	 * @param string       $transient_prefix Transient-name prefix, i.e. the
+	 *                                       option name WITHOUT its
+	 *                                       `_transient_` prefix.
+	 * @param list<string> $keep             Transient-name prefixes to keep.
 	 * @return void
 	 */
-	private function delete_transients_by_prefix( string $transient_prefix ): void {
+	private function delete_transients_by_prefix( string $transient_prefix, array $keep = [] ): void {
 		global $wpdb;
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
 
 		$prefix         = $wpdb->esc_like( '_transient_' . $transient_prefix ) . '%';
 		$timeout_prefix = $wpdb->esc_like( '_transient_timeout_' . $transient_prefix ) . '%';
+		$kept_values    = [];
+		$kept_timeouts  = [];
 
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		foreach ( $keep as $kept ) {
+			$kept_values[]   = $wpdb->esc_like( '_transient_' . $kept ) . '%';
+			$kept_timeouts[] = $wpdb->esc_like( '_transient_timeout_' . $kept ) . '%';
+		}
+
+		$not_values   = implode( '', array_fill( 0, count( $kept_values ), ' AND option_name NOT LIKE %s' ) );
+		$not_timeouts = implode( '', array_fill( 0, count( $kept_timeouts ), ' AND option_name NOT LIKE %s' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$names = $wpdb->get_col(
-			$wpdb->prepare( "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s", $prefix )
+			$wpdb->prepare( "SELECT option_name FROM %i WHERE option_name LIKE %s{$not_values}", $wpdb->options, $prefix, ...$kept_values )
 		);
 
+		// prepare() gives null only for a malformed statement; query('')
+		// then runs nothing.
 		$wpdb->query(
 			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+				"DELETE FROM %i WHERE ( option_name LIKE %s OR option_name LIKE %s ){$not_values}{$not_timeouts}",
+				$wpdb->options,
 				$prefix,
-				$timeout_prefix
-			)
+				$timeout_prefix,
+				...$kept_values,
+				...$kept_timeouts
+			) ?? ''
 		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		// phpcs:enable
 
 		// With a drop-in installed get_transient() reads the object cache's
 		// shared `transient` group instead of wp_options. CacheManager never
 		// writes there (set()/set_many() skip L3 in that mode), but the
-		// plugin's hand-rolled transients do - the strings-regenerating flag,
-		// the per-user admin notices, Breaker state - and the rows we just
-		// deleted are the pre-drop-in twins of exactly those names, which the
-		// old delete_transient() loop used to clear. Keep that behaviour. The
-		// set shrinks to nothing after the first sweep (those rows are gone
-		// for good), so this costs one round-trip per legacy row, once.
+		// plugin's hand-rolled transients do (Site Health counts, the add-on
+		// boot list, DNS lookups), and the rows just deleted are the twins of
+		// those names written before the drop-in appeared, so their
+		// object-cache copies go too. The set shrinks to nothing after the
+		// first sweep (those rows are gone for good), so this costs one
+		// round-trip per such row, once. Kept names are not in the set.
 		$ext_cache = wp_using_ext_object_cache();
 
 		foreach ( (array) $names as $name ) {
@@ -1328,7 +1788,13 @@ final class CacheManager {
 	}
 
 	/**
-	 * Flush all PerfLocale caches.
+	 * Flush all PerfLocale caches, and only those.
+	 *
+	 * Every `perflocale_` transient goes except the state ones
+	 * (FLUSH_KEPT_TRANSIENTS): another user's pending notice, a breaker or a
+	 * rate-limit window survives a flush. A persistent object cache keeps
+	 * every key outside PerfLocale's groups and transients: other plugins'
+	 * data and WordPress's own.
 	 *
 	 * @return void
 	 */
@@ -1344,7 +1810,8 @@ final class CacheManager {
 			$this->bump_generation( $group );
 		}
 
-		// L3: every `perflocale_*` transient in one SELECT + one bulk DELETE,
+		// L3: every `perflocale_*` transient but the kept state ones
+		// (FLUSH_KEPT_TRANSIENTS) in one SELECT + one bulk DELETE,
 		// with the per-name cache busts that keep get_transient() from reading
 		// through to a value we just removed (the reason the original code
 		// looped delete_transient() instead of issuing a wildcard DELETE -
@@ -1366,14 +1833,18 @@ final class CacheManager {
 		// wp_options row, so L3 rows written before the drop-in appeared
 		// survived every flush forever (5,659 of them non-expiring on that
 		// same site). The bulk DELETE reaps them.
-		$this->delete_transients_by_prefix( 'perflocale_' );
+		$this->delete_transients_by_prefix( 'perflocale_', self::FLUSH_KEPT_TRANSIENTS );
 
-		// The epochs of the stored variation maps and copy maps, by name: with
-		// a persistent object cache the maps and their epochs live only in
-		// its `transient` group, which the sweep above does not reach. A
+		// With a persistent object cache the transients live only in its
+		// `transient` group, which the sweep above does not reach: the
+		// fixed-name DERIVED and LEGACY ones go by name, in one call. Among
+		// them are the epochs of the stored variation maps and copy maps; a
 		// missing epoch retires every stored map of the blog (InventorySync).
-		delete_transient( \PerfLocale\WooCommerce\InventorySync::STORED_MAP_EPOCH );
-		delete_transient( \PerfLocale\WooCommerce\InventorySync::COPY_MAP_EPOCH );
+		// The DNS answers are retired by the generation bump above (see
+		// flush_scoped_hash()).
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete_multiple( self::FLUSH_DELETED_TRANSIENTS, 'transient' );
+		}
 
 		// L0: the eager link map is a plain autoloaded option, not a
 		// transient, so neither the generation bumps above nor the L3 sweep
@@ -1384,7 +1855,7 @@ final class CacheManager {
 		// before whatever the operator was trying to fix, leaving that state
 		// with no user-reachable recovery at all. Pure invalidation: the map
 		// rebuilds lazily in TranslationGroupRepository::get_eager_link_map(),
-		// which re-persists it with autoload still on. Five option deletes,
+		// which re-persists it with autoload still on. Six option deletes,
 		// paid only where flush_all() itself already runs - the admin
 		// Clear-cache button, WP-CLI, deactivation and the version-gated
 		// one-shot in Migrator::maybe_update() - never on a steady-state
@@ -1407,7 +1878,7 @@ final class CacheManager {
 		// each map's copy under its own key.
 		$eager_options = [];
 
-		foreach ( [ 'post', 'term', 'string', 'post_type', 'taxonomy' ] as $eager_type ) {
+		foreach ( [ 'post', 'term', 'option', 'string', 'post_type', 'taxonomy' ] as $eager_type ) {
 			$eager_options[] = 'perflocale_eager_links_' . $eager_type;
 		}
 

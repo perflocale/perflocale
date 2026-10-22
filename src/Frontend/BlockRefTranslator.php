@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Frontend;
 
+use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Enum\ObjectType;
 use PerfLocale\Plugin;
 use PerfLocale\Router\LanguageRouter;
@@ -538,9 +539,12 @@ final class BlockRefTranslator {
 	 * menu's items and then watch the TRANSLATED menu render - one lookup per
 	 * item instead of one batched query, on exactly the pages using the feature.
 	 *
-	 * @param int    $ref       Source post id.
+	 * A reference that names this language's own menu or pattern which cannot
+	 * render resolves to the default-language one instead.
+	 *
+	 * @param int    $ref       Referenced post id.
 	 * @param string $post_type Post type the translation is required to be.
-	 * @return int Translated post id, or 0 to keep the source.
+	 * @return int Post id to render instead, or 0 to keep the reference.
 	 */
 	public function translated_ref( int $ref, string $post_type ): int {
 		if ( $ref <= 0 || '' === $post_type ) {
@@ -575,7 +579,23 @@ final class BlockRefTranslator {
 			);
 		}
 
-		$id = (int) ( $this->manager->get_translation_id( $ref, $this->slug ) ?? 0 );
+		$translations = $this->manager->get_translations( $ref );
+		$id           = (int) ( $translations[ $this->slug ] ?? 0 );
+
+		// The reference already names this language's member, as a translated
+		// template's Navigation block or synced pattern does once
+		// TemplateBlockRefs pointed it there. It renders while it is usable;
+		// otherwise the default-language member renders, as it would from the
+		// source's id.
+		if ( $id === $ref ) {
+			if ( self::is_usable_target( get_post( $ref ), $post_type ) ) {
+				return 0;
+			}
+
+			$default      = $this->router->get_default_language();
+			$default_slug = is_object( $default ) && isset( $default->slug ) && is_string( $default->slug ) ? $default->slug : '';
+			$id           = '' !== $default_slug ? (int) ( $translations[ $default_slug ] ?? 0 ) : 0;
+		}
 
 		if ( $id <= 0 || $id === $ref ) {
 			return 0;
@@ -638,8 +658,9 @@ final class BlockRefTranslator {
 	 *
 	 * WHY: resolution is per reference, and each one costs a link query plus a
 	 * post read. Measured cold on this machine, 25 distinct patterns cost 30
-	 * queries; batching the links and priming the post cache costs 3, after
-	 * which the per-reference path costs 0. The same shape holds at scale - 50
+	 * queries; batching the links and priming the posts with their meta costs
+	 * at most 3 (none for links already cached), after which the
+	 * per-reference path costs 0. The same shape holds at scale - 50
 	 * distinct patterns added 49 queries on sites without an object cache. A
 	 * warm persistent cache hides most of it, which is exactly why the sites
 	 * that lack one are the ones that need this.
@@ -702,12 +723,21 @@ final class BlockRefTranslator {
 			return;
 		}
 
-		$grouped = $plugin->get( 'group_repo' )->get_translations_for_objects( $refs, ObjectType::Post );
+		$repo = $plugin->get( 'group_repo' );
+
+		if ( ! $repo instanceof TranslationGroupRepository ) {
+			return;
+		}
+
+		// Through the link caches translated_ref() reads: links the eager map,
+		// this request or the object cache already hold cost nothing, and the
+		// rest load in one query into those same caches.
+		$repo->prime_translations( ObjectType::Post, $refs );
 
 		$targets = [];
 
-		foreach ( (array) $grouped as $links ) {
-			foreach ( (array) $links as $link ) {
+		foreach ( $refs as $ref ) {
+			foreach ( $repo->get_translations( $ref, ObjectType::Post ) as $link ) {
 				if ( isset( $link->language_slug ) && $link->language_slug === $this->slug ) {
 					$targets[] = (int) $link->object_id;
 				}
@@ -718,8 +748,10 @@ final class BlockRefTranslator {
 			return;
 		}
 
-		// Terms and meta are not read by the resolver, so do not pay for them.
-		_prime_post_caches( array_values( array_unique( $targets ) ), false, false );
+		// Meta too: core reads the post meta of every synced pattern and menu
+		// it renders (apply_block_hooks_to_content_from_post_object()). Terms
+		// are not read, so they are not loaded.
+		_prime_post_caches( array_values( array_unique( $targets ) ), false, true );
 	}
 
 	/**

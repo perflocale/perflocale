@@ -27,6 +27,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Reads Polylang's term_taxonomy entries (taxonomy `language`,
  * `post_translations`, and `term_translations`) to reconstruct
  * translation relationships in PerfLocale's group system.
+ *
+ * @phpstan-type ImportResult array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>, notices: array<int, string>, skipped: array<string, int>, skipped_examples: array<string, list<string>>, unmapped_languages: array<string, int>, overridden: array<string, int>, overridden_examples: array<string, list<string>>, conflict_policy: array<string, string>, incomplete: bool}
  */
 final class PolylangImporter {
 
@@ -96,6 +98,122 @@ final class PolylangImporter {
 	private int $link_failures = 0;
 
 	/**
+	 * Examples kept per skip reason.
+	 */
+	private const SKIPPED_EXAMPLES = 5;
+
+	/**
+	 * Object ids per page of the bits that record which objects were counted
+	 * (4 KiB per page).
+	 */
+	private const SEEN_PAGE_IDS = 32768;
+
+	/**
+	 * Source items read and deliberately not linked, per reason (WPML's reason
+	 * names where the meaning is the same).
+	 *
+	 * @var array<string, int>
+	 */
+	private array $skipped = [];
+
+	/**
+	 * A few examples per skip reason, ids only.
+	 *
+	 * @var array<string, list<string>>
+	 */
+	private array $skipped_examples = [];
+
+	/**
+	 * Objects already counted, per kind of count and type ('missing|post'
+	 * and so on), so an object listed in a set and in its language is counted
+	 * once: one bit per object id, in pages of SEEN_PAGE_IDS ids.
+	 *
+	 * @var array<string, array<int, string>>
+	 */
+	private array $seen = [];
+
+	/**
+	 * Whether a read or a write the import needed failed. A rerun imports what
+	 * this run left out.
+	 *
+	 * @var bool
+	 */
+	private bool $incomplete = false;
+
+	/**
+	 * Source-map rows that could not be written on the reuse path.
+	 *
+	 * @var int
+	 */
+	private int $map_failures = 0;
+
+	/**
+	 * Polylang languages with no PerfLocale language of their own (no match,
+	 * or a match another Polylang language already took), as slug keys.
+	 *
+	 * @var array<string, true>
+	 */
+	private array $unmapped = [];
+
+	/**
+	 * Objects not imported per unmapped Polylang language.
+	 *
+	 * @var array<string, int>
+	 */
+	private array $unmapped_by_language = [];
+
+	/**
+	 * Language conflict policy per object type, read once when the import starts.
+	 *
+	 * @var array<string, string>
+	 */
+	private array $policies = [];
+
+	/**
+	 * Objects whose language the `source` policy changed, per reason.
+	 *
+	 * @var array<string, int>
+	 */
+	private array $overridden = [];
+
+	/**
+	 * A few examples per override reason, ids and language slugs only.
+	 *
+	 * @var array<string, list<string>>
+	 */
+	private array $overridden_examples = [];
+
+	/**
+	 * PerfLocale's default language id, read once.
+	 *
+	 * @var int|null
+	 */
+	private ?int $default_id = null;
+
+	/**
+	 * The object that holds each language of the groups read for the current
+	 * page: group id => language id => object id. Null until the page's first
+	 * slot check reads its groups.
+	 *
+	 * @var array<int, array<int, int>>|null
+	 */
+	private ?array $slots = null;
+
+	/**
+	 * The groups the current page's objects sit in, read at its first slot check.
+	 *
+	 * @var array<int, int>
+	 */
+	private array $slot_groups = [];
+
+	/**
+	 * The group each object of the read groups sits in: object id => group id.
+	 *
+	 * @var array<int, int>
+	 */
+	private array $slot_of = [];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param CacheManager $cache Cache manager - accepted for DI consistency
@@ -125,28 +243,51 @@ final class PolylangImporter {
 	/**
 	 * Run the full Polylang import.
 	 *
-	 * @return array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>}
+	 * `errors` lists what failed or could not be done; `notices` what the run
+	 * reports without it being a failure (strings PerfLocale has no place for,
+	 * types it now translates, prices kept per language, menus left as they
+	 * are, the language check's findings on a catch-up import).
+	 * `skipped` counts source items that were read and deliberately not linked,
+	 * per reason, with a few `skipped_examples` (ids only); `incomplete` is
+	 * true when a read the import needed failed, so the run did not finish and
+	 * a rerun imports the rest.
+	 *
+	 * @return ImportResult
 	 */
 	public function import(): array {
 		$result = [
-			'posts'   => 0,
-			'terms'   => 0,
-			'menus'   => 0,
-			'strings' => 0,
-			'errors'  => [],
+			'posts'               => 0,
+			'terms'               => 0,
+			'menus'               => 0,
+			'strings'             => 0,
+			'errors'              => [],
+			'notices'             => [],
+			'skipped'             => [],
+			'skipped_examples'    => [],
+			'unmapped_languages'  => [],
+			'overridden'          => [],
+			'overridden_examples' => [],
+			'conflict_policy'     => [],
+			'incomplete'          => false,
 		];
 
 		if ( ! $this->can_import() ) {
 			$result['errors'][] = __( 'Polylang language taxonomy not found.', 'perflocale' );
-			return $result;
+			return $this->finish( $result );
 		}
 
 		$this->build_language_map( $result );
 
 		if ( empty( $this->language_map ) ) {
+			if ( $this->incomplete ) {
+				return $this->finish( $result );
+			}
+
 			$result['errors'][] = __( 'No matching languages found between Polylang and PerfLocale.', 'perflocale' );
-			return $result;
+			return $this->finish( $result );
 		}
+
+		$this->policies = self::conflict_policies();
 
 		$result['posts'] = $this->import_post_translations( $result );
 		$result['terms'] = $this->import_term_translations( $result );
@@ -166,17 +307,18 @@ final class PolylangImporter {
 		$this->beat( 'site', 0, 4 );
 		$site_data       = new PolylangSiteData( $this->wpdb, $this->languages, $this->language_map, \Closure::fromCallable( [ $this, 'beat' ] ) );
 		$settings        = \PerfLocale\Plugin::get_instance()->get( 'settings' );
-		$result['menus'] = $site_data->import_menus( $result['errors'] );
+		$result['menus'] = $site_data->import_menus( $result['notices'] );
 		$this->beat( 'site', 1, 4 );
-		$result['strings'] = $site_data->import_strings( $result['errors'] );
+		$result['strings'] = $site_data->import_strings( $result['notices'] );
 		$this->beat( 'site', 2, 4 );
 
-		$site_data->import_translatable_types( $settings, $result['errors'] );
+		$site_data->import_translatable_types( $settings, $result['errors'], $result['notices'] );
 		$this->beat( 'site', 3, 4 );
-		$site_data->keep_prices_per_language( $settings, $result['errors'] );
+		$site_data->keep_prices_per_language( $settings, $result['notices'] );
 		$this->beat( 'site', 4, 4 );
 
 		if ( $this->link_failures > 0 ) {
+			$this->incomplete   = true;
 			$result['errors'][] = sprintf(
 				/* translators: %d: number of failed translation-link writes */
 				_n( 'Polylang import: %d translation link could not be written - that translation is not connected to its group; re-run the import to retry it.', 'Polylang import: %d translation links could not be written - those translations are not connected to their group; re-run the import to retry them.', $this->link_failures, 'perflocale' ),
@@ -184,26 +326,374 @@ final class PolylangImporter {
 			);
 		}
 
+		if ( $this->map_failures > 0 ) {
+			$this->incomplete   = true;
+			$result['errors'][] = sprintf(
+				/* translators: %d: number of failed source-map writes */
+				_n( 'Polylang import: %d translation set could not be recorded as imported; re-run the import.', 'Polylang import: %d translation sets could not be recorded as imported; re-run the import.', $this->map_failures, 'perflocale' ),
+				$this->map_failures
+			);
+		}
+
+		return $this->finish( $result );
+	}
+
+	/**
+	 * Add the read errors, the skips and the completion flag to a result.
+	 *
+	 * @param array<string, mixed> $result Import result.
+	 * @phpstan-param ImportResult $result
+	 * @return ImportResult
+	 */
+	private function finish( array $result ): array {
 		foreach ( $this->read_errors as $read_error ) {
 			$result['errors'][] = $read_error;
 		}
+
+		$result['skipped']             = $this->skipped;
+		$result['skipped_examples']    = $this->skipped_examples;
+		$result['unmapped_languages']  = $this->unmapped_by_language;
+		$result['overridden']          = $this->overridden;
+		$result['overridden_examples'] = $this->overridden_examples;
+
+		// Information, not a problem: a run with only this line is a success.
+		$count = $this->overridden['set_before_import'] ?? 0;
+
+		if ( $count > 0 ) {
+			$line = sprintf(
+				/* translators: %d: number of Polylang items */
+				_n( '%d Polylang item had a language set in PerfLocale before the import and now has Polylang\'s.', '%d Polylang items had a language set in PerfLocale before the import and now have Polylang\'s.', $count, 'perflocale' ),
+				$count
+			);
+
+			if ( ! empty( $this->overridden_examples['set_before_import'] ) ) {
+				/* translators: %s: comma-separated examples */
+				$line .= ' ' . sprintf( __( 'For example: %s.', 'perflocale' ), implode( ', ', $this->overridden_examples['set_before_import'] ) );
+			}
+
+			$result['notices'][] = $line;
+		}
+
+		$result['conflict_policy'] = $this->policies;
+		$result['incomplete']      = $this->incomplete;
 
 		return $result;
 	}
 
 	/**
-	 * The error left by the source read that just ran, or '' when it worked.
+	 * Count a source item that was read and not linked.
 	 *
-	 * A failed get_col()/get_results() returns [] exactly as an empty result
-	 * does; only last_error tells them apart, and the next query resets it,
-	 * so call this straight after the read.
+	 * @param string $reason  Reason key.
+	 * @param string $example Ids only, e.g. "post 24 (fi)".
+	 * @return void
+	 */
+	private function skip( string $reason, string $example ): void {
+		$this->skipped[ $reason ] = ( $this->skipped[ $reason ] ?? 0 ) + 1;
+
+		if ( count( $this->skipped_examples[ $reason ] ?? [] ) < self::SKIPPED_EXAMPLES ) {
+			$this->skipped_examples[ $reason ][] = $example;
+		}
+	}
+
+	/**
+	 * Count an object a Polylang set or language lists but that no longer
+	 * exists, once per object.
+	 *
+	 * @param ObjectType $type      Object type.
+	 * @param int        $object_id Object id.
+	 * @param string     $lang_slug Polylang language slug it is listed under.
+	 * @return void
+	 */
+	private function skip_missing( ObjectType $type, int $object_id, string $lang_slug ): void {
+		if ( ! $this->first_count( 'missing', $type, $object_id ) ) {
+			return;
+		}
+
+		$this->skip( 'missing_object', sprintf( '%s %d (%s)', ObjectType::Post === $type ? 'post' : 'term', $object_id, $lang_slug ) );
+	}
+
+	/**
+	 * Count an object in a Polylang language that has no PerfLocale language,
+	 * once per object.
+	 *
+	 * @param ObjectType $type      Object type.
+	 * @param int        $object_id Object id.
+	 * @param string     $lang_slug Polylang language slug.
+	 * @return void
+	 */
+	private function skip_unmapped( ObjectType $type, int $object_id, string $lang_slug ): void {
+		if ( $this->counted( 'missing', $type, $object_id ) || ! $this->first_count( 'unmapped', $type, $object_id ) ) {
+			return;
+		}
+
+		$this->unmapped_by_language[ $lang_slug ] = ( $this->unmapped_by_language[ $lang_slug ] ?? 0 ) + 1;
+		$this->skip( 'unmapped_language', sprintf( '%s %d (%s)', ObjectType::Post === $type ? 'post' : 'term', $object_id, $lang_slug ) );
+	}
+
+	/**
+	 * Count a set member listed under a language with no PerfLocale language:
+	 * as missing when its object is gone, else as not imported in its language.
+	 * Keys that are no Polylang language are left to the set checks.
+	 *
+	 * @param ObjectType       $type      Object type.
+	 * @param int              $object_id Object id.
+	 * @param string           $lang_slug Key in the set.
+	 * @param array<int, true> $exists    Existing ids of the batch.
+	 * @return void
+	 */
+	private function skip_unmapped_member( ObjectType $type, int $object_id, string $lang_slug, array $exists ): void {
+		if ( $object_id <= 0 || ! isset( $this->unmapped[ $lang_slug ] ) ) {
+			return;
+		}
+
+		if ( isset( $exists[ $object_id ] ) ) {
+			$this->skip_unmapped( $type, $object_id, $lang_slug );
+		} else {
+			$this->skip_missing( $type, $object_id, $lang_slug );
+		}
+	}
+
+	/**
+	 * Record that an object was counted for one kind of count; true the first
+	 * time.
+	 *
+	 * @param string     $kind      missing, unmapped or conflict.
+	 * @param ObjectType $type      Object type.
+	 * @param int        $object_id Object id.
+	 * @return bool
+	 */
+	private function first_count( string $kind, ObjectType $type, int $object_id ): bool {
+		$key                    = $kind . '|' . $type->value;
+		[ $page, $byte, $mask ] = self::seen_bit( $object_id );
+
+		if ( ! isset( $this->seen[ $key ][ $page ] ) ) {
+			$this->seen[ $key ][ $page ] = str_repeat( "\0", intdiv( self::SEEN_PAGE_IDS, 8 ) );
+		}
+
+		$bits = ord( $this->seen[ $key ][ $page ][ $byte ] );
+
+		if ( 0 !== ( $bits & $mask ) ) {
+			return false;
+		}
+
+		$this->seen[ $key ][ $page ][ $byte ] = chr( $bits | $mask );
+
+		return true;
+	}
+
+	/**
+	 * Whether an object was counted for one kind of count.
+	 *
+	 * @param string     $kind      missing, unmapped or conflict.
+	 * @param ObjectType $type      Object type.
+	 * @param int        $object_id Object id.
+	 * @return bool
+	 */
+	private function counted( string $kind, ObjectType $type, int $object_id ): bool {
+		$key                    = $kind . '|' . $type->value;
+		[ $page, $byte, $mask ] = self::seen_bit( $object_id );
+
+		return isset( $this->seen[ $key ][ $page ] ) && 0 !== ( ord( $this->seen[ $key ][ $page ][ $byte ] ) & $mask );
+	}
+
+	/**
+	 * Where an object's bit is: its page, the byte in the page and the bit's mask.
+	 *
+	 * @param int $object_id Object id.
+	 * @return array{0: int, 1: int, 2: int}
+	 */
+	private static function seen_bit( int $object_id ): array {
+		$offset = ( $object_id % self::SEEN_PAGE_IDS + self::SEEN_PAGE_IDS ) % self::SEEN_PAGE_IDS;
+
+		return [ intdiv( $object_id - $offset, self::SEEN_PAGE_IDS ), intdiv( $offset, 8 ), 1 << ( $offset % 8 ) ];
+	}
+
+	/**
+	 * Which of these objects exist: one read for the whole list.
+	 *
+	 * @param ObjectType $type Object type.
+	 * @param array<int> $ids  Object ids.
+	 * @return array<int, true>|null Existing ids as keys; null when the read failed.
+	 */
+	private function existing_ids( ObjectType $type, array $ids ): ?array {
+		if ( $ids === [] ) {
+			return [];
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- One existence read per batch; the IN() list is generated placeholders, every value bound.
+		$ids   = array_values( $ids );
+		$found = ObjectType::Post === $type
+			? $this->wpdb->get_col( $this->wpdb->prepare( 'SELECT ID FROM %i WHERE ID IN (' . implode( ',', array_fill( 0, count( $ids ), '%d' ) ) . ')', array_merge( [ $this->wpdb->posts ], $ids ) ) )
+			: $this->wpdb->get_col( $this->wpdb->prepare( 'SELECT term_id FROM %i WHERE term_id IN (' . implode( ',', array_fill( 0, count( $ids ), '%d' ) ) . ')', array_merge( [ $this->wpdb->terms ], $ids ) ) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders
+
+		$error = $this->read_error( $found );
+
+		if ( $error !== '' ) {
+			$this->record_read_error( $type, $error );
+			return null;
+		}
+
+		$exists = [];
+
+		foreach ( (array) $found as $id ) {
+			if ( is_numeric( $id ) ) {
+				$exists[ (int) $id ] = true;
+			}
+		}
+
+		return $exists;
+	}
+
+	/**
+	 * An integer column of a database row object (0 when absent or not numeric).
+	 *
+	 * @param object $row Row.
+	 * @param string $key Column.
+	 * @return int
+	 */
+	private static function row_int( object $row, string $key ): int {
+		$value = get_object_vars( $row )[ $key ] ?? 0;
+
+		return is_numeric( $value ) ? (int) $value : 0;
+	}
+
+	/**
+	 * The language keys of a decoded Polylang set (Polylang's own `sync` key and
+	 * any other non-language entry left out).
+	 *
+	 * @param array<mixed> $set Decoded description.
+	 * @return array<mixed>
+	 */
+	private static function set_members( array $set ): array {
+		unset( $set['sync'] );
+
+		return $set;
+	}
+
+	/**
+	 * Polylang import lines for the skipped items, per reason, with examples.
+	 *
+	 * @param array<string, mixed> $result Import result with `skipped` and `skipped_examples`.
+	 * @return list<string>
+	 */
+	public static function skipped_lines( array $result ): array {
+		$lines    = [];
+		$examples = (array) ( $result['skipped_examples'] ?? [] );
+
+		foreach ( (array) ( $result['skipped'] ?? [] ) as $reason => $count ) {
+			$count = is_numeric( $count ) ? (int) $count : 0;
+
+			if ( $count <= 0 ) {
+				continue;
+			}
+
+			// One line per language, with that language's examples.
+			if ( 'unmapped_language' === $reason ) {
+				foreach ( (array) ( $result['unmapped_languages'] ?? [] ) as $slug => $in_language ) {
+					$in_language = is_numeric( $in_language ) ? (int) $in_language : 0;
+
+					if ( $in_language <= 0 ) {
+						continue;
+					}
+
+					$slug = (string) $slug;
+					$line = sprintf(
+						/* translators: 1: number of Polylang items, 2: Polylang language code */
+						_n( '%1$d Polylang item in %2$s was not imported: %2$s has no PerfLocale language of its own (see above). Add it under PerfLocale → Languages, then run the import again.', '%1$d Polylang items in %2$s were not imported: %2$s has no PerfLocale language of its own (see above). Add it under PerfLocale → Languages, then run the import again.', $in_language, 'perflocale' ),
+						$in_language,
+						$slug
+					);
+					$found = array_values( array_filter( array_map( static fn( $example ): string => is_scalar( $example ) ? (string) $example : '', (array) ( $examples[ $reason ] ?? [] ) ), static fn( string $example ): bool => str_ends_with( $example, ' (' . $slug . ')' ) ) );
+
+					if ( $found !== [] ) {
+						/* translators: %s: comma-separated examples */
+						$line .= ' ' . sprintf( __( 'For example: %s.', 'perflocale' ), implode( ', ', $found ) );
+					}
+
+					$lines[] = $line;
+				}
+
+				continue;
+			}
+
+			$line = match ( (string) $reason ) {
+				'missing_object' =>
+					/* translators: %d: number of Polylang items */
+					_n( '%d Polylang item was not imported: its post or term no longer exists.', '%d Polylang items were not imported: their posts or terms no longer exist.', $count, 'perflocale' ),
+				'empty_set'        =>
+					/* translators: %d: number of Polylang translation sets */
+					_n( '%d Polylang translation set was not imported: it lists no item.', '%d Polylang translation sets were not imported: they list no item.', $count, 'perflocale' ),
+				'language_taken'   =>
+					/* translators: %d: number of Polylang items */
+					_n( '%d Polylang item was not linked, and its translation set was left as it is: in the PerfLocale translation group it would join, another post or term already has its language.', '%d Polylang items were not linked, and their translation sets were left as they are: in the PerfLocale translation group each would join, another post or term already has its language.', $count, 'perflocale' ),
+				'split_groups'     =>
+					/* translators: %d: number of Polylang items */
+					_n( '%d Polylang item was not linked, and its translation set was left as it is: it is in a PerfLocale translation group with other posts or terms, and linking it would move it away from them.', '%d Polylang items were not linked, and their translation sets were left as they are: each is in a PerfLocale translation group with other posts or terms, and linking it would move it away from them.', $count, 'perflocale' ),
+				'stale_source_map' =>
+					/* translators: %d: number of Polylang sets or items */
+					_n( '%d record of an earlier Polylang import pointed to a translation group that no longer matches it (a group of another kind, or one holding other posts or terms in its languages); it was not used.', '%d records of an earlier Polylang import pointed to translation groups that no longer match them (groups of another kind, or holding other posts or terms in their languages); they were not used.', $count, 'perflocale' ),
+				'language_differs' =>
+					/* translators: %d: number of Polylang items */
+					_n( '%d Polylang item kept its PerfLocale language, which differs from Polylang\'s. Change it in PerfLocale if Polylang is right, then run the import again.', '%d Polylang items kept their PerfLocale language, which differs from Polylang\'s. Change them in PerfLocale if Polylang is right, then run the import again.', $count, 'perflocale' ),
+				default            => '',
+			};
+
+			if ( $line === '' ) {
+				continue;
+			}
+
+			$line = sprintf( $line, $count );
+
+			if ( ! empty( $examples[ $reason ] ) ) {
+				/* translators: %s: comma-separated examples */
+				$line .= ' ' . sprintf( __( 'For example: %s.', 'perflocale' ), implode( ', ', array_map( static fn( $example ): string => is_scalar( $example ) ? (string) $example : '', (array) $examples[ $reason ] ) ) );
+			}
+
+			$lines[] = $line;
+		}
+
+		$changed = (array) ( $result['overridden'] ?? [] );
+		$count   = is_numeric( $changed['language_differs'] ?? null ) ? (int) $changed['language_differs'] : 0;
+
+		if ( $count > 0 ) {
+			$line = sprintf(
+				/* translators: 1: number of Polylang items, 2: filter name */
+				_n( '%1$d Polylang item was changed from its PerfLocale language to Polylang\'s (%2$s).', '%1$d Polylang items were changed from their PerfLocale language to Polylang\'s (%2$s).', $count, 'perflocale' ),
+				$count,
+				'perflocale/migration/language_conflict_policy'
+			);
+			$shown = (array) ( ( (array) ( $result['overridden_examples'] ?? [] ) )['language_differs'] ?? [] );
+
+			if ( $shown !== [] ) {
+				/* translators: %s: comma-separated examples */
+				$line .= ' ' . sprintf( __( 'For example: %s.', 'perflocale' ), implode( ', ', array_map( static fn( $example ): string => is_scalar( $example ) ? (string) $example : '', $shown ) ) );
+			}
+
+			$lines[] = $line;
+		}
+
+		return $lines;
+	}
+
+	/**
+	 * Why the source read that just ran failed, or '' when it worked.
+	 *
+	 * A read failed when it returned no array (get_results() gives null) or
+	 * left last_error set (get_col() gives [] then, as an empty result does).
+	 * The next query resets last_error, so call this straight after the read.
 	 *
 	 * @phpstan-impure
 	 *
+	 * @param mixed $rows What the read returned.
 	 * @return string
 	 */
-	private function read_error(): string {
-		return $this->wpdb->last_error;
+	private function read_error( $rows ): string {
+		if ( $this->wpdb->last_error !== '' ) {
+			return $this->wpdb->last_error;
+		}
+
+		return is_array( $rows ) ? '' : 'the query returned no result';
 	}
 
 	/**
@@ -235,6 +725,8 @@ final class PolylangImporter {
 	 * @return void
 	 */
 	private function record_read_error( ObjectType $type, string $error ): void {
+		$this->incomplete = true;
+
 		self::log_db_error( ObjectType::Post === $type ? 'reading post data' : 'reading term data', $error );
 
 		$this->read_errors[] = ObjectType::Post === $type
@@ -273,7 +765,8 @@ final class PolylangImporter {
 	/**
 	 * Build a mapping from Polylang language slugs to PerfLocale language IDs.
 	 *
-	 * @param array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>} $result Import result (passed by reference for errors).
+	 * @param array<string, mixed> $result Import result (passed by reference for errors).
+	 * @phpstan-param ImportResult $result
 	 * @return void
 	 */
 	private function build_language_map( array &$result ): void {
@@ -296,7 +789,16 @@ final class PolylangImporter {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		if ( ! is_array( $pll_langs ) ) {
+		$read_error = $this->read_error( $pll_langs );
+
+		if ( $read_error !== '' || ! is_array( $pll_langs ) ) {
+			$this->incomplete = true;
+			self::log_db_error( 'reading the languages', $read_error );
+			$this->read_errors[] = sprintf(
+				/* translators: %s: source plugin name */
+				__( '%s languages could not be read because of a database error, so nothing was imported. Re-run the import.', 'perflocale' ),
+				'Polylang'
+			);
 			return;
 		}
 
@@ -347,6 +849,7 @@ final class PolylangImporter {
 						$pll_slug,
 						$pll_slug
 					);
+					$this->unmapped[ $pll_slug ] = true;
 					continue;
 				}
 
@@ -359,6 +862,7 @@ final class PolylangImporter {
 					$pll_slug,
 					$pll_locale
 				);
+				$this->unmapped[ $pll_slug ] = true;
 			}
 		}
 	}
@@ -409,7 +913,8 @@ final class PolylangImporter {
 	 * Polylang stores translation groups as serialized arrays in
 	 * term meta under the `post_translations` taxonomy.
 	 *
-	 * @param array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>} $result Import result (passed by reference for errors).
+	 * @param array<string, mixed> $result Import result (passed by reference for errors).
+	 * @phpstan-param ImportResult $result
 	 * @return int Number of posts imported.
 	 */
 	private function import_post_translations( array &$result ): int {
@@ -432,7 +937,7 @@ final class PolylangImporter {
 			)
 		);
 
-		$read_error = $this->read_error();
+		$read_error = $this->read_error( $term_ids );
 
 		if ( $read_error !== '' ) {
 			$this->record_read_error( ObjectType::Post, $read_error );
@@ -470,14 +975,10 @@ final class PolylangImporter {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 			// Skip only this batch: the ones after it still import.
-			$read_error = $this->read_error();
+			$read_error = $this->read_error( $translation_terms );
 
-			if ( $read_error !== '' ) {
+			if ( $read_error !== '' || ! is_array( $translation_terms ) ) {
 				$this->record_read_error( ObjectType::Post, $read_error );
-				continue;
-			}
-
-			if ( ! is_array( $translation_terms ) ) {
 				continue;
 			}
 
@@ -494,8 +995,9 @@ final class PolylangImporter {
 	/**
 	 * Per-batch processor for the post-translations taxonomy terms.
 	 *
-	 * @param array<int, object>   $translation_terms term rows for this batch
-	 * @param array<string, mixed> $result            accumulator (errors[])
+	 * @param array<int, object>   $translation_terms Term rows for this batch.
+	 * @param array<string, mixed> $result            Accumulator (errors[]).
+	 * @phpstan-param ImportResult $result
 	 * @return int
 	 */
 	private function process_post_translation_terms( array $translation_terms, array &$result ): int {
@@ -554,6 +1056,17 @@ final class PolylangImporter {
 			$this->groups->prime_translations( ObjectType::Post, $post_id_list );
 		}
 
+		// Which listed posts exist: one read for the batch. When it fails the
+		// batch's sets are left for a rerun (their members still get their
+		// language in the single-language pass).
+		$exists = $this->existing_ids( ObjectType::Post, array_keys( $all_post_ids ) );
+
+		if ( null === $exists ) {
+			return 0;
+		}
+
+		$this->start_slot_page( ObjectType::Post, $exists );
+
 		foreach ( $translation_terms as $term ) {
 			// Before each item: the report counts the items finished before it.
 			$this->beat( $this->item_progress[0], $this->item_progress[1]++, $this->item_progress[2] );
@@ -579,142 +1092,244 @@ final class PolylangImporter {
 				continue;
 			}
 
+			if ( is_array( $translations ) && [] === self::set_members( $translations ) ) {
+				$this->skip( 'empty_set', 'term ' . self::row_int( $term, 'term_id' ) );
+				continue;
+			}
+
 			if ( ! is_array( $translations ) || count( $translations ) < 2 ) {
 				continue;
 			}
 
-			// Reuse path #1: migration source-map. Survives DB restores
-			// because the map row was committed in the same transaction as
-			// the group. Confirm the group still exists before reusing it so a
-			// row left by a pre-cascade delete can't link posts to a dead id.
-			$source_key        = $term->term_id . '|post';
-			$mapped_id         = $this->source_map->get_group_id( 'polylang', (string) $source_key );
-			$existing_group_id = ( $mapped_id !== null && $this->groups->find( $mapped_id ) ) ? $mapped_id : null;
+			$imported += $this->apply_set( ObjectType::Post, self::row_int( $term, 'term_id' ), $translations, $exists, $result );
+		}
 
-			// Find an existing PerfLocale group for any post in the set -
-			// supports resumable imports after a partial run that pre-dated
-			// the source_map (e.g. upgrade from an older version). If none
-			// exist, pick the first valid entry as the seed for a new group.
-			$first_slug    = null;
-			$first_post_id = null;
-			$first_lang_id = null;
+		return $imported;
+	}
 
-			foreach ( $translations as $lang_slug => $post_id ) {
-				$post_id = (int) $post_id;
-				$lang_id = $this->language_map[ $lang_slug ] ?? null;
+	/**
+	 * Link one Polylang set, or leave it whole and count why.
+	 *
+	 * The set joins the group its source-map row records, else the one group
+	 * of a member that also holds posts or terms outside the set, else the
+	 * group of the first member that has one; with none, a new group. Before
+	 * any write, every member that is not already in place is checked, and
+	 * the whole set is left as it is (no link, no source-map row) when:
+	 * - `language_taken`: the group holds that member's language for an
+	 *   object outside the set (linking would unlink it);
+	 * - `split_groups`: the member sits in another group that holds objects
+	 *   outside the set (linking would move it away from them), or two or
+	 *   more members' groups do;
+	 * - `language_differs`: PerfLocale has another language for the member
+	 *   and the language conflict policy is `keep`, or Polylang's language is
+	 *   the default language. A link alone in its group that no import wrote
+	 *   is no language yet: it takes Polylang's language under both policies
+	 *   (a post saved before PerfLocale's default language was changed, or
+	 *   given the default language by the bulk tool).
+	 * Under `source` a member whose language differs takes Polylang's
+	 * language, counted in `overridden`. Members already in the group are
+	 * relabelled before the others are linked.
+	 *
+	 * @param ObjectType           $type         Post or Term.
+	 * @param int                  $set_id       Term id of the Polylang set.
+	 * @param array<mixed>         $translations Decoded set: language slug => object id.
+	 * @param array<int, true>     $exists       Existing ids of the batch.
+	 * @param array<string, mixed> $result       Import result (errors).
+	 * @phpstan-param ImportResult $result
+	 * @return int Group and link writes that succeeded.
+	 */
+	private function apply_set( ObjectType $type, int $set_id, array $translations, array $exists, array &$result ): int {
+		$is_post    = ObjectType::Post === $type;
+		$source_key = $set_id . '|' . $type->value;
+		$members    = [];
 
-				if ( $lang_id === null || ! get_post( $post_id ) ) {
-					continue;
-				}
+		foreach ( self::set_members( $translations ) as $lang_slug => $object_id ) {
+			$object_id = is_numeric( $object_id ) ? (int) $object_id : 0;
+			$lang_slug = (string) $lang_slug;
+			$lang_id   = $this->language_map[ $lang_slug ] ?? null;
 
-				if ( $existing_group_id === null ) {
-					$existing = $this->groups->find_for_object( $post_id, ObjectType::Post );
-
-					if ( $existing ) {
-						$existing_group_id = (int) $existing->id;
-					}
-				}
-
-				if ( $first_slug === null ) {
-					$first_slug    = $lang_slug;
-					$first_post_id = $post_id;
-					$first_lang_id = $lang_id;
-				}
-			}
-
-			if ( $first_slug === null || $first_post_id === null || $first_lang_id === null ) {
+			if ( $lang_id === null ) {
+				$this->skip_unmapped_member( $type, $object_id, $lang_slug, $exists );
 				continue;
 			}
 
-			if ( $existing_group_id !== null ) {
-				$group_id  = $existing_group_id;
-				$skip_seed = false; // Link every sibling, existing group may be missing some.
-
-				// Converge the source map on the REUSE path too. It is only
-				// written inside create_group(), so importing over objects that
-				// already had a group (the common case - every post gets one on
-				// save) left the map empty, and `--force-restart` then cleared
-				// it permanently. set_group_id() is INSERT .. ON DUPLICATE KEY
-				// UPDATE, so this is idempotent and repairs stale rows too.
-				if ( $mapped_id !== $group_id ) {
-					$this->source_map->set_group_id( 'polylang', (string) $source_key, $group_id );
-				}
-			} else {
-				$new_group_id = $this->groups->create_group(
-					ObjectType::Post,
-					$first_post_id,
-					$first_lang_id,
-					// Derive the link status from the post's real status: a draft
-					// translation must NOT be imported as published, or hreflang/
-					// switcher would emit a public alternate URL for a non-public
-					// post. Non-publish states collapse to Draft (never
-					// over-claims published). Matches the WPML importer.
-					get_post_status( $first_post_id ) === 'publish'
-						? TranslationStatus::Published->value
-						: TranslationStatus::Draft->value,
-					SourceType::ImportedPolylang,
-					[
-						'type' => 'polylang',
-						'key'  => (string) $source_key,
-					]
-				);
-
-				if ( $new_group_id === false ) {
-					$result['errors'][] = sprintf(
-						/* translators: %d: term ID of Polylang's post translation set */
-						__( 'Failed to create group for Polylang post translation term %d.', 'perflocale' ),
-						(int) $term->term_id
-					);
-					continue;
-				}
-
-				$group_id  = (int) $new_group_id;
-				$skip_seed = true;
-				++$imported;
+			if ( ! isset( $exists[ $object_id ] ) ) {
+				$this->skip_missing( $type, $object_id, $lang_slug );
+				continue;
 			}
 
-			foreach ( $translations as $lang_slug => $post_id ) {
-				if ( $skip_seed && $lang_slug === $first_slug ) {
+			$members[] = [
+				'slug'   => $lang_slug,
+				'object' => $object_id,
+				'lang'   => $lang_id,
+			];
+		}
+
+		if ( $members === [] ) {
+			return 0;
+		}
+
+		$in_set     = array_column( $members, 'object' );
+		$default_id = $this->default_language_id();
+		$state      = [];
+
+		// Each member's own link and whether its group holds objects outside the set.
+		foreach ( $members as $i => $member ) {
+			$own     = null;
+			$outside = [];
+			$links   = $this->groups->get_translations( $member['object'], $type );
+
+			foreach ( $links as $link ) {
+				if ( ! is_object( $link ) ) {
 					continue;
 				}
 
-				$post_id = (int) $post_id;
-				$lang_id = $this->language_map[ $lang_slug ] ?? null;
+				$linked = self::row_int( $link, 'object_id' );
 
-				if ( $lang_id === null || ! get_post( $post_id ) ) {
+				if ( $linked === $member['object'] ) {
+					$own = $link;
+				} elseif ( ! in_array( $linked, $in_set, true ) ) {
+					$outside[] = $linked;
+				}
+			}
+
+			$state[ $i ] = [
+				'group'      => null !== $own ? self::row_int( $own, 'group_id' ) : 0,
+				'linked'     => null !== $own ? self::row_int( $own, 'language_id' ) : 0,
+				'outside'    => $outside,
+				'unassigned' => null !== $own && 1 === count( $links ) && ! self::imported_link( $own ),
+			];
+		}
+
+		// The group the set joins: its recorded group when that still fits the
+		// set (a record that does not is counted and replaced by the writes below).
+		$mapped_id = $this->source_map->get_group_id( 'polylang', $source_key );
+		$target    = 0;
+
+		if ( $mapped_id !== null ) {
+			$langs = array_flip( array_column( $members, 'lang' ) );
+
+			if ( SourceMapCheck::group_fits( $type, (int) $mapped_id, $in_set, $langs ) ) {
+				$target = (int) $mapped_id;
+			} elseif ( null !== $this->groups->find( (int) $mapped_id ) ) {
+				$this->skip( 'stale_source_map', sprintf( '%s set %d', $type->value, $set_id ) );
+			}
+		}
+
+		if ( 0 === $target ) {
+			$holding = [];
+
+			foreach ( $state as $i => $st ) {
+				if ( $st['group'] > 0 && $st['outside'] !== [] ) {
+					$holding[ $st['group'] ][] = $i;
+				}
+			}
+
+			if ( count( $holding ) > 1 ) {
+				foreach ( $holding as $indexes ) {
+					foreach ( $indexes as $i ) {
+						$this->skip_conflict( 'split_groups', $type, $members[ $i ]['object'], sprintf( '%s %d (%s, its group holds %s %d)', $type->value, $members[ $i ]['object'], $members[ $i ]['slug'], $type->value, $state[ $i ]['outside'][0] ) );
+					}
+				}
+
+				return 0;
+			}
+
+			if ( $holding !== [] ) {
+				$target = (int) array_key_first( $holding );
+			} else {
+				foreach ( $state as $st ) {
+					if ( $st['group'] > 0 ) {
+						$target = $st['group'];
+						break;
+					}
+				}
+			}
+		}
+
+		if ( 0 === $target ) {
+			return $this->create_set_group( $type, $set_id, $members, $source_key, $result );
+		}
+
+		// Checks before any write: the whole set or nothing.
+		$conflicts = [];
+		$relabel   = [];
+
+		foreach ( $members as $i => $member ) {
+			$st = $state[ $i ];
+
+			if ( $st['group'] === $target && $st['linked'] === $member['lang'] ) {
+				continue;
+			}
+
+			if ( $st['group'] > 0 && $st['linked'] !== $member['lang'] && ! $st['unassigned'] ) {
+				if ( 'source' !== $this->policy( $type ) || $member['lang'] === $default_id ) {
+					$conflicts[] = [ 'language_differs', $i, sprintf( '%s %d (%s in PerfLocale, %s in Polylang)', $type->value, $member['object'], $this->language_slug( $st['linked'] ), $member['slug'] ) ];
 					continue;
 				}
 
-				// Skip only when the post is in the target group AND already
-				// filed under this language. PerfLocale auto-assigns the
-				// default language on save, so a group-only check leaves the
-				// seed mis-languaged and lets the next sibling's link_object()
-				// (which deletes the group+language row it replaces) drop it
-				// entirely.
-				$already = $this->groups->find_link_for_object( $post_id, ObjectType::Post );
+				$relabel[ $i ] = true;
+			}
 
-				if ( $already
-					&& (int) $already->group_id === $group_id
-					&& (int) $already->language_id === (int) $lang_id ) {
-					continue;
-				}
+			if ( $st['group'] > 0 && $st['group'] !== $target && $st['outside'] !== [] ) {
+				$conflicts[] = [ 'split_groups', $i, sprintf( '%s %d (%s, its group holds %s %d)', $type->value, $member['object'], $member['slug'], $type->value, $st['outside'][0] ) ];
+				continue;
+			}
 
-				$link_result = $this->groups->link_object(
-					$group_id,
-					$post_id,
-					$lang_id,
-					// Derive from the real post_status - see create_group above.
-					get_post_status( $post_id ) === 'publish'
-						? TranslationStatus::Published->value
-						: TranslationStatus::Draft->value,
-					SourceType::ImportedPolylang
-				);
+			$holder = $this->slot_holder( $target, $member['lang'] );
 
-				if ( $link_result !== false ) {
-					++$imported;
-				} else {
-					++$this->link_failures;
-				}
+			if ( $holder > 0 && ! in_array( $holder, $in_set, true ) ) {
+				$conflicts[] = [ 'language_taken', $i, sprintf( '%s %d (%s, held by %s %d)', $type->value, $member['object'], $member['slug'], $type->value, $holder ) ];
+			}
+		}
+
+		if ( $conflicts !== [] ) {
+			foreach ( $conflicts as [ $reason, $i, $example ] ) {
+				$this->skip_conflict( $reason, $type, $members[ $i ]['object'], $example );
+			}
+
+			return 0;
+		}
+
+		if ( $mapped_id !== $target && ! $this->source_map->set_group_id( 'polylang', $source_key, $target ) ) {
+			++$this->map_failures;
+		}
+
+		// Members already in the group first: a relabel frees or takes a slot
+		// another member's link needs.
+		$order = array_keys( $members );
+		usort(
+			$order,
+			static function ( int $a, int $b ) use ( $state, $target ): int {
+				$in_group = (int) ( $state[ $b ]['group'] === $target ) <=> (int) ( $state[ $a ]['group'] === $target );
+
+				return 0 !== $in_group ? $in_group : $a <=> $b;
+			}
+		);
+		$imported = 0;
+
+		foreach ( $order as $i ) {
+			$member = $members[ $i ];
+
+			if ( $state[ $i ]['group'] === $target && $state[ $i ]['linked'] === $member['lang'] ) {
+				continue;
+			}
+
+			$linked = $this->groups->link_object( $target, $member['object'], $member['lang'], $this->link_status( $type, $member['object'] ), SourceType::ImportedPolylang );
+
+			$this->forget_slots( $member['object'], $target, $state[ $i ]['group'] );
+
+			if ( false === $linked ) {
+				++$this->link_failures;
+				continue;
+			}
+
+			++$imported;
+
+			if ( isset( $relabel[ $i ] ) ) {
+				$this->count_overridden( 'language_differs', $type, $member['object'], sprintf( '%s %d (%s in PerfLocale, now %s)', $type->value, $member['object'], $this->language_slug( $state[ $i ]['linked'] ), $member['slug'] ) );
+			} elseif ( $state[ $i ]['unassigned'] && $state[ $i ]['linked'] !== $member['lang'] && $state[ $i ]['linked'] !== $default_id ) {
+				$this->count_overridden( 'set_before_import', $type, $member['object'], sprintf( '%s %d (%s in PerfLocale, now %s)', $type->value, $member['object'], $this->language_slug( $state[ $i ]['linked'] ), $member['slug'] ) );
 			}
 		}
 
@@ -722,9 +1337,361 @@ final class PolylangImporter {
 	}
 
 	/**
+	 * Create the group of a set none of whose members has one, then link the others.
+	 *
+	 * @param ObjectType                                        $type       Post or Term.
+	 * @param int                                               $set_id     Term id of the Polylang set.
+	 * @param list<array{slug: string, object: int, lang: int}> $members    Valid members.
+	 * @param string                                            $source_key Source-map key.
+	 * @param array<string, mixed>                              $result     Import result (errors).
+	 * @phpstan-param ImportResult $result
+	 * @return int Group and link writes that succeeded.
+	 */
+	private function create_set_group( ObjectType $type, int $set_id, array $members, string $source_key, array &$result ): int {
+		$seed     = $members[0];
+		$group_id = $this->groups->create_group(
+			$type,
+			$seed['object'],
+			$seed['lang'],
+			$this->link_status( $type, $seed['object'] ),
+			SourceType::ImportedPolylang,
+			[
+				'type' => 'polylang',
+				'key'  => $source_key,
+			]
+		);
+
+		$this->forget_slots( $seed['object'], is_numeric( $group_id ) ? (int) $group_id : 0 );
+
+		if ( false === $group_id ) {
+			$this->incomplete   = true;
+			$result['errors'][] = sprintf(
+				ObjectType::Post === $type
+					/* translators: %d: term ID of Polylang's post translation set */
+					? __( 'Failed to create group for Polylang post translation term %d.', 'perflocale' )
+					/* translators: %d: term ID of Polylang's term translation set */
+					: __( 'Failed to create group for Polylang term translation term %d.', 'perflocale' ),
+				$set_id
+			);
+
+			return 0;
+		}
+
+		$imported = 1;
+
+		foreach ( array_slice( $members, 1 ) as $member ) {
+			$linked = $this->groups->link_object( (int) $group_id, $member['object'], $member['lang'], $this->link_status( $type, $member['object'] ), SourceType::ImportedPolylang );
+
+			$this->forget_slots( $member['object'], $group_id );
+
+			if ( false === $linked ) {
+				++$this->link_failures;
+			} else {
+				++$imported;
+			}
+		}
+
+		return $imported;
+	}
+
+	/**
+	 * Start a page of sets or objects: its slot checks read the groups its
+	 * objects sit in (from the primed memberships), all in one query at the
+	 * first check.
+	 *
+	 * @param ObjectType       $type   Object type.
+	 * @param array<int, true> $exists The page's existing objects, as keys.
+	 * @return void
+	 */
+	private function start_slot_page( ObjectType $type, array $exists ): void {
+		$groups = [];
+
+		foreach ( array_keys( $exists ) as $object_id ) {
+			$link = $this->groups->find_link_for_object( (int) $object_id, $type );
+
+			if ( null !== $link ) {
+				$groups[ self::row_int( $link, 'group_id' ) ] = true;
+			}
+		}
+
+		unset( $groups[0] );
+
+		$this->slots       = null;
+		$this->slot_groups = array_keys( $groups );
+		$this->slot_of     = [];
+	}
+
+	/**
+	 * The object that holds a language in a group, read from the database: the
+	 * page's groups (and the group checked) in one query at its first check,
+	 * any other group when it is first checked, and a group this import wrote
+	 * to since it was read is read again. When a read fails, the slot is read on its own
+	 * (TranslationGroupRepository::object_in_group_language()).
+	 *
+	 * @param int $group_id    Group ID.
+	 * @param int $language_id Language ID.
+	 * @return int Object ID, or 0 when no object holds that language.
+	 */
+	private function slot_holder( int $group_id, int $language_id ): int {
+		if ( null === $this->slots ) {
+			$this->slots = [];
+			$this->read_slots( array_unique( array_merge( $this->slot_groups, [ $group_id ] ) ) );
+		}
+
+		if ( ! isset( $this->slots[ $group_id ] ) ) {
+			$this->read_slots( [ $group_id ] );
+		}
+
+		if ( isset( $this->slots[ $group_id ] ) ) {
+			return $this->slots[ $group_id ][ $language_id ] ?? 0;
+		}
+
+		return $this->groups->object_in_group_language( $group_id, $language_id );
+	}
+
+	/**
+	 * Read which object holds each language of these groups, uncached (the
+	 * import reads its own writes). A group whose read failed stays unread.
+	 *
+	 * @param array<int, int> $group_ids Group IDs.
+	 * @return void
+	 */
+	private function read_slots( array $group_ids ): void {
+		foreach ( array_chunk( array_values( $group_ids ), 500 ) as $chunk ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- Uncached on purpose (the import reads its own writes); the IN() list is generated placeholders, every value bound.
+			$rows = $this->wpdb->get_results(
+				$this->wpdb->prepare(
+					'SELECT group_id, language_id, object_id FROM %i WHERE group_id IN (' . implode( ',', array_fill( 0, count( $chunk ), '%d' ) ) . ')',
+					array_merge( [ \PerfLocale\Database\Schema::table( 'translation_links' ) ], $chunk )
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders
+
+			if ( '' !== $this->wpdb->last_error || ! is_array( $rows ) ) {
+				continue;
+			}
+
+			foreach ( $chunk as $group_id ) {
+				$this->slots[ $group_id ] = [];
+			}
+
+			foreach ( $rows as $row ) {
+				$group_id  = self::row_int( $row, 'group_id' );
+				$object_id = self::row_int( $row, 'object_id' );
+
+				$this->slots[ $group_id ][ self::row_int( $row, 'language_id' ) ] = $object_id;
+				$this->slot_of[ $object_id ]                                     = $group_id;
+			}
+		}
+	}
+
+	/**
+	 * After a write that linked an object: the groups it may have changed
+	 * (the destination, the object's group before, as given and as read) are
+	 * read again at their next check.
+	 *
+	 * @param int $object_id The linked object.
+	 * @param int ...$group_ids Groups the write touched.
+	 * @return void
+	 */
+	private function forget_slots( int $object_id, int ...$group_ids ): void {
+		if ( null === $this->slots ) {
+			return;
+		}
+
+		if ( isset( $this->slot_of[ $object_id ] ) ) {
+			$group_ids[] = $this->slot_of[ $object_id ];
+		}
+
+		foreach ( $group_ids as $group_id ) {
+			unset( $this->slots[ $group_id ] );
+		}
+	}
+
+	/**
+	 * The status an imported link gets: a post's follows its post status (a
+	 * draft never imports as published); terms are published.
+	 *
+	 * @param ObjectType $type      Post or Term.
+	 * @param int        $object_id Object id.
+	 * @return string
+	 */
+	private function link_status( ObjectType $type, int $object_id ): string {
+		return ( ObjectType::Post === $type && get_post_status( $object_id ) !== 'publish' )
+			? TranslationStatus::Draft->value
+			: TranslationStatus::Published->value;
+	}
+
+	/**
+	 * Whether an import wrote this link (its source is an import).
+	 *
+	 * @param object $link Link row.
+	 * @return bool
+	 */
+	private static function imported_link( object $link ): bool {
+		$source = get_object_vars( $link )['source'] ?? '';
+
+		return in_array( $source, [ SourceType::ImportedPolylang->value, SourceType::ImportedWpml->value, SourceType::ImportedTrp->value ], true );
+	}
+
+	/**
+	 * PerfLocale's default language id (0 when none).
+	 *
+	 * @return int
+	 */
+	private function default_language_id(): int {
+		if ( null === $this->default_id ) {
+			$default          = $this->languages->get_default();
+			$this->default_id = null !== $default ? (int) $default->id : 0;
+		}
+
+		return $this->default_id;
+	}
+
+	/**
+	 * A PerfLocale language's slug, for examples.
+	 *
+	 * @param int $language_id Language id.
+	 * @return string
+	 */
+	private function language_slug( int $language_id ): string {
+		$language = $this->languages->find( $language_id );
+		$slug     = null !== $language ? ( get_object_vars( $language )['slug'] ?? '' ) : '';
+
+		return is_string( $slug ) && $slug !== '' ? $slug : (string) $language_id;
+	}
+
+
+	/**
+	 * The language conflict policy of an object type for this run.
+	 *
+	 * @param ObjectType $type Post or Term.
+	 * @return string 'keep' or 'source'.
+	 */
+	private function policy( ObjectType $type ): string {
+		return $this->policies[ $type->value ] ?? 'keep';
+	}
+
+	/**
+	 * The language conflict policy per object type, read from the filter.
+	 *
+	 * @return array{post: string, term: string}
+	 */
+	public static function conflict_policies(): array {
+		$policies = [];
+
+		foreach ( [ ObjectType::Post, ObjectType::Term ] as $type ) {
+			/**
+			 * What a Polylang import does when PerfLocale already has another
+			 * language for an imported post or term.
+			 *
+			 * 'keep' (default) leaves PerfLocale's language and lists the item.
+			 * 'source' sets Polylang's language and lists the change, with no
+			 * record of the old value. Neither value moves another post or term
+			 * out of its translation group or takes its place: those sets are
+			 * listed and left as they are under both values, and so is a post or
+			 * term that Polylang has in the default language.
+			 *
+			 * A post or term alone in its translation group, with a language no
+			 * import wrote (set in PerfLocale before the import, by a person or
+			 * by PerfLocale when it was saved), has no language yet: both values
+			 * give it Polylang's, the default language included, alone or in a
+			 * translation set. When that replaces a language other than the
+			 * default, the change is listed.
+			 *
+			 * Read once per object type when an import starts. Any value other
+			 * than 'source' counts as 'keep'. Put it in a plugin or must-use
+			 * plugin (an import from the settings screen runs in its own
+			 * request) and remove it after the transition.
+			 *
+			 * @hook perflocale/migration/language_conflict_policy
+			 * @since 1.0.7.3
+			 *
+			 * @param string $policy      'keep'.
+			 * @param string $source      'polylang'.
+			 * @param string $object_type 'post' or 'term'.
+			 * @return string 'keep' or 'source'.
+			 */
+			$value                    = apply_filters( 'perflocale/migration/language_conflict_policy', 'keep', 'polylang', $type->value );
+			$policies[ $type->value ] = 'source' === $value ? 'source' : 'keep';
+		}
+
+		return [
+			'post' => $policies['post'],
+			'term' => $policies['term'],
+		];
+	}
+
+	/**
+	 * The line that announces a policy other than `keep`, or ''.
+	 *
+	 * @param array<mixed> $policies Policy per object type.
+	 * @return string
+	 */
+	public static function policy_line( array $policies ): string {
+		$post = 'source' === ( $policies['post'] ?? '' );
+		$term = 'source' === ( $policies['term'] ?? '' );
+
+		if ( ! $post && ! $term ) {
+			return '';
+		}
+
+		$what = $post && $term
+			? __( 'posts and terms', 'perflocale' )
+			: ( $post ? __( 'posts', 'perflocale' ) : __( 'terms', 'perflocale' ) );
+
+		return sprintf(
+			/* translators: 1: which objects (posts and terms, posts, or terms), 2: filter name */
+			__( 'Language conflicts: the import sets Polylang\'s language for %1$s that PerfLocale has in another language, and lists each change (%2$s).', 'perflocale' ),
+			$what,
+			'perflocale/migration/language_conflict_policy'
+		);
+	}
+
+	/**
+	 * Count a set member or object left as it is because of a conflict, once
+	 * per object.
+	 *
+	 * @param string     $reason    language_taken, split_groups or language_differs.
+	 * @param ObjectType $type      Object type.
+	 * @param int        $object_id Object id.
+	 * @param string     $example   Ids and language slugs only.
+	 * @return void
+	 */
+	private function skip_conflict( string $reason, ObjectType $type, int $object_id, string $example ): void {
+		if ( ! $this->first_count( 'conflict', $type, $object_id ) ) {
+			return;
+		}
+
+		$this->skip( $reason, $example );
+	}
+
+	/**
+	 * Count an object whose language the `source` policy changed, once per object.
+	 *
+	 * @param string     $reason    language_differs.
+	 * @param ObjectType $type      Object type.
+	 * @param int        $object_id Object id.
+	 * @param string     $example   Ids and language slugs only.
+	 * @return void
+	 */
+	private function count_overridden( string $reason, ObjectType $type, int $object_id, string $example ): void {
+		if ( ! $this->first_count( 'conflict', $type, $object_id ) ) {
+			return;
+		}
+
+		$this->overridden[ $reason ]                       = ( $this->overridden[ $reason ] ?? 0 ) + 1;
+
+		if ( count( $this->overridden_examples[ $reason ] ?? [] ) < self::SKIPPED_EXAMPLES ) {
+			$this->overridden_examples[ $reason ][] = $example;
+		}
+	}
+
+	/**
 	 * Import term translations from Polylang's term_translations taxonomy.
 	 *
-	 * @param array{posts: int, terms: int, menus: int, strings: int, errors: array<int, string>} $result Import result (passed by reference for errors).
+	 * @param array<string, mixed> $result Import result (passed by reference for errors).
+	 * @phpstan-param ImportResult $result
 	 * @return int Number of terms imported.
 	 */
 	private function import_term_translations( array &$result ): int {
@@ -740,7 +1707,7 @@ final class PolylangImporter {
 			)
 		);
 
-		$read_error = $this->read_error();
+		$read_error = $this->read_error( $term_ids );
 
 		if ( $read_error !== '' ) {
 			$this->record_read_error( ObjectType::Term, $read_error );
@@ -777,14 +1744,10 @@ final class PolylangImporter {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-			$read_error = $this->read_error();
+			$read_error = $this->read_error( $translation_terms );
 
-			if ( $read_error !== '' ) {
+			if ( $read_error !== '' || ! is_array( $translation_terms ) ) {
 				$this->record_read_error( ObjectType::Term, $read_error );
-				continue;
-			}
-
-			if ( ! is_array( $translation_terms ) ) {
 				continue;
 			}
 
@@ -801,12 +1764,46 @@ final class PolylangImporter {
 	/**
 	 * Per-batch processor for the term-translations taxonomy terms.
 	 *
-	 * @param array<int, object>   $translation_terms term rows for this batch
-	 * @param array<string, mixed> $result            accumulator (errors[])
+	 * @param array<int, object>   $translation_terms Term rows for this batch.
+	 * @param array<string, mixed> $result            Accumulator (errors[]).
+	 * @phpstan-param ImportResult $result
 	 * @return int
 	 */
 	private function process_term_translation_terms( array $translation_terms, array &$result ): int {
 		$imported = 0;
+
+		// Which listed terms exist: one read for the batch (as for posts).
+		$listed = [];
+
+		foreach ( $translation_terms as $term ) {
+			$vars        = get_object_vars( $term );
+			$description = is_string( $vars['description'] ?? null ) ? $vars['description'] : '';
+			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false blocks object instantiation; @ suppresses the unsupported-class notice the option neutralises.
+			$decoded = is_serialized( $description ) ? @unserialize( $description, [ 'allowed_classes' => false ] ) : $description;
+			// phpcs:enable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged
+
+			foreach ( is_array( $decoded ) ? self::set_members( $decoded ) : [] as $term_id ) {
+				if ( is_int( $term_id ) || is_string( $term_id ) ) {
+					$term_id = (int) $term_id;
+
+					if ( $term_id > 0 ) {
+						$listed[ $term_id ] = true;
+					}
+				}
+			}
+		}
+
+		if ( $listed !== [] ) {
+			$this->groups->prime_translations( ObjectType::Term, array_keys( $listed ) );
+		}
+
+		$exists = $this->existing_ids( ObjectType::Term, array_keys( $listed ) );
+
+		if ( null === $exists ) {
+			return 0;
+		}
+
+		$this->start_slot_page( ObjectType::Term, $exists );
 
 		foreach ( $translation_terms as $term ) {
 			// Before each item: the report counts the items finished before it.
@@ -831,116 +1828,16 @@ final class PolylangImporter {
 				continue;
 			}
 
+			if ( is_array( $translations ) && [] === self::set_members( $translations ) ) {
+				$this->skip( 'empty_set', 'term ' . self::row_int( $term, 'term_id' ) );
+				continue;
+			}
+
 			if ( ! is_array( $translations ) || count( $translations ) < 2 ) {
 				continue;
 			}
 
-			// Source-map first - survives DB restores. Same layering as the
-			// post path in process_post_translation_terms().
-			$term_source_key   = $term->term_id . '|term';
-			$mapped_term_id    = $this->source_map->get_group_id( 'polylang', (string) $term_source_key );
-			$existing_group_id = ( $mapped_term_id !== null && $this->groups->find( $mapped_term_id ) ) ? $mapped_term_id : null;
-			$first_slug        = null;
-			$first_term_id     = null;
-			$first_lang_id     = null;
-
-			foreach ( $translations as $lang_slug => $term_id ) {
-				$term_id = (int) $term_id;
-				$lang_id = $this->language_map[ $lang_slug ] ?? null;
-
-				if ( $lang_id === null || ! term_exists( $term_id ) ) {
-					continue;
-				}
-
-				if ( $existing_group_id === null ) {
-					$existing = $this->groups->find_for_object( $term_id, ObjectType::Term );
-
-					if ( $existing ) {
-						$existing_group_id = (int) $existing->id;
-					}
-				}
-
-				if ( $first_slug === null ) {
-					$first_slug    = $lang_slug;
-					$first_term_id = $term_id;
-					$first_lang_id = $lang_id;
-				}
-			}
-
-			if ( $first_slug === null || $first_term_id === null || $first_lang_id === null ) {
-				continue;
-			}
-
-			if ( $existing_group_id !== null ) {
-				$group_id  = $existing_group_id;
-				$skip_seed = false;
-
-				// See the post path: keep the source map converged on reuse.
-				if ( $mapped_term_id !== $group_id ) {
-					$this->source_map->set_group_id( 'polylang', (string) $term_source_key, $group_id );
-				}
-			} else {
-				$new_group_id = $this->groups->create_group(
-					ObjectType::Term,
-					$first_term_id,
-					$first_lang_id,
-					TranslationStatus::Published->value,
-					SourceType::ImportedPolylang,
-					[
-						'type' => 'polylang',
-						'key'  => (string) $term_source_key,
-					]
-				);
-
-				if ( $new_group_id === false ) {
-					$result['errors'][] = sprintf(
-						/* translators: %d: term ID of Polylang's term translation set */
-						__( 'Failed to create group for Polylang term translation term %d.', 'perflocale' ),
-						(int) $term->term_id
-					);
-					continue;
-				}
-
-				$group_id  = (int) $new_group_id;
-				$skip_seed = true;
-				++$imported;
-			}
-
-			foreach ( $translations as $lang_slug => $term_id ) {
-				if ( $skip_seed && $lang_slug === $first_slug ) {
-					continue;
-				}
-
-				$term_id = (int) $term_id;
-				$lang_id = $this->language_map[ $lang_slug ] ?? null;
-
-				if ( $lang_id === null || ! term_exists( $term_id ) ) {
-					continue;
-				}
-
-				// Language-aware skip - see the post loop above.
-				$already = $this->groups->find_link_for_object( $term_id, ObjectType::Term );
-
-				if ( $already
-					&& (int) $already->group_id === $group_id
-					&& (int) $already->language_id === (int) $lang_id ) {
-					continue;
-				}
-
-				$link_result = $this->groups->link_object(
-					$group_id,
-					$term_id,
-					$lang_id,
-					TranslationStatus::Published->value,
-					SourceType::ImportedPolylang
-				);
-
-				if ( $link_result !== false ) {
-					++$imported;
-				} else {
-					++$this->link_failures;
-				}
-			}
+			$imported += $this->apply_set( ObjectType::Term, self::row_int( $term, 'term_id' ), $translations, $exists, $result );
 		}
 
 		return $imported;
@@ -961,6 +1858,7 @@ final class PolylangImporter {
 	 * @param string               $taxonomy Polylang language taxonomy name.
 	 * @param ObjectType           $type     Object type the taxonomy classifies.
 	 * @param array<string, mixed> $result   Accumulator (errors[]).
+	 * @phpstan-param ImportResult $result
 	 * @return int Number of groups created.
 	 */
 	private function import_single_language_objects( string $taxonomy, ObjectType $type, array &$result ): int {
@@ -981,14 +1879,10 @@ final class PolylangImporter {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		$read_error = $this->read_error();
+		$read_error = $this->read_error( $lang_terms );
 
-		if ( $read_error !== '' ) {
+		if ( $read_error !== '' || ! is_array( $lang_terms ) ) {
 			$this->record_read_error( $type, $read_error );
-			return 0;
-		}
-
-		if ( ! is_array( $lang_terms ) ) {
 			return 0;
 		}
 
@@ -1007,9 +1901,21 @@ final class PolylangImporter {
 			$slug    = str_starts_with( $slug, 'pll_' ) ? substr( $slug, 4 ) : $slug;
 			$lang_id = $this->language_map[ $slug ] ?? null;
 
+			// Objects in a language with no PerfLocale language are counted,
+			// not imported.
+			if ( $lang_id === null ) {
+				if ( isset( $this->unmapped[ $slug ] ) ) {
+					$this->count_unmapped_objects( $lang_term, $type, $slug, $batch_size );
+				}
+
+				continue;
+			}
+
 			// A lone default-language object is handled by the fallback
-			// convention and needs no row.
-			if ( $lang_id === null || $lang_id === $default_lang_id ) {
+			// convention and needs no row. One PerfLocale has in another
+			// language is listed and left as it is, under both values.
+			if ( $lang_id === $default_lang_id ) {
+				$imported += $this->import_default_language_objects( $lang_term, $type, $slug, $default_lang_id, $batch_size );
 				continue;
 			}
 
@@ -1034,7 +1940,7 @@ final class PolylangImporter {
 
 				// The keyset cursor cannot move past a page it never read, so
 				// this language ends here; the other languages still import.
-				$read_error = $this->read_error();
+				$read_error = $this->read_error( $object_ids );
 
 				if ( $read_error !== '' ) {
 					$this->record_read_error( $type, $read_error );
@@ -1056,12 +1962,19 @@ final class PolylangImporter {
 
 				$this->groups->prime_translations( $type, $object_ids );
 
-				foreach ( $object_ids as $object_id ) {
-					$object_exists = ObjectType::Post === $type
-						? (bool) get_post( $object_id )
-						: (bool) term_exists( $object_id );
+				// Which of the page's objects exist: one read for the page. When
+				// it fails this language ends here, as for a failed page read.
+				$exists = $this->existing_ids( $type, $object_ids );
 
-					if ( ! $object_exists ) {
+				if ( null === $exists ) {
+					break;
+				}
+
+				$this->start_slot_page( $type, $exists );
+
+				foreach ( $object_ids as $object_id ) {
+					if ( ! isset( $exists[ $object_id ] ) ) {
+						$this->skip_missing( $type, $object_id, $slug );
 						continue;
 					}
 
@@ -1087,6 +2000,31 @@ final class PolylangImporter {
 							continue;
 						}
 
+						// A link alone in its group that no import wrote is no
+						// language yet. Any other language is PerfLocale's: kept
+						// under `keep`; under `source` relabelled only when no
+						// other object holds Polylang's language in the group.
+						$alone    = 1 === count( $this->groups->get_translations( $object_id, $type ) );
+						$override = false;
+
+						if ( ! $alone || self::imported_link( $existing_link ) ) {
+							$example = sprintf( '%s %d (%s in PerfLocale, %s in Polylang)', $type->value, $object_id, $this->language_slug( (int) $existing_link->language_id ), $slug );
+
+							if ( 'source' !== $this->policy( $type ) ) {
+								$this->skip_conflict( 'language_differs', $type, $object_id, $example );
+								continue;
+							}
+
+							$holder = $this->slot_holder( (int) $existing_link->group_id, (int) $lang_id );
+
+							if ( $holder > 0 && $holder !== $object_id ) {
+								$this->skip_conflict( 'language_taken', $type, $object_id, sprintf( '%s %d (%s, held by %s %d)', $type->value, $object_id, $slug, $type->value, $holder ) );
+								continue;
+							}
+
+							$override = true;
+						}
+
 						$relinked = $this->groups->link_object(
 							(int) $existing_link->group_id,
 							$object_id,
@@ -1095,8 +2033,16 @@ final class PolylangImporter {
 							SourceType::ImportedPolylang
 						);
 
+						$this->forget_slots( $object_id, self::row_int( $existing_link, 'group_id' ) );
+
 						if ( $relinked !== false ) {
 							++$imported;
+
+							if ( $override ) {
+								$this->count_overridden( 'language_differs', $type, $object_id, sprintf( '%s %d (%s in PerfLocale, now %s)', $type->value, $object_id, $this->language_slug( (int) $existing_link->language_id ), $slug ) );
+							} elseif ( self::row_int( $existing_link, 'language_id' ) !== $default_lang_id ) {
+								$this->count_overridden( 'set_before_import', $type, $object_id, sprintf( '%s %d (%s in PerfLocale, now %s)', $type->value, $object_id, $this->language_slug( self::row_int( $existing_link, 'language_id' ) ), $slug ) );
+							}
 						} else {
 							++$this->link_failures;
 						}
@@ -1106,13 +2052,29 @@ final class PolylangImporter {
 
 					$source_key = $lang_term->term_id . ':' . $object_id . '|' . $type->value;
 
-					// A live source-map row means a prior run created this
-					// group; if the object was since unlinked by hand, don't
-					// fight the removal.
+					// A recorded group that is empty and of this kind takes
+					// the object back; any other record is counted and
+					// replaced by the new group's.
 					$mapped_id = $this->source_map->get_group_id( 'polylang', (string) $source_key );
 
-					if ( $mapped_id !== null && $this->groups->find( $mapped_id ) ) {
-						continue;
+					if ( $mapped_id !== null ) {
+						if ( SourceMapCheck::group_fits( $type, (int) $mapped_id, [ $object_id ], [ (int) $lang_id => 0 ], true ) ) {
+							$relinked = $this->groups->link_object( (int) $mapped_id, $object_id, (int) $lang_id, $link_status, SourceType::ImportedPolylang );
+
+							$this->forget_slots( $object_id, (int) $mapped_id );
+
+							if ( false !== $relinked ) {
+								++$imported;
+							} else {
+								++$this->link_failures;
+							}
+
+							continue;
+						}
+
+						if ( null !== $this->groups->find( (int) $mapped_id ) ) {
+							$this->skip( 'stale_source_map', sprintf( '%s %d (%s)', $type->value, $object_id, $slug ) );
+						}
 					}
 
 					$new_group_id = $this->groups->create_group(
@@ -1127,7 +2089,10 @@ final class PolylangImporter {
 						]
 					);
 
+					$this->forget_slots( $object_id, is_numeric( $new_group_id ) ? (int) $new_group_id : 0 );
+
 					if ( $new_group_id === false ) {
+						$this->incomplete   = true;
 						$result['errors'][] = sprintf(
 							$type === ObjectType::Post
 								/* translators: %d: post ID */
@@ -1157,6 +2122,153 @@ final class PolylangImporter {
 		}
 
 		$this->beat( $stage, $done, $done );
+
+		return $imported;
+	}
+
+	/**
+	 * Count the objects of one unmapped Polylang language, page by page: a
+	 * gone object as missing, the others as not imported in that language.
+	 *
+	 * @param object     $lang_term  Row of the language taxonomy (term_taxonomy_id).
+	 * @param ObjectType $type       Object type.
+	 * @param string     $slug       Polylang language slug.
+	 * @param int        $batch_size Page size.
+	 * @return void
+	 */
+	private function count_unmapped_objects( object $lang_term, ObjectType $type, string $slug, int $batch_size ): void {
+		$tt_id = self::row_int( $lang_term, 'term_taxonomy_id' );
+		$last  = 0;
+		$full  = true;
+
+		while ( $full ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Keyset page of one language's objects, counted only; the table is bound with %i.
+			$object_ids = $this->wpdb->get_col(
+				$this->wpdb->prepare(
+					'SELECT object_id FROM %i WHERE term_taxonomy_id = %d AND object_id > %d ORDER BY object_id ASC LIMIT %d',
+					$this->wpdb->term_relationships,
+					$tt_id,
+					$last,
+					$batch_size
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+			$read_error = $this->read_error( $object_ids );
+
+			if ( $read_error !== '' ) {
+				$this->record_read_error( $type, $read_error );
+				return;
+			}
+
+			if ( empty( $object_ids ) ) {
+				return;
+			}
+
+			$ids = [];
+
+			foreach ( $object_ids as $object_id ) {
+				$ids[] = is_numeric( $object_id ) ? (int) $object_id : 0;
+			}
+
+			$last   = (int) end( $ids );
+			$full   = count( $ids ) === $batch_size;
+			$exists = $this->existing_ids( $type, $ids );
+
+			if ( null === $exists ) {
+				return;
+			}
+
+			foreach ( $ids as $object_id ) {
+				if ( isset( $exists[ $object_id ] ) ) {
+					$this->skip_unmapped( $type, $object_id, $slug );
+				} else {
+					$this->skip_missing( $type, $object_id, $slug );
+				}
+			}
+
+			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+			$this->beat();
+		}
+	}
+
+	/**
+	 * Objects Polylang has in PerfLocale's default language that PerfLocale
+	 * has in another language. A link alone in its group that no import wrote
+	 * is no language yet: it takes the default language, under both values of
+	 * the conflict policy, and the change is listed (the replaced language is
+	 * not the default). Any other is listed as language_differs and left as it
+	 * is, under both values: the policy never sets the default language over
+	 * one PerfLocale holds, as in the translation-set pass.
+	 *
+	 * One keyset query per page joins the language's objects to their links in
+	 * another language, so a site with no such object reads one empty page.
+	 *
+	 * @param object     $lang_term       Row of the language taxonomy (term_taxonomy_id).
+	 * @param ObjectType $type            Post or Term.
+	 * @param string     $slug            Polylang language slug.
+	 * @param int        $default_lang_id PerfLocale default language ID.
+	 * @param int        $batch_size      Page size.
+	 * @return int Number of objects given the default language.
+	 */
+	private function import_default_language_objects( object $lang_term, ObjectType $type, string $slug, int $default_lang_id, int $batch_size ): int {
+		$tt_id    = self::row_int( $lang_term, 'term_taxonomy_id' );
+		$last     = 0;
+		$full     = true;
+		$imported = 0;
+
+		while ( $full ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Keyset page of one language's objects that hold a link in another language; tables bound with %i.
+			$rows = $this->wpdb->get_results(
+				$this->wpdb->prepare(
+					'SELECT r.object_id, l.group_id, l.language_id, l.source FROM %i r INNER JOIN %i l ON l.object_id = r.object_id AND l.type = %s WHERE r.term_taxonomy_id = %d AND r.object_id > %d AND l.language_id <> %d ORDER BY r.object_id ASC LIMIT %d',
+					$this->wpdb->term_relationships,
+					\PerfLocale\Database\Schema::table( 'translation_links' ),
+					$type->value,
+					$tt_id,
+					$last,
+					$default_lang_id,
+					$batch_size
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+			$read_error = $this->read_error( $rows );
+
+			if ( $read_error !== '' || ! is_array( $rows ) ) {
+				$this->record_read_error( $type, $read_error );
+				return $imported;
+			}
+
+			$full = count( $rows ) === $batch_size;
+
+			// The page's memberships in one read, for the group check below.
+			if ( [] !== $rows ) {
+				$this->groups->prime_translations( $type, array_map( static fn( object $row ): int => self::row_int( $row, 'object_id' ), $rows ) );
+			}
+
+			foreach ( $rows as $row ) {
+				$object_id = self::row_int( $row, 'object_id' );
+				$old_lang  = self::row_int( $row, 'language_id' );
+				$last      = max( $last, $object_id );
+
+				if ( self::imported_link( $row ) || 1 !== count( $this->groups->get_translations( $object_id, $type ) ) ) {
+					$this->skip_conflict( 'language_differs', $type, $object_id, sprintf( '%s %d (%s in PerfLocale, %s in Polylang)', $type->value, $object_id, $this->language_slug( $old_lang ), $slug ) );
+					continue;
+				}
+
+				if ( false === $this->groups->link_object( self::row_int( $row, 'group_id' ), $object_id, $default_lang_id, $this->link_status( $type, $object_id ), SourceType::ImportedPolylang ) ) {
+					++$this->link_failures;
+					continue;
+				}
+
+				++$imported;
+				$this->count_overridden( 'set_before_import', $type, $object_id, sprintf( '%s %d (%s in PerfLocale, now %s)', $type->value, $object_id, $this->language_slug( $old_lang ), $slug ) );
+			}
+
+			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+			$this->beat();
+		}
 
 		return $imported;
 	}

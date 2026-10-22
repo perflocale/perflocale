@@ -479,7 +479,20 @@ final class MachineTranslateController extends RestController {
 
 		$string_ids = array_map( 'intval', (array) $request->get_param( 'string_ids' ) );
 
-		return $this->success( $estimator->estimate_strings( $string_ids, $target_lang_ids, in_array( $request->get_param( 'overwrite' ), [ true, 1, '1', 'true' ], true ) ) );
+		// The strings one dispatch of these IDs translates: the job's own
+		// selection, cut at its per-dispatch cap. `capped` counts the IDs
+		// beyond it, as the job result does.
+		$selected = ( new \PerfLocale\Background\Jobs\BulkStringTranslateJob() )->resolve_ids_for_estimate(
+			[
+				'mode'       => 'ids',
+				'string_ids' => $string_ids,
+			]
+		);
+		$estimate = $estimator->estimate_strings( $selected, $target_lang_ids, in_array( $request->get_param( 'overwrite' ), [ true, 1, '1', 'true' ], true ) );
+
+		$estimate['capped'] = max( 0, count( array_filter( $string_ids, static fn( int $id ): bool => $id > 0 ) ) - count( $selected ) );
+
+		return $this->success( $estimate );
 	}
 
 	/**
@@ -611,7 +624,9 @@ final class MachineTranslateController extends RestController {
 	 * and edit authority ({@see \PerfLocale\Helper::user_can_copy_translation_source()}),
 	 * a term edit_term. A post also needs the create capability of that
 	 * member's type, the type the new post gets
-	 * ({@see \PerfLocale\Helper::user_can_create_like()}). When a translation
+	 * ({@see \PerfLocale\Helper::user_can_create_like()}), a term the create
+	 * rule of that member's taxonomy
+	 * ({@see \PerfLocale\Helper::user_can_create_term_like()}). When a translation
 	 * already exists nothing is created, so nothing is checked here. translate()
 	 * then reads only the requested post, which its own edit_post gate covers.
 	 * translate_object() pivots to the default-language member and reads that;
@@ -640,6 +655,10 @@ final class MachineTranslateController extends RestController {
 				? ( new \PerfLocale\Translation\TermTranslationManager( $plugin->get( 'cache' ) ) )->get_copy_source_id( $id, $term->taxonomy, $target_lang )
 				: 0;
 			$allowed   = $copy_from <= 0 || $copy_from === $id || current_user_can( 'edit_term', $copy_from );
+
+			if ( $allowed && $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_term_like( $copy_from ) ) {
+				return $this->error( 'cannot_create_type', __( 'You do not have permission to create translations of this content.', 'perflocale' ), 403 );
+			}
 		}
 
 		return $allowed

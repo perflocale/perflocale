@@ -1148,6 +1148,14 @@ final class WpmlImporter {
 			$mapped_id  = $this->source_map->get_group_id( 'wpml', $source_key );
 			$existing   = $mapped_id !== null ? $this->groups->find( $mapped_id ) : null;
 
+			// A recorded group that no longer fits the set (another kind of
+			// group, or one holding other items in the set's languages) is
+			// counted and not used; the writes below replace the record.
+			if ( $existing && ! SourceMapCheck::group_fits( $type, (int) $mapped_id, array_column( $members, 'object' ), array_flip( array_column( $members, 'lang' ) ) ) ) {
+				$this->skip_row( 'stale_source_map', $trid, $kind, $first['object'] );
+				$existing = null;
+			}
+
 			if ( ! $existing ) {
 				$member_group = $this->member_group( $members, $type );
 
@@ -1582,6 +1590,9 @@ final class WpmlImporter {
 				'other_set_group' =>
 					/* translators: %d: number of WPML rows */
 					_n( '%d WPML row was not linked: its item already belongs to the translation group of another WPML set.', '%d WPML rows were not linked: their items already belong to the translation group of another WPML set.', $count, 'perflocale' ),
+				'stale_source_map' =>
+					/* translators: %d: number of WPML translation sets */
+					_n( '%d record of an earlier WPML import pointed to a translation group that no longer matches its set (a group of another kind, or one holding other items in its languages); it was not used.', '%d records of an earlier WPML import pointed to translation groups that no longer match their sets (groups of another kind, or holding other items in their languages); they were not used.', $count, 'perflocale' ),
 				'split_groups' =>
 					/* translators: %d: number of WPML rows */
 					_n( '%d WPML row was not linked: the items of its translation set belong to different PerfLocale translation groups that also hold other items.', '%d WPML rows were not linked: the items of their translation sets belong to different PerfLocale translation groups that also hold other items.', $count, 'perflocale' ),
@@ -1981,6 +1992,7 @@ final class WpmlImporter {
 	 * @param int                         $skipped_insert   Rows whose string could not be created; added to.
 	 * @param int                         $link_failures    Link writes that failed; added to.
 	 * @return int Translations written.
+	 * @throws \Throwable What the batch writer throws, after the batch is rolled back.
 	 */
 	private function import_string_batch( array $rows, StringTranslationRepository $str_trans, array &$domains, int &$skipped_unmapped, int &$skipped_insert, int &$link_failures ): int {
 		$items     = [];
@@ -2028,157 +2040,280 @@ final class WpmlImporter {
 			return 0;
 		}
 
-		$imported = 0;
+		// One transaction per batch, which must never go on once it is lost
+		// (Schema::transaction_lost(): a failed statement of the batch, or any
+		// failed query that ended the transaction: on SQLite every one, after
+		// which later statements commit one by one; on MySQL a deadlock).
+		// write_string_batch() checks after every statement and stops at once;
+		// the batch is then rolled back and written again outside a
+		// transaction, row by row where the batch form failed, as an import
+		// without a transaction writes it.
+		$counters = [ $domains, $skipped_insert, $link_failures, $this->strings_sanitized ];
+		$errors   = Schema::query_error_count();
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One transaction per batch.
 		$in_transaction = $this->wpdb->query( 'START TRANSACTION' ) !== false;
 
+		if ( ! $in_transaction ) {
+			return (int) $this->write_string_batch( $items, $originals, $str_trans, $domains, $skipped_insert, $link_failures, false, $errors );
+		}
+
+		$this->groups->set_in_transaction( true );
+
 		try {
-			$strings = $this->strings_by_hash( array_values( array_unique( array_merge( array_column( $items, 'hash' ), array_map( 'strval', array_keys( $originals ) ) ) ) ) );
-			$failed  = [];
-			$created = [];
+			$imported = $this->write_string_batch( $items, $originals, $str_trans, $domains, $skipped_insert, $link_failures, true, $errors );
+		} catch ( \Throwable $e ) {
+			$this->groups->set_in_transaction( false );
+			$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-			foreach ( array_merge( $items, array_values( $originals ) ) as $item ) {
-				if ( isset( $strings[ $item['hash'] ] ) || isset( $failed[ $item['hash'] ] ) || isset( $created[ $item['hash'] ] ) ) {
-					continue;
-				}
+			throw $e;
+		}
 
-				$string_id = $this->strings->insert(
-					[
-						'domain'   => $item['domain'],
-						'context'  => $item['context'],
-						'original' => $item['original'],
-					]
-				);
+		$this->groups->set_in_transaction( false );
 
-				if ( $string_id === false ) {
-					$failed[ $item['hash'] ] = true;
-				} else {
-					$created[ $item['hash'] ] = true;
-				}
+		if ( null !== $imported ) {
+			$this->wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			return $imported;
+		}
+
+		$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		[ $domains, $skipped_insert, $link_failures, $this->strings_sanitized ] = $counters;
+
+		return (int) $this->write_string_batch( $items, $originals, $str_trans, $domains, $skipped_insert, $link_failures, false, Schema::query_error_count() );
+	}
+
+	/**
+	 * Write one prepared batch of WPML string translations (see
+	 * import_string_batch()). With $in_transaction it stops as soon as the
+	 * transaction is lost, before sending another statement, and answers
+	 * null; without it a failed batch write falls back to one write per row,
+	 * as before.
+	 *
+	 * @param array                       $items          Translations to write.
+	 * @param array                       $originals      Strings to create without a translation.
+	 * @param StringTranslationRepository $str_trans      Translations.
+	 * @param array<string, true>         $domains        Domains holding an imported string or translation; added to.
+	 * @param int                         $skipped_insert Rows whose string could not be created; added to.
+	 * @param int                         $link_failures  Link writes that failed; added to.
+	 * @param bool                        $in_transaction Whether a transaction is open.
+	 * @param int                         $errors         Schema::query_error_count() before the batch.
+	 * @return int|null Translations written, or null when a statement failed inside the transaction.
+	 *
+	 * @phpstan-param array<int, array{domain: string, context: string, original: string, lang: int, value: string, sanitized: bool, hash: string}> $items
+	 * @phpstan-param array<string, array{domain: string, context: string, original: string, hash: string}> $originals
+	 */
+	private function write_string_batch( array $items, array $originals, StringTranslationRepository $str_trans, array &$domains, int &$skipped_insert, int &$link_failures, bool $in_transaction, int $errors ): ?int {
+		$imported = 0;
+
+		// Up to the link write every statement is the batch's own (no hook runs
+		// in these reads and writes), so any new failed query is its own.
+		$stopped = static fn(): bool => $in_transaction && Schema::transaction_lost( $errors, Schema::query_error_count() > $errors );
+		$strings = $this->strings_by_hash( array_values( array_unique( array_merge( array_column( $items, 'hash' ), array_map( 'strval', array_keys( $originals ) ) ) ) ) );
+		$failed  = [];
+		$created = [];
+
+		if ( $stopped() ) {
+			return null;
+		}
+
+		foreach ( array_merge( $items, array_values( $originals ) ) as $item ) {
+			if ( isset( $strings[ $item['hash'] ] ) || isset( $failed[ $item['hash'] ] ) || isset( $created[ $item['hash'] ] ) ) {
+				continue;
 			}
 
-			foreach ( $this->strings_by_hash( array_map( 'strval', array_keys( $created ) ) ) as $hash => $string ) {
-				$strings[ $hash ] = $string;
+			$string_id = $this->strings->insert(
+				[
+					'domain'   => $item['domain'],
+					'context'  => $item['context'],
+					'original' => $item['original'],
+				],
+				$in_transaction
+			);
+
+			if ( $stopped() ) {
+				return null;
 			}
 
-			foreach ( $originals as $hash => $entry ) {
-				if ( isset( $strings[ $hash ] ) ) {
-					$domains[ $entry['domain'] ] = true;
-				}
-			}
-
-			$ids_by_lang = [];
-			$group_ids   = [];
-
-			foreach ( $items as $item ) {
-				$string = $strings[ $item['hash'] ] ?? null;
-
-				if ( $string !== null && (int) $string->group_id > 0 ) {
-					$ids_by_lang[ $item['lang'] ][] = (int) $string->id;
-					$group_ids[]                    = (int) $string->group_id;
-				}
-			}
-
-			$have = [];
-
-			foreach ( $ids_by_lang as $lang_id => $ids ) {
-				$have[ $lang_id ] = $str_trans->get_many( array_values( array_unique( $ids ) ), (int) $lang_id );
-			}
-
-			$links   = $this->string_links_for_groups( array_values( array_unique( $group_ids ) ) );
-			$to_set  = [];
-			$pairs   = [];
-			$changed = [];
-
-			foreach ( $items as $item ) {
-				if ( isset( $failed[ $item['hash'] ] ) ) {
-					++$skipped_insert;
-					continue;
-				}
-
-				$string = $strings[ $item['hash'] ] ?? null;
-
-				if ( $string === null || (int) $string->group_id <= 0 ) {
-					continue;
-				}
-
-				$string_id = (int) $string->id;
-				$lang_id   = $item['lang'];
-				$is_new    = false;
-
-				// Idempotency: an existing translation (e.g. a correction made
-				// after an earlier import) is kept; only the link is checked.
-				// The first row of the batch for a string + language wins.
-				if ( ! isset( $have[ $lang_id ][ $string_id ] ) ) {
-					$to_set[]                       = [ $string_id, $lang_id, $item['value'] ];
-					$have[ $lang_id ][ $string_id ] = $item['value'];
-					$is_new                         = true;
-
-					if ( $item['sanitized'] ) {
-						$changed[] = $string_id . ':' . $lang_id;
-					}
-				}
-
-				$pairs[] = [ $string_id, (int) $string->group_id, $lang_id, $item['domain'], $is_new ];
-			}
-
-			$saved = [];
-
-			if ( $to_set !== [] ) {
-				if ( $str_trans->set_many( $to_set ) ) {
-					foreach ( $to_set as [ $string_id, $lang_id ] ) {
-						$saved[ $string_id . ':' . $lang_id ] = true;
-					}
-				} else {
-					foreach ( $to_set as [ $string_id, $lang_id, $value ] ) {
-						if ( $str_trans->set( $string_id, $lang_id, $value ) ) {
-							$saved[ $string_id . ':' . $lang_id ] = true;
-						}
-					}
-				}
-
-				$imported += count( $saved );
-
-				foreach ( $changed as $key ) {
-					if ( isset( $saved[ $key ] ) ) {
-						++$this->strings_sanitized;
-					}
-				}
-			}
-
-			// The value row alone is never served: the gettext map, the
-			// files-mode generator and the strings screen all join
-			// translation_links. A link is written unless it already links
-			// this string as an imported translation; a failed write is
-			// counted, because that translation is stored but shown nowhere.
-			$to_link = [];
-
-			foreach ( $pairs as [ $string_id, $group_id, $lang_id, $domain, $is_new ] ) {
-				if ( $is_new && ! isset( $saved[ $string_id . ':' . $lang_id ] ) ) {
-					continue;
-				}
-
-				$domains[ $domain ] = true;
-				$link               = $links[ $group_id ][ $lang_id ] ?? null;
-
-				if ( isset( $to_link[ $group_id . ':' . $lang_id ] ) || (
-					$link !== null
-					&& (int) $link->object_id === $string_id
-					&& (string) $link->status === 'translated'
-					&& (string) $link->source === SourceType::ImportedWpml->value
-				) ) {
-					continue;
-				}
-
-				$to_link[ $group_id . ':' . $lang_id ] = [ $group_id, $string_id, $lang_id ];
-			}
-
-			$link_failures += $this->groups->upsert_string_links( array_values( $to_link ), SourceType::ImportedWpml );
-		} finally {
-			if ( $in_transaction ) {
-				$this->wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			if ( $string_id === false ) {
+				$failed[ $item['hash'] ] = true;
+			} else {
+				$created[ $item['hash'] ] = true;
 			}
 		}
+
+		foreach ( $this->strings_by_hash( array_map( 'strval', array_keys( $created ) ) ) as $hash => $string ) {
+			$strings[ $hash ] = $string;
+		}
+
+		if ( $stopped() ) {
+			return null;
+		}
+
+		foreach ( $originals as $hash => $entry ) {
+			if ( isset( $strings[ $hash ] ) ) {
+				$domains[ $entry['domain'] ] = true;
+			}
+		}
+
+		$ids_by_lang = [];
+		$group_ids   = [];
+		$not_string  = [];
+
+		foreach ( $items as $item ) {
+			$string = $strings[ $item['hash'] ] ?? null;
+
+			if ( $string !== null && (int) $string->group_id > 0 ) {
+				$string_id                      = (int) $string->id;
+				$ids_by_lang[ $item['lang'] ][] = $string_id;
+				$group_ids[]                    = (int) $string->group_id;
+
+				if ( ! isset( $string->group_type ) || 'string' !== $string->group_type ) {
+					$not_string[ $string_id ] = true;
+				}
+			}
+		}
+
+		$have = [];
+
+		foreach ( $ids_by_lang as $lang_id => $ids ) {
+			$have[ $lang_id ] = $str_trans->get_many( array_values( array_unique( $ids ) ), (int) $lang_id );
+
+			if ( $stopped() ) {
+				return null;
+			}
+		}
+
+		$links = $this->string_links_for_groups( array_values( array_unique( $group_ids ) ) );
+
+		if ( $stopped() ) {
+			return null;
+		}
+
+		$to_set  = [];
+		$pairs   = [];
+		$changed = [];
+
+		foreach ( $items as $item ) {
+			if ( isset( $failed[ $item['hash'] ] ) ) {
+				++$skipped_insert;
+				continue;
+			}
+
+			$string = $strings[ $item['hash'] ] ?? null;
+
+			if ( $string === null || (int) $string->group_id <= 0 ) {
+				continue;
+			}
+
+			$string_id = (int) $string->id;
+			$lang_id   = $item['lang'];
+			$is_new    = false;
+
+			// Idempotency: an existing translation (e.g. a correction made
+			// after an earlier import) is kept; only the link is checked.
+			// The first row of the batch for a string + language wins.
+			if ( ! isset( $have[ $lang_id ][ $string_id ] ) ) {
+				$to_set[]                       = [ $string_id, $lang_id, $item['value'] ];
+				$have[ $lang_id ][ $string_id ] = $item['value'];
+				$is_new                         = true;
+
+				if ( $item['sanitized'] ) {
+					$changed[] = $string_id . ':' . $lang_id;
+				}
+			}
+
+			$pairs[] = [ $string_id, (int) $string->group_id, $lang_id, $item['domain'], $is_new ];
+		}
+
+		$saved = [];
+
+		if ( $to_set !== [] ) {
+			$set = $str_trans->set_many( $to_set );
+
+			if ( $stopped() ) {
+				return null;
+			}
+
+			if ( $set ) {
+				foreach ( $to_set as [ $string_id, $lang_id ] ) {
+					$saved[ $string_id . ':' . $lang_id ] = true;
+				}
+			} else {
+				foreach ( $to_set as [ $string_id, $lang_id, $value ] ) {
+					if ( $str_trans->set( $string_id, $lang_id, $value ) ) {
+						$saved[ $string_id . ':' . $lang_id ] = true;
+					}
+				}
+			}
+
+			$imported += count( $saved );
+
+			foreach ( $changed as $key ) {
+				if ( isset( $saved[ $key ] ) ) {
+					++$this->strings_sanitized;
+				}
+			}
+		}
+
+		// The value row alone is never served: the gettext map, the
+		// files-mode generator and the strings screen all join
+		// translation_links. A link is written unless it already links
+		// this string as an imported translation; a failed write is
+		// counted, because that translation is stored but shown nowhere.
+		$to_link = [];
+		$moved   = [];
+
+		foreach ( $pairs as [ $string_id, $group_id, $lang_id, $domain, $is_new ] ) {
+			if ( $is_new && ! isset( $saved[ $string_id . ':' . $lang_id ] ) ) {
+				continue;
+			}
+
+			$domains[ $domain ] = true;
+
+			// A string link goes only into a string group: a string pointing
+			// at a post or term group (or at none) gets a new string group
+			// first, once per string.
+			if ( isset( $not_string[ $string_id ] ) ) {
+				if ( ! isset( $moved[ $string_id ] ) ) {
+					$moved[ $string_id ] = $this->groups->assign_new_string_group( $string_id, $in_transaction );
+
+					if ( $stopped() ) {
+						return null;
+					}
+				}
+
+				$group_id = $moved[ $string_id ];
+
+				if ( $group_id <= 0 ) {
+					++$link_failures;
+					continue;
+				}
+			}
+
+			$link = $links[ $group_id ][ $lang_id ] ?? null;
+
+			if ( isset( $to_link[ $group_id . ':' . $lang_id ] ) || (
+				$link !== null
+				&& (int) $link->object_id === $string_id
+				&& (string) $link->status === 'translated'
+				&& (string) $link->source === SourceType::ImportedWpml->value
+			) ) {
+				continue;
+			}
+
+			$to_link[ $group_id . ':' . $lang_id ] = [ $group_id, $string_id, $lang_id ];
+		}
+
+		// The link write runs perflocale/translation/linked listeners; it
+		// answers -1 when the transaction was lost (its own statement failed,
+		// or a listener's failed query ended it: Schema::transaction_lost()).
+		$unlinked = $this->groups->upsert_string_links( array_values( $to_link ), SourceType::ImportedWpml );
+
+		if ( $unlinked < 0 || ( $in_transaction && Schema::transaction_lost( $errors ) ) ) {
+			return null;
+		}
+
+		$link_failures += $unlinked;
 
 		return $imported;
 	}
@@ -2221,7 +2356,7 @@ final class WpmlImporter {
 	 * PerfLocale strings by hash, for a batch.
 	 *
 	 * @param string[] $hashes original_hash values.
-	 * @return array<string, object> hash => row with id and group_id.
+	 * @return array<string, object> hash => row with id, group_id and group_type (null when the group is missing).
 	 */
 	private function strings_by_hash( array $hashes ): array {
 		$out = [];
@@ -2232,8 +2367,8 @@ final class WpmlImporter {
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- $placeholders is a generated %s list bound to $chunk.
 			$rows = $this->wpdb->get_results(
 				$this->wpdb->prepare(
-					"SELECT id, group_id, original_hash FROM %i WHERE original_hash IN ({$placeholders})",
-					array_merge( [ Schema::table( 'strings' ) ], $chunk )
+					"SELECT s.id, s.group_id, s.original_hash, g.type AS group_type FROM %i s LEFT JOIN %i g ON g.id = s.group_id WHERE s.original_hash IN ({$placeholders})",
+					array_merge( [ Schema::table( 'strings' ), Schema::table( 'translation_groups' ) ], $chunk )
 				)
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders

@@ -566,3 +566,13 @@
 		display: none;
 	}
 }
+
+/* Export & Import: the add-on data choices of the import form. */
+.perflocale-import-addon {
+	margin: 12px 0;
+}
+
+.perflocale-import-addon__choice {
+	display: block;
+	margin-bottom: 4px;
+}

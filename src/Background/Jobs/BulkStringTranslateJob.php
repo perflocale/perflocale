@@ -150,6 +150,18 @@ final class BulkStringTranslateJob extends AbstractJob {
 	}
 
 	/**
+	 * The most strings one dispatch translates: MAX_STRINGS_PER_DISPATCH
+	 * through the `perflocale/mt/bulk_string_max_per_dispatch` filter. The
+	 * dispatch, the estimate route and the Strings screen's confirm dialog
+	 * read the cap here.
+	 *
+	 * @return int
+	 */
+	public static function max_per_dispatch(): int {
+		return (int) apply_filters( 'perflocale/mt/bulk_string_max_per_dispatch', self::MAX_STRINGS_PER_DISPATCH );
+	}
+
+	/**
 	 * Resolve the string IDs a dispatch with these args WOULD translate -
 	 * public so the pre-dispatch budget gate and the /machine-translate/estimate
 	 * endpoint can estimate cost with the job's exact selection semantics
@@ -181,7 +193,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 */
 	private function resolve_string_ids( array $args ): array {
 		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'ids';
-		$cap  = (int) apply_filters( 'perflocale/mt/bulk_string_max_per_dispatch', self::MAX_STRINGS_PER_DISPATCH );
+		$cap  = self::max_per_dispatch();
 
 		if ( $mode === 'ids' ) {
 			$ids = (array) ( $args['string_ids'] ?? [] );
@@ -305,7 +317,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		// the selection actually matched more, report how many are left so the
 		// operator knows to re-run rather than assuming the whole set was
 		// translated.
-		$cap     = (int) apply_filters( 'perflocale/mt/bulk_string_max_per_dispatch', self::MAX_STRINGS_PER_DISPATCH );
+		$cap     = self::max_per_dispatch();
 		$dropped = 0;
 		if ( count( $string_ids ) >= $cap ) {
 			$dropped = max( 0, $this->resolve_string_count( $args ) - count( $string_ids ) );

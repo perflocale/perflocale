@@ -86,6 +86,10 @@ final class AdminController {
 		// This notice is the only surface left that can say what happened.
 		add_action( 'admin_notices', [ $this, 'render_discarded_post_notice' ] );
 
+		// Why a translation the Create action meant to machine-translate is an
+		// untranslated copy (classic editor, Translations screen).
+		add_action( 'admin_notices', [ $this, 'render_mt_create_notice' ] );
+
 
 		// Handle admin-post.php actions.
 		add_action( 'admin_post_perflocale_create_translation', [ $this, 'handle_create_translation' ] );
@@ -199,16 +203,11 @@ final class AdminController {
 			$plugin    = \PerfLocale\Plugin::get_instance();
 			$cache     = $plugin->get( 'cache' );
 			$generator = new \PerfLocale\Strings\TranslationFileGenerator( $cache );
-			// generate_all() self-heals first, but we still want the repair
-			// counts surfaced in the redirect notice so the user sees that
-			// stranded translations were reconnected during the run.
-			$repaired_before = $generator->count_repairable_orphans();
-			$count           = $generator->generate_all();
-			// Anything that started orphaned and is no longer orphaned was
-			// repaired by generate_all(). count_repairable_orphans() after
-			// the run should be ≤ before.
-			$repaired_after = $generator->count_repairable_orphans();
-			$repaired       = max( 0, $repaired_before - $repaired_after );
+			$count     = $generator->generate_all();
+			// generate_all() repairs orphaned translation rows first; the
+			// notice reports how many so the user sees that stranded
+			// translations were reconnected during the run.
+			$repaired = $generator->get_repaired_count();
 			// Languages whose translations could not be read kept their
 			// existing files; the notice reports them instead of a plain count.
 			$read_failed = count( $generator->get_read_failed_locales() );
@@ -292,6 +291,10 @@ final class AdminController {
 			$redirect_args['mt-address-refused'] = '1';
 		}
 
+		if ( [] !== Pages\SettingsPage::last_refused_sync_fields() ) {
+			$redirect_args['sync-refused'] = rawurlencode( implode( ',', Pages\SettingsPage::last_refused_sync_fields() ) );
+		}
+
 		if ( in_array( $tab, $addon_subtabs, true ) ) {
 			$redirect_args['tab']    = 'addons';
 			$redirect_args['subtab'] = $tab;
@@ -343,20 +346,28 @@ final class AdminController {
 	/**
 	 * Ceiling the JSON data importer applies on top of PHP's own upload limits.
 	 *
-	 * The twin of po_max_bytes(), and kept a second ceiling for the same
-	 * reason: the staged file is read back and decoded whole. Applying the
-	 * filter in one place is what keeps the gate and the number shown on the
-	 * import form from drifting apart.
+	 * The importer reads the file in pieces, and the screen sends a file larger
+	 * than PHP's upload limits in pieces too, so this ceiling bounds the disk
+	 * space a staged upload takes and the length of the import, not memory.
+	 * Applying the filter in one place is what keeps the gate, the number
+	 * shown on the import form and the export screen's size warning from
+	 * drifting apart.
 	 *
 	 * @return int Maximum accepted import size, in bytes.
 	 */
 	public static function import_max_bytes(): int {
 		/**
-		 * Filters the largest data-export JSON the importer will accept, in bytes.
+		 * Filters the largest data-export JSON the importer will accept through
+		 * the Export & Import screen, in bytes. A file larger than PHP's own
+		 * upload limits (upload_max_filesize, post_max_size) is sent from the
+		 * screen in pieces, so this filter is the screen's only size cap.
+		 * WP-CLI (`wp perflocale import`) does not apply it.
 		 *
 		 * @hook perflocale/import/max_file_bytes
+		 *
+		 * @param int $bytes Default 512 MB.
 		 */
-		return (int) apply_filters( 'perflocale/import/max_file_bytes', 50 * MB_IN_BYTES );
+		return (int) apply_filters( 'perflocale/import/max_file_bytes', 512 * MB_IN_BYTES );
 	}
 
 	/**
@@ -569,6 +580,28 @@ final class AdminController {
 	}
 
 	/**
+	 * `admin_notices`: the Create action's machine translation notice
+	 * (MtCreateNotice::render_admin_notice()). It can show only on post.php
+	 * with a post, or on a screen whose URL carries `perflocale_created`;
+	 * every other admin screen returns here, before MtCreateNotice is
+	 * loaded. MtCreateNotice makes the exact checks.
+	 *
+	 * @return void
+	 */
+	public function render_mt_create_notice(): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Presence check only; the value is read nowhere here.
+		$on_post_screen = 'post.php' === ( $GLOBALS['pagenow'] ?? '' ) && isset( $_GET['post'] );
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Presence check only, as above.
+		$after_create = isset( $_GET['perflocale_created'] );
+
+		if ( ! $on_post_screen && ! $after_create ) {
+			return;
+		}
+
+		MtCreateNotice::render_admin_notice();
+	}
+
+	/**
 	 * Tell the operator when PHP discarded their upload before WordPress saw it.
 	 *
 	 * Renders on this plugin's own admin screens only, and only for the
@@ -619,6 +652,38 @@ final class AdminController {
 	}
 
 	/**
+	 * The add-on data choices a form posted, kept only when this site
+	 * declares them: group parts (DataExporter::addon_groups() keys) and,
+	 * when `$with_shared`, the shared `addon_data` choice. The form that
+	 * shows the checkboxes also posts `<field>_shown`, so nothing ticked is
+	 * an empty list; a post without it (a form or script from before the
+	 * checkboxes) gets null, which means every choice.
+	 *
+	 * @param string $field       POST field (a checkbox list).
+	 * @param bool   $with_shared Whether the shared Add-on data choice is one of them.
+	 * @return list<string>|null
+	 */
+	private static function posted_addon_choices( string $field, bool $with_shared ): ?array {
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Called by the export and import handlers after their nonce checks.
+		if ( empty( $_POST[ $field . '_shown' ] ) ) {
+			return null;
+		}
+
+		$posted = isset( $_POST[ $field ] ) ? Typed::strs( map_deep( wp_unslash( (array) $_POST[ $field ] ), 'sanitize_text_field' ) ) : [];
+		// phpcs:enable WordPress.Security.NonceVerification.Missing
+
+		$allowed = array_keys( \PerfLocale\Admin\DataExporter::addon_groups() );
+
+		if ( $with_shared ) {
+			$allowed[] = 'addon_data';
+		}
+
+		// Only exact matches of the allowed keys are kept, so nothing posted
+		// reaches the exporter or importer unchecked.
+		return array_values( array_intersect( $posted, $allowed ) );
+	}
+
+	/**
 	 * Why an admin-started migration did not run, or '' when it ran.
 	 *
 	 * The inline run reports an exception (another import holds the lock) as
@@ -665,13 +730,22 @@ final class AdminController {
 				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
 			}
 
-			if ( ! current_user_can( 'manage_options' ) ) {
+			// The same two capabilities the background export, the export
+			// download and every import require: a site that took
+			// perflocale_import_export away from a role keeps that role from
+			// the streamed export too.
+			if ( ! current_user_can( 'manage_options' ) || ! current_user_can( 'perflocale_import_export' ) ) {
 				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
 			}
 
 			$sections = isset( $_POST['export_sections'] )
 				? array_map( 'sanitize_key', wp_unslash( (array) $_POST['export_sections'] ) )
 				: [];
+
+			// The add-on groups ticked on the form, kept only when this site
+			// declares them; null (every group with Add-on data) for a post
+			// that does not come from a form showing them.
+			$groups = self::posted_addon_choices( 'export_addon_groups', false );
 
 			// Decide sync vs async manually here rather than via
 			// Dispatcher::dispatch - the sync path needs to STREAM the
@@ -683,21 +757,16 @@ final class AdminController {
 			$settings = $plugin->get( 'settings' );
 			$job      = new \PerfLocale\Background\Jobs\DataExportJob();
 			$job_args = [
-				'sections' => $sections,
-				'path'     => '',
+				'sections'     => $sections,
+				'addon_groups' => $groups,
+				'path'         => '',
 			];
 
 			if ( $job->should_run_async( $job_args, $settings ) ) {
 				$result = \PerfLocale\Background\Dispatcher::dispatch( $job, $job_args );
 
 				if ( ( $result['mode'] ?? '' ) === 'async' ) {
-					wp_safe_redirect(
-						add_query_arg(
-							'import_result',
-							rawurlencode( __( 'Data export queued. The download link will appear under PerfLocale → Jobs when ready.', 'perflocale' ) ),
-							admin_url( 'admin.php?page=perflocale-jobs' )
-						)
-					);
+					wp_safe_redirect( add_query_arg( 'perflocale_notice', 'export_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 					exit;
 				}
 
@@ -706,7 +775,7 @@ final class AdminController {
 			}
 
 			$exporter = new \PerfLocale\Admin\DataExporter();
-			$exporter->download( $sections ); // Dies after sending file.
+			$exporter->download( $sections, $groups ); // Dies after sending file.
 		}
 
 		// ---- Import ----
@@ -719,113 +788,140 @@ final class AdminController {
 				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
 			}
 
-			// PHP records why an upload produced no tmp_name in the entry's
-			// `error` slot and nowhere else. Read it BEFORE the emptiness
-			// gate below: a file the server refused for being too big arrives
-			// here as a populated $_FILES entry with an empty tmp_name, which
-			// that gate would otherwise report as "No file uploaded".
-			$upload_error = isset( $_FILES['perflocale_import_file']['error'] ) && is_scalar( $_FILES['perflocale_import_file']['error'] )
-				? (int) $_FILES['perflocale_import_file']['error']
-				: UPLOAD_ERR_NO_FILE;
+			// A file the screen sent in pieces (ImportUpload, for a file
+			// larger than PHP accepts in one request): the form carries the
+			// upload's token instead of the file, and the assembled copy is
+			// already staged in the temp directory. Taking it ends the upload
+			// and frees its place in the upload quota.
+			$upload_token   = isset( $_POST['perflocale_import_upload'] ) && is_string( $_POST['perflocale_import_upload'] ) ? sanitize_text_field( wp_unslash( $_POST['perflocale_import_upload'] ) ) : '';
+			$persisted_path = '' !== $upload_token ? \PerfLocale\Admin\ImportUpload::claim( $upload_token ) : '';
 
-			if ( UPLOAD_ERR_OK !== $upload_error ) {
-				wp_safe_redirect(
-					add_query_arg(
-						'import_error',
-						rawurlencode( self::upload_error_message( $upload_error ) ),
-						$redirect_url
-					)
-				);
+			if ( null === $persisted_path ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', \PerfLocale\Admin\ImportUpload::busy_message() ) );
 				exit;
 			}
 
-			if ( empty( $_FILES['perflocale_import_file']['tmp_name'] ) ) {
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( __( 'No file uploaded.', 'perflocale' ) ), $redirect_url ) );
+			if ( '' !== $upload_token && '' === $persisted_path ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'The file was not uploaded completely, or the upload has expired. Choose the file and import it again.', 'perflocale' ) ) );
 				exit;
 			}
 
-			// tmp_name is a server-controlled path - do NOT sanitize_text_field()
-			// which can strip valid path characters. is_uploaded_file() is the
-			// correct security check for uploaded file paths.
-			$tmp_path = $_FILES['perflocale_import_file']['tmp_name']; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+			if ( '' === $persisted_path ) {
+				// PHP records why an upload produced no tmp_name in the entry's
+				// `error` slot and nowhere else. Read it BEFORE the emptiness
+				// gate below: a file the server refused for being too big arrives
+				// here as a populated $_FILES entry with an empty tmp_name, which
+				// that gate would otherwise report as "No file uploaded".
+				$upload_error = isset( $_FILES['perflocale_import_file']['error'] ) && is_scalar( $_FILES['perflocale_import_file']['error'] )
+					? (int) $_FILES['perflocale_import_file']['error']
+					: UPLOAD_ERR_NO_FILE;
 
-			if ( ! is_uploaded_file( $tmp_path ) ) {
-				wp_safe_redirect( add_query_arg( 'import_error', __( 'Invalid file upload.', 'perflocale' ), $redirect_url ) );
-				exit;
-			}
+				if ( UPLOAD_ERR_OK !== $upload_error ) {
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', self::upload_error_message( $upload_error ) ) );
+					exit;
+				}
 
-			// Fail-fast size check before the chunked copy stages a multi-GB
-			// file (wasted I/O + disk-fill risk). $_FILES size is PHP's own
-			// measurement, not client-forgeable. The ceiling comes from
-			// import_max_bytes() so this gate and the number the import form
-			// advertises can never disagree.
-			$max_import_bytes = self::import_max_bytes();
-			$upload_size      = isset( $_FILES['perflocale_import_file']['size'] )
-				? (int) $_FILES['perflocale_import_file']['size']
-				: 0;
+				if ( empty( $_FILES['perflocale_import_file']['tmp_name'] ) ) {
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'No file uploaded.', 'perflocale' ) ) );
+					exit;
+				}
 
-			if ( $upload_size <= 0 || $upload_size > max( 1024 * 1024, $max_import_bytes ) ) {
-				wp_safe_redirect(
-					add_query_arg(
-						'import_error',
-						rawurlencode(
+				// tmp_name is a server-controlled path - do NOT sanitize_text_field()
+				// which can strip valid path characters. is_uploaded_file() is the
+				// correct security check for uploaded file paths.
+				$tmp_path = $_FILES['perflocale_import_file']['tmp_name']; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+
+				if ( ! is_uploaded_file( $tmp_path ) ) {
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'Invalid file upload.', 'perflocale' ) ) );
+					exit;
+				}
+
+				// Fail-fast size check before the chunked copy stages a multi-GB
+				// file (wasted I/O + disk-fill risk). $_FILES size is PHP's own
+				// measurement, not client-forgeable. The ceiling comes from
+				// import_max_bytes() so this gate and the number the import form
+				// advertises can never disagree.
+				$max_import_bytes = self::import_max_bytes();
+				$upload_size      = isset( $_FILES['perflocale_import_file']['size'] )
+					? (int) $_FILES['perflocale_import_file']['size']
+					: 0;
+
+				if ( $upload_size <= 0 || $upload_size > max( 1024 * 1024, $max_import_bytes ) ) {
+					wp_safe_redirect(
+						ImportNotice::url(
+							$redirect_url,
+							'error',
 							sprintf(
-							/* translators: %s: maximum allowed import file size, e.g. "50 MB" */
+								/* translators: %s: maximum allowed import file size, e.g. "50 MB" */
 								__( 'Import file exceeds the maximum allowed size (%s).', 'perflocale' ),
 								size_format( $max_import_bytes )
 							)
-						),
-						$redirect_url
-					)
-				);
-				exit;
-			}
-
-			// Move PHP's tmp upload into wp-content/uploads/perflocale/temp/
-			// so the async worker can still see the file when WP-Cron /
-			// Action Scheduler runs on a later request. Mirrors the
-			// chunked-stream pattern used by the CSV importer
-			// below - Plugin Check rejects move_uploaded_file/rename/copy.
-			$temp_dir = \PerfLocale\Helper::uploads_temp_dir();
-
-			if ( $temp_dir === '' || ! wp_mkdir_p( $temp_dir ) ) {
-				wp_safe_redirect( add_query_arg( 'import_error', __( 'Could not create temporary upload directory.', 'perflocale' ), $redirect_url ) );
-				exit;
-			}
-
-			\PerfLocale\Helper::harden_directory( $temp_dir );
-
-			$token          = wp_generate_password( 16, false );
-			$persisted_path = $temp_dir . '/import-' . $token . '.json';
-
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Reading a fresh PHP upload tmp file; WP_Filesystem cannot reach php_uploaded_file area; @ suppresses open-failure warning handled by the truthiness check below.
-			$source = @fopen( $tmp_path, 'rb' );
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Writing into our wp-content/uploads/perflocale/temp/ scratch dir created via wp_mkdir_p above; @ suppresses open-failure warning handled below.
-			$dest = @fopen( $persisted_path, 'wb' );
-
-			if ( ! $source || ! $dest ) {
-				if ( $source ) {
-					fclose( $source ); } // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
-				if ( $dest ) {
-					fclose( $dest ); }   // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
-				wp_safe_redirect( add_query_arg( 'import_error', __( 'Could not stage uploaded file.', 'perflocale' ), $redirect_url ) );
-				exit;
-			}
-
-			while ( ! feof( $source ) ) {
-				$chunk = fread( $source, 65536 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- Chunked copy of fresh PHP upload tmp file.
-				if ( $chunk === false ) {
-					break;
+						)
+					);
+					exit;
 				}
-				fwrite( $dest, $chunk ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Chunked write into wp-content/uploads scratch dir.
-			}
-			fclose( $source ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
-			fclose( $dest );   // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
-			wp_delete_file( $tmp_path );
 
-			if ( ! file_exists( $persisted_path ) || filesize( $persisted_path ) === 0 ) {
-				wp_safe_redirect( add_query_arg( 'import_error', __( 'Staged upload is empty.', 'perflocale' ), $redirect_url ) );
-				exit;
+				// Move PHP's tmp upload into wp-content/uploads/perflocale/temp/
+				// so the async worker can still see the file when WP-Cron /
+				// Action Scheduler runs on a later request. Mirrors the
+				// chunked-stream pattern used by the CSV importer
+				// below - Plugin Check rejects move_uploaded_file/rename/copy.
+				$temp_dir = \PerfLocale\Helper::uploads_temp_dir();
+
+				if ( $temp_dir === '' || ! wp_mkdir_p( $temp_dir ) ) {
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'Could not create temporary upload directory.', 'perflocale' ) ) );
+					exit;
+				}
+
+				\PerfLocale\Helper::harden_directory( $temp_dir );
+
+				$token          = wp_generate_password( 16, false );
+				$persisted_path = $temp_dir . '/import-' . $token . '.json';
+
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Reading a fresh PHP upload tmp file; WP_Filesystem cannot reach php_uploaded_file area; @ suppresses open-failure warning handled by the truthiness check below.
+				$source = @fopen( $tmp_path, 'rb' );
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Writing into our wp-content/uploads/perflocale/temp/ scratch dir created via wp_mkdir_p above; @ suppresses open-failure warning handled below.
+				$dest = @fopen( $persisted_path, 'wb' );
+
+				if ( ! $source || ! $dest ) {
+					if ( $source ) {
+						fclose( $source ); } // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+					if ( $dest ) {
+						fclose( $dest ); }   // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'Could not stage uploaded file.', 'perflocale' ) ) );
+					exit;
+				}
+
+				// Every read and write is checked: a full disk would otherwise
+				// leave a truncated copy that the importer then reports as
+				// invalid JSON instead of as the real cause.
+				$staged = true;
+
+				while ( ! feof( $source ) ) {
+					$chunk = fread( $source, 65536 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- Chunked copy of fresh PHP upload tmp file.
+					if ( $chunk === false ) {
+						$staged = false;
+						break;
+					}
+					if ( strlen( $chunk ) !== fwrite( $dest, $chunk ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Chunked write into wp-content/uploads scratch dir.
+						$staged = false;
+						break;
+					}
+				}
+				fclose( $source ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+				$staged = fclose( $dest ) && $staged; // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+				wp_delete_file( $tmp_path );
+
+				if ( ! $staged ) {
+					wp_delete_file( $persisted_path );
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'Could not stage the uploaded file: the server could not write a full copy of it (the disk may be full). Nothing was imported.', 'perflocale' ) ) );
+					exit;
+				}
+
+				if ( ! file_exists( $persisted_path ) || filesize( $persisted_path ) === 0 ) {
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'Staged upload is empty.', 'perflocale' ) ) );
+					exit;
+				}
 			}
 
 			// Safety-net cleanup: if async never runs (cron stalled) or
@@ -846,6 +942,11 @@ final class AdminController {
 			// job args so an async replay keeps the same answer.
 			$same_ids = ! empty( $_POST['perflocale_import_same_ids'] );
 
+			// The add-on data to import: the shared Add-on data checkbox and
+			// each group's own; null (everything the file carries) for a post
+			// that does not come from a form showing them.
+			$addon_choices = self::posted_addon_choices( 'perflocale_import_addon', true );
+
 			// Route through Dispatcher. Sync below the threshold (admin
 			// sees counts on the redirect); async above (admin redirects
 			// to PerfLocale → Jobs to watch progress). DataImportJob
@@ -856,17 +957,12 @@ final class AdminController {
 					'file_path'         => $persisted_path,
 					'replace'           => $replace,
 					'allow_foreign_ids' => $same_ids,
+					'addon_choices'     => $addon_choices,
 				]
 			);
 
 			if ( $result['mode'] === 'async' ) {
-				wp_safe_redirect(
-					add_query_arg(
-						'import_result',
-						rawurlencode( __( 'Data import queued. Track progress under PerfLocale → Jobs.', 'perflocale' ) ),
-						admin_url( 'admin.php?page=perflocale-jobs' )
-					)
-				);
+				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'import_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 				exit;
 			}
 
@@ -895,7 +991,7 @@ final class AdminController {
 			// releases the uploaded file and its scheduled safety-net
 			// cleanup, exactly as a successful one does.
 			if ( ! empty( $result['error'] ) ) {
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( (string) $result['error'] ), $redirect_url ) );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', (string) $result['error'] ) );
 				exit;
 			}
 
@@ -920,16 +1016,44 @@ final class AdminController {
 			// importer's notice says so and points to Replace.
 			$not_applied_note = isset( $r['notice'] ) && is_string( $r['notice'] ) && '' !== $r['notice'] ? ' ' . $r['notice'] : '';
 
+			// A provider address the settings update refused is named too.
+			if ( isset( $r['address_notice'] ) && is_string( $r['address_notice'] ) && '' !== $r['address_notice'] ) {
+				$not_applied_note .= ' ' . $r['address_notice'];
+			}
+
+			// What the import left out, kept or changed on purpose, one
+			// sentence each.
+			foreach ( (array) ( $r['notes'] ?? [] ) as $note ) {
+				if ( is_string( $note ) && '' !== $note ) {
+					$not_applied_note .= ' ' . $note;
+				}
+			}
+
 			// rawurlencode(): the message is translated text and may carry the
 			// file's own error text, and an unencoded `&`, `#` or `+` would cut
 			// or alter it in the query string.
 			if ( ! empty( $r['errors'] ) ) {
-				$msg = implode( '; ', array_slice( $r['errors'], 0, 3 ) ) . $sanitized_note . $not_applied_note;
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $msg ), $redirect_url ) );
+				// A merge that wrote rows and hit errors says how far it got:
+				// the notice shows only the first three errors. A refusal or a
+				// file that was rejected whole wrote nothing, and says only why.
+				$errors   = Typed::strs( $r['errors'] );
+				$imported = Typed::int( $r['imported'] ?? 0 );
+				$skipped  = Typed::int( $r['skipped'] ?? 0 );
+				$counts   = $imported + $skipped > 0
+					? sprintf(
+						/* translators: 1: number of errors, 2: imported count, 3: skipped count */
+						_n( 'Import finished with %1$d error (%2$d items imported, %3$d skipped):', 'Import finished with %1$d errors (%2$d items imported, %3$d skipped):', count( $errors ), 'perflocale' ),
+						count( $errors ),
+						$imported,
+						$skipped
+					) . ' '
+					: '';
+				$msg = $counts . implode( '; ', array_slice( $errors, 0, 3 ) ) . $sanitized_note . $not_applied_note;
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $msg ) );
 			} else {
 				/* translators: %1$d: imported count, %2$d: skipped count */
 				$msg = sprintf( __( 'Import complete. %1$d items imported, %2$d skipped.', 'perflocale' ), (int) ( $r['imported'] ?? 0 ), (int) ( $r['skipped'] ?? 0 ) ) . $sanitized_note . $not_applied_note;
-				wp_safe_redirect( add_query_arg( 'import_result', rawurlencode( $msg ), $redirect_url ) );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
 			}
 
 			exit;
@@ -980,7 +1104,7 @@ final class AdminController {
 			$refused = self::migration_refusal( $result );
 
 			if ( $refused !== '' ) {
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $refused ), $redirect_url ) );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
 				exit;
 			}
 
@@ -1016,7 +1140,7 @@ final class AdminController {
 				$msg .= ' ' . $rejected_note;
 			}
 
-			wp_safe_redirect( add_query_arg( 'import_result', rawurlencode( $msg ), $redirect_url ) );
+			wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
 			exit;
 		}
 
@@ -1036,24 +1160,28 @@ final class AdminController {
 			);
 
 			if ( $result['mode'] === 'async' ) {
-				wp_safe_redirect(
-					add_query_arg(
-						'import_result',
-						__( 'Polylang migration queued. Track progress under PerfLocale → Jobs.', 'perflocale' ),
-						admin_url( 'admin.php?page=perflocale-jobs' )
-					)
-				);
+				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'polylang_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 				exit;
 			}
 
 			$refused = self::migration_refusal( $result );
 
 			if ( $refused !== '' ) {
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $refused ), $redirect_url ) );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
 				exit;
 			}
 
-			$r   = $result['result'] ?? [];
+			$r = $result['result'] ?? [];
+
+			// An import that did not finish is reported as the failure the job
+			// and the CLI report, with the notice that says to run it again.
+			if ( ! empty( $r['run_failed'] ) ) {
+				$reason = $r['first_error'] ?? '';
+
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', is_string( $reason ) ? $reason : '' ) );
+				exit;
+			}
+
 			$msg = sprintf(
 				/* translators: %1$d: number of posts imported, %2$d: number of terms imported */
 				__( 'Polylang import complete. %1$d posts, %2$d terms imported.', 'perflocale' ),
@@ -1061,15 +1189,35 @@ final class AdminController {
 				(int) ( $r['terms'] ?? 0 )
 			);
 
-			if ( ! empty( $r['errors'] ) ) {
+			// Failures are counted; the run's notices are shown as they are.
+			$errors = (array) ( $r['errors'] ?? [] );
+
+			if ( $errors !== [] ) {
 				$msg .= ' ' . sprintf(
 					/* translators: %d: number of errors */
-					__( '%d errors occurred.', 'perflocale' ),
-					count( $r['errors'] )
+					_n( '%d error occurred.', '%d errors occurred.', count( $errors ), 'perflocale' ),
+					count( $errors )
 				);
 			}
 
-			wp_safe_redirect( add_query_arg( 'import_result', $msg, $redirect_url ) );
+			$notices = array_filter( (array) ( $r['notices'] ?? [] ), 'is_string' );
+
+			if ( $notices !== [] ) {
+				$msg .= ' ' . implode( ' ', $notices );
+			}
+
+			// Items read and not imported: the run finished, and the notice
+			// asks for attention instead of reporting a plain success.
+			$skipped_lines = \PerfLocale\Migration\MigrationRunner::skipped_lines( 'polylang', $r );
+
+			if ( $skipped_lines !== [] ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'warning', $msg . ' ' . implode( ' ', $skipped_lines ) ) );
+				exit;
+			}
+
+			// Encoded as the attention notice is: wp_sanitize_redirect() drops
+			// an apostrophe a notice line may hold.
+			wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
 			exit;
 		}
 
@@ -1089,20 +1237,14 @@ final class AdminController {
 			);
 
 			if ( $result['mode'] === 'async' ) {
-				wp_safe_redirect(
-					add_query_arg(
-						'import_result',
-						__( 'TranslatePress migration queued. Track progress under PerfLocale → Jobs.', 'perflocale' ),
-						admin_url( 'admin.php?page=perflocale-jobs' )
-					)
-				);
+				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'translatepress_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 				exit;
 			}
 
 			$refused = self::migration_refusal( $result );
 
 			if ( $refused !== '' ) {
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( $refused ), $redirect_url ) );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
 				exit;
 			}
 
@@ -1113,7 +1255,7 @@ final class AdminController {
 			if ( ! empty( $r['run_failed'] ) ) {
 				$reason = $r['first_error'] ?? '';
 
-				wp_safe_redirect( add_query_arg( 'import_error', rawurlencode( is_string( $reason ) ? $reason : '' ), $redirect_url ) );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', is_string( $reason ) ? $reason : '' ) );
 				exit;
 			}
 
@@ -1133,7 +1275,7 @@ final class AdminController {
 				);
 			}
 
-			wp_safe_redirect( add_query_arg( 'import_result', $msg, $redirect_url ) );
+			wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
 			exit;
 		}
 	}
@@ -1692,7 +1834,7 @@ final class AdminController {
 
 		$hidden = (array) get_user_meta( get_current_user_id(), 'perflocale_strings_hidden_langs', true );
 
-		$settings .= '<fieldset class="metabox-prefs">';
+		$settings .= '<fieldset class="metabox-prefs" data-perflocale-col-action="perflocale_save_hidden_columns" data-perflocale-col-nonce="' . esc_attr( wp_create_nonce( 'perflocale_hidden_columns' ) ) . '">';
 		$settings .= '<legend>' . esc_html__( 'Language Columns', 'perflocale' ) . '</legend>';
 
 		foreach ( $languages as $lang ) {
@@ -1705,33 +1847,7 @@ final class AdminController {
 
 		$settings .= '</fieldset>';
 
-		// Inline JS to save column visibility via AJAX.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleColNonce=' . wp_json_encode( wp_create_nonce( 'perflocale_hidden_columns' ), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT ) . ';',
-			'before'
-		);
-
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var checkboxes=document.querySelectorAll(".perflocale-col-toggle");' .
-				'checkboxes.forEach(function(cb){' .
-					'cb.addEventListener("change",function(){' .
-						'var hidden=[];' .
-						'checkboxes.forEach(function(c){if(!c.checked)hidden.push(c.value);});' .
-						'var fd=new FormData();' .
-						'fd.append("action","perflocale_save_hidden_columns");' .
-						'fd.append("_wpnonce",perflocaleColNonce);' .
-						'fd.append("hidden",JSON.stringify(hidden));' .
-						'fetch(ajaxurl,{method:"POST",body:fd});' .
-						'var slug=this.value;' .
-						'var cols=document.querySelectorAll("[data-perflocale-lang-col=\'"+slug+"\']");' .
-						'cols.forEach(function(el){el.style.display=cb.checked?"":"none";});' .
-					'});' .
-				'});' .
-			'})();'
-		);
+		Assets::enqueue_script( 'perflocale-column-toggles', 'column-toggles.js' );
 
 		return $settings;
 	}
@@ -1779,7 +1895,7 @@ final class AdminController {
 
 		$hidden = (array) get_user_meta( get_current_user_id(), $meta_key, true );
 
-		$settings .= '<fieldset class="metabox-prefs">';
+		$settings .= '<fieldset class="metabox-prefs" data-perflocale-col-action="perflocale_save_hidden_columns_generic" data-perflocale-col-nonce="' . esc_attr( wp_create_nonce( $nonce_slug ) ) . '">';
 		$settings .= '<legend>' . esc_html__( 'Language Columns', 'perflocale' ) . '</legend>';
 
 		foreach ( $languages as $lang ) {
@@ -1792,36 +1908,9 @@ final class AdminController {
 
 		$settings .= '</fieldset>';
 
-		// Inline JS: save column visibility via admin-ajax. Uses the SAME
-		// AJAX action as the Strings page (perflocale_save_hidden_columns)
-		// but submits its own meta_key so the handler stores into the right
-		// bucket. See ajax_save_hidden_columns_generic below.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleColNonce_' . esc_js( $nonce_slug ) . '=' . wp_json_encode( wp_create_nonce( $nonce_slug ) ) . ';',
-			'before'
-		);
-
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var boxes=document.querySelectorAll(".perflocale-col-toggle[data-meta-key=\"' . esc_js( $meta_key ) . '\"]");' .
-				'boxes.forEach(function(cb){' .
-					'cb.addEventListener("change",function(){' .
-						'var hidden=[];' .
-						'boxes.forEach(function(c){if(!c.checked)hidden.push(c.value);});' .
-						'var fd=new FormData();' .
-						'fd.append("action","perflocale_save_hidden_columns_generic");' .
-						'fd.append("_wpnonce",perflocaleColNonce_' . esc_js( $nonce_slug ) . ');' .
-						'fd.append("meta_key",' . wp_json_encode( $meta_key ) . ');' .
-						'fd.append("hidden",JSON.stringify(hidden));' .
-						'fetch(ajaxurl,{method:"POST",body:fd});' .
-						'var slug=this.value;' .
-						'document.querySelectorAll("[data-perflocale-lang-col=\'"+slug+"\']").forEach(function(el){el.style.display=cb.checked?"":"none";});' .
-					'});' .
-				'});' .
-			'})();'
-		);
+		// column-toggles.js sends each checkbox's data-meta-key, so
+		// ajax_save_hidden_columns_generic stores into this page's bucket.
+		Assets::enqueue_script( 'perflocale-column-toggles', 'column-toggles.js' );
 
 		return $settings;
 	}
@@ -2334,7 +2423,7 @@ final class AdminController {
 			exit;
 		}
 
-		wp_safe_redirect( add_query_arg( 'bulk_mt_queued', '1', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
+		wp_safe_redirect( add_query_arg( 'perflocale_notice', 'bulk_mt_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 		exit;
 	}
 
@@ -2521,13 +2610,7 @@ final class AdminController {
 				);
 
 				if ( $result['mode'] === 'async' ) {
-					wp_safe_redirect(
-						add_query_arg(
-							'bulk_mt_queued',
-							'1',
-							admin_url( 'admin.php?page=perflocale-jobs' )
-						)
-					);
+					wp_safe_redirect( add_query_arg( 'perflocale_notice', 'bulk_mt_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 					exit;
 				}
 
@@ -2698,17 +2781,37 @@ final class AdminController {
 					);
 
 					// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Bulk status flip: no cache to read. The two interpolated variables are generated "%d,%d,..." placeholder lists, never data. Replacements arrive as one array ($update_args), which WPCS cannot count; it holds exactly the three %i, the two %s and the two %d id lists.
-					$updated = $wpdb->query(
-						$wpdb->prepare(
-							"UPDATE %i AS t
+					if ( ! $wpdb instanceof \wpdb ) {
+						$updated = false;
+					} elseif ( '' === \PerfLocale\Database\Schema::touch_write_time( [ [ 't.status', "'needs_update'", 'text' ] ], 't.' ) ) {
+						$updated = $wpdb->query(
+							$wpdb->prepare(
+								"UPDATE %i AS t
 							INNER JOIN %i AS g ON g.id = t.group_id
 							INNER JOIN %i AS s ON s.group_id = t.group_id
 							SET t.status = %s
 							WHERE g.type = %s AND s.object_id IN ($id_placeholders)
 							AND t.language_id IN ($lang_placeholders)",
-							$update_args
-						)
-					);
+								$update_args
+							) ?? ''
+						);
+					} else {
+						// SQLite: the same write with the write time the
+						// column's ON UPDATE CURRENT_TIMESTAMP gives on MySQL,
+						// the assignment Schema::touch_write_time() returns for
+						// t.status written out.
+						$updated = $wpdb->query(
+							$wpdb->prepare(
+								"UPDATE %i AS t
+							INNER JOIN %i AS g ON g.id = t.group_id
+							INNER JOIN %i AS s ON s.group_id = t.group_id
+							SET t.status = %s, t.updated_at = CASE WHEN CAST(t.status AS BINARY) = CAST('needs_update' AS BINARY) THEN t.updated_at ELSE NOW() END
+							WHERE g.type = %s AND s.object_id IN ($id_placeholders)
+							AND t.language_id IN ($lang_placeholders)",
+								$update_args
+							) ?? ''
+						);
+					}
 					// phpcs:enable
 
 					if ( $updated === false ) {
@@ -3201,8 +3304,11 @@ final class AdminController {
 		// source is sent only when the perflocale/mt/send_password_protected
 		// filter allows it. admit() counts the request when it allows it, so
 		// it is asked last, only when MT would otherwise run. A refusal falls
-		// through to the stub, as a provider failure does.
-		$source_post = get_post( $source_id );
+		// through to the stub, as a provider failure does, and its reason is
+		// shown on the screen the user lands on.
+		$source_post   = get_post( $source_id );
+		$mt_reason     = '';
+		$mt_reason_own = false;
 
 		if (
 			$copy_from > 0
@@ -3213,16 +3319,34 @@ final class AdminController {
 			&& current_user_can( 'perflocale_use_mt' )
 			&& current_user_can( 'edit_post', $source_id )
 			&& $source_post instanceof \WP_Post
-			&& \PerfLocale\MachineTranslation\TranslationService::may_send_post( $source_post, 'auto_create' )
-			&& null === \PerfLocale\Translation\MtRateLimiter::admit( get_current_user_id() )
 		) {
-			try {
-				$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $cache );
-				$result     = $mt_service->translate_post( $source_id, $target_lang );
-				$new_id     = $result['post_id'] ?? false;
-			} catch ( \Throwable $e ) {
-				// MT failed - fall back to stub creation below.
-				$new_id = false;
+			$throttled = null;
+
+			if ( ! \PerfLocale\MachineTranslation\TranslationService::may_send_post( $source_post, 'auto_create' ) ) {
+				$mt_reason = __( 'The original is password-protected, and machine translation does not send password-protected posts when a translation is created.', 'perflocale' );
+			} else {
+				$throttled = \PerfLocale\Translation\MtRateLimiter::admit( get_current_user_id() );
+			}
+
+			if ( $throttled instanceof \WP_Error ) {
+				$mt_reason = $throttled->get_error_message();
+			} elseif ( '' === $mt_reason ) {
+				try {
+					$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $cache );
+					$result     = $mt_service->translate_post( $source_id, $target_lang );
+					$new_id     = $result['post_id'] ?? false;
+
+					if ( ! $new_id ) {
+						$mt_reason = __( 'The machine translation returned no translation.', 'perflocale' );
+					}
+				} catch ( \Throwable $e ) {
+					// MT failed (the save guard's refusal, a provider error):
+					// the stub below is created and the reason shown. A save
+					// guard's refusal already says it was not saved.
+					$new_id        = false;
+					$mt_reason     = $e->getMessage();
+					$mt_reason_own = $e instanceof \PerfLocale\MachineTranslation\NotSavedException;
+				}
 			}
 		}
 
@@ -3239,6 +3363,10 @@ final class AdminController {
 
 		if ( $new_id === false ) {
 			wp_die( esc_html__( 'Failed to create translation.', 'perflocale' ) );
+		}
+
+		if ( '' !== $mt_reason ) {
+			MtCreateNotice::remember( is_numeric( $new_id ) ? (int) $new_id : 0, $mt_reason, $mt_reason_own );
 		}
 
 		// Redirect to the translation's edit screen (the new post, or the live
@@ -3303,6 +3431,13 @@ final class AdminController {
 
 		if ( $copy_from > 0 && $copy_from !== $source_id && ! current_user_can( 'edit_term', $copy_from ) ) {
 			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
+		}
+
+		// The new term goes into the copy source's taxonomy, and
+		// wp_insert_term() checks no capability, so apply the taxonomy's own
+		// create rule here.
+		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_term_like( $copy_from ) ) {
+			wp_die( esc_html__( 'You do not have permission to create translations of this content.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$new_id = $manager->create_translation( $source_id, $taxonomy, $target_lang, true );
@@ -4075,12 +4210,12 @@ final class AdminController {
 			$plugin = \PerfLocale\Plugin::get_instance();
 			$cache  = $plugin->get( 'cache' );
 
+			// PerfLocale's caches only: a persistent object cache keeps other
+			// plugins' data, WordPress's own and the state records
+			// flush_all() leaves in place.
 			if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
 				$cache->flush_all();
 			}
-
-			// Also flush WordPress object cache group.
-			wp_cache_flush();
 
 			$redirect = add_query_arg( 'perflocale_notice', 'cache_cleared', $redirect );
 		} elseif ( $action === 'flush_permalinks' ) {

@@ -347,11 +347,15 @@ final class ContentChangeDetector {
 
 		$table = Schema::table( 'content_hashes' );
 
+		$touch = Schema::touch_write_time( [ [ 'content_hash', 'VALUES(content_hash)', 'text' ] ] );
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->query(
 			$wpdb->prepare(
 				'INSERT INTO %i (object_id, object_type, content_hash) VALUES (%d, %s, %s)
-				ON DUPLICATE KEY UPDATE content_hash = VALUES(content_hash)',
+				ON DUPLICATE KEY UPDATE content_hash = VALUES(content_hash)'
+				// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Schema::touch_write_time(): column names and VALUES() only, '' on MySQL.
+				. $touch,
 				$table,
 				$object_id,
 				$object_type,
@@ -525,12 +529,14 @@ final class ContentChangeDetector {
 		// same second: a translation's stale mark stores the link's write
 		// time, and clearing the mark restores its status only while that
 		// time is unchanged (ContentSync::SYNC_STALE_META), so no content
-		// flag can leave it equal.
+		// flag can leave it equal. DATE_ADD() rather than `+ INTERVAL`: MySQL
+		// reads the two the same, and the SQLite Database Integration
+		// translates only DATE_ADD().
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->query(
 			$wpdb->prepare(
 				"UPDATE %i SET status = 'needs_update',
-				updated_at = GREATEST( NOW(), COALESCE( updated_at + INTERVAL 1 SECOND, NOW() ) )
+				updated_at = GREATEST( NOW(), COALESCE( DATE_ADD( updated_at, INTERVAL 1 SECOND ), NOW() ) )
 				WHERE group_id = %d AND object_id != %d",
 				$links_table,
 				(int) $group->id,

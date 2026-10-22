@@ -31,6 +31,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  *   - The site transient `available_translations`, the list of WordPress
  *     translations core caches for three hours when its language selector is
  *     opened. When it is not cached, nothing here asks WordPress.org for it.
+ *     It and `update_core` are read only when a locale's WordPress pack is
+ *     not installed (they decide nothing else).
  *   - The headers of the themes and plugins a report lists as offered or not
  *     offered, for their names (not read when the caller needs no names).
  *   - The active theme and its parent, and the `active_plugins` option (with
@@ -110,11 +112,21 @@ final class LanguagePacks {
 
 		$theme_data  = self::update_data( 'update_themes', true );
 		$plugin_data = self::update_data( 'update_plugins', true );
-		$offered     = self::offered( [ self::update_data( 'update_core', false ), $theme_data, $plugin_data ] );
-		$available   = get_site_transient( 'available_translations' );
+		$offered     = self::offered( [ $theme_data, $plugin_data ] );
 		$installed   = array_fill_keys( get_available_languages(), true );
 		$items       = self::items( $theme_data, $plugin_data );
-		$files       = [
+
+		// The WordPress packs core offered and the list of WordPress
+		// translations matter only for a locale whose WordPress pack is not
+		// installed; neither is read otherwise.
+		$available = null;
+
+		if ( [] !== array_diff_key( $wanted, $installed ) ) {
+			$offered  += self::offered( [ self::update_data( 'update_core', false ) ] );
+			$available = get_site_transient( 'available_translations' );
+		}
+
+		$files = [
 			'theme'  => null,
 			'plugin' => null,
 		];

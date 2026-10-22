@@ -613,11 +613,13 @@ final class JobState {
 	 *
 	 * @param string $job_id UUID.
 	 * @param string $error  Human-readable error message (truncated).
-	 * @return void
+	 * @return bool True when this call moved the row to `failed`. False when
+	 *              the write failed or the row was not queued/running (a
+	 *              cancel or a completion won, or the row is gone).
 	 */
-	public static function mark_failed( string $job_id, string $error ): void {
+	public static function mark_failed( string $job_id, string $error ): bool {
 		if ( ! self::is_safe_id( $job_id ) ) {
-			return;
+			return false;
 		}
 
 		global $wpdb;
@@ -628,7 +630,7 @@ final class JobState {
 		// transitions - those take precedence (status='canceled'/'complete'
 		// rows are excluded by the WHERE).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
-		$wpdb->query(
+		$affected = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE %i
 			 SET status = 'failed',
@@ -644,6 +646,8 @@ final class JobState {
 				$job_id
 			)
 		);
+
+		return 1 === $affected;
 	}
 
 	/**
@@ -1942,7 +1946,7 @@ final class JobState {
 					 WHERE option_name LIKE %s
 					 AND NOT (
 						option_value REGEXP '^[0-9]+\\\\|'
-						AND CAST(SUBSTRING_INDEX(option_value, '|', 1) AS UNSIGNED) >= %d
+						AND CAST(CASE WHEN INSTR(option_value, '|') > 0 THEN SUBSTR(option_value, 1, INSTR(option_value, '|') - 1) ELSE option_value END AS UNSIGNED) >= %d
 					 )",
 					$wpdb->esc_like( $prefix ) . '%',
 					$now
@@ -1993,7 +1997,7 @@ final class JobState {
 					 WHERE option_name IN ({$placeholders})
 					 AND NOT (
 						option_value REGEXP '^[0-9]+\\\\|'
-						AND CAST(SUBSTRING_INDEX(option_value, '|', 1) AS UNSIGNED) >= %d
+						AND CAST(CASE WHEN INSTR(option_value, '|') > 0 THEN SUBSTR(option_value, 1, INSTR(option_value, '|') - 1) ELSE option_value END AS UNSIGNED) >= %d
 					 )",
 					array_merge( $names, [ $now ] )
 				)

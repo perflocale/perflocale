@@ -234,6 +234,15 @@ final class BlockTemplateSupport {
 		// brand-new template its language, and after ContentSync (20) and
 		// ContentChangeDetector (30), so neither sees a half-built group.
 		add_action( 'save_post', [ $this, 'ensure_translations_exist' ], 40, 2 );
+
+		// Menu and synced-pattern references in translated templates and parts.
+		// Registered by class name, so TemplateBlockRefs is loaded only when one
+		// of these fires. `before_delete_post` at 5: before the link cleanup (10)
+		// removes the deleted post's language.
+		add_action( 'perflocale/translation/created', [ TemplateBlockRefs::class, 'on_created' ], 20, 3 );
+		add_action( 'before_delete_post', [ TemplateBlockRefs::class, 'on_removed' ], 5, 1 );
+		add_action( 'wp_trash_post', [ TemplateBlockRefs::class, 'on_removed' ], 10, 1 );
+		add_action( 'untrashed_post', [ TemplateBlockRefs::class, 'on_restored' ], 10, 1 );
 	}
 
 	/**

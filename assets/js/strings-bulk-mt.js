@@ -34,6 +34,9 @@
 
 	var i18n              = cfg.i18n || {};
 
+	// The most strings one dispatch translates (the server's cap).
+	var maxPerDispatch    = parseInt( cfg.runCap, 10 ) > 0 ? parseInt( cfg.runCap, 10 ) : 5000;
+
 	// ─── Unsaved-edit protection ──────────────────────────────────────
 	// Hand-typed translations live in .perflocale-str-input fields until
 	// "Save Translations" posts them. This file's own MT flow reloads or
@@ -340,8 +343,8 @@
 		var ids = collectSelectedIds();
 		if ( ids.length === 0 ) { setStatus( i18n.pickStrings, 'error' ); return; }
 
-		// The server caps a run at 5,000 strings, whatever the number of languages.
-		if ( ids.length > 5000 ) { setStatus( i18n.maxExceeded, 'error' ); return; }
+		// The server caps a run at maxPerDispatch strings, whatever the number of languages.
+		if ( ids.length > maxPerDispatch ) { setStatus( i18n.maxExceeded, 'error' ); return; }
 
 		var prompt = format( i18n.confirmSelected || '', [ ids.length, collectTargetNames().join( ', ' ) ] );
 		if ( ! window.confirm( prompt ) ) { return; }
@@ -364,7 +367,11 @@
 		var filter;
 		try { filter = JSON.parse( filterRaw ); } catch ( e ) { filter = {}; }
 
-		var prompt = format( i18n.confirmFiltered || '', [ total, collectTargetNames().join( ', ' ) ] );
+		// A run translates at most maxPerDispatch strings; say so when the
+		// filter matches more.
+		var prompt = total > maxPerDispatch && i18n.filteredCapped
+			? format( i18n.filteredCapped, [ maxPerDispatch, total, collectTargetNames().join( ', ' ) ] )
+			: format( i18n.confirmFiltered || '', [ total, collectTargetNames().join( ', ' ) ] );
 		if ( ! window.confirm( prompt ) ) { return; }
 
 		dispatch( {
@@ -383,7 +390,9 @@
 		// Whole-table count, not the filtered subset - Translate-all
 		// ignores any active filter on purpose.
 		var total  = parseInt( toolbar.getAttribute( 'data-perflocale-grand-total' ) || toolbar.getAttribute( 'data-perflocale-total' ) || '0', 10 );
-		var prompt = format( i18n.confirmAll || '', [ total, collectTargetNames().join( ', ' ) ] );
+		var prompt = total > maxPerDispatch && i18n.allCapped
+			? format( i18n.allCapped, [ maxPerDispatch, total, collectTargetNames().join( ', ' ) ] )
+			: format( i18n.confirmAll || '', [ total, collectTargetNames().join( ', ' ) ] );
 		if ( ! window.confirm( prompt ) ) { return; }
 
 		dispatch( {

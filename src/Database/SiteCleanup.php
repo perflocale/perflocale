@@ -9,8 +9,8 @@
  *   2. perflocale.php's wp_uninitialize_site handler - when a network admin
  *      permanently deletes a subsite from the network.
  *
- * Both paths share the same option/transient/meta delete-list so they
- * can't drift apart silently.
+ * Both paths delete what the data registry (DataRegistry) lists for
+ * uninstall, so they and the registry cannot drift apart silently.
  *
  * @package PerfLocale
  */
@@ -52,16 +52,6 @@ final class SiteCleanup {
 	}
 
 	/**
-	 * Static option keys this plugin writes that must be deleted on full
-	 * uninstall. Wildcards (perflocale_addon_manifest_*, perflocale_str_*,
-	 * perflocale_mt_usage_*, perflocale_css_*, _transient_perflocale_*) are
-	 * handled separately below via SELECT … LIKE.
-	 *
-	 * Add a key here when introducing a new plugin-owned wp_option.
-	 *
-	 * @var string[]
-	 */
-	/**
 	 * Action Scheduler group used by every PerfLocale-enqueued action.
 	 *
 	 * Duplicated as a local constant so `uninstall.php` can sweep AS rows
@@ -76,131 +66,13 @@ final class SiteCleanup {
 	 * The settings row, which is also where each blog's
 	 * `delete_data_on_uninstall` decision lives.
 	 *
-	 * Named as a constant because the purge has to treat it specially: it is
-	 * in STATIC_OPTIONS like every other option, but it is deleted LAST (see
-	 * purge_current_site()).
+	 * Named as a constant because the purge has to treat it specially: the
+	 * data registry gives it uninstall `last`, so the option sweep leaves it
+	 * and purge_current_site() deletes it at the very end.
 	 *
 	 * @var string
 	 */
 	public const MODE_OPTION = 'perflocale_settings';
-
-	public const STATIC_OPTIONS = [
-		self::MODE_OPTION,
-		'perflocale_tables_exist',
-		'perflocale_db_version',
-		'perflocale_version',
-		'perflocale_flush_rules',
-		'perflocale_caps_version',
-		// The Translator role's capability ledger (TranslatorRole): what the
-		// plugin granted and which grants the owner had removed. A
-		// preserve-mode uninstall keeps it with the rest of the data.
-		'perflocale_translator_caps',
-		// Record of the one-time Shop Manager grant (TranslatorRole). Kept by
-		// a preserve-mode uninstall, so a reinstall puts back only what the
-		// deactivation took off.
-		'perflocale_shop_manager_caps',
-		// Timestamp of the last completed string full-scan; gates the stale-
-		// strings GC so it never deletes never-scanned (imported) strings.
-		'perflocale_strings_last_full_scan',
-		// GC-protected string domains (e.g. _pfl_dyn). Not
-		// matched by any OPTION_PATTERNS LIKE, so it must be listed explicitly
-		// or a full-data uninstall leaks it.
-		'perflocale_gc_protected_domains',
-		// Autoloaded l10n manifest (generated .l10n.php file map). Survives
-		// uninstall without this entry, per the plugin's own orphan-data audit.
-		'perflocale_l10n_manifest',
-		'perflocale_webhooks',
-		'perflocale_webhook_failures',
-		'perflocale_webhook_queue',
-		'perflocale_addon_failures',
-		// Per-addon last-N migration / uninstall / boot error records, used
-		// by the Addons admin page to surface "last error" inline on the
-		// card. Bounded internally (newest 200 entries) but defensively
-		// swept on full-data uninstall.
-		'perflocale_addon_migration_errors',
-		'perflocale_addon_schema_versions',
-		// Operator-controlled per-addon disabled list (4 KiB capped,
-		// autoloaded). Always present on a normally-operated site but
-		// purged on full uninstall so leftover entries don't haunt a
-		// reinstall.
-		'perflocale_disabled_addons',
-		// Single autoloaded option storing each addon's user-editable
-		// settings entry, keyed by addon ID. Per-entry capped at 16 KiB.
-		'perflocale_addon_settings',
-		'perflocale_exchange_rates',
-		'perflocale_exchange_rates_last_sync',
-		'perflocale_exchange_rate_last_error',
-		// Last-known active engine (used by Bootstrap's drift detector).
-		'perflocale_active_engine',
-		// Last-run timestamps for recurring handlers (Jobs admin panel).
-		'perflocale_recurring_last_run',
-		// Autoloaded perf flags. Each is a cheap "does this blog have any
-		// X yet?" sentinel so warm requests skip a SELECT 1 LIMIT 1
-		// against the relevant table.
-		'perflocale_has_any_groups',
-		'perflocale_has_any_slugs',
-		'perflocale_rewrites_verified',
-		// Old-slug → new-slug 301 redirect map written by
-		// LanguageRepository::rename_slug() (autoloaded). Created on-demand
-		// (only when a slug is renamed) so it matches no LIKE pattern - must
-		// be listed explicitly or it lingers in alloptions on every request
-		// after a full uninstall.
-		'perflocale_slug_redirects',
-		// WP-managed widget option for the Language Switcher widget. WP
-		// stores widget instance data under `widget_<id_base>` and our
-		// widget's id_base is `perflocale_switcher`. Not picked up by
-		// `perflocale_%` patterns because the WP convention puts the
-		// `widget_` prefix BEFORE our identifier.
-		'widget_perflocale_switcher',
-		// Defensive sweeps for options written by earlier builds. Not
-		// created on fresh installs, but listed so a site upgraded from a
-		// dev build doesn't leak them. delete_option no-ops on missing rows.
-		'perflocale_active_jobs',
-		'perflocale_currencies',
-		'perflocale_bulk_string_translate_threshold',
-		'perflocale_settings_autoload_migrated',
-		// Timestamp guard written by Bootstrap::ensure_recurring_schedules_throttled
-		// so the admin_init "are my recurring events registered?" check runs at
-		// most once a day. Single fixed key.
-		'perflocale_schedules_verified_at',
-		// TranslatePress importer per-post checkpoint. Written by
-		// TranslatePressImporter so an interrupted run can resume from the
-		// last committed batch. Cleared on successful completion but
-		// survives crash / watchdog kill / manual abort - must be in the
-		// uninstall sweep so it doesn't haunt a reinstall.
-		'perflocale_trp_import_post_checkpoint',
-		// The language selection that checkpoint was written under.
-		'perflocale_trp_import_post_checkpoint_fp',
-		// Which migration sources have been imported (MigrationState).
-		'perflocale_migration_state',
-	];
-
-	/**
-	 * Network-global options (stored in `wp_sitemeta`, not any blog's
-	 * `wp_options`). The per-site uninstall purge loop switch_to_blog()'s
-	 * through every blog and only touches `wp_options`, so these are removed
-	 * separately, on EVERY network, by purge_network_scope() once a sweep has
-	 * completed - never after an interrupted one, because the resume marker
-	 * is in this list.
-	 *
-	 * Every `perflocale_*` network option MUST be listed here - the orphan-data
-	 * audit (concurrency scenario 26) scans `wp_sitemeta` against this list and
-	 * fails on any uncovered key, closing the leak class rather than a single
-	 * instance.
-	 *
-	 * @var string[]
-	 */
-	public const NETWORK_OPTIONS = [
-		// Addon bootable-cache generation token, written on multisite by
-		// AddonRegistry::flush_bootable_cache() (BOOTABLE_GEN_OPTION).
-		'perflocale_bootable_gen',
-		// Resume marker for an uninstall sweep that did not finish: it ran
-		// out of execution budget, or a site failed. Listed here so the
-		// orphan-data audit covers it and so the run that finishes the sweep
-		// removes it - uninstall.php deletes this list ONLY on the completing
-		// pass, precisely so an interrupted sweep keeps its own marker.
-		self::RESUME_OPTION,
-	];
 
 	/**
 	 * Network option holding the uninstall sweep's resume marker.
@@ -259,93 +131,10 @@ final class SiteCleanup {
 	private const NETWORK_PURGE_TIME_SHARE = 0.7;
 
 	/**
-	 * wp_options name patterns (LIKE) cleared on full uninstall.
-	 *
-	 * @var string[]
+	 * Meta rows one page of delete_meta_like() reads and deletes when a
+	 * persistent object cache is in use.
 	 */
-	public const OPTION_PATTERNS = [
-		'perflocale_addon_manifest_%',
-		'perflocale_str_%',
-		'perflocale_mt_usage_%',
-		// Background-jobs system: per-job locks + per-type locks live in
-		// wp_options (the per-job state itself is in the wp_perflocale_jobs
-		// table, which Schema::drop_tables removes). `perflocale_job_lock_*`
-		// matches the per-job UUID lock pattern; `perflocale_type_lock_*`
-		// the per-type concurrency lock.
-		'perflocale_job_lock_%',
-		'perflocale_type_lock_%',
-		// Translation create-first-group lock keyed by source post ID;
-		// 30s TTL so stale rows are rare but possible if a worker crashed
-		// mid-create. Wildcard suffix covers every numeric post ID.
-		'perflocale_link_lock_%',
-		// Generic concurrency locks written by Concurrency\Lock (mt_usage_*,
-		// etc). Lock::reap_expired() handles them daily
-		// in a live install, but on uninstall the reaper is gone too - any
-		// expired rows from the last run would persist forever otherwise.
-		'perflocale_lock_%',
-		// Per-type eager link map (autoloaded). Pattern-cleared because
-		// the type suffix is open-ended ('post', 'term', etc).
-		'perflocale_eager_links_%',
-		// Gravity Forms addon per-form translation stores (one option per GF
-		// form id - the numeric suffix is open-ended, so pattern-cleared).
-		'perflocale_gf_translations_%',
-		// Generational cache tokens: one autoloaded int per cache group
-		// (CacheManager::bump_group_generation). The group-name suffix is
-		// open-ended ('perflocale_trans', 'perflocale_hreflang', ...), so it
-		// must be pattern-cleared or each group's token lingers in alloptions
-		// after a full uninstall.
-		'perflocale_cgen_%',
-		// Circuit-breaker tracking index (autoload=no, single row).
-		// Maintained by PerfLocale\Concurrency\Breaker so Site Health
-		// can enumerate active breakers regardless of transient storage
-		// backend. Not pattern-needed - single fixed key - but listed
-		// alongside the other breaker artifacts for grep-discoverability.
-		'perflocale_breakers_index',
-		// Per-breaker atomic failure counters (autoload=no, one row per
-		// breaker key). Written by Breaker::bump_streak_counter() as a real
-		// option rather than a transient because the window-reset and the
-		// increment have to happen in ONE statement. Breaker::record_success()
-		// clears the row on recovery, but a breaker that never recovers before
-		// uninstall would leave its counter behind forever without this.
-		'perflocale_breaker_n_%',
-		'_transient_perflocale_%',
-		'_transient_timeout_perflocale_%',
-		'_site_transient_perflocale_%',
-		'_site_transient_timeout_perflocale_%',
-	];
-
-	/**
-	 * User-meta keys cleared on full uninstall.
-	 *
-	 * Aliased directly to {@see \PerfLocale\Admin\PrivacyIntegration::USER_META_KEYS}
-	 * so the uninstall sweep and the GDPR Erase Personal Data flow can't drift
-	 * apart silently when a new admin-UI preference is added.
-	 *
-	 * @var string[]
-	 */
-	public const USER_META_KEYS = \PerfLocale\Admin\PrivacyIntegration::USER_META_KEYS;
-
-	/**
-	 * Post-meta key prefixes cleared on full uninstall. Each entry is the
-	 * literal prefix (NOT a SQL LIKE pattern) - the cleanup loop runs them
-	 * through `$wpdb->esc_like()` so the underscores are treated as literal
-	 * characters, not single-char wildcards.
-	 *
-	 * Covers:
-	 *   - `_perflocale_language`         (WC-order language tag from
-	 *                                    EmailTranslation)
-	 *   - `_perflocale_alt_<lang>`       per-language attachment alt text
-	 *   - `_perflocale_caption_<lang>`   per-language attachment captions
-	 *   - `_perflocale_description_<lang>` per-language attachment descriptions
-	 *
-	 * The same prefixes are cleared from WooCommerce's `wc_orders_meta`, where
-	 * an HPOS store keeps the order language tag (see purge_order_meta()).
-	 *
-	 * @var string[]
-	 */
-	public const POST_META_PREFIXES = [
-		'_perflocale_',
-	];
+	private const META_PAGE = 5000;
 
 	/**
 	 * Purge every blog of the installation, each one per its own
@@ -733,7 +522,7 @@ final class SiteCleanup {
 		}
 
 		foreach ( $networks as $network_id ) {
-			foreach ( self::NETWORK_OPTIONS as $option ) {
+			foreach ( DataRegistry::network_options() as $option ) {
 				delete_network_option( $network_id, $option );
 			}
 		}
@@ -978,7 +767,10 @@ final class SiteCleanup {
 		// one blog - coming back as PRESERVE mode on the retry, stranding
 		// that blog's meta, translation files and role permanently. Nothing
 		// else in the purge reads it, so holding it back costs nothing.
-		foreach ( self::STATIC_OPTIONS as $opt ) {
+		// The registry's lists: exact names (perflocale_settings is not among
+		// them, its uninstall value is `last`) and LIKE patterns, transient
+		// value and timeout rows included.
+		foreach ( DataRegistry::uninstall_options() as $opt ) {
 			if ( self::MODE_OPTION === $opt ) {
 				continue;
 			}
@@ -986,14 +778,15 @@ final class SiteCleanup {
 			delete_option( $opt );
 		}
 
-		foreach ( self::OPTION_PATTERNS as $pattern ) {
+		foreach ( DataRegistry::uninstall_option_likes() as $pattern ) {
 			self::delete_options_like( $pattern );
 		}
 
-		// 4. User meta - namespace LIKE sweep. We own `perflocale_*`
-		// exclusively, so a prefix DELETE is safe and sweeps any new key a
-		// dev forgot to register in USER_META_KEYS. That constant stays the
-		// canonical fixed list for the GDPR erase flow (no wildcard there).
+		// 4. User meta - namespace LIKE sweep (the registry's user-meta
+		// prefixes). We own `perflocale_*` exclusively, so a prefix DELETE is
+		// safe and sweeps any key the registry does not list by name; its
+		// fixed list (DataRegistry::user_meta_keys()) is what the GDPR erase
+		// flow uses (no wildcard there).
 		//
 		// SKIP on a single-subsite teardown: wp_usermeta is NETWORK-GLOBAL
 		// (switch_to_blog does NOT re-scope it, unlike post/term meta), and
@@ -1013,36 +806,21 @@ final class SiteCleanup {
 			$clean = false;
 		}
 
-		// 5. Term meta - language tags on menus.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$deleted = $wpdb->query(
-			$wpdb->prepare(
-				'DELETE FROM %i WHERE meta_key LIKE %s',
-				$wpdb->termmeta,
-				$wpdb->esc_like( '_perflocale_' ) . '%'
-			)
-		);
-
-		if ( false === $deleted ) {
-			$clean = false;
+		// 5. Term meta - language tags and pairings of menus: the registry's
+		// term-meta prefixes.
+		foreach ( DataRegistry::uninstall_meta_likes( 'term' ) as $prefix ) {
+			if ( ! self::delete_meta_like( $wpdb->termmeta, 'meta_id', 'term_id', 'term_meta', $prefix ) ) {
+				$clean = false;
+			}
 		}
 
-		// 6. Post meta - prefix LIKE deletes cover the WC-order language tag
-		// plus per-language attachment caption/description/alt-text
-		// variants. See POST_META_PREFIXES for the exact coverage. Each
-		// prefix runs through esc_like() so the underscores stay literal
-		// rather than being treated as single-char wildcards.
-		foreach ( self::POST_META_PREFIXES as $prefix ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$deleted = $wpdb->query(
-				$wpdb->prepare(
-					'DELETE FROM %i WHERE meta_key LIKE %s',
-					$wpdb->postmeta,
-					$wpdb->esc_like( $prefix ) . '%'
-				)
-			);
-
-			if ( false === $deleted ) {
+		// 6. Post meta - the registry's post-meta prefixes: the WC-order
+		// language tag on shop_order posts, the per-language attachment
+		// texts and every other `_perflocale_` key. Each prefix runs through
+		// esc_like() so the underscores stay literal rather than being
+		// treated as single-char wildcards.
+		foreach ( DataRegistry::uninstall_meta_likes( 'post' ) as $prefix ) {
+			if ( ! self::delete_meta_like( $wpdb->postmeta, 'meta_id', 'post_id', 'post_meta', $prefix ) ) {
 				$clean = false;
 			}
 		}
@@ -1144,7 +922,7 @@ final class SiteCleanup {
 
 		// bump_group_generation() above RE-WRITES each `perflocale_cgen_<group>`
 		// option (it persists the incremented generation), which the
-		// OPTION_PATTERNS sweep in full_purge() already deleted a few steps
+		// option LIKE sweep in full_purge() already deleted a few steps
 		// earlier - so without this, a full-data uninstall leaves ~10 orphaned
 		// generation tokens in wp_options forever. This method is the LAST cache
 		// step and runs only during uninstall, where nothing reads the cache
@@ -1209,30 +987,113 @@ final class SiteCleanup {
 	 * uninstall, or once at the end of a completed network sweep in which
 	 * some blog chose deletion and none chose to keep its data.
 	 *
-	 * We own the `perflocale_` namespace exclusively, so a prefix DELETE is
-	 * safe and catches keys a developer forgot to list; USER_META_KEYS stays
-	 * the fixed list the GDPR erase flow uses.
+	 * We own the `perflocale_` namespace exclusively, so a prefix DELETE (the
+	 * registry's user-meta prefixes) is safe and catches keys the registry
+	 * does not list by name; DataRegistry::user_meta_keys() stays the fixed
+	 * list the GDPR erase flow uses.
 	 *
-	 * @return bool False only if the DELETE failed. 0 rows deleted is success.
+	 * @return bool False only if a DELETE failed. 0 rows deleted is success.
 	 */
 	private static function sweep_plugin_user_meta(): bool {
 		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		foreach ( DataRegistry::uninstall_meta_likes( 'user' ) as $prefix ) {
+			if ( ! self::delete_meta_like( $wpdb->usermeta, 'umeta_id', 'user_id', 'user_meta', $prefix ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Delete the rows of one core meta table whose key starts with a prefix,
+	 * and drop WordPress's cached meta of every object that held one.
+	 *
+	 * The DELETE bypasses the meta API, so with a persistent object cache
+	 * (Redis, Memcached) each object's `<type>_meta` cache entry would keep
+	 * the deleted rows: get_post_meta() would go on returning them, and after
+	 * a reinstall an import would skip a row of the file because
+	 * metadata_exists() reads the cached copy. With such a cache the rows go
+	 * in pages of META_PAGE, in row id order: each page's rows are read (row
+	 * id and object id, after the last row id of the page before), deleted
+	 * by row id, and their objects' cache entries deleted, so memory holds
+	 * one page whatever the number of rows. Without a
+	 * persistent object cache the entries end with the request, so one
+	 * DELETE removes every row.
+	 *
+	 * @param string $table       Meta table.
+	 * @param string $row_column  Its row id column (meta_id, umeta_id).
+	 * @param string $id_column   Its object id column (post_id, term_id, user_id).
+	 * @param string $cache_group The core cache group of that meta type.
+	 * @param string $prefix      Literal key prefix.
+	 * @return bool False if a read or a DELETE failed.
+	 */
+	private static function delete_meta_like( string $table, string $row_column, string $id_column, string $cache_group, string $prefix ): bool {
+		global $wpdb;
 		/**
-		 * WordPress database access object.
+		 * WordPress database object.
 		 *
 		 * @var \wpdb $wpdb
 		 */
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$deleted = $wpdb->query(
-			$wpdb->prepare(
-				'DELETE FROM %i WHERE meta_key LIKE %s',
-				$wpdb->usermeta,
-				$wpdb->esc_like( 'perflocale_' ) . '%'
-			)
-		);
+		$like = $wpdb->esc_like( $prefix ) . '%';
 
-		return false !== $deleted;
+		if ( ! wp_using_ext_object_cache() ) {
+			$delete = $wpdb->prepare( 'DELETE FROM %i WHERE meta_key LIKE %s', $table, $like );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- prepared just above.
+			return null !== $delete && false !== $wpdb->query( $delete );
+		}
+
+		$after = 0;
+
+		do {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- the uninstall's own page of the rows it deletes next.
+			$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT %i, %i FROM %i WHERE meta_key LIKE %s AND %i > %d ORDER BY %i LIMIT %d', $row_column, $id_column, $table, $like, $row_column, $after, $row_column, self::META_PAGE ), ARRAY_N );
+
+			// wpdb clears last_error at the start of every query, so a
+			// non-empty one belongs to this SELECT.
+			if ( '' !== $wpdb->last_error || null === $rows ) {
+				return false;
+			}
+
+			$row_ids = [];
+			$objects = [];
+
+			foreach ( $rows as $row ) {
+				if ( is_numeric( $row[0] ?? null ) && is_numeric( $row[1] ?? null ) ) {
+					$row_ids[]                = (int) $row[0];
+					$objects[ (int) $row[1] ] = true;
+				}
+			}
+
+			if ( [] === $row_ids ) {
+				return true;
+			}
+
+			$placeholders = implode( ', ', array_fill( 0, count( $row_ids ), '%d' ) );
+
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Table and column bound with %i; row ids bound one %d each.
+			$delete = $wpdb->prepare( "DELETE FROM %i WHERE %i IN ({$placeholders})", $table, $row_column, ...$row_ids );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- prepared just above.
+			if ( null === $delete || false === $wpdb->query( $delete ) ) {
+				return false;
+			}
+
+			$after = max( $row_ids );
+
+			wp_cache_delete_multiple( array_keys( $objects ), $cache_group );
+
+			$read = count( $rows );
+		} while ( $read >= self::META_PAGE );
+
+		return true;
 	}
 
 	/**
@@ -1288,7 +1149,7 @@ final class SiteCleanup {
 			return null !== $exists;
 		}
 
-		foreach ( self::POST_META_PREFIXES as $prefix ) {
+		foreach ( DataRegistry::uninstall_meta_likes( 'order' ) as $prefix ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$deleted = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_key LIKE %s', $table, $wpdb->esc_like( $prefix ) . '%' ) );
 
@@ -1688,8 +1549,8 @@ final class SiteCleanup {
 	private static function delete_options_like( string $like_pattern ): void {
 		global $wpdb;
 
-		// ⚠️ `_` IS A SINGLE-CHARACTER WILDCARD IN LIKE. Every pattern in
-		// OPTION_PATTERNS contains underscores - `perflocale_lock_%` also
+		// ⚠️ `_` IS A SINGLE-CHARACTER WILDCARD IN LIKE. Every pattern of
+		// DataRegistry::uninstall_option_likes() contains underscores - `perflocale_lock_%` also
 		// matches `perflocaleXlockY...`, so the DELETE reached further than the
 		// pattern says. Nothing is known to have been lost (no other plugin
 		// ships an option that close to ours), but a cleanup routine must
@@ -1764,7 +1625,8 @@ final class SiteCleanup {
 	 *     alone. The full-data path must pass false: by the time it calls
 	 *     this, its own option sweep has already deleted that flag.
 	 * @param bool $drop_role_assignment Full-data path only - see
-	 *     {@see sweep_orphan_user_caps()}.
+	 *     {@see sweep_orphan_user_caps()}. Also deletes Oxygen's access
+	 *     option for the Translator role.
 	 * @return void
 	 */
 	private static function strip_role_and_caps( bool $allow_skip = false, bool $drop_role_assignment = false ): void {
@@ -1792,6 +1654,18 @@ final class SiteCleanup {
 		}
 
 		remove_role( \PerfLocale\Admin\TranslatorRole::ROLE_SLUG );
+
+		// Oxygen stores an access level per editable role
+		// (`oxygen_vsb_access_role_<role>`, added on every admin page load)
+		// and never deletes one, and WordPress tells no plugin that a role
+		// was removed. Once a full-data uninstall has removed the Translator
+		// role for good, Oxygen's row for it can never be read again, so it
+		// goes with the role. Deactivation and a preserve-mode uninstall keep
+		// it: the role and the access level chosen for it come back together
+		// on the next activation.
+		if ( $drop_role_assignment ) {
+			delete_option( 'oxygen_vsb_access_role_perflocale_translator' );
+		}
 
 		$caps = self::canonical_caps();
 
@@ -1848,7 +1722,7 @@ final class SiteCleanup {
 		// removed. The flag and the caps are two halves of the same state -
 		// if the caps go and the flag stays, install_caps() short-circuits
 		// on the next reinstall and the caps never come back. full_purge()
-		// already deletes this via STATIC_OPTIONS so the duplicate is a
+		// already deletes this through the registry's option list, so the duplicate is a
 		// harmless no-op there; the load-bearing call is from preserve_purge().
 		delete_option( 'perflocale_caps_version' );
 	}

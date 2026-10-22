@@ -641,6 +641,12 @@ final class Settings {
 	private static array $last_update_refused = [];
 
 	/**
+	 * Writes update() tries before it gives up, each after a lost
+	 * compare-and-set re-reads the row ({@see write_row()}).
+	 */
+	private const WRITE_ATTEMPTS = 5;
+
+	/**
 	 * Machine-translation provider address setting => the key setting sent to
 	 * that address.
 	 */
@@ -679,29 +685,46 @@ final class Settings {
 				// `alloptions` entry, which load() re-adds at once; every
 				// save already evicts it twice through the cache-generation
 				// bumps.
-				$this->reset_cache();
-				wp_cache_delete( self::OPTION_KEY, 'options' );
-				wp_cache_delete( 'alloptions', 'options' );
+				// The write is a compare-and-set on the row ({@see write_row()}):
+				// a writer that does not take this lock (a language delete or
+				// rename, a settings import restore) may change the row between
+				// the read above and the write, and an unconditional write would
+				// undo that change. After a lost comparison the row is read
+				// again and the merge redone, a bounded number of times.
+				$expected = false;
 
-				$current                 = $this->load();
-				[ $sanitized, $refused ] = $this->apply_provider_address_rules( $current, $sanitized );
-				$merged                  = array_merge( $current, $sanitized );
+				for ( $attempt = 0; ; $attempt++ ) {
+					$this->reset_cache();
+					wp_cache_delete( self::OPTION_KEY, 'options' );
+					wp_cache_delete( 'alloptions', 'options' );
 
-				self::$last_update_refused = $refused;
+					$current               = $this->load();
+					[ $applied, $refused ] = $this->apply_provider_address_rules( $current, $sanitized );
+					$merged                = array_merge( $current, $applied );
 
-				// autoload='yes' - the ~4 KB blob is read on nearly every request
-				// (frontend language routing, hreflang, URL rewriting) so paying for
-				// it inside the bundled alloptions fetch is strictly cheaper than a
-				// second DB round-trip. The memory cost of carrying it in alloptions
-				// is not measurable at this payload size.
-				$saved = update_option( self::OPTION_KEY, $merged, true );
+					self::$last_update_refused = $refused;
+
+					// The first attempt compares against the value the load
+					// above read (no statement); a later one against the row
+					// itself, so a value the options cache or a filter shapes
+					// differently from the row costs one lost attempt only.
+					$written = $this->write_row( $merged, $expected );
+
+					if ( null !== $written || $attempt + 1 >= self::WRITE_ATTEMPTS ) {
+						break;
+					}
+
+					$expected = self::stored_row();
+				}
+
+				$saved = true === $written;
 
 				// Update the in-memory cache only on a successful write - else
-				// an update_option failure would leave Settings::$settings
-				// ahead of the DB and get() would return unpersisted values.
-				// update_option also returns false for a no-op (value already
-				// current); that case is harmless, so if the merged blob equals
-				// $current we sync the memo anyway.
+				// a failed write would leave Settings::$settings ahead of the
+				// DB and get() would return unpersisted values. write_row()
+				// also reports a no-op (value already current) as not written;
+				// that case is harmless, so if the merged blob equals $current
+				// we sync the memo anyway.
 				if ( (bool) $saved ) {
 					$this->settings = $merged;
 				} elseif ( $merged === $current ) {
@@ -743,6 +766,49 @@ final class Settings {
 
 		return (bool) $result['ok'];
 	}
+
+	/**
+	 * The settings row's bytes read from the database, past any cached
+	 * copy; null when there is no row.
+	 *
+	 * @return string|null
+	 */
+	private static function stored_row(): ?string {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return null;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The row itself, past any cached copy.
+		$row = $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, self::OPTION_KEY ) );
+
+		return is_string( $row ) ? $row : null;
+	}
+
+	/**
+	 * Write the merged settings to their row with a compare-and-set: what
+	 * update_option() does (sanitize_option(), the pre_update_option filters,
+	 * no write when the value is unchanged, add_option() when there is no
+	 * row, the options cache updated, the update_option actions), except
+	 * that the UPDATE matches only while the row still holds $expected.
+	 *
+	 * @param array<string, mixed> $merged   Settings to store.
+	 * @param string|false|null    $expected The row's bytes the merge was built from; false: the
+	 *                                       value get_option() serves, serialized; null: no row.
+	 * @return bool|null True when written; false when there was nothing to write; null when the
+	 *                   row no longer held $expected (or the write failed).
+	 */
+	private function write_row( array $merged, $expected ): ?bool {
+		$old_value = get_option( self::OPTION_KEY );
+
+		if ( false === $expected ) {
+			$expected = false === $old_value ? null : \PerfLocale\Database\OptionWriter::bytes( $old_value );
+		}
+
+		return \PerfLocale\Database\OptionWriter::compare_and_set( self::OPTION_KEY, $merged, $old_value, $expected, true );
+	}
+
 
 	/**
 	 * The provider address settings (mt_libre_url, mt_agency_url) whose change

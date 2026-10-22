@@ -40,6 +40,16 @@ final class PolylangSiteData {
 	private const PRICE_SYNC_FLAG = 'price_sync_off';
 
 	/**
+	 * Products whose prices keep_prices_per_language() reads at a time.
+	 */
+	private const PRICE_PAGE = 200;
+
+	/**
+	 * Variations whose post meta is loaded per statement.
+	 */
+	private const VARIATION_CHUNK = 500;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param \wpdb              $wpdb         Database.
@@ -114,10 +124,10 @@ final class PolylangSiteData {
 	 * alone (reported); a menu Polylang showed for two languages stays with
 	 * the first of them.
 	 *
-	 * @param array<int, string> $errors Import errors, appended to.
+	 * @param array<int, string> $notices Import notices, appended to.
 	 * @return int Menu sets linked.
 	 */
-	public function import_menus( array &$errors ): int {
+	public function import_menus( array &$notices ): int {
 		$nav_menus = self::settings()['nav_menus'][ get_stylesheet() ] ?? null;
 
 		if ( ! is_array( $nav_menus ) ) {
@@ -151,7 +161,7 @@ final class PolylangSiteData {
 			$result = MenuManager::link_imported_menus( $set );
 
 			if ( $result['conflict'] !== null ) {
-				$errors[] = sprintf(
+				$notices[] = sprintf(
 					/* translators: 1: theme menu location, 2: comma-separated menu IDs */
 					__( 'The Polylang menus of the "%1$s" location (menus %2$s) were not linked: one of them already has a different language or link in PerfLocale.', 'perflocale' ),
 					(string) $location,
@@ -171,10 +181,10 @@ final class PolylangSiteData {
 	/**
 	 * Import Polylang's string translations.
 	 *
-	 * @param array<int, string> $errors Import errors, appended to.
+	 * @param array<int, string> $notices Import notices, appended to.
 	 * @return int Translations stored (option strings and language formats).
 	 */
-	public function import_strings( array &$errors ): int {
+	public function import_strings( array &$notices ): int {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Values are bound through prepare(); table names through %i.
 		$rows = $this->wpdb->get_results(
 			$this->wpdb->prepare(
@@ -263,7 +273,7 @@ final class PolylangSiteData {
 			}
 
 			if ( $unplaced > 0 ) {
-				$errors[] = sprintf(
+				$notices[] = sprintf(
 					/* translators: 1: number of strings, 2: language slug */
 					_n( '%1$d Polylang string translation in %2$s was not imported: PerfLocale has no place for it (widget titles and texts, and strings a theme or plugin registered with Polylang).', '%1$d Polylang string translations in %2$s were not imported: PerfLocale has no place for them (widget titles and texts, and strings a theme or plugin registered with Polylang).', $unplaced, 'perflocale' ),
 					$unplaced,
@@ -284,9 +294,10 @@ final class PolylangSiteData {
 	 *
 	 * @param \PerfLocale\Settings $settings PerfLocale settings.
 	 * @param array<int, string>   $errors   Import errors, appended to.
+	 * @param array<int, string>   $notices  Import notices, appended to.
 	 * @return list<string> Post types and taxonomies added.
 	 */
-	public function import_translatable_types( \PerfLocale\Settings $settings, array &$errors ): array {
+	public function import_translatable_types( \PerfLocale\Settings $settings, array &$errors, array &$notices ): array {
 		$pll   = self::settings();
 		$links = Schema::table( 'translation_links' );
 
@@ -356,7 +367,7 @@ final class PolylangSiteData {
 			return [];
 		}
 
-		$errors[] = sprintf(
+		$notices[] = sprintf(
 			/* translators: %s: comma-separated post type and taxonomy names */
 			__( 'Polylang translated %s, so PerfLocale now treats them as translatable too.', 'perflocale' ),
 			implode( ', ', $added )
@@ -375,22 +386,26 @@ final class PolylangSiteData {
 	 * choice) keeps it and warns.
 	 *
 	 * @param \PerfLocale\Settings $settings PerfLocale settings.
-	 * @param array<int, string>   $errors   Import errors, appended to.
+	 * @param array<int, string>   $notices  Import notices, appended to.
 	 * @return int Products whose language versions have different prices.
 	 */
-	public function keep_prices_per_language( \PerfLocale\Settings $settings, array &$errors ): int {
+	public function keep_prices_per_language( \PerfLocale\Settings $settings, array &$notices ): int {
 		if ( ! post_type_exists( 'product' ) || ! (bool) $settings->get( 'wc_sync_prices', true ) ) {
 			return 0;
 		}
 
 		// Every product in a group this import linked, whatever wrote the
 		// other members' links (a product saved under PerfLocale before the
-		// import keeps its own link).
+		// import keeps its own link), in group order. One read: paging it
+		// would scan the post links once per page. The rows are kept as two
+		// lists of integers, and a group's prices are compared once its last
+		// product is read; only the group being read keeps its prices.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Values are bound through prepare(); table names through %i.
 		$rows = $this->wpdb->get_results(
 			$this->wpdb->prepare(
 				'SELECT l.group_id, p.ID FROM %i l INNER JOIN %i p ON p.ID = l.object_id AND p.post_type = %s
-				WHERE l.type = %s AND l.group_id IN ( SELECT i.group_id FROM %i i WHERE i.type = %s AND i.source = %s )',
+				WHERE l.type = %s AND l.group_id IN ( SELECT i.group_id FROM %i i WHERE i.type = %s AND i.source = %s )
+				ORDER BY l.group_id',
 				Schema::table( 'translation_links' ),
 				$this->wpdb->posts,
 				'product',
@@ -402,21 +417,54 @@ final class PolylangSiteData {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
 
-		$prices = [];
+		$groups   = [];
+		$products = [];
 
-		foreach ( array_chunk( (array) $rows, 200 ) as $chunk ) {
-			$ids = array_map( static fn( object $row ): int => (int) $row->ID, $chunk );
+		foreach ( (array) $rows as $row ) {
+			$groups[]   = (int) $row->group_id;
+			$products[] = (int) $row->ID;
+		}
+
+		unset( $rows );
+
+		$differing  = 0;
+		$open       = 0;
+		$signatures = [];
+		$count      = count( $products );
+
+		for ( $offset = 0; $offset < $count; $offset += self::PRICE_PAGE ) {
+			$ids = array_slice( $products, $offset, self::PRICE_PAGE );
 
 			update_meta_cache( 'post', $ids );
 
-			foreach ( $chunk as $row ) {
-				$prices[ (int) $row->group_id ][ self::price_signature( (int) $row->ID ) ] = true;
+			$own = [];
+
+			foreach ( $ids as $product_id ) {
+				$own[ $product_id ] = self::price_pair( $product_id );
+			}
+
+			$variations = self::variation_prices( $ids );
+
+			foreach ( $ids as $index => $product_id ) {
+				$group_id = $groups[ $offset + $index ];
+
+				if ( $group_id !== $open ) {
+					$differing += count( $signatures ) > 1 ? 1 : 0;
+					$signatures = [];
+					$open       = $group_id;
+				}
+
+				$signatures[ self::price_signature( $own[ $product_id ], $variations[ $product_id ] ?? [] ) ] = true;
 			}
 
 			$this->keep_alive();
+
+			if ( $offset + self::PRICE_PAGE < $count ) {
+				\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+			}
 		}
 
-		$differing = count( array_filter( $prices, static fn( array $set ): bool => count( $set ) > 1 ) );
+		$differing += count( $signatures ) > 1 ? 1 : 0;
 
 		if ( $differing === 0 ) {
 			return 0;
@@ -425,7 +473,7 @@ final class PolylangSiteData {
 		// Price Sync is switched off once. When it is on again after that,
 		// the operator switched it on: keep it and only warn.
 		if ( MigrationState::has_flag( 'polylang', self::PRICE_SYNC_FLAG ) || ! $settings->update( [ 'wc_sync_prices' => false ] ) ) {
-			$errors[] = sprintf(
+			$notices[] = sprintf(
 				/* translators: %d: number of products */
 				_n( 'The language versions of %d product have different prices, as Polylang kept them. Switch off Price Sync under PerfLocale → Settings → Addons → WooCommerce before editing it, or the first edit copies one language\'s prices to the others.', 'The language versions of %d products have different prices, as Polylang kept them. Switch off Price Sync under PerfLocale → Settings → Addons → WooCommerce before editing them, or the first edit copies one language\'s prices to the others.', $differing, 'perflocale' ),
 				$differing
@@ -435,7 +483,7 @@ final class PolylangSiteData {
 
 		MigrationState::set_flag( 'polylang', self::PRICE_SYNC_FLAG );
 
-		$errors[] = sprintf(
+		$notices[] = sprintf(
 			/* translators: %d: number of products */
 			_n( 'The language versions of %d product have different prices, as Polylang kept them, so Price Sync (PerfLocale → Settings → Addons → WooCommerce) was switched off: editing one language\'s price no longer changes the others. Switch it on again if every language should share one price.', 'The language versions of %d products have different prices, as Polylang kept them, so Price Sync (PerfLocale → Settings → Addons → WooCommerce) was switched off: editing one language\'s price no longer changes the others. Switch it on again if every language should share one price.', $differing, 'perflocale' ),
 			$differing
@@ -445,36 +493,72 @@ final class PolylangSiteData {
 	}
 
 	/**
+	 * The variations' prices of a page of products, by product: the
+	 * variations are found in one query and their post meta is loaded 500
+	 * at a time, released before the next 500 are loaded.
+	 *
+	 * @param array<int, int> $product_ids Product IDs (one page).
+	 * @return array<int, array<int, string>> Variation prices (price_pair())
+	 *                                        by product ID; a product without
+	 *                                        variations is absent.
+	 */
+	private static function variation_prices( array $product_ids ): array {
+		if ( $product_ids === [] ) {
+			return [];
+		}
+
+		// An empty 'lang' is Polylang's "every language": while Polylang is
+		// active, the query is otherwise limited to its current language.
+		$parents = (array) get_posts(
+			[
+				'post_type'       => 'product_variation',
+				'post_parent__in' => $product_ids,
+				'post_status'     => 'any',
+				'fields'          => 'id=>parent',
+				'numberposts'     => -1,
+				'lang'            => '',
+			]
+		);
+
+		$chunks = array_chunk( array_map( 'intval', array_keys( $parents ) ), self::VARIATION_CHUNK );
+		$prices = [];
+
+		foreach ( $chunks as $index => $variation_chunk ) {
+			if ( $index > 0 ) {
+				\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+			}
+
+			update_meta_cache( 'post', $variation_chunk );
+
+			foreach ( $variation_chunk as $variation_id ) {
+				$prices[ (int) $parents[ $variation_id ] ][] = self::price_pair( $variation_id );
+			}
+		}
+
+		return $prices;
+	}
+
+	/**
+	 * A product's or variation's regular and sale price, as one string.
+	 *
+	 * @param int $post_id Product or variation ID.
+	 * @return string
+	 */
+	private static function price_pair( int $post_id ): string {
+		return get_post_meta( $post_id, '_regular_price', true ) . '/' . get_post_meta( $post_id, '_sale_price', true );
+	}
+
+	/**
 	 * A product's own prices and its variations' prices, as one comparable string.
 	 *
 	 * Variations are compared as a sorted list: their IDs differ between the
 	 * language versions.
 	 *
-	 * @param int $product_id Product ID.
+	 * @param string             $own        The product's price_pair().
+	 * @param array<int, string> $variations Its variations' price_pair() values.
 	 * @return string
 	 */
-	private static function price_signature( int $product_id ): string {
-		$own = get_post_meta( $product_id, '_regular_price', true ) . '/' . get_post_meta( $product_id, '_sale_price', true );
-
-		// An empty 'lang' is Polylang's "every language": while Polylang is
-		// active, the query is otherwise limited to its current language.
-		$variation_ids = get_posts(
-			[
-				'post_type'   => 'product_variation',
-				'post_parent' => $product_id,
-				'post_status' => 'any',
-				'fields'      => 'ids',
-				'numberposts' => -1,
-				'lang'        => '',
-			]
-		);
-
-		$variations = [];
-
-		foreach ( $variation_ids as $variation_id ) {
-			$variations[] = get_post_meta( (int) $variation_id, '_regular_price', true ) . '/' . get_post_meta( (int) $variation_id, '_sale_price', true );
-		}
-
+	private static function price_signature( string $own, array $variations ): string {
 		sort( $variations );
 
 		return $own . '#' . implode( ',', $variations );

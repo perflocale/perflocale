@@ -82,6 +82,9 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 	/**
 	 * Per-request memo of `is_string_group()`, keyed by `{blog_id}:{group_id}`.
+	 * It holds only `true`: a missing id can become a string group later in the
+	 * same request (a self-heal mints the next id, and on SQLite that can be an
+	 * id a dangling `strings.group_id` already names), so a "no" is read again.
 	 *
 	 * Blog-prefixed for the same reason as $find_cache and
 	 * $eager_link_map_memo: group ids are per-blog, so on multisite the same
@@ -963,36 +966,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		// Cascade - for each sibling object_id in the fetched link rows that
 		// WASN'T in the original $missing list, cache the same group's link
-		// list under its key. Pick the first non-empty source list as the
-		// canonical view of the group.
-		foreach ( $all_object_ids as $sibling_id => $_ ) {
-			if ( isset( $grouped_by_source[ $sibling_id ] ) ) {
-				continue;
-			}
-
-			// Find the list for whichever missing ID shares this sibling's
-			// group. Since all siblings are in the same group, any non-
-			// empty source list works.
-			foreach ( $grouped_by_source as $source_links ) {
-				if ( $source_links === [] ) {
-					continue;
-				}
-
-				$shares_group = false;
-
-				foreach ( $source_links as $link ) {
-					if ( (int) ( $link->object_id ?? 0 ) === $sibling_id ) {
-						$shares_group = true;
-						break;
-					}
-				}
-
-				if ( $shares_group ) {
-					$to_write[ "translations_{$type->value}_{$sibling_id}" ] = $source_links;
-					break;
-				}
-			}
-		}
+		// list under its key (see sibling_cascade()).
+		$to_write += self::sibling_cascade( $grouped_by_source, $all_object_ids, $type->value );
 
 		if ( $to_write !== [] ) {
 			$this->cache->set_many( $to_write, HOUR_IN_SECONDS, 'perflocale_trans', $read_failed ? [] : $stale_timeout_keys );
@@ -1013,6 +988,48 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		if ( get_option( 'perflocale_has_any_groups', '' ) !== '1' ) {
 			update_option( 'perflocale_has_any_groups', '1', true );
 		}
+	}
+
+	/**
+	 * Cache entries for the siblings in a batch of fetched link lists.
+	 *
+	 * Each object in $all_object_ids that is not itself a key of
+	 * $grouped_by_source gets the first list of $grouped_by_source that holds
+	 * a link to it, under the key "translations_{type}_{id}", in
+	 * $all_object_ids order. Members of one group share one link list, so
+	 * that list is the sibling's own. One pass builds an object-ID index of
+	 * the lists, so the cost grows with the number of links instead of with
+	 * links times groups.
+	 *
+	 * @internal Used by prime_translations(); public for its unit test.
+	 *
+	 * @param array<int, list<\stdClass>> $grouped_by_source Link lists by requested object ID.
+	 * @param array<int, mixed>            $all_object_ids    Every object ID in those lists, as keys.
+	 * @param string                       $type_value        Object type value (post or term).
+	 * @return array<non-falsy-string, list<\stdClass>> Cache key => link list.
+	 */
+	public static function sibling_cascade( array $grouped_by_source, array $all_object_ids, string $type_value ): array {
+		$list_of = [];
+
+		foreach ( $grouped_by_source as $source_links ) {
+			foreach ( $source_links as $link ) {
+				$object_id = (int) ( $link->object_id ?? 0 );
+
+				if ( ! isset( $list_of[ $object_id ] ) ) {
+					$list_of[ $object_id ] = $source_links;
+				}
+			}
+		}
+
+		$entries = [];
+
+		foreach ( $all_object_ids as $sibling_id => $_ ) {
+			if ( ! isset( $grouped_by_source[ $sibling_id ] ) && isset( $list_of[ $sibling_id ] ) ) {
+				$entries[ "translations_{$type_value}_{$sibling_id}" ] = $list_of[ $sibling_id ];
+			}
+		}
+
+		return $entries;
 	}
 
 	/**
@@ -1071,9 +1088,149 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders
 
-		self::$is_string_group_memo[ $memo_key ] = ( 'string' === $type );
+		if ( 'string' !== $type ) {
+			return false;
+		}
 
-		return self::$is_string_group_memo[ $memo_key ];
+		self::$is_string_group_memo[ $memo_key ] = true;
+
+		return true;
+	}
+
+	/**
+	 * Record a group the caller has just created with `type = 'string'`, so
+	 * the string-link writers' type check needs no read for it.
+	 *
+	 * @param int $group_id Id of the string group the caller inserted.
+	 * @return void
+	 */
+	public static function remember_string_group( int $group_id ): void {
+		if ( $group_id > 0 ) {
+			self::$is_string_group_memo[ get_current_blog_id() . ':' . $group_id ] = true;
+		}
+	}
+
+	/**
+	 * Give one string a new string-type group and point the string at it.
+	 *
+	 * For a string whose `group_id` is not a string group (a post or term
+	 * group, or no group at all): a string link written there would rewrite
+	 * that group's link for the language. The same INSERT-then-UPDATE pair, with
+	 * the same checks, as PoSync::mint_string_group() and
+	 * BulkStringTranslateJob::mint_string_group(). A failed or zero-row UPDATE
+	 * reclaims the new group (outside a transaction; inside one the caller
+	 * rolls back).
+	 *
+	 * A new id that other strings already name (a `group_id` left pointing at
+	 * no group, which the next id can match on SQLite) is not used: a group
+	 * shared with them would let their links replace this string's. That
+	 * group is deleted again and the new one takes an id above every group id
+	 * and every `strings.group_id`.
+	 *
+	 * @param int  $string_id      Row in the `strings` table.
+	 * @param bool $in_transaction True inside the caller's transaction: nothing follows a failed statement.
+	 * @return int The new group id, or 0 when the string could not be moved.
+	 */
+	public function assign_new_string_group( int $string_id, bool $in_transaction = false ): int {
+		if ( $string_id <= 0 ) {
+			return 0;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Self-heal write; there is no cache to consult.
+		$inserted = $this->wpdb->insert( $this->groups_table(), [ 'type' => ObjectType::String->value ], [ '%s' ] );
+
+		if ( ! $inserted ) {
+			return 0;
+		}
+
+		// Read only after a confirmed INSERT: on a failed one insert_id can
+		// still hold a prior row's id.
+		$group_id = (int) $this->wpdb->insert_id;
+
+		if ( $group_id <= 0 ) {
+			return 0;
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Self-heal reads on the primary key and the group_id index; identifiers are bound with %i.
+		$claimed = $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT id FROM %i WHERE group_id = %d LIMIT 1', Schema::table( 'strings' ), $group_id ) );
+
+		if ( null !== $claimed && '' !== $claimed ) {
+			$this->wpdb->delete( $this->groups_table(), [ 'id' => $group_id ], [ '%d' ] );
+
+			$group_id = 1 + max(
+				(int) $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT MAX(id) FROM %i', $this->groups_table() ) ),
+				(int) $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT MAX(group_id) FROM %i', Schema::table( 'strings' ) ) )
+			);
+
+			$row = [
+				'id'   => $group_id,
+				'type' => ObjectType::String->value,
+			];
+
+			if ( ! $this->wpdb->insert( $this->groups_table(), $row, [ '%d', '%s' ] ) ) {
+				return 0;
+			}
+		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Self-heal write, keyed on the primary key.
+		$updated = $this->wpdb->update( Schema::table( 'strings' ), [ 'group_id' => $group_id ], [ 'id' => $string_id ], [ '%d' ], [ '%d' ] );
+
+		if ( ! is_int( $updated ) || $updated < 1 ) {
+			if ( ! ( false === $updated && ( $in_transaction || self::$in_transaction ) ) ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reclaiming the group this method just created, by primary key.
+				$this->wpdb->delete( $this->groups_table(), [ 'id' => $group_id ], [ '%d' ] );
+			}
+
+			return 0;
+		}
+
+		self::remember_string_group( $group_id );
+
+		return $group_id;
+	}
+
+	/**
+	 * Which of these group ids are string groups, in one read.
+	 *
+	 * Ids already known as string groups this request are not read again.
+	 *
+	 * @param int[] $group_ids Group ids.
+	 * @return array<int, true> group_id => true for each string group.
+	 */
+	private function string_group_ids( array $group_ids ): array {
+		$out     = [];
+		$blog_id = get_current_blog_id();
+		$unknown = [];
+
+		foreach ( $group_ids as $group_id ) {
+			if ( isset( self::$is_string_group_memo[ $blog_id . ':' . $group_id ] ) ) {
+				$out[ $group_id ] = true;
+			} elseif ( $group_id > 0 ) {
+				$unknown[] = $group_id;
+			}
+		}
+
+		if ( $unknown === [] ) {
+			return $out;
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $unknown ), '%d' ) );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $placeholders is a generated %d list bound to $unknown.
+		$ids = $this->wpdb->get_col(
+			$this->wpdb->prepare(
+				"SELECT id FROM %i WHERE type = 'string' AND id IN ({$placeholders})",
+				array_merge( [ $this->groups_table() ], $unknown )
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		foreach ( (array) $ids as $id ) {
+			$out[ (int) $id ] = true;
+		}
+
+		return $out;
 	}
 
 	public function has_any_groups(): bool {
@@ -1431,7 +1588,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	public function invalidate_eager_link_map( ?ObjectType $type = null ): void {
 		++self::$link_changes;
 
-		$types = $type ? [ $type->value ] : [ 'post', 'term', 'string', 'post_type', 'taxonomy' ];
+		$types = $type ? [ $type->value ] : [ 'post', 'term', 'option', 'string', 'post_type', 'taxonomy' ];
 		$names = [];
 
 		foreach ( $types as $t ) {
@@ -2563,6 +2720,19 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			)
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders
+		// A failed read inside the transaction stops it: on the SQLite Database
+		// Integration a failed statement ends the transaction and the writes
+		// after it would commit one by one (get_col() answers a failure with an
+		// empty result, so last_error tells them apart).
+		if ( $this->statement_failed() ) {
+			if ( $needs_own_transaction ) {
+				$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				self::$in_transaction = false;
+			}
+
+			return false;
+		}
+
 		$previous_group_ids = array_map( 'intval', (array) $previous_group_ids );
 
 		// Remove existing links for this object within its own TYPE space, so
@@ -2613,7 +2783,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 			// A failed read means the transaction is in doubt, as for the
 			// statements around it.
-			if ( '' !== $this->wpdb->last_error ) {
+			if ( $this->statement_failed() ) {
 				if ( $needs_own_transaction ) {
 					$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 					self::$in_transaction = false;
@@ -2723,6 +2893,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders
 
+			// A failed read stops the transaction, as the reads above do.
+			if ( $this->statement_failed() ) {
+				if ( $needs_own_transaction ) {
+					$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					self::$in_transaction = false;
+				}
+
+				return false;
+			}
+
 			if ( ! $prev_group_row || ( $prev_group_row->type ?? '' ) === 'string' ) {
 				continue;
 			}
@@ -2746,6 +2926,9 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				}
 				return false;
 			}
+
+			// The import records that pointed at the emptied group go with it.
+			$this->delete_source_map_for_group( $prev_gid );
 		}
 
 		if ( $needs_own_transaction ) {
@@ -2792,6 +2975,10 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 		if ( ObjectType::Post->value === $dest_type ) {
 			self::report_link_change( $group_id, $object_id, $member_ids, $displaced_id, $left_member_ids );
+
+			// Menu and pattern references in translated templates follow the
+			// link at the end of the request (posts only: one array entry).
+			\PerfLocale\Translation\TemplateBlockRefs::note_post_link( $object_id );
 		}
 
 		/** @hook perflocale/translation/linked Fires after an object is linked to a group. */
@@ -2855,6 +3042,10 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @param int                         $language_id Language ID.
 	 * @param string                      $status Translation status.
 	 * @param \PerfLocale\Enum\SourceType $source Translation source provenance.
+	 * @param bool                        $in_transaction True when the caller runs this inside its own
+	 *                                                    transaction (one it did not mark with
+	 *                                                    set_in_transaction()): a failed write is then
+	 *                                                    returned at once, with no further statement.
 	 * @return int|false Link ID or false on failure.
 	 * @throws \InvalidArgumentException When $object_id <= 0 and WP_DEBUG is on (mirrors link_object() guard).
 	 */
@@ -2863,7 +3054,8 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		int $object_id,
 		int $language_id,
 		string $status = 'translated',
-		\PerfLocale\Enum\SourceType $source = \PerfLocale\Enum\SourceType::Manual
+		\PerfLocale\Enum\SourceType $source = \PerfLocale\Enum\SourceType::Manual,
+		bool $in_transaction = false
 	): int|false {
 		// Same object_id > 0 guard as link_object() - dual-mode.
 		if ( $object_id <= 0 ) {
@@ -2884,10 +3076,30 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			return false;
 		}
 
+		// A string link goes only into a string group: in a post or term
+		// group the ON DUPLICATE KEY UPDATE below would rewrite that group's
+		// link for this language. Callers give such a string a new string
+		// group first (assign_new_string_group()).
+		if ( ! $this->is_string_group( $group_id ) ) {
+			return false;
+		}
+
 		$safe_status = sanitize_key( $status );
 		$safe_source = $source->value;
 
 		$link_id = $this->write_string_link( $group_id, $object_id, $language_id, $safe_status, $safe_source );
+		$link_id = $link_id < 0 && ! ( $in_transaction || self::$in_transaction ) ? 0 : $link_id;
+
+		// Inside a transaction no statement may follow a FAILED write (on the
+		// SQLite Database Integration a failed statement ends the transaction
+		// and the next ones would commit one by one), so there it is reported
+		// as it is, with wpdb's last_error still naming it; the caller rolls
+		// back, which leaves the cached links valid. Outside one, a failed
+		// write still gets the reap and one retry below, which also heals a
+		// write that collided on both unique keys at once.
+		if ( $link_id < 0 && ( $in_transaction || self::$in_transaction ) ) {
+			return false;
+		}
 
 		if ( $link_id === 0 ) {
 			// The write reported no error yet this group has no link for the
@@ -2916,8 +3128,16 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders
 
+			if ( false === $reaped && ( $in_transaction || self::$in_transaction ) ) {
+				return false;
+			}
+
 			if ( is_int( $reaped ) && $reaped > 0 ) {
 				$link_id = $this->write_string_link( $group_id, $object_id, $language_id, $safe_status, $safe_source );
+
+				if ( $link_id < 0 && ( $in_transaction || self::$in_transaction ) ) {
+					return false;
+				}
 			}
 		}
 
@@ -2949,13 +3169,21 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * @param int    $language_id Language ID.
 	 * @param string $status      Sanitised status.
 	 * @param string $source      Source value.
-	 * @return int Link ID, or 0 when this group + language ended up with no row.
+	 * @return int Link ID, 0 when this group + language ended up with no row, or -1 when the
+	 *             statement failed.
 	 */
 	private function write_string_link( int $group_id, int $object_id, int $language_id, string $status, string $source ): int {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table bound with %i; the NotPrepared sniff misses $this->wpdb->prepare().
 		// upsert_link() is the string-group-safe path (link_object()'s Guard 2
 		// routes string groups here; nothing routes post/term groups here), so
 		// type is always 'string' - set it explicitly, no group lookup needed.
+		$touch  = \PerfLocale\Database\Schema::touch_write_time(
+			[
+				[ 'object_id', 'VALUES(object_id)', 'int' ],
+				[ 'status', 'VALUES(status)', 'text' ],
+				[ 'source', 'VALUES(source)', 'text' ],
+			]
+		);
 		$result = $this->wpdb->query(
 			$this->wpdb->prepare(
 				'INSERT INTO %i (group_id, object_id, language_id, type, status, source)
@@ -2963,7 +3191,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				ON DUPLICATE KEY UPDATE
 					object_id = VALUES(object_id),
 					status = VALUES(status),
-					source = VALUES(source)',
+					source = VALUES(source)' . $touch,
 				$this->links_table(),
 				$group_id,
 				$object_id,
@@ -2974,7 +3202,7 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		);
 
 		if ( $result === false ) {
-			return 0;
+			return -1;
 		}
 
 		return (int) $this->wpdb->get_var(
@@ -3633,10 +3861,20 @@ final class TranslationGroupRepository implements RepositoryInterface {
 	 * every group touched are invalidated once, and
 	 * `perflocale/translation/linked` fires for each link written.
 	 *
+	 * Inside a transaction (set_in_transaction()) it stops as soon as the
+	 * transaction is lost (\PerfLocale\Database\Schema::transaction_lost():
+	 * one of its own statements failed, or a failed query, a
+	 * perflocale/translation/linked listener's included, ended the
+	 * transaction), sends no other
+	 * statement, and answers -1: the caller rolls the batch back.
+	 *
+	 * A link whose group is not a string group is not written and counts as
+	 * not written. The types of each chunk's groups are read in one query.
+	 *
 	 * @param array<int, array{0: int, 1: int, 2: int}> $links  group_id, string_id, language_id.
 	 * @param \PerfLocale\Enum\SourceType               $source Source written on each link.
 	 * @param string                                    $status Status written on each link.
-	 * @return int Links that could not be written.
+	 * @return int Links that could not be written, or -1 when the transaction was lost.
 	 */
 	public function upsert_string_links( array $links, \PerfLocale\Enum\SourceType $source, string $status = 'translated' ): int {
 		$links = array_values( array_filter( $links, static fn( array $l ): bool => (int) $l[0] > 0 && (int) $l[1] > 0 && (int) $l[2] > 0 ) );
@@ -3648,8 +3886,32 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		$safe_status = sanitize_key( $status );
 		$failed      = 0;
 		$group_ids   = [];
+		$errors      = \PerfLocale\Database\Schema::query_error_count();
+		$touch       = \PerfLocale\Database\Schema::touch_write_time(
+			[
+				[ 'object_id', 'VALUES(object_id)', 'int' ],
+				[ 'status', 'VALUES(status)', 'text' ],
+				[ 'source', 'VALUES(source)', 'text' ],
+			]
+		);
 
 		foreach ( array_chunk( $links, 200 ) as $chunk ) {
+			// A link into a group that is not a string group is not written
+			// (see upsert_link()); it counts as not written.
+			$string_groups = $this->string_group_ids( array_values( array_unique( array_map( static fn( array $l ): int => (int) $l[0], $chunk ) ) ) );
+
+			if ( self::$in_transaction && \PerfLocale\Database\Schema::transaction_lost( $errors, $this->statement_failed() ) ) {
+				return -1;
+			}
+
+			$kept    = array_values( array_filter( $chunk, static fn( array $l ): bool => isset( $string_groups[ (int) $l[0] ] ) ) );
+			$failed += count( $chunk ) - count( $kept );
+			$chunk   = $kept;
+
+			if ( $chunk === [] ) {
+				continue;
+			}
+
 			$values = implode( ',', array_fill( 0, count( $chunk ), "(%d, %d, %d, 'string', %s, %s)" ) );
 			$args   = [ $this->links_table() ];
 
@@ -3662,18 +3924,22 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			}
 
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $values is a generated placeholder list bound to $args.
-			$this->wpdb->query(
+			$written = $this->wpdb->query(
 				$this->wpdb->prepare(
 					"INSERT INTO %i (group_id, object_id, language_id, type, status, source)
 					VALUES {$values}
 					ON DUPLICATE KEY UPDATE
 						object_id = VALUES(object_id),
 						status = VALUES(status),
-						source = VALUES(source)",
+						source = VALUES(source)" . $touch,
 					$args
 				)
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			if ( self::$in_transaction && \PerfLocale\Database\Schema::transaction_lost( $errors, false === $written ) ) {
+				return -1;
+			}
 
 			$ids          = array_values( array_unique( array_map( static fn( array $l ): int => (int) $l[0], $chunk ) ) );
 			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
@@ -3687,6 +3953,10 @@ final class TranslationGroupRepository implements RepositoryInterface {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
+			if ( self::$in_transaction && \PerfLocale\Database\Schema::transaction_lost( $errors, $this->statement_failed() ) ) {
+				return -1;
+			}
+
 			$now = [];
 
 			foreach ( (array) $rows as $row ) {
@@ -3699,7 +3969,13 @@ final class TranslationGroupRepository implements RepositoryInterface {
 				$language_id = (int) $language_id;
 
 				if ( ( $now[ $group_id ][ $language_id ] ?? 0 ) !== $string_id ) {
-					if ( $this->upsert_link( $group_id, $string_id, $language_id, $safe_status, $source ) === false ) {
+					$linked = $this->upsert_link( $group_id, $string_id, $language_id, $safe_status, $source );
+
+					if ( self::$in_transaction && \PerfLocale\Database\Schema::transaction_lost( $errors, false === $linked && $this->statement_failed() ) ) {
+						return -1;
+					}
+
+					if ( false === $linked ) {
 						++$failed;
 					}
 
@@ -3710,6 +3986,10 @@ final class TranslationGroupRepository implements RepositoryInterface {
 
 				/** This action is documented in upsert_link(). */
 				do_action( 'perflocale/translation/linked', $group_id, $string_id, $language_id );
+
+				if ( self::$in_transaction && \PerfLocale\Database\Schema::transaction_lost( $errors ) ) {
+					return -1;
+				}
 			}
 		}
 
@@ -3762,5 +4042,17 @@ final class TranslationGroupRepository implements RepositoryInterface {
 		}
 
 		CacheManager::delete_autoloaded_options( $names );
+	}
+
+	/**
+	 * Whether the statement that just ran failed (wpdb clears last_error at
+	 * the start of every query, so a non-empty one belongs to it).
+	 *
+	 * @phpstan-impure
+	 *
+	 * @return bool
+	 */
+	private function statement_failed(): bool {
+		return '' !== $this->wpdb->last_error;
 	}
 }

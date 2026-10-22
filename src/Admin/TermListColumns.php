@@ -98,10 +98,6 @@ final class TermListColumns {
 		add_action( 'quick_edit_custom_box', [ $this, 'render_quick_edit_field' ], 10, 3 );
 		add_action( 'edited_term', [ $this, 'save_quick_edit_language' ], 15, 3 );
 
-		// Inline JS attached during enqueue phase (NOT admin_footer-* - that
-		// fires after wp_print_footer_scripts has already emitted the
-		// `perflocale-admin` script payload, so wp_add_inline_script() calls
-		// at that point are silently dropped).
 		add_action( 'admin_enqueue_scripts', [ $this, 'quick_edit_js' ] );
 	}
 
@@ -139,14 +135,20 @@ final class TermListColumns {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$current = isset( $_GET['perflocale_lang'] ) ? sanitize_key( $_GET['perflocale_lang'] ) : '';
 
-		$options = '<option value="">' . esc_html__( 'All Languages', 'perflocale' ) . '</option>';
+		$options = [
+			[
+				'value'    => '',
+				'label'    => __( 'All Languages', 'perflocale' ),
+				'selected' => false,
+			],
+		];
 
 		foreach ( $languages as $lang ) {
-			$flag     = \PerfLocale\Helper::get_flag_emoji( $lang );
-			$selected = ( $current === $lang->slug ) ? ' selected' : '';
-			$options .= '<option value="' . esc_attr( $lang->slug ) . '"' . $selected . '>'
-				. esc_html( $flag . ' ' . $lang->name )
-				. '</option>';
+			$options[] = [
+				'value'    => $lang->slug,
+				'label'    => \PerfLocale\Helper::get_flag_emoji( $lang ) . ' ' . $lang->name,
+				'selected' => $current === $lang->slug,
+			];
 		}
 
 		$filter_url = admin_url( 'edit-tags.php?taxonomy=' . rawurlencode( $screen->taxonomy ) );
@@ -155,51 +157,19 @@ final class TermListColumns {
 			$filter_url = add_query_arg( 'post_type', $screen->post_type, $filter_url );
 		}
 
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleTermFilter=' . wp_json_encode(
-				[
-					'options'   => $options,
-					'filterBtn' => __( 'Filter', 'perflocale' ),
-					// Raw URL, NOT esc_url(): this value is consumed as a
-					// JavaScript string, not emitted into an HTML attribute.
-					// esc_url() encodes '&' as '&#038;', which JS does not
-					// decode, so the query string the browser navigated to
-					// became '...category&#038;post_type=post' and the
-					// language parameter was parsed into the fragment and
-					// dropped - the filter silently did nothing. The
-					// wp_json_encode() call below (JSON_HEX_* flags) is the
-					// context-correct escaper for a JS string literal.
-					'filterUrl' => $filter_url,
-				],
-				JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-			) . ';',
-			'before'
-		);
+		Assets::enqueue_script( 'perflocale-term-list-filter', 'term-list-filter.js' );
 
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var tablenav=document.querySelector("#posts-filter .tablenav.top .bulkactions");' .
-				'if(!tablenav)return;' .
-				'var select=document.createElement("select");' .
-				'select.name="perflocale_lang";' .
-				'select.style.marginLeft="6px";' .
-				'select.innerHTML=perflocaleTermFilter.options;' .
-				'var btn=document.createElement("input");' .
-				'btn.type="button";' .
-				'btn.className="button";' .
-				'btn.value=perflocaleTermFilter.filterBtn;' .
-				'btn.style.marginLeft="4px";' .
-				'btn.addEventListener("click",function(){' .
-					'var val=select.value;' .
-					'var url=perflocaleTermFilter.filterUrl;' .
-					'if(val){url+="&perflocale_lang="+encodeURIComponent(val);}' .
-					'window.location.href=url;' .
-				'});' .
-				'tablenav.parentNode.insertBefore(select,tablenav.nextSibling);' .
-				'select.parentNode.insertBefore(btn,select.nextSibling);' .
-			'})();'
+		wp_localize_script(
+			'perflocale-term-list-filter',
+			'perflocaleTermFilter',
+			[
+				'options'   => $options,
+				'label'     => __( 'Filter by language', 'perflocale' ),
+				'filterBtn' => __( 'Filter', 'perflocale' ),
+				// Raw URL, not esc_url(): the script appends to it and
+				// navigates, and esc_url() would turn '&' into '&#038;'.
+				'filterUrl' => $filter_url,
+			]
 		);
 	}
 
@@ -713,7 +683,7 @@ final class TermListColumns {
 	}
 
 	/**
-	 * Inline JS that pre-populates the term Quick Edit language `<select>`
+	 * Enqueue the script that fills the term Quick Edit language `<select>`
 	 * from row data each time a row's Quick Edit is opened.
 	 *
 	 * Mirrors {@see PostListColumns::quick_edit_js()} - same state-shape,
@@ -734,69 +704,14 @@ final class TermListColumns {
 			return;
 		}
 
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleTermQeI18n=' . wp_json_encode(
-				[
-					'inUse' => __( 'in use', 'perflocale' ),
-				],
-				JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-			) . ';',
-			'before'
-		);
+		Assets::enqueue_script( 'perflocale-term-quick-edit', 'term-quick-edit.js', [ 'jquery' ] );
 
-		// Defer the inlineEditTax.edit override. `inline-edit-tax.js` is
-		// enqueued lazily by core (sometimes after our inline script runs),
-		// so a synchronous `if (typeof inlineEditTax === "undefined") return`
-		// would silently no-op. Poll briefly + override once it's available.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function($){' .
-				'function install(){' .
-					'if(typeof inlineEditTax==="undefined"){return false;}' .
-					'if(inlineEditTax.__perflocaleHooked){return true;}' .
-					'inlineEditTax.__perflocaleHooked=true;' .
-					'var origEdit=inlineEditTax.edit;' .
-					'inlineEditTax.edit=function(id){' .
-						'origEdit.apply(this,arguments);' .
-						'if(typeof id==="object"){id=this.getId(id);}' .
-						'if(!id){return;}' .
-						// Term rows are `tag-{id}` regardless of taxonomy.
-						'var row=document.getElementById("tag-"+id);' .
-						'var langCell=row?row.querySelector(".perflocale-lang-cell"):null;' .
-						'if(!langCell){return;}' .
-						'var lang=langCell.getAttribute("data-perflocale-lang")||"";' .
-						'var taken=[];' .
-						'try{taken=JSON.parse(langCell.getAttribute("data-perflocale-taken")||"[]");}catch(e){}' .
-						'var editRow=document.getElementById("edit-"+id);' .
-						'var select=editRow?editRow.querySelector(\'select[name="perflocale_term_language_qe"]\'):null;' .
-						'if(!select){return;}' .
-						'for(var i=0;i<select.options.length;i++){' .
-							'select.options[i].disabled=false;' .
-							'select.options[i].textContent=select.options[i].textContent.replace(/ \\(.*\\)$/,"");' .
-						'}' .
-						'for(var i=0;i<select.options.length;i++){' .
-							'var val=select.options[i].value;' .
-							'if(val===""||val===lang){continue;}' .
-							'if(taken.indexOf(val)!==-1){' .
-								'select.options[i].disabled=true;' .
-								'select.options[i].textContent+=" ("+perflocaleTermQeI18n.inUse+")";' .
-							'}' .
-						'}' .
-						'select.value=lang||"";' .
-					'};' .
-					'return true;' .
-				'}' .
-				'if(install()){return;}' .
-				// Poll up to ~3s for inline-edit-tax.js to load. Inexpensive
-				// (50 ms × 60 = 60 short JSON-less DOM ops) and hands control
-				// back to the browser between checks. Stops the moment the
-				// hook installs successfully.
-				'var tries=0;' .
-				'var iv=setInterval(function(){' .
-					'if(install()||++tries>60){clearInterval(iv);}' .
-				'},50);' .
-			'})(jQuery);'
+		wp_localize_script(
+			'perflocale-term-quick-edit',
+			'perflocaleTermQeI18n',
+			[
+				'inUse' => __( 'in use', 'perflocale' ),
+			]
 		);
 	}
 }

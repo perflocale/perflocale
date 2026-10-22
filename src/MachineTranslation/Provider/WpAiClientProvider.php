@@ -492,14 +492,22 @@ final class WpAiClientProvider extends AbstractProvider {
 		/**
 		 * Filter the prompt sent to the WordPress AI Client.
 		 *
+		 * A custom prompt must keep the default prompt's rules, because the text
+		 * carries tokens PerfLocale puts back after the answer: placeholder
+		 * tokens like [[PFL_PH_N]] and printf-style tokens (%s, %d, %1$s) must
+		 * come back verbatim, and in html format every HTML comment too (block
+		 * markers `<!-- pfl-b-... -->` and "Do not translate" markers). An
+		 * answer that loses or changes one is not saved.
+		 *
 		 * @hook perflocale/mt/wp_ai_client_prompt
 		 *
 		 * @param string $prompt      The full prompt.
 		 * @param string $text        Source text.
 		 * @param string $source_lang Normalised source language.
 		 * @param string $target_lang Normalised target language.
+		 * @param string $format      Destination format: 'html' (markup kept) or 'text' (plain text, no markup or entities). Passed to callbacks that accept five arguments.
 		 */
-		return (string) apply_filters( 'perflocale/mt/wp_ai_client_prompt', $prompt, $text, $source, $target );
+		return (string) apply_filters( 'perflocale/mt/wp_ai_client_prompt', $prompt, $text, $source, $target, $format );
 	}
 
 	/**

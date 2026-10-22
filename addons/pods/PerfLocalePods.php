@@ -64,18 +64,11 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	private static array $pod_cache = [];
 
 	/**
-	 * Lazily instantiated post translation manager.
+	 * The front-end field reads, built on the first Pods field read.
 	 *
-	 * @var \PerfLocale\Translation\PostTranslationManager|null
+	 * @var \PerfLocalePodsDisplay|null
 	 */
-	private ?\PerfLocale\Translation\PostTranslationManager $manager = null;
-
-	/**
-	 * Lazily instantiated translation group repository.
-	 *
-	 * @var \PerfLocale\Database\Repository\TranslationGroupRepository|null
-	 */
-	private ?\PerfLocale\Database\Repository\TranslationGroupRepository $repo = null;
+	private ?\PerfLocalePodsDisplay $display = null;
 
 	/**
 	 * {@inheritDoc}
@@ -127,6 +120,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 		// Translate pick (relationship) fields on the frontend only.
 		if ( ! is_admin() ) {
 			add_filter( 'pods_pods_field', [ $this, 'translate_field_value' ], 10, 4 );
+			add_filter( 'pods_pods_field_related_output_type', [ $this, 'map_display_source' ], PHP_INT_MAX, 4 );
 		}
 
 		// The Pod-config cache is keyed by post type only; on multisite a
@@ -376,6 +370,12 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 * post/term IDs with their translated counterparts for the
 	 * current language.
 	 *
+	 * The value is mapped for the outputs that carry IDs: arrays (Pods'
+	 * default), ids and objects. A form read (in_form), a display read
+	 * (the formatted text the Pods shortcode and blocks print) and the
+	 * names, pods and find outputs are returned as they are: a form saves
+	 * what it reads back to the item, and the others carry no ID to map.
+	 *
 	 * @param mixed  $value Field value.
 	 * @param array  $row Current row data.
 	 * @param object $params Params object passed to field().
@@ -383,82 +383,30 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 * @return mixed
 	 */
 	public function translate_field_value( mixed $value, mixed $row, mixed $params, mixed $obj ): mixed {
-		// Only translate pick (relationship) fields.
-		if ( ! is_object( $params ) || ! isset( $params->name ) ) {
-			return $value;
-		}
+		return $this->display()->translate_field_value( $value, $row, $params, $obj );
+	}
 
-		if ( empty( $value ) ) {
-			return $value;
-		}
-
-		// Resolve the language first: nothing is translated on the default
-		// language, so bail BEFORE the (more expensive) Pods field-config
-		// lookup below - matching the ACF and Meta Box addons' ordering.
-		$lang_slug = $this->get_current_slug();
-
-		if ( $lang_slug === '' ) {
-			return $value;
-		}
-
-		$plugin  = \PerfLocale\Plugin::get_instance();
-		$default = $plugin->has( 'router' ) ? $plugin->get( 'router' )->get_default_language() : null;
-
-		if ( $default && $lang_slug === $default->slug ) {
-			return $value;
-		}
-
-		// Get the field configuration from the Pods object.
-		$field_data = null;
-
-		if ( is_object( $obj ) && method_exists( $obj, 'fields' ) ) {
-			$field_data = $obj->fields( $params->name );
-		}
-
-		// Pods' fields() can return a Field object, an array, null, or
-		// false depending on field state. Only proceed when we have
-		// something usable to avoid downstream method-on-null errors.
-		if ( ! is_object( $field_data ) && ! is_array( $field_data ) ) {
-			return $value;
-		}
-
-		// Get field type - Pods Field objects use get_arg(), arrays use direct access.
-		$field_type = null;
-
-		if ( is_object( $field_data ) && method_exists( $field_data, 'get_arg' ) ) {
-			$field_type = $field_data->get_arg( 'type' );
-		} elseif ( is_array( $field_data ) ) {
-			$field_type = $field_data['type'] ?? null;
-		}
-
-		if ( $field_type !== 'pick' ) {
-			return $value;
-		}
-
-		// Get the pick_object to determine what the field relates to.
-		$pick_object = null;
-
-		if ( is_object( $field_data ) && method_exists( $field_data, 'get_arg' ) ) {
-			$pick_object = $field_data->get_arg( 'pick_object' );
-		} elseif ( is_array( $field_data ) ) {
-			$pick_object = $field_data['pick_object'] ?? null;
-		}
-
-		if ( empty( $pick_object ) ) {
-			return $value;
-		}
-
-		// Determine translation strategy based on pick_object.
-		if ( str_starts_with( $pick_object, 'post_type-' ) || $pick_object === 'media' ) {
-			return $this->translate_post_references( $value, $lang_slug );
-		}
-
-		if ( str_starts_with( $pick_object, 'taxonomy-' ) ) {
-			return $this->translate_term_references( $value, $lang_slug );
-		}
-
-		// user, role, site, network, table, comment - not translatable.
-		return $value;
+	/**
+	 * Map the related items a display read formats.
+	 *
+	 * A display read ($pod->display(), a magic tag, the [pods] shortcode and
+	 * the Pods blocks) formats a relationship field before pods_pods_field
+	 * runs. It formats the rows Pods keeps in the item's row under the field
+	 * name, the arrays output. This filter runs at the start of that read:
+	 * it maps those rows to the current language, after reading the field
+	 * once with the arrays output when Pods has not read it yet (the read the
+	 * display would make). Pods then formats and escapes the mapped rows as
+	 * it does any rows, and translate_field_value() puts the item's own rows
+	 * back at the end of the read. The output type is returned unchanged.
+	 *
+	 * @param mixed $output How Pods outputs the related items.
+	 * @param mixed $row    Current row.
+	 * @param mixed $params Params object passed to field().
+	 * @param mixed $obj    Current Pods object.
+	 * @return mixed
+	 */
+	public function map_display_source( mixed $output, mixed $row, mixed $params, mixed $obj ): mixed {
+		return $this->display()->map_display_source( $output, $row, $params, $obj );
 	}
 
 	/**
@@ -491,290 +439,15 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Resolve a post's current-language sibling, but only when the visitor is
-	 * allowed to see it.
+	 * The front-end field reads, loaded and built on first use.
 	 *
-	 * `pods_pods_field` is filtered on the FRONT END, so a pick field whose
-	 * sibling is still a draft/pending/private translation would otherwise put
-	 * that unpublished post's title on a public page and link to a URL an
-	 * anonymous visitor cannot open. PerfLocale creates translations as drafts,
-	 * so that is the normal state of a half-finished translation, not an edge
-	 * case. Returning null keeps the published source in place - the same rule
-	 * the ACF addon applies to its relationship / post-object fields and the
-	 * WooCommerce addon to cross-sell and upsell IDs.
-	 *
-	 * @param int    $post_id   Source post ID.
-	 * @param string $lang_slug Target language slug.
-	 * @return int|null Sibling post ID, or null when there is none to show.
+	 * @return \PerfLocalePodsDisplay
 	 */
-	private function public_translation_id( int $post_id, string $lang_slug ): ?int {
-		if ( $post_id <= 0 ) {
-			return null;
+	private function display(): \PerfLocalePodsDisplay {
+		if ( ! class_exists( 'PerfLocalePodsDisplay', false ) ) {
+			require_once __DIR__ . '/PerfLocalePodsDisplay.php';
 		}
 
-		$translation = $this->get_manager()->get_translation_id( $post_id, $lang_slug );
-
-		if ( ! $translation || $translation === $post_id ) {
-			return null;
-		}
-
-		if ( function_exists( 'is_post_publicly_viewable' ) ) {
-			return is_post_publicly_viewable( $translation ) ? $translation : null;
-		}
-
-		$status = get_post_status( $translation );
-
-		return ( is_string( $status ) && in_array( $status, get_post_stati( [ 'public' => true ] ), true ) )
-			? $translation
-			: null;
-	}
-
-	/**
-	 * Translate post reference IDs to their current-language equivalents.
-	 *
-	 * Handles arrays of IDs, arrays of associative arrays (output=arrays),
-	 * WP_Post objects, and single IDs. A sibling the visitor may not see is
-	 * skipped - see {@see self::public_translation_id()}.
-	 *
-	 * @param mixed  $value Post reference value(s).
-	 * @param string $lang_slug Target language slug.
-	 * @return mixed
-	 */
-	private function translate_post_references( mixed $value, string $lang_slug ): mixed {
-		// Array of values (most common for pick fields).
-		if ( is_array( $value ) ) {
-			$translated = [];
-
-			foreach ( $value as $key => $item ) {
-				// Array of associative arrays - Pods returns each entry as a row map keyed by ID, post_title, … when its output is set to 'arrays'.
-				if ( is_array( $item ) && isset( $item['ID'] ) ) {
-					$item_id     = (int) $item['ID'];
-					$translation = $this->public_translation_id( $item_id, $lang_slug );
-
-					if ( $translation ) {
-						$translated_post = get_post( $translation, ARRAY_A );
-
-						if ( is_array( $translated_post ) ) {
-							$translated[] = $translated_post;
-							continue;
-						}
-					}
-
-					$translated[] = $item;
-					continue;
-				}
-
-				// WP_Post objects.
-				if ( is_object( $item ) && isset( $item->ID ) ) {
-					$item_id     = (int) $item->ID;
-					$translation = $this->public_translation_id( $item_id, $lang_slug );
-
-					if ( $translation ) {
-						$translated_post = get_post( $translation );
-
-						if ( $translated_post instanceof \WP_Post ) {
-							$translated[] = $translated_post;
-							continue;
-						}
-					}
-
-					$translated[] = $item;
-					continue;
-				}
-
-				// Single ID in array.
-				$item_id      = (int) $item;
-				$translation  = $this->public_translation_id( $item_id, $lang_slug );
-				$translated[] = $translation ?? $item_id;
-			}
-
-			return $translated;
-		}
-
-		// Single WP_Post object.
-		if ( is_object( $value ) && isset( $value->ID ) ) {
-			$item_id     = (int) $value->ID;
-			$translation = $this->public_translation_id( $item_id, $lang_slug );
-
-			if ( $translation ) {
-				$translated_post = get_post( $translation );
-
-				if ( $translated_post instanceof \WP_Post ) {
-					return $translated_post;
-				}
-			}
-
-			return $value;
-		}
-
-		// Single ID.
-		$item_id = (int) $value;
-
-		if ( $item_id <= 0 ) {
-			return $value;
-		}
-
-		$translation = $this->public_translation_id( $item_id, $lang_slug );
-
-		return $translation ?? $value;
-	}
-
-	/**
-	 * Translate term reference IDs to their current-language equivalents.
-	 *
-	 * Handles arrays of IDs, arrays of associative arrays, WP_Term objects,
-	 * and single IDs.
-	 *
-	 * @param mixed  $value Term reference value(s).
-	 * @param string $lang_slug Target language slug.
-	 * @return mixed
-	 */
-	private function translate_term_references( mixed $value, string $lang_slug ): mixed {
-		// Array of values.
-		if ( is_array( $value ) ) {
-			$translated = [];
-
-			foreach ( $value as $item ) {
-				// Array of associative arrays: [{term_id => 1, name => '...', ...}]
-				if ( is_array( $item ) && isset( $item['term_id'] ) ) {
-					$term_id = (int) $item['term_id'];
-					$new_id  = $term_id > 0 ? $this->get_translated_term_id( $term_id, $lang_slug ) : $term_id;
-
-					if ( $new_id !== $term_id ) {
-						$translated_term = get_term( $new_id, '', ARRAY_A );
-
-						if ( is_array( $translated_term ) ) {
-							$translated[] = $translated_term;
-							continue;
-						}
-					}
-
-					$translated[] = $item;
-					continue;
-				}
-
-				// WP_Term objects.
-				if ( is_object( $item ) && isset( $item->term_id ) ) {
-					$term_id = (int) $item->term_id;
-					$new_id  = $term_id > 0 ? $this->get_translated_term_id( $term_id, $lang_slug ) : $term_id;
-
-					if ( $new_id !== $term_id ) {
-						$translated_term = get_term( $new_id );
-
-						if ( $translated_term instanceof \WP_Term ) {
-							$translated[] = $translated_term;
-							continue;
-						}
-					}
-
-					$translated[] = $item;
-					continue;
-				}
-
-				// Single ID in array.
-				$term_id      = (int) $item;
-				$new_id       = $term_id > 0 ? $this->get_translated_term_id( $term_id, $lang_slug ) : $term_id;
-				$translated[] = $new_id;
-			}
-
-			return $translated;
-		}
-
-		// Single WP_Term object.
-		if ( is_object( $value ) && isset( $value->term_id ) ) {
-			$term_id = (int) $value->term_id;
-			$new_id  = $term_id > 0 ? $this->get_translated_term_id( $term_id, $lang_slug ) : $term_id;
-
-			if ( $new_id !== $term_id ) {
-				$translated_term = get_term( $new_id );
-
-				if ( $translated_term instanceof \WP_Term ) {
-					return $translated_term;
-				}
-			}
-
-			return $value;
-		}
-
-		// Single ID.
-		$term_id = (int) $value;
-
-		if ( $term_id <= 0 ) {
-			return $value;
-		}
-
-		return $this->get_translated_term_id( $term_id, $lang_slug );
-	}
-
-	/**
-	 * Get the translated term ID for a given term.
-	 *
-	 * @param int    $term_id Original term ID.
-	 * @param string $lang_slug Target language slug.
-	 * @return int Translated term ID, or original if no translation found.
-	 */
-	private function get_translated_term_id( int $term_id, string $lang_slug ): int {
-		$repo  = $this->get_repo();
-		$links = $repo->get_translations( $term_id, \PerfLocale\Enum\ObjectType::Term );
-
-		foreach ( $links as $link ) {
-			if ( ! empty( $link->language_slug ) && $link->language_slug === $lang_slug && (int) $link->object_id !== $term_id ) {
-				$translated_term = get_term( (int) $link->object_id );
-
-				if ( $translated_term instanceof \WP_Term ) {
-					return (int) $link->object_id;
-				}
-			}
-		}
-
-		return $term_id;
-	}
-
-	/**
-	 * Get the current language slug.
-	 *
-	 * @return string
-	 */
-	private function get_current_slug(): string {
-		$plugin = \PerfLocale\Plugin::get_instance();
-
-		if ( ! $plugin->has( 'router' ) ) {
-			return '';
-		}
-
-		return $plugin->get( 'router' )->get_current_slug();
-	}
-
-	/**
-	 * Get the post translation manager (lazy).
-	 *
-	 * @return \PerfLocale\Translation\PostTranslationManager
-	 */
-	private function get_manager(): \PerfLocale\Translation\PostTranslationManager {
-		if ( $this->manager === null ) {
-			$plugin        = \PerfLocale\Plugin::get_instance();
-			$this->manager = new \PerfLocale\Translation\PostTranslationManager(
-				$plugin->get( 'cache' ),
-				$plugin->get( 'settings' )
-			);
-		}
-
-		return $this->manager;
-	}
-
-	/**
-	 * Get the translation group repository (lazy).
-	 *
-	 * @return \PerfLocale\Database\Repository\TranslationGroupRepository
-	 */
-	private function get_repo(): \PerfLocale\Database\Repository\TranslationGroupRepository {
-		if ( $this->repo === null ) {
-			$plugin     = \PerfLocale\Plugin::get_instance();
-			$this->repo = new \PerfLocale\Database\Repository\TranslationGroupRepository(
-				$plugin->get( 'cache' )
-			);
-		}
-
-		return $this->repo;
+		return $this->display ??= new \PerfLocalePodsDisplay();
 	}
 }

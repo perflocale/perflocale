@@ -167,7 +167,7 @@ final class StringTranslationRepository {
 				'INSERT INTO %i (string_id, language_id, translation)
 				 VALUES (%d, %d, %s)
 				 ON DUPLICATE KEY UPDATE
-					translation = VALUES(translation)',
+					translation = VALUES(translation)' . Schema::touch_write_time( [ [ 'translation', 'VALUES(translation)', 'text' ] ] ),
 				$this->table(),
 				$string_id,
 				$language_id,
@@ -204,24 +204,25 @@ final class StringTranslationRepository {
 		// %s argument as the empty string, which would satisfy the
 		// `IS NOT NULL` guards (batch map load, counts) with a junk value.
 		// NULL is the column's only "no extra forms" state, so branch the SQL.
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- The replacements arrive as one array (a second binding on SQLite only).
 		if ( $json === null ) {
 			$result = $this->wpdb->query(
 				$this->wpdb->prepare(
-					'UPDATE %i SET extra_forms = NULL WHERE string_id = %d AND language_id = %d',
+					'UPDATE %i SET extra_forms = NULL' . Schema::touch_write_time( [ [ 'extra_forms', 'NULL', 'text_null' ] ] ) . ' WHERE string_id = %d AND language_id = %d',
 					$this->table(),
 					$string_id,
 					$language_id
 				)
 			);
 		} else {
+			// On SQLite the write-time fragment compares with the new value, a
+			// second binding of the same JSON (never NULL here; a stored NULL
+			// compares unequal, so that change moves the write time too).
+			$touch  = Schema::touch_write_time( [ [ 'extra_forms', '%s', 'text' ] ] );
 			$result = $this->wpdb->query(
 				$this->wpdb->prepare(
-					'UPDATE %i SET extra_forms = %s WHERE string_id = %d AND language_id = %d',
-					$this->table(),
-					$json,
-					$string_id,
-					$language_id
+					'UPDATE %i SET extra_forms = %s' . $touch . ' WHERE string_id = %d AND language_id = %d',
+					array_merge( [ $this->table(), $json ], '' === $touch ? [] : [ $json ], [ $string_id, $language_id ] )
 				)
 			);
 		}
@@ -435,16 +436,15 @@ final class StringTranslationRepository {
 			return 0;
 		}
 
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- The replacements arrive as one array (a second binding on SQLite only).
+		$touch  = Schema::touch_write_time( [ [ 'string_id', '%d', 'int' ] ] );
 		$result = $this->wpdb->query(
 			$this->wpdb->prepare(
-				'UPDATE IGNORE %i SET string_id = %d WHERE string_id = %d',
-				$this->table(),
-				$to_id,
-				$from_id
+				'UPDATE IGNORE %i SET string_id = %d' . $touch . ' WHERE string_id = %d',
+				array_merge( [ $this->table(), $to_id ], '' === $touch ? [] : [ $to_id ], [ $from_id ] )
 			)
 		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
 		// A failed UPDATE moved NOTHING - every row is still attached to
 		// $from_id, and the DELETE below is the destination-wins cleanup for
@@ -597,7 +597,7 @@ final class StringTranslationRepository {
 					"INSERT INTO %i (string_id, language_id, translation)
 					 VALUES {$values}
 					 ON DUPLICATE KEY UPDATE
-						translation = VALUES(translation)",
+						translation = VALUES(translation)" . Schema::touch_write_time( [ [ 'translation', 'VALUES(translation)', 'text' ] ] ),
 					$args
 				)
 			);

@@ -37,6 +37,13 @@ final class MenuManager {
 	private readonly CacheManager $cache;
 
 	/**
+	 * Menu Language field data (JSON) for the Menus screen's footer, or null.
+	 *
+	 * @var string|null
+	 */
+	private ?string $menu_lang_json = null;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param LanguageRouter $router Language router.
@@ -72,14 +79,13 @@ final class MenuManager {
 		add_action( 'wp_create_nav_menu', [ $this, 'save_menu_language' ] );
 		add_action( 'load-nav-menus.php', [ $this, 'save_menu_language_on_load' ] );
 
-		// Admin: attach the Menu Language field + language badges behaviour
-		// as inline scripts on the carrier handle registered by Assets.php.
-		// Priority 20 so the carrier handle is registered (by Assets.php at
-		// priority 10) before we attach inline payloads to it. Inline scripts
-		// added at this stage print in the normal admin_print_footer_scripts
-		// cycle - unlike admin_footer-{hook_suffix}, which fires AFTER scripts
-		// are printed and silently drops any wp_add_inline_script calls.
+		// Admin: enqueue the Menu Language field and the language badges
+		// scripts on the Menus screen, and prepare their data.
 		add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_nav_menus_assets' ], 20 );
+
+		// Admin: the Menu Language field's data, printed as a data attribute
+		// at admin_footer, which runs before the footer scripts print.
+		add_action( 'admin_footer', [ $this, 'print_menu_language_data' ] );
 
 		// Admin: filter "Add to Menu" items by menu language (still needs
 		// admin_head to install get_pages + pre_get_posts filters before WP
@@ -88,7 +94,7 @@ final class MenuManager {
 	}
 
 	/**
-	 * Attach Menu Language field + language-badges inline scripts on the
+	 * Enqueue the Menu Language field and language-badges scripts on the
 	 * nav-menus.php admin screen.
 	 *
 	 * @param string $hook Current admin page hook suffix.
@@ -880,32 +886,49 @@ final class MenuManager {
 		// server-built (per-language flags, native names, currently selected
 		// slug) so it has to travel as data; the script file itself is static
 		// and runs the DOM injection.
-		wp_enqueue_script(
-			'perflocale-menu-lang-field',
-			PERFLOCALE_URL . 'assets/js/menu-lang-field.js',
-			[],
-			PERFLOCALE_VERSION,
-			true
-		);
+		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-menu-lang-field', 'menu-lang-field.js' );
+
 		// NOT wp_localize_script(): WP_Scripts::localize() runs every scalar
 		// through html_entity_decode() (wp-includes/class-wp-scripts.php), which
 		// UNDOES the esc_html() applied to the language labels above - and the
 		// consumer assigns these strings to innerHTML. Language names come from
 		// the languages table, so a label containing markup would be re-inflated
 		// into live HTML on the way out. wp_json_encode() performs no entity
-		// decoding, so the escaping survives to the browser intact.
-		wp_add_inline_script(
-			'perflocale-menu-lang-field',
-			'var perflocaleMenuLang = ' . wp_json_encode(
-				[
-					'legendLabel' => __( 'Menu Language', 'perflocale' ),
-					'langOptions' => $lang_options,
-					'linkedHtml'  => $linked_section,
-					'description' => __( 'If no menu is linked for a language, the default menu will be shown.', 'perflocale' ),
-				],
-				JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-			) . ';',
-			'before'
+		// decoding, and the JSON_HEX_* flags turn every < > & ' " into a \u
+		// escape, so esc_attr() in print_menu_language_data() changes nothing
+		// and the browser decodes nothing: JSON.parse() gets this exact JSON,
+		// with the escaping intact.
+		$json = wp_json_encode(
+			[
+				'legendLabel' => __( 'Menu Language', 'perflocale' ),
+				'langOptions' => $lang_options,
+				'linkedHtml'  => $linked_section,
+				'description' => __( 'If no menu is linked for a language, the default menu will be shown.', 'perflocale' ),
+			],
+			JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
 		);
+
+		$this->menu_lang_json = is_string( $json ) ? $json : null;
+	}
+
+	/**
+	 * Print the Menu Language field's data on the Menus screen: a hidden
+	 * element whose data-perflocale-menu-lang attribute holds the JSON that
+	 * menu-lang-field.js reads. Printed once, only after
+	 * inject_menu_language_field() prepared it.
+	 *
+	 * @return void
+	 */
+	public function print_menu_language_data(): void {
+		if ( null === $this->menu_lang_json ) {
+			return;
+		}
+
+		printf(
+			'<div id="perflocale-menu-lang-data" hidden data-perflocale-menu-lang="%s"></div>' . "\n",
+			esc_attr( $this->menu_lang_json )
+		);
+
+		$this->menu_lang_json = null;
 	}
 }

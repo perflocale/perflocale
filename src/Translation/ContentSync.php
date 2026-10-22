@@ -77,10 +77,12 @@ final class ContentSync {
 	private const DEFERRED_CAP = 200;
 
 	/**
-	 * Most compare-and-set attempts of one change or delete of a post's
-	 * stale mark (change_stale_mark(), delete_stale_mark()).
+	 * Most rounds of one change or delete of a post's stale mark
+	 * (change_stale_mark(), delete_stale_mark()). A round is lost only when
+	 * another request changed the mark meanwhile, so reaching it takes that
+	 * many changes of one post's mark during one call.
 	 */
-	private const STALE_MARK_ATTEMPTS = 3;
+	private const STALE_MARK_ROUNDS = 50;
 
 	/**
 	 * Depth of sibling writes ContentSync itself is making. Meta writes seen
@@ -89,6 +91,15 @@ final class ContentSync {
 	 * @var int
 	 */
 	private static int $writing = 0;
+
+	/**
+	 * Depth of meta writes that start no sync (suspend_meta_write_sync()):
+	 * a data import writes the file's values, and each post gets the value
+	 * the file holds for it.
+	 *
+	 * @var int
+	 */
+	private static int $suspended = 0;
 
 	/**
 	 * Posts inside a save right now ("{blog_id}:{post_id}" => true): from
@@ -1573,6 +1584,11 @@ final class ContentSync {
 	 * @return string|null
 	 */
 	private function configured_field_for_meta_key( string $meta_key ): ?string {
+		// The plugin's own keys are never synced, whatever lists them.
+		if ( SyncMeta::is_never_synced( $meta_key ) ) {
+			return null;
+		}
+
 		$user_fields = (array) $this->settings->get( 'sync_fields', [] );
 
 		if ( $meta_key === '_thumbnail_id' ) {
@@ -1584,6 +1600,27 @@ final class ContentSync {
 		}
 
 		return in_array( $meta_key, $user_fields, true ) ? $meta_key : null;
+	}
+
+	/**
+	 * Meta writes made until resume_meta_write_sync() start no sync: each
+	 * post keeps the value written to it, and no sibling is written or
+	 * marked stale. Calls nest. Used by the data import, whose own writes
+	 * carry the file's values (DataImporter).
+	 *
+	 * @return void
+	 */
+	public static function suspend_meta_write_sync(): void {
+		++self::$suspended;
+	}
+
+	/**
+	 * End one suspend_meta_write_sync().
+	 *
+	 * @return void
+	 */
+	public static function resume_meta_write_sync(): void {
+		self::$suspended = max( 0, self::$suspended - 1 );
 	}
 
 	/**
@@ -1609,7 +1646,7 @@ final class ContentSync {
 			self::forget_stale_mark( is_numeric( $object_id ) ? (int) $object_id : 0 );
 		}
 
-		if ( self::$writing > 0 || ! is_string( $meta_key ) || ! is_numeric( $object_id ) || (int) $object_id <= 0 ) {
+		if ( self::$writing > 0 || self::$suspended > 0 || ! is_string( $meta_key ) || ! is_numeric( $object_id ) || (int) $object_id <= 0 ) {
 			return;
 		}
 
@@ -1855,19 +1892,22 @@ final class ContentSync {
 	 * still holds exactly the value read. So a change another request made
 	 * in between, such as a Sync Field it kept as pending
 	 * (keep_pending_changes()), is not overwritten: the row is read again and
-	 * $transform applied to it again, a bounded number of times. Nothing is
-	 * ever inserted: once the mark's row is gone (the mark was cleared),
-	 * the post stays unmarked. The post's meta cache is dropped, and after a
-	 * write the posts last_changed stamp is renewed, as update_post_meta()
-	 * does.
+	 * $transform applied to it again, for as long as each missed write is
+	 * explained by a row that changed (up to STALE_MARK_ROUNDS). A row read
+	 * again unchanged after a missed write is one the compare-and-set cannot
+	 * match (its stored bytes differ from the value read), so the change
+	 * stops there. Nothing is ever inserted: once the mark's row is gone (the
+	 * mark was cleared), the post stays unmarked. The post's meta cache is
+	 * dropped, and after a write the posts last_changed stamp is renewed, as
+	 * update_post_meta() does.
 	 *
 	 * @param int      $post_id   Post ID.
 	 * @param callable $transform Given the mark as read, returns the mark after the change, or null
 	 *                            when nothing is to change.
 	 * @phpstan-param callable(array{status: string, at: string, pending: list<string>}): (array{status: string, at: string, pending: list<string>}|null) $transform
 	 * @return bool True once the row holds the changed mark, or nothing had
-	 *              to change; false when the post has no mark or after the
-	 *              bounded attempts.
+	 *              to change; false when the post has no mark, the row cannot
+	 *              be matched, the write failed or the rounds ran out.
 	 */
 	private static function change_stale_mark( int $post_id, callable $transform ): bool {
 		global $wpdb;
@@ -1877,9 +1917,10 @@ final class ContentSync {
 		 * @var \wpdb $wpdb
 		 */
 
-		$done = false;
+		$done   = false;
+		$missed = null;
 
-		for ( $attempt = 0; $attempt < self::STALE_MARK_ATTEMPTS; $attempt++ ) {
+		for ( $round = 0; $round < self::STALE_MARK_ROUNDS; $round++ ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The mark's row itself, past the meta cache, for the compare-and-set below.
 			$row = $wpdb->get_row( $wpdb->prepare( 'SELECT meta_id, meta_value FROM %i WHERE post_id = %d AND meta_key = %s ORDER BY meta_id LIMIT 1', $wpdb->postmeta, $post_id, self::SYNC_STALE_META ) );
 
@@ -1889,7 +1930,14 @@ final class ContentSync {
 
 			$meta_id = (int) $row->meta_id;
 			$read    = $row->meta_value;
-			$after   = $transform( self::parse_stale_mark( maybe_unserialize( $read ) ) );
+
+			// The last write missed a row that did not change since: the
+			// compare-and-set cannot match it.
+			if ( [ $meta_id, $read ] === $missed ) {
+				break;
+			}
+
+			$after = $transform( self::parse_stale_mark( maybe_unserialize( $read ) ) );
 
 			if ( null === $after ) {
 				$done = true;
@@ -1913,13 +1961,19 @@ final class ContentSync {
 			}
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set write of the mark; the post's meta cache is dropped below.
-			$affected = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET meta_value = %s WHERE meta_id = %d AND meta_value = CAST(%s AS BINARY)', $wpdb->postmeta, $value, $meta_id, $read ) ?? '' );
+			$affected = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET meta_value = %s WHERE meta_id = %d AND CAST(meta_value AS BINARY) = CAST(%s AS BINARY)', $wpdb->postmeta, $value, $meta_id, $read ) ?? '' );
 
 			if ( 1 === $affected ) {
 				$done = true;
 				wp_cache_set_posts_last_changed();
 				break;
 			}
+
+			if ( 0 !== $affected ) {
+				break;
+			}
+
+			$missed = [ $meta_id, $read ];
 		}
 
 		wp_cache_delete( $post_id, 'post_meta' );
@@ -2112,10 +2166,14 @@ final class ContentSync {
 	 * (its meta_id) still holds exactly the value read. A row another request
 	 * changed in between, such as one a save refused the post's lock added a
 	 * pending Sync Field to (keep_pending_changes()), is read again and its
-	 * pending fields are returned too, a bounded number of times; after that
-	 * the rows are deleted by meta_id alone. The post's meta cache is
-	 * dropped, and after a delete the posts last_changed stamp is renewed, as
-	 * delete_post_meta() does.
+	 * pending fields are returned too, for as long as each missed delete is
+	 * explained by a row that changed (up to STALE_MARK_ROUNDS). A row read
+	 * again unchanged after a missed delete is one the compare-and-set cannot
+	 * match (its stored bytes differ from the value read): it is deleted by
+	 * meta_id, holding what was read. A row still changing when the rounds
+	 * run out is left with the mark, for the next clearing save. The post's
+	 * meta cache is dropped, and after a delete the posts last_changed stamp
+	 * is renewed, as delete_post_meta() does.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return list<string>|null The Sync Fields the deleted rows kept as
@@ -2132,36 +2190,41 @@ final class ContentSync {
 
 		$pending = [];
 		$deleted = false;
+		$missed  = [];
 
-		for ( $attempt = 0; $attempt <= self::STALE_MARK_ATTEMPTS; $attempt++ ) {
+		for ( $round = 0; $round < self::STALE_MARK_ROUNDS; $round++ ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The mark's rows themselves, past the meta cache, for the compare-and-set below.
-			$rows   = $wpdb->get_results( $wpdb->prepare( 'SELECT meta_id, meta_value FROM %i WHERE post_id = %d AND meta_key = %s ORDER BY meta_id', $wpdb->postmeta, $post_id, self::SYNC_STALE_META ) );
-			$missed = false;
+			$rows      = $wpdb->get_results( $wpdb->prepare( 'SELECT meta_id, meta_value FROM %i WHERE post_id = %d AND meta_key = %s ORDER BY meta_id', $wpdb->postmeta, $post_id, self::SYNC_STALE_META ) );
+			$unchanged = $missed;
+			$missed    = [];
 
 			foreach ( is_array( $rows ) ? $rows : [] as $row ) {
 				if ( ! isset( $row->meta_id, $row->meta_value ) || ! is_numeric( $row->meta_id ) || ! is_string( $row->meta_value ) ) {
 					continue;
 				}
 
+				$meta_id = (int) $row->meta_id;
 				$read    = $row->meta_value;
 				$pending = array_values( array_unique( array_merge( $pending, self::parse_stale_mark( maybe_unserialize( $read ) )['pending'] ) ) );
 
-				if ( $attempt < self::STALE_MARK_ATTEMPTS ) {
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set delete of the mark; the post's meta cache is dropped below.
-					$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_id = %d AND meta_value = CAST(%s AS BINARY)', $wpdb->postmeta, (int) $row->meta_id, $read ) ?? '' );
+				if ( ( $unchanged[ $meta_id ] ?? null ) === $read ) {
+					// The last delete missed this row and it did not change
+					// since: the compare-and-set cannot match it.
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The row by meta_id, holding the value read; the post's meta cache is dropped below.
+					$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_id = %d', $wpdb->postmeta, $meta_id ) ?? '' );
 				} else {
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Last attempt: the row by meta_id; the post's meta cache is dropped below.
-					$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_id = %d', $wpdb->postmeta, (int) $row->meta_id ) ?? '' );
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set delete of the mark; the post's meta cache is dropped below.
+					$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE meta_id = %d AND CAST(meta_value AS BINARY) = CAST(%s AS BINARY)', $wpdb->postmeta, $meta_id, $read ) ?? '' );
 				}
 
 				if ( 1 === $affected ) {
 					$deleted = true;
 				} elseif ( 0 === $affected ) {
-					$missed = true;
+					$missed[ $meta_id ] = $read;
 				}
 			}
 
-			if ( ! $missed ) {
+			if ( [] === $missed ) {
 				break;
 			}
 		}
@@ -2203,10 +2266,13 @@ final class ContentSync {
 		// A Sync Field a save refused the post's lock kept with the mark after
 		// this save read it (keep_pending_changes()) is read from the row it
 		// deletes and counts as changed by this save too (sync_cleared()).
+		// That save wrote the post after this one loaded it, so the post's
+		// caches are dropped and its values are copied as the row holds them.
 		$pending = array_values( array_unique( array_merge( $mark['pending'], self::clear_stale( $post_id, $mark ) ) ) );
 
 		if ( $pending !== $mark['pending'] ) {
 			self::$cleared_marks[ $key ]['pending'] = $pending;
+			clean_post_cache( $post_id );
 		}
 
 		if ( ! isset( self::$settled_content[ $key ] ) ) {
@@ -3397,6 +3463,16 @@ final class ContentSync {
 	 *              value it does not hold; false otherwise.
 	 */
 	private function sync_fields_to_post( int $source_id, int $target_id, array $fields, string $target_lang_slug, bool $source_is_default_lang, array $seed_only = [], bool $dry_run = false ): bool {
+		// The plugin's own meta keys are never mirrored or seeded, whatever
+		// listed them: a stored Sync Fields value, an import, WP-CLI or the
+		// perflocale/sync_fields filters (SyncMeta::is_never_synced()). Every
+		// sibling write passes here, so this one check covers them all.
+		$internal  = static function ( mixed $field ): bool {
+			return ! ( is_string( $field ) && SyncMeta::is_never_synced( $field ) );
+		};
+		$fields    = array_values( array_filter( $fields, $internal ) );
+		$seed_only = array_values( array_filter( $seed_only, $internal ) );
+
 		// Post fields that can be batched into a single wp_update_post() call.
 		$post_field_map = self::POST_FIELD_MAP;
 

@@ -55,6 +55,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class PerfLocaleCommand {
 
 	/**
+	 * Rows a diagnostic command's table holds at once while printing.
+	 */
+	private const PRINT_PAGE = 500;
+
+	/**
 	 * @var Plugin
 	 */
 	private readonly Plugin $plugin;
@@ -546,6 +551,32 @@ final class PerfLocaleCommand {
 		// process, just without the graceful summary.
 		$interrupted = false;
 
+		// A translation written for a language deleted or deactivated while
+		// the command runs is removed again and counted failed; the checkpoint
+		// before each post that is translated reads the languages (and
+		// everything cached) as they are now when another process changed
+		// them. The guard is settled every SETTLE_EVERY posts and at the end;
+		// each removal is reported as it happens.
+		$guard       = new \PerfLocale\MachineTranslation\TargetLanguageGuard();
+		$lang_repo   = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
+		$target_id   = $lang_repo instanceof \PerfLocale\Database\Repository\LanguageRepository ? \PerfLocale\MachineTranslation\TargetLanguageGuard::id_of( $lang_repo->find_by_slug( $target_lang ) ) : 0;
+		$target_gone = false;
+		$seen        = 0;
+		$report      = static function ( string $line ): void {
+			\WP_CLI::warning( $line );
+		};
+		$guard_count = static function () use ( $guard, &$translated, &$failed, $report ): void {
+			foreach ( array_keys( $guard->settle() ) as $removed_id ) {
+				--$translated;
+				++$failed;
+				$report( "Translation {$removed_id}: " . \PerfLocale\MachineTranslation\TargetLanguageGuard::reason() );
+			}
+		};
+		$gone        = static function ( int $pid ) use ( &$failed, $report ): void {
+			++$failed;
+			$report( "Post {$pid}: " . \PerfLocale\MachineTranslation\TargetLanguageGuard::gone_reason() );
+		};
+
 		if ( function_exists( 'pcntl_async_signals' ) && function_exists( 'pcntl_signal' ) ) {
 			pcntl_async_signals( true );
 			pcntl_signal(
@@ -561,13 +592,46 @@ final class PerfLocaleCommand {
 				break;
 			}
 
-			$skip = $skip_existing && $manager->get_translation_id( $pid, $target_lang ) !== null;
+			if ( $seen > 0 && 0 === $seen % \PerfLocale\MachineTranslation\TargetLanguageGuard::SETTLE_EVERY ) {
+				$guard_count();
+			}
+
+			++$seen;
+
+			if ( $target_gone ) {
+				$gone( $pid );
+				continue;
+			}
+
+			// Checked before the checkpoint below, so a post that is skipped
+			// costs no query; by the language's id, which a change of its code
+			// leaves as it is.
+			$skip = $skip_existing && ( $target_id > 0 ? $manager->has_translation_in( $pid, $target_id ) : $manager->get_translation_id( $pid, $target_lang ) !== null );
 
 			// A password-protected post is sent when the
 			// perflocale/mt/send_password_protected filter allows it.
 			if ( ! $skip ) {
 				$source = get_post( $pid );
 				$skip   = $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, $trigger );
+			}
+
+			// Before every post that is translated.
+			if ( ! $skip && $target_id > 0 && $guard->checkpoint() ) {
+				$guard_count();
+
+				$fresh = $guard->live_target( $target_id );
+
+				if ( null === $fresh ) {
+					$target_gone = true;
+					$gone( $pid );
+					continue;
+				}
+
+				$target_lang = \PerfLocale\MachineTranslation\TargetLanguageGuard::slug_of( $fresh );
+
+				// The language may have a new code: look the translation up
+				// under it.
+				$skip = $skip_existing && $manager->get_translation_id( $pid, $target_lang ) !== null;
 			}
 
 			if ( $skip ) {
@@ -577,8 +641,15 @@ final class PerfLocaleCommand {
 			}
 
 			try {
-				$result = $service->translate_post( $pid, $target_lang, $provider, false, $include_meta );
+				$inserted = false;
+				$result   = $service->translate_post( $pid, $target_lang, $provider, false, $include_meta, $inserted );
 				++$translated;
+
+				// Only a translation this run inserted: one it updated
+				// existed before the run and is never removed.
+				if ( $inserted && $target_id > 0 && isset( $result['post_id'] ) && is_numeric( $result['post_id'] ) ) {
+					$guard->written( (int) $result['post_id'], $target_id );
+				}
 
 				foreach ( (array) ( $result['warnings'] ?? [] ) as $warning ) {
 					if ( is_string( $warning ) ) {
@@ -593,6 +664,7 @@ final class PerfLocaleCommand {
 			$progress->tick();
 		}
 
+		$guard_count();
 		$progress->finish();
 
 		// CI scripts (and wp.org's own automated tests) rely on the exit
@@ -1167,7 +1239,9 @@ final class PerfLocaleCommand {
 	 * : Import mode: merge (default) or replace. Merge adds the file's rows and
 	 *   leaves this site's settings, add-on settings, add-on list and roles as
 	 *   they are. Replace clears this site's rows for every section the file
-	 *   declares, then loads the file and applies its configuration.
+	 *   declares, then loads the file and applies its configuration; the
+	 *   site's own domains, provider addresses, uninstall choice and paused
+	 *   queue are kept and named in a warning when the file differs.
 	 * ---
 	 * default: merge
 	 * options:
@@ -1186,17 +1260,36 @@ final class PerfLocaleCommand {
 	 *   domain migration), or for a backup this site itself wrote under an
 	 *   older version, which could record a language-specific address.
 	 *   Addresses compare as host, port and path with the scheme ignored. A
-	 *   file that records no address at all is not checked; one whose recorded
-	 *   address cannot be read counts as a mismatch. With `--mode=replace` a
+	 *   file written by PerfLocale 1.0.7.3 or later that records no address,
+	 *   or whose rows that name posts, terms or orders carry no fingerprints,
+	 *   needs this flag too; an older file that records no address is not
+	 *   checked. One whose recorded address cannot be read counts as a
+	 *   mismatch. With `--mode=replace` a
 	 *   foreign bundle is refused for the sections it DECLARES, carrying rows
 	 *   for them or not, because replace deletes this site's rows for those
 	 *   sections first. Same meaning as `network-import --force`.
+	 *
+	 * [--addon-data=<choices>]
+	 * : The add-on data to import, as on the import screen: a comma-separated
+	 *   list of `addon_data` (the "Add-on data" checkbox) and the add-ons' own
+	 *   checkboxes by key (`<owner>/<group>`, as the file's `addon_groups`
+	 *   names them), or `none`. Default: all the add-on data the file carries.
+	 *   Add-on data whose add-on is not active on this site is skipped and
+	 *   named in a warning.
+	 *
+	 * [--batch-size=<rows>]
+	 * : Rows the importer reads and checks per piece, from 50 to 5000, for
+	 *   this run, in place of the perflocale/import/batch_size filter
+	 *   (default 500). Larger pieces need fewer look-up queries; smaller ones
+	 *   keep peak memory lower.
 	 *
 	 * ## EXAMPLES
 	 *
 	 * wp perflocale import /tmp/perflocale-backup.json
 	 * wp perflocale import /tmp/backup.json --mode=replace --yes
 	 * wp perflocale import /tmp/staging.json --force
+	 * wp perflocale import /tmp/backup.json --addon-data=ext:acme/acme-settings
+	 * wp perflocale import /tmp/backup.json --batch-size=2000
 	 *
 	 * @subcommand import
 	 * @param array<int, string>    $args Positional args.
@@ -1217,8 +1310,10 @@ final class PerfLocaleCommand {
 
 		$replace = ( $mode === 'replace' );
 
+		self::apply_batch_size( $assoc_args );
+
 		if ( $replace ) {
-			\WP_CLI::confirm( 'Replace mode will DELETE all existing PerfLocale data. Continue?', $assoc_args );
+			\WP_CLI::confirm( 'Replace mode deletes this site\'s PerfLocale rows for every section the file declares, then loads the file. Continue?', $assoc_args );
 		}
 
 		\WP_CLI::log( "Importing from {$file} (mode: {$mode})..." );
@@ -1231,14 +1326,18 @@ final class PerfLocaleCommand {
 		// than a PHP fatal. Errors and logic exceptions stay uncaught, with
 		// their file and line.
 		try {
-			$result = $importer->import(
+			$addon_choices = self::addon_data_choices( $assoc_args );
+			$result        = $importer->import(
 				$file,
 				$replace,
 				false,
 				// Shell access is the trust level here, so the flag is the whole
 				// confirmation: the same "this site is a copy, the IDs match"
 				// statement the admin form's checkbox makes.
-				[ 'allow_foreign_ids' => ! empty( $assoc_args['force'] ) ]
+				[
+					'allow_foreign_ids' => ! empty( $assoc_args['force'] ),
+					'addon_choices'     => $addon_choices,
+				]
 			);
 		} catch ( \RuntimeException $e ) {
 			\WP_CLI::error( 'Import failed: ' . $e->getMessage() );
@@ -1249,6 +1348,17 @@ final class PerfLocaleCommand {
 		// or role grants to change needs to see that merge left them alone.
 		if ( ! empty( $result['not_applied'] ) ) {
 			\WP_CLI::warning( $this->merge_not_applied_message() );
+		}
+
+		// WP-CLI may change a network-supplied provider address, so this is
+		// set only when a filter or a later rule refuses one; named if so.
+		if ( ! empty( $result['address_notice'] ) ) {
+			\WP_CLI::warning( $result['address_notice'] );
+		}
+
+		// What the import left out, kept or changed on purpose.
+		foreach ( (array) ( $result['notes'] ?? [] ) as $note ) {
+			\WP_CLI::warning( (string) $note );
 		}
 
 		if ( ! empty( $result['errors'] ) ) {
@@ -1279,6 +1389,70 @@ final class PerfLocaleCommand {
 				$result['skipped'] ?? 0
 			)
 		);
+	}
+
+	/**
+	 * `--batch-size=<rows>` of `import` and `network-import`: the rows the
+	 * importer reads and checks per piece for the rest of this command, in
+	 * place of the perflocale/import/batch_size filter. Without the flag
+	 * nothing changes.
+	 *
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return void Ends the command with an error on a value that is not a
+	 *              whole number from 50 to 5000.
+	 */
+	private static function apply_batch_size( array $assoc_args ): void {
+		if ( ! isset( $assoc_args['batch-size'] ) ) {
+			return;
+		}
+
+		$raw = (string) $assoc_args['batch-size'];
+		$min = \PerfLocale\Admin\DataImporter::BATCH_SIZE_MIN;
+		$max = \PerfLocale\Admin\DataImporter::BATCH_SIZE_MAX;
+
+		if ( 1 !== preg_match( '/^[0-9]{1,9}$/', $raw ) || (int) $raw < $min || (int) $raw > $max ) {
+			\WP_CLI::error( "Invalid --batch-size: use a whole number from {$min} to {$max}." );
+		}
+
+		$size = (int) $raw;
+
+		add_filter( 'perflocale/import/batch_size', static fn(): int => $size, PHP_INT_MAX );
+	}
+
+	/**
+	 * The `--addon-data` choices of `import`: null without the flag (all the
+	 * add-on data the file carries), [] for `none`.
+	 *
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return list<string>|null
+	 * @throws \RuntimeException On a value that is not `addon_data`, a group key or `none`.
+	 */
+	private static function addon_data_choices( array $assoc_args ): ?array {
+		if ( ! isset( $assoc_args['addon-data'] ) ) {
+			return null;
+		}
+
+		$choices = [];
+
+		foreach ( explode( ',', (string) $assoc_args['addon-data'] ) as $choice ) {
+			$choice = trim( $choice );
+
+			if ( '' !== $choice ) {
+				$choices[] = $choice;
+			}
+		}
+
+		if ( [ 'none' ] === $choices ) {
+			return [];
+		}
+
+		foreach ( $choices as $choice ) {
+			if ( ! \PerfLocale\Admin\DataExporter::is_addon_choice( $choice ) ) {
+				throw new \RuntimeException( esc_html( "Unknown --addon-data value: {$choice}. Use addon_data, an add-on group key (owner/group) or none." ) );
+			}
+		}
+
+		return $choices;
 	}
 
 	/**
@@ -1316,6 +1490,7 @@ final class PerfLocaleCommand {
 	 * @param array<int,string>    $args       Positional args.
 	 * @param array<string,string> $assoc_args Named args.
 	 * @return void
+	 * @throws \Throwable A failure while writing the file, after the partial file is deleted.
 	 */
 	public function network_export( array $args, array $assoc_args ): void {
 		if ( ! is_multisite() ) {
@@ -1339,11 +1514,7 @@ final class PerfLocaleCommand {
 		$site_ids       = get_sites(
 			[
 				'fields'     => 'ids',
-				// Every site, in one go. The ID list is ints and is dwarfed by
-				// the `$envelope` this command builds below, which holds every
-				// site's decoded export in memory at once - chunking the ID
-				// query would not bound the command's footprint, so it would
-				// buy nothing here.
+				// Every site, in one go: the ID list is ints, one per site.
 				'number'     => 0,
 				// The network WP-CLI is pointed at (via --url), not every
 				// network on the installation: WP_Site_Query defaults
@@ -1361,91 +1532,132 @@ final class PerfLocaleCommand {
 		);
 		$exported_count = 0;
 
-		// Build the envelope as one document. We don't use DataExporter's
-		// streaming API here because we need the per-site sections nested,
-		// not concatenated; the streaming approach gains us nothing on a
-		// network-wide JSON that's the sum of per-site dumps anyway.
-		$envelope = [
+		// The envelope is written as a stream: each site's export file is
+		// copied into it byte for byte, never decoded, so memory stays at one
+		// read buffer however large the network is, and no value is ever
+		// re-encoded. Written next to the target and renamed over it, so a
+		// crash or a full disk never leaves a truncated file in place of the
+		// previous one.
+		$out_tmp = $file . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Streaming write; WP_Filesystem has no streaming API.
+		$out = fopen( $out_tmp, 'xb' );
+
+		if ( ! $out ) {
+			\WP_CLI::error( "Failed to write to: {$file}" );
+			return;
+		}
+
+		$ok   = true;
+		$head = [
 			'perflocale_export' => true,
 			'network'           => true,
 			'format_version'    => \PerfLocale\Admin\DataExporter::FORMAT_VERSION,
 			'version'           => PERFLOCALE_VERSION,
 			'exported_at'       => gmdate( 'c' ),
 			'network_url'       => network_home_url(),
-			'sites'             => [],
 		];
 
-		foreach ( $site_ids as $site_id ) {
-			$site_id = (int) $site_id;
-			switch_to_blog( $site_id );
-
-			try {
-				if ( ! $include_inactive && ! is_plugin_active( $plugin_basename )
-					&& ! is_plugin_active_for_network( $plugin_basename ) ) {
-					\WP_CLI::log( "Skipping site {$site_id}: PerfLocale not active." );
-					continue;
-				}
-
-				// Stream per-site export to a temp file, then read it back
-				// as JSON to nest under sites[]. This keeps the existing
-				// DataExporter contract (single-site only) untouched.
-				$tmp      = wp_tempnam( "pl-net-{$site_id}-" );
-				$exporter = new \PerfLocale\Admin\DataExporter();
-				$bytes    = $exporter->write_to_file( $tmp, [] );
-
-				if ( $bytes === false || $bytes <= 0 ) {
-					\WP_CLI::warning( "Failed to export site {$site_id}; skipping." );
-					wp_delete_file( $tmp );
-					continue;
-				}
-
-				$fs       = \PerfLocale\Helper::filesystem();
-				$contents = $fs ? $fs->get_contents( $tmp ) : false;
-				wp_delete_file( $tmp );
-
-				if ( $contents === false ) {
-					\WP_CLI::warning( "Failed to read site {$site_id} export; skipping." );
-					continue;
-				}
-
-				$decoded = json_decode( (string) $contents, true );
-
-				if ( ! is_array( $decoded ) ) {
-					\WP_CLI::warning( "Site {$site_id} export decoded to non-array; skipping." );
-					continue;
-				}
-
-				// Written from the same producer as the per-site envelope's
-				// own `site_url`, which is the value network-import actually
-				// reads back (it reaches for `$slice['export']['site_url']`).
-				// Nothing reads this outer copy; it is here so an operator
-				// reading the network file sees each slice's origin without
-				// unwrapping it, and so the two can never disagree.
-				$envelope['sites'][ (string) $site_id ] = [
-					'site_url' => \PerfLocale\Admin\DataExporter::site_address(),
-					'export'   => $decoded,
-				];
-				++$exported_count;
-			} finally {
-				restore_current_blog();
+		$write = static function ( string $bytes ) use ( $out, &$ok ): void {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming write.
+			if ( $ok && strlen( $bytes ) !== fwrite( $out, $bytes ) ) {
+				$ok = false;
 			}
+		};
+
+		$head_json = wp_json_encode( $head );
+		$write( substr( (string) $head_json, 0, -1 ) . ",\n\"sites\": {" );
+
+		$first = true;
+
+		try {
+			foreach ( $site_ids as $site_id ) {
+				$site_id = (int) $site_id;
+				switch_to_blog( $site_id );
+
+				try {
+					if ( ! $include_inactive && ! is_plugin_active( $plugin_basename )
+						&& ! is_plugin_active_for_network( $plugin_basename ) ) {
+						\WP_CLI::log( "Skipping site {$site_id}: PerfLocale not active." );
+						continue;
+					}
+
+					// Stream the per-site export to a temp file (the single-site
+					// exporter's own checks: complete, lossless, closing brace),
+					// then copy it into the envelope under sites[].
+					$tmp      = wp_tempnam( "pl-net-{$site_id}-" );
+					$exporter = new \PerfLocale\Admin\DataExporter();
+					$bytes    = $exporter->write_to_file( $tmp, [] );
+
+					if ( $bytes === false || $bytes <= 0 ) {
+						\WP_CLI::warning( "Failed to export site {$site_id}; skipping." );
+						wp_delete_file( $tmp );
+						continue;
+					}
+
+					// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Streaming read of the file written above.
+					$in = fopen( $tmp, 'rb' );
+
+					if ( ! $in ) {
+						wp_delete_file( $tmp );
+						\WP_CLI::warning( "Failed to read site {$site_id} export; skipping." );
+						continue;
+					}
+
+					// Written from the same producer as the per-site envelope's
+					// own `site_url`, which is the value network-import actually
+					// reads back (it reaches for `$slice['export']['site_url']`).
+					// Nothing reads this outer copy; it is here so an operator
+					// reading the network file sees each slice's origin without
+					// unwrapping it, and so the two can never disagree.
+					$write( ( $first ? "\n" : ",\n" ) . wp_json_encode( (string) $site_id ) . ': {"site_url": ' . wp_json_encode( \PerfLocale\Admin\DataExporter::site_address() ) . ', "export": ' );
+
+					while ( $ok && ! feof( $in ) ) {
+						// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- Streaming copy.
+						$chunk = fread( $in, 1048576 );
+
+						if ( false === $chunk ) {
+							$ok = false;
+							break;
+						}
+
+						$write( $chunk );
+					}
+
+					// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Paired with the fopen above.
+					fclose( $in );
+					wp_delete_file( $tmp );
+
+					$write( '}' );
+					$first = false;
+					++$exported_count;
+				} finally {
+					restore_current_blog();
+				}
+			}
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Paired with the fopen above.
+			fclose( $out );
+			wp_delete_file( $out_tmp );
+
+			throw $e;
 		}
 
-		$json = wp_json_encode( $envelope, JSON_PRETTY_PRINT );
+		$write( "\n}}\n" );
 
-		if ( $json === false ) {
-			\WP_CLI::error( 'Failed to encode network envelope.' );
-		}
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fflush -- Streaming write.
+		$ok = $ok && fflush( $out );
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Paired with the fopen above.
+		$ok = fclose( $out ) && $ok;
 
-		$fs = \PerfLocale\Helper::filesystem();
-
-		if ( ! $fs || ! $fs->put_contents( $file, $json, FS_CHMOD_FILE ) ) {
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.rename_rename -- Atomic publish of the file written above.
+		if ( ! $ok || ! rename( $out_tmp, $file ) ) {
+			wp_delete_file( $out_tmp );
 			\WP_CLI::error( "Failed to write to: {$file}" );
+			return;
 		}
 
-		// WP_Filesystem doesn't return the byte count from put_contents, so
-		// stat the freshly-written file to report size.
-		$bytes = (int) $fs->size( $file );
+		$bytes = (int) filesize( $file );
 		$kb    = round( $bytes / 1024, 1 );
 		\WP_CLI::success( "Network export: {$exported_count} site(s) → {$file} ({$kb} KB)." );
 	}
@@ -1473,6 +1685,9 @@ final class PerfLocaleCommand {
 	 *   - replace
 	 * ---
 	 *
+	 * [--yes]
+	 * : Skip the confirmation prompt shown in replace mode.
+	 *
 	 * [--site=<id>]
 	 * : Restore only one source site_id (e.g. when migrating one site to a
 	 *   smaller network). The CURRENT blog receives the data.
@@ -1487,6 +1702,12 @@ final class PerfLocaleCommand {
 	 *   port do not. The target is the blog's `home` option. A file written by
 	 *   an older version from a front-end request may have recorded the address
 	 *   of whichever language was active then, and needs this flag.
+	 *
+	 * [--batch-size=<rows>]
+	 * : Rows the importer reads and checks per piece, from 50 to 5000, for
+	 *   this run, in place of the perflocale/import/batch_size filter
+	 *   (default 500). Larger pieces need fewer look-up queries; smaller ones
+	 *   keep peak memory lower.
 	 *
 	 * ## EXAMPLES
 	 *
@@ -1510,27 +1731,57 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( 'File not readable. Usage: wp perflocale network-import <file> [--mode=replace] [--site=<id>]' );
 		}
 
-		$fs       = \PerfLocale\Helper::filesystem();
-		$contents = $fs ? $fs->get_contents( $file ) : false;
+		self::apply_batch_size( $assoc_args );
 
-		if ( $contents === false ) {
+		// The file is read in pieces: its structure is indexed once, and each
+		// slice is copied byte for byte into a file of its own that the
+		// importer reads in pieces too. A network export is never decoded
+		// whole.
+		$reader = \PerfLocale\Admin\ImportReader::open( $file );
+
+		if ( null === $reader ) {
 			\WP_CLI::error( "Failed to read: {$file}" );
+			return;
 		}
 
-		$decoded = json_decode( (string) $contents, true );
+		// The import's own limits (perflocale/import/quality_limits): what the
+		// index keeps in all, the top-level members and the slices. Of the
+		// envelope only the keys network-export writes are read.
+		$limits = \PerfLocale\Admin\DataImporter::quality_limits();
+		$bounds = \PerfLocale\Admin\DataImporter::reader_limits( $limits );
 
-		if ( ! is_array( $decoded ) || empty( $decoded['network'] ) || empty( $decoded['sites'] ) ) {
+		$reader->limit( $bounds['max_captured_bytes'], $bounds['max_top_level_members'], $bounds['max_data_members'] );
+
+		try {
+			$reader->index_network(
+				$bounds['max_section_bytes'],
+				static fn( string $key ): bool => in_array( $key, [ 'perflocale_export', 'network', 'format_version', 'version', 'exported_at', 'network_url' ], true )
+			);
+		} catch ( \UnexpectedValueException $e ) {
+			$reader->close();
+			$over_a_limit = in_array( $e->getCode(), [ \PerfLocale\Admin\ImportReader::ERR_TOO_MUCH_KEPT, \PerfLocale\Admin\ImportReader::ERR_TOO_MANY_MEMBERS, \PerfLocale\Admin\ImportReader::ERR_TOO_MANY_DATA_MEMBERS ], true );
+
+			\WP_CLI::error( $over_a_limit ? \PerfLocale\Admin\DataImporter::read_error_message( $e, $limits ) : 'File is not a valid network-export envelope: ' . $e->getMessage() . '.' );
+			return;
+		}
+
+		$envelope = $reader->envelope();
+		$sites    = $reader->sites();
+
+		if ( empty( $envelope['network'] ) || [] === $sites ) {
+			$reader->close();
 			\WP_CLI::error( 'File is not a network-export envelope (missing `network: true` or `sites`).' );
+			return;
 		}
 
 		$mode    = $assoc_args['mode'] ?? 'merge';
 		$replace = ( $mode === 'replace' );
 
 		if ( $replace ) {
-			// Pass the full assoc_args through so WP-CLI's global `--yes`
-			// flag bypasses the prompt in scripted contexts (CI, tests,
-			// headless pipelines). Without this propagation, automation
-			// would hang indefinitely on the prompt.
+			// `--yes` (declared in the synopsis, which WP-CLI checks before
+			// the command runs) reaches WP_CLI::confirm() through the
+			// assoc_args, so scripted runs (CI, tests, backups) skip the
+			// prompt; without it the prompt waits for an answer.
 			\WP_CLI::confirm( 'Replace mode will WIPE matching data on every targeted site. Continue?', $assoc_args );
 		}
 
@@ -1540,12 +1791,52 @@ final class PerfLocaleCommand {
 		$total_errors   = 0;
 		$importer       = new \PerfLocale\Admin\DataImporter();
 
-		foreach ( $decoded['sites'] as $source_site_id => $slice ) {
+		foreach ( $sites as $source_site_id => $slice ) {
 			if ( $only_site !== '' && (string) $source_site_id !== $only_site ) {
 				continue;
 			}
 
-			if ( ! is_array( $slice ) || empty( $slice['export'] ) || ! is_array( $slice['export'] ) ) {
+			if ( ! $slice['is_object'] ) {
+				\WP_CLI::warning( "Site {$source_site_id} slice missing 'export'; skipping." );
+				continue;
+			}
+
+			// The slice's export, copied byte for byte into a file of its own
+			// (DataImporter takes a file path and reads it in pieces). Its
+			// recorded address is read from that file's envelope.
+			$tmp = wp_tempnam( "pl-netimp-{$source_site_id}-" );
+
+			try {
+				$staged = $reader->copy_export( $source_site_id, $tmp );
+			} catch ( \UnexpectedValueException $e ) {
+				$staged = false;
+			}
+
+			$slice_reader = $staged ? \PerfLocale\Admin\ImportReader::open( $tmp ) : null;
+			$slice_env    = null;
+
+			if ( null !== $slice_reader ) {
+				$slice_reader->limit( $bounds['max_captured_bytes'], $bounds['max_top_level_members'], $bounds['max_data_members'] );
+
+				try {
+					$slice_reader->index( $bounds['max_section_bytes'], [ \PerfLocale\Admin\DataImporter::class, 'reads_member' ] );
+					$slice_env = $slice_reader->envelope();
+				} catch ( \UnexpectedValueException $e ) {
+					// Not valid JSON: the import below refuses it and says so.
+					$slice_env = [ '__invalid' => true ];
+				} finally {
+					$slice_reader->close();
+				}
+			}
+
+			if ( null === $slice_env ) {
+				wp_delete_file( $tmp );
+				\WP_CLI::warning( "Failed to stage slice for site {$source_site_id}; skipping." );
+				continue;
+			}
+
+			if ( [] === $slice_env ) {
+				wp_delete_file( $tmp );
 				\WP_CLI::warning( "Site {$source_site_id} slice missing 'export'; skipping." );
 				continue;
 			}
@@ -1557,6 +1848,7 @@ final class PerfLocaleCommand {
 
 			if ( $only_site === '' ) {
 				if ( ! get_blog_details( (int) $source_site_id ) ) {
+					wp_delete_file( $tmp );
 					\WP_CLI::warning( "Site {$source_site_id} doesn't exist on this network; skipping." );
 					continue;
 				}
@@ -1584,8 +1876,8 @@ final class PerfLocaleCommand {
 			// an array, a bare scheme, a JSON `false` - is a mismatch, because
 			// nothing in it identifies the site the slice came from.
 			// Everything else is compared.
-			$slice_url = $slice['export']['site_url'] ?? null;
-			$has_url   = isset( $slice['export']['site_url'] ) && '' !== $slice['export']['site_url'];
+			$slice_url = $slice_env['site_url'] ?? null;
+			$has_url   = isset( $slice_env['site_url'] ) && '' !== $slice_env['site_url'];
 			$verdict   = \PerfLocale\Admin\DataImporter::bundle_matches_this_site( $slice_url );
 
 			if ( ! $forced && ( false === $verdict || ( $has_url && null === $verdict ) ) ) {
@@ -1608,28 +1900,12 @@ final class PerfLocaleCommand {
 					restore_current_blog();
 				}
 
+				wp_delete_file( $tmp );
 				++$total_errors;
 				continue;
 			}
 
 			try {
-				// Write the slice to a temp file because DataImporter's
-				// public API takes a file path (it streams large JSON via
-				// the WP_Filesystem layer, not in-memory parse).
-				$tmp      = wp_tempnam( "pl-netimp-{$source_site_id}-" );
-				$slice_fs = \PerfLocale\Helper::filesystem();
-				$slice_ok = $slice_fs && $slice_fs->put_contents(
-					$tmp,
-					(string) wp_json_encode( $slice['export'] ),
-					FS_CHMOD_FILE
-				);
-
-				if ( ! $slice_ok ) {
-					wp_delete_file( $tmp );
-					\WP_CLI::warning( "Failed to stage slice for site {$source_site_id}; skipping." );
-					continue;
-				}
-
 				// --force carries through: the slice has already passed the
 				// identical check above, or the operator forced past it, so
 				// re-running it inside import() could only contradict the
@@ -1661,6 +1937,14 @@ final class PerfLocaleCommand {
 					\WP_CLI::warning( "Site {$source_site_id}: " . $this->merge_not_applied_message() );
 				}
 
+				if ( ! empty( $result['address_notice'] ) ) {
+					\WP_CLI::warning( "Site {$source_site_id}: " . $result['address_notice'] );
+				}
+
+				foreach ( (array) ( $result['notes'] ?? [] ) as $note ) {
+					\WP_CLI::warning( "Site {$source_site_id}: " . (string) $note );
+				}
+
 				\WP_CLI::log(
 					sprintf(
 						'Site %s: %d imported, %d skipped, %d errors.',
@@ -1676,6 +1960,8 @@ final class PerfLocaleCommand {
 				}
 			}
 		}
+
+		$reader->close();
 
 		if ( $total_errors > 0 ) {
 			// Per-site slices that were deliberately skipped (missing blog,
@@ -1899,6 +2185,14 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( ucfirst( $source ) . ' data not detected. Make sure the plugin was active and has translation data.' );
 		}
 
+		// A language conflict policy other than the default is announced before
+		// anything runs.
+		$policy_line = $source === 'polylang' ? \PerfLocale\Migration\PolylangImporter::policy_line( \PerfLocale\Migration\PolylangImporter::conflict_policies() ) : '';
+
+		if ( $policy_line !== '' ) {
+			\WP_CLI::warning( $policy_line );
+		}
+
 		if ( $dry_run ) {
 			\WP_CLI::log( "Dry run - checking {$source} data..." );
 			if ( $force_restart ) {
@@ -1957,8 +2251,14 @@ final class PerfLocaleCommand {
 			}
 		}
 
-		// Rows the WPML import left out, per reason, with examples.
-		foreach ( \PerfLocale\Migration\WpmlImporter::skipped_lines( $result ) as $line ) {
+		foreach ( (array) ( $result['notices'] ?? [] ) as $notice ) {
+			\WP_CLI::warning( is_string( $notice ) ? $notice : '' );
+		}
+
+		// Items the import read and left out, per reason, with examples.
+		$skipped_lines = \PerfLocale\Migration\MigrationRunner::skipped_lines( $source, $result );
+
+		foreach ( $skipped_lines as $line ) {
 			\WP_CLI::warning( $line );
 		}
 
@@ -1993,6 +2293,13 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( 'The import did not finish: some data could not be read or written (see the warnings above). What it imported is kept. Run it again to import the rest.' );
 		}
 
+		// Polylang: items left out need the operator's attention; the run
+		// finished (exit 0), but it is not reported as a plain success.
+		if ( $source === 'polylang' && $skipped_lines !== [] ) {
+			\WP_CLI::warning( "Migration finished. Imported: {$summary}. Some Polylang items were not imported and need attention (see above)." );
+			return;
+		}
+
 		\WP_CLI::success( "Migration complete. Imported: {$summary}." );
 	}
 
@@ -2001,8 +2308,9 @@ final class PerfLocaleCommand {
 	 *
 	 * One row per source language: its code, locale, items and the
 	 * PerfLocale language it maps to. Then each problem, and an exit code:
-	 * 0 when the import would run, 1 when it would be refused. Writes nothing
-	 * and takes no lock.
+	 * 0 when the import would run, 1 when it would be refused. A catch-up
+	 * import that would run despite errors ends with a warning naming what it
+	 * would skip, not with Success. Writes nothing and takes no lock.
 	 *
 	 * @param string $source   wpml, polylang or translatepress.
 	 * @param object $importer The source's importer.
@@ -2041,12 +2349,38 @@ final class PerfLocaleCommand {
 			\WP_CLI\Utils\format_items( 'table', $rows, [ 'code', 'locale', 'items', 'perflocale', 'status' ] );
 		}
 
+		$blocking   = ! empty( $pre['blocking'] );
+		$has_errors = false;
+
 		foreach ( (array) $pre['problems'] as $problem ) {
-			\WP_CLI::warning( ( $problem['level'] === 'error' ? 'Error: ' : '' ) . $problem['message'] );
+			$has_errors = $has_errors || $problem['level'] === 'error';
+			\WP_CLI::warning( ( $blocking && $problem['level'] === 'error' ? 'Error: ' : '' ) . $problem['message'] );
 		}
 
-		if ( ! empty( $pre['blocking'] ) ) {
+		if ( $blocking ) {
 			\WP_CLI::error( ucfirst( $source ) . ' data detected, but the import would be refused. Fix the errors above, then run it again.' );
+		}
+
+		// A catch-up import runs despite these problems: say what it would
+		// leave out instead of reporting it ready.
+		if ( $has_errors ) {
+			$left_out = [];
+
+			foreach ( (array) $pre['map'] as $code => $slug ) {
+				$raw   = $content[ (string) $code ] ?? 0;
+				$items = is_numeric( $raw ) ? (int) $raw : 0;
+
+				if ( $slug === null && $items > 0 ) {
+					$left_out[] = "{$items} items in {$code}";
+				}
+			}
+
+			\WP_CLI::warning(
+				ucfirst( $source ) . ' data detected. The import would run'
+				. ( $left_out !== [] ? ' and skip ' . implode( ', ', $left_out ) . ' (no matching PerfLocale language)' : '' )
+				. '. Fix the problems above first, or run without --dry-run to import the rest.'
+			);
+			return;
 		}
 
 		\WP_CLI::success( ucfirst( $source ) . ' data detected and ready to import. Run without --dry-run to proceed.' );
@@ -2431,6 +2765,531 @@ final class PerfLocaleCommand {
 	}
 
 	// =========================================================================
+	// Damaged block markup
+	// =========================================================================
+
+	/**
+	 * List translations whose content has damaged block markup.
+	 *
+	 * Reads every post translation (a linked post whose language is not the
+	 * default language) and reports the ones whose post_content holds escaped
+	 * block-delimiter text (`&lt;!-- wp:`), block-delimiter text that is not a
+	 * delimiter (a cut-off opener left as text) or unbalanced block
+	 * delimiters, more of a kind than the default-language source holds, and
+	 * blocks that lost comment attributes their source block has (a key the
+	 * block editor would have kept). Each row names the first damaged spot.
+	 * Changes no content or settings; reads in batches.
+	 *
+	 * Exit status: 0 when no translation is listed, 2 when translations are
+	 * listed, 1 when the command cannot run.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--lang=<slug>]
+	 * : Only translations in this language.
+	 *
+	 * [--post-type=<type>]
+	 * : Only translations of this post type.
+	 *
+	 * [--batch-size=<number>]
+	 * : Translations read per query.
+	 * ---
+	 * default: 200
+	 * ---
+	 *
+	 * [--format=<format>]
+	 * : Render output in a particular format.
+	 * ---
+	 * default: table
+	 * options:
+	 *   - table
+	 *   - csv
+	 *   - json
+	 * ---
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     # Every damaged translation
+	 *     wp perflocale damaged-blocks
+	 *
+	 *     # German pages as JSON, for a script (exit status 2 when something is listed)
+	 *     wp perflocale damaged-blocks --lang=de --post-type=page --format=json
+	 *
+	 * @subcommand damaged-blocks
+	 *
+	 * @param array<int, string>    $args       Positional args.
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return void
+	 */
+	public function damaged_blocks( array $args, array $assoc_args ): void {
+		$format = (string) ( $assoc_args['format'] ?? 'table' );
+		$langs  = $this->plugin->get( 'lang_repo' );
+
+		if ( ! in_array( $format, [ 'table', 'csv', 'json' ], true ) ) {
+			\WP_CLI::error( 'Unknown --format. Use table, csv or json.' );
+		}
+
+		if ( ! $langs instanceof LanguageRepository ) {
+			\WP_CLI::error( 'The language repository is not available.' );
+			return;
+		}
+
+		$batch     = (int) ( $assoc_args['batch-size'] ?? 200 );
+		$lang_slug = sanitize_key( (string) ( $assoc_args['lang'] ?? '' ) );
+		$post_type = sanitize_key( (string) ( $assoc_args['post-type'] ?? '' ) );
+
+		// Page by page: memory holds one page of contents and of rows, which
+		// are printed as they are found.
+		$rows = ( static function () use ( $langs, $batch, $lang_slug, $post_type ): \Generator {
+			$cursor = 0;
+
+			do {
+				$page   = \PerfLocale\MachineTranslation\DamagedBlockScan::page( $langs, $cursor, $batch, $lang_slug, $post_type );
+				$cursor = $page['next'];
+
+				foreach ( $page['rows'] as $row ) {
+					yield $row;
+				}
+
+				// What the page read leaves the runtime cache (no query).
+				\PerfLocale\Cache\CacheManager::flush_runtime();
+			} while ( null !== $cursor );
+		} )();
+
+		try {
+			$listed = $this->print_rows( $format, $rows, [ 'post_id', 'language', 'source_id', 'issue', 'spot' ], 'No translation has damaged block markup.' );
+		} catch ( \InvalidArgumentException | \RuntimeException $e ) {
+			\WP_CLI::error( $e->getMessage() );
+			return;
+		}
+
+		// Listed translations end with status 2 after the rows (1 stays the
+		// error status), as stock-drift does.
+		if ( $listed > 0 ) {
+			\WP_CLI::halt( 2 );
+		}
+	}
+
+	// =========================================================================
+	// Template reference backfill
+	// =========================================================================
+
+	/**
+	 * Point the menus and synced patterns of translated templates and template parts at their language's translations.
+	 *
+	 * Runs the one-time update backfill again, inline: every template and
+	 * template part linked in a language other than the default whose
+	 * Navigation block or synced pattern still names the source-language menu
+	 * or pattern that its original names too is pointed at that menu's or
+	 * pattern's translation in its language, when the translation exists and
+	 * the editor opens it. A reference changed in the Site Editor is kept.
+	 * What a visitor sees does not change: the page already renders the
+	 * translation. Records the backfill as done for this site.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--batch-size=<number>]
+	 * : Templates and template parts read per query (1-500).
+	 * ---
+	 * default: 50
+	 * ---
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     wp perflocale template-refs-backfill
+	 *
+	 * @subcommand template-refs-backfill
+	 *
+	 * @param array<int, string>    $args       Positional args.
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return void
+	 */
+	public function template_refs_backfill( array $args, array $assoc_args ): void {
+		$batch  = max( 1, min( 500, (int) ( $assoc_args['batch-size'] ?? 50 ) ) );
+		$after  = 0;
+		$totals = [
+			'read'       => 0,
+			'updated'    => 0,
+			'references' => 0,
+		];
+
+		do {
+			$page = \PerfLocale\Translation\TemplateBlockRefs::backfill_page( $after, $batch );
+
+			if ( $page['error'] ) {
+				\WP_CLI::error(
+					$page['failed'] > 0
+						? sprintf(
+							'conflict' === $page['cause']
+								? 'Template or template part #%1$d was edited at the same time and was not updated yet; %2$d read and %3$d updated so far. Run the command again. The backfill is not recorded as done.'
+								: 'Template or template part #%1$d could not be saved because the database did not accept the change; %2$d read and %3$d updated so far. The backfill is not recorded as done.',
+							$page['failed'],
+							$totals['read'] + $page['read'],
+							$totals['updated'] + $page['updated']
+						)
+						: sprintf( 'The templates and template parts after #%d could not be read (database error, or no default language); %d read and %d updated so far. The backfill is not recorded as done.', $after, $totals['read'], $totals['updated'] )
+				);
+				return;
+			}
+
+			$totals['read']       += $page['read'];
+			$totals['updated']    += $page['updated'];
+			$totals['references'] += $page['references'];
+			$after                 = $page['next'];
+
+			// The posts and meta read for the page stay out of the runtime
+			// cache: memory holds one page at a time.
+			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+		} while ( $after > 0 );
+
+		update_option( \PerfLocale\Background\Jobs\TemplateRefsBackfillJob::OPTION, 'done:' . time(), true );
+
+		\WP_CLI::success( sprintf( '%d template(s) and template part(s) read, %d updated, %d reference(s) pointed at a translation.', $totals['read'], $totals['updated'], $totals['references'] ) );
+	}
+
+	// =========================================================================
+	// Stock drift
+	// =========================================================================
+
+	/**
+	 * List language copies of a product whose stock differs.
+	 *
+	 * Inventory Sync keeps the language copies of a product as one stock. This
+	 * reads every product translation group and lists the groups whose copies
+	 * hold different stock quantities: products that manage their own stock,
+	 * and each variation with its matching variation in every other language.
+	 * Copies that do not manage their stock or are excluded from the sync are
+	 * left out. Changes no content, settings or stock; reads in batches.
+	 *
+	 * Exit status: 0 when no copies differ, 2 when copies differ (listed),
+	 * 1 when the command cannot run.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--batch-size=<number>]
+	 * : Translation groups read per query (1-500).
+	 * ---
+	 * default: 200
+	 * ---
+	 *
+	 * [--format=<format>]
+	 * : Render output in a particular format.
+	 * ---
+	 * default: table
+	 * options:
+	 *   - table
+	 *   - csv
+	 *   - json
+	 * ---
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     # Every copy group whose stock differs
+	 *     wp perflocale stock-drift
+	 *
+	 *     # As JSON, for a script (exit status 2 when something differs)
+	 *     wp perflocale stock-drift --format=json
+	 *
+	 * @subcommand stock-drift
+	 *
+	 * @param array<int, string>    $args       Positional args.
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return void
+	 */
+	public function stock_drift( array $args, array $assoc_args ): void {
+		$format = (string) ( $assoc_args['format'] ?? 'table' );
+		$langs  = $this->plugin->get( 'lang_repo' );
+
+		if ( ! in_array( $format, [ 'table', 'csv', 'json' ], true ) ) {
+			\WP_CLI::error( 'Unknown --format. Use table, csv or json.' );
+		}
+
+		if ( ! $langs instanceof LanguageRepository ) {
+			\WP_CLI::error( 'The language repository is not available.' );
+			return;
+		}
+
+		$sync = class_exists( 'WooCommerce' ) ? \PerfLocale\WooCommerce\InventorySyncHooks::instance() : null;
+
+		if ( null === $sync || ! $sync->sync_enabled() ) {
+			\WP_CLI::error( 'Inventory Sync is not active on this site (WooCommerce, the WooCommerce add-on and its stock sync setting).' );
+			return;
+		}
+
+		$default = $langs->get_default();
+		$default = null !== $default ? get_object_vars( $default ) : [];
+		$default = isset( $default['id'] ) && is_numeric( $default['id'] ) ? (int) $default['id'] : 0;
+		$batch   = is_numeric( $assoc_args['batch-size'] ?? 200 ) ? (int) ( $assoc_args['batch-size'] ?? 200 ) : 0;
+		$groups  = 0;
+
+		// Page by page: memory holds one page of products, and the rows are
+		// printed as they are found. Every language, inactive ones too, read
+		// straight from the table: the repository's list of all languages is
+		// cached in a transient, which without a persistent object cache is a
+		// write.
+		$rows = ( static function () use ( $sync, $default, $batch, &$groups ): \Generator {
+			$languages = \PerfLocale\WooCommerce\StockDriftScan::languages();
+			$cursor    = 0;
+
+			do {
+				$page    = \PerfLocale\WooCommerce\StockDriftScan::page( $sync, $languages, $default, $cursor, $batch );
+				$groups += $page['groups'];
+				$cursor  = $page['next'];
+
+				foreach ( $page['rows'] as $row ) {
+					yield $row;
+				}
+
+				// What the page read leaves the runtime cache (no query).
+				\PerfLocale\Cache\CacheManager::flush_runtime();
+			} while ( null !== $cursor );
+		} )();
+
+		try {
+			$listed = $this->print_rows( $format, $rows, [ 'group', 'product_id', 'parent_id', 'language', 'stock' ], 'No copy group has stock that differs.' );
+		} catch ( \InvalidArgumentException | \RuntimeException $e ) {
+			\WP_CLI::error( $e->getMessage() );
+			return;
+		}
+
+		if ( 0 === $listed ) {
+			return;
+		}
+
+		\WP_CLI::warning( 1 === $groups ? '1 copy group has stock that differs.' : sprintf( '%d copy groups have stock that differs.', $groups ) );
+		\WP_CLI::halt( 2 );
+	}
+
+	/**
+	 * Print the rows a paged scan yields the way format_items() prints a
+	 * list, holding one page of them at a time. The rows are spooled to a
+	 * temporary stream (memory up to 1 MB, then a temporary file) and printed
+	 * once the scan has ended, so a scan that fails prints nothing. A table's
+	 * column widths are measured while it spools, and its rows are then
+	 * printed PRINT_PAGE at a time with those widths.
+	 *
+	 * @param string                                      $format table, csv or json.
+	 * @param \Generator<int, array<string, int|string>>  $rows   The rows, each holding $fields in that order.
+	 * @param list<string>                                $fields Columns.
+	 * @param string                                      $none   Success message a table with no row prints instead.
+	 * @return int Rows printed.
+	 */
+	private function print_rows( string $format, \Generator $rows, array $fields, string $none ): int {
+		$count = 0;
+
+		// The scan runs to its first row here. A scan that ended without one
+		// cannot be traversed again: there is nothing to print.
+		$rows->current();
+
+		$rows = $rows->valid() ? $rows : [];
+
+		$spool_failed = 'The rows could not be written to a temporary file; the temporary directory may be full. Free space there and run the command again.';
+
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- A memory stream that spills to a temporary file; WP_Filesystem has no streams.
+		$spool = fopen( 'php://temp/maxmemory:' . MB_IN_BYTES, 'w+b' );
+
+		if ( false === $spool ) {
+			throw new \RuntimeException( esc_html( $spool_failed ) );
+		}
+
+		// Every step on the spool is checked: a row it lost would be a list
+		// printed as complete without it.
+		$put = static function ( $written ) use ( $spool_failed ): void {
+			if ( false === $written ) {
+				throw new \RuntimeException( esc_html( $spool_failed ) );
+			}
+		};
+
+		// Each record is written whole: a short write (a full disk, a file
+		// size limit) and a temporary file that could not be made (0 bytes
+		// written) end the command instead of leaving the record cut.
+		$write = static function ( string $bytes ) use ( $spool, $spool_failed ): void {
+			while ( '' !== $bytes ) {
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- The stream opened above.
+				$written = fwrite( $spool, $bytes );
+
+				if ( false === $written || 0 === $written ) {
+					throw new \RuntimeException( esc_html( $spool_failed ) );
+				}
+
+				$bytes = (string) substr( $bytes, $written );
+			}
+		};
+
+		// A csv record is encoded in memory, as fputcsv() writes it, then
+		// written whole.
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- A memory stream; WP_Filesystem has no streams.
+		$line = fopen( 'php://memory', 'w+b' );
+
+		if ( false === $line ) {
+			fclose( $spool ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- The stream opened above.
+
+			throw new \RuntimeException( esc_html( $spool_failed ) );
+		}
+
+		$csv = static function ( array $values, string $escape ) use ( $line, $write, $spool_failed ): void {
+			/** @var array<int|string, bool|float|int|string|null> $values */
+			if ( ! rewind( $line ) || ! ftruncate( $line, 0 ) || false === fputcsv( $line, $values, ',', '"', $escape ) || ! rewind( $line ) ) {
+				throw new \RuntimeException( esc_html( $spool_failed ) );
+			}
+
+			$record = stream_get_contents( $line );
+
+			if ( false === $record ) {
+				throw new \RuntimeException( esc_html( $spool_failed ) );
+			}
+
+			$write( $record );
+		};
+
+		if ( 'csv' === $format || 'json' === $format ) {
+			try {
+				if ( 'csv' === $format ) {
+					// As format_items() writes csv (WP_CLI\Utils\write_csv()), to the spool.
+					$csv( self::csv_line( array_combine( $fields, $fields ), $fields ), '\\' );
+
+					foreach ( $rows as $row ) {
+						++$count;
+						$csv( self::csv_line( $row, $fields ), '\\' );
+					}
+				} else {
+					// As format_items() prints json: one array, no white space.
+					$write( '[' );
+
+					foreach ( $rows as $row ) {
+						$write( ( $count++ > 0 ? ',' : '' ) . wp_json_encode( $row, JSON_PARTIAL_OUTPUT_ON_ERROR ) );
+					}
+
+					$write( ']' );
+				}
+
+				$size = ftell( $spool );
+				$put( rewind( $spool ) ? $size : false );
+
+				// csv goes to STDOUT and json through PHP's output, as format_items() sends them.
+				$copied = 'csv' === $format ? stream_copy_to_stream( $spool, STDOUT ) : fpassthru( $spool );
+				$put( $copied === $size ? $copied : false );
+			} finally {
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- The streams opened above.
+				fclose( $line );
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- The streams opened above.
+				fclose( $spool );
+			}
+
+			return $count;
+		}
+
+		// As format_items() draws a table: colors off while it measures and prints.
+		$runner = \WP_CLI::get_runner();
+		$color  = is_object( $runner ) && method_exists( $runner, 'in_color' ) && true === $runner->in_color();
+		$print  = static function ( $lines ): void {
+			foreach ( is_array( $lines ) ? $lines : [] as $line ) {
+				\WP_CLI::line( is_string( $line ) ? $line : '' );
+			}
+		};
+
+		if ( $color ) {
+			\cli\Colors::disable( true );
+		}
+
+		try {
+			$table = new \cli\Table();
+			$table->setHeaders( $fields );
+
+			foreach ( $rows as $row ) {
+				$values = array_values( $row );
+
+				$table->addRow( $values );
+				$csv( $values, '' );
+
+				if ( 0 === ++$count % self::PRINT_PAGE ) {
+					$table->setRows( [] );
+				}
+			}
+
+			if ( 0 === $count ) {
+				\WP_CLI::success( $none );
+
+				return 0;
+			}
+
+			// The table without rows: its head (borders and headers), then its foot.
+			$table->setRows( [] );
+			$frame = $table->getDisplayLines();
+			$frame = is_array( $frame ) ? array_values( $frame ) : [];
+			$head  = 1 === count( $frame ) ? 1 : 3;
+
+			$put( rewind( $spool ) );
+			$print( array_slice( $frame, 0, $head ) );
+
+			$read = 0;
+
+			do {
+				$page = [];
+
+				while ( count( $page ) < self::PRINT_PAGE ) {
+					$values = fgetcsv( $spool, null, ',', '"', '' );
+
+					if ( ! is_array( $values ) ) {
+						break;
+					}
+
+					$page[] = $values;
+				}
+
+				if ( [] === $page ) {
+					break;
+				}
+
+				$read += count( $page );
+
+				$table->setRows( $page );
+				$all = $table->getDisplayLines();
+				$all = is_array( $all ) ? array_values( $all ) : [];
+
+				$print( array_slice( $all, $head, count( $all ) - count( $frame ) ) );
+			} while ( count( $page ) === self::PRINT_PAGE );
+
+			// Every row spooled was read back: a failed read is not the end.
+			$put( $read === $count );
+			$print( array_slice( $frame, $head ) );
+		} finally {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- The streams opened above.
+			fclose( $line );
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- The streams opened above.
+			fclose( $spool );
+
+			if ( $color ) {
+				\cli\Colors::enable( true );
+			}
+		}
+
+		return $count;
+	}
+
+	/**
+	 * One csv line of $fields as WP-CLI's write_csv() writes it: each value
+	 * as a string, escaped by escape_csv_value() in the WP-CLI versions that
+	 * have it.
+	 *
+	 * @param array<string, mixed> $row    Row.
+	 * @param list<string>         $fields Columns.
+	 * @return list<string>
+	 */
+	private static function csv_line( array $row, array $fields ): array {
+		$line = [];
+
+		foreach ( $fields as $field ) {
+			$value  = $row[ $field ] ?? null;
+			$value  = is_scalar( $value ) ? (string) $value : '';
+			$escaped = function_exists( '\WP_CLI\Utils\escape_csv_value' ) ? \WP_CLI\Utils\escape_csv_value( $value ) : $value;
+			$line[]  = is_string( $escaped ) ? $escaped : $value;
+		}
+
+		return $line;
+	}
+
+	// =========================================================================
 	// Status
 	// =========================================================================
 
@@ -2510,10 +3369,66 @@ final class PerfLocaleCommand {
 		try {
 			$migrator->maybe_migrate();
 			$migrator->maybe_update();
-			\WP_CLI::success( 'PerfLocale database migrations completed successfully.' );
+
+			// SQLite only. The engine is read before the repair class is named,
+			// so nothing of the repair is loaded on MySQL or MariaDB.
+			$note = defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ? $this->sqlite_group_repair() : '';
+
+			\WP_CLI::success( 'PerfLocale database migrations completed successfully.' . $note );
 		} catch ( \Throwable $e ) {
 			\WP_CLI::error( 'Migration failed: ' . $e->getMessage() );
 		}
+	}
+
+	/**
+	 * Run the SQLite string-group repair to the end, slice by slice,
+	 * reporting its progress. While another process holds the repair (the
+	 * background job between two slices), it tries again for up to 20
+	 * seconds; then it stops with an error, so the command never reports a
+	 * repair it did not finish.
+	 *
+	 * @return string What the repair changed, for the success line ('' when
+	 *                it had nothing to do).
+	 *
+	 * @throws \RuntimeException When a slice failed (it was rolled back), the
+	 *                           check after the last slice failed, or another
+	 *                           process holds the repair.
+	 */
+	private function sqlite_group_repair(): string {
+		if ( ! \PerfLocale\Strings\SqliteGroupRepair::applies() ) {
+			return '';
+		}
+
+		$shown  = -1;
+		$waited = 0;
+
+		do {
+			$outcome = \PerfLocale\Strings\SqliteGroupRepair::run_slice( true );
+
+			if ( 'busy' === $outcome['status'] ) {
+				if ( $waited >= 20 ) {
+					throw new \RuntimeException( 'The SQLite string-group repair is busy in another process (the background job, another WP-CLI run, or one that stopped less than 5 minutes ago). Nothing was repaired by this run; run this command again later.' );
+				}
+
+				sleep( 1 );
+				++$waited;
+				continue;
+			}
+
+			$waited = 0;
+
+			// One line per 5 percent.
+			if ( intdiv( $outcome['percent'], 5 ) > intdiv( max( 0, $shown ), 5 ) || -1 === $shown ) {
+				\WP_CLI::log( sprintf( 'Repairing SQLite string groups: %d%%', $outcome['percent'] ) );
+				$shown = $outcome['percent'];
+			}
+		} while ( in_array( $outcome['status'], [ 'more', 'busy' ], true ) );
+
+		if ( 'complete' !== $outcome['status'] ) {
+			return '';
+		}
+
+		return sprintf( ' SQLite string groups repaired: %d groups created, %d links moved, %d links written, %d empty groups deleted, %d links left where they were, %d translated pairs skipped.', $outcome['groups_created'], $outcome['links_moved'], $outcome['links_written'], $outcome['groups_deleted'], $outcome['links_left'], $outcome['pairs_skipped'] );
 	}
 
 	// =========================================================================
@@ -2748,6 +3663,9 @@ final class PerfLocaleCommand {
 				\WP_CLI::error( "Could not cancel job {$job_id}: the database refused the status change. Nothing was changed." );
 			}
 		}
+
+		// A one-time job's dispatch state records the cancel.
+		\PerfLocale\Background\OneTimeDispatch::job_ended( $job_id, is_string( $state['type'] ?? null ) ? $state['type'] : '', 'canceled' );
 
 		\PerfLocale\Background\JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $job_id );
 

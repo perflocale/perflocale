@@ -11,6 +11,12 @@
  * domain mode, so a save keeps the stored domains; this only follows the
  * radio. No-ops on tabs without the URL mode radios.
  *
+ * URL & Routing tab: the GeoIP rows (`.perflocale-geo-field`) follow the
+ * GeoIP checkbox (`#perflocale-geo-enabled`).
+ *
+ * Export & Import tab: "Select All" (`#perflocale-export-all`) ticks or
+ * clears every export section, and follows them when they change.
+ *
  * Clipboard / confirm / submit-busy handlers for data-perflocale-* attrs
  * live in admin-actions.js (delegated, loaded on every plugin admin page).
  */
@@ -54,9 +60,52 @@
 		} );
 	}
 
+	function syncGeoFields() {
+		var geo = document.getElementById( 'perflocale-geo-enabled' );
+
+		if ( ! geo ) {
+			return;
+		}
+
+		function toggle() {
+			var on = geo.checked;
+			document.querySelectorAll( '.perflocale-geo-field' ).forEach( function ( tr ) {
+				tr.style.display = on ? '' : 'none';
+			} );
+		}
+
+		geo.addEventListener( 'change', toggle );
+		toggle();
+	}
+
+	function syncExportSelectAll() {
+		var allCb = document.getElementById( 'perflocale-export-all' );
+		var boxes = document.querySelectorAll( '.perflocale-export-section' );
+
+		if ( ! allCb ) {
+			return;
+		}
+
+		allCb.addEventListener( 'change', function () {
+			boxes.forEach( function ( cb ) {
+				cb.checked = allCb.checked;
+			} );
+		} );
+
+		boxes.forEach( function ( cb ) {
+			cb.addEventListener( 'change', function () {
+				allCb.checked = [].every.call( boxes, function ( c ) {
+					return c.checked;
+				} );
+			} );
+		} );
+	}
+
 	function init() {
 		syncDisplayRows();
 		syncDomainConfig();
+		syncGeoFields();
+		syncExportSelectAll();
 	}
 
 	if ( document.readyState === 'loading' ) {

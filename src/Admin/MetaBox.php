@@ -69,8 +69,6 @@ final class MetaBox {
 		// `is_admin() && ! wp_doing_ajax()`) and the meta needs to clear
 		// on REST API saves (block editor) and WP-CLI saves too - neither
 		// of which loads MetaBox. See Bootstrap::register_post_meta_cleanup_hooks().
-		add_action( 'admin_footer-post.php', [ $this, 'inject_term_language_badges' ] );
-		add_action( 'admin_footer-post-new.php', [ $this, 'inject_term_language_badges' ] );
 
 		// Filter the category/tag checklist on post.php + post-new.php so
 		// translators only see terms matching the post's current language -
@@ -173,12 +171,9 @@ final class MetaBox {
 	}
 
 	/**
-	 * Register and attach the metabox styles on the classic post editor.
-	 *
-	 * Uses the standard wp_register_style( handle, false, ... ) + wp_add_inline_style
-	 * pattern so the CSS rides on WordPress' normal print-styles pipeline
-	 * (emitted during wp_head()) rather than being echoed ad-hoc from the
-	 * metabox body.
+	 * Enqueue the metabox stylesheet (assets/css/metabox.css) on the classic
+	 * post editor of a translatable post type. The block editor uses its own
+	 * sidebar panel and gets nothing here.
 	 *
 	 * @param string $hook Current admin page hook.
 	 * @return void
@@ -207,7 +202,6 @@ final class MetaBox {
 			[],
 			PERFLOCALE_VERSION
 		);
-
 	}
 
 	/**
@@ -601,119 +595,6 @@ final class MetaBox {
 					implode( ', ', array_values( $step_labels ) )
 				)
 			)
-		);
-	}
-
-	/**
-	 * Inject JavaScript to add language badges to taxonomy checklist items.
-	 *
-	 * Shows a small language code (e.g. "EN", "DE") next to each term name
-	 * in the category/tag checklists on the post edit screen.
-	 *
-	 * @return void
-	 */
-	public function inject_term_language_badges(): void {
-		$settings   = \PerfLocale\Plugin::get_instance()->get( 'settings' );
-		$post_types = $settings->get_translatable_post_types();
-		$screen     = get_current_screen();
-
-		if ( ! $screen || ! in_array( $screen->post_type, $post_types, true ) ) {
-			return;
-		}
-
-		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
-		$languages = $lang_repo->get_active();
-
-		if ( count( $languages ) < 2 ) {
-			return;
-		}
-
-		global $wpdb;
-
-		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
-		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
-		$langs_table  = \PerfLocale\Database\Schema::table( 'languages' );
-
-		// Only fetch term-language mappings for taxonomies registered on this post type.
-		$taxonomies = get_object_taxonomies( $screen->post_type, 'names' );
-
-		if ( empty( $taxonomies ) ) {
-			return;
-		}
-
-		$tax_placeholders = implode( ',', array_fill( 0, count( $taxonomies ), '%s' ) );
-
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge()/unpacking, which WPCS cannot count; the %i table names lead, then the values in placeholder order.
-		$results = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT l.object_id, lang.slug AS lang_slug
-				FROM %i l
-				INNER JOIN %i g ON l.group_id = g.id AND g.type = 'term'
-				INNER JOIN %i lang ON l.language_id = lang.id
-				INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = l.object_id
-				WHERE tt.taxonomy IN ({$tax_placeholders})",
-				$links_table,
-				$groups_table,
-				$langs_table,
-				...$taxonomies
-			)
-		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
-
-		$term_lang_map = [];
-
-		foreach ( $results as $row ) {
-			$term_lang_map[ (int) $row->object_id ] = \PerfLocale\Helper::format_locale_as_bcp47( (string) $row->lang_slug );
-		}
-
-		if ( empty( $term_lang_map ) ) {
-			return;
-		}
-
-		// Get the default language slug to hide badges for default-language terms.
-		$default_lang = $lang_repo->get_default();
-		$default_slug = $default_lang ? \PerfLocale\Helper::format_locale_as_bcp47( $default_lang->slug ) : '';
-
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleTermBadges=' . wp_json_encode(
-				[
-					'langMap'     => $term_lang_map,
-					'defaultLang' => $default_slug,
-				],
-				JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-			) . ';',
-			'before'
-		);
-
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var langMap=perflocaleTermBadges.langMap;' .
-				'var defaultLang=perflocaleTermBadges.defaultLang;' .
-				'function addTermBadges(){' .
-					'var labels=document.querySelectorAll(".categorychecklist li label, .tagchecklist li");' .
-					'labels.forEach(function(label){' .
-						'if(label.dataset.perflocaleTermLabeled)return;' .
-						'label.dataset.perflocaleTermLabeled="1";' .
-						'var input=label.querySelector(\'input[type="checkbox"], input[type="radio"]\');' .
-						'if(!input)return;' .
-						'var termId=parseInt(input.value,10);' .
-						'if(!termId||!langMap[termId])return;' .
-						'if(langMap[termId]===defaultLang)return;' .
-						'var badge=document.createElement("span");' .
-						'badge.style.cssText="display:inline-block;background:#e5e7eb;color:#374151;font-size:10px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px;vertical-align:middle;";' .
-						'badge.textContent=langMap[termId];' .
-						'label.appendChild(badge);' .
-					'});' .
-				'}' .
-				'addTermBadges();' .
-				'var observer=new MutationObserver(function(){setTimeout(addTermBadges,50);});' .
-				'var containers=document.querySelectorAll(".categorydiv, .tagsdiv");' .
-				'containers.forEach(function(el){' .
-					'observer.observe(el,{childList:true,subtree:true});' .
-				'});' .
-			'})();'
 		);
 	}
 }

@@ -104,7 +104,7 @@ final class XliffImporter {
 
 		$imported = 0;
 		$skipped  = 0;
-		$errors   = [];
+		$report   = new XliffImportErrors();
 
 		// Resolve the TARGET language from <xliff trgLang="...">. The unit id
 		// (post-{id}-{field}) is the SOURCE post id baked in at export time, so
@@ -155,7 +155,7 @@ final class XliffImporter {
 		$pending_id = null;
 		/** @var array{post_title?: string, post_content?: string, post_excerpt?: string} $pending_fields Unslashed, sanitised field values. */
 		$pending_fields = [];
-		/** @var array<int, string> $pending_units Unit ids held for that post. */
+		/** @var array<string, int> $pending_units Unit ids held for that post, each mapped to the post ID it names. */
 		$pending_units = [];
 
 		/**
@@ -166,7 +166,7 @@ final class XliffImporter {
 		 * wp_update_post() unslashes internally. A second slash doubles every
 		 * backslash; a missing one eats it.
 		 */
-		$flush = function () use ( &$pending_id, &$pending_fields, &$pending_units, &$imported, &$errors ): void {
+		$flush = function () use ( &$pending_id, &$pending_fields, &$pending_units, &$imported, $report ): void {
 			if ( $pending_id === null ) {
 				return;
 			}
@@ -190,15 +190,12 @@ final class XliffImporter {
 			$result = wp_update_post( wp_slash( $postarr ), true );
 
 			if ( is_wp_error( $result ) ) {
-				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					error_log( sprintf( 'PerfLocale XLIFF import: failed to update post %d (%s): %s', $held_id, implode( ', ', $held_units ), $result->get_error_message() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				}
+				// Logged whatever WP_DEBUG says: the reported error points here.
+				error_log( sprintf( 'PerfLocale XLIFF import: failed to update post %d (%s): %s', $held_id, implode( ', ', array_keys( $held_units ) ), $result->get_error_message() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 
-				// One entry per held unit: a batched write must not collapse
-				// several unit failures into a single reported error.
-				foreach ( $held_units as $ignored_unit_id ) {
-					unset( $ignored_unit_id );
-					$errors[] = __( 'Failed to import a translation unit.', 'perflocale' );
+				// Every held unit is reported, under the post its id names.
+				foreach ( $held_units as $held_unit_id => $held_source_id ) {
+					$report->add( XliffImportErrors::SAVE_FAILED, $held_source_id, (string) $held_unit_id );
 				}
 			} else {
 				$imported += count( $held_units );
@@ -278,7 +275,7 @@ final class XliffImporter {
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 					error_log( sprintf( 'PerfLocale XLIFF import: source post %d not found.', $post_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				}
-				$errors[] = __( 'Referenced post not found.', 'perflocale' );
+				$report->add( XliffImportErrors::NOT_FOUND, $post_id, $unit_id );
 				continue;
 			}
 
@@ -287,7 +284,7 @@ final class XliffImporter {
 			// check on the export path. The copy source is checked below, where
 			// the translation is created.
 			if ( ! current_user_can( 'edit_post', $post_id ) ) {
-				$errors[] = __( 'You do not have permission to edit a referenced post.', 'perflocale' );
+				$report->add( XliffImportErrors::CANNOT_EDIT, $post_id, $unit_id );
 				continue;
 			}
 
@@ -302,14 +299,14 @@ final class XliffImporter {
 				$copy_from = $manager->get_copy_source_id( $post_id, $target_slug );
 
 				if ( $copy_from > 0 && $copy_from !== $post_id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
-					$errors[] = __( 'You cannot edit the original this translation is copied from.', 'perflocale' );
+					$report->add( XliffImportErrors::CANNOT_EDIT_COPY_SOURCE, $post_id, $unit_id, $copy_from );
 					continue;
 				}
 
 				// The new post takes the copy source's type; apply that type's
 				// create capability.
 				if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_like( $copy_from ) ) {
-					$errors[] = __( 'You do not have permission to create translations of this content.', 'perflocale' );
+					$report->add( XliffImportErrors::CANNOT_CREATE, $post_id, $unit_id );
 					continue;
 				}
 
@@ -322,7 +319,9 @@ final class XliffImporter {
 				$created = $manager->create_translation( $post_id, $target_slug, true );
 
 				if ( $created === false ) {
-					$errors[] = __( 'Could not create the target-language translation for a referenced post.', 'perflocale' );
+					// Logged whatever WP_DEBUG says: the reported error points here.
+					error_log( sprintf( 'PerfLocale XLIFF import: could not create the %s translation of post %d (%s).', $target_slug, $post_id, $unit_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+					$report->add( XliffImportErrors::CREATE_FAILED, $post_id, $unit_id );
 					continue;
 				}
 
@@ -336,7 +335,7 @@ final class XliffImporter {
 
 			// Permission is checked on the TARGET post being written.
 			if ( ! current_user_can( 'edit_post', $target_id ) ) {
-				$errors[] = __( 'You do not have permission to edit a referenced post.', 'perflocale' );
+				$report->add( XliffImportErrors::CANNOT_EDIT_TRANSLATION, $post_id, $unit_id, (int) $target_id );
 				continue;
 			}
 
@@ -381,7 +380,7 @@ final class XliffImporter {
 			// last-wins rule the pre-pass above already applies to unit ids.
 			$pending_id      = (int) $target_id;
 			$pending_fields  = array_merge( $pending_fields, $update_data );
-			$pending_units[] = $unit_id;
+			$pending_units[ $unit_id ] = $post_id;
 		}
 
 		// Commit the final target.
@@ -390,7 +389,15 @@ final class XliffImporter {
 		return [
 			'imported' => $imported,
 			'skipped'  => $skipped,
-			'errors'   => $errors,
+			// One message per post and cause. A title only for a post the user
+			// can edit; never for a missing post or one they cannot edit.
+			'errors'   => $report->messages(
+				static function ( int $id ): string {
+					$post = $id > 0 ? get_post( $id ) : null;
+
+					return $post instanceof \WP_Post && current_user_can( 'edit_post', $id ) ? (string) $post->post_title : '';
+				}
+			),
 		];
 	}
 

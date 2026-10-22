@@ -11,6 +11,7 @@ namespace PerfLocale\Migration;
 
 use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Database\Repository\StringTranslationRepository;
+use PerfLocale\Enum\ObjectType;
 use PerfLocale\Enum\SourceType;
 use PerfLocale\Frontend\OptionStrings;
 use PerfLocale\Plugin;
@@ -52,12 +53,17 @@ final class ImportedOptionStrings {
 	/**
 	 * Store one option's translation, unless the language already has one.
 	 *
+	 * Either way the string ends up linked in the language: a string whose
+	 * group is not a string group gets a new string group first, and a
+	 * translation the language already has is linked when it has no link
+	 * there (an earlier import that stored it and could not link it).
+	 *
 	 * @param string     $option      Option name (a key of OptionStrings::labels()).
 	 * @param string     $raw         The option's stored value.
 	 * @param int        $language_id Target language ID.
 	 * @param string     $value       Translation, plain text.
 	 * @param SourceType $source      Import source for the translation link.
-	 * @return bool True when a translation was stored.
+	 * @return bool True when a translation was stored and linked.
 	 */
 	public static function save( string $option, string $raw, int $language_id, string $value, SourceType $source ): bool {
 		$value = sanitize_textarea_field( $value );
@@ -71,21 +77,42 @@ final class ImportedOptionStrings {
 		$translations = new StringTranslationRepository( $plugin->get( 'cache' ) );
 		$row          = $strings->find_by_hash( OptionStrings::DOMAIN, $option, $raw );
 
-		if ( $row === null || $translations->get( (int) $row->id, $language_id ) !== '' ) {
+		if ( $row === null ) {
 			return false;
 		}
 
-		if ( ! $translations->set( (int) $row->id, $language_id, $value ) ) {
+		$string_id = (int) $row->id;
+		$group_id  = (int) $row->group_id;
+		$stored    = false;
+
+		if ( $translations->get( $string_id, $language_id ) === '' ) {
+			if ( ! $translations->set( $string_id, $language_id, $value ) ) {
+				return false;
+			}
+
+			$stored = true;
+		}
+
+		// phpcs:ignore Generic.Commenting.DocComment.MissingShort -- Inline type hint for static analysis; a short description would be noise.
+		/** @var \PerfLocale\Database\Repository\TranslationGroupRepository $groups */
+		$groups = $plugin->get( 'group_repo' );
+
+		// A string link goes only into a string group: a string pointing at
+		// a post or term group (or at none) gets a new string group first.
+		$moved = ! $groups->is_string_group( $group_id );
+
+		if ( $moved ) {
+			$group_id = $groups->assign_new_string_group( $string_id );
+		}
+
+		// A translation the language already had, in its own string group and
+		// linked there, is left as it is.
+		if ( ! $stored && ! $moved && null !== $groups->get_link_state( $string_id, $language_id, ObjectType::String ) ) {
 			return false;
 		}
 
-		if ( (int) ( $row->group_id ?? 0 ) > 0 ) {
-			// phpcs:ignore Generic.Commenting.DocComment.MissingShort -- Inline type hint for static analysis; a short description would be noise.
-			/** @var \PerfLocale\Database\Repository\TranslationGroupRepository $groups */
-			$groups = $plugin->get( 'group_repo' );
-			$groups->upsert_link( (int) $row->group_id, (int) $row->id, $language_id, 'translated', $source );
-		}
+		$linked = $group_id > 0 && false !== $groups->upsert_link( $group_id, $string_id, $language_id, 'translated', $source );
 
-		return true;
+		return $stored && $linked;
 	}
 }

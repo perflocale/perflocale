@@ -272,6 +272,22 @@ final class MigrationRunner {
 	}
 
 	/**
+	 * The lines that list what an import read and did not link, per reason,
+	 * in the source's own words (WPML rows, Polylang items).
+	 *
+	 * @param string               $source Source.
+	 * @param array<string, mixed> $result Import result.
+	 * @return list<string>
+	 */
+	public static function skipped_lines( string $source, array $result ): array {
+		return match ( $source ) {
+			'wpml'     => WpmlImporter::skipped_lines( $result ),
+			'polylang' => PolylangImporter::skipped_lines( $result ),
+			default    => [],
+		};
+	}
+
+	/**
 	 * Run the source's importer.
 	 *
 	 * @param string       $source           Source.
@@ -308,11 +324,21 @@ final class MigrationRunner {
 
 		$result = $importer->import();
 
-		$result['errors']    = array_merge( SourcePreflight::messages( $preflight ), (array) ( $result['errors'] ?? [] ) );
+		// A Polylang run keeps its failures in `errors` and the language
+		// check's findings with its other notices.
+		if ( $source === 'polylang' ) {
+			$result['notices'] = array_merge( SourcePreflight::messages( $preflight ), (array) ( $result['notices'] ?? [] ) );
+		} else {
+			$result['errors'] = array_merge( SourcePreflight::messages( $preflight ), (array) ( $result['errors'] ?? [] ) );
+		}
+
 		$result['blocked']   = false;
 		$result['preflight'] = $preflight;
 
-		if ( array_filter( $preflight['map'], static fn( $slug ): bool => $slug !== null ) !== [] ) {
+		// Only a finished run marks the source imported: a run whose reads
+		// failed may have written nothing, and the first-import checks must
+		// still apply to the rerun.
+		if ( empty( $result['incomplete'] ) && array_filter( $preflight['map'], static fn( $slug ): bool => $slug !== null ) !== [] ) {
 			MigrationState::mark_imported( $source );
 		}
 

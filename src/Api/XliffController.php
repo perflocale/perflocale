@@ -25,6 +25,21 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class XliffController extends RestController {
 
 	/**
+	 * Posts loaded per statement by export_permissions_check().
+	 *
+	 * @var int
+	 */
+	private const PERMISSION_CHUNK = 100;
+
+	/**
+	 * Export requests whose post check passed: the user and post IDs it
+	 * passed for, by request.
+	 *
+	 * @var \WeakMap<\WP_REST_Request, array{0: int, 1: string}>|null
+	 */
+	private static ?\WeakMap $export_allowed = null;
+
+	/**
 	 * Register routes.
 	 *
 	 * @return void
@@ -101,18 +116,43 @@ final class XliffController extends RestController {
 		}
 
 		$post_ids = array_map( 'absint', (array) $request->get_param( 'post_ids' ) );
+		$checked  = [ get_current_user_id(), implode( ',', $post_ids ) ];
+
+		// Core runs this check again after the handler, for the response's
+		// Allow header (rest_send_allow_header()). The export released its
+		// posts by then, so the same request, user and posts are answered
+		// from the first check instead of loading every post again.
+		self::$export_allowed ??= new \WeakMap();
+
+		if ( ( self::$export_allowed[ $request ] ?? null ) === $checked ) {
+			return true;
+		}
+
 		// Empty/missing post_ids is a missing-params 400 from the handler;
 		// don't pre-empt it here. Only enforce edit_post on the IDs the
 		// caller did supply.
-		foreach ( $post_ids as $pid ) {
-			if ( $pid > 0 && ! current_user_can( 'edit_post', $pid ) ) {
-				return new \WP_Error(
-					'rest_forbidden',
-					__( 'You do not have permission to export one or more of the specified posts.', 'perflocale' ),
-					[ 'status' => 403 ]
-				);
+		// current_user_can( 'edit_post' ) loads the post, so each chunk's
+		// posts are loaded in one query before its checks. A refused post
+		// ends the check before the next chunk is loaded.
+		foreach ( array_chunk( $post_ids, self::PERMISSION_CHUNK ) as $chunk ) {
+			$ids = array_values( array_filter( $chunk ) );
+
+			if ( $ids !== [] && function_exists( '_prime_post_caches' ) ) {
+				_prime_post_caches( $ids, false, false );
+			}
+
+			foreach ( $chunk as $pid ) {
+				if ( $pid > 0 && ! current_user_can( 'edit_post', $pid ) ) {
+					return new \WP_Error(
+						'rest_forbidden',
+						__( 'You do not have permission to export one or more of the specified posts.', 'perflocale' ),
+						[ 'status' => 403 ]
+					);
+				}
 			}
 		}
+
+		self::$export_allowed[ $request ] = $checked;
 
 		return true;
 	}

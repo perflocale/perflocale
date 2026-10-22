@@ -85,7 +85,10 @@ final class PerfLocaleBeaverBuilder implements \PerfLocale\Addon\AddonInterface 
 			return;
 		}
 
-		require_once __DIR__ . '/modules/language-switcher/language-switcher.php';
+		// Labels only where Beaver Builder shows them; see language-switcher-source.php.
+		$labels = ( ( isset( $_GET['fl_builder'] ) || isset( $_POST['fl_builder_data'] ) ) && is_user_logged_in() ) || \PerfLocale\Helper::shows_registration_labels(); // phpcs:ignore WordPress.Security.NonceVerification -- request type only.
+
+		require_once __DIR__ . '/modules/language-switcher/' . ( $labels ? 'language-switcher.php' : 'language-switcher-source.php' );
 	}
 
 	/**

@@ -562,7 +562,11 @@ final class Breaker {
 	 *
 	 * The row stores `count:last_failure_ts`, so the SQL can compare the
 	 * stored timestamp against the window and either restart at 1 or add
-	 * one, atomically, with no read-modify-write in PHP.
+	 * one, atomically, with no read-modify-write in PHP. The two parts are cut
+	 * at the first `:` with INSTR() and SUBSTR(), which MySQL, MariaDB and the
+	 * SQLite Database Integration all run; SUBSTRING_INDEX() is MySQL-only.
+	 * The sum inside CONCAT() is parenthesised: the SQLite integration turns
+	 * CONCAT() into `||`, which binds tighter than `+`.
 	 *
 	 * Deliberately NOT autoloaded: read only after a call has already
 	 * failed, never on the hot `is_open()` path.
@@ -595,10 +599,10 @@ final class Breaker {
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
 				 VALUES (%s, %s, 'no')
 				 ON DUPLICATE KEY UPDATE option_value = IF(
-					 %d - CAST(SUBSTRING_INDEX(option_value, ':', -1) AS UNSIGNED) > %d,
+					 %d - CAST(CASE WHEN INSTR(option_value, ':') > 0 THEN SUBSTR(option_value, INSTR(option_value, ':') + 1) ELSE option_value END AS UNSIGNED) > %d,
 					 %s,
 					 CONCAT(
-						 CAST(SUBSTRING_INDEX(option_value, ':', 1) AS UNSIGNED) + 1,
+						 ( CAST(CASE WHEN INSTR(option_value, ':') > 0 THEN SUBSTR(option_value, 1, INSTR(option_value, ':') - 1) ELSE option_value END AS UNSIGNED) + 1 ),
 						 ':',
 						 %d
 					 )

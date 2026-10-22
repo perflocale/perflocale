@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin;
 
+use PerfLocale\Database\DataRegistry;
 use PerfLocale\Database\Schema;
 use PerfLocale\Settings;
 
@@ -46,30 +47,6 @@ final class PrivacyIntegration {
 	 * export.
 	 */
 	private const EXPORT_JOBS_PER_PAGE = 200;
-
-	/**
-	 * Per-user meta keys PerfLocale stores. Used by both the exporter (to
-	 * surface them to the data subject) and the eraser (to delete them).
-	 *
-	 * These are admin-UI preferences keyed to the user's ID:
-	 *   - hidden_langs: which language columns the user has hidden on the
-	 *     Strings / Translations admin tables.
-	 *   - per_page: the user's chosen items-per-page on each list table
-	 *     (Screen Options).
-	 *
-	 * Public so {@see \PerfLocale\Database\SiteCleanup} can reuse the same
-	 * list on full uninstall - keeping the two flows from drifting apart
-	 * silently when a new admin-UI preference is added.
-	 *
-	 * @var array<int, string>
-	 */
-	public const USER_META_KEYS = [
-		'perflocale_strings_hidden_langs',
-		'perflocale_translations_hidden_langs',
-		'perflocale_strings_per_page',
-		'perflocale_translations_per_page',
-		'perflocale_languages_per_page',
-	];
 
 	/**
 	 * Settings instance.
@@ -160,7 +137,9 @@ final class PrivacyIntegration {
 		if ( 1 === $page ) {
 			$meta_fields = [];
 
-			foreach ( self::USER_META_KEYS as $meta_key ) {
+			// The admin-UI preferences keyed to the user's ID (hidden language
+			// columns, items per page): the registry's user-meta entries.
+			foreach ( DataRegistry::user_meta_keys() as $meta_key ) {
 				$value = get_user_meta( (int) $user->ID, $meta_key, true );
 
 				if ( $value === '' || $value === [] || $value === null ) {
@@ -278,7 +257,7 @@ final class PrivacyIntegration {
 		// state, no shared-history concern. Runs even when step 1 failed.
 		$meta_deleted = 0;
 
-		foreach ( self::USER_META_KEYS as $meta_key ) {
+		foreach ( DataRegistry::user_meta_keys() as $meta_key ) {
 			if ( delete_user_meta( (int) $user->ID, $meta_key ) ) {
 				++$meta_deleted;
 			}

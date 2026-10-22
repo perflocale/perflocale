@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin\Pages;
 
+use PerfLocale\Database\DataRegistry;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -44,6 +45,14 @@ final class SettingsPage {
 	 * @var array<string, string>
 	 */
 	private array $tabs = [];
+
+	/**
+	 * Sync Fields entries the last {@see merge_sync_fields()} left out
+	 * because they are the plugin's own meta keys.
+	 *
+	 * @var array<int, string>
+	 */
+	private static array $refused_sync_fields = [];
 
 	/**
 	 * Constructor.
@@ -163,6 +172,9 @@ final class SettingsPage {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
 		$address_refused = isset( $_GET['mt-address-refused'] );
 
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$sync_refused = isset( $_GET['sync-refused'] ) && is_string( $_GET['sync-refused'] ) ? array_filter( array_map( 'trim', explode( ',', sanitize_text_field( wp_unslash( $_GET['sync-refused'] ) ) ) ) ) : [];
+
 		?>
 		<div class="wrap perflocale-settings">
 			<h1><?php echo esc_html__( 'PerfLocale Settings', 'perflocale' ); ?></h1>
@@ -176,6 +188,21 @@ final class SettingsPage {
 				<?php // A save that wpdb refused. It reported success before this existed. ?>
 				<div class="notice notice-error is-dismissible">
 					<p><?php echo esc_html__( 'Settings could not be saved. The database refused the write, which usually means one value is too long for its column or contains characters it cannot store. Your previous settings are unchanged.', 'perflocale' ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( [] !== $sync_refused ) : ?>
+				<?php // Sync Fields entries merge_sync_fields() left out: the plugin's own meta keys. ?>
+				<div class="notice notice-warning is-dismissible">
+					<p>
+						<?php
+						printf(
+							/* translators: %s: comma-separated list of meta keys. */
+							esc_html__( 'Not added to Sync Fields: %s. PerfLocale keeps these fields per post and never syncs them between translations.', 'perflocale' ),
+							wp_kses( implode( ', ', array_map( static fn( string $key ): string => '<code>' . esc_html( $key ) . '</code>', $sync_refused ) ), [ 'code' => [] ] )
+						);
+						?>
+					</p>
 				</div>
 			<?php endif; ?>
 
@@ -1439,21 +1466,6 @@ final class SettingsPage {
 		$cookie_lifetime       = (int) $this->settings->get( 'cookie_lifetime' );
 		$excluded_paths        = $this->settings->get_excluded_paths();
 
-		// Inline script: GeoIP provider toggle.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var geo = document.getElementById(\'perflocale-geo-enabled\');' .
-				'if(!geo) return;' .
-				'function toggle(){' .
-					'var on = geo.checked;' .
-					'document.querySelectorAll(\'.perflocale-geo-field\').forEach(function(tr){ tr.style.display = on ? \'\' : \'none\'; });' .
-				'}' .
-				'geo.addEventListener(\'change\', toggle);' .
-				'toggle();' .
-			'})();'
-		);
-
 		?>
 		<tr>
 			<th scope="row"><?php echo esc_html__( 'URL Mode', 'perflocale' ); ?></th>
@@ -1979,7 +1991,26 @@ final class SettingsPage {
 			? array_filter( array_map( 'sanitize_text_field', array_map( 'trim', explode( "\n", sanitize_textarea_field( wp_unslash( $_POST['custom_sync_meta'] ) ) ) ) ) )
 			: [];
 
-		return array_values( array_unique( array_merge( $checkbox_fields, $custom_meta ) ) );
+		$fields = array_values( array_unique( array_merge( $checkbox_fields, $custom_meta ) ) );
+
+		// The plugin's own meta keys (the data registry's post-meta entries
+		// with sync `never`, and any key of its `_perflocale_` namespace that
+		// no entry lets Sync Fields list) describe one post each: mirrored,
+		// a sibling would take over another post's diagnostics, marks or
+		// per-language texts. They are left out and named on the screen.
+		self::$refused_sync_fields = array_values( array_filter( $fields, [ DataRegistry::class, 'is_never_sync_meta' ] ) );
+
+		return array_values( array_diff( $fields, self::$refused_sync_fields ) );
+	}
+
+	/**
+	 * Sync Fields entries the last settings save left out because they are
+	 * the plugin's own meta keys.
+	 *
+	 * @return array<int, string>
+	 */
+	public static function last_refused_sync_fields(): array {
+		return self::$refused_sync_fields;
 	}
 
 	/**
@@ -2118,259 +2149,32 @@ final class SettingsPage {
 		$builtin_keys     = array_keys( $available_sync_fields );
 		$custom_sync_meta = array_filter( $sync_fields, fn( $f ) => ! in_array( $f, $builtin_keys, true ) );
 
-		// Inline script: Create taxonomy translations AJAX.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleTranslationData = ' . wp_json_encode(
-				[
-					'taxNonce'         => wp_create_nonce( 'perflocale_create_taxonomy_translations' ),
-					'postLangNonce'    => wp_create_nonce( 'perflocale_assign_post_languages' ),
-					'genTrNonce'       => wp_create_nonce( 'perflocale_generate_missing_translations' ),
-					'i18nCreating'     => __( 'Creating taxonomy translations...', 'perflocale' ),
-					'i18nAssigning'    => __( 'Assigning default language to unlinked posts...', 'perflocale' ),
-					'i18nFailed'       => __( 'Failed', 'perflocale' ),
-					'i18nFailedDot'    => __( 'Failed.', 'perflocale' ),
-					'i18nDone'         => __( 'Done', 'perflocale' ),
-					'i18nTaxonomy'     => __( 'Taxonomy', 'perflocale' ),
-					'i18nPostType'     => __( 'Post type', 'perflocale' ),
-					'i18nCreated'      => __( 'Created', 'perflocale' ),
-					'i18nExisted'      => __( 'Existed', 'perflocale' ),
-					'i18nAssigned'     => __( 'Assigned', 'perflocale' ),
-					'i18nNetworkError' => __( 'Network error', 'perflocale' ),
-				],
-				JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-			) . ';',
-			'before'
-		);
+		// The three bulk tools below (Create Taxonomy Translations, Assign
+		// Default Language, Generate Missing Translations): settings-bulk-tools.js,
+		// on top of the shared request helper window.perflocaleBulkFetch
+		// (admin-bulk-fetch.js). Enqueued here, so only this tab loads them.
+		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-admin-bulk-fetch', 'admin-bulk-fetch.js' );
+		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-settings-bulk-tools', 'settings-bulk-tools.js', [ 'perflocale-admin-bulk-fetch' ] );
 
-		// Shared request helper of the bulk tools below (window.perflocaleBulkFetch).
-		// The tools call it only from their click handlers, so it is defined
-		// before any call wherever the footer prints it.
-		wp_enqueue_script(
-			'perflocale-admin-bulk-fetch',
-			PERFLOCALE_URL . 'assets/js/admin-bulk-fetch.js',
-			[],
-			PERFLOCALE_VERSION,
-			true
-		);
-
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var btn = document.getElementById(\'perflocale-create-tax-translations\');' .
-				'if ( ! btn ) return;' .
-				'var d = perflocaleTranslationData;' .
-				'var esc = function( s ) { return String( s ).replace( /&/g, \'&amp;\' ).replace( /</g, \'&lt;\' ).replace( />/g, \'&gt;\' ).replace( /"/g, \'&quot;\' ).replace( /\'/g, \'&#39;\' ); };' .
-				'btn.addEventListener(\'click\', function() {' .
-					'var st = {};' .
-					'var progress = document.getElementById(\'perflocale-tax-progress\');' .
-					'var bar = document.getElementById(\'perflocale-tax-bar\');' .
-					'var status = document.getElementById(\'perflocale-tax-status\');' .
-					'var percent = document.getElementById(\'perflocale-tax-percent\');' .
-					'var result = document.getElementById(\'perflocale-tax-result\');' .
-					'btn.disabled = true;' .
-					'if ( progress ) progress.style.display = \'block\';' .
-					'if ( bar ) { bar.style.width = \'0\'; bar.style.background = \'#2271b1\'; }' .
-					'if ( status ) status.textContent = d.i18nCreating;' .
-					'if ( percent ) percent.textContent = \'\';' .
-					'if ( result ) result.innerHTML = \'\';' .
-					'var pct = 0;' .
-					'var pInterval = setInterval(function() {' .
-						'pct = Math.min(pct + Math.random() * 8, 90);' .
-						'if ( bar ) bar.style.width = pct + \'%\';' .
-						'if ( percent ) percent.textContent = Math.round(pct) + \'%\';' .
-					'}, 400);' .
-					'var cursorTax = 0, cursorOffset = 0;' .
-					'var run = function() {' .
-					'var data = new FormData();' .
-					'data.append(\'action\', \'perflocale_create_taxonomy_translations\');' .
-					'data.append(\'_nonce\', d.taxNonce);' .
-					'data.append(\'tax_index\', cursorTax);' .
-					'data.append(\'term_offset\', cursorOffset);' .
-					'perflocaleBulkFetch(data, st)' .
-						'.then(function(resp) {' .
-							'clearInterval(pInterval);' .
-							'if ( bar ) bar.style.width = \'100%\';' .
-							'if ( percent ) percent.textContent = \'100%\';' .
-							'btn.disabled = false;' .
-							'if ( ! resp.success ) {' .
-								'if ( bar ) bar.style.background = \'#d63638\';' .
-								'if ( status ) status.textContent = d.i18nFailed;' .
-								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc(resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
-								'return;' .
-							'}' .
-							'if ( resp.data && resp.data.more ) {' .
-								'cursorTax = resp.data.tax_index; cursorOffset = resp.data.term_offset;' .
-								'if ( status ) status.textContent = resp.data.message || d.i18nCreating;' .
-								'pct = 0;' .
-								'pInterval = setInterval(function() { pct = Math.min(pct + Math.random() * 10, 90);' .
-									'if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
-								'btn.disabled = true;' .
-								'run();' .
-								'return;' .
-							'}' .
-							'if ( bar ) bar.style.background = \'#00a32a\';' .
-							'if ( status ) status.textContent = resp.data.message || d.i18nDone;' .
-							'var details = resp.data.taxonomy_details;' .
-							'if ( details && details.length ) {' .
-								'var html = \'<table class="widefat striped" style="max-width:420px;margin-top:6px;">\';' .
-								'html += \'<thead><tr><th style="padding:6px 8px;">\' + esc(d.i18nTaxonomy) + \'</th>\';' .
-								'html += \'<th style="padding:6px 8px;text-align:center;">\' + esc(d.i18nCreated) + \'</th>\';' .
-								'html += \'<th style="padding:6px 8px;text-align:center;">\' + esc(d.i18nExisted) + \'</th></tr></thead><tbody>\';' .
-								'details.forEach(function(row) {' .
-									'html += \'<tr><td style="padding:4px 8px;">\' + esc(row.taxonomy) + \'</td>\';' .
-									'html += \'<td style="padding:4px 8px;text-align:center;color:#00a32a;font-weight:500;">\' + esc(row.created) + \'</td>\';' .
-									'html += \'<td style="padding:4px 8px;text-align:center;color:#6b7280;">\' + esc(row.skipped) + \'</td></tr>\';' .
-								'});' .
-								'html += \'</tbody></table>\';' .
-								'if ( result ) result.innerHTML = html;' .
-							'}' .
-						'})' .
-						'.catch(function() {' .
-							'clearInterval(pInterval);' .
-							'if ( bar ) { bar.style.width = \'100%\'; bar.style.background = \'#d63638\'; }' .
-							'if ( status ) status.textContent = d.i18nNetworkError;' .
-							'if ( percent ) percent.textContent = \'\';' .
-							'btn.disabled = false;' .
-						'});' .
-					'};' .
-					'run();' .
-				'});' .
-			'})();'
-		);
-
-		// Inline script: Assign default language to unlinked posts/pages.
-		// Same progress-bar pattern as taxonomy button but wires a different
-		// AJAX action + UI nodes.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var btn = document.getElementById(\'perflocale-assign-post-langs\');' .
-				'if ( ! btn ) return;' .
-				'var d = perflocaleTranslationData;' .
-				'var esc = function( s ) { return String( s ).replace( /&/g, \'&amp;\' ).replace( /</g, \'&lt;\' ).replace( />/g, \'&gt;\' ).replace( /"/g, \'&quot;\' ).replace( /\'/g, \'&#39;\' ); };' .
-				'btn.addEventListener(\'click\', function() {' .
-					'var st = {};' .
-					'var progress = document.getElementById(\'perflocale-postlang-progress\');' .
-					'var bar = document.getElementById(\'perflocale-postlang-bar\');' .
-					'var status = document.getElementById(\'perflocale-postlang-status\');' .
-					'var percent = document.getElementById(\'perflocale-postlang-percent\');' .
-					'var result = document.getElementById(\'perflocale-postlang-result\');' .
-					'btn.disabled = true;' .
-					'if ( progress ) progress.style.display = \'block\';' .
-					'if ( bar ) { bar.style.width = \'0\'; bar.style.background = \'#2271b1\'; }' .
-					'if ( status ) status.textContent = d.i18nAssigning;' .
-					'if ( percent ) percent.textContent = \'\';' .
-					'if ( result ) result.innerHTML = \'\';' .
-					'var pct = 0;' .
-					'var pInterval = setInterval(function() {' .
-						'pct = Math.min(pct + Math.random() * 10, 90);' .
-						'if ( bar ) bar.style.width = pct + \'%\';' .
-						'if ( percent ) percent.textContent = Math.round(pct) + \'%\';' .
-					'}, 400);' .
-					'var run = function() {' .
-					'var data = new FormData();' .
-					'data.append(\'action\', \'perflocale_assign_post_languages\');' .
-					'data.append(\'_nonce\', d.postLangNonce);' .
-					'perflocaleBulkFetch(data, st)' .
-						'.then(function(resp) {' .
-							'clearInterval(pInterval);' .
-							'if ( bar ) bar.style.width = \'100%\';' .
-							'if ( percent ) percent.textContent = \'100%\';' .
-							'btn.disabled = false;' .
-							'if ( ! resp.success ) {' .
-								'if ( bar ) bar.style.background = \'#d63638\';' .
-								'if ( status ) status.textContent = d.i18nFailed;' .
-								'if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc(resp.data && resp.data.message ? resp.data.message : d.i18nFailedDot) + \'</p>\';' .
-								'return;' .
-							'}' .
-								'if ( resp.data && resp.data.remaining > 0 ) {' .
-									'if ( status ) status.textContent = resp.data.message || d.i18nAssigning;' .
-									'pct = 0;' .
-									'pInterval = setInterval(function() { pct = Math.min(pct + Math.random() * 10, 90);' .
-										'if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
-									'btn.disabled = true;' .
-									'run();' .
-									'return;' .
-								'}' .
-							'if ( bar ) bar.style.background = \'#00a32a\';' .
-							'if ( status ) status.textContent = resp.data.message || d.i18nDone;' .
-							'var details = resp.data.post_type_details;' .
-							'if ( details && details.length ) {' .
-								'var html = \'<table class="widefat striped" style="max-width:420px;margin-top:6px;">\';' .
-								'html += \'<thead><tr><th style="padding:6px 8px;">\' + esc(d.i18nPostType) + \'</th>\';' .
-								'html += \'<th style="padding:6px 8px;text-align:center;">\' + esc(d.i18nAssigned) + \'</th></tr></thead><tbody>\';' .
-								'details.forEach(function(row) {' .
-									'html += \'<tr><td style="padding:4px 8px;">\' + esc(row.post_type) + \'</td>\';' .
-									'html += \'<td style="padding:4px 8px;text-align:center;color:#00a32a;font-weight:500;">\' + esc(row.assigned) + \'</td></tr>\';' .
-								'});' .
-								'html += \'</tbody></table>\';' .
-								'if ( result ) result.innerHTML = html;' .
-							'}' .
-						'})' .
-						'.catch(function() {' .
-							'clearInterval(pInterval);' .
-							'if ( bar ) { bar.style.width = \'100%\'; bar.style.background = \'#d63638\'; }' .
-							'if ( status ) status.textContent = d.i18nNetworkError;' .
-							'if ( percent ) percent.textContent = \'\';' .
-							'btn.disabled = false;' .
-						'});' .
-					'};' .
-					'run();' .
-				'});' .
-			'})();'
-		);
-
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var btn = document.getElementById(\'perflocale-generate-translations\');' .
-				'if ( ! btn ) return;' .
-				'var d = perflocaleTranslationData;' .
-				'var esc = function( s ) { return String( s ).replace( /&/g, \'&amp;\' ).replace( /</g, \'&lt;\' ).replace( />/g, \'&gt;\' ).replace( /"/g, \'&quot;\' ).replace( /\'/g, \'&#39;\' ); };' .
-				'var wrap = document.getElementById(\'perflocale-gentr-progress\');' .
-				'var bar = document.getElementById(\'perflocale-gentr-bar\');' .
-				'var status = document.getElementById(\'perflocale-gentr-status\');' .
-				'var percent = document.getElementById(\'perflocale-gentr-percent\');' .
-				'var result = document.getElementById(\'perflocale-gentr-result\');' .
-				'btn.addEventListener(\'click\', function() {' .
-					'var cursorType = 0, cursorOffset = 0, pInterval = null, pct = 0, st = {};' .
-					'var post = function( extra ) {' .
-						'var data = new FormData();' .
-						'data.append(\'action\', \'perflocale_generate_missing_translations\');' .
-						'data.append(\'_nonce\', d.genTrNonce);' .
-						'Object.keys(extra).forEach(function(k){ data.append(k, extra[k]); });' .
-						'return perflocaleBulkFetch(data, st);' .
-					'};' .
-					// ⭐ COUNT FIRST. This creates posts; the operator sees the
-					// scale and agrees to it before anything is written.
-					'btn.disabled = true;' .
-					'if ( result ) result.innerHTML = \'\';' .
-					'post({ mode: \'count\' }).then(function(resp){' .
-						'btn.disabled = false;' .
-						'if ( ! resp.success ) { if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc((resp.data && resp.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
-						'if ( ! resp.data.max ) { if ( result ) result.innerHTML = \'<p style="margin:0;">\' + esc(resp.data.message) + \'</p>\'; return; }' .
-						'if ( ! window.confirm( resp.data.message ) ) { return; }' .
-						'btn.disabled = true;' .
-						'if ( wrap ) wrap.style.display = \'block\';' .
-						'if ( bar ) { bar.style.width = \'0\'; bar.style.background = \'#2271b1\'; }' .
-						'if ( status ) status.textContent = d.i18nCreating;' .
-						'pInterval = setInterval(function(){ pct = Math.min(pct + Math.random() * 10, 90); if ( bar ) bar.style.width = pct + \'%\'; if ( percent ) percent.textContent = Math.round(pct) + \'%\'; }, 400);' .
-						'var run = function() {' .
-							'post({ type_index: cursorType, post_offset: cursorOffset }).then(function(r2){' .
-								'if ( ! r2.success ) { clearInterval(pInterval); btn.disabled = false; if ( bar ) bar.style.background = \'#d63638\'; if ( status ) status.textContent = d.i18nFailed; if ( result ) result.innerHTML = \'<p style="color:#d63638;margin:0;">\' + esc((r2.data && r2.data.message) || d.i18nFailedDot) + \'</p>\'; return; }' .
-								'if ( r2.data.more ) { cursorType = r2.data.type_index; cursorOffset = r2.data.post_offset; if ( status ) status.textContent = r2.data.message; run(); return; }' .
-								'clearInterval(pInterval);' .
-								'if ( bar ) { bar.style.width = \'100%\'; bar.style.background = \'#00a32a\'; }' .
-								'if ( percent ) percent.textContent = \'100%\';' .
-								'btn.disabled = false;' .
-								'if ( status ) status.textContent = r2.data.message || d.i18nDone;' .
-							'}).catch(function(){ clearInterval(pInterval); btn.disabled = false; if ( bar ) bar.style.background = \'#d63638\'; if ( status ) status.textContent = d.i18nNetworkError; });' .
-						'};' .
-						'run();' .
-					'}).catch(function(){ btn.disabled = false; if ( status ) status.textContent = d.i18nNetworkError; });' .
-				'});' .
-			'})();'
+		wp_localize_script(
+			'perflocale-settings-bulk-tools',
+			'perflocaleTranslationData',
+			[
+				'taxNonce'         => wp_create_nonce( 'perflocale_create_taxonomy_translations' ),
+				'postLangNonce'    => wp_create_nonce( 'perflocale_assign_post_languages' ),
+				'genTrNonce'       => wp_create_nonce( 'perflocale_generate_missing_translations' ),
+				'i18nCreating'     => __( 'Creating taxonomy translations...', 'perflocale' ),
+				'i18nAssigning'    => __( 'Assigning default language to unlinked posts...', 'perflocale' ),
+				'i18nFailed'       => __( 'Failed', 'perflocale' ),
+				'i18nFailedDot'    => __( 'Failed.', 'perflocale' ),
+				'i18nDone'         => __( 'Done', 'perflocale' ),
+				'i18nTaxonomy'     => __( 'Taxonomy', 'perflocale' ),
+				'i18nPostType'     => __( 'Post type', 'perflocale' ),
+				'i18nCreated'      => __( 'Created', 'perflocale' ),
+				'i18nExisted'      => __( 'Existed', 'perflocale' ),
+				'i18nAssigned'     => __( 'Assigned', 'perflocale' ),
+				'i18nNetworkError' => __( 'Network error', 'perflocale' ),
+			]
 		);
 
 		?>
@@ -3786,24 +3590,28 @@ final class SettingsPage {
 
 	/**
 	 * Render the import outcome the Export & Import handlers redirect back
-	 * with. Printed in the page's notice area, above the tab strip, where
+	 * with (ImportNotice: a record of this user's, named by the redirect's
+	 * token). Printed in the page's notice area, above the tab strip, where
 	 * WordPress's admin script would otherwise move it after first paint.
 	 *
 	 * @return void
 	 */
 	private function render_import_notices(): void {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$import_result = isset( $_GET['import_result'] ) ? sanitize_text_field( wp_unslash( $_GET['import_result'] ) ) : '';
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$import_error = isset( $_GET['import_error'] ) ? sanitize_text_field( wp_unslash( $_GET['import_error'] ) ) : '';
+		$notice  = \PerfLocale\Admin\ImportNotice::take();
+		$type    = $notice['type'] ?? '';
+		$message = $notice['message'] ?? '';
 		?>
 
-		<?php if ( $import_result !== '' ) : ?>
-			<div class="notice notice-success" style="margin:16px 0 8px;"><p><?php echo esc_html( $import_result ); ?></p></div>
+		<?php if ( 'success' === $type ) : ?>
+			<div class="notice notice-success" style="margin:16px 0 8px;"><p><?php echo esc_html( $message ); ?></p></div>
 		<?php endif; ?>
 
-		<?php if ( $import_error !== '' ) : ?>
-			<div class="notice notice-error" style="margin:16px 0 8px;"><p><?php echo esc_html( $import_error ); ?></p></div>
+		<?php if ( 'warning' === $type ) : ?>
+			<div class="notice notice-warning" style="margin:16px 0 8px;"><p><strong><?php esc_html_e( 'Needs attention:', 'perflocale' ); ?></strong> <?php echo esc_html( $message ); ?></p></div>
+		<?php endif; ?>
+
+		<?php if ( 'error' === $type ) : ?>
+			<div class="notice notice-error" style="margin:16px 0 8px;"><p><?php echo esc_html( $message ); ?></p></div>
 		<?php endif; ?>
 		<?php
 	}
@@ -3884,6 +3692,48 @@ final class SettingsPage {
 	}
 
 	/**
+	 * The export section's label as the screen shows it, translated. The
+	 * data registry holds the English label (it is pure data, loaded without
+	 * WordPress); a section this list does not know shows the registry's.
+	 *
+	 * @param string $key   Section key.
+	 * @param string $label The registry's label.
+	 * @return string
+	 */
+	public static function export_section_label( string $key, string $label ): string {
+		switch ( $key ) {
+			case 'settings':
+				return __( 'Settings', 'perflocale' );
+			case 'roles':
+				return __( 'Roles & Capabilities', 'perflocale' );
+			case 'languages':
+				return __( 'Languages', 'perflocale' );
+			case 'translations':
+				return __( 'Translation Links', 'perflocale' );
+			case 'strings':
+				return __( 'String Translations', 'perflocale' );
+			case 'slugs':
+				return __( 'Slug Translations', 'perflocale' );
+			case 'hashes':
+				return __( 'Content Hashes', 'perflocale' );
+			case 'media':
+				/* translators: export section: per-language alt text, captions, descriptions and featured-image overrides. */
+				return __( 'Media', 'perflocale' );
+			case 'menus':
+				/* translators: export section: classic menus' languages and their pairing. */
+				return __( 'Menus', 'perflocale' );
+			case 'item_flags':
+				/* translators: export section: per-post sync opt-out and SEO-exclude flags, the order language. */
+				return __( 'Item flags', 'perflocale' );
+			case 'addon_data':
+				/* translators: export section: data add-ons store, for example Gravity Forms translations. */
+				return __( 'Add-on data', 'perflocale' );
+			default:
+				return $label;
+		}
+	}
+
+	/**
 	 * Render the Export & Import tab.
 	 *
 	 * @return void
@@ -3895,41 +3745,41 @@ final class SettingsPage {
 		$wpml_available           = ( new \PerfLocale\Migration\WpmlImporter( $cache ) )->can_import();
 		$polylang_available       = ( new \PerfLocale\Migration\PolylangImporter( $cache ) )->can_import();
 		$translatepress_available = ( new \PerfLocale\Migration\TranslatePressImporter( $cache ) )->can_import();
-		$sections                 = \PerfLocale\Admin\DataExporter::SECTIONS;
+		$sections                 = \PerfLocale\Admin\DataExporter::sections();
+		$addon_groups             = \PerfLocale\Admin\DataExporter::addon_groups();
 
 		// The ceiling an operator will actually hit, named on the import form
 		// so the limit is visible BEFORE a doomed upload rather than only after
 		// it - the same pair of ceilings StringsPage names on the PO form, and
 		// the smaller one binds: what PHP will accept
 		// (`AdminController::max_upload_bytes()`, the one that binds on every
-		// stock host) and what the importer will read back whole
-		// (`AdminController::import_max_bytes()`, the ceiling
-		// AdminController's own gate applies). One admin-page-only call to
-		// each; nothing on the front end.
-		$import_ceiling = \PerfLocale\Admin\AdminController::format_bytes(
-			min(
-				\PerfLocale\Admin\AdminController::max_upload_bytes(),
-				\PerfLocale\Admin\AdminController::import_max_bytes()
-			)
+		// stock host) and the importer's own ceiling
+		// (`AdminController::import_max_bytes()`, the one AdminController's
+		// gate applies). One admin-page-only call to each; nothing on the
+		// front end.
+		// A file larger than PHP accepts in one request is sent in pieces
+		// (assets/js/import-upload.js, ImportUpload), so the ceiling the
+		// screen names is the importer's own; the PHP limit decides only
+		// whether a file goes in one request or in pieces.
+		$single_request_bytes = \PerfLocale\Admin\AdminController::max_upload_bytes();
+		$import_ceiling_bytes = \PerfLocale\Admin\AdminController::import_max_bytes();
+		$import_ceiling       = \PerfLocale\Admin\AdminController::format_bytes( $import_ceiling_bytes );
+
+		/* translators: %d: percentage of the file uploaded so far. */
+		$upload_progress_msg = __( 'Uploading the file in pieces: %d%%', 'perflocale' );
+		/* translators: %s: the reason the upload stopped. */
+		$upload_failed_msg  = __( 'The upload stopped and nothing was imported: %s', 'perflocale' );
+		$upload_network_msg = __( 'the connection to the server was lost.', 'perflocale' );
+		$upload_piece_msg   = sprintf(
+			/* translators: %s: the smallest piece the screen sends, e.g. "256 KB". "wp perflocale import" is a command and stays in English. */
+			__( 'the server refused a piece of %s as too large. Ask your host to accept larger uploads, or import the file with WP-CLI: wp perflocale import <file>.', 'perflocale' ),
+			\PerfLocale\Admin\AdminController::format_bytes( \PerfLocale\Admin\ImportUpload::MIN_PIECE )
 		);
 
-		// Inline script: Export checkboxes select-all.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'var allCb = document.getElementById(\'perflocale-export-all\');' .
-				'var boxes = document.querySelectorAll(\'.perflocale-export-section\');' .
-				'if(!allCb)return;' .
-				'allCb.addEventListener(\'change\',function(){' .
-					'boxes.forEach(function(cb){cb.checked=allCb.checked;});' .
-				'});' .
-				'boxes.forEach(function(cb){' .
-					'cb.addEventListener(\'change\',function(){' .
-						'allCb.checked=[].every.call(boxes,function(c){return c.checked;});' .
-					'});' .
-				'});' .
-			'})();'
-		);
+		// A full export larger than the import ceiling cannot come back
+		// through this screen; say so before the operator relies on it as a
+		// backup. Two queries per table, on this tab only.
+		$export_estimate = ( new \PerfLocale\Admin\DataExporter() )->estimate_bytes();
 
 		?>
 
@@ -3943,6 +3793,7 @@ final class SettingsPage {
 				<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=export-import' ) ); ?>" style="margin-top:8px;">
 					<?php wp_nonce_field( 'perflocale_export_data' ); ?>
 					<input type="hidden" name="perflocale_action" value="export">
+					<input type="hidden" name="export_addon_groups_shown" value="1">
 					<fieldset style="margin-bottom:12px;">
 						<label style="display:block;margin-bottom:4px;">
 							<input type="checkbox" id="perflocale-export-all" checked>
@@ -3952,7 +3803,13 @@ final class SettingsPage {
 							<?php foreach ( $sections as $key => $section ) : ?>
 								<label>
 									<input type="checkbox" name="export_sections[]" value="<?php echo esc_attr( $key ); ?>" class="perflocale-export-section" checked>
-									<?php echo esc_html( $section['label'] ); ?>
+									<?php echo esc_html( self::export_section_label( (string) $key, (string) $section['label'] ) ); ?>
+								</label>
+							<?php endforeach; ?>
+							<?php foreach ( $addon_groups as $group_key => $group_label ) : ?>
+								<label>
+									<input type="checkbox" name="export_addon_groups[]" value="<?php echo esc_attr( $group_key ); ?>" class="perflocale-export-section" checked>
+									<?php echo esc_html( $group_label ); ?>
 								</label>
 							<?php endforeach; ?>
 						</div>
@@ -3960,6 +3817,20 @@ final class SettingsPage {
 							<?php echo esc_html__( 'Keep "Languages" selected whenever the export includes Translation Links, String Translations or Slug Translations. Those rows name their language by its numeric ID, and the same ID belongs to a different language on a different site - imported without the Languages section, a German translation can silently become a French one.', 'perflocale' ); ?>
 						</p>
 					</fieldset>
+					<?php if ( $import_ceiling_bytes > 0 && $export_estimate > $import_ceiling_bytes ) : ?>
+						<div class="notice notice-warning inline">
+							<p>
+								<?php
+								printf(
+									/* translators: 1: estimated size of a full export, e.g. "80 MB", 2: largest file this site accepts for an import through this screen, e.g. "64 MB". */
+									esc_html__( 'A full export of this site will be about %1$s, more than this site accepts for an import through this screen (%2$s). To restore it, import it with WP-CLI (wp perflocale import), raise the import limit, or export the sections in smaller files.', 'perflocale' ),
+									esc_html( \PerfLocale\Admin\AdminController::format_bytes( $export_estimate ) ),
+									esc_html( $import_ceiling )
+								);
+								?>
+							</p>
+						</div>
+					<?php endif; ?>
 					<?php submit_button( __( 'Export Data', 'perflocale' ), 'secondary', 'submit', false ); ?>
 				</form>
 			</td>
@@ -3971,9 +3842,20 @@ final class SettingsPage {
 			<td>
 				<p class="description" style="margin-top:0;"><?php echo esc_html__( 'Restore data from a PerfLocale JSON export file. Large imports run in the background - track progress under PerfLocale → Jobs.', 'perflocale' ); ?></p>
 
-				<form method="post" enctype="multipart/form-data" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=export-import' ) ); ?>" style="margin-top:8px;">
+				<form method="post" enctype="multipart/form-data" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=export-import' ) ); ?>" style="margin-top:8px;"
+					data-perflocale-import-form
+					data-single-limit="<?php echo esc_attr( (string) $single_request_bytes ); ?>"
+					data-import-limit="<?php echo esc_attr( (string) $import_ceiling_bytes ); ?>"
+					data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>"
+					data-msg-too-large="<?php echo esc_attr( \PerfLocale\Admin\ImportUpload::too_large_message() ); ?>"
+					data-msg-progress="<?php echo esc_attr( $upload_progress_msg ); ?>"
+					data-msg-failed="<?php echo esc_attr( $upload_failed_msg ); ?>"
+					data-msg-network="<?php echo esc_attr( $upload_network_msg ); ?>"
+					data-min-piece="<?php echo esc_attr( (string) \PerfLocale\Admin\ImportUpload::MIN_PIECE ); ?>"
+					data-msg-piece-refused="<?php echo esc_attr( $upload_piece_msg ); ?>">
 					<?php wp_nonce_field( 'perflocale_import_data' ); ?>
 					<input type="hidden" name="perflocale_action" value="import">
+					<input type="hidden" name="perflocale_import_upload" value="">
 
 					<div data-perflocale-dropzone class="perflocale-dropzone" style="border:2px dashed #c3c4c7;border-radius:4px;padding:24px;text-align:center;margin-bottom:12px;">
 						<span class="dashicons dashicons-upload" style="font-size:32px;width:32px;height:32px;color:#8c8f94;"></span>
@@ -3982,7 +3864,8 @@ final class SettingsPage {
 						</p>
 						<p data-perflocale-dropzone-name style="margin:8px 0 0;font-weight:600;color:#1e1e1e;"></p>
 						<p style="margin:12px 0 0;">
-							<input type="file" name="perflocale_import_file" accept=".json,application/json" required>
+							<label for="perflocale-import-file" class="screen-reader-text"><?php echo esc_html__( 'File to import', 'perflocale' ); ?></label>
+							<input type="file" name="perflocale_import_file" id="perflocale-import-file" accept=".json,application/json" required>
 						</p>
 						<p style="margin:8px 0 0;font-size:11px;color:#646970;">
 							<?php
@@ -3991,9 +3874,19 @@ final class SettingsPage {
 								esc_html__( 'Maximum file size: %s.', 'perflocale' ),
 								esc_html( $import_ceiling )
 							);
+
+							if ( $single_request_bytes > 0 && $single_request_bytes < $import_ceiling_bytes ) {
+								echo ' ';
+								printf(
+									/* translators: %s: largest file the server accepts in one request, e.g. "8 MB". */
+									esc_html__( 'A file larger than %s is sent in pieces.', 'perflocale' ),
+									esc_html( \PerfLocale\Admin\AdminController::format_bytes( $single_request_bytes ) )
+								);
+							}
 							?>
 						</p>
 					</div>
+					<p class="description" data-perflocale-import-status role="status" hidden></p>
 
 					<fieldset style="margin-bottom:12px;">
 						<legend class="screen-reader-text"><?php echo esc_html__( 'Import Mode', 'perflocale' ); ?></legend>
@@ -4003,17 +3896,32 @@ final class SettingsPage {
 						</label>
 						<label style="display:block;">
 							<input type="radio" name="perflocale_import_mode" value="replace">
-							<strong><?php echo esc_html__( 'Replace', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'delete all existing data first', 'perflocale' ); ?>
+							<strong><?php echo esc_html__( 'Replace', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'clear this site\'s rows for the sections in the file, then load the file', 'perflocale' ); ?>
 						</label>
 					</fieldset>
 
 					<p class="description" style="margin-top:0;">
-						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale tables before loading, so anything the uploaded bundle does not carry is gone, and applies the file\'s settings, add-on settings, add-on list and roles. Merge only adds rows and never changes this site\'s configuration.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Replace clears this site\'s PerfLocale table rows for each section the file carries before loading it, so rows the file does not hold are gone; other data (flags on posts, terms and orders, menu and media languages, redirects, add-on data) is only overwritten where the file has a value. It also applies the file\'s settings, add-on settings, add-on list and roles; this site keeps its own domains, provider addresses, uninstall choice and paused queue. Merge only adds rows and never changes this site\'s configuration.', 'perflocale' ); ?>
 						<a href="https://perflocale.com/docs/export-import/#merge-vs-replace" target="_blank" rel="noopener"><?php echo esc_html__( 'Merge vs Replace - what Replace clears', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 					<p class="description" style="margin-top:0;">
 						<?php echo esc_html__( 'Tip: re-importing the same backup in Merge mode creates fresh translation_groups rows (the table has no natural key) - the matching links de-duplicate via their object_lang (type, object_id, language_id) UNIQUE key, so the duplicate groups are linked to nothing and are swept at the end of every Merge import. For deterministic re-imports use Replace mode.', 'perflocale' ); ?>
 					</p>
+
+					<fieldset class="perflocale-import-addon" data-perflocale-import-addon>
+						<legend><?php echo esc_html__( 'Add-on data to import', 'perflocale' ); ?></legend>
+						<input type="hidden" name="perflocale_import_addon_shown" value="1">
+						<label class="perflocale-import-addon__choice" data-perflocale-addon-choice="addon_data">
+							<input type="checkbox" name="perflocale_import_addon[]" value="addon_data" checked>
+							<?php echo esc_html( self::export_section_label( 'addon_data', 'Add-on data' ) ); ?>
+						</label>
+						<?php foreach ( $addon_groups as $group_key => $group_label ) : ?>
+							<label class="perflocale-import-addon__choice" data-perflocale-addon-choice="<?php echo esc_attr( $group_key ); ?>">
+								<input type="checkbox" name="perflocale_import_addon[]" value="<?php echo esc_attr( $group_key ); ?>" checked>
+								<?php echo esc_html( $group_label ); ?>
+							</label>
+						<?php endforeach; ?>
+					</fieldset>
 
 					<fieldset style="margin:12px 0;">
 						<legend class="screen-reader-text"><?php echo esc_html__( 'Cross-site import', 'perflocale' ); ?></legend>
@@ -4093,6 +4001,10 @@ final class SettingsPage {
 									);
 									?>
 								</form>
+								<?php $pll_policy_line = \PerfLocale\Migration\PolylangImporter::policy_line( \PerfLocale\Migration\PolylangImporter::conflict_policies() ); ?>
+								<?php if ( $pll_policy_line !== '' ) : ?>
+									<p class="perflocale-migration-card__policy"><?php echo esc_html( $pll_policy_line ); ?></p>
+								<?php endif; ?>
 								<p class="perflocale-migration-card__found"><?php echo esc_html__( 'Polylang data found', 'perflocale' ); ?></p>
 							</div>
 						<?php endif; ?>

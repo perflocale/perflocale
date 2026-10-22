@@ -33,16 +33,8 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 $perflocale_includes = [
 	__DIR__ . '/src/Admin/TranslatorRole.php',
 	__DIR__ . '/src/Database/Schema.php',
-	// PrivacyIntegration MUST load before SiteCleanup - SiteCleanup's
-	// USER_META_KEYS class constant is aliased to
-	// PrivacyIntegration::USER_META_KEYS at class-definition time, so
-	// PHP needs the PrivacyIntegration class available the moment
-	// SiteCleanup.php is required. The autoloader isn't registered
-	// during uninstall, so without this entry SiteCleanup.php throws
-	// "Class PerfLocale\Admin\PrivacyIntegration not found" and the
-	// cron/option sweep silently skips, leaking scheduled events past
-	// uninstall.
-	__DIR__ . '/src/Admin/PrivacyIntegration.php',
+	// Schema::drop_tables() forwards to SchemaWrites.
+	__DIR__ . '/src/Database/SchemaWrites.php',
 	// CacheManager carries the canonical list of plugin-owned object-cache
 	// groups (GROUPS constant). SiteCleanup::flush_cache_groups() iterates
 	// it on full uninstall so the L2 (Redis/Memcached) cache doesn't keep
@@ -50,6 +42,12 @@ $perflocale_includes = [
 	// (rather than as a soft dependency in SiteCleanup) because uninstall
 	// has no autoloader.
 	__DIR__ . '/src/Cache/CacheManager.php',
+	// The data registry: the uninstall lists (options, LIKE patterns, meta
+	// prefixes, network options, user meta) SiteCleanup reads. Pure data
+	// with no dependency of its own. The autoloader is not registered during
+	// uninstall, so without this entry every SiteCleanup sweep would throw
+	// "Class PerfLocale\Database\DataRegistry not found".
+	__DIR__ . '/src/Database/DataRegistry.php',
 	__DIR__ . '/src/Database/SiteCleanup.php',
 	__DIR__ . '/src/Addon/AddonInterface.php',
 	// ⚠️ THE FULL CLOSURE, not "one more require". AddonUninstaller::plan()
@@ -57,7 +55,7 @@ $perflocale_includes = [
 	// that class was missing here - so the entire manifest-driven addon purge
 	// threw "class not found" and the throw was swallowed, leaving addon tables
 	// and options behind on every uninstall with no error anywhere. Same shape
-	// as the PrivacyIntegration load-order note above.
+	// as the DataRegistry load note above.
 	//
 	// plan() also reaches PurgePlan (its return type) and AddonManifestWriter
 	// (reads/refreshes the manifest), so both are required or the path throws a

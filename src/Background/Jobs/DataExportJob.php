@@ -27,6 +27,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Args shape:
  *   - 'sections' : string[]  Section keys to include (e.g. ['settings',
  *                            'translations']). Empty = full export.
+ *   - 'addon_groups' : string[]  Add-on group parts to include
+ *                            (DataExporter::addon_groups() keys). Absent =
+ *                            every group when the sections include Add-on data.
  *   - 'path'     : string    Optional override; default = uploads dir
  *                            with timestamp filename. Validated to live
  *                            inside `wp_upload_dir()['basedir']`.
@@ -87,6 +90,7 @@ final class DataExportJob extends AbstractJob {
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$sections = isset( $args['sections'] ) && is_array( $args['sections'] ) ? $args['sections'] : [];
+		$groups   = isset( $args['addon_groups'] ) && is_array( $args['addon_groups'] ) ? \PerfLocale\Admin\Typed::strs( $args['addon_groups'] ) : null;
 		$path     = isset( $args['path'] ) ? (string) $args['path'] : '';
 
 		if ( $path === '' ) {
@@ -102,7 +106,7 @@ final class DataExportJob extends AbstractJob {
 		$progress( 0, 1 );
 
 		$exporter = new DataExporter();
-		$bytes    = $exporter->write_to_file( $path, $sections );
+		$bytes    = $exporter->write_to_file( $path, $sections, $groups );
 
 		if ( $bytes === false ) {
 			throw new \RuntimeException( esc_html( sprintf( 'Failed to write export to: %s', $path ) ) );
@@ -131,7 +135,7 @@ final class DataExportJob extends AbstractJob {
 		 * @param int                $bytes    Size of the written file.
 		 * @param array<int,string>  $sections The section keys that were
 		 *                                     exported - a subset of
-		 *                                     {@see DataExporter::SECTIONS}
+		 *                                     {@see DataExporter::sections()}
 		 *                                     (settings, roles, languages,
 		 *                                     translations, strings). Empty
 		 *                                     when the dispatch asked for a

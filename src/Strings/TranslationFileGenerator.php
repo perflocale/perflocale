@@ -63,6 +63,13 @@ final class TranslationFileGenerator {
 	public const COMBINED_PREFIX = '_combined';
 
 	/**
+	 * Missing links written per statement by repair_orphaned_translations().
+	 *
+	 * @var int
+	 */
+	private const RELINK_BATCH = 200;
+
+	/**
 	 * @var CacheManager
 	 */
 	private readonly CacheManager $cache;
@@ -74,6 +81,14 @@ final class TranslationFileGenerator {
 	 * @var string[]
 	 */
 	private array $read_failed_locales = [];
+
+	/**
+	 * Translation rows the orphan repair of the last generate_all() run
+	 * removed or connected again (see get_repaired_count()).
+	 *
+	 * @var int
+	 */
+	private int $repaired_count = 0;
 
 	/**
 	 * Constructor.
@@ -112,6 +127,7 @@ final class TranslationFileGenerator {
 	 */
 	public function generate_all( ?array $only_language_ids = null ): int {
 		$this->read_failed_locales = [];
+		$this->repaired_count      = 0;
 
 		$this->ensure_directory();
 
@@ -157,7 +173,8 @@ final class TranslationFileGenerator {
 		// them. We deliberately do this on every Regenerate run, not just
 		// when there is a problem - repair is idempotent and cheap when
 		// nothing needs fixing.
-		$this->repair_orphaned_translations();
+		$repair               = $this->repair_orphaned_translations();
+		$this->repaired_count = $repair['dangling'] + $repair['repaired_rows'];
 
 		// Fetch all translated strings grouped by domain and language.
 		$failed_language_ids = [];
@@ -400,6 +417,20 @@ final class TranslationFileGenerator {
 	}
 
 	/**
+	 * Translation rows the last generate_all() run repaired before
+	 * generating: the dangling rows it deleted plus the rows it linked again
+	 * (a regrouped string's rows are among the linked ones). This is the
+	 * number of rows count_repairable_orphans() stops counting because of
+	 * the run, without its two full-table counts. 0 when the run returned
+	 * before the repair.
+	 *
+	 * @return int
+	 */
+	public function get_repaired_count(): int {
+		return $this->repaired_count;
+	}
+
+	/**
 	 * Resolve the path for a (domain, locale) translation file.
 	 *
 	 * @param string $domain Text domain.
@@ -569,7 +600,8 @@ final class TranslationFileGenerator {
 	 *      but the matching `translation_links` row is missing → INSERT it
 	 *      so the generator's JOIN sees the pair.
 	 *
-	 * @return array{dangling: int, regrouped: int, relinked: int} Repair counts.
+	 * @return array{dangling: int, regrouped: int, relinked: int, repaired_rows: int} Repair counts: `relinked`
+	 *         counts inserted links, `repaired_rows` the translation rows those links made reachable.
 	 */
 	public function repair_orphaned_translations(): array {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -581,9 +613,10 @@ final class TranslationFileGenerator {
 		$st_table      = Schema::table( 'string_translations' );
 
 		$out = [
-			'dangling'  => 0,
-			'regrouped' => 0,
-			'relinked'  => 0,
+			'dangling'      => 0,
+			'regrouped'     => 0,
+			'relinked'      => 0,
+			'repaired_rows' => 0,
 		];
 
 		// (1) Dangling: string_translations rows whose string_id is gone.
@@ -660,6 +693,10 @@ final class TranslationFileGenerator {
 		// recorded, not guarded against. Do not "simplify" the comment back to
 		// naming one key: believing translation_links has a single unique key
 		// is what produced the upsert defect fixed in release week.
+		if ( ! $wpdb instanceof \wpdb ) {
+			return $out;
+		}
+
 		$missing = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT s.id AS string_id, s.group_id, st.language_id
@@ -676,24 +713,84 @@ final class TranslationFileGenerator {
 			)
 		);
 
+		// Several translation rows can share one (group, language) slot: one
+		// link makes all of them reachable, so the slot's row count is
+		// credited once its link is written, and later rows of a linked slot
+		// are not written again (group_lang would ignore them).
+		$rows     = [];
+		$per_slot = [];
 		foreach ( (array) $missing as $row ) {
-			$inserted = $wpdb->query(
-				$wpdb->prepare(
-					// `type` mirrors the owning group's type (Schema.php:89); this
-					// repair only ever re-links string-type groups.
-					'INSERT IGNORE INTO %i
-					 (group_id, object_id, language_id, type, status, source)
-					 VALUES (%d, %d, %d, \'string\', %s, %s)',
-					$links_table,
-					(int) $row->group_id,
-					(int) $row->string_id,
-					(int) $row->language_id,
-					'published',
-					'manual'
-				)
+			if ( ! isset( $row->string_id, $row->group_id, $row->language_id ) || ! is_numeric( $row->string_id ) || ! is_numeric( $row->group_id ) || ! is_numeric( $row->language_id ) ) {
+				continue;
+			}
+			$rows[]            = [ (int) $row->string_id, (int) $row->group_id, (int) $row->language_id ];
+			$slot              = (int) $row->group_id . ':' . (int) $row->language_id;
+			$per_slot[ $slot ] = ( $per_slot[ $slot ] ?? 0 ) + 1;
+		}
+		$linked = [];
+
+		// One INSERT IGNORE per batch, rows in the order read. A row is
+		// skipped when its slot is linked (group_lang) or its string already
+		// has a link in that language under another group (object_lang), so
+		// a later row of the same slot can still link it.
+		foreach ( array_chunk( $rows, self::RELINK_BATCH ) as $batch ) {
+			$values = [];
+			$slots  = [];
+			$groups = [];
+			foreach ( $batch as [ $string_id, $group_id, $language_id ] ) {
+				$slot = $group_id . ':' . $language_id;
+				if ( isset( $linked[ $slot ] ) ) {
+					continue;
+				}
+				// `type` mirrors the owning group's type (Schema.php:89); this
+				// repair only ever re-links string-type groups.
+				$value = $wpdb->prepare( '(%d, %d, %d, %s, %s, %s)', $group_id, $string_id, $language_id, 'string', 'published', 'manual' );
+				if ( ! is_string( $value ) ) {
+					continue;
+				}
+				$values[]            = $value;
+				$slots[ $slot ]      = true;
+				$groups[ $group_id ] = true;
+			}
+			if ( $values === [] ) {
+				continue;
+			}
+			$inserted = (int) $wpdb->query(
+				$wpdb->prepare( 'INSERT IGNORE INTO %i (group_id, object_id, language_id, type, status, source) VALUES ', $links_table )
+				. implode( ', ', $values )
 			);
-			if ( $inserted ) {
+			if ( $inserted <= 0 ) {
+				continue;
+			}
+			// A slot takes at most one row (group_lang): when every slot of
+			// the batch took one, the count says which; otherwise the batch's
+			// slots that now have a link are read back.
+			$done = array_keys( $slots );
+			if ( $inserted < count( $slots ) ) {
+				$done  = [];
+				$found = $wpdb->get_results(
+					// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- One %d placeholder per group of the batch.
+					$wpdb->prepare(
+						'SELECT group_id, language_id FROM %i WHERE type = %s AND group_id IN (' . implode( ',', array_fill( 0, count( $groups ), '%d' ) ) . ')',
+						$links_table,
+						'string',
+						...array_keys( $groups )
+					)
+				);
+				foreach ( (array) $found as $link ) {
+					if ( ! isset( $link->group_id, $link->language_id ) || ! is_numeric( $link->group_id ) || ! is_numeric( $link->language_id ) ) {
+						continue;
+					}
+					$slot = (int) $link->group_id . ':' . (int) $link->language_id;
+					if ( isset( $slots[ $slot ] ) ) {
+						$done[] = $slot;
+					}
+				}
+			}
+			foreach ( $done as $slot ) {
 				++$out['relinked'];
+				$out['repaired_rows'] += $per_slot[ $slot ];
+				$linked[ $slot ]       = true;
 			}
 		}
 		// phpcs:enable
@@ -707,8 +804,8 @@ final class TranslationFileGenerator {
 	/**
 	 * Count rows that the generator currently cannot compile (orphans of
 	 * any of the three shapes that `repair_orphaned_translations()`
-	 * handles). Used by Site Health so the message can name the actual
-	 * size of the problem in plain language.
+	 * handles). The Regenerate notice reports the repair's own count
+	 * instead (get_repaired_count()); the regression suites read this one.
 	 *
 	 * @return int
 	 */

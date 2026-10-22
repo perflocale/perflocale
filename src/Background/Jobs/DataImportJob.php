@@ -44,6 +44,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                            run time, because it is a statement about the
  *                            FILE the operator chose - a replay has to keep
  *                            the same answer.
+ *   - 'addon_choices' : string[]  The add-on data the operator ticked on the
+ *                            import form (DataImporter::import() option
+ *                            `addon_choices`). Absent = everything the file
+ *                            carries.
  *
  * Result shape (matches DataImporter::import()):
  *   - 'imported'  : int      Rows successfully imported.
@@ -58,20 +62,18 @@ if ( ! defined( 'ABSPATH' ) ) {
  *                            (settings, add-on settings, the add-on list,
  *                            roles) and the sentence that says so; the job's
  *                            details on PerfLocale → Jobs show both.
- *
- * A bundle the importer refuses on the site-identity gate never becomes a
- * result: `execute()` throws instead, so the job ends `failed` with the
- * refusal sentence in its `error` column where both the Jobs list and the
- * sync dispatcher already show it.
- *
- * The pipeline has no terminal-failure signal, so the worker retries a
- * thrown job with backoff up to `perflocale/jobs/max_attempts` (5) - the
- * same shape the two path guards below already have. A refusal is
- * deterministic, so each retry re-reads the file, re-decodes it and refuses
- * again; DataImporter runs the site-identity gate AHEAD of its per-value
- * data-quality scan precisely so that those retries do not each walk the
- * whole envelope. Until the cap is reached the Jobs list shows the row as
- * queued with no reason, because it renders `error` only on a failed row.
+ *   - 'refused_addresses', 'address_notice' : the provider address settings
+ *                            the settings update refused (multisite, key
+ *                            supplied from outside the database, a dispatching
+ *                            user who is not a super admin) and the sentence
+ *                            that names them; shown in the job's details
+ *                            (PerfLocale → Jobs, `wp perflocale jobs get`).
+ *   - 'run_failed', 'first_error' : set when the importer refused the file
+ *                            before its first write (`refused`), or wrote no
+ *                            row and reported errors. The worker then records
+ *                            the job as failed with `first_error` as its
+ *                            reason (shown on PerfLocale → Jobs) and does not
+ *                            re-run it automatically.
  */
 final class DataImportJob extends AbstractJob {
 
@@ -145,30 +147,24 @@ final class DataImportJob extends AbstractJob {
 	 * {@inheritDoc}
 	 *
 	 * @param array<string, mixed> $args
-	 * @param callable             $progress Called exactly TWICE - once before
-	 *                                       the import and once after it -
-	 *                                       because DataImporter doesn't yet
-	 *                                       expose per-table progress
-	 *                                       callbacks. Promoting this to true
-	 *                                       incremental progress is a
-	 *                                       follow-up task (see backlog).
+	 * @param callable             $progress Called ONCE, before the import:
+	 *                                       DataImporter does not expose
+	 *                                       per-table progress callbacks.
 	 *
-	 *   Consequence worth knowing before you rely on Cancel: the progress
-	 *   callback is also the ONLY place the worker probes for an operator
-	 *   cancel, so a cancel issued WHILE the import is running is not seen
-	 *   until the final tick - by which point DataImporter has already
-	 *   finished and committed every row, and the post-import cache flush has
-	 *   run. The cancel is honoured at that point (the tick throws), so the
-	 *   job row ends up `canceled` with no stored result even though the
-	 *   import fully succeeded. Cancel therefore reliably stops a QUEUED
-	 *   import (WorkerRegistry bails on a terminal status before execute()),
-	 *   but cannot interrupt a running one. `get_lock_ttl()` is 4h for the
-	 *   same reason: no tick means no lock refresh for the whole import.
+	 *   The progress callback is the only place the worker probes for an
+	 *   operator cancel or a queue pause, so it is not called again once the
+	 *   import has run: every row is committed by then, and a cancel or pause
+	 *   seen there would record a finished import as canceled with no result,
+	 *   or re-queue it to run a second time. A cancel that arrives while the
+	 *   import runs is reported by the worker as one that came after the work
+	 *   had finished; a pause takes effect for the jobs after this one. Cancel
+	 *   stops a QUEUED import (WorkerRegistry bails on a terminal status
+	 *   before execute()), and the tick before the import stops one that was
+	 *   canceled or paused while it started. `get_lock_ttl()` is 4h because no
+	 *   tick refreshes the lock during the import.
 	 *
 	 * @return array<string, mixed>
-	 * @throws \RuntimeException When the import path is unsafe or unreadable,
-	 *                           or the importer refused the bundle before
-	 *                           writing anything.
+	 * @throws \RuntimeException When the import path is unsafe or unreadable.
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$file    = isset( $args['file_path'] ) ? (string) $args['file_path'] : '';
@@ -209,50 +205,31 @@ final class DataImportJob extends AbstractJob {
 			$sanitize_strings,
 			// ! empty(): JobState round-trips args through JSON, so a ticked
 			// checkbox comes back as true, 1 or '1' depending on the path.
-			[ 'allow_foreign_ids' => ! empty( $args['allow_foreign_ids'] ) ]
+			[
+				'allow_foreign_ids' => ! empty( $args['allow_foreign_ids'] ),
+				'addon_choices'     => isset( $args['addon_choices'] ) && is_array( $args['addon_choices'] ) ? \PerfLocale\Admin\Typed::strs( $args['addon_choices'] ) : null,
+			]
 		);
 
-		// A refusal that never reached the first write is a failure, not a
-		// finished import.
-		//
-		// This throw exists for the ASYNC path only. Dispatch compares
-		// self::args_size() - the file size divided by 200 - against
-		// self::get_default_threshold() (1000), so a bundle under roughly
-		// 200 KB runs INLINE, and there the refusal already surfaces without
-		// help: Dispatcher::execute_inline returns the importer's array and
-		// AdminController redirects on its `error`. Above the threshold the
-		// operator is redirected to a job instead, and a job that RETURNED
-		// the refusal would be marked complete - "0 imported", with the
-		// reason readable only inside the result JSON in the detail drawer.
-		// Throwing puts the sentence in the job row's `error`, which the Jobs
-		// list renders beside the failed row.
-		//
-		// Keyed on the importer's own `refused` flag rather than on "zero
-		// imported plus some errors": a replace that wiped its tables and
-		// then failed every row ends that way too, and the worker's retry
-		// would re-run that wipe. A site-identity refusal wrote nothing and
-		// refuses identically on a replay, so re-running it costs a file
-		// parse. The importer always pairs the flag with the sentence that
-		// explains it.
-		//
-		// esc_html() is required here by WordPress.Security.EscapeOutput: an
-		// exception message is treated as output. That makes this the one
-		// import error that reaches the operator pre-escaped - every other one
-		// is plain __() text - so the refusal sentences quote with typographic
-		// marks, which survive the second escape the Jobs screen applies. An
-		// `&` inside an address the FILE recorded still renders as `&amp;`;
-		// cosmetic, and the address is the operator's own upload.
-		if ( ! empty( $result['refused'] ) ) {
-			throw new \RuntimeException( esc_html( (string) ( $result['errors'][0] ?? '' ) ) );
+		// An import that was refused before its first write, or that wrote
+		// no row and reported errors, is a failed run: the worker records the
+		// job as failed with the first error as its reason, which the Jobs
+		// list shows beside the row, and keeps the whole result for the
+		// details. A failed run is not re-run automatically: a refusal is
+		// deterministic, and a replace that removed rows and then stored none
+		// must not run again without the operator. The inline path reads the
+		// same `errors` and shows them on the import screen.
+		$first = trim( $result['errors'][0] ?? '' );
+
+		if ( '' !== $first && ( ! empty( $result['refused'] ) || 0 === $result['imported'] ) ) {
+			$result['run_failed']  = true;
+			$result['first_error'] = $first;
 		}
 
-		// Flush post-import caches - see MigrationCacheHelper for the
-		// full sequence + rationale. Deliberately below the refusal above: a
-		// refused import wrote nothing, and this regenerates every
-		// translation file in files mode.
-		\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
-
-		$progress( 1, 1 );
+		// DataImporter::import() ends with the post-import cache flush (and,
+		// in files mode, the translation file regeneration) after its string
+		// repair, so nothing is flushed or regenerated a second time here.
+		// No progress tick follows the import (see the doc above).
 
 		// Normalise to a plain array (DataImporter already returns the
 		// right shape, but assert it for the JobState write).

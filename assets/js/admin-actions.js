@@ -20,6 +20,10 @@
  *     On click of a form submit button, sets textContent to the
  *     attribute value (or "…" if empty), disables the button, and
  *     submits the parent form. Prevents double-submit on slow handlers.
+ *
+ *   <details data-perflocale-popover>
+ *     Closes on a click outside it and on Escape (the focus returns to its
+ *     <summary> when it was inside). Native <details> handles the toggle.
  */
 ( function () {
 	'use strict';
@@ -134,10 +138,41 @@
 		} );
 	}
 
+	function popovers() {
+		return document.querySelectorAll( 'details[data-perflocale-popover]' );
+	}
+
+	function bindPopovers() {
+		document.addEventListener( 'click', function ( e ) {
+			popovers().forEach( function ( d ) {
+				if ( d.open && ! d.contains( e.target ) ) {
+					d.open = false;
+				}
+			} );
+		} );
+
+		document.addEventListener( 'keydown', function ( e ) {
+			if ( e.key !== 'Escape' ) {
+				return;
+			}
+			popovers().forEach( function ( d ) {
+				if ( d.open ) {
+					var s = d.querySelector( 'summary' );
+					var refocus = d.contains( document.activeElement );
+					d.open = false;
+					if ( refocus && s ) {
+						s.focus();
+					}
+				}
+			} );
+		} );
+	}
+
 	function init() {
 		bindConfirm();
 		bindClipboard();
 		bindSubmitBusy();
+		bindPopovers();
 	}
 
 	if ( document.readyState === 'loading' ) {

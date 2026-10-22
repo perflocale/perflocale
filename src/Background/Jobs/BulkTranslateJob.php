@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Background\Jobs;
 
 use PerfLocale\Background\AbstractJob;
+use PerfLocale\MachineTranslation\TargetLanguageGuard;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
 use PerfLocale\Translation\PostTranslationManager;
@@ -52,9 +53,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  * {@see AbstractJob::supports_continuation()}): on a web request a slice
  * stops after SLICE_SECONDS or SLICE_MAX_PAIRS pairs, and the same job
  * continues from the stored counts in the next worker run. Under WP-CLI a
- * slice has no budget and drops the runtime caches every
- * RELEASE_EVERY_PAIRS pairs. Inline runs and SiteTranslateJob's chunks run
- * every pair in one call.
+ * slice has no budget and, every RELEASE_EVERY_PAIRS pairs, settles the
+ * target-language guard and drops the runtime caches. Inline runs and
+ * SiteTranslateJob's chunks run every pair in one call.
  */
 final class BulkTranslateJob extends AbstractJob {
 
@@ -72,10 +73,19 @@ final class BulkTranslateJob extends AbstractJob {
 	private const SLICE_MAX_PAIRS = 500;
 
 	/**
-	 * Pairs between two runtime-cache releases under WP-CLI, where a slice
-	 * has no budget by default. Bounds the memory a long run holds.
+	 * Pairs between two releases under WP-CLI, where a slice has no budget
+	 * by default: each settles the target-language guard and drops the
+	 * runtime caches. Bounds the memory a long run holds.
 	 */
-	private const RELEASE_EVERY_PAIRS = 500;
+	private const RELEASE_EVERY_PAIRS = TargetLanguageGuard::SETTLE_EVERY;
+
+	/**
+	 * The run's guard against a target language deleted or deactivated
+	 * while it runs ({@see TargetLanguageGuard}).
+	 *
+	 * @var TargetLanguageGuard|null
+	 */
+	private ?TargetLanguageGuard $guard = null;
 
 	/** {@inheritDoc} */
 	public function get_type(): string {
@@ -221,6 +231,7 @@ final class BulkTranslateJob extends AbstractJob {
 		$slice_seconds   = 0.0;
 		$slice_max_pairs = 0;
 		$release_every   = 0;
+		$run_guard       = new TargetLanguageGuard();
 		$slice           = is_array( $args['__perflocale_slice'] ?? null ) ? $args['__perflocale_slice'] : null;
 
 		if ( null !== $slice ) {
@@ -306,7 +317,7 @@ final class BulkTranslateJob extends AbstractJob {
 			$next_release = $release_every;
 
 			// Checked before each pair. Every slice runs at least one pair.
-			$before_pair = static function ( int $source_index, int $target_index ) use ( &$processed, $slice_start, $slice_began, $slice_seconds, $slice_max_pairs, $release_every, &$next_release, $prime ): bool {
+			$before_pair = static function ( int $source_index, int $target_index ) use ( &$processed, &$created, &$failed, &$first_error, $slice_start, $slice_began, $slice_seconds, $slice_max_pairs, $release_every, &$next_release, $prime, $run_guard ): bool {
 				$done = $processed - $slice_start;
 
 				if ( $done < 1 ) {
@@ -319,10 +330,18 @@ final class BulkTranslateJob extends AbstractJob {
 					return true;
 				}
 
-				// Under WP-CLI, drop the runtime caches every
-				// RELEASE_EVERY_PAIRS pairs and prime the next window.
+				// Under WP-CLI, every RELEASE_EVERY_PAIRS pairs: settle the
+				// translations written since the last release, drop the
+				// runtime caches and prime the next window. A change another
+				// process made, found by the release, is the run's checkpoint
+				// change too: the next pair reads its target language again.
 				if ( $release_every > 0 && $done >= $next_release ) {
-					\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
+					self::settle_guard( $run_guard, $created, $failed, $first_error );
+
+					if ( \PerfLocale\Background\MigrationCacheHelper::release_batch_memory() ) {
+						$run_guard->changed_elsewhere();
+					}
+
 					$prime( $source_index, $target_index );
 					$next_release = $done + $release_every;
 				}
@@ -391,11 +410,15 @@ final class BulkTranslateJob extends AbstractJob {
 		$yield   = $args['yield_after_source'] ?? null;
 		$stopped = false;
 
+		$this->guard = $run_guard;
+
 		try {
 			$stopped = $this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error, is_callable( $yield ) ? $yield : null, $cursor, $skipped_permission, $kept, $first_warning, $start_source, $start_target, $before_pair, $trigger );
 		} finally {
 			\PerfLocale\Database\Repository\TranslationGroupRepository::resume_eager_link_map();
 			\PerfLocale\Plugin::get_instance()->get( 'group_repo' )->invalidate_eager_link_map();
+			$this->settle( $created, $failed, $first_error );
+			$this->guard = null;
 		}
 
 		// Bound worker memory across slices (runtime cache + SAVEQUERIES log
@@ -421,6 +444,44 @@ final class BulkTranslateJob extends AbstractJob {
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Remove the translations written for a target language that is gone
+	 * ({@see TargetLanguageGuard::settle()}) and count each as failed.
+	 *
+	 * @param int    $created     Translations created.
+	 * @param int    $failed      Pairs failed.
+	 * @param string $first_error First error.
+	 * @return void
+	 */
+	private function settle( int &$created, int &$failed, string &$first_error ): void {
+		if ( null !== $this->guard ) {
+			self::settle_guard( $this->guard, $created, $failed, $first_error );
+		}
+	}
+
+	/**
+	 * Settle a run's guard ({@see TargetLanguageGuard::settle()}) and count
+	 * each translation it removed as failed.
+	 *
+	 * @param TargetLanguageGuard $guard       The run's guard.
+	 * @param int                 $created     Translations created.
+	 * @param int                 $failed      Pairs failed.
+	 * @param string              $first_error First error.
+	 * @return void
+	 */
+	private static function settle_guard( TargetLanguageGuard $guard, int &$created, int &$failed, string &$first_error ): void {
+		$removed = count( $guard->settle() );
+
+		if ( $removed > 0 ) {
+			$created -= $removed;
+			$failed  += $removed;
+
+			if ( $first_error === '' ) {
+				$first_error = TargetLanguageGuard::reason();
+			}
+		}
 	}
 
 	/**
@@ -468,6 +529,22 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
+	 * Whether a source already has a translation in a language this run
+	 * knows (null: none), by the language's id, which a change of the
+	 * language's code leaves as it is.
+	 *
+	 * @param object      $manager   Post translation manager.
+	 * @param int         $source_id Source post id.
+	 * @param object|null $language  Language row.
+	 * @return bool
+	 */
+	private static function has_translation( object $manager, int $source_id, ?object $language ): bool {
+		$id = null !== $language ? ( get_object_vars( $language )['id'] ?? null ) : null;
+
+		return is_numeric( $id ) && method_exists( $manager, 'has_translation_in' ) && $manager->has_translation_in( $source_id, (int) $id );
+	}
+
+	/**
 	 * The bulk row loop - split from execute() so the eager-link-map
 	 * suspension can wrap it in a single try/finally.
 	 *
@@ -475,7 +552,7 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param array<int,int>            $target_ids  Target language IDs.
 	 * @param array<int,object>         $lang_by_id  Language rows keyed by id.
 	 * @param object                    $manager     Post translation manager.
-	 * @param object                    $service     MT translation service.
+	 * @param TranslationService        $service     MT translation service.
 	 * @param object                    $settings    Plugin settings.
 	 * @param bool                      $include_meta Whether to translate meta.
 	 * @param int                       $total       Total row count (rows × languages).
@@ -504,7 +581,7 @@ final class BulkTranslateJob extends AbstractJob {
 	 *                                         as skipped.
 	 * @return bool True when $before_pair stopped the loop.
 	 */
-	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, object $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk' ): bool {
+	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, TranslationService $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk' ): bool {
 		// `perflocale_use_mt` is the capability that authorises SPENDING the
 		// provider; `perflocale_manage_translations` - the one WorkerRegistry
 		// re-validates at worker time - only authorises running the job. A queued
@@ -514,6 +591,7 @@ final class BulkTranslateJob extends AbstractJob {
 		// gate, so a revoked capability produces exactly the "skipped" accounting
 		// an unauthorised post already produces rather than a new failure shape.
 		$can_use_mt = current_user_can( 'perflocale_use_mt' );
+		$gone_ids   = [];
 
 		// Say WHY the run did nothing. Without this the job completes with every
 		// row "skipped" and an empty error, which reads as "there was nothing to
@@ -561,7 +639,8 @@ final class BulkTranslateJob extends AbstractJob {
 			// reused for its remaining targets. A later row can add the
 			// default-language member itself; that copy derives from $source_id,
 			// which the user may edit, so the answer stays sound.
-			$copy_allowed = null;
+			$copy_allowed  = null;
+			$create_denied = false;
 
 			// Whether this run may send this source, resolved at its first row
 			// that would be translated, so a source whose rows all exist costs
@@ -571,6 +650,55 @@ final class BulkTranslateJob extends AbstractJob {
 			foreach ( $targets as $target_index => $target_lang_id ) {
 				if ( null !== $before_pair && $before_pair( $source_index, $target_index ) ) {
 					return true;
+				}
+
+				// Don't overwrite an existing translation. Checked by the
+				// target's id, before the checkpoint below, so a pair that is
+				// skipped costs no query.
+				if ( ! isset( $gone_ids[ (int) $target_lang_id ] ) && self::has_translation( $manager, (int) $source_id, $lang_by_id[ $target_lang_id ] ?? null ) ) {
+					++$skipped;
+					++$processed;
+					$tick( $processed );
+					continue;
+				}
+
+				// Another process may have changed the languages (or anything
+				// cached) since the run started: after a change, the pair reads
+				// its target as it is now, and a translation written for a
+				// language that has gone since is removed again (settle()).
+				// Runs before every pair that calls the provider or writes.
+				$guard     = $this->guard;
+				$refreshed = false;
+
+				if ( null !== $guard && $guard->checkpoint() ) {
+					$this->settle( $created, $failed, $first_error );
+
+					// Every target is read again: a language deleted or
+					// deactivated meanwhile fails its remaining pairs.
+					foreach ( array_keys( $lang_by_id ) as $known_id ) {
+						$fresh = $guard->live_target( (int) $known_id );
+
+						if ( null === $fresh ) {
+							unset( $lang_by_id[ $known_id ] );
+							$gone_ids[ (int) $known_id ] = true;
+						} else {
+							$lang_by_id[ $known_id ] = $fresh;
+						}
+					}
+
+					$refreshed = true;
+				}
+
+				if ( isset( $gone_ids[ (int) $target_lang_id ] ) ) {
+					++$failed;
+
+					if ( $first_error === '' ) {
+						$first_error = TargetLanguageGuard::gone_reason();
+					}
+
+					++$processed;
+					$tick( $processed );
+					continue;
 				}
 
 				$target_lang = $lang_by_id[ $target_lang_id ] ?? null;
@@ -592,8 +720,9 @@ final class BulkTranslateJob extends AbstractJob {
 					continue;
 				}
 
-				// Don't overwrite an existing translation.
-				if ( $manager->get_translation_id( $source_id, $target_lang->slug ) !== null ) {
+				// The languages were read again: the pair's translation is
+				// looked up under the target as it is now.
+				if ( $refreshed && $manager->get_translation_id( $source_id, $target_lang->slug ) !== null ) {
 					++$skipped;
 					++$processed;
 					$tick( $processed );
@@ -602,14 +731,21 @@ final class BulkTranslateJob extends AbstractJob {
 
 				// The row creates a translation, which is copied from the group's
 				// default-language post rather than necessarily from $source_id,
-				// so edit_post on $source_id above is not enough. A 0 answer
-				// (nothing would be copied) is not remembered: it can depend on
-				// the target.
+				// so edit_post on $source_id above is not enough, and it inserts
+				// a post of that post's type, so the type's create capability
+				// applies as on the single-create route. A 0 answer (nothing
+				// would be copied) is not remembered: it can depend on the
+				// target.
 				if ( $copy_allowed === null ) {
 					$copy_from = $manager->get_copy_source_id( (int) $source_id, (string) $target_lang->slug );
 
 					if ( $copy_from > 0 ) {
-						$copy_allowed = $copy_from === (int) $source_id || \PerfLocale\Helper::user_can_copy_translation_source( $copy_from );
+						$copy_allowed  = $copy_from === (int) $source_id || \PerfLocale\Helper::user_can_copy_translation_source( $copy_from );
+						$create_denied = $copy_allowed && ( ! is_int( $copy_from ) || ! \PerfLocale\Helper::user_can_create_like( $copy_from ) );
+
+						if ( $create_denied ) {
+							$copy_allowed = false;
+						}
 					}
 				}
 
@@ -620,7 +756,9 @@ final class BulkTranslateJob extends AbstractJob {
 					$tick( $processed );
 
 					if ( $first_error === '' ) {
-						$first_error = __( 'You cannot edit the original this translation is copied from.', 'perflocale' );
+						$first_error = $create_denied
+							? __( 'You do not have permission to create translations of this content.', 'perflocale' )
+							: __( 'You cannot edit the original this translation is copied from.', 'perflocale' );
 					}
 
 					continue;
@@ -717,10 +855,17 @@ final class BulkTranslateJob extends AbstractJob {
 				try {
 					// fast_fail=false lets the provider's retry loop
 					// catch transient errors (rate limit, network blip).
-					$row_result = $service->translate_post( $source_id, $target_lang->slug, '', false, $include_meta );
+					$inserted   = false;
+					$row_result = $service->translate_post( $source_id, TargetLanguageGuard::slug_of( $target_lang ), '', false, $include_meta, $inserted );
 
 					if ( ! empty( $row_result['post_id'] ) ) {
 						++$created;
+
+						// Only a translation this run inserted: one it updated
+						// existed before the run and is never removed.
+						if ( $inserted && null !== $this->guard ) {
+							$this->guard->written( is_numeric( $row_result['post_id'] ) ? (int) $row_result['post_id'] : 0, (int) $target_lang_id );
+						}
 
 						// A lost "Do not translate" section keeps the source
 						// content; the row counts as created and is reported.
@@ -777,7 +922,7 @@ final class BulkTranslateJob extends AbstractJob {
 					'perflocale/mt/bulk/after_translate',
 					(int) $source_id,
 					(string) $target_lang->slug,
-					is_array( $row_result ) ? $row_result : [],
+					$row_result,
 					array_merge(
 						$row_context,
 						[

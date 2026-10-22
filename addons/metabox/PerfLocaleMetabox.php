@@ -50,16 +50,6 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	];
 
 	/**
-	 * Field types that store reference IDs needing translation.
-	 *
-	 * @var array<int, string>
-	 */
-	private const REFERENCE_TYPES = [
-		'post',
-		'taxonomy_advanced',
-	];
-
-	/**
 	 * Cached field definitions per post type.
 	 *
 	 * @var array<string, array<string, array<string, mixed>>>
@@ -151,6 +141,14 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 		// Translate reference fields on the frontend only.
 		if ( ! is_admin() ) {
 			add_filter( 'rwmb_get_value', [ $this, 'translate_field_value' ], 10, 4 );
+
+			// A translated request also gets the translated-page hooks
+			// (PerfLocaleMetaboxTranslated) once its language is detected. A
+			// request already known here to be in the default language (the
+			// language comes from the URL) attaches nothing more.
+			if ( $this->get_current_slug() === '' || $this->translated_slug() !== '' ) {
+				add_action( 'perflocale/language/detected', [ $this, 'serve_translated_request' ], 20 );
+			}
 		}
 
 		// The field-definition cache is keyed by post type only; on multisite
@@ -185,6 +183,55 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 */
 	public static function reset_static_caches(): void {
 		self::$field_cache = [];
+	}
+
+	/**
+	 * Hand a request in a language other than the default one to
+	 * PerfLocaleMetaboxTranslated, which attaches the translated-page hooks.
+	 * A request in the default language, or without a language, loads and
+	 * attaches nothing.
+	 *
+	 * @return void
+	 */
+	public function serve_translated_request(): void {
+		if ( $this->translated_slug() === '' ) {
+			return;
+		}
+
+		$this->translated()->serve();
+	}
+
+	/**
+	 * The current language slug when it is not the default language.
+	 *
+	 * @return string The slug, or an empty string for the default language or no language.
+	 */
+	private function translated_slug(): string {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'router' ) ) {
+			return '';
+		}
+
+		/**
+		 * The language router service.
+		 *
+		 * @var \PerfLocale\Router\LanguageRouter $router
+		 */
+		$router    = $plugin->get( 'router' );
+		$lang_slug = $router->get_current_slug();
+
+		if ( $lang_slug === '' ) {
+			return '';
+		}
+
+		$default = $router->get_default_language();
+
+		if ( null !== $default && isset( $default->slug ) && $lang_slug === $default->slug ) {
+			return '';
+		}
+
+		return $lang_slug;
 	}
 
 	/**
@@ -665,22 +712,13 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 
 		$type = $field['type'];
 
-		// Translate post reference fields.
-		if ( $type === 'post' ) {
-			return $this->translate_post_ids( $value, $lang_slug );
+		// Translate post and taxonomy_advanced reference fields, and the
+		// reference sub-fields inside groups.
+		if ( $type !== 'post' && $type !== 'taxonomy_advanced' && $type !== 'group' ) {
+			return $value;
 		}
 
-		// Translate taxonomy_advanced reference fields.
-		if ( $type === 'taxonomy_advanced' ) {
-			return $this->translate_term_ids( $value, $lang_slug );
-		}
-
-		// Translate reference sub-fields inside groups.
-		if ( $type === 'group' && is_array( $value ) && ! empty( $field['fields'] ) ) {
-			return $this->translate_group_references( $value, $field, $lang_slug );
-		}
-
-		return $value;
+		return $this->translated()->translate_reference_value( $value, $field, $lang_slug );
 	}
 
 	/**
@@ -752,311 +790,6 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Resolve a post's current-language sibling, but only when the visitor is
-	 * allowed to see it.
-	 *
-	 * `rwmb_get_value` is filtered on the FRONT END, so a reference field whose
-	 * sibling is still a draft/pending/private translation would otherwise put
-	 * that unpublished post's title on a public page and link to a URL an
-	 * anonymous visitor cannot open. PerfLocale creates translations as drafts,
-	 * so that is the normal state of a half-finished translation, not an edge
-	 * case. Returning null keeps the published source in place - the same rule
-	 * the ACF addon applies to its relationship / post-object fields and the
-	 * WooCommerce addon to cross-sell and upsell IDs.
-	 *
-	 * @param int    $post_id   Source post ID.
-	 * @param string $lang_slug Target language slug.
-	 * @return int|null Sibling post ID, or null when there is none to show.
-	 */
-	private function public_translation_id( int $post_id, string $lang_slug ): ?int {
-		if ( $post_id <= 0 ) {
-			return null;
-		}
-
-		$translation = $this->get_manager()->get_translation_id( $post_id, $lang_slug );
-
-		if ( ! $translation || $translation === $post_id ) {
-			return null;
-		}
-
-		if ( function_exists( 'is_post_publicly_viewable' ) ) {
-			return is_post_publicly_viewable( $translation ) ? $translation : null;
-		}
-
-		$status = get_post_status( $translation );
-
-		return ( is_string( $status ) && in_array( $status, get_post_stati( [ 'public' => true ] ), true ) )
-			? $translation
-			: null;
-	}
-
-	/**
-	 * Translate post IDs to their current-language equivalents.
-	 *
-	 * Handles single IDs, arrays, comma-separated strings, and WP_Post objects.
-	 * A sibling the visitor may not see is skipped - see
-	 * {@see self::public_translation_id()}.
-	 *
-	 * @param mixed  $value Post ID(s) in various formats.
-	 * @param string $lang_slug Target language slug.
-	 * @return mixed
-	 */
-	private function translate_post_ids( mixed $value, string $lang_slug ): mixed {
-		if ( empty( $value ) ) {
-			return $value;
-		}
-
-		// Comma-separated string of IDs.
-		if ( is_string( $value ) && str_contains( $value, ',' ) ) {
-			$ids        = array_map( 'intval', explode( ',', $value ) );
-			$translated = [];
-
-			foreach ( $ids as $id ) {
-				if ( $id <= 0 ) {
-					continue;
-				}
-
-				$translation  = $this->public_translation_id( $id, $lang_slug );
-				$translated[] = $translation ?? $id;
-			}
-
-			return implode( ',', $translated );
-		}
-
-		// Array of IDs or WP_Post objects.
-		if ( is_array( $value ) ) {
-			$translated = [];
-
-			foreach ( $value as $item ) {
-				$item_id = is_object( $item ) && isset( $item->ID ) ? (int) $item->ID : (int) $item;
-
-				if ( $item_id <= 0 ) {
-					$translated[] = $item;
-					continue;
-				}
-
-				$translation = $this->public_translation_id( $item_id, $lang_slug );
-
-				if ( $translation ) {
-					if ( is_object( $item ) ) {
-						$translated_post = get_post( $translation );
-						$translated[]    = $translated_post instanceof \WP_Post ? $translated_post : $item;
-					} else {
-						$translated[] = $translation;
-					}
-				} else {
-					$translated[] = $item;
-				}
-			}
-
-			return $translated;
-		}
-
-		// Single ID.
-		$item_id = is_object( $value ) && isset( $value->ID ) ? (int) $value->ID : (int) $value;
-
-		if ( $item_id <= 0 ) {
-			return $value;
-		}
-
-		$translation = $this->public_translation_id( $item_id, $lang_slug );
-
-		if ( $translation ) {
-			if ( is_object( $value ) ) {
-				$translated_post = get_post( $translation );
-
-				return $translated_post instanceof \WP_Post ? $translated_post : $value;
-			}
-
-			return $translation;
-		}
-
-		return $value;
-	}
-
-	/**
-	 * Translate term IDs to their current-language equivalents.
-	 *
-	 * Handles single IDs, arrays, and comma-separated strings.
-	 *
-	 * @param mixed  $value Term ID(s) in various formats.
-	 * @param string $lang_slug Target language slug.
-	 * @return mixed
-	 */
-	private function translate_term_ids( mixed $value, string $lang_slug ): mixed {
-		if ( empty( $value ) ) {
-			return $value;
-		}
-
-		// Comma-separated string of IDs.
-		if ( is_string( $value ) && str_contains( $value, ',' ) ) {
-			$ids        = array_map( 'intval', explode( ',', $value ) );
-			$translated = [];
-
-			foreach ( $ids as $id ) {
-				if ( $id <= 0 ) {
-					continue;
-				}
-
-				$translated[] = $this->get_translated_term_id( $id, $lang_slug );
-			}
-
-			return implode( ',', $translated );
-		}
-
-		// Array of IDs or WP_Term objects.
-		if ( is_array( $value ) ) {
-			$translated = [];
-
-			foreach ( $value as $item ) {
-				$term_id = is_object( $item ) && isset( $item->term_id ) ? (int) $item->term_id : (int) $item;
-
-				if ( $term_id <= 0 ) {
-					$translated[] = $item;
-					continue;
-				}
-
-				$new_id = $this->get_translated_term_id( $term_id, $lang_slug );
-
-				if ( $new_id !== $term_id && is_object( $item ) ) {
-					$translated_term = get_term( $new_id );
-					$translated[]    = $translated_term instanceof \WP_Term ? $translated_term : $item;
-				} else {
-					$translated[] = is_object( $item ) ? $item : $new_id;
-				}
-			}
-
-			return $translated;
-		}
-
-		// Single ID.
-		$term_id = is_object( $value ) && isset( $value->term_id ) ? (int) $value->term_id : (int) $value;
-
-		if ( $term_id <= 0 ) {
-			return $value;
-		}
-
-		$new_id = $this->get_translated_term_id( $term_id, $lang_slug );
-
-		if ( $new_id !== $term_id && is_object( $value ) ) {
-			$translated_term = get_term( $new_id );
-			return $translated_term instanceof \WP_Term ? $translated_term : $value;
-		}
-
-		return is_object( $value ) ? $value : $new_id;
-	}
-
-	/**
-	 * Translate reference fields inside a group value.
-	 *
-	 * Walks the deserialized group value and translates post/term IDs
-	 * for sub-fields that are reference types.
-	 *
-	 * @param array<string, mixed>|array<int, array<string, mixed>> $value Group value (single or cloneable array of groups).
-	 * @param array<string, mixed>                                  $field Group field config.
-	 * @param string                                                $lang_slug Target language slug.
-	 * @return array<string, mixed>|array<int, array<string, mixed>>
-	 */
-	private function translate_group_references( array $value, array $field, string $lang_slug ): array {
-		// Build a map of reference sub-fields.
-		$ref_sub_fields = [];
-
-		foreach ( $field['fields'] as $sub_field ) {
-			if ( ! is_array( $sub_field ) || empty( $sub_field['id'] ) || empty( $sub_field['type'] ) ) {
-				continue;
-			}
-
-			if ( in_array( $sub_field['type'], self::REFERENCE_TYPES, true ) ) {
-				$ref_sub_fields[ $sub_field['id'] ] = $sub_field['type'];
-			}
-
-			// Recurse into nested groups.
-			if ( $sub_field['type'] === 'group' && ! empty( $sub_field['fields'] ) ) {
-				$ref_sub_fields[ $sub_field['id'] ] = 'group';
-			}
-		}
-
-		// No reference sub-fields - return as-is.
-		if ( empty( $ref_sub_fields ) ) {
-			return $value;
-		}
-
-		// Cloneable group: array of arrays.
-		$is_cloneable = ! empty( $field['clone'] ) && isset( $value[0] ) && is_array( $value[0] );
-
-		if ( $is_cloneable ) {
-			foreach ( $value as $index => $clone_entry ) {
-				if ( ! is_array( $clone_entry ) ) {
-					continue;
-				}
-
-				$value[ $index ] = $this->translate_group_entry( $clone_entry, $ref_sub_fields, $field, $lang_slug );
-			}
-		} else {
-			$value = $this->translate_group_entry( $value, $ref_sub_fields, $field, $lang_slug );
-		}
-
-		return $value;
-	}
-
-	/**
-	 * Translate reference fields in a single group entry.
-	 *
-	 * @param array<string, mixed>  $entry Group entry data.
-	 * @param array<string, string> $ref_sub_fields Map of field_id => type for reference fields.
-	 * @param array<string, mixed>  $field Parent group field config.
-	 * @param string                $lang_slug Target language slug.
-	 * @return array<string, mixed>
-	 */
-	private function translate_group_entry( array $entry, array $ref_sub_fields, array $field, string $lang_slug ): array {
-		foreach ( $ref_sub_fields as $sub_id => $sub_type ) {
-			if ( ! isset( $entry[ $sub_id ] ) ) {
-				continue;
-			}
-
-			if ( $sub_type === 'post' ) {
-				$entry[ $sub_id ] = $this->translate_post_ids( $entry[ $sub_id ], $lang_slug );
-			} elseif ( $sub_type === 'taxonomy_advanced' ) {
-				$entry[ $sub_id ] = $this->translate_term_ids( $entry[ $sub_id ], $lang_slug );
-			} elseif ( $sub_type === 'group' ) {
-				// Find the nested group's field config for recursive translation.
-				foreach ( $field['fields'] as $sub_field ) {
-					if ( is_array( $sub_field ) && ( $sub_field['id'] ?? '' ) === $sub_id && is_array( $entry[ $sub_id ] ) ) {
-						$entry[ $sub_id ] = $this->translate_group_references( $entry[ $sub_id ], $sub_field, $lang_slug );
-						break;
-					}
-				}
-			}
-		}
-
-		return $entry;
-	}
-
-	/**
-	 * Get the translated term ID for a given term.
-	 *
-	 * @param int    $term_id Original term ID.
-	 * @param string $lang_slug Target language slug.
-	 * @return int Translated term ID, or original if no translation found.
-	 */
-	private function get_translated_term_id( int $term_id, string $lang_slug ): int {
-		$repo  = $this->get_repo();
-		$links = $repo->get_translations( $term_id, \PerfLocale\Enum\ObjectType::Term );
-
-		foreach ( $links as $link ) {
-			if ( ! empty( $link->language_slug ) && $link->language_slug === $lang_slug && (int) $link->object_id !== $term_id ) {
-				$translated_term = get_term( (int) $link->object_id );
-
-				if ( $translated_term instanceof \WP_Term ) {
-					return (int) $link->object_id;
-				}
-			}
-		}
-
-		return $term_id;
-	}
-
-	/**
 	 * Get the current language slug.
 	 *
 	 * @return string
@@ -1069,6 +802,20 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		return $plugin->get( 'router' )->get_current_slug();
+	}
+
+	/**
+	 * The translated-request class serving this addon, loaded on first use.
+	 *
+	 * @return \PerfLocaleMetaboxTranslated
+	 */
+	private function translated(): \PerfLocaleMetaboxTranslated {
+		if ( ! class_exists( 'PerfLocaleMetaboxTranslated', false ) ) {
+			require_once __DIR__ . '/PerfLocaleMetaboxTranslated.php';
+		}
+
+		return \PerfLocaleMetaboxTranslated::of( $this )
+			?? \PerfLocaleMetaboxTranslated::start( $this, $this->get_manager( ... ), $this->get_repo( ... ) );
 	}
 
 	/**

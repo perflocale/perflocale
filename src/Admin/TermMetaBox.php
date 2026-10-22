@@ -130,10 +130,11 @@ final class TermMetaBox {
 		wp_nonce_field( 'perflocale_term_lang', 'perflocale_term_nonce' );
 
 		// Withhold Create from a user the Create action is certain to refuse (no
-		// perflocale_translate). The action also requires edit_term on the
-		// default-language term a translation is seeded from, which only the
-		// action checks. Resolved once for every row.
-		$can_create = current_user_can( 'perflocale_translate' );
+		// perflocale_translate, or no right to create a term in this taxonomy).
+		// The action also requires edit_term on the default-language term a
+		// translation is seeded from, which only the action checks. Resolved
+		// once for every row.
+		$can_create = current_user_can( 'perflocale_translate' ) && \PerfLocale\Helper::user_can_create_term_like( $term->term_id );
 
 		// Translation rows.
 		echo '<tr class="form-field">';
@@ -256,7 +257,9 @@ final class TermMetaBox {
 			return;
 		}
 
-		if ( ! current_user_can( 'manage_categories' ) ) {
+		// The term's own edit right, as core's term screens and Quick Edit use:
+		// a taxonomy can register capabilities other than manage_categories.
+		if ( ! current_user_can( 'edit_term', $term_id ) ) {
 			return;
 		}
 

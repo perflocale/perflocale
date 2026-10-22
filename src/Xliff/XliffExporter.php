@@ -21,6 +21,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class XliffExporter {
 
 	/**
+	 * Posts loaded per statement.
+	 *
+	 * @var int
+	 */
+	private const CHUNK = 100;
+
+	/**
 	 * Export posts as XLIFF 2.0 XML string.
 	 *
 	 * @param array<int> $post_ids Post IDs to export.
@@ -61,8 +68,13 @@ final class XliffExporter {
 	/**
 	 * Shared XLIFF writer - serialises the xliff/file/unit tree via XMLWriter.
 	 *
-	 * Releases each post from the object cache after writing so the peak
-	 * memory footprint is bounded by one post, not the full export set.
+	 * Reading a post does not clear its caches: the export changes nothing,
+	 * and clean_post_cache() would invalidate shared caches (the post's
+	 * entries and the posts last_changed key other requests' queries use).
+	 * An export longer than one chunk releases each chunk's posts from the
+	 * runtime cache once they are written
+	 * (CacheManager::release_runtime_posts()), so the posts held shrink as
+	 * the document grows, and none are held when it is returned.
 	 *
 	 * @param \XMLWriter $writer Writer.
 	 * @param array<int> $post_ids Post IDs.
@@ -81,15 +93,14 @@ final class XliffExporter {
 		$writer->writeAttribute( 'srcLang', \PerfLocale\Helper::format_locale_as_bcp47( $source_lang ) );
 		$writer->writeAttribute( 'trgLang', \PerfLocale\Helper::format_locale_as_bcp47( $target_lang ) );
 
-		// Prime the post cache in ONE query instead of one-per-post inside the
-		// loop - big exports of 50+ posts otherwise issue 50+ SELECTs against
-		// wp_posts. `update_meta_cache`=false because we only read title/
-		// content/excerpt from the post row itself.
-		// Chunked (100/query), NOT one prime over the whole set: front-loading
-		// every full post row into the object cache before the loop starts
-		// defeats the per-post clean_post_cache() below, so peak memory grew
-		// with the export size instead of staying bounded by one chunk.
-		foreach ( array_chunk( array_map( 'intval', $post_ids ), 100 ) as $chunk ) {
+		// Prime the post cache one chunk (100 posts) per query instead of one
+		// query per post inside the loop. `update_meta_cache`=false because we
+		// only read title/content/excerpt from the post row itself. Posts
+		// already cached cost nothing.
+		$post_ids = array_map( 'intval', $post_ids );
+		$release  = count( $post_ids ) > self::CHUNK;
+
+		foreach ( array_chunk( $post_ids, self::CHUNK ) as $chunk ) {
 			if ( function_exists( '_prime_post_caches' ) ) {
 				_prime_post_caches( $chunk, false, false );
 			}
@@ -116,9 +127,10 @@ final class XliffExporter {
 				}
 
 				$writer->endElement(); // file
+			}
 
-				// Drop the post from the cache so memory stays flat across the loop.
-				clean_post_cache( $post_id );
+			if ( $release ) {
+				\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
 			}
 		}
 

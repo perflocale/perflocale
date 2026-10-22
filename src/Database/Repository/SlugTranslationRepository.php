@@ -369,7 +369,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			// missing, connection lost, etc.) won't be fixed by another
 			// pass - bail immediately so we don't burn cycles on a real
 			// fault.
-			if ( strpos( (string) $this->wpdb->last_error, 'Duplicate entry' ) === false ) {
+			if ( ! Schema::is_duplicate_key_error( (string) $this->wpdb->last_error ) ) {
 				break;
 			}
 		}
@@ -381,7 +381,7 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			// fault (missing table, lost connection) - the remedies differ.
 			$db_error = (string) $this->wpdb->last_error;
 			$this->report_write_failure(
-				str_contains( $db_error, 'Duplicate entry' ) ? 'duplicate_exhausted' : 'db_error',
+				Schema::is_duplicate_key_error( $db_error ) ? 'duplicate_exhausted' : 'db_error',
 				[
 					'object_type'    => $object_type,
 					'object_subtype' => $object_subtype,

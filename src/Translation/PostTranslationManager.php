@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Translation;
 
 use PerfLocale\Cache\CacheManager;
+use PerfLocale\Database\DataRegistry;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Enum\ObjectType;
@@ -880,6 +881,42 @@ final class PostTranslationManager {
 	];
 
 	/**
+	 * Key words that keep a meta value out of machine translation on top of
+	 * SENSITIVE_META_PATTERNS, matched as whole segments of the key (see
+	 * is_sensitive_meta_key()): a key named `token`, `password`, `api_key`,
+	 * `secret_*` or `license*` is never sent to a provider. Copying between
+	 * languages does not use this list: a copy stays inside the site.
+	 */
+	private const MT_SENSITIVE_META_PATTERNS = [
+		'token',
+		'secret',
+		'api_key',
+		'apikey',
+		'password',
+		'license',
+		'licence',
+	];
+
+	/**
+	 * The meta-key patterns whose values are never sent to machine
+	 * translation: the sensitive patterns and MT_SENSITIVE_META_PATTERNS,
+	 * through the same filter as sensitive_meta_patterns() with the context
+	 * 'machine_translation'. Removing a pattern there sends such a key again.
+	 *
+	 * @return array<int, string>
+	 */
+	public static function mt_sensitive_meta_patterns(): array {
+		/** This filter is documented in src/Translation/PostTranslationManager.php */
+		$patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', array_merge( self::SENSITIVE_META_PATTERNS, self::MT_SENSITIVE_META_PATTERNS ), 'machine_translation' );
+
+		if ( ! is_array( $patterns ) ) {
+			return [];
+		}
+
+		return array_values( array_filter( $patterns, 'is_string' ) );
+	}
+
+	/**
 	 * The sensitive meta-key patterns in force for the current site.
 	 *
 	 * Runs the filter on every call rather than memoising: the answer can
@@ -889,8 +926,8 @@ final class PostTranslationManager {
 	 * @return array<int, string>
 	 */
 	public static function sensitive_meta_patterns(): array {
-		/** @hook perflocale/translation/dangerous_meta_patterns Filter patterns for meta keys that should never be copied. */
-		$patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', self::SENSITIVE_META_PATTERNS );
+		/** @hook perflocale/translation/dangerous_meta_patterns Filter patterns for meta keys that should never be copied, nor sent to machine translation. The second argument names the list: 'copy', or 'machine_translation' (that list adds token, secret, api_key, apikey, password, license and licence). */
+		$patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', self::SENSITIVE_META_PATTERNS, 'copy' );
 
 		if ( ! is_array( $patterns ) ) {
 			return [];
@@ -927,7 +964,7 @@ final class PostTranslationManager {
 				continue;
 			}
 
-			if ( in_array( strtolower( $pattern ), self::SENSITIVE_META_PATTERNS, true ) ) {
+			if ( in_array( strtolower( $pattern ), self::SENSITIVE_META_PATTERNS, true ) || in_array( strtolower( $pattern ), self::MT_SENSITIVE_META_PATTERNS, true ) ) {
 				// The pattern and the glued words ignore case, the boundaries
 				// do not. Each glued alternative consumes its own text (one
 				// digit, not a run), so the repeated group cannot backtrack
@@ -960,6 +997,7 @@ final class PostTranslationManager {
 			return;
 		}
 
+		// WordPress's own per-post bookkeeping, never copied.
 		$excluded = [
 			'_edit_lock',
 			'_edit_last',
@@ -968,31 +1006,40 @@ final class PostTranslationManager {
 			'_encloseme',
 			'_pingme',
 			'_thumbnail_id',
-			// Per-source copy-failure bookkeeping - copying it would surface a
-			// stale failure notice on a freshly-created translation.
-			'_perflocale_meta_copy_errors',
-			// Keys the copy source's owner emptied. The new translation has not
-			// emptied anything, so it must still receive later seeds.
-			SyncMeta::SEED_CLEARED_META,
-			// The copy source's own stale Sync Fields mark. The new translation
-			// starts with the copy source's values and is not marked.
-			SyncMeta::SYNC_STALE_META,
-			// The Sync Fields values the copy source held before its stale
-			// mark was cleared; they describe that post's edit screen only.
-			SyncMeta::SYNC_HELD_META,
 		];
 
-		// The SEO exclusion takes the post it is set on out of hreflang and
-		// sitemap alternates. A new translation is listed until its own editor
-		// sets the flag on it, unless the site's Sync Fields list the flag:
-		// the group then shares one value, and the new translation starts
-		// with it, so its first save mirrors nothing back over the group.
-		if ( ! in_array( \PerfLocale\Helper::SEO_EXCLUDE_META, (array) $this->settings->get( 'sync_fields', [] ), true ) ) {
-			$excluded[] = \PerfLocale\Helper::SEO_EXCLUDE_META;
+		// The plugin's own keys a new translation must not inherit: the data
+		// registry's post-meta entries with copy `no` (copy-failure and
+		// machine-translation diagnostics, the template reference records,
+		// the Sync Fields marks, the WooCommerce page attempt mark).
+		$excluded = array_merge( $excluded, DataRegistry::copy_excluded_post_meta() );
+
+		// Entries with copy `if_synced`, such as the SEO exclusion: it takes
+		// the post it is set on out of hreflang and sitemap alternates, so a
+		// new translation is listed until its own editor sets the flag on it,
+		// unless the site's Sync Fields list the flag: the group then shares
+		// one value, and the new translation starts with it, so its first save
+		// mirrors nothing back over the group.
+		$sync_fields = (array) $this->settings->get( 'sync_fields', [] );
+
+		foreach ( DataRegistry::copy_if_synced_post_meta() as $synced_only ) {
+			if ( ! in_array( $synced_only, $sync_fields, true ) ) {
+				$excluded[] = $synced_only;
+			}
 		}
 
 		/** @hook perflocale/translation/excluded_meta_keys Filter meta keys excluded from copying. */
 		$excluded = apply_filters( 'perflocale/translation/excluded_meta_keys', $excluded, $source_id );
+
+		// Key prefixes never copied: the registry's pattern entries with copy
+		// `no`. The per-language featured-image overrides
+		// (`_perflocale_thumbnail_{lang}`) are language-scoped bookkeeping
+		// owned by the source post: copied onto a translation, the override
+		// would shadow the sibling's own featured image on its /{lang}/ view
+		// (MediaTranslationManager), with no panel on the translation to
+		// clear it. The translation's own featured image is copied via
+		// _thumbnail_id (copy_featured_image).
+		$excluded_prefixes = DataRegistry::copy_excluded_post_meta_prefixes();
 
 		$dangerous_patterns = self::sensitive_meta_patterns();
 
@@ -1001,15 +1048,10 @@ final class PostTranslationManager {
 				continue;
 			}
 
-			// Per-language featured-image overrides (`_perflocale_thumbnail_{lang}`)
-			// are language-scoped bookkeeping owned by the source post. Copying
-			// them onto a translation makes MediaTranslationManager render the
-			// copied override on the sibling's own /{lang}/ view (shadowing its
-			// real featured image), and the per-language panel is hidden on the
-			// translation so there's no UI to clear it. The translation's own
-			// featured image is copied via _thumbnail_id (copy_featured_image).
-			if ( str_starts_with( $key, '_perflocale_thumbnail_' ) ) {
-				continue;
+			foreach ( $excluded_prefixes as $prefix ) {
+				if ( str_starts_with( (string) $key, $prefix ) ) {
+					continue 2;
+				}
 			}
 
 			// Skip keys matching dangerous patterns (credentials, tokens, secrets).
@@ -1364,6 +1406,27 @@ final class PostTranslationManager {
 	}
 
 	/**
+	 * Whether a post has a translation in a language, by the language's id,
+	 * which a change of the language's code leaves as it is. Reads the same
+	 * cached links as get_translations().
+	 *
+	 * @param int $post_id     Post ID.
+	 * @param int $language_id Language ID.
+	 * @return bool
+	 */
+	public function has_translation_in( int $post_id, int $language_id ): bool {
+		foreach ( $this->groups->get_translations( $post_id, ObjectType::Post ) as $link ) {
+			$id = is_object( $link ) ? ( get_object_vars( $link )['language_id'] ?? null ) : null;
+
+			if ( is_numeric( $id ) && (int) $id === $language_id ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * Get the translation status for a post in a specific language.
 	 *
 	 * @param int    $post_id Post ID.
@@ -1536,17 +1599,43 @@ final class PostTranslationManager {
 				return false;
 			}
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$updated = $wpdb->update(
-				$links_table,
-				[ 'language_id' => (int) $lang->id ],
-				[
-					'group_id'  => (int) $group->id,
-					'object_id' => $post_id,
-				],
-				[ '%d' ],
-				[ '%d', '%d' ]
-			);
+			// The language it leaves, for the references in that language's
+			// templates (memoised: the post's language is usually known here).
+			$left_language = $this->detect_post_language( $post_id );
+
+			$new_lang = (int) $lang->id;
+			$group_id = (int) $group->id;
+			$touch    = \PerfLocale\Database\Schema::touch_write_time( [ [ 'language_id', '%d', 'int' ] ] );
+
+			if ( '' === $touch || ! $wpdb instanceof \wpdb ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$updated = $wpdb->update(
+					$links_table,
+					[ 'language_id' => $new_lang ],
+					[
+						'group_id'  => $group_id,
+						'object_id' => $post_id,
+					],
+					[ '%d' ],
+					[ '%d', '%d' ]
+				);
+			} else {
+				// SQLite: the same write with the write time the column's
+				// ON UPDATE CURRENT_TIMESTAMP gives on MySQL, the assignment
+				// Schema::touch_write_time() returns for language_id written out.
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$updated = $wpdb->query(
+					$wpdb->prepare(
+						'UPDATE %i SET language_id = %d, updated_at = CASE WHEN language_id = %d THEN updated_at ELSE NOW() END WHERE group_id = %d AND object_id = %d',
+						$links_table,
+						$new_lang,
+						$new_lang,
+						$group_id,
+						$post_id
+					) ?? ''
+				);
+				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			}
 
 			// $wpdb->update returns false on error. A concurrent writer can
 			// take the same (group_id, language_id) slot in the TOCTOU window
@@ -1620,6 +1709,10 @@ final class PostTranslationManager {
 				// The group's pages list the post under its language. Outside a
 				// post save nothing else clears them.
 				$this->clear_group_hreflang( $post_id, $member_ids );
+
+				// Menu and pattern references in translated templates follow the
+				// new language, and leave the old one, at the end of the request.
+				TemplateBlockRefs::note_language_change( $post_id, is_object( $left_language ) && isset( $left_language->id ) && is_numeric( $left_language->id ) ? (int) $left_language->id : 0 );
 			}
 
 			return true;

@@ -390,7 +390,9 @@ final class Deactivator {
 	}
 
 	/**
-	 * Every recurring + one-shot cron hook the plugin schedules.
+	 * Every recurring + one-shot cron hook the plugin schedules: the data
+	 * registry's cron entries with deactivate `clear` (DataRegistry::
+	 * cron_hooks()), legacy hooks of removed features included.
 	 *
 	 * Consumed by the per-blog both-engines clear in
 	 * {@see unschedule_background_events()}.
@@ -398,44 +400,6 @@ final class Deactivator {
 	 * @return list<string>
 	 */
 	private static function cron_hooks(): array {
-		return [
-			\PerfLocale\WooCommerce\ExchangeRateSync::CRON_HOOK,
-			\PerfLocale\Concurrency\Lock::CLEANUP_HOOK,
-			\PerfLocale\Bootstrap::AUTO_TRANSLATE_CRON,
-			// Files-mode regeneration after a plugin update (one-shot).
-			\PerfLocale\Bootstrap::FILES_REGENERATE_HOOK,
-			// Webhook delivery + retry one-shots (scheduled with per-delivery args).
-			\PerfLocale\Api\WebhookController::DELIVERY_HOOK,
-			\PerfLocale\Api\WebhookController::RETRY_HOOK,
-			// Coalesced-queue drainer (WP-Cron engine). Omitting it left a
-			// perflocale_drain_webhooks event orphaned in cron after deactivation.
-			\PerfLocale\Api\WebhookController::DRAIN_HOOK,
-			'perflocale_cleanup_temp_import',
-			// Background-jobs GC + watchdog + MT quality scoring (per-blog recurring).
-			'perflocale_jobs_gc',
-			'perflocale_jobs_watchdog',
-			// MT-usage GC (per-blog recurring; scheduled by
-			// ensure_recurring_schedules()). Omitting them here orphaned both in
-			// each blog's WP-Cron after deactivation.
-			'perflocale_mt_usage_gc',
-			// Recurring events from features removed in later versions. Swept by
-			// RAW NAME (their owning classes are gone) so a site upgrading from
-			// an older build doesn't keep firing an event nothing listens to.
-			'perflocale_tm_gc',
-			'perflocale_mt_quality_score',
-			'perflocale_glossary_import',
-			// Tier-2 background workers: each a `perflocale_job_run_<type>` hook.
-			'perflocale_job_run_data_import',
-			'perflocale_job_run_data_export',
-			'perflocale_job_run_wpml_migration',
-			'perflocale_job_run_polylang_migration',
-			'perflocale_job_run_translatepress_migration',
-			'perflocale_job_run_string_scan',
-			'perflocale_job_run_bulk_translate',
-			'perflocale_job_run_bulk_string_translate',
-			'perflocale_job_run_site_translate',
-			// Resume-after-reactivation handler.
-			\PerfLocale\Background\Resumer::HOOK,
-		];
+		return \PerfLocale\Database\DataRegistry::cron_hooks( 'deactivate' );
 	}
 }

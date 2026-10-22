@@ -305,6 +305,48 @@ final class Lock {
 	}
 
 	/**
+	 * Push the expiry of a lock this request holds to now + $ttl, so a long
+	 * run keeps a short TTL and a crashed one still frees the lock soon. A
+	 * compare-and-swap on the stored value: a lock another request took over
+	 * is not touched.
+	 *
+	 * @param string $name Lock name.
+	 * @param int    $ttl  Seconds from now.
+	 * @return bool False when this request does not hold the lock, or no
+	 *              longer does.
+	 */
+	public static function extend( string $name, int $ttl ): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		$key       = self::PREFIX . $name;
+		$owned_key = self::owned_key( $key );
+		$owned     = self::$owned[ $owned_key ] ?? null;
+
+		if ( null === $owned ) {
+			return false;
+		}
+
+		$value = self::format_value( time() + max( 1, $ttl ), self::generate_token() );
+
+		$sql = $wpdb->prepare( 'UPDATE %i SET option_value = %s WHERE option_name = %s AND option_value = %s', $wpdb->options, $value, $key, $owned );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Prepared on the line above.
+		$updated = is_string( $sql ) ? $wpdb->query( $sql ) : false;
+
+		if ( 1 !== (int) $updated ) {
+			return false;
+		}
+
+		self::invalidate_option_caches( $key );
+		self::$owned[ $owned_key ] = $value;
+
+		return true;
+	}
+
+	/**
 	 * Run a callable under a lock. Acquire, execute, release in try/finally.
 	 *
 	 * @param string   $name Lock name.
@@ -401,6 +443,9 @@ final class Lock {
 		// name. (`acquire()` stays conservative and refuses to TAKE OVER an
 		// unparseable row; the reaper is the one that cleans them up.)
 		// `\\\\` in this double-quoted PHP string → MySQL `\\` → REGEXP `\`.
+		// The expiry is cut before the first `|` with INSTR() and SUBSTR(),
+		// which the SQLite Database Integration runs too (SUBSTRING_INDEX()
+		// is MySQL-only).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$deleted = (int) $wpdb->query(
 			$wpdb->prepare(
@@ -408,7 +453,7 @@ final class Lock {
 				WHERE option_name LIKE %s
 				AND NOT (
 					option_value REGEXP '^[0-9]+\\\\|'
-					AND CAST(SUBSTRING_INDEX(option_value, '|', 1) AS UNSIGNED) >= %d
+					AND CAST(CASE WHEN INSTR(option_value, '|') > 0 THEN SUBSTR(option_value, 1, INSTR(option_value, '|') - 1) ELSE option_value END AS UNSIGNED) >= %d
 				)",
 				$wpdb->esc_like( $prefix ) . '%',
 				$now

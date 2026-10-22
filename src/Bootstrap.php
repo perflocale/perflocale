@@ -77,6 +77,17 @@ final class Bootstrap {
 	private const DORMANT_KEY = 'was_dormant';
 
 	/**
+	 * State options of the one-time jobs that admin_init dispatches,
+	 * duplicated from Background\Jobs\TemplateRefsBackfillJob::OPTION and
+	 * Background\Jobs\StringGroupRepairJob::OPTION so that an admin page
+	 * whose job is done loads neither class (reading a class constant
+	 * autoloads its class). BootstrapOneTimeJobGateTest asserts they equal
+	 * the jobs' constants.
+	 */
+	private const TEMPLATE_REFS_BACKFILL_OPTION = 'perflocale_template_refs_backfill';
+	private const SQLITE_GROUP_REPAIR_OPTION    = 'perflocale_sqlite_string_groups_repair_job';
+
+	/**
 	 * Initialize the plugin.
 	 *
 	 * Called once from perflocale.php after the autoloader is loaded.
@@ -1126,7 +1137,9 @@ final class Bootstrap {
 									return;
 								}
 
-								if ( ! current_user_can( 'manage_categories' ) ) {
+								// The new term's own edit right, which follows the
+								// taxonomy's capabilities.
+								if ( ! current_user_can( 'edit_term', $term_id ) ) {
 									return;
 								}
 
@@ -1146,6 +1159,11 @@ final class Bootstrap {
 					}
 				}
 			);
+
+			// The import form's upload in pieces (Settings → Export & Import,
+			// a file larger than PHP accepts in one request). The class loads
+			// only when the action runs.
+			add_action( 'wp_ajax_perflocale_import_upload', [ Admin\ImportUpload::class, 'handle_ajax' ] );
 
 			add_action(
 				'wp_ajax_perflocale_save_hidden_columns',
@@ -1597,69 +1615,7 @@ final class Bootstrap {
 		// WooCommerce, AIOWPSecurity, etc.) will wipe the detected-language
 		// state mid-request and break the switcher/hreflang/PostQueryFilter.
 		if ( is_multisite() ) {
-			add_action( 'switch_blog', [ Translation\PostQueryFilter::class, 'reset_static_caches' ] );
-			add_action( 'switch_blog', [ Translation\TermQueryFilter::class, 'reset_static_caches' ] );
-			add_action( 'switch_blog', [ Translation\PostTranslationManager::class, 'reset_static_caches' ] );
-			add_action( 'switch_blog', [ Database\Repository\TranslationGroupRepository::class, 'reset_static_caches' ] );
-			add_action( 'switch_blog', [ Database\Repository\SlugTranslationRepository::class, 'reset_static_caches' ] );
-			add_action( 'switch_blog', [ Seo\SitemapIntegration::class, 'reset_caches' ] );
-			add_action( 'switch_blog', [ Seo\SchemaEnricher::class, 'reset' ] );
-			add_action( 'switch_blog', [ Translation\MediaTranslationManager::class, 'reset_registered' ] );
-			// Addon settings are keyed per-blog (one autoloaded option per
-			// site), so the in-memory cache MUST drop on switch_blog or
-			// addons would read the wrong site's values after a switch.
-			add_action( 'switch_blog', [ Addon\AddonSettings::class, 'reset_static_caches' ] );
-
-			// Helper memoises current_language() per request. Templates on
-			// the new blog must see the new blog's current language -
-			// without this, a theme calling perflocale()->locale() after
-			// switch_to_blog() reads the previous blog's value.
-			add_action( 'switch_blog', [ Helper::class, 'reset_static_caches' ] );
-
-			// String translation is a shared singleton holding a per-BLOG memo.
-			// Only one of these two services is registered (database vs files
-			// mode), so resolve whichever exists and drop its memo on a blog
-			// switch - otherwise blog 2 serves blog 1's strings.
-			add_action(
-				'switch_blog',
-				static function (): void {
-					$plugin = Plugin::get_instance();
-
-					foreach ( [ 'string_translation', 'translation_file_loader' ] as $service ) {
-						if ( ! $plugin->has( $service ) ) {
-							continue;
-						}
-
-						$instance = $plugin->get( $service );
-
-						if ( method_exists( $instance, 'reset_for_blog_switch' ) ) {
-							$instance->reset_for_blog_switch();
-						}
-					}
-				}
-			);
-
-			// Settings is a DI singleton that loads its per-blog options
-			// blob ONCE on first access and memoises it for the rest of the
-			// request. Without an explicit reset, switch_to_blog() leaves
-			// the memo pointing at blog A's url_mode / translatable_post_types
-			// / hide_default_prefix / mt_provider, which then drive blog B's
-			// routing and translation decisions for any code that reads
-			// settings after the switch. Resolve from the container lazily
-			// so we don't instantiate Settings on blogs that never read it.
-			add_action(
-				'switch_blog',
-				static function (): void {
-					try {
-						$plugin = Plugin::get_instance();
-						if ( $plugin->has( 'settings' ) ) {
-							$plugin->get( 'settings' )->reset_cache();
-						}
-					} catch ( \Throwable $e ) {
-						// Mid-deactivation / container missing - fail closed.
-					}
-				}
-			);
+			add_action( 'switch_blog', [ self::class, 'reset_static_state' ] );
 		}
 
 		// Mirror the same data-derived invalidation pattern used by
@@ -1722,6 +1678,11 @@ final class Bootstrap {
 				if ( $file === '' ) {
 					return;
 				}
+
+				// An upload sent in pieces that was never imported gives up
+				// its place in the upload quota, whether or not its file is
+				// still there (the name alone identifies it).
+				Admin\ImportUpload::release_path( $file );
 
 				// Path-traversal guard: only files inside `uploads/perflocale/temp/`
 				// may be deleted via this publicly-callable hook.
@@ -2166,6 +2127,44 @@ final class Bootstrap {
 				'translatepress_migration',
 				static fn(): Background\AbstractJob => new Background\Jobs\TranslatePressMigrationJob()
 			);
+			// One-time backfill of menu and pattern references in the translated
+			// templates a site already has: dispatched by the first wp-admin
+			// request of a user who may edit templates, run by the job runner.
+			Background\WorkerRegistry::register(
+				'template_refs_backfill',
+				static fn(): Background\AbstractJob => new Background\Jobs\TemplateRefsBackfillJob()
+			);
+			// The containers a menu or pattern event reaches beyond those the
+			// request that made the change rewrote (TemplateBlockRefs::fan_out()).
+			Background\WorkerRegistry::register(
+				'template_refs_fanout',
+				static fn(): Background\AbstractJob => new Background\Jobs\TemplateRefsFanoutJob()
+			);
+
+			if ( is_admin() ) {
+				add_action( 'admin_init', [ self::class, 'maybe_dispatch_template_refs_backfill' ], 20 );
+			}
+
+			// The one-time jobs (the backfill above, the SQLite repair below)
+			// record a cancel in their dispatch state (a final failure is
+			// recorded by the worker), so that an admin page decides from
+			// that option alone.
+			add_action( 'perflocale/jobs/canceled', [ Background\OneTimeDispatch::class, 'on_canceled' ], 10, 2 );
+
+			// SQLite sites only: the repair of the string groups a scan before
+			// 1.0.7.3 shared. The engine is read first, so on MySQL and MariaDB
+			// no hook is added and nothing of the repair is loaded. wp-admin
+			// only queues the job; the job runner does the work in slices.
+			if ( defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ) {
+				Background\WorkerRegistry::register(
+					'sqlite_group_repair',
+					static fn(): Background\AbstractJob => new Background\Jobs\StringGroupRepairJob()
+				);
+
+				if ( is_admin() ) {
+					add_action( 'admin_init', [ self::class, 'maybe_dispatch_sqlite_group_repair' ] );
+				}
+			}
 		}
 		Background\WorkerRegistry::register(
 			'string_scan',
@@ -2402,6 +2401,113 @@ final class Bootstrap {
 	 * (autoloaded; written at most every 6 hours by the throttled path).
 	 */
 	private const SCHEDULES_VERIFIED_OPTION = 'perflocale_schedules_verified_at';
+
+	/**
+	 * Drop the per-request memos that hold one blog's data: run on
+	 * switch_blog (multisite), and by CacheManager::refresh_if_changed() when
+	 * a long-running process's checkpoint finds data another process changed.
+	 *
+	 * - Post/TermQueryFilter, PostTranslationManager, TranslationGroupRepository,
+	 *   SlugTranslationRepository, SitemapIntegration, SchemaEnricher and
+	 *   MediaTranslationManager memoise per-blog lookups.
+	 * - AddonSettings: addon settings are keyed per blog (one autoloaded
+	 *   option per site).
+	 * - Helper memoises current_language(); templates after a switch must see
+	 *   the new blog's language (a theme calling perflocale()->locale() after
+	 *   switch_to_blog() would read the previous blog's value).
+	 * - String translation is a shared singleton holding a per-blog memo;
+	 *   only one of its two services is registered (database or files mode),
+	 *   so whichever exists drops it.
+	 * - Settings loads its per-blog options blob once and memoises it;
+	 *   without a reset the memo keeps another blog's (or an older) url_mode,
+	 *   translatable_post_types, hide_default_prefix and mt_provider. Resolved
+	 *   lazily so Settings is not instantiated on blogs that never read it.
+	 *
+	 * LanguageRouter keeps its own switch_blog listener (maybe_reset_on_switch):
+	 * a raw reset here would wipe the detected-language state on same-blog
+	 * switches (common in WooCommerce, AIOWPSecurity, etc.).
+	 *
+	 * @return void
+	 */
+	public static function reset_static_state(): void {
+		Translation\PostQueryFilter::reset_static_caches();
+		Translation\TermQueryFilter::reset_static_caches();
+		Translation\PostTranslationManager::reset_static_caches();
+		Database\Repository\TranslationGroupRepository::reset_static_caches();
+		Database\Repository\SlugTranslationRepository::reset_static_caches();
+		Seo\SitemapIntegration::reset_caches();
+		Seo\SchemaEnricher::reset();
+		Translation\MediaTranslationManager::reset_registered();
+		Addon\AddonSettings::reset_static_caches();
+		Helper::reset_static_caches();
+
+		try {
+			$plugin = Plugin::get_instance();
+
+			foreach ( [ 'string_translation', 'translation_file_loader' ] as $service ) {
+				if ( ! $plugin->has( $service ) ) {
+					continue;
+				}
+
+				$instance = $plugin->get( $service );
+
+				if ( method_exists( $instance, 'reset_for_blog_switch' ) ) {
+					$instance->reset_for_blog_switch();
+				}
+			}
+
+			if ( $plugin->has( 'settings' ) ) {
+				$plugin->get( 'settings' )->reset_cache();
+			}
+		} catch ( \Throwable $e ) {
+			// Mid-deactivation / container missing - fail closed.
+		}
+	}
+
+	/**
+	 * `admin_init`: Background\Jobs\TemplateRefsBackfillJob::maybe_dispatch().
+	 * Once the backfill is done (the state of every admin page after it
+	 * ran), this returns on the autoloaded state option, before the job,
+	 * AbstractJob and OneTimeDispatch are loaded; every other state goes
+	 * to the job, which makes all the checks.
+	 *
+	 * @return void
+	 */
+	public static function maybe_dispatch_template_refs_backfill(): void {
+		if ( self::one_time_job_done( self::TEMPLATE_REFS_BACKFILL_OPTION ) ) {
+			return;
+		}
+
+		Background\Jobs\TemplateRefsBackfillJob::maybe_dispatch();
+	}
+
+	/**
+	 * `admin_init` on SQLite: Background\Jobs\StringGroupRepairJob::maybe_dispatch(),
+	 * after the same done check as maybe_dispatch_template_refs_backfill().
+	 *
+	 * @return void
+	 */
+	public static function maybe_dispatch_sqlite_group_repair(): void {
+		if ( self::one_time_job_done( self::SQLITE_GROUP_REPAIR_OPTION ) ) {
+			return;
+		}
+
+		Background\Jobs\StringGroupRepairJob::maybe_dispatch();
+	}
+
+	/**
+	 * Whether a one-time job's state option records it as done
+	 * (`done:<unix time>`, Background\OneTimeDispatch). Reads the option
+	 * only.
+	 *
+	 * @param string $option State option.
+	 * @return bool
+	 */
+	private static function one_time_job_done( string $option ): bool {
+		$state = get_option( $option, '' );
+
+		return is_string( $state ) && str_starts_with( $state, 'done:' );
+	}
 
 	/**
 	 * Ensure the plugin's two recurring background events
@@ -3110,6 +3216,14 @@ final class Bootstrap {
 				continue;
 			}
 
+			// A translation this click creates is published only when its
+			// source page is published and the user may publish that type.
+			$source_type = get_post_type_object( $source_post->post_type );
+			$may_publish = 'publish' === $source_post->post_status
+				&& $source_type instanceof \WP_Post_Type
+				&& is_string( $source_type->cap->publish_posts ?? null )
+				&& current_user_can( $source_type->cap->publish_posts );
+
 			foreach ( $languages as $lang ) {
 				if ( $lang->slug === $default->slug ) {
 					continue;
@@ -3123,7 +3237,8 @@ final class Bootstrap {
 				$link_source = $mt_provider !== null
 					? \PerfLocale\Enum\SourceType::MachineTranslation
 					: \PerfLocale\Enum\SourceType::Manual;
-				$new_id      = $manager->create_translation( $page_id, $lang->slug, true, $link_source );
+				$inserted    = false;
+				$new_id      = $manager->create_translation( $page_id, $lang->slug, true, $link_source, $inserted );
 
 				if ( ! $new_id || $new_id === $page_id ) {
 					$details[] = $label . ': failed';
@@ -3190,9 +3305,11 @@ final class Bootstrap {
 					$translated_title = $new_post->post_title;
 				}
 
-				// Publish with matching slug and translated title.
-				$needs_update = (
-					$new_post->post_status !== 'publish'
+				// Matching slug and translated title. A translation that existed
+				// before this click keeps its status.
+				$target_status = $inserted && $may_publish ? 'publish' : $new_post->post_status;
+				$needs_update  = (
+					$new_post->post_status !== $target_status
 					|| $new_post->post_name !== $source_post->post_name
 					|| $new_post->post_title !== $translated_title
 				);
@@ -3210,7 +3327,7 @@ final class Bootstrap {
 						[
 							'post_title'  => $translated_title,
 							'post_name'   => $source_post->post_name,
-							'post_status' => 'publish',
+							'post_status' => $target_status,
 						],
 						[ 'ID' => $new_id ],
 						[ '%s', '%s', '%s' ],
@@ -5423,6 +5540,10 @@ final class Bootstrap {
 			return;
 		}
 
+		// The job runs without a user; what it cannot save is shown to the
+		// user publishing now.
+		Admin\MtCreateNotice::remember_publisher( (int) $post->ID );
+
 		// Defer to async runner - Action Scheduler when available
 		// (immediate claim, no per-minute cron tick wait), WP-Cron otherwise.
 		if ( ! Background\BackgroundEvents::is_scheduled( self::AUTO_TRANSLATE_CRON, [ $post->ID ] ) ) {
@@ -5432,6 +5553,11 @@ final class Bootstrap {
 
 	/**
 	 * Process deferred auto-translation for a single post.
+	 *
+	 * A refusal, and each language whose machine translation failed or was
+	 * refused by a save guard, is shown once on the post's edit screen to
+	 * the user who published it (the post's author when nobody did); see
+	 * Admin\MtCreateNotice. The debug log line stays.
 	 *
 	 * @param int $post_id Post ID to translate.
 	 * @return void
@@ -5455,6 +5581,22 @@ final class Bootstrap {
 		// A password-protected post is sent only when the
 		// perflocale/mt/send_password_protected filter allows it.
 		if ( ! MachineTranslation\TranslationService::may_send_post( $source, 'auto_publish' ) ) {
+			self::remember_auto_translate_failures(
+				$source,
+				[
+					[
+						'reason'   => __( 'The post is password-protected, and machine translation does not send password-protected posts when they are published.', 'perflocale' ),
+						'own'      => false,
+						'language' => '',
+					],
+				]
+			);
+			return;
+		}
+
+		// The job was queued at publish; a source that is no longer published
+		// is not sent.
+		if ( 'publish' !== $source->post_status ) {
 			return;
 		}
 
@@ -5495,6 +5637,7 @@ final class Bootstrap {
 			$scope = (array) $settings->get( 'mt_auto_translate_languages', [] );
 
 			$translations = $manager->get_translations( $post_id );
+			$failures     = [];
 
 			foreach ( $languages as $lang ) {
 				if ( $lang->slug === $default->slug ) {
@@ -5544,27 +5687,67 @@ final class Bootstrap {
 					continue;
 				}
 
+				// The source can be unpublished while earlier languages run; the
+				// status is read from the table, not from this process's cache.
+				$db = $GLOBALS['wpdb'] ?? null;
+
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One primary-key read per language.
+				if ( ! $db instanceof \wpdb || 'publish' !== $db->get_var( $db->prepare( 'SELECT post_status FROM %i WHERE ID = %d', $db->posts, $post_id ) ) ) {
+					break;
+				}
+
 				try {
 					$service->translate_post( $post_id, $lang->slug );
 				} catch ( \Throwable $e ) {
-					if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-						// Silence the common benign cases (post deleted
-						// mid-cron, stub reused) so debug.log stays
-						// usable for real failures.
-						$msg    = $e->getMessage();
-						$benign = str_contains( $msg, 'Source post not found' )
-							|| str_contains( $msg, 'Invalid post ID' )
-							|| str_contains( $msg, 'Невалидно ID' );
+					// The common benign cases (post deleted mid-cron, stub
+					// reused) are neither logged nor shown, so debug.log
+					// stays usable for real failures.
+					$msg    = $e->getMessage();
+					$benign = str_contains( $msg, 'Source post not found' )
+						|| str_contains( $msg, 'Invalid post ID' )
+						|| str_contains( $msg, 'Невалидно ID' );
 
-						if ( ! $benign ) {
+					if ( ! $benign ) {
+						if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
 							error_log( 'PerfLocale auto-translate failed for ' . $lang->slug . ': ' . $msg ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 						}
+
+						$lang_vars  = get_object_vars( $lang );
+						$lang_name  = $lang_vars['name'] ?? '';
+						$failures[] = [
+							'reason'   => $msg,
+							'own'      => $e instanceof MachineTranslation\NotSavedException,
+							'language' => is_string( $lang_name ) && '' !== $lang_name ? $lang_name : ( is_string( $lang_vars['slug'] ?? null ) ? $lang_vars['slug'] : '' ),
+						];
 					}
 				}
 			}
+
+			self::remember_auto_translate_failures( $source, $failures );
 		} finally {
 			Concurrency\Lock::release( 'auto_translate_' . $post_id );
 		}
+	}
+
+	/**
+	 * Record what an auto-translate on publish run could not save, for the
+	 * user who published the post, or for its author when nobody did (a
+	 * scheduled publish, WP-CLI): the author answers for the post, and the
+	 * notice is shown only to a user who can edit it. A run with no failures
+	 * removes an earlier run's record.
+	 *
+	 * @param \WP_Post                         $source   The published post.
+	 * @param array<int, array<string, mixed>> $failures Failures, in language order (see MtCreateNotice::remember_publish()).
+	 * @return void
+	 */
+	private static function remember_auto_translate_failures( \WP_Post $source, array $failures ): void {
+		$user_id = Admin\MtCreateNotice::take_publisher( (int) $source->ID );
+
+		if ( $user_id <= 0 ) {
+			$user_id = (int) $source->post_author;
+		}
+
+		Admin\MtCreateNotice::remember_publish( $user_id, (int) $source->ID, $failures );
 	}
 
 	/**

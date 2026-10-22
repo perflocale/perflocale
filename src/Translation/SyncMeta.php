@@ -97,6 +97,35 @@ final class SyncMeta {
 	private static array $tracked = [];
 
 	/**
+	 * Prefix of the plugin's own post-meta keys. Sync Fields never mirrors
+	 * or seeds one of them, whatever lists it (a stored Sync Fields value, an
+	 * import, WP-CLI, the perflocale/sync_fields filters): each describes the
+	 * one post it is on. The data registry holds the same rule (post-meta
+	 * entries with sync `never`, and the namespace sweep); SyncMetaParityTest
+	 * keeps the two equal. A prefix check here, so the save path never loads
+	 * the registry.
+	 */
+	public const INTERNAL_META_PREFIX = '_perflocale_';
+
+	/**
+	 * The plugin's own post-meta keys Sync Fields may list: the registry's
+	 * post-meta entries with sync `if_listed`, other than another plugin's
+	 * meta (class FOREIGN).
+	 */
+	public const SYNCABLE_INTERNAL_META = [ '_perflocale_seo_exclude' ];
+
+	/**
+	 * Whether Sync Fields must leave a meta key alone: a key of the plugin's
+	 * own namespace that is not one it may list.
+	 *
+	 * @param string $key Meta key.
+	 * @return bool
+	 */
+	public static function is_never_synced( string $key ): bool {
+		return str_starts_with( $key, self::INTERNAL_META_PREFIX ) && ! in_array( $key, self::SYNCABLE_INTERNAL_META, true );
+	}
+
+	/**
 	 * Whether this request is a front-end page view: a GET or HEAD request
 	 * outside admin, AJAX, cron, REST and WP-CLI. Meta written while a page
 	 * is viewed (a view counter, a cached value) is not an edit: it starts no

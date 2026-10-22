@@ -1155,6 +1155,35 @@ final class Helper {
 	}
 
 	/**
+	 * Whether a request URI names an XML sitemap: "sitemap" and, later in the
+	 * same path segment (no "/" between them), ".xml", as in
+	 * /sitemap_index.xml, /page-sitemap2.xml or /wp-sitemap-posts-post-1.xml.
+	 *
+	 * The answer of preg_match( '/sitemap[^\/]*\.xml/', $uri ), in time linear
+	 * in the URI's length. The SEO add-ons ask on every front-end request,
+	 * with a URI the visitor chooses; a URI without "sitemap" costs one
+	 * substring search.
+	 *
+	 * @param string $uri Request URI.
+	 * @return bool
+	 */
+	public static function is_sitemap_uri( string $uri ): bool {
+		if ( ! str_contains( $uri, 'sitemap' ) ) {
+			return false;
+		}
+
+		foreach ( explode( '/', $uri ) as $segment ) {
+			$at = strpos( $segment, 'sitemap' );
+
+			if ( false !== $at && false !== strpos( $segment, '.xml', $at + 7 ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * Whether the current request is a REST API request - usable at BOOT time.
 	 *
 	 * The `REST_REQUEST` constant is only defined on `parse_request` (deep
@@ -3628,6 +3657,43 @@ final class Helper {
 		}
 
 		return self::object_permission( 'create', $capability, $post_id );
+	}
+
+	/**
+	 * Whether the current user may create a term like `$term_id`: a term of its
+	 * taxonomy.
+	 *
+	 * Creating a term translation inserts a term into the copy source's
+	 * taxonomy, and wp_insert_term() checks no capability. The rule is the one
+	 * core applies to a new term: the taxonomy's `edit_terms` capability (the
+	 * term screen and its add-term request), or for a flat taxonomy also
+	 * `assign_terms` (the REST terms route). Edit rights on one term
+	 * (`edit_term`) are not this right: a site can grant them per term. Entry
+	 * points that create pass the term
+	 * {@see \PerfLocale\Translation\TermTranslationManager::get_copy_source_id()}
+	 * names, and ask only when a translation would be created; the term box
+	 * asks about the term it shows, to decide whether to offer Create.
+	 *
+	 * @param int $term_id Term the new translation would be copied from.
+	 * @return bool False when the term or its taxonomy does not exist.
+	 */
+	public static function user_can_create_term_like( int $term_id ): bool {
+		$term     = get_term( $term_id );
+		$taxonomy = $term instanceof \WP_Term ? get_taxonomy( $term->taxonomy ) : false;
+
+		if ( ! $taxonomy instanceof \WP_Taxonomy ) {
+			return false;
+		}
+
+		$caps = $taxonomy->hierarchical ? [ $taxonomy->cap->edit_terms ] : [ $taxonomy->cap->edit_terms, $taxonomy->cap->assign_terms ];
+
+		foreach ( $caps as $capability ) {
+			if ( is_string( $capability ) && current_user_can( $capability ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

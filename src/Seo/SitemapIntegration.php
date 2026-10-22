@@ -9,10 +9,6 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Seo;
 
-use PerfLocale\Database\Repository\LanguageRepository;
-use PerfLocale\Database\Repository\TranslationGroupRepository;
-use PerfLocale\Enum\ObjectType;
-use PerfLocale\Plugin;
 use PerfLocale\Settings;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -31,56 +27,11 @@ final class SitemapIntegration {
 	private readonly Settings $settings;
 
 	/**
-	 * Per-request caches populated by add_alternate_links()/add_taxonomy_alternate_links().
+	 * The sitemap-request work, built on the first sitemap callback.
 	 *
-	 * Stored at class level so switch_blog() can nuke them on multisite
-	 * instead of relying on method-local statics that we can't reach.
-	 *
-	 * @var TranslationGroupRepository|null
+	 * @var SitemapRequest|null
 	 */
-	private static ?TranslationGroupRepository $repo_cache = null;
-
-	/**
-	 * @var LanguageRepository|null
-	 */
-	private static ?LanguageRepository $lang_repo_cache = null;
-
-	/**
-	 * @var array<int, object>|null
-	 */
-	private static ?array $languages_cache = null;
-
-	/**
-	 * @var object|null
-	 */
-	private static ?object $default_lang_cache = null;
-
-	/**
-	 * Map of language slug → hreflang value.
-	 *
-	 * @var array<string, string>|null
-	 */
-	private static ?array $slug_map_cache = null;
-
-	/**
-	 * Post types whose caches have been primed for this sitemap run.
-	 *
-	 * WordPress renders one sitemap per post type (and per taxonomy).
-	 * A single global $primed bool would prime on the first post type
-	 * and never again, so subsequent types miss the optimisation. Key
-	 * the prime state by post type to fix that.
-	 *
-	 * @var array<string, bool>
-	 */
-	private static array $primed_types = [];
-
-	/**
-	 * Taxonomies whose term caches have been primed for this sitemap run.
-	 * Mirrors $primed_types for the taxonomy path.
-	 *
-	 * @var array<string, bool>
-	 */
-	private static array $primed_taxonomies = [];
+	private ?SitemapRequest $request = null;
 
 	/**
 	 * Reset per-request caches when multisite switches blog context.
@@ -88,13 +39,9 @@ final class SitemapIntegration {
 	 * @return void
 	 */
 	public static function reset_caches(): void {
-		self::$repo_cache         = null;
-		self::$lang_repo_cache    = null;
-		self::$languages_cache    = null;
-		self::$default_lang_cache = null;
-		self::$slug_map_cache     = null;
-		self::$primed_types       = [];
-		self::$primed_taxonomies  = [];
+		if ( class_exists( SitemapRequest::class, false ) ) {
+			SitemapRequest::reset_caches();
+		}
 	}
 
 	/**
@@ -219,15 +166,46 @@ final class SitemapIntegration {
 	}
 
 	/**
+	 * The sitemap-request work.
+	 *
+	 * @return SitemapRequest
+	 */
+	private function request(): SitemapRequest {
+		return $this->request ??= new SitemapRequest( $this->settings );
+	}
+
+	/**
 	 * Include posts in all languages in sitemaps.
 	 *
 	 * @param array<string, mixed> $args Query arguments.
 	 * @return array<string, mixed>
 	 */
 	public function include_all_languages( array $args ): array {
-		$args['perflocale_all_languages'] = true;
+		$args['perflocale_all_languages']       = true;
+		$args[ SitemapRequest::PAGE_QUERY_VAR ] = true;
+
+		// Registered only once a core post sitemap builds its query, so no
+		// other request gains a the_posts callback. Adding the same callback
+		// again is a no-op.
+		add_filter( 'the_posts', [ $this, 'capture_page_posts' ], 10, 2 );
 
 		return $args;
+	}
+
+	/**
+	 * Record the IDs of the posts a core post sitemap page lists.
+	 *
+	 * Only the query marked by include_all_languages() is recorded, and it
+	 * replaces the previous page's IDs (an empty page included). Over the
+	 * bulk-prime cap, the page's first entry primes the translation siblings
+	 * of exactly these posts.
+	 *
+	 * @param mixed $posts Posts the query returned.
+	 * @param mixed $query The query.
+	 * @return mixed The posts, unchanged.
+	 */
+	public function capture_page_posts( mixed $posts, mixed $query ): mixed {
+		return $this->request()->capture_page_posts( $posts, $query );
 	}
 
 	/**
@@ -237,9 +215,31 @@ final class SitemapIntegration {
 	 * @return array<string, mixed>
 	 */
 	public function include_all_languages_taxonomies( array $args ): array {
-		$args['perflocale_all_languages'] = true;
+		$args['perflocale_all_languages']       = true;
+		$args[ SitemapRequest::PAGE_QUERY_VAR ] = true;
+
+		// Registered only once a core taxonomy sitemap builds its query, so
+		// no other request gains a pre_get_terms callback. Adding the same
+		// callback again is a no-op.
+		add_action( 'pre_get_terms', [ $this, 'capture_page_term_query' ] );
 
 		return $args;
+	}
+
+	/**
+	 * Record the term query a core taxonomy sitemap page runs.
+	 *
+	 * Only the query marked by include_all_languages_taxonomies() that loads
+	 * whole terms is recorded (not the page-count query), and it replaces the
+	 * previous page's query. Its terms are read by the page's first entry,
+	 * after the query has run: over the bulk-prime cap, that entry primes the
+	 * translation siblings of exactly these terms.
+	 *
+	 * @param mixed $query The term query.
+	 * @return void
+	 */
+	public function capture_page_term_query( mixed $query ): void {
+		$this->request()->capture_page_term_query( $query );
 	}
 
 	/**
@@ -255,56 +255,7 @@ final class SitemapIntegration {
 	 * @return array<string, mixed>
 	 */
 	public function add_home_alternate_links( array $entry ): array {
-		$this->prime_static_caches();
-
-		if ( count( self::$languages_cache ) < 2 ) {
-			return $entry;
-		}
-
-		$plugin = Plugin::get_instance();
-
-		if ( ! $plugin->has( 'url_converter' ) ) {
-			return $entry;
-		}
-
-		$url_converter = $plugin->get( 'url_converter' );
-		$default       = self::$default_lang_cache;
-		$alternates    = [];
-		$default_url   = null;
-
-		foreach ( self::$languages_cache as $lang ) {
-			if ( empty( $lang->slug ) || ! isset( self::$slug_map_cache[ $lang->slug ] ) ) {
-				continue;
-			}
-
-			$href = $url_converter->convert( home_url( '/' ), $lang->slug );
-
-			if ( $href === '' ) {
-				continue;
-			}
-
-			$alternates[] = [
-				'href'     => $href,
-				'hreflang' => self::$slug_map_cache[ $lang->slug ],
-			];
-
-			if ( $default && $lang->slug === $default->slug ) {
-				$default_url = $href;
-			}
-		}
-
-		if ( count( $alternates ) > 1 ) {
-			if ( $default_url && (bool) $this->settings->get( 'seo_x_default', true ) ) {
-				$alternates[] = [
-					'href'     => $default_url,
-					'hreflang' => 'x-default',
-				];
-			}
-
-			$entry['xhtml:link'] = $alternates;
-		}
-
-		return $entry;
+		return $this->request()->add_home_alternate_links( $entry );
 	}
 
 	/**
@@ -323,195 +274,7 @@ final class SitemapIntegration {
 	 * @return array<string, mixed>
 	 */
 	public function add_alternate_links( array $entry, object $post, string $post_type ): array {
-		$this->prime_static_caches();
-
-		if ( count( self::$languages_cache ) < 2 ) {
-			return $entry;
-		}
-
-		// Prime the post cache for all translation IDs on first call
-		// PER post type. WordPress sitemaps render one page per post type,
-		// and priming only once would miss all subsequent types.
-		if ( empty( self::$primed_types[ $post_type ] ) ) {
-			self::$primed_types[ $post_type ] = true;
-			$this->prime_sitemap_caches( self::$repo_cache, $post_type );
-		}
-
-		// Per-post opt-out: a flagged entry advertises no alternates (and is
-		// skipped as a sibling below) so excluded translations never appear
-		// in any alternate set. O(1) against a per-request memoised id set.
-		if ( \PerfLocale\Helper::is_seo_excluded( (int) $post->ID ) ) {
-			return $entry;
-		}
-
-		$links = self::$repo_cache->get_translations( $post->ID, ObjectType::Post );
-
-		if ( empty( $links ) ) {
-			// Untranslated post. In host-based URL modes (subdomain/domain)
-			// every language host serves its own /wp-sitemap.xml, and the loc
-			// core built inherits the REQUEST host - so the same untranslated
-			// post would be advertised self-canonically on every language
-			// host (cross-host duplicate content). An unlinked object is
-			// default-language content by definition, so pin the loc to the
-			// default language; a no-op in path-based modes.
-			return $this->pin_entry_loc_to_default( $entry );
-		}
-
-		// Detect front page translations - use language root URL instead of permalink.
-		$front_page_id = (int) get_option( 'page_on_front' );
-		$is_front_page = false;
-
-		if ( $front_page_id > 0 ) {
-			foreach ( $links as $link ) {
-				if ( (int) $link->object_id === $front_page_id ) {
-					$is_front_page = true;
-					break;
-				}
-			}
-		}
-
-		$plugin        = Plugin::get_instance();
-		$url_converter = ( $is_front_page && $plugin->has( 'url_converter' ) )
-			? $plugin->get( 'url_converter' )
-			: null;
-
-		// Collect all translation object IDs for batch status/permalink check.
-		$alternates  = [];
-		$default_url = null;
-		$slug_map    = self::$slug_map_cache;
-		$default     = self::$default_lang_cache;
-
-		foreach ( $links as $link ) {
-			if ( empty( $link->language_slug ) || ! isset( $slug_map[ $link->language_slug ] ) ) {
-				continue;
-			}
-
-			$object_id = (int) $link->object_id;
-
-			// get_post_status() uses the WP post cache (primed above).
-			if ( get_post_status( $object_id ) !== 'publish' ) {
-				continue;
-			}
-
-			if ( \PerfLocale\Helper::is_seo_excluded( $object_id ) ) {
-				continue;
-			}
-
-			if ( $url_converter ) {
-				$permalink = $url_converter->convert( home_url( '/' ), $link->language_slug );
-			} else {
-				$permalink = get_permalink( $object_id );
-			}
-
-			if ( ! $permalink ) {
-				continue;
-			}
-
-			$alternates[] = [
-				'href'     => $permalink,
-				'hreflang' => $slug_map[ $link->language_slug ],
-			];
-
-			// Track default language URL for x-default.
-			if ( $default && $link->language_slug === $default->slug ) {
-				$default_url = $permalink;
-			}
-		}
-
-		if ( count( $alternates ) > 1 ) {
-			if ( $default_url && (bool) $this->settings->get( 'seo_x_default', true ) ) {
-				$alternates[] = [
-					'href'     => $default_url,
-					'hreflang' => 'x-default',
-				];
-			}
-
-			// Store under the standard W3C key 'xhtml:link'. WordPress core's
-			// default renderer drops unknown fields silently - we swap in
-			// PerfLocaleSitemapRenderer via wp_sitemaps_init below so this
-			// array is serialized as real <xhtml:link rel="alternate" …> child
-			// elements of <url>, which is the documented hreflang-in-sitemap
-			// pattern (sitemaps.org + Google Search Central).
-			$entry['xhtml:link'] = $alternates;
-		}
-
-		return $entry;
-	}
-
-	/**
-	 * Pin a sitemap entry's loc to the default language's URL shape.
-	 *
-	 * Core builds loc from get_permalink() in the REQUEST context; in
-	 * subdomain/domain URL modes home_url() is host-mapped to the current
-	 * language, so on a language host an unlinked (default-language) object's
-	 * loc inherits that host. Every language host serves its own
-	 * /wp-sitemap.xml, so without this the same content is advertised
-	 * self-canonically on every host. UrlConverter::convert() to the default
-	 * language maps the host back to the base domain; in path-based modes the
-	 * default language is unprefixed, making this a byte-identical no-op.
-	 *
-	 * @param array<string, mixed> $entry Sitemap entry.
-	 * @return array<string, mixed>
-	 */
-	private function pin_entry_loc_to_default( array $entry ): array {
-		$default = self::$default_lang_cache;
-
-		if ( ! $default || empty( $entry['loc'] ) ) {
-			return $entry;
-		}
-
-		$plugin = Plugin::get_instance();
-
-		if ( ! $plugin->has( 'url_converter' ) ) {
-			return $entry;
-		}
-
-		$pinned = (string) $plugin->get( 'url_converter' )->convert( (string) $entry['loc'], (string) $default->slug );
-
-		if ( $pinned !== '' ) {
-			$entry['loc'] = $pinned;
-		}
-
-		return $entry;
-	}
-
-	/**
-	 * Populate the class-level caches on first use. Cheap no-op afterwards.
-	 *
-	 * @return void
-	 */
-	private function prime_static_caches(): void {
-		if ( self::$repo_cache !== null ) {
-			return;
-		}
-
-		$plugin                   = Plugin::get_instance();
-		$cache                    = $plugin->get( 'cache' );
-		self::$repo_cache         = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
-		self::$lang_repo_cache    = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
-		self::$languages_cache    = self::$lang_repo_cache->get_active();
-		self::$default_lang_cache = self::$lang_repo_cache->get_default();
-
-		$slug_map = [];
-
-		foreach ( self::$languages_cache as $lang ) {
-			$slug_map[ $lang->slug ] = $this->locale_to_hreflang( $lang->locale );
-		}
-
-		self::$slug_map_cache = $slug_map;
-	}
-
-	/**
-	 * Convert a WordPress locale to a canonical BCP 47 hreflang tag.
-	 *
-	 * Lowercase language + UPPERCASE region (`en_US` → `en-US`,
-	 * `pt_BR` → `pt-BR`). See {@see \PerfLocale\Helper::format_locale_as_bcp47()}.
-	 *
-	 * @param string $locale WordPress locale.
-	 * @return string
-	 */
-	private function locale_to_hreflang( string $locale ): string {
-		return \PerfLocale\Helper::format_locale_as_bcp47( $locale );
+		return $this->request()->add_alternate_links( $entry, $post, $post_type );
 	}
 
 	/**
@@ -524,213 +287,7 @@ final class SitemapIntegration {
 	 * @return array<string, mixed>
 	 */
 	public function add_taxonomy_alternate_links( array $entry, int $term_id, string $taxonomy, object $term ): array {
-		$this->prime_static_caches();
-
-		if ( count( self::$languages_cache ) < 2 ) {
-			return $entry;
-		}
-
-		// Batch-prime term caches once per taxonomy (mirrors the post path):
-		// otherwise each sibling's get_term_link() below issues its own
-		// get_term() query, an N+1 that scales with page size × languages.
-		if ( empty( self::$primed_taxonomies[ $taxonomy ] ) ) {
-			self::$primed_taxonomies[ $taxonomy ] = true;
-			$this->prime_sitemap_term_caches( $taxonomy );
-		}
-
-		$links = self::$repo_cache->get_translations( $term_id, ObjectType::Term );
-
-		if ( empty( $links ) ) {
-			// Untranslated term - same cross-host duplicate-content guard as
-			// the post path.
-			return $this->pin_entry_loc_to_default( $entry );
-		}
-
-		$slug_map    = self::$slug_map_cache;
-		$default     = self::$default_lang_cache;
-		$alternates  = [];
-		$default_url = null;
-
-		foreach ( $links as $link ) {
-			if ( empty( $link->language_slug ) || ! isset( $slug_map[ $link->language_slug ] ) ) {
-				continue;
-			}
-
-			$term_link = get_term_link( (int) $link->object_id );
-
-			if ( is_wp_error( $term_link ) ) {
-				continue;
-			}
-
-			$alternates[] = [
-				'href'     => $term_link,
-				'hreflang' => $slug_map[ $link->language_slug ],
-			];
-
-			if ( $default && $link->language_slug === $default->slug ) {
-				$default_url = $term_link;
-			}
-		}
-
-		if ( count( $alternates ) > 1 ) {
-			if ( $default_url && (bool) $this->settings->get( 'seo_x_default', true ) ) {
-				$alternates[] = [
-					'href'     => $default_url,
-					'hreflang' => 'x-default',
-				];
-			}
-
-			// Store under the standard W3C key 'xhtml:link'. WordPress core's
-			// default renderer drops unknown fields silently - we swap in
-			// PerfLocaleSitemapRenderer via wp_sitemaps_init below so this
-			// array is serialized as real <xhtml:link rel="alternate" …> child
-			// elements of <url>, which is the documented hreflang-in-sitemap
-			// pattern (sitemaps.org + Google Search Central).
-			$entry['xhtml:link'] = $alternates;
-		}
-
-		return $entry;
-	}
-
-	/**
-	 * Batch-prime WordPress post caches for all translation siblings.
-	 *
-	 * Loads all translation link object IDs for the current post type
-	 * in a single query, then primes the WP post cache so subsequent
-	 * get_post_status() and get_permalink() calls are free.
-	 *
-	 * @param TranslationGroupRepository $repo Repository instance.
-	 * @param string                     $post_type Post type.
-	 * @return void
-	 */
-	private function prime_sitemap_caches( TranslationGroupRepository $repo, string $post_type ): void {
-		global $wpdb;
-
-		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
-		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
-
-		// Memory bound: a sitemap PAGE renders at most wp_sitemaps_get_max_urls()
-		// (2000) URLs, so priming every translated post of the type is wasteful
-		// and, on a very large site (tens of thousands of translated posts),
-		// loads them all into memory on a single sitemap request. Cap the prime
-		// at a generous multiple of one page; SELECT one row past the cap so we
-		// can detect the over-limit case cheaply. When the type has MORE than
-		// the cap, skip bulk priming entirely - the per-entry get_post_status()/
-		// get_permalink() lookups below still return correct output, they just
-		// query per sibling instead of from a warmed cache. Filterable.
-		$max_urls = function_exists( 'wp_sitemaps_get_max_urls' ) ? (int) wp_sitemaps_get_max_urls( 'post' ) : 2000;
-
-		// Bound the prime by what ONE PAGE can actually consume, not by a flat
-		// multiple of it. A page renders at most $max_urls entries, and each
-		// entry needs its siblings - so $max_urls * languages is the most this
-		// request can use. A flat multiple would load far more posts than the
-		// page renders (about 4 KB each, so tens of MB on a large catalog) on
-		// every sitemap page request. Sites whose catalog fits inside one
-		// page's need are unaffected and still get the full bulk prime.
-		$lang_count = max( 2, count( self::$languages_cache ) );
-		$prime_cap  = max( 2000, (int) apply_filters( 'perflocale/sitemap/max_prime', $max_urls * $lang_count ) );
-
-		// Get translation object IDs for this post type in one query, bounded.
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		$all_ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT l.object_id
-				FROM %i l
-				INNER JOIN %i g ON l.group_id = g.id AND g.type = 'post'
-				WHERE l.object_id IN (
-					SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = 'publish'
-				)
-				LIMIT %d",
-				$links_table,
-				$groups_table,
-				$post_type,
-				$prime_cap + 1
-			)
-		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-		// Over the cap: bulk priming would blow memory to no benefit (the page
-		// only needs ~2000 of these). Bail to per-entry lookups.
-		if ( count( (array) $all_ids ) > $prime_cap ) {
-			return;
-		}
-
-		if ( ! empty( $all_ids ) ) {
-			$ids = array_map( 'intval', $all_ids );
-
-			// Prime WP post cache in one batch - makes get_post_status()
-			// and get_permalink() use the cache instead of querying.
-			// `_prime_post_caches` is an internal WP function that could
-			// in theory be renamed; fall back to a plain get_posts() pull
-			// which triggers the same cache priming via WP_Query.
-			if ( function_exists( '_prime_post_caches' ) ) {
-				_prime_post_caches( $ids, true, false );
-			} else {
-				get_posts(
-					[
-						'post__in'               => $ids,
-						'posts_per_page'         => count( $ids ),
-						'post_type'              => 'any',
-						'post_status'            => 'any',
-						'no_found_rows'          => true,
-						'update_post_term_cache' => true,
-						'update_post_meta_cache' => false,
-					]
-				);
-			}
-		}
-	}
-
-	/**
-	 * Batch-prime WordPress term caches for all translation siblings of a
-	 * taxonomy. Same bounded design as {@see prime_sitemap_caches()} for posts:
-	 * one query capped at a generous multiple of a sitemap page, and a bail on
-	 * the over-cap case (per-entry get_term_link() lookups stay correct).
-	 *
-	 * @param string $taxonomy Taxonomy name.
-	 * @return void
-	 */
-	private function prime_sitemap_term_caches( string $taxonomy ): void {
-		if ( ! function_exists( '_prime_term_caches' ) ) {
-			return;
-		}
-
-		global $wpdb;
-
-		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
-		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
-
-		// Page-proportional bound - see prime_sitemap_caches() for why a flat
-		// multiple of the page size over-fetches on large catalogues.
-		$max_urls   = function_exists( 'wp_sitemaps_get_max_urls' ) ? (int) wp_sitemaps_get_max_urls( 'term' ) : 2000;
-		$lang_count = max( 2, count( self::$languages_cache ) );
-		$prime_cap  = max( 2000, (int) apply_filters( 'perflocale/sitemap/max_prime', $max_urls * $lang_count ) );
-
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		$all_ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT l.object_id
-				FROM %i l
-				INNER JOIN %i g ON l.group_id = g.id AND g.type = 'term'
-				WHERE l.object_id IN (
-					SELECT term_id FROM {$wpdb->term_taxonomy} WHERE taxonomy = %s
-				)
-				LIMIT %d",
-				$links_table,
-				$groups_table,
-				$taxonomy,
-				$prime_cap + 1
-			)
-		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-		if ( count( (array) $all_ids ) > $prime_cap ) {
-			return;
-		}
-
-		if ( ! empty( $all_ids ) ) {
-			_prime_term_caches( array_map( 'intval', $all_ids ) );
-		}
+		return $this->request()->add_taxonomy_alternate_links( $entry, $term_id, $taxonomy, $term );
 	}
 
 	/**

@@ -463,7 +463,9 @@ final class JobLock {
 		// Atomic CAS: bump the entire value ONLY if the stored expiry is
 		// in the past (i.e. the previous holder crashed or ran past TTL).
 		// Concurrent reclaimers race at the DB layer; only one observes
-		// `affected_rows = 1`.
+		// `affected_rows = 1`. The expiry is cut before the first `|` with
+		// INSTR() and SUBSTR(), as Lock::reap_expired() does, so SQLite sites
+		// reclaim too (SUBSTRING_INDEX() is MySQL-only).
 		//
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$updated = $wpdb->query(
@@ -471,7 +473,7 @@ final class JobLock {
 				"UPDATE {$wpdb->options}
 				 SET option_value = %s
 				 WHERE option_name = %s
-				 AND CAST(SUBSTRING_INDEX(option_value, '|', 1) AS UNSIGNED) < %d",
+				 AND CAST(CASE WHEN INSTR(option_value, '|') > 0 THEN SUBSTR(option_value, 1, INSTR(option_value, '|') - 1) ELSE option_value END AS UNSIGNED) < %d",
 				$value,
 				$key,
 				time()

@@ -38,6 +38,14 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	];
 
 	/**
+	 * Translated posts or terms loaded per statement by
+	 * prime_reference_targets() and prime_term_targets().
+	 *
+	 * @var int
+	 */
+	private const TARGET_PRIME_CHUNK = 100;
+
+	/**
 	 * {@inheritDoc}
 	 */
 	public function get_id(): string {
@@ -1039,14 +1047,10 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 		$manager    = $this->get_manager();
 		$translated = [];
 
+		$this->prime_reference_targets( $value, $lang_slug );
+
 		foreach ( $value as $related_post ) {
-			if ( $related_post instanceof \WP_Post ) {
-				$related_id = (int) $related_post->ID;
-			} elseif ( is_int( $related_post ) || ( is_string( $related_post ) && is_numeric( $related_post ) ) ) {
-				$related_id = (int) $related_post;
-			} else {
-				$related_id = 0;
-			}
+			$related_id = self::reference_id( $related_post );
 
 			// Not a post reference: hand it back untouched, type included.
 			if ( $related_id <= 0 ) {
@@ -1083,6 +1087,73 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		return $translated;
+	}
+
+	/**
+	 * The post ID a relationship item refers to: a WP_Post's ID, an integer
+	 * or a numeric string; 0 for anything else.
+	 *
+	 * @param mixed $item Relationship field item.
+	 * @return int
+	 */
+	private static function reference_id( mixed $item ): int {
+		if ( $item instanceof \WP_Post ) {
+			return (int) $item->ID;
+		}
+
+		if ( is_int( $item ) || ( is_string( $item ) && is_numeric( $item ) ) ) {
+			return (int) $item;
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Load what translate_relationship() reads for a list of references in
+	 * batches: the links of every referenced post in one prime, then the
+	 * current-language posts in chunks of TARGET_PRIME_CHUNK. The mapping
+	 * loop then finds them in the cache instead of paying one link lookup
+	 * (above the eager-map cap) and one post query per item. It only fills
+	 * caches: the per-item visibility check, the fallback to the source and
+	 * the order of the list are the loop's, unchanged. Terms and meta are not
+	 * read by the loop, so they are not loaded. A list with fewer than two
+	 * distinct posts is left to the loop.
+	 *
+	 * @param array<int|string, mixed> $value     Relationship field value.
+	 * @param string                   $lang_slug Current language slug.
+	 * @return void
+	 */
+	private function prime_reference_targets( array $value, string $lang_slug ): void {
+		$ids = [];
+
+		foreach ( $value as $item ) {
+			$id = self::reference_id( $item );
+
+			if ( $id > 0 ) {
+				$ids[ $id ] = $id;
+			}
+		}
+
+		if ( count( $ids ) < 2 || ! function_exists( '_prime_post_caches' ) ) {
+			return;
+		}
+
+		$this->get_repo()->prime_translations( \PerfLocale\Enum\ObjectType::Post, array_values( $ids ) );
+
+		$manager = $this->get_manager();
+		$targets = [];
+
+		foreach ( $ids as $id ) {
+			$target = $manager->get_translation_id( $id, $lang_slug );
+
+			if ( $target !== null && $target > 0 ) {
+				$targets[ $target ] = $target;
+			}
+		}
+
+		foreach ( array_chunk( array_values( $targets ), self::TARGET_PRIME_CHUNK ) as $chunk ) {
+			_prime_post_caches( $chunk, false, false );
+		}
 	}
 
 	/**
@@ -1176,6 +1247,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
 		$translated = [];
 
+		$this->prime_term_targets( $value, $lang_slug );
+
 		foreach ( $value as $term ) {
 			$term_id = is_object( $term ) && isset( $term->term_id ) ? (int) $term->term_id : (int) $term;
 
@@ -1210,6 +1283,66 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		return $translated;
+	}
+
+	/**
+	 * Load what translate_taxonomy() reads for a list of terms in batches:
+	 * the links of every listed term in one prime, then the current-language
+	 * terms in chunks of TARGET_PRIME_CHUNK, without term meta. The mapping
+	 * loop then finds them in the cache instead of paying one link lookup
+	 * (above the eager-map cap) and one term query per item. It only fills
+	 * caches: the per-item get_term() check, the fallback to the source and
+	 * the order of the list are the loop's, unchanged. Only term objects,
+	 * integers and numeric strings are read here; a list with fewer than two
+	 * distinct terms is left to the loop.
+	 *
+	 * @param array<int|string, mixed> $value     Taxonomy field value.
+	 * @param string                   $lang_slug Current language slug.
+	 * @return void
+	 */
+	private function prime_term_targets( array $value, string $lang_slug ): void {
+		$ids = [];
+
+		foreach ( $value as $term ) {
+			if ( is_object( $term ) && isset( $term->term_id ) ) {
+				$term_id = (int) $term->term_id;
+			} elseif ( is_int( $term ) || ( is_string( $term ) && is_numeric( $term ) ) ) {
+				$term_id = (int) $term;
+			} else {
+				continue;
+			}
+
+			if ( $term_id > 0 ) {
+				$ids[ $term_id ] = $term_id;
+			}
+		}
+
+		if ( count( $ids ) < 2 || ! function_exists( '_prime_term_caches' ) ) {
+			return;
+		}
+
+		$repo = $this->get_repo();
+		$repo->prime_translations( \PerfLocale\Enum\ObjectType::Term, array_values( $ids ) );
+
+		$targets = [];
+
+		foreach ( $ids as $term_id ) {
+			foreach ( $repo->get_translations( $term_id, \PerfLocale\Enum\ObjectType::Term ) as $link ) {
+				if ( ! empty( $link->language_slug ) && $link->language_slug === $lang_slug && (int) $link->object_id !== $term_id ) {
+					$target = (int) $link->object_id;
+
+					if ( $target > 0 ) {
+						$targets[ $target ] = $target;
+					}
+
+					break;
+				}
+			}
+		}
+
+		foreach ( array_chunk( array_values( $targets ), self::TARGET_PRIME_CHUNK ) as $chunk ) {
+			_prime_term_caches( $chunk, false );
+		}
 	}
 
 	/**

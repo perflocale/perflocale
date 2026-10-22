@@ -102,10 +102,6 @@ final class PostListColumns {
 		add_action( 'quick_edit_custom_box', [ $this, 'render_quick_edit_field' ], 10, 2 );
 		add_action( 'save_post', [ $this, 'save_quick_edit_language' ], 15, 2 );
 
-		// Inline JS attached during enqueue phase (NOT admin_footer-edit.php
-		// - that fires after wp_print_footer_scripts has already emitted
-		// the `perflocale-admin` script payload, so wp_add_inline_script()
-		// calls at that point are silently dropped).
 		add_action( 'admin_enqueue_scripts', [ $this, 'quick_edit_js' ] );
 	}
 
@@ -185,7 +181,8 @@ final class PostListColumns {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$current = isset( $_GET['perflocale_lang'] ) ? sanitize_key( $_GET['perflocale_lang'] ) : '';
 
-		echo '<select name="perflocale_lang">';
+		echo '<label for="perflocale-filter-by-language" class="screen-reader-text">' . esc_html__( 'Filter by language', 'perflocale' ) . '</label>';
+		echo '<select name="perflocale_lang" id="perflocale-filter-by-language">';
 		echo '<option value="">' . esc_html__( 'All Languages', 'perflocale' ) . '</option>';
 
 		$option_allowed = [
@@ -622,7 +619,7 @@ final class PostListColumns {
 	}
 
 	/**
-	 * Inline JavaScript to populate the Quick Edit language field from row data.
+	 * Enqueue the script that fills the Quick Edit language field from row data.
 	 *
 	 * @return void
 	 */
@@ -637,50 +634,14 @@ final class PostListColumns {
 			return;
 		}
 
-		wp_add_inline_script(
-			'perflocale-admin',
-			'var perflocaleQeI18n=' . wp_json_encode(
-				[
-					'inUse' => __( 'in use', 'perflocale' ),
-				],
-				JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-			) . ';',
-			'before'
-		);
+		Assets::enqueue_script( 'perflocale-post-quick-edit', 'post-quick-edit.js', [ 'jquery', 'inline-edit-post' ] );
 
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function($){' .
-				'if(typeof inlineEditPost==="undefined")return;' .
-				'var origEdit=inlineEditPost.edit;' .
-				'inlineEditPost.edit=function(id){' .
-					'origEdit.apply(this,arguments);' .
-					'if(typeof id==="object"){id=this.getId(id);}' .
-					'if(!id)return;' .
-					'var row=document.getElementById("post-"+id);' .
-					'var langCell=row?row.querySelector(".perflocale-lang-cell"):null;' .
-					'if(!langCell)return;' .
-					'var lang=langCell.getAttribute("data-perflocale-lang")||"";' .
-					'var taken=[];' .
-					'try{taken=JSON.parse(langCell.getAttribute("data-perflocale-taken")||"[]");}catch(e){}' .
-					'var editRow=document.getElementById("edit-"+id);' .
-					'var select=editRow?editRow.querySelector(\'select[name="perflocale_language_qe"]\'):null;' .
-					'if(!select)return;' .
-					'for(var i=0;i<select.options.length;i++){' .
-						'select.options[i].disabled=false;' .
-						'select.options[i].textContent=select.options[i].textContent.replace(/ \\(.*\\)$/,"");' .
-					'}' .
-					'for(var i=0;i<select.options.length;i++){' .
-						'var val=select.options[i].value;' .
-						'if(val===""||val===lang)continue;' .
-						'if(taken.indexOf(val)!==-1){' .
-							'select.options[i].disabled=true;' .
-							'select.options[i].textContent+=" ("+perflocaleQeI18n.inUse+")";' .
-						'}' .
-					'}' .
-					'select.value=lang||"";' .
-				'};' .
-			'})(jQuery);'
+		wp_localize_script(
+			'perflocale-post-quick-edit',
+			'perflocaleQeI18n',
+			[
+				'inUse' => __( 'in use', 'perflocale' ),
+			]
 		);
 	}
 }

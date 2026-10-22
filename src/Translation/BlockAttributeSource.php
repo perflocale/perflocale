@@ -238,6 +238,41 @@ final class BlockAttributeSource {
 	}
 
 	/**
+	 * Text attributes of a block that live only in its block comment.
+	 *
+	 * The names of the block type's chain whose schema gives no `source` (so
+	 * the value is stored in the comment's attribute JSON, never in the saved
+	 * HTML) and whose value is a string with at least one letter. Used when a
+	 * whole post goes to machine translation with its block comments held
+	 * back: these values would otherwise not be translated.
+	 *
+	 * @param string       $block_name Block name, e.g. `acme/card`.
+	 * @param array<mixed> $attrs      The block's decoded comment attributes.
+	 * @return string[]
+	 */
+	public static function comment_text_names( string $block_name, array $attrs ): array {
+		$schema = self::schema( $block_name );
+		$names  = [];
+
+		foreach ( self::chain( $block_name ) as $name ) {
+			$def = is_array( $schema[ $name ] ?? null ) ? $schema[ $name ] : [];
+
+			if (
+				preg_match( self::IGNORE_NAMES, $name )
+				|| ( is_string( $def['source'] ?? null ) && '' !== $def['source'] )
+				|| ! is_string( $attrs[ $name ] ?? null )
+				|| ! preg_match( '/\p{L}/u', $attrs[ $name ] )
+			) {
+				continue;
+			}
+
+			$names[] = $name;
+		}
+
+		return $names;
+	}
+
+	/**
 	 * Whether a block or any block above it on a path carries the "Do not
 	 * translate" marker.
 	 *

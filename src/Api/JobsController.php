@@ -11,6 +11,7 @@ namespace PerfLocale\Api;
 
 use PerfLocale\Background\JobRunnerFactory;
 use PerfLocale\Background\JobState;
+use PerfLocale\Background\OneTimeDispatch;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -298,6 +299,9 @@ final class JobsController extends RestController {
 				);
 			}
 		}
+
+		// A one-time job's dispatch state records the cancel.
+		OneTimeDispatch::job_ended( $id, is_string( $state['type'] ?? null ) ? $state['type'] : '', 'canceled' );
 
 		JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $id );
 

@@ -12,13 +12,17 @@
  * calls the route the post-editor panel's Create calls
  * (POST perflocale/v1/translations/post/<id>) with the open entity's numeric
  * id. The canvas keeps editing the entity it has open; the panel loads its rows
- * again, so the new translation shows with its Edit link. After a Create on a
+ * again, so the new translation shows with its Edit link. A menu translation
+ * that is a draft or pending also offers Publish (the Site Editor has no
+ * status control for menus). After a Create on a
  * navigation menu or a synced pattern, whose copy keeps the source's name, the
  * panel also shows a hint to rename the new translation in its language, with
  * that translation's Edit link.
  *
- * The second part of this file adds each menu's language after its name in
- * the Site Editor's Navigation list (see its own comment at the end).
+ * The second part of this file adds a notice to a Navigation block or synced
+ * pattern that a translated template or part shares with the original language,
+ * and the third adds each menu's language after its name in the Site Editor's
+ * Navigation list (each part has its own comment).
  *
  * ⭐ WHY IT READS THE ENTITY FROM THE STORE, NOT FROM PHP.
  * The post editor knows its post at page load, so EditorSidebar can localise the
@@ -305,6 +309,61 @@
 				} );
 		}
 
+		/**
+		 * Publish a draft or pending menu translation.
+		 *
+		 * The Site Editor has no status control for navigation menus. This
+		 * saves the menu's status through core's own route
+		 * (POST /wp/v2/navigation/<id>, through the core data store, so the
+		 * editor's copy of the menu is updated too), which checks the user's
+		 * rights to edit and publish it exactly as any other save does.
+		 *
+		 * @param {Object} row Language row of the translation.
+		 */
+		function handlePublish( row ) {
+			var notices = wp.data.dispatch( 'core/notices' );
+			var postId = parseInt( row.post_id, 10 ) || 0;
+
+			if ( ! postId || busyKey ) {
+				return;
+			}
+
+			setBusyKey( 'publish:' + postId );
+
+			wp.data
+				.dispatch( 'core' )
+				.saveEntityRecord( 'postType', 'wp_navigation', { id: postId, status: 'publish' }, { throwOnError: true } )
+				.then( function () {
+					setBusyKey( '' );
+
+					if ( notices ) {
+						notices.createNotice( 'success', i18n.publishedNote || 'Translation published.', {
+							type: 'snackbar',
+							isDismissible: true,
+						} );
+					}
+
+					setReload( function ( n ) {
+						return n + 1;
+					} );
+				} )
+				.catch( function ( err ) {
+					setBusyKey( '' );
+
+					if ( notices ) {
+						notices.createNotice(
+							'error',
+							( err && err.message ) || i18n.publishError || 'Could not publish the translation.',
+							{ type: 'snackbar', isDismissible: true }
+						);
+					}
+
+					setReload( function ( n ) {
+						return n + 1;
+					} );
+				} );
+		}
+
 		if ( supported.indexOf( entity.type ) === -1 ) {
 			return null;
 		}
@@ -371,6 +430,34 @@
 					// A language with no translation gets Create instead.
 					var action = null;
 
+					// A menu translation that is not published yet: Publish, the
+					// open menu included.
+					var publishButton = null;
+
+					if (
+						entity.type === 'wp_navigation' &&
+						row.has_translation &&
+						row.post_id &&
+						( row.post_status === 'draft' || row.post_status === 'pending' )
+					) {
+						var publishBusy = busyKey === 'publish:' + row.post_id;
+
+						publishButton = el(
+							'button',
+							{
+								type: 'button',
+								className: 'perflocale-panel-create perflocale-panel-publish',
+								disabled: !! busyKey,
+								'aria-busy': publishBusy ? 'true' : undefined,
+								onClick: function () {
+									handlePublish( row );
+								},
+								key: 'publish',
+							},
+							publishBusy ? el( 'span', { className: 'perflocale-panel-spinner' } ) : i18n.publish || 'Publish'
+						);
+					}
+
 					if ( ! isCurrent && row.has_translation && row.edit_url ) {
 						action = el(
 							'a',
@@ -411,7 +498,9 @@
 							key: row.slug,
 						},
 						el( 'div', { className: 'perflocale-panel-row__info' }, info ),
-						action ? el( 'div', { className: 'perflocale-panel-row__action' }, action ) : null
+						action || publishButton
+							? el( 'div', { className: 'perflocale-panel-row__action' }, publishButton, action )
+							: null
 					);
 				} )
 			);
@@ -482,6 +571,322 @@
 	wp.plugins.registerPlugin( 'perflocale-site-editor-translations', {
 		render: PerfLocaleSiteEditorPanel,
 	} );
+}() );
+
+/**
+ * A notice on a Navigation block or synced pattern that a translated template
+ * or template part shares with the original language.
+ *
+ * A translated template or part, such as "Header (de)", is a copy of the
+ * original. Its Navigation block names a menu and its synced pattern names a
+ * pattern; editing either inside it edits that menu or pattern for every
+ * language that shows it. While the open entity is a template or template
+ * part in a language other than the default, and the selected block still
+ * names the original-language menu or pattern (or one with no language), the
+ * block's settings show "This menu is shared with <language>. Edit its
+ * <language> translation instead." with Open (the translation's edit link) or
+ * Create.
+ *
+ * Create sends the request the Translations panel sends. When the block can
+ * open the new translation (a menu published or draft, a pattern published,
+ * draft or pending), the block in the canvas is then pointed at it, so saving
+ * the template stores it; when the template still names what its original
+ * names, the server has already stored that reference.
+ *
+ * Reads go through perflocale/v1/translations/post/<id>, once per id and page
+ * load, and only for a selected block.
+ */
+( function () {
+	'use strict';
+
+	var config = window.perflocaleSiteEditor || {};
+	var types = config.postTypes || [];
+
+	if (
+		( types.indexOf( 'wp_template_part' ) === -1 && types.indexOf( 'wp_template' ) === -1 ) ||
+		! window.wp ||
+		! wp.hooks ||
+		! wp.compose ||
+		! wp.blockEditor ||
+		! wp.blockEditor.InspectorControls ||
+		! wp.components ||
+		! wp.element ||
+		! wp.data ||
+		! wp.apiFetch
+	) {
+		return;
+	}
+
+	var el = wp.element.createElement;
+	var Fragment = wp.element.Fragment;
+	var useState = wp.element.useState;
+	var useEffect = wp.element.useEffect;
+	var useSelect = wp.data.useSelect;
+	var apiFetch = wp.apiFetch;
+	var i18n = config.i18n || {};
+
+	// The post type each block references.
+	var BLOCKS = {
+		'core/navigation': 'wp_navigation',
+		'core/block': 'wp_block',
+	};
+
+	// Statuses the block opens in the editor, per referenced post type.
+	var OPENABLE = {
+		wp_navigation: [ 'publish', 'draft' ],
+		wp_block: [ 'publish', 'draft', 'pending' ],
+	};
+
+	var requests = {};
+
+	/**
+	 * The translations response for a post id, fetched once per page load.
+	 *
+	 * @param {number} id Post id.
+	 * @return {Promise} Response, or null when it could not be read.
+	 */
+	function translationsOf( id ) {
+		if ( ! requests[ id ] ) {
+			requests[ id ] = apiFetch( { path: 'perflocale/v1/translations/post/' + id } ).catch( function () {
+				delete requests[ id ];
+				return null;
+			} );
+		}
+
+		return requests[ id ];
+	}
+
+	function rowWhere( response, test ) {
+		var rows = ( response && response.languages ) || [];
+
+		for ( var i = 0; i < rows.length; i++ ) {
+			if ( test( rows[ i ] ) ) {
+				return rows[ i ];
+			}
+		}
+
+		return null;
+	}
+
+	function languageName( row ) {
+		return row ? row.native_name || row.name || row.slug : '';
+	}
+
+	function SharedNotice( props ) {
+		var refType = BLOCKS[ props.name ];
+		var ref = parseInt( props.attributes && props.attributes.ref, 10 ) || 0;
+
+		var part = useSelect( function ( select ) {
+			var editor = select( 'core/editor' );
+			var post = editor && editor.getCurrentPost ? editor.getCurrentPost() || {} : {};
+
+			return {
+				type: post.type || '',
+				wpId: post.wp_id ? parseInt( post.wp_id, 10 ) || 0 : 0,
+			};
+		}, [] );
+
+		var state = useState( null );
+		var notice = state[ 0 ];
+		var setNotice = state[ 1 ];
+
+		var busyState = useState( false );
+		var busy = busyState[ 0 ];
+		var setBusy = busyState[ 1 ];
+
+		var reloadState = useState( 0 );
+		var reload = reloadState[ 0 ];
+		var setReload = reloadState[ 1 ];
+
+		useEffect(
+			function () {
+				var live = true;
+
+				setNotice( null );
+
+				if ( ( part.type !== 'wp_template_part' && part.type !== 'wp_template' ) || ! part.wpId || ! ref || types.indexOf( refType ) === -1 ) {
+					return undefined;
+				}
+
+				Promise.all( [ translationsOf( part.wpId ), translationsOf( ref ) ] ).then( function ( responses ) {
+					if ( ! live ) {
+						return;
+					}
+
+					var partLang = rowWhere( responses[ 0 ], function ( r ) {
+						return r.is_current;
+					} );
+
+					// Only a translation: the original template or part is where
+					// the original menu and pattern belong.
+					if ( ! partLang || partLang.is_default || ! responses[ 1 ] ) {
+						return;
+					}
+
+					var refLang = rowWhere( responses[ 1 ], function ( r ) {
+						return r.is_current;
+					} );
+					var original = responses[ 1 ].is_unassigned
+						? rowWhere( responses[ 1 ], function ( r ) {
+								return r.is_default;
+						  } )
+						: refLang;
+
+					if ( ! original || ! original.is_default ) {
+						return;
+					}
+
+					var target = rowWhere( responses[ 1 ], function ( r ) {
+						return r.slug === partLang.slug;
+					} );
+
+					setNotice( {
+						from: languageName( original ),
+						to: languageName( partLang ),
+						slug: partLang.slug,
+						target: target,
+					} );
+				} );
+
+				return function () {
+					live = false;
+				};
+			},
+			[ part.type, part.wpId, ref, refType, reload ]
+		);
+
+		if ( ! notice ) {
+			return null;
+		}
+
+		function create() {
+			var notices = wp.data.dispatch( 'core/notices' );
+
+			if ( busy ) {
+				return;
+			}
+
+			setBusy( true );
+
+			apiFetch( {
+				path: 'perflocale/v1/translations/post/' + ref,
+				method: 'POST',
+				data: { target_lang: notice.slug, copy_content: true },
+			} )
+				.then( function () {
+					delete requests[ ref ];
+
+					if ( notices ) {
+						notices.createNotice( 'success', i18n.created || 'Translation created.', {
+							type: 'snackbar',
+							isDismissible: true,
+						} );
+					}
+
+					return translationsOf( ref );
+				} )
+				.then( function ( response ) {
+					setBusy( false );
+
+					var created = rowWhere( response, function ( r ) {
+						return r.slug === notice.slug;
+					} );
+
+					// The block names the new translation; saving the template
+					// stores it.
+					if (
+						created &&
+						created.post_id &&
+						( OPENABLE[ refType ] || [] ).indexOf( created.post_status ) !== -1
+					) {
+						props.setAttributes( { ref: created.post_id } );
+					} else {
+						setReload( function ( n ) {
+							return n + 1;
+						} );
+					}
+				} )
+				.catch( function ( err ) {
+					setBusy( false );
+
+					if ( notices ) {
+						notices.createNotice(
+							'error',
+							( err && err.message ) || i18n.createError || 'Failed to create translation.',
+							{ type: 'snackbar', isDismissible: true }
+						);
+					}
+				} );
+		}
+
+		var format =
+			refType === 'wp_navigation'
+				? i18n.sharedMenu || 'This menu is shared with %1$s. Edit its %2$s translation instead.'
+				: i18n.sharedPattern || 'This pattern is shared with %1$s. Edit its %2$s translation instead.';
+
+		var action = null;
+
+		if ( notice.target && notice.target.has_translation && notice.target.edit_url ) {
+			action = el(
+				'a',
+				{ className: 'perflocale-panel-edit perflocale-shared-notice__open', href: notice.target.edit_url },
+				i18n.open || 'Open'
+			);
+		} else if ( notice.target && ! notice.target.has_translation ) {
+			action = el(
+				'button',
+				{
+					type: 'button',
+					className: 'perflocale-panel-create perflocale-shared-notice__create',
+					disabled: busy,
+					'aria-busy': busy ? 'true' : undefined,
+					onClick: create,
+				},
+				busy ? el( 'span', { className: 'perflocale-panel-spinner' } ) : '+ ' + ( i18n.create || 'Create' )
+			);
+		}
+
+		var box = el(
+			'div',
+			{ className: 'perflocale-panel-notice perflocale-shared-notice', role: 'status' },
+			el( 'p', { className: 'perflocale-panel-notice__text' }, wp.i18n.sprintf( format, notice.from, notice.to ) ),
+			action ? el( 'div', { className: 'perflocale-panel-notice__actions' }, action ) : null
+		);
+
+		// The Navigation block's settings open on its menu list ("list" group),
+		// which is where its labels are edited; its other settings are on a
+		// second tab. The notice shows on both.
+		if ( refType === 'wp_navigation' ) {
+			return el(
+				Fragment,
+				null,
+				el( wp.blockEditor.InspectorControls, { group: 'list' }, box ),
+				el( wp.blockEditor.InspectorControls, null, box )
+			);
+		}
+
+		// A synced pattern is a section block: its settings show the "content"
+		// group, not the default one (WordPress 7.0+). Older versions show the
+		// default group.
+		return el(
+			Fragment,
+			null,
+			el( wp.blockEditor.InspectorControls, { group: 'content' }, box ),
+			el( wp.blockEditor.InspectorControls, null, box )
+		);
+	}
+
+	var withSharedNotice = wp.compose.createHigherOrderComponent( function ( BlockEdit ) {
+		return function ( props ) {
+			if ( ! BLOCKS[ props.name ] || ! props.isSelected ) {
+				return el( BlockEdit, props );
+			}
+
+			return el( Fragment, null, el( SharedNotice, props ), el( BlockEdit, props ) );
+		};
+	}, 'withPerfLocaleSharedNotice' );
+
+	wp.hooks.addFilter( 'editor.BlockEdit', 'perflocale/shared-notice', withSharedNotice );
 }() );
 
 /**

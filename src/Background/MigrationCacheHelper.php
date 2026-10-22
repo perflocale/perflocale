@@ -108,16 +108,23 @@ final class MigrationCacheHelper {
 	 *
 	 * Cheap and idempotent - callers invoke it once per committed batch.
 	 *
-	 * @return void
+	 * @return bool Whether another process changed cached data since the
+	 *              process's last checkpoint (CacheManager::refresh_if_changed()).
 	 */
-	public static function release_batch_memory(): void {
+	public static function release_batch_memory(): bool {
 		global $wpdb;
 
 		$wpdb->queries = [];
+
+		// A batch boundary of a long-running process is a checkpoint: what
+		// another process changed meanwhile is read again from here on.
+		$changed = \PerfLocale\Cache\CacheManager::refresh_if_changed();
 
 		// WP 6.1+ (plugin floor 6.4). Clears ONLY in-memory runtime copies;
 		// a persistent backend (Redis/Memcached) is untouched. Drop-ins
 		// lacking flush_runtime() make this a silent no-op.
 		\PerfLocale\Cache\CacheManager::flush_runtime();
+
+		return $changed;
 	}
 }

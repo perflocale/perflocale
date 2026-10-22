@@ -133,7 +133,7 @@ final class MetaTranslator {
 
 		if ( $keys !== [] ) {
 			// A credential-named key is never sent to a provider or overwritten.
-			$patterns = PostTranslationManager::sensitive_meta_patterns();
+			$patterns = PostTranslationManager::mt_sensitive_meta_patterns();
 			$keys     = array_values( array_filter( $keys, static fn( string $k ): bool => ! PostTranslationManager::is_sensitive_meta_key( $k, $patterns ) ) );
 		}
 

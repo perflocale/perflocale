@@ -624,7 +624,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		// for the full system timeout (often 30s per nameserver). Caching
 		// the resolution limits the blast radius to one slow request per
 		// host per 5 minutes.
-		$cache_key = 'perflocale_dns_' . md5( $host );
+		$cache_key = 'perflocale_dns_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host );
 		$ip        = get_transient( $cache_key );
 
 		if ( $ip === false ) {
@@ -686,8 +686,8 @@ abstract class AbstractProvider implements ProviderInterface {
 			return;
 		}
 
-		delete_transient( 'perflocale_dns_' . md5( $host ) );
-		delete_transient( 'perflocale_dns6_' . md5( $host ) );
+		delete_transient( 'perflocale_dns_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host ) );
+		delete_transient( 'perflocale_dns6_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host ) );
 	}
 
 	/**
@@ -712,7 +712,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			return [];
 		}
 
-		$cache_key = 'perflocale_dns6_' . md5( $host );
+		$cache_key = 'perflocale_dns6_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host );
 		$cached    = get_transient( $cache_key );
 
 		if ( is_array( $cached ) ) {

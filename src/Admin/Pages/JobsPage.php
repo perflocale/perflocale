@@ -37,6 +37,27 @@ final class JobsPage {
 	private const KEPT_RESULT_TYPES = [ 'bulk_translate', 'site_translate' ];
 
 	/**
+	 * Migration job types whose result lists source items left out (`skipped`), by source.
+	 */
+	private const ATTENTION_RESULT_TYPES = [ 'polylang_migration' => 'polylang' ];
+
+	/**
+	 * Job types whose finished row reports what they changed, by count.
+	 */
+	private const COUNT_RESULT_TYPES = [ 'template_refs_backfill', 'template_refs_fanout', 'sqlite_group_repair' ];
+
+	/**
+	 * Job types whose result carries the first error of the items that failed
+	 * (`first_error`); a finished or canceled row shows it.
+	 */
+	private const FIRST_ERROR_RESULT_TYPES = [ 'bulk_translate', 'site_translate', 'bulk_string_translate', 'string_scan' ];
+
+	/**
+	 * Characters of the first error a row shows; the job's details hold all of it.
+	 */
+	private const FIRST_ERROR_SHOWN = 140;
+
+	/**
 	 * Enqueue stylesheet + auto-refresh script on the Jobs admin page only.
 	 *
 	 * Wired from {@see AdminController} on `admin_enqueue_scripts`. The
@@ -127,11 +148,12 @@ final class JobsPage {
 			);
 		}
 
-		// The kept-rows warning needs the result of each displayed row that
-		// shows it: one batched read for all of them, none when no row does.
+		// The kept-rows warning and the count lines need the result of each
+		// displayed row that shows one: one batched read for all of them, none
+		// when no row does.
 		$kept_ids = [];
 		foreach ( $jobs as $kept_id => $summary ) {
-			if ( self::shows_kept( $summary['status'] ?? '', $summary['type'] ?? '' ) ) {
+			if ( self::shows_kept( $summary['status'] ?? '', $summary['type'] ?? '' ) || self::shows_first_error( $summary['status'] ?? '', $summary['type'] ?? '' ) ) {
 				$kept_ids[] = (string) $kept_id;
 			}
 		}
@@ -160,6 +182,13 @@ final class JobsPage {
 			$scan_queued_notice = '';
 		}
 
+		// A queued job's confirmation (Export & Import, migrations, bulk
+		// machine translation): the redirect carries a fixed code, and only
+		// a known code shows its message.
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$queued_code    = isset( $_GET['perflocale_notice'] ) && is_string( $_GET['perflocale_notice'] ) ? sanitize_key( wp_unslash( $_GET['perflocale_notice'] ) ) : '';
+		$queued_message = '' !== $queued_code ? self::queued_message( $queued_code ) : '';
+
 		?>
 		<div class="wrap perflocale-jobs">
 			<h1><?php esc_html_e( 'Background Jobs', 'perflocale' ); ?></h1>
@@ -168,6 +197,12 @@ final class JobsPage {
 			<?php if ( $scan_queued_notice !== '' ) : ?>
 				<div class="notice notice-success is-dismissible">
 					<p><?php echo esc_html( $scan_queued_notice ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $queued_message !== '' ) : ?>
+				<div class="notice notice-success is-dismissible">
+					<p><?php echo esc_html( $queued_message ); ?></p>
 				</div>
 			<?php endif; ?>
 
@@ -572,6 +607,97 @@ final class JobsPage {
 	}
 
 	/**
+	 * The lines under a finished row's status that come from its result: a
+	 * Polylang job's policy line and left-out items, and the first error.
+	 * Prints nothing when there is none of them.
+	 *
+	 * @param string        $policy_line Language conflict policy line, or ''.
+	 * @param array<string> $attention   Lines of items left out.
+	 * @param string        $first_error The result's first error, or ''.
+	 * @return void
+	 */
+	private static function render_result_notes( string $policy_line, array $attention, string $first_error ): void {
+		self::render_migration_notes( $policy_line, $attention );
+		self::render_first_error( $first_error );
+	}
+
+	/**
+	 * A Polylang job's policy line and the items its run left out, when there are any.
+	 *
+	 * Prints nothing otherwise, so every other row's cell stays byte for byte as it was.
+	 *
+	 * @param string        $policy_line Language conflict policy line, or ''.
+	 * @param array<string> $attention   Lines of items left out.
+	 * @return void
+	 */
+	private static function render_migration_notes( string $policy_line, array $attention ): void {
+		if ( $policy_line !== '' ) {
+			echo '<div class="perflocale-jobs-warning">' . esc_html( $policy_line ) . '</div>';
+		}
+
+		if ( $attention !== [] ) {
+			echo '<div class="perflocale-jobs-warning"><strong>' . esc_html__( 'Needs attention:', 'perflocale' ) . '</strong> ' . esc_html( implode( ' ', $attention ) ) . '</div>';
+		}
+	}
+
+	/**
+	 * The message for a queued-job code a redirect to this screen carries,
+	 * or '' for any other code.
+	 *
+	 * @param string $code The perflocale_notice code.
+	 * @return string
+	 */
+	private static function queued_message( string $code ): string {
+		switch ( $code ) {
+			case 'export_queued':
+				return __( 'Data export queued. The download link will appear under PerfLocale → Jobs when ready.', 'perflocale' );
+			case 'import_queued':
+				return __( 'Data import queued. Track progress under PerfLocale → Jobs.', 'perflocale' );
+			case 'polylang_queued':
+				return __( 'Polylang migration queued. Track progress under PerfLocale → Jobs.', 'perflocale' );
+			case 'translatepress_queued':
+				return __( 'TranslatePress migration queued. Track progress under PerfLocale → Jobs.', 'perflocale' );
+			case 'bulk_mt_queued':
+				return __( 'Machine translation queued. Track progress below.', 'perflocale' );
+			default:
+				return '';
+		}
+	}
+
+	/**
+	 * Whether a row shows its result's first error: a finished or canceled
+	 * job of a type in FIRST_ERROR_RESULT_TYPES. A failed row shows its own
+	 * error instead.
+	 *
+	 * @param mixed $status Job status.
+	 * @param mixed $type   Job type slug.
+	 * @return bool
+	 */
+	private static function shows_first_error( $status, $type ): bool {
+		return in_array( $status, [ 'complete', 'canceled' ], true ) && in_array( $type, self::FIRST_ERROR_RESULT_TYPES, true );
+	}
+
+	/**
+	 * The result's first error under the status, shortened; the title and the
+	 * job's details hold the whole text. Prints nothing when there is none,
+	 * so every other row's cell stays byte for byte as it was.
+	 *
+	 * @param string $first_error The result's first error, or ''.
+	 * @return void
+	 */
+	private static function render_first_error( string $first_error ): void {
+		if ( $first_error === '' ) {
+			return;
+		}
+
+		$shown = mb_strlen( $first_error ) > self::FIRST_ERROR_SHOWN
+			? mb_substr( $first_error, 0, self::FIRST_ERROR_SHOWN - 3 ) . '…'
+			: $first_error;
+
+		echo '<div class="perflocale-jobs-first-error" title="' . esc_attr( $first_error ) . '"><strong>' . esc_html__( 'First error:', 'perflocale' ) . '</strong> ' . esc_html( $shown ) . '</div>';
+	}
+
+	/**
 	 * Whether a row shows how many created translations kept the source
 	 * language: a finished job of a type in KEPT_RESULT_TYPES.
 	 *
@@ -580,7 +706,7 @@ final class JobsPage {
 	 * @return bool
 	 */
 	private static function shows_kept( $status, $type ): bool {
-		return 'complete' === $status && in_array( $type, self::KEPT_RESULT_TYPES, true );
+		return 'complete' === $status && ( in_array( $type, self::KEPT_RESULT_TYPES, true ) || in_array( $type, self::COUNT_RESULT_TYPES, true ) || ( is_string( $type ) && isset( self::ATTENTION_RESULT_TYPES[ $type ] ) ) );
 	}
 
 	/**
@@ -633,6 +759,25 @@ final class JobsPage {
 			$first_warning = $kept > 0 ? trim( (string) ( $result['first_warning'] ?? '' ) ) : '';
 		}
 
+		// A finished or canceled job whose items failed names the first error.
+		$first_error = self::shows_first_error( $status, $type ) ? ( $result['first_error'] ?? '' ) : '';
+		$first_error = is_string( $first_error ) ? trim( $first_error ) : '';
+
+		// A finished migration that left source items out lists them.
+		$attention = 'complete' === $status && isset( self::ATTENTION_RESULT_TYPES[ $type ] )
+			? \PerfLocale\Migration\MigrationRunner::skipped_lines( self::ATTENTION_RESULT_TYPES[ $type ], array_filter( $result, 'is_string', ARRAY_FILTER_USE_KEY ) )
+			: [];
+
+		// A Polylang job under a language conflict policy other than the
+		// default says so: a finished one with the policy it ran under, a
+		// queued or running one with the policy it will read.
+		$policy_line = '';
+
+		if ( 'polylang_migration' === $type ) {
+			$ran         = is_array( $result['conflict_policy'] ?? null ) ? $result['conflict_policy'] : null;
+			$policy_line = \PerfLocale\Migration\PolylangImporter::policy_line( null !== $ran && JobState::is_terminal( (string) $status ) ? $ran : \PerfLocale\Migration\PolylangImporter::conflict_policies() );
+		}
+
 		?>
 		<tr data-perflocale-job-row="<?php echo esc_attr( $job_id ); ?>">
 			<td><code><?php echo esc_html( $type ); ?></code></td>
@@ -646,8 +791,38 @@ final class JobsPage {
 						style="margin-top:4px; font-size:11px; color:#b32d2e; max-width:380px; white-space:normal; line-height:1.4;">
 						<?php echo esc_html( $error_short ); ?>
 					</div>
+				<?php endif; if ( 'complete' === $status && in_array( $type, [ 'template_refs_backfill', 'template_refs_fanout' ], true ) ) : ?>
+					<div class="perflocale-jobs-stage">
+						<?php
+						echo esc_html(
+							sprintf(
+								/* translators: 1: templates and template parts read, 2: of those, the ones updated, 3: menu and pattern references pointed at a translation. */
+								__( 'Templates and template parts read: %1$d; updated: %2$d; menu and pattern references pointed at their translation: %3$d.', 'perflocale' ),
+								is_numeric( $result['read'] ?? null ) ? max( 0, (int) $result['read'] ) : 0,
+								is_numeric( $result['updated'] ?? null ) ? max( 0, (int) $result['updated'] ) : 0,
+								is_numeric( $result['references'] ?? null ) ? max( 0, (int) $result['references'] ) : 0
+							)
+						);
+						?>
+					</div>
+				<?php endif; if ( 'complete' === $status && 'sqlite_group_repair' === $type ) : ?>
+					<div class="perflocale-jobs-stage">
+						<?php
+						echo esc_html(
+							sprintf(
+								/* translators: 1: string groups created, 2: string links moved into their string's group, 3: links written for translated strings that had none, 4: unused string groups deleted, 5: links left where they were. */
+								__( 'String groups created: %1$d; links moved: %2$d; links written: %3$d; empty groups deleted: %4$d; links left where they were: %5$d.', 'perflocale' ),
+								is_numeric( $result['groups_created'] ?? null ) ? max( 0, (int) $result['groups_created'] ) : 0,
+								is_numeric( $result['links_moved'] ?? null ) ? max( 0, (int) $result['links_moved'] ) : 0,
+								is_numeric( $result['links_written'] ?? null ) ? max( 0, (int) $result['links_written'] ) : 0,
+								is_numeric( $result['groups_deleted'] ?? null ) ? max( 0, (int) $result['groups_deleted'] ) : 0,
+								is_numeric( $result['links_left'] ?? null ) ? max( 0, (int) $result['links_left'] ) : 0
+							)
+						);
+						?>
+					</div>
 				<?php endif; ?>
-				<?php if ( $kept > 0 ) : ?>
+				<?php self::render_result_notes( $policy_line, $attention, $first_error ); if ( $kept > 0 ) : ?>
 					<div class="perflocale-jobs-warning">
 						<?php
 						echo esc_html(

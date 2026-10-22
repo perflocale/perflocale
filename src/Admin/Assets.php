@@ -22,6 +22,27 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class Assets {
 
 	/**
+	 * Enqueue one of the plugin's scripts (assets/js/<file>) in the footer.
+	 *
+	 * @param string             $handle Script handle.
+	 * @param string             $file   File name under assets/js/.
+	 * @param array<int, string> $deps   Handles it depends on.
+	 * @return void
+	 */
+	public static function enqueue_script( string $handle, string $file, array $deps = [] ): void {
+		$base    = \defined( 'PERFLOCALE_URL' ) ? \constant( 'PERFLOCALE_URL' ) : '';
+		$version = \defined( 'PERFLOCALE_VERSION' ) ? \constant( 'PERFLOCALE_VERSION' ) : false;
+
+		wp_enqueue_script(
+			$handle,
+			( is_string( $base ) ? $base : '' ) . 'assets/js/' . $file,
+			$deps,
+			is_string( $version ) ? $version : false,
+			true
+		);
+	}
+
+	/**
 	 * Register hooks.
 	 *
 	 * @return void
@@ -196,14 +217,14 @@ final class Assets {
 		}
 
 		// `perflocale-admin` is a carrier-only handle (no script file). It
-		// holds the localized `perflocaleAdmin` payload, picks up inline
-		// scripts from page classes via wp_add_inline_script(), and serves
-		// as a dependency for adjacent admin scripts (bulk-actions,
+		// holds the localized `perflocaleAdmin` payload and serves as a
+		// dependency for adjacent admin scripts (bulk-actions,
 		// strings-validate, languages-reorder).
 		wp_register_script( 'perflocale-admin', false, [], PERFLOCALE_VERSION, true );
 		wp_enqueue_script( 'perflocale-admin' );
 
-		// Shared delegated handlers for data-perflocale-{confirm,copy,submit-busy}.
+		// Shared delegated handlers for data-perflocale-{confirm,copy,submit-busy}
+		// and the <details data-perflocale-popover> dismissal.
 		// One small file ships the JS that page templates trigger via
 		// data-attributes - keeps PHP free of inline `onclick=` (repo
 		// rule).
@@ -241,37 +262,6 @@ final class Assets {
 					'reorderFailedStatus' => __( 'Reorder failed (%1$s).', 'perflocale' ),
 				],
 			]
-		);
-
-		// Click-outside + ESC dismissal for any <details data-perflocale-popover>
-		// element on PerfLocale admin pages (Export PO / Import PO on Strings,
-		// Import CSV on Glossary, plus any future popovers that opt in via the
-		// data attribute). Native <details> already handles keyboard toggling
-		// and ARIA; this script just adds the dismissal behaviours users expect
-		// from floating UI, mirroring the Publish dropdown and Customizer
-		// popovers in WP core. Re-queries on each event so popovers added to
-		// the DOM after page load also participate.
-		wp_add_inline_script(
-			'perflocale-admin',
-			'(function(){' .
-				'function popovers(){return document.querySelectorAll("details[data-perflocale-popover]");}' .
-				'document.addEventListener("click",function(e){' .
-					'popovers().forEach(function(d){' .
-						'if(d.open&&!d.contains(e.target)){d.open=false;}' .
-					'});' .
-				'});' .
-				'document.addEventListener("keydown",function(e){' .
-					'if(e.key!=="Escape")return;' .
-					'popovers().forEach(function(d){' .
-						'if(d.open){' .
-							'var s=d.querySelector("summary");' .
-							'var refocus=d.contains(document.activeElement);' .
-							'd.open=false;' .
-							'if(refocus&&s)s.focus();' .
-						'}' .
-					'});' .
-				'});' .
-			'})();'
 		);
 
 		// Bulk-actions UI: only loaded on the Translations page, which
@@ -381,8 +371,17 @@ final class Assets {
 		}
 
 		// Settings page progressive enhancements (e.g. Switcher tab's
-		// display-mode-dependent row visibility).
+		// display-mode-dependent row visibility), and the import form's
+		// upload in pieces for a file larger than PHP accepts in one request.
 		if ( $hook === 'perflocale_page_perflocale-settings' ) {
+			wp_enqueue_script(
+				'perflocale-import-upload',
+				PERFLOCALE_URL . 'assets/js/import-upload.js',
+				[],
+				PERFLOCALE_VERSION,
+				true
+			);
+
 			wp_enqueue_script(
 				'perflocale-admin-settings',
 				PERFLOCALE_URL . 'assets/js/admin-settings.js',
@@ -445,6 +444,9 @@ final class Assets {
 						'nonce'    => wp_create_nonce( 'wp_rest' ),
 						'targets'  => $mt_targets,
 						'provider' => (string) $settings->get_mt_provider(),
+						// The most strings one dispatch translates; the confirm
+						// dialogs show the selection cut at it, as the job runs it.
+						'runCap'   => \PerfLocale\Background\Jobs\BulkStringTranslateJob::max_per_dispatch(),
 						'i18n'     => [
 							'pickTargets'     => __( 'Pick at least one target language.', 'perflocale' ),
 							'pickStrings'     => __( 'Pick at least one string row first.', 'perflocale' ),
@@ -454,7 +456,15 @@ final class Assets {
 							'confirmFiltered' => __( 'MT-translate %1$d filtered strings into %2$s? This may take a while.', 'perflocale' ),
 							/* translators: 1: total string count, 2: comma-separated language names */
 							'confirmAll'      => __( 'MT-translate every string in the table (%1$d total) into %2$s? This will dispatch a background job and may incur provider costs.', 'perflocale' ),
-							'maxExceeded'     => __( 'Selection exceeds the per-dispatch cap (5,000 strings per run). Narrow the filter or split the run.', 'perflocale' ),
+							/* translators: 1: number of strings one run translates, 2: number of filtered strings, 3: comma-separated language names */
+							'filteredCapped'  => __( 'MT-translate %1$d of the %2$d filtered strings into %3$s? One run translates at most %1$d strings; run it again to continue. This may take a while.', 'perflocale' ),
+							/* translators: 1: number of strings one run translates, 2: total string count, 3: comma-separated language names */
+							'allCapped'       => __( 'MT-translate %1$d of the %2$d strings in the table into %3$s? One run translates at most %1$d strings; run it again to continue. This will dispatch a background job and may incur provider costs.', 'perflocale' ),
+							'maxExceeded'     => sprintf(
+								/* translators: %s: the most strings one run translates, for example 5,000. */
+								__( 'Selection exceeds the per-dispatch cap (%s strings per run). Narrow the filter or split the run.', 'perflocale' ),
+								number_format_i18n( \PerfLocale\Background\Jobs\BulkStringTranslateJob::max_per_dispatch() )
+							),
 							'queued'          => __( 'Bulk MT job queued. Redirecting to Jobs page…', 'perflocale' ),
 							/* translators: 1: translated count, 2: skipped count, 3: failed count */
 							'syncDone'        => __( 'Done. %1$d translated, %2$d skipped, %3$d failed.', 'perflocale' ),

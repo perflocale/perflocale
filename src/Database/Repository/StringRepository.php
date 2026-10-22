@@ -214,6 +214,12 @@ final class StringRepository implements RepositoryInterface {
 
 		$group_ph   = implode( ',', array_fill( 0, $count, '(%s)' ) );
 		$group_args = array_fill( 0, $count, 'string' );
+		$sqlite     = defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' );
+
+		// SQLite: the highest group id before the batch, which the batch's
+		// first id must exceed (see below).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$prior_max = $sqlite ? (int) $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT MAX(id) FROM %i', $groups_table ) ) : 0;
 
 		// Values bound via prepare(); the table name is bound with the %i
 		// identifier placeholder, so only the generated (%s) list interpolates.
@@ -224,6 +230,37 @@ final class StringRepository implements RepositoryInterface {
 
 		$first_group_id = (int) $this->wpdb->insert_id;
 		$inserted       = 0;
+
+		// On the SQLite Database Integration the id after a multi-row INSERT
+		// is the LAST row's (MySQL and MariaDB give the first), and there is no
+		// @@auto_increment_increment: the batch's ids run up from
+		// insert_id - (count - 1). SQLite writes one statement at a time and
+		// numbers its rows consecutively, so the block is exact; it is still
+		// checked (above the highest id before the batch, and every id a
+		// string group no string uses) before it is trusted, and the per-row
+		// path below takes over when it is not.
+		if ( $sqlite && $first_group_id > 0 && $rows_affected === $count ) {
+			$first_group_id -= $count - 1;
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$fresh = (int) $this->wpdb->get_var(
+				$this->wpdb->prepare(
+					"SELECT COUNT(*) FROM %i g WHERE g.id BETWEEN %d AND %d AND g.type = 'string'
+					AND NOT EXISTS ( SELECT 1 FROM %i s WHERE s.group_id = g.id )",
+					$groups_table,
+					$first_group_id,
+					$first_group_id + $count - 1,
+					$this->table()
+				)
+			);
+
+			if ( $first_group_id <= $prior_max || $fresh !== $count ) {
+				// Not the expected block: the per-row path below takes over. The
+				// batch's rows are left for the empty-group sweep rather than
+				// deleted by an id range that just proved unreliable.
+				$first_group_id = 0;
+			}
+		}
 
 		// Safety: if batch insert failed or returned unexpected count, fall back to individual inserts.
 		if ( $first_group_id === 0 || $rows_affected !== $count ) {
@@ -285,7 +322,7 @@ final class StringRepository implements RepositoryInterface {
 		// the node count). Assuming a step of 1 there would link strings to
 		// nonexistent / wrong group_ids. Read the step once and apply it.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$increment     = max( 1, (int) $this->wpdb->get_var( 'SELECT @@auto_increment_increment' ) );
+		$increment     = $sqlite ? 1 : max( 1, (int) $this->wpdb->get_var( 'SELECT @@auto_increment_increment' ) );
 		$index         = 0;
 		$orphan_groups = [];
 
@@ -770,8 +807,16 @@ final class StringRepository implements RepositoryInterface {
 
 	/**
 	 * {@inheritDoc}
+	 *
+	 * With $in_transaction the group row of a string whose insert failed is
+	 * left to the caller's rollback: no statement follows a failed one inside
+	 * a transaction (on the SQLite Database Integration the failure has ended
+	 * the transaction, and a later statement would commit on its own).
+	 *
+	 * @param array<string, mixed> $data           domain, context, original, file_path, line_number.
+	 * @param bool                 $in_transaction Whether the caller holds an open transaction it rolls back on a failure.
 	 */
-	public function insert( array $data ): int|false {
+	public function insert( array $data, bool $in_transaction = false ): int|false {
 		$hash = self::compute_hash(
 			$data['domain'] ?? 'default',
 			$data['context'] ?? '',
@@ -813,8 +858,11 @@ final class StringRepository implements RepositoryInterface {
 		// group we just inserted has no owner - it would be a widow. GC it
 		// right away rather than leave schema rot.
 		if ( $result === false ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			$this->wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
+			if ( ! $in_transaction ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				$this->wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
+			}
+
 			return false;
 		}
 
@@ -1401,7 +1449,7 @@ final class StringRepository implements RepositoryInterface {
 					$this->wpdb->prepare(
 						"INSERT INTO %i (group_id, object_id, language_id, type, status, source)
 						VALUES {$row_ph}
-						ON DUPLICATE KEY UPDATE status = 'needs_update', type = 'string'",
+						ON DUPLICATE KEY UPDATE status = 'needs_update', type = 'string'" . Schema::touch_write_time( [ [ 'status', "'needs_update'", 'text' ], [ 'type', "'string'", 'text' ] ] ),
 						array_merge( [ $links_table ], $args )
 					)
 				);

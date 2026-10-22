@@ -393,7 +393,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 			$request_uri = isset( $_SERVER['REQUEST_URI'] )
 				? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) )
 				: '';
-			$is_sitemap  = (bool) preg_match( '/sitemap[^\\/]*\.xml/', $request_uri );
+			$is_sitemap  = \PerfLocale\Helper::is_sitemap_uri( $request_uri );
 		}
 
 		return $is_sitemap;

@@ -184,6 +184,15 @@ final class TranslatePressImporter {
 	private array $trp_settings = [];
 
 	/**
+	 * Set by stop_if_batch_broken() when the current batch's transaction was
+	 * lost, so the batch's catch runs the batch once more outside a
+	 * transaction.
+	 *
+	 * @var bool
+	 */
+	private bool $batch_lost = false;
+
+	/**
 	 * Language mapping: TRP locale => PerfLocale language ID.
 	 *
 	 * @var array<string, int>
@@ -398,6 +407,41 @@ final class TranslatePressImporter {
 	 */
 	private function mark_incomplete(): void {
 		$this->result['incomplete'] = true;
+	}
+
+	/**
+	 * Throw so the batch's catch takes over when the batch transaction is
+	 * lost or one of the batch's own statements failed.
+	 *
+	 * Lost (Schema::transaction_lost() without an own failure): a query that
+	 * failed while the transaction was open ended it (on SQLite any failed
+	 * query; on MySQL a deadlock, or a lock wait timeout with
+	 * innodb_rollback_on_timeout ON); the batch is rolled back and run once
+	 * more outside a transaction ($batch_lost). An own failure (a DB error
+	 * behind wp_insert_post()'s WP_Error) fails the batch on every engine.
+	 * Any other failed query of another plugin leaves a MySQL transaction
+	 * intact, and the batch goes on.
+	 *
+	 * @param bool   $in_tx      Whether the batch runs in a transaction.
+	 * @param int    $errors     Schema::query_error_count() when the batch started.
+	 * @param bool   $own_failed Whether one of the batch's own statements failed.
+	 * @param string $step       What the batch was doing, for the batch error.
+	 * @return void
+	 * @throws \RuntimeException When the batch has to stop.
+	 */
+	private function stop_if_batch_broken( bool $in_tx, int $errors, bool $own_failed, string $step ): void {
+		if ( $in_tx && Schema::transaction_lost( $errors ) ) {
+			$this->batch_lost = true;
+			$message          = 'trp_import: the batch transaction ended on a failed query while ' . $step;
+
+			throw new \RuntimeException( $message ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text built from literals and integer ids.
+		}
+
+		if ( $own_failed ) {
+			$message = 'trp_import: a database statement failed while ' . $step;
+
+			throw new \RuntimeException( $message ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text built from literals and integer ids.
+		}
 	}
 
 	/**
@@ -885,7 +929,20 @@ final class TranslatePressImporter {
 
 		$this->beat( 'posts', 0, count( $post_ids ) );
 
+		// Each batch runs in one transaction ($in_tx). A batch whose
+		// transaction was lost (see stop_if_batch_broken()) is rolled back and
+		// queued once more, to run outside a transaction, where another
+		// plugin's failed query is tolerated.
+		$queue = [];
+
 		foreach ( $batches as $batch_index => $batch ) {
+			$queue[] = [ $batch_index, $batch, true ];
+		}
+
+		for ( $next = 0; isset( $queue[ $next ] ); ) {
+			[ $batch_index, $batch, $in_tx ] = $queue[ $next ];
+			++$next;
+
 			$this->beat( 'posts', min( count( $post_ids ), (int) $batch_index * $batch_size ), count( $post_ids ) );
 			$rebuilder->forget();
 
@@ -895,12 +952,19 @@ final class TranslatePressImporter {
 			// ends with flush_all().
 			$this->groups->release_status_selectors();
 
-			$this->wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			// Register this raw transaction so nested create_group()/link_object()
-			// calls join it instead of issuing a second START TRANSACTION (which
-			// MySQL treats as an implicit COMMIT of this outer one, defeating the
-			// batch ROLLBACK below). Cleared in the finally on every exit path.
-			$this->groups->set_in_transaction( true );
+			if ( $in_tx ) {
+				$this->wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				// Register this raw transaction so nested create_group()/link_object()
+				// calls join it instead of issuing a second START TRANSACTION (which
+				// MySQL treats as an implicit COMMIT of this outer one, defeating the
+				// batch ROLLBACK below). Cleared in the finally on every exit path.
+				$this->groups->set_in_transaction( true );
+			}
+
+			// Failed queries before this batch's writes, for
+			// stop_if_batch_broken() after each write step.
+			$batch_errors     = Schema::query_error_count();
+			$this->batch_lost = false;
 
 			// Snapshot the running totals so a mid-batch failure can roll
 			// them back together with the SQL transaction. Previously, a
@@ -1166,7 +1230,11 @@ final class TranslatePressImporter {
 						// translation keep the same slug.
 						$source_lang = $this->get_source_perflocale_language();
 
-						if ( $source_lang && ! $manager->set_post_language( $post_id, $source_lang->slug ) ) {
+						$source_set = ! $source_lang || $manager->set_post_language( $post_id, $source_lang->slug );
+
+						$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'setting the language of post ' . (int) $post_id );
+
+						if ( ! $source_set ) {
 							$this->result['errors'][] = sprintf(
 								/* translators: 1: language slug, 2: post ID */
 								__( 'Failed to assign source language "%1$s" to post %2$d.', 'perflocale' ),
@@ -1216,6 +1284,16 @@ final class TranslatePressImporter {
 							(string) $pl_lang->slug
 						);
 
+						// A failed INSERT/UPDATE of the post fails the batch; a
+						// post WordPress refused (any other WP_Error, such as
+						// empty content) stays a recorded skip.
+						$this->stop_if_batch_broken(
+							$in_tx,
+							$batch_errors,
+							is_wp_error( $new_post_id ) && in_array( $new_post_id->get_error_code(), [ 'db_insert_error', 'db_update_error' ], true ),
+							'creating the translation of post ' . (int) $post_id
+						);
+
 						if ( is_wp_error( $new_post_id ) ) {
 							$this->result['errors'][] = sprintf(
 								/* translators: 1: post ID, 2: TranslatePress locale code, 3: error message */
@@ -1243,7 +1321,11 @@ final class TranslatePressImporter {
 						$batch_new_posts[] = (int) $new_post_id;
 
 						// Link to translation group.
-						if ( ! $manager->set_post_language( $new_post_id, $pl_lang->slug ) ) {
+						$language_set = $manager->set_post_language( $new_post_id, $pl_lang->slug );
+
+						$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'setting the language of post ' . (int) $new_post_id );
+
+						if ( ! $language_set ) {
 							$this->result['errors'][] = sprintf(
 								/* translators: 1: language slug, 2: post ID */
 								__( 'Failed to assign language "%1$s" to translation post %2$d.', 'perflocale' ),
@@ -1273,6 +1355,8 @@ final class TranslatePressImporter {
 								throw new \RuntimeException( 'trp_import: link_object failed for post ' . $new_post_id );
 							}
 
+							$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'linking post ' . (int) $new_post_id );
+
 							// Record the source_map mapping so the
 							// `--force-restart` CLI flag can clear it
 							// symmetrically with WPML and Polylang.
@@ -1297,6 +1381,8 @@ final class TranslatePressImporter {
 							// WooCommerce addon sets the product type and creates
 							// the variations.
 							$manager->complete_imported_translation( (int) $new_post_id, (int) $post_id, (string) $pl_lang->slug );
+
+							$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'completing post ' . (int) $new_post_id );
 						} else {
 							// No source group (e.g. the source set_post_language
 							// above failed): the freshly-inserted translation
@@ -1310,6 +1396,8 @@ final class TranslatePressImporter {
 						++$imported;
 					}
 				}
+
+				$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'finishing batch ' . (int) $batch_index );
 			} catch ( \Throwable $e ) {
 				// Any throw inside the batch (hook callback, KSES filter,
 				// MySQL deadlock, failed source read, etc.) lands here.
@@ -1318,7 +1406,33 @@ final class TranslatePressImporter {
 				// so the result reflects what's actually in the DB. The
 				// translation posts a non-transactional (MyISAM) wp_posts
 				// kept are deleted below.
-				$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				if ( $in_tx ) {
+					$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				}
+
+				// A lost transaction (SQLite): the same batch once more,
+				// outside a transaction, from its pre-batch state.
+				if ( $in_tx && $this->batch_lost ) {
+					$imported                = $pre_batch_imported;
+					$this->result['skipped'] = $pre_batch_skipped;
+					$this->result['errors']  = $pre_batch_errors;
+
+					[ $this->result['existing'], $this->result['existing_targets'] ] = $pre_batch_existing;
+
+					// This process still remembers the rolled-back links (the
+					// repository's per-request lookups and the cache manager's
+					// request-scoped layer); the second run must read the
+					// database, or it takes a rolled-back translation for an
+					// existing one.
+					wp_cache_flush();
+					\PerfLocale\Database\Repository\TranslationGroupRepository::reset_static_caches();
+					$this->cache->reset_static();
+					$this->delete_unlinked_batch_posts( (int) $batch_index, $batch_new_posts );
+
+					$queue[ --$next ] = [ $batch_index, $batch, false ];
+
+					continue;
+				}
 
 				$imported                 = $pre_batch_imported;
 				$this->result['skipped']  = $pre_batch_skipped;
@@ -1356,7 +1470,7 @@ final class TranslatePressImporter {
 			}
 
 			if ( ! $batch_failed ) {
-				$committed = $this->wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$committed = $in_tx ? $this->wpdb->query( 'COMMIT' ) : 0; // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
 				// The status selections this batch asked to delete, on any
 				// blog, now that its transaction has ended either way.
@@ -1692,8 +1806,8 @@ final class TranslatePressImporter {
 						}
 					}
 
-					// Check if string already exists in PerfLocale.
-					$existing = $this->strings->find_by_hash( $domain, $context, $original );
+					// Check if string already exists in PerfLocale (with its group's type).
+					$existing = $this->find_string( $domain, $context, $original );
 
 					if ( ! $existing ) {
 						// Insert the string (hash is computed by StringRepository::insert()).
@@ -1751,13 +1865,23 @@ final class TranslatePressImporter {
 							: (int) ( $this->strings->find( (int) $string_id )->group_id ?? 0 );
 
 						if ( $has_translation && $group_id > 0 ) {
-							$link_id = $this->groups->upsert_link(
+							// A string link goes only into a string group. A new
+							// string's group is the one insert() just created; an
+							// existing string pointing at a post or term group (or
+							// at none) gets a new string group first.
+							if ( ! $existing || ( isset( $existing->group_type ) && 'string' === $existing->group_type ) ) {
+								TranslationGroupRepository::remember_string_group( $group_id );
+							} else {
+								$group_id = $this->groups->assign_new_string_group( (int) $string_id );
+							}
+
+							$link_id = $group_id > 0 ? $this->groups->upsert_link(
 								$group_id,
 								(int) $string_id,
 								(int) $pl_lang_id,
 								'translated',
 								\PerfLocale\Enum\SourceType::ImportedTrp
-							);
+							) : false;
 
 							if ( $link_id === false ) {
 								++$link_failures;
@@ -1829,6 +1953,30 @@ final class TranslatePressImporter {
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		return $imported;
+	}
+
+	/**
+	 * A PerfLocale string by domain, context and original, with the type of
+	 * its group (`group_type`, null when the group is missing), in one read.
+	 *
+	 * @param string $domain   Text domain.
+	 * @param string $context  Context.
+	 * @param string $original Original text.
+	 * @return object|null The strings row plus group_type.
+	 */
+	private function find_string( string $domain, string $context, string $original ): ?object {
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifiers are bound with %i; an import reads each string once.
+		$row = $this->wpdb->get_row(
+			$this->wpdb->prepare(
+				'SELECT s.*, g.type AS group_type FROM %i s LEFT JOIN %i g ON g.id = s.group_id WHERE s.original_hash = %s',
+				Schema::table( 'strings' ),
+				Schema::table( 'translation_groups' ),
+				StringRepository::compute_hash( $domain, $context, $original )
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return is_object( $row ) ? $row : null;
 	}
 
 	/**

@@ -252,3 +252,10 @@ a.perflocale-panel-status:hover {
 .perflocale-panel-notice__close:focus {
 	color: #1e1e1e;
 }
+
+/* The shared menu or pattern notice in a translated template part's block settings. */
+.perflocale-shared-notice {
+	margin: 16px;
+	border-left-color: #dba617;
+	background: #fcf9e8;
+}

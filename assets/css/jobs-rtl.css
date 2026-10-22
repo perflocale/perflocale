@@ -59,6 +59,17 @@
 	overflow-wrap: anywhere;
 }
 
+/* A finished job's first error under its status (the whole text is in the title and the details). */
+.perflocale-jobs-first-error {
+	margin-top: 4px;
+	max-width: 380px;
+	font-size: 11px;
+	line-height: 1.4;
+	color: #b32d2e;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
 /* Expandable detail row (lazily fetched via /jobs/{id}). */
 .perflocale-jobs-detail-row > td {
 	background: #f6f7f7;
