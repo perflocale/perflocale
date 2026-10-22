@@ -748,6 +748,7 @@ final class PostQueryFilter {
 
 			if ( ! $target_id ) {
 				// No translation found - show the front page as-is.
+				$this->guard_editor_fallback( $front_page_id );
 				$target_id = $front_page_id;
 			}
 		}
@@ -948,7 +949,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Find the unpublished front-page translation a logged-in editor is
-	 * previewing on the language root.
+	 * previewing, or opening without a preview argument, on the language root.
 	 *
 	 * Same status rules as find_preview_target(): without a preview_id only a
 	 * protected status qualifies; a preview_id must name this translation,
@@ -965,7 +966,7 @@ final class PostQueryFilter {
 	private function find_preview_front_page( \WP_Query $query, int $front_page_id, int $language_id ): int {
 		$preview_id = $this->logged_in_preview_id( $query );
 
-		if ( $preview_id < 0 ) {
+		if ( $preview_id < 0 && ! $this->may_edit_unpublished( 'page' ) ) {
 			return 0;
 		}
 
@@ -1243,7 +1244,8 @@ final class PostQueryFilter {
 			// The candidates above are published only, and a new translation
 			// copies its source's slug, so a preview=true link to an unpublished
 			// translation would otherwise fall through to a published sibling.
-			if ( $preview_id === 0 ) {
+			// A page builder's link carries no preview argument: editors get the same lookup.
+			if ( $preview_id === 0 || ( $preview_id === -1 && $this->may_edit_unpublished( 'page' ) ) ) {
 				$preview_target = $this->find_preview_target( $lookup_slug, $language_id, 'page', $preview_uri, 0 );
 
 				if ( $preview_target > 0 ) {
@@ -1262,6 +1264,7 @@ final class PostQueryFilter {
 			}
 
 			if ( $fallback_id ) {
+				$this->guard_editor_fallback( $fallback_id );
 				$query->set( 'page_id', $fallback_id );
 				$query->set( 'pagename', '' );
 				$query->set( 'perflocale_all_languages', true );
@@ -1288,6 +1291,7 @@ final class PostQueryFilter {
 			}
 
 			if ( $any_id ) {
+				$this->guard_editor_fallback( $any_id );
 				$query->set( 'page_id', $any_id );
 				$query->set( 'pagename', '' );
 				$query->set( 'perflocale_all_languages', true );
@@ -1329,12 +1333,8 @@ final class PostQueryFilter {
 			// (wp-includes/class-wp-query.php:2156-2170, :2186-2217). A post
 			// routed by `p` survives only when it is that same post, so the
 			// preview route leaves these requests to the lookups below.
-			if ( $preview_id >= 0 ) {
-				$type_object = get_post_type_object( $post_type );
-
-				if ( $type_object && $type_object->hierarchical && $type_object->query_var && ! empty( $query->get( (string) $type_object->query_var ) ) ) {
-					$preview_id = -1;
-				}
+			if ( $preview_id >= 0 && $this->is_own_query_var_request( $query, $post_type ) ) {
+				$preview_id = -1;
 			}
 
 			if ( $preview_id > 0 ) {
@@ -1358,7 +1358,7 @@ final class PostQueryFilter {
 			}
 
 			// Same reason as the pagename branch above.
-			if ( $preview_id === 0 ) {
+			if ( $preview_id === 0 || ( $preview_id === -1 && $this->may_edit_unpublished( $post_type ) && ! $this->is_own_query_var_request( $query, $post_type ) ) ) {
 				$preview_target = $this->find_preview_target( $name, $language_id, $post_type, '', 0 );
 
 				if ( $preview_target > 0 ) {
@@ -1371,6 +1371,7 @@ final class PostQueryFilter {
 			$fallback_id = $this->find_fallback_post( $name, $language_id, $post_type );
 
 			if ( $fallback_id ) {
+				$this->guard_editor_fallback( $fallback_id );
 				$query->set( 'p', $fallback_id );
 				$query->set( 'name', '' );
 				$query->set( 'perflocale_all_languages', true );
@@ -1387,6 +1388,7 @@ final class PostQueryFilter {
 			$any_id = $this->find_any_translated_post_by_slug( $name, $post_type, $language_id );
 
 			if ( $any_id ) {
+				$this->guard_editor_fallback( $any_id );
 				$query->set( 'p', $any_id );
 				$query->set( 'name', '' );
 				$query->set( 'perflocale_all_languages', true );
@@ -1549,6 +1551,49 @@ final class PostQueryFilter {
 		$preview_id = isset( $_GET['preview_id'] ) && is_scalar( $_GET['preview_id'] ) ? (int) $_GET['preview_id'] : 0;
 
 		return max( 0, $preview_id );
+	}
+
+	/**
+	 * Whether a logged-in user may edit posts of this type; gates the unpublished-translation lookup.
+	 *
+	 * @param string $post_type Post type.
+	 * @return bool
+	 */
+	private function may_edit_unpublished( string $post_type ): bool {
+		$type = is_user_logged_in() ? get_post_type_object( $post_type ) : null;
+		$cap  = $type !== null ? ( $type->cap->edit_posts ?? null ) : null;
+
+		return is_string( $cap ) && current_user_can( $cap );
+	}
+
+	/**
+	 * Whether a hierarchical type is requested through its own query var.
+	 * Core resolves that by path after pre_get_posts and drops a post routed by `p`.
+	 *
+	 * @param \WP_Query $query     The main query.
+	 * @param string    $post_type Post type.
+	 * @return bool
+	 */
+	private function is_own_query_var_request( \WP_Query $query, string $post_type ): bool {
+		$type = get_post_type_object( $post_type );
+
+		return $type !== null && $type->hierarchical && $type->query_var && ! empty( $query->get( (string) $type->query_var ) );
+	}
+
+	/**
+	 * Refuses a page-builder link that would load this post of another language (the guard loads only here).
+	 *
+	 * @param int $post_id The post about to load.
+	 * @return void
+	 */
+	private function guard_editor_fallback( int $post_id ): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ( $_GET !== [] && is_user_logged_in() ) {
+			EditorFallbackGuard::check(
+				$post_id,
+				fn(): string => EditorFallbackGuard::language_name( $this->router->get_active_languages(), $this->get_post_language_id( $post_id ) )
+			);
+		}
 	}
 
 	/**

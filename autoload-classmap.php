@@ -212,6 +212,7 @@ return [
 	'PerfLocale\\Translation\\BlockTemplateSupport' => 'Translation/BlockTemplateSupport.php',
 	'PerfLocale\\Translation\\ContentChangeDetector' => 'Translation/ContentChangeDetector.php',
 	'PerfLocale\\Translation\\ContentSync' => 'Translation/ContentSync.php',
+	'PerfLocale\\Translation\\EditorFallbackGuard' => 'Translation/EditorFallbackGuard.php',
 	'PerfLocale\\Translation\\FallbackSnippetGuard' => 'Translation/FallbackSnippetGuard.php',
 	'PerfLocale\\Translation\\MediaTranslationManager' => 'Translation/MediaTranslationManager.php',
 	'PerfLocale\\Translation\\MenuManager' => 'Translation/MenuManager.php',

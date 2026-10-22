@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.7.3
+Stable tag: 1.0.7.3.1
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -207,6 +207,9 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
+= 1.0.7.3.1 =
+* Page builders: the builder link of an unpublished translation (for example "Edit with Oxygen") opens the translation, not the original page, so saving no longer changes the original. A builder link that cannot open the translation stops with a message instead.
+
 = 1.0.7.3 =
 * Security hardening.
 * Machine translation: a result that breaks the source's block structure is never saved, block comments and shortcode tags are held back from the provider, and the editor says why a translation was not saved. A translation someone edits while machine translation runs keeps their edit. New `wp perflocale damaged-blocks` finds translations damaged earlier.
@@ -254,6 +257,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.7.3.1 =
+Opening an unpublished translation in a page builder opens the translation, not the original page.
 
 = 1.0.7.3 =
 Security hardening. Machine translations that would break block markup are no longer saved, a more complete and safer Export & Import, Site Editor menus and patterns per language, and less work on large sites.
