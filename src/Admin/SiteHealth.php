@@ -17,62 +17,39 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds PerfLocale-specific entries to WordPress' Site Health screen.
- *
- * Exposes two surfaces:
- *
- * - Status tab - individual tests (good/recommended/critical) covering
- * the configuration + runtime states that matter for translation to
- * actually work. The language-pack test is asynchronous: the Status screen
- * runs it through admin-ajax after rendering, and the weekly scheduled
- * check calls it directly. Every other test is "direct" (synchronous) and
- * cheap.
- * - Info tab - a dedicated `perflocale` section with a diagnostic dump
- * of the whole translation stack. Useful for support tickets.
- *
- * API keys, secrets, and tokens are always redacted - the Info dump
- * reports "configured" or "not configured", never the raw value.
- *
- * Heavy lookups (row counts) are cached for five minutes in a transient
- * so repeatedly opening the Site Health screen doesn't hammer the DB.
+ * PerfLocale's Site Health entries: Status tests (the language-pack test asynchronous, the rest direct and cheap)
+ * and an Info section for support. Secrets show as configured or not, never their value; heavy counts are cached.
  */
 final class SiteHealth {
 
 	/**
-	 * Transient key used to cache aggregate counts.
+	 * Transient of the aggregate counts.
 	 */
 	private const COUNTS_TRANSIENT = 'perflocale_site_health_counts';
 
 	/**
-	 * Transient key used to cache the hreflang sanity probe result.
+	 * Transient of the hreflang probe result.
 	 */
 	private const HREFLANG_TRANSIENT = 'perflocale_site_health_hreflang';
 
 	/**
-	 * Transient key used to cache the stuck-translations row-count probe.
-	 * Heavy: COUNT(*) on translation_links with a status+date predicate.
+	 * Transient of the stuck-translations count (a COUNT on translation_links by status and date).
 	 */
 	private const STUCK_TRANSIENT = 'perflocale_site_health_stuck';
 
 	/**
-	 * Transient key used to cache the orphan-rows probe (LEFT JOIN to wp_posts
-	 * and wp_terms looking for translation rows whose target object vanished).
-	 * Heavy: scans the entire translation_links + slug_translations tables.
+	 * Transient of the orphan-rows probe (translation and slug rows whose object is gone; scans both tables).
 	 */
 	private const ORPHANS_TRANSIENT = 'perflocale_site_health_orphans';
 
 	/**
-	 * Legacy transient key, kept only so {@see self::flush_counts_cache()} can
-	 * reap it. It cached the MT-quality-scoring COUNT(*) pair; that card was
-	 * removed with the quality-scoring feature, so no code writes this key any
-	 * more and an upgraded site is the only place a row can still exist.
+	 * Transient flush_counts_cache() still deletes; nothing writes it (its card is gone), but old sites may hold a row.
 	 */
 	private const MT_SCORING_TRANSIENT = 'perflocale_site_health_mt_scoring';
 
 	/**
-	 * Transient key used to cache the translation-files probe COUNTs (two
-	 * 4-table JOINs plus a full COUNT(*) on string_translations). Runs on
-	 * every Status load in files mode without the cache.
+	 * Transient of the translation-files probe counts (two 4-table JOINs and a full COUNT), else run on every Status load
+	 * in files mode.
 	 */
 	private const FILES_TRANSIENT = 'perflocale_site_health_files';
 
@@ -82,65 +59,46 @@ final class SiteHealth {
 	private const COUNTS_TTL = 5 * MINUTE_IN_SECONDS;
 
 	/**
-	 * Heavy-query cache TTL (stuck-translations + orphan-rows). Longer than
-	 * COUNTS_TTL because these run full-table scans on large sites; the
-	 * Site Health card surfaces last-checked timestamp so operators know
-	 * how fresh the answer is.
+	 * TTL of the heavy probes (stuck translations, orphan rows), which scan whole tables; the card shows when it last ran.
 	 */
 	private const HEAVY_TTL = HOUR_IN_SECONDS;
 
 	/**
-	 * Eager-link-map autoloaded-blob size at which we start surfacing a
-	 * Site Health recommendation. Per the perf-tuning notes, this option
-	 * is the dominant frontend optimization but grows linearly with
-	 * translation-group count; past this threshold the alloptions cost
-	 * starts to dominate the savings.
+	 * Size of the autoloaded eager-link map at which a recommendation shows: it grows with the group count, and past
+	 * this its alloptions cost outweighs what it saves.
 	 */
-	private const EAGER_LINK_MAP_WARN_BYTES = 262144; // 256 KB
+	private const EAGER_LINK_MAP_WARN_BYTES = 262144; // 256 KB.
 
 	/**
-	 * Upper bound on the number of language-hostname lookups
-	 * test_multisite_language_hosts() will perform in one run. Each lookup is
-	 * one cached WP_Site_Query; the cap keeps a network with a very long
-	 * language list from turning the scheduled health check into a scan.
-	 * Anything beyond the cap is reported as unchecked, never as resolving.
+	 * Most language hostname lookups test_multisite_language_hosts() makes per run (one cached WP_Site_Query each);
+	 * the rest is reported as unchecked, never as resolving.
 	 */
 	private const MAX_HOST_PROBES = 20;
 
 	/**
-	 * Shape of a locale that the language-pack test puts into its suggested
-	 * WP-CLI command, the shape WordPress.org locales have and
-	 * `wp perflocale languages add` accepts: de_DE, de_DE_formal, pt_PT_ao90,
-	 * ca_valencia, fi, ary. The command is meant to be pasted into a shell,
-	 * and a locale stored through the admin form or an import can hold any
-	 * text, so a locale of another shape is listed but left out of it.
+	 * Locale shape the language-pack test puts in its suggested WP-CLI command (WordPress.org shapes: de_DE,
+	 * de_DE_formal, pt_PT_ao90, ca_valencia, fi, ary); a stored locale can hold any text, so others are left out of it.
 	 */
 	private const CLI_LOCALE = '/\A[a-z]{2,3}(?:_[A-Za-z0-9]{2,8})*\z/';
 
 	/**
-	 * Name of the language-pack test as core's Site Health script sends it:
-	 * the admin-ajax action is "health-check-" followed by this.
+	 * The language-pack test's name as core's script sends it (the admin-ajax action is "health-check-" + this).
 	 */
 	private const LANGUAGE_PACKS_ACTION = 'perflocale-language-packs';
 
 	/**
-	 * Stuck-translation age threshold. Translations whose row was created
-	 * more than this many days ago and still sit in `in_progress` or
-	 * `pending` status are surfaced as a recommendation.
+	 * Days after which a translation still `in_progress` or `pending` is reported as stuck.
 	 */
 	private const STUCK_AGE_DAYS = 7;
 
 	/**
 	 * MT usage thresholds (as a fraction of the monthly limit).
 	 */
-	private const MT_WARN_THRESHOLD     = 0.80; // recommended at 80%+
-	private const MT_CRITICAL_THRESHOLD = 0.95; // critical at 95%+
+	private const MT_WARN_THRESHOLD     = 0.80; // Recommended at 80%.
+	private const MT_CRITICAL_THRESHOLD = 0.95; // Critical at 95%.
 
 	/**
-	 * Third-party multilingual plugin constants that conflict with us.
-	 *
-	 * Mirrored from Bootstrap - duplicated to keep this class decoupled
-	 * from the bootstrap flow.
+	 * Constants of conflicting multilingual plugins (as in Bootstrap, duplicated to keep this class apart).
 	 */
 	private const CONFLICTING_PLUGINS = [
 		'ICL_SITEPRESS_VERSION' => 'WPML',
@@ -149,53 +107,27 @@ final class SiteHealth {
 	];
 
 	/**
-	 * PHP extensions that gate one optional PerfLocale feature each. Absent
-	 * ones cost that feature and nothing else - the rest of the plugin runs
-	 * unchanged - so this reports a recommendation, not a critical failure.
-	 *
-	 * Two extensions an earlier revision listed here are deliberately gone:
-	 *
-	 * - `mbstring`: the only multibyte calls left in the plugin are
-	 *   mb_strlen() and mb_substr(), and WordPress core polyfills both in
-	 *   wp-includes/compat.php at every version PerfLocale supports. Nothing
-	 *   degrades without the extension, so flagging it raised a critical
-	 *   failure that was never true. Core's own Site Health agrees: it marks
-	 *   mbstring `required => false`.
-	 * - `json`: cannot be disabled on PHP 8.0+, and this plugin's floor is
-	 *   8.1, so the branch was unreachable.
-	 *
-	 * `xmlwriter` is new here: XLIFF export builds its document with it, and
-	 * the old list omitted it while naming `simplexml`, which the plugin only
-	 * ever touches through core's already-guarded sitemap renderer.
+	 * PHP extensions that each gate one optional feature, so a missing one is a recommendation. Not mbstring (core
+	 * polyfills mb_strlen() and mb_substr(); its own Site Health has it not required) and not json (always on in PHP 8).
 	 *
 	 * @var array<int, string>
 	 */
 	private const FEATURE_PHP_EXTENSIONS = [ 'dom', 'libxml', 'xmlwriter', 'simplexml', 'filter', 'intl' ];
 
 	/**
-	 * How far past its scheduled time a recurring event may be before the cron
-	 * card treats it as proof that nothing is running the queue.
-	 *
-	 * The shortest recurring event PerfLocale schedules runs hourly, and a
-	 * system crontab commonly fires every 5-15 minutes, so an hour of slack
-	 * absorbs a slow tick, a paused container or a busy queue without crying
-	 * wolf, while still catching a runner that has genuinely stopped.
+	 * How late a recurring event may be before the cron card takes it as nothing running the queue: the shortest event
+	 * is hourly and system crontabs fire every 5-15 minutes, so an hour absorbs slow ticks.
 	 */
 	private const CRON_OVERDUE_GRACE = HOUR_IN_SECONDS;
 
 	/**
-	 * Failed jobs in the last 24 hours needed before the background-jobs card
-	 * will say the pipeline is dead rather than merely unhealthy.
-	 *
-	 * A busy site failing everything clears this in minutes. A quiet site with a
-	 * single retryable error does not, and should not be shown a red card saying
-	 * every job is failing.
+	 * Failed jobs in 24 hours needed before the jobs card says the pipeline is dead, so one retryable error on a quiet
+	 * site does not show red.
 	 */
 	private const JOBS_ALL_DEAD_MIN = 3;
 
 	/**
-	 * MT provider API hosts for DNS reachability checks. Keyed by the
-	 * provider slug returned by Settings::get_mt_provider().
+	 * Provider API hosts for the DNS check, by Settings::get_mt_provider() slug.
 	 *
 	 * @var array<string, string>
 	 */
@@ -207,8 +139,7 @@ final class SiteHealth {
 	];
 
 	/**
-	 * API-key / secret setting names - anything listed here is redacted
-	 * to "configured / not configured" in the Info dump.
+	 * Secret settings shown in the Info dump as configured or not configured.
 	 *
 	 * @var array<int, string>
 	 */
@@ -229,30 +160,22 @@ final class SiteHealth {
 		add_filter( 'site_status_tests', [ $this, 'register_tests' ] );
 		add_filter( 'debug_information', [ $this, 'register_info' ] );
 
-		// When settings change, our cached counts might no longer match
-		// what the user expects to see in the Info dump - best-effort
-		// invalidation keeps things fresh without adding extra queries
-		// on the hot path.
+		// Settings changes can change the cached counts: drop them.
 		add_action( 'perflocale/settings/updated', [ $this, 'flush_counts_cache' ] );
 
-		// A string edit / PO import / bulk MT run changes the numbers behind the
-		// counts, hreflang and translation-files cards. Bust their short-TTL
-		// caches so a just-completed change shows fresh figures. Fires only on
-		// admin / background string writes, never on a frontend request.
+		// String edits, PO imports and bulk runs change the counts, hreflang and files cards: drop their caches (admin and
+		// background writes only).
 		add_action( 'perflocale/strings/changed', [ $this, 'flush_counts_cache' ] );
 
 		add_action( 'admin_notices', [ $this, 'render_leftover_notice' ] );
 
-		// The Status screen runs the language-pack test through this
-		// admin-ajax action (an asynchronous test, see register_tests()).
+		// The Status screen runs the language-pack test through this admin-ajax action.
 		if ( wp_doing_ajax() ) {
 			add_action( 'wp_ajax_health-check-' . self::LANGUAGE_PACKS_ACTION, [ $this, 'ajax_language_packs' ] );
 		}
 	}
 
-	// -------------------------------------------------------------------------
-	// Status tab - register tests
-	// -------------------------------------------------------------------------
+	// Status tab: test registration.
 
 	/**
 	 * @param array<string, array<string, array<string, mixed>>> $tests
@@ -263,9 +186,7 @@ final class SiteHealth {
 			'perflocale_exports_exposed'   => [
 				'label' => __( 'PerfLocale export files are not web-readable', 'perflocale' ),
 				'test'  => [ $this, 'test_exports_not_public' ],
-				// Writes a canary file and fetches it over HTTP. Fine when an
-				// admin opens the Status tab; not something to do unattended on
-				// every weekly cron run.
+				// Writes a canary file and fetches it over HTTP: fine when an admin opens the tab, not on every weekly cron run.
 				'skip_cron' => true,
 			],
 			'perflocale_tables'            => [
@@ -379,11 +300,8 @@ final class SiteHealth {
 			$tests['direct'][ $id ] = $entry;
 		}
 
-		// Asynchronous: it reads translation file listings and core's update
-		// data, so the Status screen renders without waiting for it. The
-		// screen's script posts to admin-ajax.php with the action
-		// "health-check-" . $test; core's weekly scheduled check calls
-		// async_direct_test instead.
+		// Asynchronous, so the Status screen renders without waiting: the screen posts admin-ajax "health-check-" . $test;
+		// the weekly check calls async_direct_test.
 		$tests['async']['perflocale_language_packs'] = [
 			'label'             => __( 'PerfLocale language packs', 'perflocale' ),
 			'test'              => self::LANGUAGE_PACKS_ACTION,
@@ -395,8 +313,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Admin-ajax endpoint of the language-pack test, with the nonce and
-	 * capability checks of core's own Site Health ajax tests.
+	 * Admin-ajax endpoint of the language-pack test, with core's Site Health ajax nonce and capability checks.
 	 *
 	 * @return void
 	 */
@@ -411,21 +328,10 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Are the WordPress.org language packs of the site's languages installed?
+	 * Are the WordPress.org language packs of the site's active languages (en_US excepted) installed?
 	 *
-	 * Visitors of a language see English text wherever WordPress, the theme
-	 * or a plugin has no translation for its locale, and WordPress installs
-	 * language packs only for the locales it is installed in. Every active
-	 * PerfLocale language of this site is checked by its locale (en_US
-	 * excepted); LanguagePacks::report() says what is read and what each
-	 * state means.
-	 *
-	 * Recommended when a WordPress pack is not installed, when WordPress.org
-	 * has no WordPress translation for a locale (known only while core's
-	 * `available_translations` list is cached), or when a theme or plugin pack
-	 * is waiting on Dashboard > Updates. Theme and plugin packs the last update
-	 * check did not offer, and kinds without update data, are listed without
-	 * changing the status.
+	 * Recommended when a WordPress pack is missing or has no WordPress.org translation, or a theme or plugin pack waits
+	 * on Dashboard > Updates; LanguagePacks::report() says what each state means.
 	 *
 	 * @return array<mixed>
 	 */
@@ -595,9 +501,7 @@ final class SiteHealth {
 		);
 	}
 
-	// -------------------------------------------------------------------------
-	// Status tests
-	// -------------------------------------------------------------------------
+	// Status tests.
 
 	/**
 	 * Are all of the plugin's custom tables present?
@@ -605,17 +509,9 @@ final class SiteHealth {
 	 * @return array<string, mixed>
 	 */
 	public function test_tables_exist(): array {
-		// Schema::tables_exist() is deliberately NOT used here. It is the hot-path
-		// installed-or-not guard: it looks at one table out of nine, and usually
-		// looks at none at all because a sticky autoloaded option short-circuits
-		// it. That is right for a guard consulted on every request and wrong for
-		// a card that claims "translation storage is healthy" - a partial restore,
-		// a half-finished migration or a support step that dropped one table left
-		// the option in place and the card green.
-		//
-		// missing_tables() asks the server about all nine. Site Health runs on a
-		// page load or a weekly cron tick, so nine SHOW TABLES is affordable
-		// exactly where the per-request guard's shortcut is not.
+		// All nine tables, not Schema::tables_exist() (the per-request guard checks one table, usually short-circuited by an
+		// option, which kept this card green after a partial restore). Docs: docs-ai/11-code-rationale.md, "SiteHealth:
+		// tables and rewrite checks".
 		$missing = Schema::missing_tables();
 
 		if ( [] === $missing ) {
@@ -658,7 +554,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Is there a language marked as default?
+	 * Is a language marked as default?
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -696,7 +592,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * In subdirectory URL mode, are language-prefixed rewrite rules present?
+	 * In subdirectory mode, are the language-prefixed rewrite rules present?
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -729,9 +625,7 @@ final class SiteHealth {
 		$rules = get_option( 'rewrite_rules' );
 
 		if ( is_array( $rules ) ) {
-			// RewriteManager writes the filtered query-variable name, so the
-			// needle has to be built the same way or a renamed site reports
-			// "rewrite rules missing" while they are present and correct.
+			// The filtered query variable, as RewriteManager writes it, or a renamed one reports rules missing.
 			$lang_needle = \PerfLocale\Router\UrlConverter::query_var() . '=$matches[1]';
 
 			foreach ( $rules as $rewrite ) {
@@ -745,13 +639,8 @@ final class SiteHealth {
 			}
 		}
 
-		// Plain permalinks: the language prefix is parsed from the raw request
-		// URI (no rewrite rules involved) and object URLs use the ?p= form, so
-		// the plugin works - PROVIDED the web server routes prefixed paths like
-		// /de/ to WordPress. nginx catch-all configs do; Apache without the
-		// standard WordPress .htaccess block returns a server-level 404 before
-		// PHP runs. Pretty permalinks make WordPress maintain that routing
-		// itself, which is why they are the recommended fix either way.
+		// Plain permalinks work only when the server routes prefixed paths (/de/) to WordPress (Apache without the
+		// WordPress .htaccess does not); pretty permalinks are the fix either way.
 		if ( (string) get_option( 'permalink_structure' ) === '' ) {
 			global $is_apache;
 
@@ -786,32 +675,9 @@ final class SiteHealth {
 	}
 
 	/**
-	 * On multisite, do the hostnames that `subdomain` / `domain` URL mode
-	 * generates actually resolve to a site in the network?
-	 *
-	 * This is not a URL-builder check - the builders are correct, and
-	 * tools/regression-tests/mu-url-modes.php asserts that `apply_subdomain()`
-	 * produces `de.sub.example.com` and that `detect_from_subdomain()` reads it
-	 * back. The failure sits upstream of the plugin entirely: on multisite,
-	 * ms-settings.php resolves the requested hostname against the network's
-	 * site list (`get_site_by_path()`) BEFORE a single plugin file is loaded.
-	 * A language hostname with no site row never reaches PHP-land at all - the
-	 * visitor gets core's "site does not exist" screen or a wp-signup.php
-	 * redirect, and no plugin code can intercept that.
-	 *
-	 * Registering those hostnames as network sites - or mapping them with a
-	 * domain-mapping plugin, which hooks the same `pre_get_site_by_path` filter
-	 * this test calls through - is a legitimate configuration. So the test
-	 * RESOLVES each hostname for real instead of pattern-matching the setting:
-	 * a network where the operator did that work reports good.
-	 *
-	 * Cost: zero queries on single sites and in subdirectory / query URL mode -
-	 * both return before the first lookup. Otherwise one WP_Site_Query per
-	 * DISTINCT language hostname, capped at self::MAX_HOST_PROBES, each cached
-	 * in core's `site-queries` group - so the `wp_scheduled_health_check` run
-	 * hits a warm cache. No HTTP request and no DNS lookup: whether the host
-	 * resolves in DNS is the operator's business, not something a health check
-	 * should block on.
+	 * On multisite, do the hostnames of `subdomain` / `domain` mode resolve to a site of the network? ms-settings.php
+	 * resolves the host before any plugin loads, so an unregistered one never reaches PerfLocale. Resolved for real,
+	 * so domain mapping counts. Docs: docs-ai/11-code-rationale.md, "SiteHealth: language hostnames on multisite".
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -860,8 +726,7 @@ final class SiteHealth {
 			$listed[] = '<code>' . esc_html( $target ) . '</code>';
 		}
 
-		// Every hostname was checked: the only case in which "they resolve" is
-		// a statement about all of them.
+		// Every hostname checked: only then is "they resolve" about all of them.
 		if ( $unchecked === 0 ) {
 			return $this->pass(
 				$id,
@@ -883,11 +748,7 @@ final class SiteHealth {
 			);
 		}
 
-		// The probe cap bit. Reporting `good` here would be a card claiming
-		// hostnames "resolve" about hostnames it never looked at - the exact
-		// silent-success shape this test exists to remove. Say what was
-		// actually checked, and take the status down to `recommended`, because
-		// partial knowledge is not a pass.
+		// The probe cap was hit: say what was checked, and recommended, not good: partial knowledge is not a pass.
 		return $this->recommended(
 			$id,
 			sprintf(
@@ -913,7 +774,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Trailing sentence naming the hostnames a run did not get to.
+	 * The sentence naming how many hostnames the run did not check.
 	 *
 	 * @param int $unchecked How many hostnames were left unprobed.
 	 * @return string HTML fragment, or an empty string when nothing was skipped.
@@ -938,21 +799,8 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Resolve every language hostname this URL mode generates against the
-	 * network's site list, and report exactly what was looked at.
-	 *
-	 * Extracted so the Site Health card and the URL-mode warning on the
-	 * Settings screen ask the same question of the same code. The Status tab
-	 * only fires when somebody opens it; an operator who switches to subdomain
-	 * or domain mode breaks their network at SAVE time, so
-	 * {@see \PerfLocale\Admin\Pages\SettingsPage::render()} runs this too.
-	 *
-	 * Cost: zero queries on single sites and in subdirectory / query URL mode -
-	 * both return `applies => false` before the first lookup. Otherwise one
-	 * WP_Site_Query per DISTINCT language hostname, capped at
-	 * self::MAX_HOST_PROBES, each cached in core's `site-queries` group. No
-	 * HTTP request and no DNS lookup: whether the host resolves in DNS is the
-	 * operator's business, not something a health check should block on.
+	 * Resolve every language hostname of this URL mode against the network's sites and report what was looked at;
+	 * shared with the Settings screen's URL-mode warning (the mode breaks a network at save time).
 	 *
 	 * @return array{applies:bool,mode:string,total:int,checked:array<int,string>,unresolved:array<int,string>,label:string,description:string}
 	 *         `applies` false means there is nothing to resolve, and `label` /
@@ -972,8 +820,7 @@ final class SiteHealth {
 			'description' => '',
 		];
 
-		// Single site: WordPress serves whatever hostname reaches it, so no
-		// hostname the plugin generates can fail to resolve for this reason.
+		// Single site: WordPress serves any hostname that reaches it.
 		if ( ! is_multisite() ) {
 			$report['label']       = __( 'Language hostname check does not apply', 'perflocale' );
 			$report['description'] = __( 'This is a single-site install. WordPress serves whichever hostname reaches it, so PerfLocale\'s URL modes never depend on a network site list.', 'perflocale' );
@@ -994,8 +841,7 @@ final class SiteHealth {
 		$mode           = $settings->get_url_mode();
 		$report['mode'] = $mode;
 
-		// Only the two host-rewriting modes can generate a hostname that is
-		// not this site's own. Subdirectory and query mode keep the host.
+		// Only the host-rewriting modes generate other hosts.
 		if ( $mode !== 'subdomain' && $mode !== 'domain' ) {
 			$report['label']       = __( 'URL mode is safe on a multisite network', 'perflocale' );
 			$report['description'] = sprintf(
@@ -1007,19 +853,13 @@ final class SiteHealth {
 			return $report;
 		}
 
-		// Build each hostname the way UrlConverter does. apply_subdomain()
-		// derives its base from home_url() with the converter's own `home_url`
-		// filter suppressed by its re-entrancy guard, which is the stored
-		// `home` option - read that directly so this test cannot be rewritten
-		// by the very mode it is checking.
+		// Built as UrlConverter builds them, from the stored `home` option (apply_subdomain() reads home_url() with its own
+		// filter suppressed), so the mode being checked cannot rewrite the check.
 		$home      = (string) get_option( 'home' );
 		$home_host = wp_parse_url( $home, PHP_URL_HOST );
 		$host      = is_string( $home_host ) ? strtolower( $home_host ) : '';
 
-		// ms-settings.php strips `:80` / `:443` from the request host and
-		// nothing else, so a nonstandard port (staging, local installs) stays
-		// part of the authority WordPress looks up - and UrlConverter leaves
-		// that port on the rewritten URL. The lookup has to carry it too.
+		// ms-settings.php strips only :80 and :443, and UrlConverter keeps other ports: so does the lookup.
 		$home_port   = wp_parse_url( $home, PHP_URL_PORT );
 		$port_suffix = ( is_int( $home_port ) && 80 !== $home_port && 443 !== $home_port ) ? ':' . $home_port : '';
 
@@ -1028,8 +868,7 @@ final class SiteHealth {
 		$default_slug = ( $default !== null && ! empty( $default->slug ) ) ? (string) $default->slug : '';
 
 		/**
-		 * Hostnames to probe, deduplicated - two languages can be configured
-		 * with the same domain, and one probe answers for both.
+		 * Hostnames to probe, deduplicated (two languages can share a domain).
 		 *
 		 * @var array<string, string> Hostname => language slug.
 		 */
@@ -1043,17 +882,14 @@ final class SiteHealth {
 			}
 
 			if ( $mode === 'subdomain' ) {
-				// apply_subdomain() leaves the default language on the base
-				// host, which is by definition this site's own registered one.
+				// apply_subdomain() keeps the default language on the base host, this site's own.
 				if ( $slug === $default_slug || $host === '' ) {
 					continue;
 				}
 
 				$target = strtolower( $slug . '.' . $host . $port_suffix );
 			} else {
-				// apply_domain() has NO default-language exemption: a domain
-				// configured for the default language replaces the base host
-				// too, and is just as unresolvable when it is not registered.
+				// apply_domain() has no default exemption: a default-language domain replaces the base host too.
 				$target = self::normalize_authority( $settings->get_language_domain( $slug ) );
 
 				if ( $target === '' || $target === $host . $port_suffix ) {
@@ -1082,9 +918,7 @@ final class SiteHealth {
 
 		$probes = array_slice( $targets, 0, self::MAX_HOST_PROBES, true );
 
-		// The path half of the lookup: `/` on a subdomain network, `/sub/` on
-		// a subdirectory one. Taken from wp_blogs via get_site() rather than
-		// from a URL, because that is the column ms-settings.php matches on.
+		// The lookup's path (`/` or `/sub/`) from wp_blogs via get_site(), the column ms-settings.php matches.
 		$current_site = get_site();
 		$site_path    = ( $current_site !== null && $current_site->path !== '' ) ? $current_site->path : '/';
 
@@ -1092,9 +926,7 @@ final class SiteHealth {
 			$target              = (string) $target;
 			$report['checked'][] = $target;
 
-			// The exact call ms_load_current_site_and_network() makes, filter
-			// hooks included - so a domain-mapped hostname reports resolvable
-			// here for the same reason it resolves in a real request.
+			// The call ms_load_current_site_and_network() makes, filters included, so a mapped domain resolves here too.
 			if ( empty( get_site_by_path( $target, $site_path ) ) ) {
 				$report['unresolved'][] = $target;
 			}
@@ -1104,14 +936,8 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Reduce a configured per-language domain to the authority WordPress would
-	 * compare against the network's site list.
-	 *
-	 * Operators paste schemes and trailing slashes into that settings field,
-	 * and apply_domain() substitutes the value verbatim into the URL - so the
-	 * hostname a visitor actually requests is whatever survives the browser's
-	 * own parsing. Mirror that: take the host, lowercase it, and keep a
-	 * nonstandard port, because ms-settings.php strips only `:80` and `:443`.
+	 * The authority WordPress compares for a configured language domain (operators paste schemes and slashes, and
+	 * apply_domain() uses the value verbatim): the host, normalised, plus a nonstandard port.
 	 *
 	 * @param string $domain Configured domain, possibly with scheme or path.
 	 * @return string Authority (host, optionally `host:port`), or '' when the
@@ -1124,8 +950,7 @@ final class SiteHealth {
 			return '';
 		}
 
-		// wp_parse_url() reads a bare `example.fr` as a PATH, so give it a
-		// protocol-relative prefix before asking for the host.
+		// wp_parse_url() reads a bare `example.fr` as a path: add a protocol-relative prefix.
 		if ( ! str_contains( $domain, '//' ) ) {
 			$domain = '//' . $domain;
 		}
@@ -1136,13 +961,7 @@ final class SiteHealth {
 			return '';
 		}
 
-		// Ask the router's own normaliser, not a lookalike. It lowercases AND
-		// punycode-encodes; this method only lowercased, so a language domain
-		// typed as `bücher.example` was compared verbatim against the network's
-		// site list while the router compared `xn--bcher-kva.example`. The card
-		// and the code it reports on were answering different questions, in both
-		// directions: healthy for a host the router will never match, or blamed
-		// for one it matches fine.
+		// The router's own normaliser (lowercase and punycode), so card and router compare the same host.
 		$authority = \PerfLocale\Router\LanguageRouter::normalize_host( (string) $parsed['host'] );
 
 		if ( '' === $authority ) {
@@ -1226,8 +1045,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Notice for leftover WPML add-ons, on PerfLocale's screens and the
-	 * Plugins screen, for users who can activate plugins.
+	 * Notice for leftover WPML add-ons on PerfLocale's screens and the Plugins screen, for users who can activate plugins.
 	 *
 	 * @return void
 	 */
@@ -1281,7 +1099,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Surface quarantined addons.
+	 * Report add-ons that are not running: quarantined, incompatible, or needing a newer PerfLocale.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -1298,11 +1116,8 @@ final class SiteHealth {
 
 		$ids = $registry->get_quarantined_ids();
 
-		// Quarantine is only ONE way an integration ends up not running. An addon
-		// that reported itself incompatible, or that needs a newer PerfLocale
-		// than the one installed, is skipped just as silently - and this card used
-		// to answer "all active integrations are booting without errors" in both
-		// cases, because it only ever counted quarantined ones.
+		// Quarantine is one way an integration stops; an incompatible add-on or one needing a newer PerfLocale is skipped
+		// as silently, and is reported too.
 		$incompatible = method_exists( $registry, 'get_incompatible_ids' )
 			? array_keys( $registry->get_incompatible_ids() )
 			: [];
@@ -1360,9 +1175,7 @@ final class SiteHealth {
 			$items .= '<li><code>' . esc_html( $labels[ $id ] ?? $id ) . '</code></li>';
 		}
 
-		// Read the same filter the registry reads rather than hardcoding "three".
-		// A site that raised the threshold saw copy telling it three failures had
-		// happened when the real number was whatever it had configured.
+		// The registry's own filter, so the copy names the configured threshold.
 		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Plugin-prefixed hook; see AddonRegistry.
 		$threshold = max( 1, (int) apply_filters( 'perflocale/addons/quarantine_threshold', 3 ) );
 
@@ -1439,11 +1252,7 @@ final class SiteHealth {
 			number_format_i18n( $percent * 100, 1 ) . '%'
 		);
 
-		// Red only once requests are ACTUALLY being refused. The cap is a number
-		// the operator chose, and enforcement blocks at 100% - so 95% of it was
-		// reporting critical while nothing had failed, on the same panel where a
-		// completely dead MT pipeline used to report merely `recommended`. That
-		// inversion is what teaches people to ignore red.
+		// Critical only once requests are refused (at 100%); 95% of a limit the operator chose is no failure.
 		if ( $percent >= 1.0 ) {
 			return $this->critical(
 				'perflocale_mt_usage',
@@ -1456,9 +1265,7 @@ final class SiteHealth {
 			return $this->recommended(
 				'perflocale_mt_usage',
 				__( 'Machine-translation usage is near the monthly limit', 'perflocale' ),
-				// Honest about WHEN it bites: enforcement blocks at 100%, not at the
-				// 95% that turns this card amber. Saying requests "will fail" at 95%
-				// is a claim the code does not make for another 5% of headroom.
+				// Says when it bites: requests stop at 100%, not at the 95% that turns the card amber.
 				$formatted . '<br>' . esc_html__( 'Translation requests are still being sent. They stop once the limit is reached - raise it in Settings → Addons → Machine Translation, or wait for the monthly reset.', 'perflocale' )
 			);
 		}
@@ -1479,29 +1286,14 @@ final class SiteHealth {
 	}
 
 	/**
-
-	/**
-	 * Aggregate circuit-breaker status across all wired callsites: MT providers
-	 * ({@see \PerfLocale\MachineTranslation\AbstractProvider}), webhook
-	 * delivery ({@see \PerfLocale\Api\WebhookController}), WooCommerce FX sync
-	 * and geo-IP providers. Those four are the whole list - nothing else in the
-	 * plugin opens a breaker.
-	 *
-	 * Three states surfaced as Site Health categories:
-	 *   - All CLOSED → green pass card with the count of registered breakers.
-	 *   - Any HALF_OPEN (probing) → recommended (yellow) so the operator
-	 *     knows recovery is in progress but not yet confirmed.
-	 *   - Any OPEN → critical (red) with cooldown countdowns + a manual
-	 *     reset URL per open breaker.
-	 *
-	 * Manual reset is gated by capability + nonce (see
-	 * {@see handle_reset_breaker_action} in AdminController).
+	 * Circuit breaker status of every breaker (MT providers, webhook delivery, WooCommerce FX sync, geo-IP): all closed
+	 * is good, any half-open recommended, any open critical with its cooldown and a reset link (capability and nonce,
+	 * AdminController::handle_reset_breaker_action()).
 	 *
 	 * @return array<string, mixed>
 	 */
 	public function test_circuit_breakers(): array {
-		// Class may not yet be autoloaded on tiny pre-init Site Health
-		// probes - defensive guard so the test is a clean no-op.
+		// Not autoloaded yet on a very early probe: no-op.
 		if ( ! class_exists( '\\PerfLocale\\Concurrency\\Breaker' ) ) {
 			return $this->pass(
 				'perflocale_circuit_breakers',
@@ -1628,10 +1420,8 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Build a nonce-protected admin-post URL the operator can hit to
-	 * force-close one breaker. Returns empty string when the current
-	 * user lacks the manage cap so the link doesn't render at all
-	 * (defence-in-depth - the handler also checks).
+	 * A nonce'd admin-post URL that force-closes one breaker; '' for a user without the capability (the handler checks
+	 * too).
 	 *
 	 * @param string $key Breaker key.
 	 * @return string
@@ -1659,11 +1449,7 @@ final class SiteHealth {
 	 * @return array<string, mixed>
 	 */
 	public function test_fx_stale(): array {
-		// Ask about WooCommerce, not about PerfLocale's own class. The guard used
-		// to be class_exists( ExchangeRateSync::class ), which is one of THIS
-		// plugin's classes and is therefore always autoloadable - so the branch
-		// never ran, and a site with no WooCommerce at all was told its exchange
-		// rates were stale.
+		// WooCommerce itself, not PerfLocale's always-autoloadable class, or a site without WooCommerce hears of stale rates.
 		if ( ! class_exists( 'WooCommerce' ) || ! class_exists( '\\PerfLocale\\WooCommerce\\ExchangeRateSync' ) ) {
 			return $this->pass(
 				'perflocale_fx_staleness',
@@ -1723,18 +1509,10 @@ final class SiteHealth {
 			)
 			: __( 'never', 'perflocale' );
 
-		// A stale state with no rate source wired is a different problem with a
-		// different remedy: every sync path aborts before the network call, so
-		// pointing the operator at WP-Cron would be a dead end.
+		// No rate source: every sync aborts before the network, a different remedy than WP-Cron.
 		if ( ! $sync->has_rate_source() ) {
-			// Severity depends on whether money is actually affected. With
-			// auto-sync on, no rate source and at least one language priced in a
-			// NON-base currency, MultiCurrency has no rate to apply and the
-			// foreign price is charged at the base-currency number - a store
-			// selling in EUR from a USD base takes 20 EUR for a 20 USD product.
-			// That is a money defect and belongs in red. With every language on
-			// the base currency (or none configured) nothing is mispriced and
-			// orange is right: it used to be orange in both cases.
+			// Red only when money is affected: a non-base currency charged at the base number. Docs:
+			// docs-ai/11-code-rationale.md, "SiteHealth: exchange-rate severity".
 			$base       = (string) get_option( 'woocommerce_currency', '' );
 			$currencies = (array) $settings->get( 'wc_currencies', [] );
 			$foreign    = [];
@@ -1747,21 +1525,8 @@ final class SiteHealth {
 				$code = (string) ( $data['currency_code'] ?? '' );
 				$rate = (float) ( $data['exchange_rate'] ?? 1.0 );
 
-				// Three conditions, and all three are required before this is a
-				// money defect:
-				//   - the currency differs from the store base (same currency is
-				//     1:1 by definition);
-				//   - no manual rate is pinned (that is the operator pricing it
-				//     deliberately, and auto-sync would not touch it anyway);
-				//   - the STORED rate is still 1.0 (or nonsense).
-				//
-				// That last one was missing, and without it this branch reported
-				// critical on a store that is priced correctly: with no rate
-				// source, MultiCurrency falls back to the stored exchange_rate
-				// (src/WooCommerce/MultiCurrency.php), so a language sitting at a
-				// hand-entered 1.18 converts fine - its rate may be going stale,
-				// which is what the staleness card below is for, but nothing is
-				// being charged at the wrong number.
+				// A money defect needs all three: a non-base currency, no pinned manual rate, and a stored rate still 1.0 (a
+				// hand-entered rate converts through MultiCurrency's stored-rate fallback).
 				if (
 					'' !== $code
 					&& '' !== $base
@@ -1821,22 +1586,9 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Warn when database string mode holds so many per-language rows that
-	 * the whole-map blob (all_string_translations_{lang}) becomes a
-	 * per-request memory/CPU cost.
-	 *
-	 * Database mode loads a language's ENTIRE string-translation map as one
-	 * serialized blob: StringTranslation::activate() preloads it eagerly once
-	 * language detection completes on a request whose detected language is
-	 * not the default (default-language requests skip the preload and the
-	 * gettext filters), the gettext path reloads it lazily if the memo was
-	 * reset (switch_blog), and each fallback in the current language's
-	 * chain adds one more map. At an estimated ~200 bytes/entry serialized
-	 * that is 4-10 MB at 20k-50k rows, and the unserialized in-request
-	 * footprint is several times larger. Files mode avoids this - it serves
-	 * opcache-compiled, per-domain .l10n.php files. We RECOMMEND switching
-	 * (never auto-switch: files mode needs a writable uploads dir, and DB
-	 * mode is a legitimate choice on read-only filesystems).
+	 * Recommend files mode when database mode's per-language whole-map blob (all_string_translations_{lang}) gets large
+	 * enough to cost every request memory and CPU; never switched automatically. Docs: docs-ai/11-code-rationale.md,
+	 * "SiteHealth: string mode and translation files".
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -1859,27 +1611,21 @@ final class SiteHealth {
 		}
 
 		/**
-		 * Rows-per-language at which the DB-mode whole-map blob is worth a
-		 * warning. Default 20,000 (~4-6 MB serialized). Filterable for
-		 * sites with unusual row sizes.
+		 * Filter the rows per language at which the database-mode blob warning shows (default 20,000, about 4-6 MB).
 		 *
 		 * @hook perflocale/site_health/string_blob_threshold
 		 * @param int $threshold Rows per language.
 		 */
 		$threshold = (int) apply_filters( 'perflocale/site_health/string_blob_threshold', 20000 );
 
-		// The heaviest single language decides the verdict. That query
-		// (GROUP BY on an unindexed LONGTEXT predicate) full-scans the very
-		// large table this check targets, and Site Health runs direct tests
-		// synchronously on every status render - so cache it for an hour.
+		// The heaviest language decides; its GROUP BY scans the table on every synchronous Status render: cached an hour.
 		$max_rows = get_transient( 'perflocale_string_blob_max' );
 
 		if ( false === $max_rows ) {
 			global $wpdb;
 			$st_table = \PerfLocale\Database\Schema::table( 'string_translations' );
 
-			// $st_table is Schema::table() (class-owned identifier), no user
-			// input, no values to bind.
+			// $st_table is Schema::table(): no input, nothing to bind.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			$max_rows = (int) $wpdb->get_var(
 				$wpdb->prepare(
@@ -1927,20 +1673,9 @@ final class SiteHealth {
 	}
 
 	/**
-	 * When string translation mode is "files", verify the compiled
-	 * `.l10n.php` files exist and are not stale relative to the newest
-	 * translation row.
-	 *
-	 * The check has four outcomes:
-	 *  - **DB mode**: no files needed, always pass.
-	 *  - **Files mode, no string translations in DB**: nothing to compile,
-	 *    pass with an explanatory note (this fixes the historical false-
-	 *    positive where a fresh install always saw "regenerate" forever).
-	 *  - **Files mode, an active non-default language has translations the
-	 *    generator compiles but no file for its locale**: recommended; name
-	 *    the languages and expose the regenerate link.
-	 *  - **Files mode, files exist but the newest translation is newer
-	 *    than the oldest file**: recommended (stale); expose the link.
+	 * Files mode: are the `.l10n.php` files there and current? Database mode, or files mode with nothing to compile,
+	 * passes; a compiled language without a file, or one whose newest translation is newer than its newest file, is
+	 * recommended with the regenerate link.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -1965,24 +1700,15 @@ final class SiteHealth {
 			);
 		}
 
-		// Resolve the canonical directory from the generator itself so this
-		// test can't drift from the generator's actual output.
+		// The directory from the generator itself, so this test cannot drift from its output.
 		$generator = new \PerfLocale\Strings\TranslationFileGenerator( $plugin->get( 'cache' ) );
 		$files_dir = $generator->get_translations_dir();
 
 		$files      = is_dir( $files_dir ) ? glob( $files_dir . '/*.l10n.php' ) : [];
 		$file_count = is_array( $files ) ? count( $files ) : 0;
 
-		// "Translations exist" here MUST match what the generator can actually
-		// write, so it mirrors the generator's JOIN walk:
-		// strings → translation_groups (type='string') → translation_links
-		// → string_translations (via string_id + language_id)
-		// Counting string_translations rows alone would include orphans the
-		// generator skips, leaving the "regenerate → 0 files" notice stuck.
-		//
-		// Two 4-table JOINs plus a full COUNT(*) is heavy on large sites, so
-		// cache the results on a short TTL (busted on settings-updated and
-		// strings-changed) instead of re-running them on every Status load.
+		// "Translations exist" as the generator's JOIN walk sees them, or orphans it skips would keep "regenerate" stuck;
+		// heavy, so cached briefly (dropped on settings and string changes).
 		$cached = get_transient( self::FILES_TRANSIENT );
 
 		if ( is_array( $cached ) && isset( $cached['compilable'], $cached['total_st'], $cached['newest_by_language'], $cached['per_language'] ) && is_array( $cached['per_language'] ) && is_array( $cached['newest_by_language'] ) ) {
@@ -1999,18 +1725,8 @@ final class SiteHealth {
 
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-			// Compilable: at least one fully-joinable row the generator would
-			// emit. Note we DO require st.translation <> '' because the
-			// generator skips empty values. Grouped per language and by
-			// whether the domain is internal (a leading "_"), which the
-			// generator never writes a file for: the total counts every row
-			// (the orphan diagnostic compares it with all of
-			// string_translations), the per-language counts only the rows
-			// that produce a file. The same walk gives each language's newest
-			// translation for the staleness check, as a Unix time:
-			// UNIX_TIMESTAMP() reads the column in the database session's
-			// time zone, the clock every writer of the column uses
-			// (DEFAULT / ON UPDATE CURRENT_TIMESTAMP).
+			// Compilable rows (non-empty values), per language and by internal domain (no file for those), plus each language's
+			// newest translation as UNIX_TIMESTAMP() in the session time zone every writer uses.
 			$compiled_rows = $wpdb->get_results(
 				$wpdb->prepare(
 					"SELECT l.language_id AS lid, LEFT( s.domain, 1 ) = '_' AS is_internal, COUNT(*) AS cnt, UNIX_TIMESTAMP( MAX( st.updated_at ) ) AS newest FROM %i s
@@ -2043,10 +1759,7 @@ final class SiteHealth {
 				}
 			}
 
-			// Total rows in `string_translations`. The difference between this
-			// and `compilable_translations` is the orphan count - surfaced as a
-			// separate diagnostic so users know something needs cleanup instead
-			// of staring at a button that does nothing.
+			// The table total; its difference to the compilable count is the orphan count, reported apart.
 			$total_st_rows = (int) $wpdb->get_var(
 				$wpdb->prepare(
 					'SELECT COUNT(*) FROM %i',
@@ -2077,11 +1790,7 @@ final class SiteHealth {
 			esc_html__( 'Go to Performance settings', 'perflocale' )
 		);
 
-		// Case 1: no compilable translations and no files. If there are
-		// orphan rows, tell the user - plain English, one number, one
-		// button. The "Regenerate translation files" action self-heals
-		// orphans before generating, so a single click fixes both the
-		// stranded data AND the missing files.
+		// Case 1: nothing compilable and no files; orphans are named, and Regenerate repairs them and writes the files.
 		if ( ! $translations_exist && $file_count === 0 ) {
 			if ( $orphan_count > 0 ) {
 				return $this->recommended(
@@ -2109,17 +1818,8 @@ final class SiteHealth {
 			);
 		}
 
-		// Case 2: an active non-default language has translations the
-		// generator compiles, but no file on disk carries its locale. The
-		// default language is never compiled (it serves source strings), so
-		// it is not checked.
-		//
-		// The same walk collects, per language, its newest compiled file:
-		// a generation run compiles every file of the languages it covers
-		// and rewrites only the files whose content changed, so a language
-		// is current when its newest file is not older than its newest
-		// translation. Comparing across languages, or with a language's
-		// oldest file, reported a language whose file was current as stale.
+		// Case 2: a non-default language with compiled translations has no file. Also each language's newest file: a run
+		// rewrites only changed files, so current means its newest file is not older than its newest translation.
 		$missing = [];
 		$stale   = [];
 
@@ -2149,7 +1849,7 @@ final class SiteHealth {
 				$newest_row = $newest_by_language[ $language_id ] ?? 0;
 				$newest_row = is_numeric( $newest_row ) ? (int) $newest_row : 0;
 
-				// A short grace window for the files written in the same request as the row.
+				// Grace for files written in the same request as the row.
 				if ( $newest_row > 0 && ( $newest_row - $newest_file ) > 60 ) {
 					$stale[] = [ $name, $locale, $newest_row, $newest_file ];
 				}
@@ -2173,8 +1873,7 @@ final class SiteHealth {
 			);
 		}
 
-		// Case 3: a language's newest translation is newer than that
-		// language's newest compiled file.
+		// Case 3: a language's newest translation is newer than its newest file.
 		if ( $stale !== [] ) {
 			$format = get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T';
 			$lines  = [];
@@ -2219,19 +1918,14 @@ final class SiteHealth {
 	}
 
 	/**
-	 * The stored `perflocale_db_version` option must match the
-	 * `PERFLOCALE_DB_VERSION` constant shipped with this release. A
-	 * mismatch means activation didn't finish or a migration is pending.
+	 * Does the stored `perflocale_db_version` match PERFLOCALE_DB_VERSION? A mismatch means activation did not finish
+	 * or a migration is pending.
 	 *
 	 * @return array<string, mixed>
 	 */
 	public function test_db_version(): array {
-		// Scope note: this card checks the stamped SCHEMA VERSION only - whether
-		// the database has been migrated as far as the running code expects. It
-		// deliberately does not inspect table structure; the tables themselves are
-		// covered by test_tables_exist(), which asks the server about all nine.
-		// The two together are the pair that matters: a version stamped ahead of
-		// the tables is exactly the "activation half-ran" case.
+		// The schema version only; test_tables_exist() checks the tables. A version stamped ahead of the tables is the
+		// half-run activation case.
 		$expected = defined( 'PERFLOCALE_DB_VERSION' ) ? (int) PERFLOCALE_DB_VERSION : 0;
 		$stored   = (int) get_option( 'perflocale_db_version', 0 );
 
@@ -2289,27 +1983,18 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Report which optional PHP extensions are absent, and name the single
-	 * feature each one costs.
-	 *
-	 * Never critical. Every code path behind these extensions now checks for
-	 * them and raises a readable exception, so a missing one narrows what the
-	 * plugin can do without breaking what it already does.
+	 * Report the optional PHP extensions that are missing and the one feature each costs; never critical.
 	 *
 	 * @return array<string, mixed>
 	 */
 	public function test_php_extensions(): array {
-		// Kept next to the constant rather than inside it so the feature names
-		// stay translatable - __() cannot run in a class constant.
+		// Next to the constant, not in it: __() cannot run in a class constant.
 		$features = [
 			'dom'       => __( 'XLIFF import', 'perflocale' ),
 			'libxml'    => __( 'XLIFF import', 'perflocale' ),
 			'xmlwriter' => __( 'XLIFF export', 'perflocale' ),
 			'simplexml' => __( 'XML sitemaps (WordPress core needs this one too)', 'perflocale' ),
-			// NOT "machine translation and webhooks": those address checks use
-			// native IP predicates and do not call filter_var() at all.
-			// The single remaining use is Helper::is_valid_url(), which already has a
-			// hand-rolled fallback, so the honest description is the narrow one.
+			// Only Helper::is_valid_url() uses filter_var(), with a fallback: the narrow description is the true one.
 			'filter'    => __( 'stricter URL syntax validation when adding a webhook (a simpler built-in check is used without it)', 'perflocale' ),
 			'intl'      => __( 'locale-aware number and currency formatting (WordPress formatting is used instead without it)', 'perflocale' ),
 		];
@@ -2344,10 +2029,7 @@ final class SiteHealth {
 			);
 		}
 
-		// The php-xml hint is only true of the four XML extensions. It used to be
-		// printed unconditionally, so an owner whose ONLY gap was intl installed
-		// php-xml, saw the identical yellow card, and had nothing else to try.
-		// Name the package that actually ships what is missing.
+		// The php-xml hint only for the four XML extensions: name the package that ships what is missing.
 		$xml_family = array_intersect( $missing, [ 'dom', 'libxml', 'xmlwriter', 'simplexml' ] );
 		$others     = array_diff( $missing, [ 'dom', 'libxml', 'xmlwriter', 'simplexml' ] );
 
@@ -2380,9 +2062,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * When any booted addon implements HasSchema and its stored_version
-	 * is behind its declared schema version, a migration is queued but
-	 * has not yet been applied - surface that loudly.
+	 * Report booted add-ons with HasSchema whose stored version is behind their declared one (a migration not applied).
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2462,10 +2142,8 @@ final class SiteHealth {
 	}
 
 	/**
-	 * DNS-level reachability check for the active MT provider's API host.
-	 * Only flags configuration problems where the host can't be resolved
-	 * at all (egress firewall, DNS misconfig); actual auth/rate-limit
-	 * errors surface in the MT request path instead.
+	 * Can the active provider's API host be resolved (egress firewall, DNS)? Auth and rate errors show on the request
+	 * path instead.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2492,21 +2170,14 @@ final class SiteHealth {
 
 		$provider = (string) $settings->get_mt_provider();
 
-		// Credentials before connectivity. A resolvable host proves nothing when
-		// the provider has no key: the request is never made - TranslationService
-		// throws at get_provider() first. Nothing used to check this, so a site
-		// with MT switched on and the key never saved (or revoked) showed a green
-		// reachability card, a green usage card and a green jobs card while every
-		// translation threw. is_active_provider_ready() is the predicate the
-		// editor already uses to decide whether to offer the Translate buttons;
-		// Site Health simply never asked it.
+		// Credentials first: without a key no request is made, so a resolvable host proves nothing. The editor's own
+		// is_active_provider_ready() decides.
 		if ( $plugin->has( 'cache' ) ) {
 			try {
 				$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $plugin->get( 'cache' ) );
 
 				if ( ! $mt_service->is_active_provider_ready() ) {
-					// The WordPress AI Client has no credential of its own: it
-					// needs a connected AI provider, set under Settings → Connectors.
+					// The AI Client has no credential: it needs a connected provider under Settings > Connectors.
 					if ( 'wp_ai_client' === $provider ) {
 						$connect = esc_html__( 'Connect an AI provider under Settings → Connectors.', 'perflocale' );
 
@@ -2540,9 +2211,7 @@ final class SiteHealth {
 					);
 				}
 			} catch ( \Throwable $e ) {
-				// Could not build the service. Not evidence of a fault in either
-				// direction, so fall through to the connectivity check rather
-				// than inventing a verdict.
+				// The service could not be built: no verdict either way, go on to connectivity.
 				unset( $e );
 			}
 		}
@@ -2561,15 +2230,7 @@ final class SiteHealth {
 			);
 		}
 
-		// Cache the lookup. gethostbyname() is blocking and has no timeout of its
-		// own - it obeys the resolver's, which on a container with no working DNS
-		// is seconds - and this ran on EVERY load of the Status tab, measured at
-		// ~21ms warm and multiple seconds cold. The answer does not change often
-		// enough to justify paying that repeatedly.
-		//
-		// Both outcomes are cached, and that is deliberate: the failing case is
-		// the expensive one, so caching only successes would leave the slow path
-		// slow. The TTL is short enough that a fixed firewall shows up quickly.
+		// Cached, both outcomes: gethostbyname() blocks without a timeout of its own, and the failing case is the slow one.
 		$dns_key  = 'perflocale_sh_mt_dns_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host );
 		$resolved = get_transient( $dns_key );
 
@@ -2605,8 +2266,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * When string translation mode is "files", the upload target must be
-	 * writable or regeneration silently skips the site.
+	 * Files mode: is the upload target writable? Otherwise regeneration skips the site.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2645,11 +2305,7 @@ final class SiteHealth {
 			);
 		}
 
-		// The generator writes .l10n.php bundles into
-		// uploads/perflocale/translations/ (Helper::uploads_translations_dir) -
-		// NOT 'perflocale-languages/', which is only an admin-page slug and no
-		// filesystem code ever touches. Probing the real dir (or its writable
-		// parent when it doesn't exist yet) is what actually gates files mode.
+		// The generator's real directory, uploads/perflocale/translations/ (or its writable parent while missing).
 		$files_dir = trailingslashit( \PerfLocale\Helper::uploads_translations_dir() );
 		$check_dir = is_dir( $files_dir ) ? $files_dir : $upload_dir['basedir'];
 
@@ -2677,14 +2333,8 @@ final class SiteHealth {
 	}
 
 	/**
-	 * When the operator has enabled the object cache layer but no
-	 * external backend (Redis, Memcached, etc.) is present, WordPress'
-	 * default object cache is per-request only - every page view still
-	 * hits the database.
-	 *
-	 * The mirror image is worse and used to report green: with a backend
-	 * present and the setting switched OFF, L2 and L3 are both out (see
-	 * the branch below), leaving no persistent caching at all.
+	 * The object cache setting against the backend: on without a backend is per-request only; a backend with the
+	 * setting off leaves no persistent caching at all (L2 and L3 both out).
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2702,16 +2352,8 @@ final class SiteHealth {
 		$enabled = (bool) $plugin->get( 'settings' )->get( 'cache_object_enabled', true );
 
 		if ( ! $enabled ) {
-			// Unchecking the setting does not merely skip L2. CacheManager
-			// writes its L3 transient fallback to wp_options only while
-			// wp_using_ext_object_cache() is false - with a drop-in present
-			// transients live in the object cache's shared `transient`
-			// group, which no PerfLocale group flush can reach, so the L3
-			// write is skipped by design. Setting off + drop-in present
-			// therefore leaves the site with NO persistent caching at all:
-			// every language, translation and slug lookup is recomputed on
-			// every request. That is a real, invisible performance cliff, so
-			// say so rather than reporting green.
+			// With a drop-in, CacheManager writes no L3 transient fallback (transients live in the backend's shared group):
+			// setting off plus a backend means no persistent caching at all. Reported, not green.
 			if ( wp_using_ext_object_cache() ) {
 				return $this->recommended(
 					'perflocale_object_cache',
@@ -2743,23 +2385,14 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Background-jobs health: surface conditions that would prevent
-	 * dispatched jobs from running. Specifically:
-	 *
-	 *   - Daily GC cron is scheduled (otherwise stuck jobs never recover,
-	 *     stale lock rows accumulate, completed jobs never get pruned).
-	 *   - With WP-Cron forced or AS unavailable AND DISABLE_WP_CRON is on,
-	 *     warn that an external cron is needed to drain the queue.
-	 *   - Queue isn't paused (informational - not a real problem, just
-	 *     surfaces an operator-set state so it shows up in support
-	 *     pastes when someone asks "why aren't my jobs running").
+	 * Background jobs health: the daily GC event scheduled, an external cron when WP-Cron runs with DISABLE_WP_CRON,
+	 * failing jobs, web refusals, and a paused queue (shown for support).
+	 * Docs: docs-ai/11-code-rationale.md, "SiteHealth: failing jobs and untyped filter arguments".
 	 *
 	 * @return array<string, mixed>
 	 */
 	public function test_bg_jobs_health(): array {
-		// Engine-agnostic, any-args probe: the GC event lives in Action
-		// Scheduler (with a blog-id arg) when AS is available, so a bare
-		// wp_next_scheduled() false-alarms on every AS site.
+		// Any engine, any args: on Action Scheduler the GC event carries a blog-id arg, so wp_next_scheduled() would false-alarm.
 		$gc_scheduled = \PerfLocale\Background\BackgroundEvents::is_scheduled( 'perflocale_jobs_gc' );
 		$engine       = \PerfLocale\Background\JobRunnerFactory::pick()->get_engine_name();
 		$cron_off     = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
@@ -2767,18 +2400,8 @@ final class SiteHealth {
 		$paused       = $plugin->has( 'settings' )
 			&& (bool) $plugin->get( 'settings' )->get( 'background_paused', false );
 
-		// Jobs that RAN and FAILED. Nothing counted these, and the neighbouring
-		// "stuck translations" card needs a job to sit untouched for seven days
-		// before it says anything - so a pipeline that was failing every single
-		// job (a revoked machine-translation key is the common one) reported green
-		// on every card for a week. A revoked key is invisible to the credential
-		// check too, because the key is still present; the only honest signal is
-		// that the work keeps failing.
-		//
-		// The breaker cannot be that signal either: its state transient expires
-		// after cooldown + window (10 minutes by default), so on a quiet site it
-		// forgets it was ever open and the circuit-breaker card returns to
-		// "operating normally" while nothing has been fixed.
+		// Jobs that ran and failed: the only signal of a pipeline failing everything (a revoked key passes the credential
+		// check, and the breaker forgets after its window).
 		global $wpdb;
 
 		$jobs_table = \PerfLocale\Database\Schema::table( 'jobs' );
@@ -2805,23 +2428,10 @@ final class SiteHealth {
 				)
 			);
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- See above.
-			$last_error = (string) $wpdb->get_var(
-				$wpdb->prepare(
-					'SELECT error FROM %i WHERE status = %s AND updated_at >= %s ORDER BY updated_at DESC LIMIT 1',
-					$jobs_table,
-					'failed',
-					$since
-				)
-			);
+			$last_error = self::last_job_error( $jobs_table, $since );
+			$killed     = self::killed_job_errors( $jobs_table, $since );
 
-			// Everything failing is a different problem from some things failing -
-			// but "everything" needs a sample worth the word. On a quiet site a
-			// single failed job and no completed ones satisfied `0 === $recent_ok`
-			// and produced a red "Every background job is failing", which is a
-			// frightening way to describe one retryable error. Require a handful
-			// before claiming the pipeline is dead; below that it is still
-			// reported, just as an amber "some jobs are failing".
+			// "Everything failing" needs a sample (JOBS_ALL_DEAD_MIN); fewer failures are amber "some jobs are failing".
 			$total    = $recent_failed + $recent_ok;
 			$all_dead = 0 === $recent_ok && $recent_failed >= self::JOBS_ALL_DEAD_MIN;
 
@@ -2847,6 +2457,10 @@ final class SiteHealth {
 					: ''
 			);
 
+			foreach ( $killed as $killed_error ) {
+				$body .= '<p>' . esc_html( $killed_error ) . '</p>';
+			}
+
 			if ( $all_dead ) {
 				return $this->critical(
 					'perflocale_bg_jobs_health',
@@ -2862,7 +2476,25 @@ final class SiteHealth {
 			);
 		}
 
-		// Hardest case first: GC cron missing.
+		// Work refused on a web request in the last week because one request cannot finish it (WebLimit).
+		$web_refused = [];
+
+		foreach ( (array) get_option( 'perflocale_web_limit_refused', [] ) as $refusal ) {
+			if ( is_array( $refusal ) && is_string( $refusal[0] ?? null ) && is_int( $refusal[1] ?? null ) && $refusal[1] > time() - WEEK_IN_SECONDS ) {
+				$web_refused[] = $refusal[0];
+			}
+		}
+
+		if ( [] !== $web_refused ) {
+			return $this->recommended(
+				'perflocale_bg_jobs_health',
+				__( 'Some tasks are too large for one web request on this site', 'perflocale' ),
+				'<p>' . esc_html__( 'They were refused because they need longer than this site lets one web request run. Run them with WP-CLI:', 'perflocale' ) . '</p><ul><li><code>'
+					. implode( '</code></li><li><code>', array_map( 'esc_html', $web_refused ) ) . '</code></li></ul>'
+			);
+		}
+
+		// GC event missing first.
 		if ( ! $gc_scheduled ) {
 			return $this->recommended(
 				'perflocale_bg_jobs_health',
@@ -2871,17 +2503,12 @@ final class SiteHealth {
 			);
 		}
 
-		// Worst-cron case: WP-Cron engine + DISABLE_WP_CRON + no external trigger.
+		// WP-Cron engine with DISABLE_WP_CRON and no external trigger.
 		if ( $engine === 'wp_cron' && $cron_off ) {
 			return $this->recommended(
 				'perflocale_bg_jobs_health',
 				__( 'WP-Cron is disabled and jobs are queued in WP-Cron', 'perflocale' ),
-				// Name the real reason the engine is wp_cron. When the operator has
-				// set the background engine to "Force WP-Cron", Action Scheduler is
-				// deliberately bypassed even when it IS installed - so the old
-				// advice to "install WooCommerce or the Action Scheduler plugin"
-				// sent them to install something they already had, and would have
-				// changed nothing.
+				// Name the real reason: "Force WP-Cron" bypasses an installed Action Scheduler, so "install it" would change nothing.
 				( 'force_wp_cron' === (string) $plugin->get( 'settings' )->get( 'background_engine', '' ) )
 					? __( 'Background jobs are queued in WP-Cron because the background engine is set to "Force WP-Cron", and DISABLE_WP_CRON is also set - so nothing will run them. Either point a system cron at wp-cron.php every minute, or change the background engine back to automatic in Settings → Performance so Action Scheduler can be used when it is available.', 'perflocale' )
 					: __( 'Background jobs are enqueued in WP-Cron but DISABLE_WP_CRON is set. Configure an external system cron to hit wp-cron.php every minute, install WooCommerce or the Action Scheduler plugin, or jobs will sit in the queue indefinitely.', 'perflocale' )
@@ -2908,9 +2535,86 @@ final class SiteHealth {
 	}
 
 	/**
-	 * When hreflang output is enabled, sanity-check the public homepage
-	 * emits at least one `<link rel="alternate" hreflang>` per active
-	 * language. Cached for 5 minutes alongside the counts transient.
+	 * Errors of the jobs failed since $since because their worker was killed 3 times at one item (each names it),
+	 * of the jobs the current user may open (JobAccess).
+	 *
+	 * @param string $jobs_table Jobs table.
+	 * @param string $since      UTC MySQL time.
+	 * @return array<int, string>
+	 */
+	private static function killed_job_errors( string $jobs_table, string $since ): array {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return [];
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Site Health runs on a page view or a weekly cron tick; `status` is indexed.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT type, created_by, args, error FROM %i WHERE status = %s AND updated_at >= %s AND log LIKE %s ORDER BY updated_at DESC LIMIT 3',
+				$jobs_table,
+				'failed',
+				$since,
+				'%' . $wpdb->esc_like( '"k":"worker_killed"' ) . '%'
+			),
+			ARRAY_A
+		);
+
+		return array_values( array_filter( array_map( [ self::class, 'job_error_for_viewer' ], (array) $rows ), static fn( string $error ): bool => '' !== $error ) );
+	}
+
+	/**
+	 * Error of the newest job failed since $since, '' when the current user may not open that job (JobAccess).
+	 *
+	 * @param string $jobs_table Jobs table.
+	 * @param string $since      UTC MySQL time.
+	 * @return string
+	 */
+	private static function last_job_error( string $jobs_table, string $since ): string {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return '';
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Site Health runs on a page view or a weekly cron tick; `status` is indexed.
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				'SELECT type, created_by, args, error FROM %i WHERE status = %s AND updated_at >= %s ORDER BY updated_at DESC LIMIT 1',
+				$jobs_table,
+				'failed',
+				$since
+			),
+			ARRAY_A
+		);
+
+		return self::job_error_for_viewer( $row );
+	}
+
+	/**
+	 * A job row's error (type, created_by, args, error), '' when the current user may not open the job.
+	 *
+	 * @param mixed $row Row.
+	 * @return string
+	 */
+	private static function job_error_for_viewer( mixed $row ): string {
+		if ( ! is_array( $row ) || ! is_string( $row['error'] ?? null ) ) {
+			return '';
+		}
+
+		$job = [
+			'type'       => $row['type'] ?? '',
+			'created_by' => $row['created_by'] ?? 0,
+			'args'       => is_string( $row['args'] ?? null ) ? json_decode( $row['args'], true ) : null,
+		];
+
+		return \PerfLocale\Background\JobAccess::may_handle( $job ) ? $row['error'] : '';
+	}
+
+	/**
+	 * With hreflang on, does the public home page emit an alternate `<link rel="alternate" hreflang>` per active language?
+	 * Cached 5 minutes.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2949,9 +2653,7 @@ final class SiteHealth {
 		$cached = get_transient( self::HREFLANG_TRANSIENT );
 
 		if ( is_array( $cached ) && isset( $cached['count'], $cached['expected'] ) ) {
-			// has_x_default is absent from entries written before this key
-			// existed; those simply omit the x-default sentence until the
-			// transient expires.
+			// Older cache entries lack has_x_default: they omit the x-default sentence until they expire.
 			return $this->hreflang_result(
 				(int) $cached['count'],
 				(int) $cached['expected'],
@@ -2962,11 +2664,13 @@ final class SiteHealth {
 		$response = wp_remote_get(
 			home_url( '/' ),
 			[
-				'timeout'     => 5,
-				'redirection' => 2,
+				'timeout'             => 5,
+				'redirection'         => 2,
 				// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core WordPress filter name (defined in WP_Http::request). Renaming would break integration with WP core + third-party plugins that expect this canonical hook.
-				'sslverify'   => apply_filters( 'https_local_ssl_verify', false ),
-				'headers'     => [ 'X-PerfLocale-Health-Check' => '1' ],
+				'sslverify'           => (bool) apply_filters( 'https_local_ssl_verify', false ),
+				'headers'             => [ 'X-PerfLocale-Health-Check' => '1' ],
+				// The <head> comes first; more of the page adds nothing.
+				'limit_response_size' => MB_IN_BYTES,
 			]
 		);
 
@@ -2978,45 +2682,16 @@ final class SiteHealth {
 			);
 		}
 
-		// Count BOTH placements. With seo_hreflang_placement = http_header the
-		// tags are emitted only as Link: headers and the body carries none, so a
-		// body-only probe would report zero and hand the operator theme/caching
-		// advice for a correctly configured site.
-		// Collect the hreflang VALUES, not a match count. Counting matches was
-		// wrong twice over:
-		//
-		//   * `x-default` matched the pattern, so it was counted as if it were a
-		//     language. On a three-language site emitting en + x-default the
-		//     tally read 2, and a site genuinely missing a language could reach
-		//     the expected total and report green.
-		//   * With seo_hreflang_placement = both, the SAME language is emitted in
-		//     the body AND as a Link header, and the two tallies were added - so
-		//     the count could reach or exceed the language total no matter what
-		//     was actually missing.
-		//
-		// A set of codes fixes both: x-default is separated out, and a language
-		// present in both placements collapses to one entry.
-		$body  = (string) wp_remote_retrieve_body( $response );
-		$codes = [];
+		// HreflangTags sends Link headers with $replace = false: a string or an array of them.
+		$link_values = [];
 
-		if ( preg_match_all( '#<link\s+[^>]*rel=["\']alternate["\'][^>]*hreflang=["\']([^"\']+)["\']#i', $body, $m ) ) {
-			foreach ( (array) $m[1] as $code ) {
-				$codes[ strtolower( trim( (string) $code ) ) ] = true;
+		foreach ( (array) wp_remote_retrieve_header( $response, 'link' ) as $link_value ) {
+			if ( is_string( $link_value ) && '' !== $link_value ) {
+				$link_values[] = $link_value;
 			}
 		}
-		// HreflangTags emits its Link headers with $replace = false, so
-		// wp_remote_retrieve_header() can hand back either a single string or an
-		// array of them depending on how many were sent - normalise both shapes.
-		$link_header = wp_remote_retrieve_header( $response, 'link' );
-		$link_values = is_array( $link_header ) ? $link_header : ( '' !== (string) $link_header ? [ (string) $link_header ] : [] );
 
-		foreach ( $link_values as $link_value ) {
-			if ( preg_match_all( '#rel=["\']?alternate["\']?[^,]*hreflang=["\']?([A-Za-z0-9_-]+)#i', (string) $link_value, $hm ) ) {
-				foreach ( (array) $hm[1] as $code ) {
-					$codes[ strtolower( trim( (string) $code ) ) ] = true;
-				}
-			}
-		}
+		$codes = self::hreflang_codes( (string) wp_remote_retrieve_body( $response ), $link_values );
 
 		$has_x_default = isset( $codes['x-default'] );
 		unset( $codes['x-default'] );
@@ -3037,8 +2712,40 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Format the Site-Health result row for the hreflang test. Kept
-	 * separate so the cached + fresh paths share wording.
+	 * Hreflang codes of the page's alternate <link> tags and Link header items, lowercased, as a set (x-default and a
+	 * language in both places count once). Only the first MB is scanned (a pre_http_request answer is not cut).
+	 *
+	 * @param string             $body        Page HTML.
+	 * @param array<int, string> $link_values Link header values.
+	 * @return array<string, true>
+	 */
+	private static function hreflang_codes( string $body, array $link_values ): array {
+		$codes = [];
+		$tags  = new \WP_HTML_Tag_Processor( substr( $body, 0, MB_IN_BYTES ) );
+
+		while ( $tags->next_tag( [ 'tag_name' => 'LINK' ] ) ) {
+			$rel  = $tags->get_attribute( 'rel' );
+			$code = $tags->get_attribute( 'hreflang' );
+
+			if ( is_string( $rel ) && is_string( $code ) && '' !== trim( $code ) && in_array( 'alternate', (array) preg_split( '/\s+/', strtolower( $rel ), -1, PREG_SPLIT_NO_EMPTY ), true ) ) {
+				$codes[ strtolower( trim( $code ) ) ] = true;
+			}
+		}
+
+		// Item by item: one pattern across a whole header value is not linear without PCRE JIT.
+		foreach ( $link_values as $link_value ) {
+			foreach ( explode( ',', (string) $link_value ) as $item ) {
+				if ( 1 === preg_match( '#\brel=["\']?alternate\b#i', $item ) && 1 === preg_match( '#\bhreflang=["\']?([A-Za-z0-9_-]+)#i', $item, $hm ) ) {
+					$codes[ strtolower( $hm[1] ) ] = true;
+				}
+			}
+		}
+
+		return $codes;
+	}
+
+	/**
+	 * The hreflang test's result row, shared by the cached and fresh paths.
 	 *
 	 * @param int $count Number of hreflang alternate links found.
 	 * @param int $expected Number of active languages.
@@ -3052,9 +2759,7 @@ final class SiteHealth {
 				sprintf(
 					/* translators: %s: the HTML tag being looked for, already escaped. */
 					esc_html__( 'Hreflang output is enabled in settings but the homepage did not render any %s tags. Check theme or cache rules that might strip head elements, and make sure the homepage is translatable.', 'perflocale' ),
-					// esc_html on the tag itself: this string used to embed a raw
-					// <link ...> in an unescaped description, so the browser parsed
-					// it and the reader saw a sentence with the subject missing.
+					// The tag escaped, or the browser would parse it and the sentence lose its subject.
 					'<code>' . esc_html( '<link rel="alternate" hreflang="…">' ) . '</code>'
 				)
 			);
@@ -3065,12 +2770,8 @@ final class SiteHealth {
 			: '';
 
 		if ( $count < $expected ) {
-			// NOT a fault on its own. HreflangTags only emits a language that
-			// actually has a translation of the page being rendered, so a site
-			// that is mid-translation legitimately shows fewer links than it has
-			// active languages - and this card used to sit permanently orange
-			// telling those owners to go looking for a caching bug. Report the
-			// gap as information, and name the real explanation first.
+			// Not a fault: HreflangTags emits only languages with a translation of the page, so a site mid-translation shows
+			// fewer links. Reported as information.
 			return $this->pass(
 				'perflocale_hreflang_output',
 				__( 'Hreflang links are present for the translated languages', 'perflocale' ),
@@ -3099,29 +2800,13 @@ final class SiteHealth {
 		);
 	}
 
-	// -------------------------------------------------------------------------
-	// Info tab - dedicated PerfLocale section
-	// -------------------------------------------------------------------------
+	// Info tab: PerfLocale's section.
 
 	/**
-	 * Add PerfLocale's own section to the Site Health Info tab.
+	 * Add PerfLocale's section to the Site Health Info tab.
 	 *
-	 * `$info` is deliberately untyped. WordPress does `$info = apply_filters(
-	 * 'debug_information', $info ); return $info;` and never re-validates the
-	 * result, so a third-party callback written like an action - edit the array,
-	 * forget the `return` - hands the NEXT callback null. Core survives that
-	 * (site-health-info.php's foreach warns and renders nothing); an `array`
-	 * hint here would make PHP throw a TypeError at ARGUMENT BINDING, before any
-	 * guard in this body could run, turning somebody else's missing `return`
-	 * into a fatal on Tools -> Site Health with PerfLocale's name on it. The
-	 * guard returns the value UNCHANGED - coercing it to an array would hide the
-	 * other plugin's bug and silently drop whatever the previous callbacks had
-	 * assembled.
-	 *
-	 * `register_tests()` is deliberately NOT widened the same way: core's
-	 * `site_status_tests` filter is immediately followed by an `array_merge()`
-	 * on the result, so a non-array there is a fatal with or without this
-	 * plugin, and a guard would only move the stack trace.
+	 * `$info` is untyped on purpose: another plugin's callback that forgets to return passes null, and an `array` hint
+	 * would make that a TypeError here; the value is returned unchanged. register_tests() keeps its hint (core merges).
 	 *
 	 * @param mixed $info Debug-information sections as the previous callbacks left them; an array in every supported case.
 	 * @return mixed The same value, with PerfLocale's section added when it was an array.
@@ -3140,7 +2825,7 @@ final class SiteHealth {
 		$settings = $plugin->get( 'settings' );
 		$fields   = [];
 
-		// ---- Plugin / schema ----
+		// Plugin and schema.
 		$fields['version']    = [
 			'label' => __( 'Version', 'perflocale' ),
 			'value' => defined( 'PERFLOCALE_VERSION' ) ? PERFLOCALE_VERSION : __( 'unknown', 'perflocale' ),
@@ -3158,7 +2843,7 @@ final class SiteHealth {
 			'value' => Schema::tables_exist() ? __( 'Yes', 'perflocale' ) : __( 'No - needs repair', 'perflocale' ),
 		];
 
-		// ---- Routing & languages ----
+		// Routing and languages.
 		$fields['url_mode']           = [
 			'label' => __( 'URL mode', 'perflocale' ),
 			'value' => (string) $settings->get_url_mode(),
@@ -3219,7 +2904,7 @@ final class SiteHealth {
 			];
 		}
 
-		// ---- Translatable scope ----
+		// Translatable scope.
 		$fields['translatable_post_types'] = [
 			'label' => __( 'Translatable post types', 'perflocale' ),
 			'value' => implode( ', ', $settings->get_translatable_post_types() ) ?: __( 'none', 'perflocale' ),
@@ -3235,7 +2920,7 @@ final class SiteHealth {
 			'value' => (string) count( $meta_keys ),
 		];
 
-		// ---- Translation data (cached counts) ----
+		// Translation data (cached counts).
 		$counts = $this->get_counts();
 
 		foreach ( $counts as $key => $value ) {
@@ -3245,7 +2930,7 @@ final class SiteHealth {
 			];
 		}
 
-		// ---- Machine translation ----
+		// Machine translation.
 		$fields['mt_enabled']  = [
 			'label' => __( 'Machine translation', 'perflocale' ),
 			'value' => $settings->mt_enabled() ? __( 'Enabled', 'perflocale' ) : __( 'Disabled', 'perflocale' ),
@@ -3272,7 +2957,7 @@ final class SiteHealth {
 
 		}
 
-		// ---- SEO ----
+		// SEO.
 		$fields['seo_hreflang']  = [
 			'label' => __( 'Hreflang output', 'perflocale' ),
 			'value' => $settings->hreflang_enabled() ? __( 'Enabled', 'perflocale' ) : __( 'Disabled', 'perflocale' ),
@@ -3290,7 +2975,7 @@ final class SiteHealth {
 			'value' => (string) $settings->get( 'seo_plugin', 'none' ),
 		];
 
-		// ---- Integrations ----
+		// Integrations.
 		$fields['detected_seo']     = [
 			'label' => __( 'SEO plugin detected', 'perflocale' ),
 			'value' => $this->detect_seo_plugin(),
@@ -3338,10 +3023,7 @@ final class SiteHealth {
 				];
 			}
 
-			// Autoloaded-option size reporting so operators can see when an
-			// addon is pushing the storage option towards the per-addon
-			// cap. The 16 KiB cap is per-addon entry; the total is shown
-			// here so big numbers stand out in the Site Health view.
+			// Size of the add-on settings option (the 16 KiB cap is per add-on entry; the total shows what grows).
 			$settings_raw   = (array) get_option( 'perflocale_addon_settings', [] );
 			$settings_total = strlen( (string) maybe_serialize( $settings_raw ) );
 			$disabled_raw   = (array) get_option( 'perflocale_disabled_addons', [] );
@@ -3368,7 +3050,7 @@ final class SiteHealth {
 			];
 		}
 
-		// ---- WooCommerce (only when active) ----
+		// WooCommerce (only when active).
 		if ( class_exists( 'WooCommerce' ) ) {
 			$fields['wc_base_currency']     = [
 				'label' => __( 'WooCommerce base currency', 'perflocale' ),
@@ -3407,7 +3089,7 @@ final class SiteHealth {
 			];
 		}
 
-		// ---- Performance ----
+		// Performance.
 		$fields['string_mode']      = [
 			'label' => __( 'String translation mode', 'perflocale' ),
 			'value' => (string) $settings->get( 'string_translation_mode', 'files' ),
@@ -3427,10 +3109,7 @@ final class SiteHealth {
 				: __( 'No', 'perflocale' ),
 		];
 
-		// ---- Background-jobs subsystem status ----
-		// Surfaces engine + queue state so an operator pasting Site Health
-		// info into a support thread gives enough signal to diagnose "my
-		// import isn't running" without asking for follow-up.
+		// Background jobs: engine and queue state, so a pasted report answers "my import is not running".
 		$bg_engine     = \PerfLocale\Background\JobRunnerFactory::pick()->get_engine_name();
 		$bg_as_loaded  = \PerfLocale\Background\JobRunnerFactory::action_scheduler_available();
 		$bg_paused     = (bool) $settings->get( 'background_paused', false );
@@ -3452,13 +3131,7 @@ final class SiteHealth {
 			'value' => null === $bg_counts ? __( 'unknown', 'perflocale' ) : (string) array_sum( $bg_counts ),
 		];
 
-		// ---- PHP extensions ----
-		// The Info tab is what owners are told to copy into a support thread, and
-		// it recorded no extension state at all - so the single most common
-		// question about a formatting or import report ("is intl loaded on that
-		// host?", "did the XLIFF import fail because dom is missing?") could not
-		// be answered from the artefact itself. One line, every optional
-		// extension, present or absent, no guessing.
+		// PHP extensions: one line with every optional extension, present or absent, for support reports.
 		$ext_state = [];
 
 		foreach ( self::FEATURE_PHP_EXTENSIONS as $ext ) {
@@ -3470,10 +3143,7 @@ final class SiteHealth {
 			'value' => implode( ', ', $ext_state ),
 		];
 
-		// ---- Migration importer batch sizes ----
-		// Resolve each importer's batch_size filter so support threads see the
-		// effective value (helps diagnose "my import is OOMing" or
-		// "my import is slow" - both usually trace back to a filter override).
+		// The importers' effective batch sizes (a filter override explains most slow or out-of-memory imports).
 		$mig_wpml = (int) apply_filters( 'perflocale/migration/wpml/batch_size', 100 );
 		$mig_pll  = (int) apply_filters( 'perflocale/migration/polylang/batch_size', 100 );
 		$mig_tp   = (int) apply_filters( 'perflocale/migration/translatepress/batch_size', 50 );
@@ -3489,7 +3159,7 @@ final class SiteHealth {
 			),
 		];
 
-		// ---- API keys / secrets status (never leak the value) ----
+		// Secrets: configured or not, never the value.
 		foreach ( self::REDACTED_SETTINGS as $key ) {
 			$value = (string) $settings->get( $key, '' );
 
@@ -3508,12 +3178,10 @@ final class SiteHealth {
 		return $info;
 	}
 
-	// -------------------------------------------------------------------------
-	// Helpers
-	// -------------------------------------------------------------------------
+	// Helpers.
 
 	/**
-	 * Flush the counts cache - called when settings change.
+	 * Flush the cached counts (settings and string changes).
 	 *
 	 * @return void
 	 */
@@ -3522,18 +3190,12 @@ final class SiteHealth {
 		delete_transient( self::HREFLANG_TRANSIENT );
 		delete_transient( self::FILES_TRANSIENT );
 
-		// Legacy key: the quality-scoring card that wrote it was removed, so
-		// nothing sets this any more. The delete stays so an upgraded site's
-		// leftover row is reaped rather than sitting in wp_options forever.
+		// Nothing writes this key; deleting it removes an upgraded site's leftover row.
 		delete_transient( self::MT_SCORING_TRANSIENT );
 	}
 
 	/**
-	 * Get translation + string + memory counts, cached for 5 minutes.
-	 *
-	 * Running these `COUNT(*)` queries on every Site Health page load
-	 * would be cheap individually but sums up on sites with millions
-	 * of rows; the transient amortises the cost.
+	 * Translation, string and memory counts, cached 5 minutes (the COUNTs add up on large sites).
 	 *
 	 * @return array<string, int>
 	 */
@@ -3577,12 +3239,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Human label for one {@see self::get_counts()} key.
-	 *
-	 * The arms mirror that method's four keys exactly; anything else falls
-	 * through to the raw key rather than being silently mislabelled. (A
-	 * 'memory' arm survived here after translation memory was removed -
-	 * a label in the POT for a feature the plugin does not ship.)
+	 * The label of a get_counts() key; an unknown key shows as itself, never mislabelled.
 	 *
 	 * @param string $key Counts key.
 	 * @return string
@@ -3638,23 +3295,9 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Surface webhook deliveries that were given up on.
-	 *
-	 * `WebhookController::record_failure()` has always written a capped log to
-	 * `perflocale_webhook_failures`, and until this test NOTHING in the shipped
-	 * plugin ever read it - there is no Webhooks admin screen, and the only other
-	 * reference is SiteCleanup deleting the option on uninstall. So a webhook
-	 * that exhausted its retries, or whose address was refused by the
-	 * delivery-time safety check, disappeared in silence: the receiver simply
-	 * never got the event and the site owner had nothing to look at.
-	 *
-	 * That matters more now that the safety check can refuse a delivery for a
-	 * policy reason. A control that can drop a customer's event must be visible
-	 * when it does.
-	 *
-	 * Recent means the last 24 hours. Older entries stay in the log (it is capped
-	 * at 100) but stop raising a card, so a problem fixed last week does not sit
-	 * orange forever.
+	 * Report webhook deliveries given up on (exhausted retries, refused by the delivery-time safety check) in the last
+	 * 24 hours, from the log WebhookController::record_failure() writes; nothing else reads it, so this keeps a dropped
+	 * event visible. Docs: docs-ai/11-code-rationale.md, "SiteHealth: cron and stuck checks".
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -3757,8 +3400,7 @@ final class SiteHealth {
 			'ELEMENTOR_VERSION' => 'Elementor',
 			'FLBuilder'         => 'Beaver Builder',
 			'BRICKS_VERSION'    => 'Bricks',
-			// Verified against the shipped plugin: oxygen/functions.php:14 does
-			// define( 'CT_VERSION', '4.9.7' ).
+			// oxygen/functions.php defines CT_VERSION.
 			'CT_VERSION'        => 'Oxygen Classic',
 		];
 
@@ -3770,18 +3412,8 @@ final class SiteHealth {
 			}
 		}
 
-		// Oxygen 6 / Breakdance is a special case and used to be looked up under
-		// BREAKDANCE_DB_VERSION, which does not exist in the plugin at all - so
-		// every Oxygen 6 support report claimed "Builder detected: none" on a
-		// site that was entirely built with one. What the plugin really declares
-		// (checked against Oxygen 6.1.3) is:
-		//
-		//   plugin.php:41  const __BREAKDANCE_VERSION = '6.1.3';   // a top-level
-		//                  const, not define() - defined() sees both
-		//   plugin.php:16  define( 'BREAKDANCE_MODE', 'oxygen' );  // 'oxygen'
-		//                  when shipped as Oxygen, absent/other for Breakdance
-		//
-		// so BREAKDANCE_MODE is also what tells the two apart.
+		// Oxygen 6 / Breakdance: a top-level const __BREAKDANCE_VERSION (defined() sees it) and BREAKDANCE_MODE 'oxygen'
+		// when shipped as Oxygen, which tells the two apart.
 		if ( defined( '__BREAKDANCE_VERSION' ) || defined( 'BREAKDANCE_MODE' ) ) {
 			$mode = defined( 'BREAKDANCE_MODE' ) ? (string) constant( 'BREAKDANCE_MODE' ) : '';
 
@@ -3801,35 +3433,19 @@ final class SiteHealth {
 		return in_array( $theme, $known, true ) ? $theme : (string) $theme;
 	}
 
-	// -------------------------------------------------------------------------
-	// Eager-link-map / cron / stuck / orphan tests
-	// -------------------------------------------------------------------------
+	// Eager-link map, cron, stuck and orphan tests.
 
 	/**
-	 * Surface the autoloaded eager-link-map state. The blob is the dominant
-	 * frontend-perf optimization (sub-µs lookups vs DB roundtrips) but grows
-	 * linearly with translation-group count. Past a few hundred KB the
-	 * alloptions cost starts to dominate the savings, AND the loader trips a
-	 * `'too_large'` sentinel that effectively disables the optimization. Both
-	 * states are operator-visible signals.
+	 * Report the autoloaded eager-link map's state: it speeds up the front end but grows with the group count, and past a
+	 * few hundred KB its alloptions cost dominates and the loader writes the 'too_large' sentinel that turns it off.
 	 *
 	 * @return array<string, mixed>
 	 */
 	public function test_eager_link_map(): array {
 		$id           = 'perflocale_eager_link_map';
-		// Real option keys are `perflocale_eager_links_{type}` (see
-		// TranslationGroupRepository::get_eager_link_map, which writes the
-		// 'too_large' sentinel there). The old `_eager_link_map_` names never
-		// existed, so this Site Health size check silently never fired.
-		// The option holds EITHER the link-map array, the 'too_large' string
-		// sentinel, the 'empty' string sentinel (written when a build proved the
-		// map genuinely empty, so a real emptiness is never confused with a
-		// failed read), or is absent. The is_array() guard below is what makes
-		// the string forms safe - do not remove it. Casting
-		// the array form to string would throw an "Array to string conversion"
-		// warning on every Status load AND collapse the byte count to strlen(
-		// "Array") = 5, which permanently dead-ends the size-envelope branch
-		// below. Measure the real autoloaded footprint via the serialized form.
+		// Options `perflocale_eager_links_{type}` (TranslationGroupRepository::get_eager_link_map()) hold the map array, the
+		// 'too_large' or 'empty' string sentinel, or nothing; keep the is_array() guard (a string cast of the array would
+		// warn and measure 5 bytes). The size is the serialized form.
 		$post_option  = get_option( 'perflocale_eager_links_post', '' );
 		$term_option  = get_option( 'perflocale_eager_links_term', '' );
 		$post_too_big = $post_option === 'too_large';
@@ -3883,9 +3499,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Surface whether PerfLocale's four recurring cron events are actually
-	 * scheduled, AND whether DISABLE_WP_CRON is set without Action Scheduler
-	 * as a fallback (in which case no background work runs at all).
+	 * Are the four recurring events scheduled, and is anything running them (DISABLE_WP_CRON without Action Scheduler)?
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -3895,17 +3509,13 @@ final class SiteHealth {
 			'perflocale_jobs_watchdog' => __( 'background-jobs watchdog', 'perflocale' ),
 			'perflocale_jobs_gc'       => __( 'background-jobs garbage collector', 'perflocale' ),
 			'perflocale_lock_cleanup'  => __( 'expired-lock reaper', 'perflocale' ),
-			// The fourth unconditionally-scheduled recurring hook. It was
-			// missing here, so a refused or lost machine-translation usage GC
-			// was the one recurring event nothing reported. Safe to list
-			// unconditionally: ensure_recurring_schedules() creates it on every
-			// site, with no feature gate.
+			// The fourth unconditional recurring hook: ensure_recurring_schedules() creates it on every site.
 			'perflocale_mt_usage_gc'   => __( 'machine-translation usage cleanup', 'perflocale' ),
 		];
 
 		$missing = [];
 		foreach ( array_keys( $expects ) as $hook ) {
-			// Any-args, both engines - see test_bg_jobs_health().
+			// Any args, both engines (see test_bg_jobs_health()).
 			if ( ! \PerfLocale\Background\BackgroundEvents::is_scheduled( $hook ) ) {
 				$missing[] = $hook;
 			}
@@ -3914,20 +3524,8 @@ final class SiteHealth {
 		$wp_cron_disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
 		$as_available     = class_exists( '\\ActionScheduler' ) || function_exists( 'as_enqueue_async_action' );
 
-		// DISABLE_WP_CRON alone proves nothing. It stops WordPress spawning cron
-		// on a page view; it does NOT stop wp-cron.php running due events when
-		// something else calls it. `DISABLE_WP_CRON = true` plus a system crontab
-		// hitting wp-cron.php is the RECOMMENDED production setup, and this
-		// branch used to report it as critical - telling the best-configured
-		// sites their background jobs "cannot run" while the jobs ran fine. A
-		// red card that is wrong on the correct configuration teaches owners to
-		// ignore the panel.
-		//
-		// PerfLocale cannot see the operator's crontab, but it does not need to:
-		// if an external runner is firing wp-cron.php, due events get consumed
-		// and rescheduled, so their next-run timestamps stay in the future. A
-		// recurring event whose next run is far in the past is the observable
-		// proof that nothing is executing. That is what gets reported.
+		// DISABLE_WP_CRON with a system crontab is the recommended setup, so it proves nothing alone: an event overdue by
+		// more than CRON_OVERDUE_GRACE is the proof that nothing runs the queue.
 		if ( $wp_cron_disabled && ! $as_available ) {
 			$now     = time();
 			$overdue = [];
@@ -3935,8 +3533,7 @@ final class SiteHealth {
 			foreach ( array_keys( $expects ) as $hook ) {
 				$next = \PerfLocale\Background\BackgroundEvents::next_run( $hook );
 
-				// Only a timestamp is evidence. null means "nothing pending",
-				// which the $missing branch below already reports.
+				// Only a timestamp is evidence; null (nothing pending) is the $missing branch's.
 				if ( is_int( $next ) && ( $now - $next ) > self::CRON_OVERDUE_GRACE ) {
 					$overdue[] = $expects[ $hook ];
 				}
@@ -3959,9 +3556,7 @@ final class SiteHealth {
 				);
 			}
 
-			// Events are current, so something IS running them - almost always
-			// the operator's own cron. Say what was actually observed rather
-			// than implying the setup is broken.
+			// Events are current, so something runs them (usually the operator's cron): say what was observed.
 			if ( $missing === [] ) {
 				return $this->pass(
 					$id,
@@ -3991,18 +3586,13 @@ final class SiteHealth {
 		return $this->pass(
 			$id,
 			__( 'PerfLocale cron schedules are healthy', 'perflocale' ),
-			// Names every event the test actually checks. It used to list three
-			// while checking four, so a missing MT-usage GC was invisible in the
-			// green card that claimed everything was scheduled.
+			// Names every event the test checks.
 			esc_html__( 'All PerfLocale recurring events (watchdog, garbage collector, lock reaper, machine-translation usage cleanup) are scheduled and will run on their normal cadence.', 'perflocale' )
 		);
 	}
 
 	/**
-	 * Count translations that have been stuck in `in_progress` or `pending`
-	 * for longer than {@see STUCK_AGE_DAYS}. Heavy enough to warrant a
-	 * {@see HEAVY_TTL}-bounded transient cache so opening Site Health twice
-	 * in quick succession doesn't double-pay the COUNT(*).
+	 * Count translations in `in_progress` or `pending` for more than STUCK_AGE_DAYS, cached HEAVY_TTL.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -4024,13 +3614,8 @@ final class SiteHealth {
 				);
 			}
 
-			// Age the rows against the DATABASE clock, not PHP's. This column
-			// is stamped by MySQL (`ON UPDATE CURRENT_TIMESTAMP`) in the DB
-			// server's timezone, so comparing it with a gmdate() string
-			// mis-ages every row by the server's UTC offset - on a DB several
-			// hours behind UTC, rows updated moments ago count as "stuck".
-			// DATE_SUB(NOW(), ...) keeps both sides in the same clock whatever
-			// that timezone is.
+			// Aged by the database clock: the column is stamped by the database in its own time zone, so a gmdate() string
+			// would mis-age rows by its UTC offset.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is bound as a %i identifier; the interval is an int class constant; result is transient-cached for an hour.
 			$count = (int) $wpdb->get_var(
 				$wpdb->prepare(
@@ -4087,11 +3672,8 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Detect orphan translation rows - translation_links rows whose target
-	 * post/term has been deleted out from under PerfLocale (typically by a
-	 * direct DB import, a destructive plugin, or a manual `DELETE FROM
-	 * wp_posts`). LEFT JOIN + IS NULL is heavy enough to warrant the
-	 * {@see HEAVY_TTL}-bounded transient cache.
+	 * Count translation_links rows whose post or term is gone (direct imports, destructive plugins, manual deletes),
+	 * cached HEAVY_TTL.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -4219,8 +3801,7 @@ final class SiteHealth {
 	}
 
 	/**
-	 * Common result skeleton - every test returns this shape with status
-	 * + label + description filled in.
+	 * The result shape every test returns.
 	 *
 	 * @param string $id Test ID (must match the array key in register_tests).
 	 * @param string $status 'good' | 'recommended' | 'critical'.
@@ -4247,27 +3828,9 @@ final class SiteHealth {
 	 * @return array<string, mixed>
 	 */
 	/**
-	 * Is the export directory actually protected, on THIS server?
-	 *
-	 * WHY THIS ASKS INSTEAD OF ASSUMING
-	 *   A data export is a full dump of the site's translation data. It is
-	 *   written under wp-content/uploads, which is web-served, and the only
-	 *   thing standing between it and the internet is the `Deny from all`
-	 *   .htaccess that Helper::harden_directory() writes. Apache and LiteSpeed
-	 *   honour that file. **nginx and Caddy ignore it completely.** On those
-	 *   servers the export is fetchable by anyone who knows its URL, and the
-	 *   plugin cannot tell from PHP which server it is behind or what that
-	 *   server's configuration says.
-	 *
-	 *   So it stops guessing and measures: write a short-lived random canary
-	 *   into the export directory, ask for it over HTTP the way a stranger
-	 *   would, and see whether the bytes come back. That turns an invisible,
-	 *   host-dependent exposure into a concrete result with the exact snippet
-	 *   needed to close it.
-	 *
-	 *   The canary is random, carries no site data, and is deleted immediately
-	 *   whatever the outcome. The result is cached for an hour so opening Site
-	 *   Health does not repeat the write and the request.
+	 * Is the export directory protected on this server? nginx and Caddy ignore its .htaccess, so a random canary is
+	 * written and fetched over HTTP, then deleted; cached an hour. Docs: docs-ai/11-code-rationale.md, "SiteHealth:
+	 * export exposure probe".
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -4282,25 +3845,9 @@ final class SiteHealth {
 		);
 
 		/**
-		 * Run the ACTIVE probe, or only give the advice?
-		 *
-		 * The probe writes a temporary file and makes one loopback request. Both
-		 * are cheap and the verdict is cached, but there is a host shape where
-		 * that stops being true: loopback blocked AND transients not persisting.
-		 * Then every visit to Site Health pays the timeout again and never
-		 * learns anything. An administrator on such a host cannot fix either
-		 * condition, so give them a way to stop paying for it.
-		 *
-		 * Returning false disables only the MEASUREMENT. The check still
-		 * appears, and still tells you to add the server rule - a filter must
-		 * not be able to turn a real exposure green, only to stop testing for
-		 * it. Verify the rule yourself if you turn this off.
-		 *
-		 * Every outcome the probe could not verify returns `recommended`, never
-		 * `good`: WordPress files `good` results in the collapsed "Passed tests"
-		 * accordion, and a security control whose state could not be determined
-		 * is not a passed test. Only a measured refusal, or a site with no
-		 * export directory yet, returns `good`.
+		 * Filter whether to run the export exposure probe (a temporary file and one loopback request). False skips only the
+		 * measurement, for hosts where loopback is blocked and the verdict cannot be cached; the advice still shows, and an
+		 * unverified state is never `good`.
 		 *
 		 * @hook perflocale/site_health/probe_export_exposure Set false to skip the active export-exposure probe.
 		 * @param bool $probe Whether to write the canary and make the request. Default true.
@@ -4332,11 +3879,7 @@ final class SiteHealth {
 			);
 		}
 
-		// An inconclusive run is cached too, and that is the point. Plenty of
-		// hosts block or stall loopback requests; without this the probe would
-		// pay its full timeout on EVERY Site Health page load on exactly those
-		// hosts. A shorter TTL than a definite answer, so a temporary network
-		// problem is re-checked sooner than a settled verdict.
+		// An inconclusive run is cached too (for less), or hosts that block loopback pay the timeout on every load.
 		if ( 'unknown' === $cached ) {
 			return $this->recommended(
 				$id,
@@ -4348,8 +3891,7 @@ final class SiteHealth {
 		$dir = \PerfLocale\Helper::uploads_exports_dir();
 
 		if ( '' === $dir || ! is_dir( $dir ) ) {
-			// Not cached: the directory appearing is exactly the event that
-			// should make this check run for real.
+			// Not cached: the directory appearing should make the check run for real.
 			return $this->pass(
 				$id,
 				__( 'PerfLocale export directory does not exist yet', 'perflocale' ),
@@ -4357,8 +3899,7 @@ final class SiteHealth {
 			);
 		}
 
-		// Random name AND random body: the body is what proves the file was
-		// served rather than a 404 page that happens to return 200.
+		// Random name and body: the body proves the file was served, not a 200 error page.
 		$token  = wp_generate_password( 24, false, false );
 		$name   = 'perflocale-healthcheck-' . $token . '.txt';
 		$path   = trailingslashit( $dir ) . $name;
@@ -4393,9 +3934,7 @@ final class SiteHealth {
 		$response = wp_remote_get(
 			$url,
 			[
-				// Short: this is a static file on the very server running the
-				// request. Anything slower than this is a host that does not
-				// want loopback, which the WP_Error branch handles and caches.
+				// A static file on this very server; slower means the host blocks loopback (the WP_Error branch).
 				'timeout'     => 3,
 				'redirection' => 0,
 				// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core WordPress filter name (defined in WP_Http::request).
@@ -4404,7 +3943,7 @@ final class SiteHealth {
 			]
 		);
 
-		// Always remove the canary, whatever happened.
+		// The canary always goes.
 		wp_delete_file( $path );
 
 		if ( is_wp_error( $response ) ) {

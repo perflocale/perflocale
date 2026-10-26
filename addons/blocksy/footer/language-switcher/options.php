@@ -35,8 +35,7 @@ $options = [ // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPre
 		),
 	],
 
-	// Dropdown arrow - hidden unless Display Mode is Dropdown (see header
-	// language-switcher options.php for rationale).
+	// Dropdown arrow: hidden unless Display Mode is Dropdown.
 	'perflocale_switcher_arrow_style'       => [
 		'label'     => __( 'Dropdown Arrow', 'perflocale' ),
 		'desc'      => __( 'Icon shown next to the language label on the dropdown trigger.', 'perflocale' ),
@@ -53,7 +52,7 @@ $options = [ // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPre
 		'condition' => [ 'perflocale_switcher_display' => 'dropdown' ],
 	],
 
-	// Trigger label format - dropdown-only, same condition gating.
+	// Trigger label format: dropdown only.
 	'perflocale_switcher_trigger_format'    => [
 		'label'     => __( 'Trigger Label Format', 'perflocale' ),
 		'desc'      => __( 'Label format on the dropdown trigger button, independent of the options list.', 'perflocale' ),

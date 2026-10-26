@@ -17,9 +17,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Machine translation via the DeepL API.
- *
- * Supports formality control, HTML preservation, and batch translation.
- * Uses wp_remote_post() for all API calls.
  */
 final class DeepLProvider extends AbstractProvider {
 
@@ -53,10 +50,7 @@ final class DeepLProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch(). The text path omits
-	 *   tag_handling so DeepL treats the payload as raw text and returns
-	 *   unescaped output.
+	 * @param string $format Destination format hint ('html'|'text'); 'text' omits tag_handling, so the answer is unescaped.
 	 *
 	 * @throws \RuntimeException When DeepL returns an unexpected response format or all retries fail.
 	 */
@@ -72,13 +66,8 @@ final class DeepLProvider extends AbstractProvider {
 
 		$is_html = 'text' !== $format;
 
-		// DeepL's v2 tag-handling parser requires every input string to have
-		// a parent tag (rejected with: "Tag handling parsing failed … 'text
-		// without parent'") for plain-text inputs like post titles. Wrap
-		// each text in a neutral root element before send and strip it back
-		// off the response so plain-text and HTML payloads coexist. The wrap
-		// exists solely for the tag-handling parser, so the text path (no
-		// tag_handling) skips it.
+		// DeepL's tag-handling parser rejects text without a parent tag (a plain title): wrap it, unwrap the answer.
+		// The text path sends no tag_handling, so it needs no wrap.
 		$body = [
 			'text'        => [ $is_html ? self::wrap_for_tag_handling( $text ) : $text ],
 			'source_lang' => $this->map_language_code( $source_lang, false ),
@@ -137,8 +126,7 @@ final class DeepLProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch().
+	 * @param string $format Destination format hint ('html'|'text'), as in translate().
 	 *
 	 * @throws \RuntimeException When DeepL batch returns an unexpected response or all retries fail.
 	 */
@@ -161,10 +149,7 @@ final class DeepLProvider extends AbstractProvider {
 
 		$is_html = 'text' !== $format;
 
-		// See note in translate(): wrap each text in a neutral parent tag so
-		// DeepL's v2 tag-handling parser doesn't reject plain-text inputs.
-		// The wrap exists solely for that parser - the text path (no
-		// tag_handling) sends the payload untouched.
+		// The parent-tag wrap of translate(), only for the tag-handling path.
 		$request_texts = $is_html
 			? array_map( [ self::class, 'wrap_for_tag_handling' ], $filtered )
 			: $filtered;
@@ -208,13 +193,8 @@ final class DeepLProvider extends AbstractProvider {
 			);
 		}
 
-		// Cardinality contract: one translation per text sent, in order. The
-		// batch is then mapped BY INDEX onto the caller's strings, so a short
-		// or over-long reply does not degrade gracefully - it silently shifts
-		// every later translation onto the wrong source. Core's
-		// TranslationService already refuses a mismatched batch, but this
-		// provider is a public class a third party can call directly, and the
-		// check that protects them costs one integer comparison per batch.
+		// One translation per text, in order: mapped by index, a count mismatch shifts every later translation.
+		// Checked here too because a third party may call this public class directly.
 		if ( count( $data['translations'] ) !== count( $filtered ) ) {
 			throw new \RuntimeException(
 				esc_html(
@@ -235,8 +215,7 @@ final class DeepLProvider extends AbstractProvider {
 			$translated = $is_html
 				? self::unwrap_from_tag_handling( $translation['text'] ?? '' )
 				: (string) ( $translation['text'] ?? '' );
-			// The result filter receives the RAW pre-filter source, matching
-			// translate()'s documented contract.
+			// The result filter receives the raw pre-filter source, as in translate().
 			$results[] = (string) apply_filters(
 				'perflocale/machine_translation/result',
 				$translated,
@@ -245,8 +224,7 @@ final class DeepLProvider extends AbstractProvider {
 			);
 		}
 
-		// Track usage once for the whole batch, counted on the filtered
-		// texts - what was actually sent.
+		// Usage counts the filtered texts: what was sent.
 		$total_chars = 0;
 		foreach ( $filtered as $text ) {
 			$total_chars += mb_strlen( (string) $text );
@@ -284,11 +262,7 @@ final class DeepLProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Get the API key from settings.
-	 *
-	 * Resolved transparently as env var → PHP constant → database via
-	 * Settings::get() (see Settings::CONSTANT_MAP for the env/constant
-	 * name binding: PERFLOCALE_DEEPL_API_KEY ↔ mt_deepl_api_key).
+	 * The API key: env var or constant PERFLOCALE_DEEPL_API_KEY first, then the database (Settings::get()).
 	 *
 	 * @return string
 	 */
@@ -299,13 +273,7 @@ final class DeepLProvider extends AbstractProvider {
 	/**
 	 * Resolve the configured formality into a DeepL `formality` parameter.
 	 *
-	 * DeepL supports formality for a subset of target languages and rejects
-	 * the whole request with HTTP 400 when it is sent for any other target.
-	 * The documented way to express "use it where available" is the
-	 * `prefer_` prefix, which DeepL ignores instead of erroring - so a
-	 * site-wide setting can't hard-fail translations into, say, English.
-	 * Hard-coding the supported-language list here would drift as DeepL
-	 * adds languages.
+	 * Always `prefer_`: plain formality makes DeepL refuse a target without it (HTTP 400), and a list of targets would drift.
 	 *
 	 * @return string DeepL formality value, or '' when unset/default.
 	 */
@@ -344,15 +312,10 @@ final class DeepLProvider extends AbstractProvider {
 	/**
 	 * Normalize a language code to DeepL's expected format.
 	 *
-	 * DeepL has asymmetric source/target requirements:
-	 * • source_lang accepts base codes only (EN, PT, ZH - not EN-US, PT-BR)
-	 * • target_lang requires a variant for some languages (EN-US/EN-GB, PT-BR/PT-PT)
-	 *
-	 * Accepts any input shape: 'en', 'EN', 'en_US', 'en-us', 'EN-US'.
+	 * Source codes are base only (EN, not EN-US); a target needs a variant for EN and PT (EN-US, PT-PT by default).
 	 *
 	 * @param string $code Language code (base, locale-underscore, or dash-variant).
-	 * @param bool   $is_target true for target_lang (keep / default variant);
-	 *   false for source_lang (strip variant).
+	 * @param bool   $is_target true for target_lang (keep or default the variant), false for source_lang (strip it).
 	 * @return string DeepL-compatible language code.
 	 */
 	private function map_language_code( string $code, bool $is_target = true ): string {
@@ -396,27 +359,14 @@ final class DeepLProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Sentinel tag used to wrap each input so DeepL's v2 tag-handling
-	 * parser is happy. The element name is intentionally unusual to avoid
-	 * collisions with content the user might already have authored
-	 * (e.g. a literal `<x>` in their post would survive the round-trip,
-	 * but `<perflocale-mt-root>` is far less likely to appear).
+	 * Parent element DeepL's tag-handling parser needs; an unusual name, so it does not collide with authored markup.
 	 *
-	 * NOTE: This wrap is DeepL-specific. Google (`format=html`),
-	 * Microsoft (`textType=html`), and LibreTranslate (`format=html`)
-	 * accept plain-text inputs without a parent element - only DeepL's
-	 * v2 parser has the "text without parent" restriction. Adding the
-	 * same wrap to those providers would add latency for no benefit and
-	 * risk leakage if their decoders ever escape the tag literally.
+	 * DeepL only: the other providers accept text without a parent, and a decoder that escapes the tag would leak it.
 	 */
 	private const WRAP_TAG = 'perflocale-mt-root';
 
 	/**
-	 * Wrap a text payload in a neutral parent element before sending to
-	 * DeepL with `tag_handling=html`. v2 of DeepL's parser rejects inputs
-	 * that don't have a parent tag (plain-text post titles, single-word
-	 * excerpts, etc.) with `'text without parent'`. Wrapping makes every
-	 * input - plain-text or HTML - have one consistent root.
+	 * Wrap a text in the parent element DeepL's `tag_handling=html` parser requires ("text without parent").
 	 *
 	 * @param string $text Source text.
 	 * @return string Wrapped text.
@@ -426,11 +376,7 @@ final class DeepLProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Strip the wrapping tag added by {@see wrap_for_tag_handling()} from
-	 * a translation response. Defensive: only strips when both the open
-	 * and close tags are present at the expected positions, so a response
-	 * that didn't get wrapped (older request, future API change) passes
-	 * through untouched.
+	 * Strip the wrap from a translation, only when both tags are at the ends: an unwrapped answer passes untouched.
 	 *
 	 * @param string $text Translated text from DeepL.
 	 * @return string Unwrapped text.

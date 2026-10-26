@@ -14,11 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Registers and enqueues the Gutenberg/Block Editor sidebar panel.
- *
- * The sidebar panel is a React component that shows all language
- * versions and their status, with actions to create, edit, or
- * machine-translate.
+ * Enqueues the block editor and Site Editor Translations panels and the Block translation panel.
  */
 final class EditorSidebar {
 
@@ -34,31 +30,8 @@ final class EditorSidebar {
 	/**
 	 * Enqueue the Site Editor translations panel.
 	 *
-	 * Templates and template parts cannot be opened in the post editor, so
-	 * before this they were the only translatable objects with no in-editor way
-	 * to see or reach their translations - which is exactly where the question
-	 * arises, since a template's translations are otherwise invisible until you
-	 * leave for the Translations screen.
-	 *
-	 * The panel resolves the edited entity CLIENT-SIDE. The Site Editor is a
-	 * single-page app: the operator moves between the 404 template, the header
-	 * part and back with no reload, so anything localised here would describe
-	 * whichever entity happened to be open first. Only the static configuration
-	 * is passed across; the script subscribes to `core/editor` for the rest.
-	 *
-	 * Reads and creates through the existing `perflocale/v1/translations/post/<id>`
-	 * route, the one the post-editor panel uses. It requires `perflocale_translate`
-	 * and `edit_post` for the specific object, and a create also the copy source's
-	 * edit and read rights and its type's create capability - so this adds no new
-	 * capability surface, and a user who cannot edit a template cannot enumerate
-	 * or create its translations either.
-	 *
-	 * The same script adds a notice to a Navigation block or synced pattern in
-	 * a translated template or template part when the block still names the
-	 * original-language menu or pattern, with an Open or Create link to its
-	 * translation in that language, and a Publish action for a draft or
-	 * pending menu translation (the Site Editor has no status control for
-	 * menus; the action saves the status through core's own route).
+	 * Static configuration only: the Site Editor changes entity without a reload, so the script reads it from
+	 * `core/editor`. It uses the post panel's REST route and its capability checks.
 	 *
 	 * @return void
 	 */
@@ -66,9 +39,7 @@ final class EditorSidebar {
 		$settings   = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 		$post_types = $settings->get_translatable_post_types();
 
-		// Only the types the Site Editor can actually open. Ordinary types are
-		// served by the post-editor panel; listing them here would register a
-		// panel that never renders.
+		// Only the types the Site Editor opens; the others have the post-editor panel.
 		$site_editor_types = array_values(
 			array_intersect(
 				$post_types,
@@ -76,8 +47,7 @@ final class EditorSidebar {
 			)
 		);
 
-		// Nothing the Site Editor edits is translatable on this site - for
-		// example Full Site Editing is off - so ship no script at all.
+		// Nothing the Site Editor edits is translatable here: no script.
 		if ( $site_editor_types === [] ) {
 			return;
 		}
@@ -145,10 +115,7 @@ final class EditorSidebar {
 	public function enqueue_sidebar(): void {
 		$screen = get_current_screen();
 
-		// The Site Editor is a different editor with a different screen base and
-		// a different lifecycle - the edited entity changes without a reload -
-		// so it gets its own, much smaller panel rather than being forced
-		// through this one.
+		// The Site Editor changes entity without a reload, so it has its own panel.
 		if ( $screen && $screen->base === 'site-editor' ) {
 			$this->enqueue_site_editor_sidebar();
 
@@ -167,13 +134,19 @@ final class EditorSidebar {
 		}
 
 		$asset_file = PERFLOCALE_DIR . 'assets/js/editor-sidebar.asset.php';
-		$deps       = [ 'wp-plugins', 'wp-edit-post', 'wp-element', 'wp-components', 'wp-data', 'wp-i18n', 'wp-api-fetch' ];
+		$deps       = [ 'wp-plugins', 'wp-edit-post', 'wp-element', 'wp-components', 'wp-data', 'wp-hooks', 'wp-i18n', 'wp-api-fetch' ];
 		$version    = PERFLOCALE_VERSION;
 
 		if ( file_exists( $asset_file ) ) {
 			$asset   = require $asset_file;
 			$deps    = $asset['dependencies'] ?? $deps;
 			$version = $asset['version'] ?? $version;
+		}
+
+		// The script fires its perflocale.* JavaScript hooks through wp.hooks.
+		$deps = is_array( $deps ) ? array_values( array_filter( $deps, 'is_string' ) ) : [];
+		if ( ! in_array( 'wp-hooks', $deps, true ) ) {
+			$deps[] = 'wp-hooks';
 		}
 
 		wp_enqueue_script(
@@ -184,17 +157,10 @@ final class EditorSidebar {
 			true
 		);
 
-		// Load the JS translations for this handle. Without it the wp.i18n.__()
-		// strings in the script file stay untranslated no matter what a
-		// translator supplies - WordPress only wires a script's JSON language
-		// pack when the handle is registered here. No-ops until a language pack
-		// exists, so it is safe on a fresh install.
+		// Without this the script's wp.i18n strings never load their JSON language pack.
 		wp_set_script_translations( 'perflocale-editor-sidebar', 'perflocale' );
 
-		// Resolve the singular label of the post type being edited so the
-		// "no language yet" prompt can read naturally on custom post types
-		// ("This movie…", "This event…") instead of always saying "post".
-		// Fall back to the generic word when no singular label is registered.
+		// The type's singular label for the "no language yet" prompt ("This movie..."), else "post".
 		$post_type_obj = get_post_type_object( $screen->post_type );
 		$singular      = $post_type_obj instanceof \WP_Post_Type && ! empty( $post_type_obj->labels->singular_name )
 			? strtolower( (string) $post_type_obj->labels->singular_name )
@@ -208,7 +174,9 @@ final class EditorSidebar {
 				'nonce'           => wp_create_nonce( 'wp_rest' ),
 				'postId'          => get_the_ID(),
 				'postType'        => $screen->post_type,
-				'mtCreateNotice' => MtCreateNotice::editor_message( (int) get_the_ID() ),
+				'mtCreateNotice' => AdminController::mt_create_notice_waiting( (int) get_the_ID() ) ? MtCreateNotice::editor_message( (int) get_the_ID() ) : '',
+				// SCRIPT_DEBUG reports a failing JavaScript hook callback once per hook in the console.
+				'debug'           => defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG,
 				'i18n'            => [
 					'panelTitle'     => __( 'Translations', 'perflocale' ),
 					'create'         => __( 'Create', 'perflocale' ),
@@ -229,10 +197,7 @@ final class EditorSidebar {
 			]
 		);
 
-		// Editor-sidebar context needs only the Translations Document Panel
-		// ruleset (+ spinner keyframe). Ship the dedicated ~6 KB file
-		// rather than the full ~92 KB admin.css. Extracted styles stay in
-		// sync with admin.css's "Gutenberg Document Panel - Translations".
+		// A small file instead of admin.css; keep it in step with admin.css's "Gutenberg Document Panel - Translations".
 		wp_enqueue_style(
 			'perflocale-editor-sidebar',
 			PERFLOCALE_URL . 'assets/css/editor-sidebar.css',
@@ -240,16 +205,7 @@ final class EditorSidebar {
 			PERFLOCALE_VERSION
 		);
 
-		// Separate "Block translation" sidebar panel: batch-translate
-		// every block in the open post via the recursive walker exposed by
-		// block-toolbar.js. Loaded as its own JS file so the existing sidebar's
-		// translation-management panel stays a standalone concern.
-		//
-		// Visibility: only enqueue when the user has opted into machine
-		// translation (Settings → Addons → Machine Translation → Enable). On a fresh
-		// install, or for sites that translate manually, the panel stays
-		// hidden so the editor sidebar isn't cluttered with a feature that
-		// can't be used.
+		// The Block translation panel (every block through block-toolbar.js's walker), only with MT enabled.
 		if ( ! $settings->mt_enabled() ) {
 			return;
 		}
@@ -257,10 +213,7 @@ final class EditorSidebar {
 		$mt_ready    = $this->mt_has_provider_configured();
 		$mt_provider = $mt_ready ? (string) $settings->get_mt_provider() : '';
 
-		// Build a compact language map mirroring what block-toolbar receives:
-		// just enough for the sidebar to render the "Translate to X" buttons.
-		// Plugin::get() throws on missing services, so the truthy check on its
-		// return value is statically dead - use has() to gate.
+		// The block toolbar's language map, trimmed. has(), because get() throws for a missing service.
 		$plugin_for_repo = \PerfLocale\Plugin::get_instance();
 		$lang_repo       = $plugin_for_repo->has( 'cache' )
 			? new \PerfLocale\Database\Repository\LanguageRepository( $plugin_for_repo->get( 'cache' ) )
@@ -271,18 +224,14 @@ final class EditorSidebar {
 			foreach ( $lang_repo->get_active() as $l ) {
 				$languages[] = [
 					'slug'  => (string) $l->slug,
-					// Canonical BCP 47 form, used by the JS for visible
-					// labels (e.g. confirm() dialogs). `slug` is reserved
-					// for identifier comparisons.
+					// Display only; `slug` is for comparisons.
 					'bcp47' => \PerfLocale\Helper::format_locale_as_bcp47( (string) $l->slug ),
 					'name'  => (string) ( $l->name ?? $l->native_name ?? $l->slug ),
 				];
 			}
 		}
 
-		// Resolve the open post's source language for the sidebar's "exclude
-		// source language from the buttons" filter. Mirrors the block toolbar's
-		// POST_SOURCE_LANG resolution so both UIs agree on what "source" is.
+		// The edited post's language, resolved as the block toolbar does so both agree on the source.
 		$post_source_lang = '';
 		$plugin           = \PerfLocale\Plugin::get_instance();
 		$current_post_id  = (int) get_the_ID();
@@ -299,9 +248,7 @@ final class EditorSidebar {
 			}
 		}
 
-		// Sibling-aware payload: mirrors the block-toolbar's resolution so
-		// the sidebar's "Translate entire post" can switch to a single
-		// "Fill all from source" action when the open post is a translation.
+		// As in the block toolbar: a translation gets "Fill all from source" instead of "Translate entire post".
 		$default_lang               = $lang_repo !== null ? $lang_repo->get_default() : null;
 		$default_lang_slug          = ( $default_lang && ! empty( $default_lang->slug ) ) ? (string) $default_lang->slug : '';
 		$is_sibling                 = false;
@@ -315,22 +262,12 @@ final class EditorSidebar {
 			&& $plugin->has( 'cache' )
 		) {
 			try {
-				$group_repo   = new \PerfLocale\Database\Repository\TranslationGroupRepository( $plugin->get( 'cache' ) );
-				$translations = $group_repo->get_translations( $current_post_id, \PerfLocale\Enum\ObjectType::Post );
-
-				foreach ( (array) $translations as $link ) {
-					if ( (int) ( $link->language_id ?? 0 ) !== (int) $default_lang->id ) {
-						continue;
-					}
-
-					$candidate_id = (int) ( $link->object_id ?? 0 );
-
-					if ( $candidate_id > 0 && get_post( $candidate_id ) instanceof \WP_Post ) {
-						$source_post_id_for_sibling = $candidate_id;
-						$is_sibling                 = true;
-						break;
-					}
-				}
+				$group_repo                 = new \PerfLocale\Database\Repository\TranslationGroupRepository( $plugin->get( 'cache' ) );
+				$source_post_id_for_sibling = self::viewable_source_post_id(
+					(array) $group_repo->get_translations( $current_post_id, \PerfLocale\Enum\ObjectType::Post ),
+					(int) $default_lang->id
+				);
+				$is_sibling                 = $source_post_id_for_sibling > 0;
 			} catch ( \Throwable $e ) {
 				$is_sibling = false;
 			}
@@ -339,18 +276,13 @@ final class EditorSidebar {
 		wp_enqueue_script(
 			'perflocale-block-translate-sidebar',
 			PERFLOCALE_URL . 'assets/js/block-translate-sidebar.js',
-			// wp-block-editor for the block-toolbar API surface that this
-			// panel calls into via window.perflocaleBlockTranslate.
+			// The panel calls block-toolbar.js through window.perflocaleBlockTranslate.
 			[ 'wp-plugins', 'wp-edit-post', 'wp-element', 'wp-i18n', 'wp-data', 'wp-block-editor' ],
 			PERFLOCALE_VERSION,
 			true
 		);
 
-		// Load the JS translations for this handle. Without it the wp.i18n.__()
-		// strings in the script file stay untranslated no matter what a
-		// translator supplies - WordPress only wires a script's JSON language
-		// pack when the handle is registered here. No-ops until a language pack
-		// exists, so it is safe on a fresh install.
+		// Without this the script's wp.i18n strings never load their JSON language pack.
 		wp_set_script_translations( 'perflocale-block-translate-sidebar', 'perflocale' );
 
 		wp_localize_script(
@@ -371,29 +303,44 @@ final class EditorSidebar {
 	}
 
 	/**
-	 * Whether at least one MT provider has its API key configured.
+	 * The group's default-language post, if it exists and the user may view it; otherwise 0.
 	 *
-	 * Mirrors the same check Bootstrap.php runs to set the `mtReady` flag
-	 * for block-toolbar.js, kept in sync so both sidebars agree on
-	 * whether the MT actions should appear.
+	 * 0 keeps the id of a source the user may not view out of every script and hook.
+	 *
+	 * @param array<mixed> $links           The group's translation links.
+	 * @param int          $default_lang_id The default language's id.
+	 * @return int The source post id, or 0.
+	 */
+	public static function viewable_source_post_id( array $links, int $default_lang_id ): int {
+		foreach ( $links as $link ) {
+			if ( ! is_object( $link ) || ! is_numeric( $link->language_id ?? null ) || (int) $link->language_id !== $default_lang_id ) {
+				continue;
+			}
+
+			$candidate_id = is_numeric( $link->object_id ?? null ) ? (int) $link->object_id : 0;
+
+			if ( $candidate_id > 0 && get_post( $candidate_id ) instanceof \WP_Post && \PerfLocale\Helper::user_can_view_object( $candidate_id ) ) {
+				return $candidate_id;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Whether the selected MT provider is ready, as BlockToolbarAssets checks it.
 	 *
 	 * @return bool
 	 */
 	/**
-	 * Apply sprintf with a single %s placeholder, falling back to the
-	 * original (English) format string if the translated version dropped or
-	 * miscounted the placeholder. Avoids the PHP notice that vanilla
-	 * `sprintf( __( ... ) )` emits on every editor load when a translator
-	 * omits %s.
+	 * Apply sprintf with one %s, using the English format when a translation miscounts it.
 	 *
 	 * @param string $format Translated format string.
 	 * @param string $arg    Singular substitution value.
 	 * @return string
 	 */
 	private function safe_sprintf_singular( string $format, string $arg ): string {
-		// Count *literal* %s occurrences (not %d, %1$s, etc.). One is the
-		// expected shape; anything else means the translation diverged
-		// from the contract and we should bail out gracefully.
+		// Exactly one literal %s (not %%s, %d or %1$s).
 		$matches = preg_match_all( '/(?<!%)%s/', $format );
 
 		if ( $matches !== 1 ) {
@@ -416,10 +363,7 @@ final class EditorSidebar {
 			$plugin->get( 'cache' )
 		);
 
-		// Tighter than `has_any_configured_provider()`: the *selected*
-		// provider must be ready, not just any provider with a key. Keeps
-		// the editor's Translate buttons aligned with what a click can
-		// actually do at request time. See TranslationService docblock.
+		// The selected provider, not any provider with a key: a click must work at request time.
 		return $service->is_active_provider_ready();
 	}
 

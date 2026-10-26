@@ -6,9 +6,8 @@
  * (optionally) a [data-perflocale-dropzone-name] node. Without JS, the
  * native file picker still works via the label's click forwarding.
  *
- * Conditionally enqueued by Admin\Assets.php - only on the Strings and
- * Glossary admin screens, since those are the only places the dropzone
- * markup is rendered.
+ * Enqueued by Admin\Assets.php on the Strings and Settings screens only, where the
+ * dropzone markup is rendered.
  *
  * @package PerfLocale
  */

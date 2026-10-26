@@ -14,19 +14,30 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The placeholder contract every mask restores by: each placeholder sent
- * comes back exactly once, and the answer holds no other token of the
- * placeholders' form. A placeholder lost, repeated or invented means the
- * answer is damaged and must not be written.
+ * The contract every mask restores by: each placeholder sent comes back exactly once and no other token of its form.
+ *
+ * A placeholder lost, repeated or invented means a damaged answer that must not be written.
  */
 final class PlaceholderCheck {
 
 	/**
-	 * How many placeholders an answer damaged.
+	 * The answer with each block and shortcode placeholder comment in its sent spelling `<!-- pfl-b-... -->`.
 	 *
-	 * One scan of the answer finds every token of the placeholders' form and
-	 * counts each token's text; each placeholder sent is then looked up in
-	 * those counts.
+	 * A provider may drop the spaces inside a comment; a name changed in any other way stays damaged.
+	 *
+	 * @param string $answer Provider answer.
+	 * @return string
+	 */
+	public static function respaced( string $answer ): string {
+		if ( ! str_contains( $answer, '<!--' ) ) {
+			return $answer;
+		}
+
+		return preg_replace( '/<!--\s*+(pfl-[bs]-[0-9a-f]{12}-\d++)\s*+-->/', '<!-- $1 -->', $answer ) ?? $answer;
+	}
+
+	/**
+	 * How many placeholders an answer damaged.
 	 *
 	 * @param string             $answer Provider answer.
 	 * @param array<int, string> $sent   The text of each placeholder sent. Each one is a whole match of $any.

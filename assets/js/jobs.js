@@ -71,6 +71,39 @@
 		return format(t('stageProgress', '%1$s: %2$s of %3$s'), [label, formatNumber(processed), formatNumber(total)]);
 	};
 
+	// JavaScript hooks (wp.hooks). With SCRIPT_DEBUG, a callback that throws
+	// is reported once per hook in the console.
+	var hookWarned = {};
+
+	// wp.hooks.doAction in a try/catch: a callback that throws does not stop the poller.
+	function doAction(name, context) {
+		var hooks = window.wp && window.wp.hooks;
+
+		try {
+			if (hooks && typeof hooks.doAction === 'function') {
+				hooks.doAction(name, context);
+			}
+		} catch (e) {
+			if (perflocaleJobs.debug && !hookWarned[name] && window.console) {
+				hookWarned[name] = true;
+				window.console.warn('PerfLocale: ' + name + ': a callback threw.');
+			}
+		}
+	}
+
+	/**
+	 * @typedef {Object} Job
+	 * @property {string} id The job id.
+	 * @property {string} type The job type, e.g. bulk_string_translate, bulk_translate or site_translate.
+	 * @property {string} status 'queued', 'running', 'complete', 'failed' or 'canceled'.
+	 * @property {string} previousStatus The status the screen showed before.
+	 * @property {number} progress Percent, 0-100.
+	 * @property {string} stage The running stage, or ''.
+	 * @property {number} processed Items done in the stage.
+	 * @property {number} total Items in the stage.
+	 * @property {number} updatedAt Last update, Unix time in seconds.
+	 */
+
 	var humanDelta = function (ts) {
 		if (!ts) {
 			return '';
@@ -147,8 +180,41 @@
 								if (status === 'complete' || status === 'failed' || status === 'canceled') {
 									anyTerminalNow = true;
 								}
+								var previous = String(span.className).split(' ').filter(function (c) {
+									return c !== '' && c !== 'perflocale-jobs-status';
+								})[0] || '';
 								span.className = 'perflocale-jobs-status ' + status;
 								span.textContent = labels[status] || status;
+
+								/**
+								 * @hook perflocale.jobs.statusChanged
+								 * @kind action
+								 * @since 1.0.7.4
+								 * @cardinality observed-change
+								 * @fires When the Jobs screen's poll sees a row's status differ from the one shown: several per poll are possible, a shown status never fires again, a status between two polls can be skipped. Only while the screen is open, before the reload a finished job causes: synchronous work only (or navigator.sendBeacon).
+								 * @context {Object} context
+								 * @property {number} context.version 1.
+								 * @property {Job} context.job The job, with the fields of the poll response.
+								 * @property {string} context.screen 'jobs'.
+								 * @example wp.hooks.addAction( 'perflocale.jobs.statusChanged', 'acme/notify', function ( ctx ) {
+								 *     if ( ctx.job.type === 'bulk_translate' && ctx.job.status === 'complete' ) { navigator.sendBeacon( '/acme/done', ctx.job.id ); }
+								 * } );
+								 */
+								doAction('perflocale.jobs.statusChanged', {
+									version: 1,
+									job: {
+										id: String(j.id || ''),
+										type: String(j.type || ''),
+										status: status,
+										previousStatus: previous,
+										progress: Math.min(100, Math.max(0, j.progress | 0)),
+										stage: typeof j.stage === 'string' ? j.stage : '',
+										processed: parseInt(j.processed, 10) || 0,
+										total: parseInt(j.total, 10) || 0,
+										updatedAt: parseInt(j.updated_at, 10) || 0
+									},
+									screen: 'jobs'
+								});
 							}
 						}
 

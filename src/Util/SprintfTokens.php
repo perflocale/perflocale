@@ -14,37 +14,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Distinct-placeholder extraction for sprintf-style format strings.
+ * Distinct sprintf placeholders of a format string, which a string translation must also contain.
  *
- * Used by the Strings admin modal validator AND the page-save fallback
- * to keep the client and server in agreement about which tokens appear
- * in a msgid (and must therefore appear, with matching positional
- * indices, in the translation).
+ * The Strings page checks with it server side; assets/js/strings-validate.js mirrors PATTERN client side.
  *
- * Lives in PerfLocale\Util because it's a generic string-parsing
- * utility - nothing about it is multilingual-specific.
- *
- * @internal Implementation detail. The public surface is the static
- *           extract() method below - third-party code that needs this
- *           parser should call it directly; everything else may change.
+ * @internal Only extract() is meant for other callers; everything else may change.
  */
 final class SprintfTokens {
 
 	/**
-	 * Regex (without delimiters) matching a single sprintf token.
+	 * Regex body (no delimiters) for one token: `%`, optional `N$`, flags, width, `.precision`, specifier; or `%%`.
 	 *
-	 *   %<positional?><flags><width><precision?><specifier>
-	 *
-	 *   - `<positional>` is an optional `N$` prefix (e.g. `%1$s`).
-	 *   - `<flags>` may include any of `-+ #0'`.
-	 *   - `<width>` may be digits or `*` (consume next sprintf arg).
-	 *   - `<precision>` is `.` followed by digits or `*`.
-	 *   - `<specifier>` covers the WP/PHP set: b c d e E f F g G o O s u x X.
-	 *
-	 * Returned without the leading `/` and trailing `/g` so callers can
-	 * pick their own delimiters and modifiers.
+	 * Width starts with 1-9 (zeros are flags), so each token has one parse and matching stays linear.
 	 */
-	public const PATTERN = '%(%|(?:\d+\$)?[-+ #0\']*\d*[bcdeEfFgGoOsuxX]|(?:\d+\$)?[-+ #0\']*(?:\d+|\*)?(?:\.(?:\d+|\*))?[bcdeEfFgGoOsuxX])';
+	public const PATTERN = '%(%|(?:\d+\$)?[-+ #0\']*(?:[1-9]\d*|\*)?(?:\.(?:\d+|\*))?[bcdeEfFgGoOsuxX])';
 
 	/**
 	 * Extract distinct sprintf placeholders from a string in their order

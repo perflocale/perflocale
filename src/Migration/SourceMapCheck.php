@@ -19,22 +19,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Checks a migration source-map row before an importer reuses its group.
  *
- * A row can outlive what it described: a Replace import or a restore can
- * bring back groups under other ids, and a group can since hold other posts
- * or terms. Reusing such a row would link posts into a term group, or move
- * another set's items. Shared by the Polylang and WPML importers.
+ * A Replace import or a restore can renumber groups, and a group can gain other items; reusing a stale
+ * row would link posts into a term group or move another set's items.
  */
 final class SourceMapCheck {
 
 	/**
-	 * Whether a recorded group still fits: it exists, holds the right kind of
-	 * object, and holds no post or term outside the set in a language the set
-	 * uses (a translation the owner added in another language is fine). An
-	 * empty group fits. With $alone (a single object), the group must hold
-	 * nothing at all.
+	 * Whether a recorded group still fits: right type, no outside item in a language the set uses.
 	 *
-	 * Reads the group and its links from the database in one query,
-	 * uncached: importers read their own writes.
+	 * Uncached on purpose: importers read their own writes.
 	 *
 	 * @param ObjectType      $type     Object type.
 	 * @param int             $group_id Recorded group.

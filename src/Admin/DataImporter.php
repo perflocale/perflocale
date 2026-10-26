@@ -1,6 +1,6 @@
 <?php
 /**
- * Data importer - imports plugin data from JSON export file.
+ * Imports plugin data from a JSON export file.
  *
  * @package PerfLocale
  */
@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Admin;
 
+use PerfLocale\Database\ConnectionGuard;
 use PerfLocale\Database\DataRegistry;
 use PerfLocale\Database\Schema;
 
@@ -17,115 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Imports PerfLocale data from a JSON export file.
+ * Imports PerfLocale data from a JSON export file, read in pieces (ImportReader), in Replace or Merge mode.
  *
- * Validates the file structure, then imports each table in batches
- * with optional replace-all or merge mode.
- *
- * ## Reading the file in pieces
- *
- * The file is read through {@see ImportReader}: one pass records the
- * envelope and where each table's rows are, the data-quality pass decodes
- * every row once (so nothing is written from a file that is not valid
- * JSON), and each table is then imported a piece at a time
- * (`perflocale/import/batch_size` rows). Memory follows the piece and the
- * id maps a merge keeps, not the size of the file.
- *
- * ## Merge-mode limitation for translation_groups (v1)
- *
- * `translation_groups` carries no natural key - its only identifier is the
- * auto-increment `id`, used as an FK target by `translation_links`. In
- * **replace mode** the importer truncates the table first and preserves
- * the export's ids, so re-importing the same export is a no-op.
- *
- * In **merge mode** each group re-imports as a NEW row (auto-increment
- * issues a fresh id), and the matching `translation_links` skip on the
- * `object_lang (type, object_id, language_id)` UNIQUE constraint - so the
- * new groups never get linked to anything. The transient orphan rows are
- * cleaned up by
- * {@see self::sweep_orphan_groups()} which runs once at the end of every
- * merge-mode import, but during the import window an operator who
- * inspects `wp_perflocale_translation_groups` directly will see
- * duplicates of the rows they just re-imported.
- *
- * A file group with a member that already exists here (same object, same
- * language) joins that member's group instead, so the members the file adds
- * are paired with it ({@see self::plan_link_anchors()}); and a link that
- * would give a post or term a second language is left out and counted
- * ({@see self::check_merge_links()}).
- *
- * The full architectural fix (a `(source_site, source_group_id)` natural
- * key persisted across re-imports, OR a content-fingerprint computed from
- * each group's link tuples) is deferred to a post-1.0 release because:
- *
- *   - The transient duplicates are swept automatically - no permanent
- *     data corruption, just brief auto-increment-id waste during the
- *     import.
- *   - Operators concerned with deterministic re-import results should
- *     choose **replace mode** (merge is what both the admin form and the
- *     CLI default to).
- *   - The migration importers (WPML / Polylang / TranslatePress) already
- *     get this guarantee via `perflocale_migration_source_map`; the
- *     export/import path is the only operator-facing gap.
- *
- * Documented as a known v1 constraint in the merge-mode admin-UI tooltip
- * ({@see \PerfLocale\Admin\Pages\SettingsPage::render_export_import_tab()}).
- *
- * ## Numeric IDs do not travel between sites
- *
- * `translation_links`, `slug_translations` and `content_hashes` name a post
- * or a term by its numeric `object_id`, and the registry's FK map
- * (DataRegistry::fk_refs()) has no
- * entry for that column because no natural key exists to resolve one site's
- * IDs to another's. The same holds for a `type='string'` link, whose
- * `object_id` is the exporting site's `strings.id`, unless a merge carries
- * the strings too: then the link follows its string's new id. Rows that name a
- * language by `language_id` are remapped only while the bundle's own
- * `languages` section is being imported, and only in merge mode.
- *
- * So a bundle carrying those rows is meaningful on the site that wrote it
- * and on a copy of that site, and nowhere else. {@see self::import()}
- * refuses such a bundle when the envelope's recorded address is not this
- * site's, unless the operator confirms the copy relationship
- * (`$options['allow_foreign_ids']`). Settings and roles name nothing by id,
- * so they never cause a refusal (see "Configuration" below for when they are
- * applied); strings match on `original_hash` and travel too, as long as the
- * `languages` section their `language_id` points into travels with them.
- *
- * In REPLACE mode the same refusal fires on a foreign bundle whose row
- * lists are all empty, because {@see self::tables_to_wipe()} plans a DELETE
- * for every table of a declared section that the file carries as a row
- * list, empty or not: an otherwise empty file from another site would
- * silently empty this site's tables.
- *
- * What the gate does NOT cover, because a language row names nothing by id
- * and is matched by slug: a foreign bundle whose only section is
- * `languages` imports in merge mode, and in replace mode is refused only
- * for the wipe it declares. A CONFIRMED foreign replace that carries
- * `languages` still re-inserts the exporting site's language ids, and the
- * destination rows the bundle does not own keep pointing at the ids those
- * numbers used to mean.
- *
- * The gate reads the sections this class owns. A section an addon shipped
- * through `perflocale/export/sections` is dispatched to its own
- * `perflocale/import/section/<name>` listener AFTER the gate, and nothing
- * here inspects its payload - whether those rows survive a move to another
- * site is the addon's question to answer.
- *
- * ## Configuration: Replace applies it, Merge never does
- *
- * The file's settings, add-on settings, disabled-add-on list and role grants
- * (the `settings` and `roles` export sections) are applied in REPLACE mode
- * only. A MERGE import adds rows and leaves this site's configuration as it
- * is: each of those four parts the file carries is counted in `skipped` and
- * named in the result's `not_applied`, with a `notice` for the operator. A
- * file that carries only those sections owns no table, so a Replace import
- * of it deletes no row. The settings that describe the site itself (its
- * domains, provider endpoints, uninstall choice and paused queue; see
- * {@see self::kept_setting_keys()}) keep this site's values in Replace too,
- * and the report names those the file had differently. Replace applies the configuration after its table
- * transaction has committed, so an import that fails or dies inside the
- * transaction changes neither the tables nor the configuration.
+ * Merge re-inserts groups (orphans swept); object ids hold only on the source site or a copy; only Replace applies
+ * configuration. Docs: docs-ai/11-code-rationale.md, "DataImporter: reading, merge groups and foreign ids".
  *
  * @phpstan-type ImportResult array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool, not_applied?: array<int, string>, notice?: string, refused_addresses?: array<int, string>, address_notice?: string, notes?: array<int, string>, default_language_kept?: string, skipped_reasons?: array<string, int>, kept_settings?: array<int, string>, unread_sections?: array<int, string>, undeclared_sections?: array<int, string>, changed_matches?: array<string, int>}
  */
@@ -144,62 +40,49 @@ final class DataImporter {
 	public const BATCH_SIZE_MAX = 5000;
 
 	/**
-	 * How a replace import looks up each unique key per piece: table =>
-	 * [ key index in DataRegistry::unique_keys() => the column whose values form the IN list ].
-	 * A table not listed here (languages, slug_translations) has text keys
-	 * that must compare the way the database's indexes compare them, so its
-	 * keys are read whole once instead; both tables stay small.
+	 * KEY_LOOKUP: per table, unique key index (DataRegistry::unique_keys()) => the column of its per-piece IN list. Tables
+	 * not listed (languages, slug_translations) have text keys read whole once, compared as the database compares them.
 	 */
 	/**
-	 * Largest row id an import accepts (2^53 - 1). A replace keeps the file's
-	 * ids, and an id near the BIGINT ceiling would push the table's next id
-	 * there.
+	 * Largest row id an import accepts (2^53 - 1): Replace keeps the file's ids, and one near the BIGINT ceiling would move
+	 * the next id there.
 	 */
 	private const MAX_ROW_ID = 9007199254740991;
 
 	/**
-	 * Fewest bytes a table row the data-quality gate accepts takes in an
-	 * export file: an empty column map (`{}` or `[]`) and the comma after it.
+	 * Fewest bytes a table row takes in an export file (`{}` and a comma), for the data-quality gate.
 	 */
 	private const MIN_ROW_BYTES = 3;
 
 	/**
-	 * Memory a Merge keeps for each row of a file's largest table until the
-	 * import ends (id maps, link anchors, linked posts and the like), with a
-	 * margin: measured at about 220 bytes per translation link row (0.44 KB
-	 * per translation group with two links).
+	 * Memory a Merge keeps per row of the file's largest table until it ends (id maps, anchors, linked posts), with a
+	 * margin over the about 220 bytes measured per link row.
 	 */
 	private const RETAINED_BYTES_PER_ROW = 512;
 
 	/**
-	 * The share of the memory still free when the import starts that the
-	 * retained state may take, in percent.
+	 * Share of the memory free at the start that the retained state may take, in percent.
 	 */
 	private const RETAINED_MEMORY_SHARE = 80;
 
 	/**
-	 * The row ceiling of 1.0.7.2 and earlier: the memory-based default never
-	 * refuses a file those versions accepted.
+	 * The row ceiling of 1.0.7.2 and earlier: the memory-based default never refuses a file those accepted.
 	 */
 	private const LEGACY_MAX_ROWS = 500000;
 
 	/**
-	 * Tables whose `type = 'string'` rows belong to the String Translations
-	 * section even though Translation Links exports the tables whole.
+	 * Tables whose `type = 'string'` rows belong to String Translations, though Translation Links exports them whole.
 	 */
 	private const STRING_SLICE_TABLES = [ 'translation_groups', 'translation_links' ];
 
 	/**
-	 * Top-level keys of a file that carry configuration (applied by Replace
-	 * only, see apply_configuration()).
+	 * Top-level keys that carry configuration (Replace only, apply_configuration()).
 	 */
 	private const CONFIGURATION_KEYS = [ 'settings', 'addon_settings', 'disabled_addons', 'roles' ];
 
 	/**
-	 * The first plugin version whose exports always record the site address
-	 * and fingerprint every ID-keyed row whose object exists. A file from
-	 * this version on that lacks either is treated as a copy from another
-	 * site (see import_from()).
+	 * First version whose exports always record the site address and fingerprint every id-keyed row whose object exists;
+	 * a file from it on lacking either is treated as from another site (import_from()).
 	 */
 	private const IDENTITY_SINCE = '1.0.7.3';
 
@@ -222,47 +105,32 @@ final class DataImporter {
 	];
 
 	/**
-	 * Per-import old_id → new_id maps, keyed by parent table short-name.
+	 * The import's per-row bookkeeping while its tables are written (null otherwise): Merge's old => new id maps and link
+	 * anchors, Replace's moved groups, and the post ids the links name (TemplateBlockRefs); a TEMPORARY table, so memory
+	 * does not grow with the file.
 	 *
-	 * Populated as parent tables are imported and consumed when child
-	 * tables get their FK columns rewritten. Reset at the start of each
-	 * import() call so independent imports don't cross-contaminate.
-	 *
-	 * @var array<string, array<int, int>>
+	 * @var ImportWorkTable|null
 	 */
-	private array $id_maps = [];
+	private ?ImportWorkTable $work = null;
 
 	/**
-	 * Post ids the file's translation links name, as keys; collected while
-	 * the links are read, for TemplateBlockRefs::after_restore().
-	 *
-	 * @var array<int, true>
-	 */
-	private array $linked_posts = [];
-
-	/**
-	 * When the languages table is not cleared: this site's default language
-	 * code, read when the first default row of the file arrives ('' when the
-	 * site has none); null until then.
+	 * Languages table not cleared: this site's default language code, read at the file's first default row ('' for none;
+	 * null until then).
 	 *
 	 * @var string|null
 	 */
 	private ?string $site_default = null;
 
 	/**
-	 * When the languages table is not cleared: the code of the file's
-	 * default language when it was added as an ordinary language; ''
-	 * otherwise.
+	 * Languages table not cleared: the file's default language code when it was added as an ordinary language, else ''.
 	 *
 	 * @var string
 	 */
 	private string $default_kept = '';
 
 	/**
-	 * Whether this import cleared the languages table (a Replace whose file
-	 * carries the Languages section). Only then may a row of the file become
-	 * the site's default language as it stands; otherwise the guard in
-	 * import_piece() keeps this site's default.
+	 * Whether this import cleared the languages table (Replace with the Languages section): only then may a file row
+	 * become the default; otherwise import_piece() keeps this site's default.
 	 *
 	 * @var bool
 	 */
@@ -276,21 +144,11 @@ final class DataImporter {
 	private array $skip_reasons = [];
 
 	/**
-	 * Whether this import carries `strings` rows (a merge then maps every
-	 * string link through the strings' id map).
+	 * Whether this import carries `strings` rows (Merge then maps every string link through their id map).
 	 *
 	 * @var bool
 	 */
 	private bool $strings_carried = false;
-
-	/**
-	 * Merge mode: file group id => the group on this site that already holds
-	 * one of its members (same object, same language), or 0 when its members
-	 * sit in different groups here. See plan_link_anchors().
-	 *
-	 * @var array<int, int>
-	 */
-	private array $link_anchor = [];
 
 	/**
 	 * Whether this import added, replaced or removed language rows.
@@ -300,130 +158,75 @@ final class DataImporter {
 	private bool $languages_changed = false;
 
 	/**
-	 * Whether a replace import cleared translation_groups or
-	 * translation_links (whole or in part); the string-link reap and repair
-	 * then run whatever the file carried.
+	 * Whether a Merge began writing: when it stops after that, what it wrote is finished (finish_stopped_merge()).
+	 *
+	 * @var bool
+	 */
+	private bool $merge_writing = false;
+
+	/**
+	 * Whether a Replace cleared translation_groups or translation_links (whole or part); the string-link reap and repair
+	 * then run.
 	 *
 	 * @var bool
 	 */
 	private bool $replaced_link_tables = false;
 
 	/**
-	 * Whether this replace import cleared only the post and term rows of
-	 * translation_groups (a Translation Links file without String
-	 * Translations), so this site's string groups stay and can hold an id
-	 * the file gives a post or term group.
+	 * Whether a Replace cleared only the post and term rows of translation_groups (Translation Links without String
+	 * Translations), so this site's string groups stay and can hold an id the file gives a post or term group.
 	 *
 	 * @var bool
 	 */
 	private bool $groups_keep_strings = false;
 
 	/**
-	 * Whether this replace import cleared only the post and term rows of
-	 * translation_links, so this site's string links stay and can hold the
-	 * id the file gives a post or term link.
+	 * Whether a Replace cleared only the post and term rows of translation_links, so this site's string links stay and
+	 * can hold an id the file gives a post or term link.
 	 *
 	 * @var bool
 	 */
 	private bool $links_keep_strings = false;
 
 	/**
-	 * Replace mode: file group id => the id the group was written under,
-	 * for each post or term group of the file whose id a kept string group
-	 * holds. The file's links of that group are written into it under the
-	 * new id.
-	 *
-	 * @var array<int, int>
-	 */
-	private array $moved_groups = [];
-
-	/**
-	 * Language ids this site has, as keys; read on first use, after the
-	 * languages table has been imported.
+	 * This site's language ids as keys, read on first use (after the languages table was imported).
 	 *
 	 * @var array<int, true>|null
 	 */
 	private ?array $language_id_set = null;
 
 	/**
-	 * Rows whose post or term changed since the export but was still
-	 * recognised: matched part (guid, slug, date, name) => rows.
+	 * Rows whose post or term changed since the export but was still recognised: matched part (guid, slug, date, name)
+	 * => rows.
 	 *
 	 * @var array<string, int>
 	 */
 	private array $changed_matches = [];
 
 	/**
-	 * Import data from a JSON file.
+	 * Replace: the open transaction's connection guard (null outside it), so a write wpdb resends on a new connection
+	 * changes nothing.
+	 *
+	 * @var ConnectionGuard|null
+	 */
+	private ?ConnectionGuard $guard = null;
+
+	/**
+	 * Import data from a JSON file. Result keys: docs-ai/11-code-rationale.md, "DataImporter: configuration and the
+	 * result".
 	 *
 	 * @param string               $file_path        Path to the JSON file.
-	 * @param bool                 $replace          Whether to replace all existing data (true) or merge (false).
-	 *                                               Only replace applies the file's settings,
-	 *                                               add-on settings, add-on list and roles.
-	 * @param bool                 $sanitize_strings Run the text columns of three tables through
-	 *                                               the sanitizers the plugin's own writers
-	 *                                               apply for a user without `unfiltered_html`:
-	 *                                               `string_translations` values (the
-	 *                                               translation and each extra plural form)
-	 *                                               through Helper::sanitize_untrusted_string_translation();
-	 *                                               `languages` rows through
-	 *                                               LanguageRepository::sanitize_data(), with a
-	 *                                               row refused when sanitizing empties its code
-	 *                                               (the code's shape check is not applied);
-	 *                                               `slug_translations` slugs through
-	 *                                               sanitize_title() and object types through
-	 *                                               sanitize_key(), as
-	 *                                               SlugTranslationRepository::insert() does.
-	 *                                               The flag changes nothing else in the file.
-	 *                                               The caller decides: the admin import job
-	 *                                               passes true for a user without
-	 *                                               `unfiltered_html`; WP-CLI passes false
-	 *                                               and restores the file's bytes.
-	 * @param array<string, mixed> $options          Import options. One key is read:
-	 *                                               `allow_foreign_ids` - the operator has
-	 *                                               confirmed this site is a copy of the site
-	 *                                               the bundle came from, so the site-identity
-	 *                                               gate below is skipped. Read with
-	 *                                               `! empty()`: a replayed job's args come
-	 *                                               back out of JSON as `1`, `'1'` or `true`.
-	 *                                               `addon_choices` - the add-on data to import:
-	 *                                               a list of `addon_data` (the parts on the
-	 *                                               shared "Add-on data" checkbox, and every
-	 *                                               add-on row of a file from before add-on
-	 *                                               parts) and group parts (`<owner>/<group
-	 *                                               id>`). Absent or null: everything the file
-	 *                                               carries. A part whose add-on declares no
-	 *                                               such data on this site is skipped and named
-	 *                                               in `notes`, as is a part left out by choice.
+	 * @param bool                 $replace          Replace all existing data (true) or merge; only Replace applies the
+	 *                                               file's configuration.
+	 * @param bool                 $sanitize_strings Sanitize string translation, language and slug rows as the plugin's
+	 *                                               own writers do for a user without `unfiltered_html` (the admin job
+	 *                                               decides; WP-CLI passes false).
+	 * @param array<string, mixed> $options          `allow_foreign_ids` (the operator confirmed this site is a copy of
+	 *                                               the source; read with `! empty()`, a replayed job's value is 1, '1'
+	 *                                               or true) and `addon_choices` (`addon_data` and `<owner>/<group id>`
+	 *                                               parts to import; null: all the file carries).
 	 * @return array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool, not_applied?: array<int, string>, notice?: string, refused_addresses?: array<int, string>, address_notice?: string, notes?: array<int, string>, default_language_kept?: string, skipped_reasons?: array<string, int>, kept_settings?: array<int, string>, unread_sections?: array<int, string>, undeclared_sections?: array<int, string>, changed_matches?: array<string, int>}
-	 *         `notes` holds one sentence for each thing the import left out,
-	 *         kept or changed on purpose (the admin notice and WP-CLI print
-	 *         them). `default_language_kept` is the file's default language
-	 *         when an import that did not clear the languages table (a merge,
-	 *         or a Replace without the Languages section) added it as an
-	 *         ordinary language because this site already has a default.
-	 *         `sanitized` counts stored string translation, language and
-	 *         translated-slug rows that `$sanitize_strings` changed, whether
-	 *         markup was removed or a value was only reformatted.
-	 *         `not_applied` and `notice` are present only after a merge import
-	 *         of a file that carries configuration: `not_applied` lists the
-	 *         parts left unapplied (`settings`, `addon_settings`,
-	 *         `disabled_addons`, `roles`, each also counted in `skipped`), and
-	 *         `notice` says so in a sentence for the operator.
-	 *         `refused_addresses` and `address_notice` are present only when
-	 *         the settings update refused a provider address change
-	 *         (Settings::last_update_refused_addresses(): a multisite network,
-	 *         the provider's key supplied from outside the database, an
-	 *         importer who is not a super admin): the refused settings and the
-	 *         sentence that names them.
-	 *         `undeclared_sections` names the configuration keys and the
-	 *         members of `data` a file with a `sections` list carries
-	 *         outside every section it declares; they are not read.
-	 *         `refused` is present only when the import stopped before its
-	 *         first write: the file could not be read, failed the structure
-	 *         or data-quality checks, or a gate (site identity, the replace
-	 *         fingerprint share) refused it. A caller reports such a result as
-	 *         a failure that changed nothing; `errors` holds the reason.
+	 *         `refused`: stopped before its first write (a failure that changed nothing); `errors` says why.
 	 */
 	public function import( string $file_path, bool $replace = false, bool $sanitize_strings = false, array $options = [] ): array {
 		$result = [
@@ -433,29 +236,23 @@ final class DataImporter {
 			'sanitized' => 0,
 		];
 
-		// Reset cross-table id maps so independent import() calls don't
-		// cross-contaminate each other (e.g. CLI script doing two imports
-		// in a row).
-		$this->id_maps              = [];
-		$this->linked_posts         = [];
+		// Reset the id maps so two import() calls in one process never mix.
+		$this->work                 = null;
 		$this->site_default         = null;
 		$this->default_kept         = '';
 		$this->languages_cleared    = false;
 		$this->skip_reasons         = [];
 		$this->strings_carried      = false;
-		$this->link_anchor          = [];
 		$this->languages_changed    = false;
+		$this->merge_writing        = false;
 		$this->replaced_link_tables = false;
 		$this->groups_keep_strings  = false;
 		$this->links_keep_strings   = false;
-		$this->moved_groups         = [];
 		$this->language_id_set      = null;
 		$this->changed_matches      = [];
+		$this->guard                = null;
 
-		// One import at a time per site, whatever started it (the form,
-		// WP-CLI, a background job, a network-import slice): held from
-		// before the file is read until the last option and meta row is
-		// written, so two imports never mix their rows or configuration.
+		// One import per site at a time, whatever started it, from before the file is read until the last write.
 		if ( ! ImportLock::acquire() ) {
 			$result['errors'][] = ImportLock::busy_message();
 			$result['refused']  = true;
@@ -486,10 +283,7 @@ final class DataImporter {
 	private function import_locked( string $file_path, bool $replace, bool $sanitize_strings, array $options, array $result ): array {
 		$limits = self::quality_limits();
 
-		// Read the file's structure: the envelope fields and small sections
-		// are decoded, the table rows are only located and counted. The rows
-		// are decoded one at a time by the passes below, so neither the file
-		// nor its decoded tables are ever held whole.
+		// The structure: envelope and small sections decoded, table rows only located and counted (decoded one at a time later).
 		$reader = ImportReader::open( $file_path );
 
 		if ( null === $reader ) {
@@ -508,58 +302,45 @@ final class DataImporter {
 			}
 
 			return $this->import_from( $reader, $file_path, $replace, $sanitize_strings, $options, $limits, $result );
+		} catch ( \Throwable $e ) {
+			if ( $this->merge_writing ) {
+				$this->finish_stopped_merge();
+			}
+
+			throw $e;
 		} finally {
+			if ( null !== $this->work ) {
+				$this->work->close();
+				$this->work = null;
+			}
+
 			$reader->close();
 		}
 	}
 
 	/**
-	 * The data-quality and reader limits of an import, as the
-	 * perflocale/import/quality_limits filter returns them.
+	 * The data-quality and reader limits, as perflocale/import/quality_limits returns them.
 	 *
 	 * @return array<array-key, mixed>
 	 */
 	public static function quality_limits(): array {
 		/**
-		 * Filter the data-quality limits applied to imports.
+		 * Filter the data-quality limits applied to imports (also `wp perflocale network-import`).
 		 *
 		 * @hook perflocale/import/quality_limits
 		 *
 		 * @param array{max_languages?: int, max_rows_per_table?: int, max_value_bytes?: int, max_section_bytes?: int, max_config_bytes?: int, max_captured_bytes?: int, max_top_level_members?: int, max_data_members?: int} $limits
-		 *        Defaults: 500 / the rows that fit in PHP's memory_limit, never
-		 *        fewer than 500000 and never more than the import file ceiling
-		 *        divided by 3 (178956970 for the 512 MB
-		 *        `perflocale/import/max_file_bytes` default), so a file whose
-		 *        import would run out of memory is refused before anything is
-		 *        written; with no memory limit (-1), that file ceiling / 1048576 /
-		 *        33554432 / 4194304 / 67108864 / 1000 / 100000. `max_section_bytes`
-		 *        is the largest single row, and the largest add-on section, the
-		 *        importer reads; the file itself is read in pieces.
-		 *        `max_config_bytes` is the largest of the file's own top-level
-		 *        keys (settings, roles, add-on settings and the other envelope
-		 *        keys), which hold settings and lists, never content.
-		 *        `max_captured_bytes` is the most the importer keeps in all
-		 *        while it reads a file's structure (the sections other than the
-		 *        table rows, and the names of the tables); `max_top_level_members`
-		 *        the most top-level sections a file may have, and
-		 *        `max_data_members` the most tables and row lists in its `data`
-		 *        section (for `wp perflocale network-import`, the most sites).
-		 *        Only the core sections and the sections of an add-on that hooks
-		 *        `perflocale/import/section/<name>` are read; the importer walks
-		 *        over any other top-level section without keeping it. The same
-		 *        limits apply to `wp perflocale network-import`.
-		 *        The memory rule for `max_rows_per_table`: a Merge keeps about
-		 *        512 bytes (with margin) for each row of the file's largest table
-		 *        until the import ends, and may use 80% of the memory left free
-		 *        when the import starts. Return a `max_rows_per_table` to replace
-		 *        that default, for example on a host whose PHP processes may
-		 *        exceed memory_limit, or to keep large imports out.
+		 *        Defaults: 500 / the rows that fit in memory_limit (a Merge keeps about 512 bytes per row of the largest table
+		 *        and may use 80% of the free memory; never fewer than 500000, never more than the file ceiling / 3) / 1048576 /
+		 *        33554432 / 4194304 / 67108864 / 1000 / 100000. Section bytes: the largest row or add-on section read; config:
+		 *        the largest top-level key; captured: all kept while reading the structure; members: top-level sections and
+		 *        `data` entries (network-import: sites).
 		 */
 		return (array) apply_filters( 'perflocale/import/quality_limits', [] );
 	}
 
 	/**
-	 * The limits the reader applies while it reads a file's structure.
+	 * The limits the reader applies to a file's structure.
 	 *
 	 * @param array<array-key, mixed> $limits Quality limits (quality_limits()).
 	 * @return array{max_section_bytes: int, max_config_bytes: int, max_captured_bytes: int, max_top_level_members: int, max_data_members: int}
@@ -575,10 +356,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Whether the importer reads a top-level member of a file: a core
-	 * envelope key, or the section of an add-on that restores it through
-	 * `perflocale/import/section/<name>`. Any other member is walked over
-	 * without being kept and named as not imported.
+	 * Whether the importer reads a top-level member: a core envelope key or an add-on section restored through
+	 * `perflocale/import/section/<name>`; others are walked over and named as not imported.
 	 *
 	 * @param string $key Member key.
 	 * @return bool
@@ -604,8 +383,7 @@ final class DataImporter {
 			$reader->index(
 				$bounds['max_section_bytes'],
 				[ self::class, 'reads_member' ],
-				// The envelope's own keys hold settings and lists, never content:
-				// they get the smaller settings cap. Add-on sections keep the section cap.
+				// The envelope's own keys hold settings and lists: the smaller config cap. Add-on sections keep the section cap.
 				static function ( string $key ) use ( $bounds ): ?int {
 					return in_array( $key, DataExporter::RESERVED_SECTION_KEYS, true ) ? $bounds['max_config_bytes'] : null;
 				}
@@ -684,22 +462,16 @@ final class DataImporter {
 	}
 
 	/**
-	 * Rows read per piece for one table, and the interval of the importer's
-	 * per-piece work (look-ups, cache release).
+	 * Rows per piece for one table, also the interval of the per-piece work (look-ups, cache release).
 	 *
 	 * @param string $table_name Table short name.
 	 * @return int
 	 */
 	private static function batch_size( string $table_name ): int {
 		/**
-		 * Rows the data importer reads and checks per piece.
-		 *
-		 * The importer reads an export file a piece at a time: for each piece
-		 * it runs one look-up query per unique key of the table (so rows that
-		 * would collide are skipped before any write) and then inserts the
-		 * rows one by one. Larger pieces mean fewer look-ups; smaller ones
-		 * keep peak memory lower. Clamped to 50-5000. `wp perflocale import
-		 * --batch-size` (and `network-import`) sets it for one run.
+		 * Filter the rows the data importer reads and checks per piece: one look-up per unique key per piece, so collisions
+		 * skip before any write; larger pieces mean fewer look-ups, smaller ones less memory. Clamped 50-5000;
+		 * `wp perflocale import --batch-size` sets it for one run.
 		 *
 		 * @hook  perflocale/import/batch_size
 		 * @since 1.0.7.3
@@ -728,18 +500,14 @@ final class DataImporter {
 	 * @throws \Throwable A replace import's failure, after the rollback (import() reports it).
 	 */
 	private function import_from( ImportReader $reader, string $file_path, bool $replace, bool $sanitize_strings, array $options, array $limits, array $result ): array {
-		// The envelope as the checks below read it: every top-level member
-		// decoded, and `data` as table => row count (a list's count is empty()
-		// exactly when the list is), or the member itself when it is not a list.
+		// The envelope as the checks read it: members decoded, `data` as table => row count (or the member when not a list).
 		$data = Typed::map( $reader->envelope() );
 
 		if ( $reader->has_table_data() ) {
 			$data['data'] = $reader->table_summary();
 		}
 
-		// A file that lists its sections is read for those sections only:
-		// a table list, row list, add-on part or configuration key that no
-		// declared section carries is left unread and named in the report.
+		// A file with a `sections` list is read for those only; the rest is left unread and named.
 		$undeclared = self::undeclared_members( $data, array_keys( $reader->table_summary() ) );
 
 		foreach ( $undeclared['envelope'] as $key ) {
@@ -751,7 +519,7 @@ final class DataImporter {
 			$data['data'] = $reader->table_summary();
 		}
 
-		// Validate structure.
+		// Structure.
 		$validation = $this->validate( $data );
 
 		if ( ! empty( $validation ) ) {
@@ -760,41 +528,19 @@ final class DataImporter {
 			return $result;
 		}
 
-		// Site-identity gate. As early as the envelope allows: validate() has
-		// guaranteed a `data` array, and everything read below is an address
-		// and a set of array keys. Ahead of the data-quality scan on purpose -
-		// that scan walks every value in the file, and it never looks at
-		// `site_url`, so nothing here depends on it having run. A refusal
-		// therefore costs one address comparison rather than a full walk, and
-		// it leaves settings, add-on settings, the disabled list, the role grants and
-		// the replace transaction all untouched.
-		//
-		// The rows this protects name posts, terms and strings by numeric ID
-		// (see the class docblock). On a site that is not the one the bundle
-		// came from, those IDs address unrelated content, and importing them
-		// groups that content as translations of each other. There is nothing
-		// to remap them with, so the only honest outcomes are "refuse" and
-		// "the operator says this site is a copy".
+		// Site identity gate, before the data-quality scan: an address comparison, and a refusal leaves configuration and
+		// the transaction untouched. The rows name posts, terms and strings by id, which mean nothing on another site.
 		$allow_foreign_ids = ! empty( $options['allow_foreign_ids'] );
 		$recorded_url      = $data['site_url'] ?? null;
 		$addon             = self::addon_plan( $reader, $data, $options['addon_choices'] ?? null );
 
-		// Three shapes, two verdicts. No address at all - the key absent, or an
-		// empty string - is the legacy envelope shape and is NOT checked here
-		// (a file from IDENTITY_SINCE on is, by the rule just below). An
-		// address that is present but yields no host (a number, an array, a
-		// bare scheme, a JSON `false`) identifies nothing and so cannot be this
-		// site: it counts as a mismatch. `wp perflocale network-import` has
-		// always judged its slices that way, and both paths read the same key
-		// out of the same file.
+		// No address (absent or '') is the legacy shape and not checked here; an address yielding no host identifies nothing
+		// and is a mismatch (as network-import judges its slices).
 		$has_recorded_url = isset( $data['site_url'] ) && '' !== $data['site_url'];
 		$identity         = self::bundle_matches_this_site( $recorded_url );
 
-		// A file whose `version` is IDENTITY_SINCE or later always records
-		// the address of the site that wrote it. Without one it is treated as
-		// a copy from another site: refused, without the copy-confirmation
-		// box, for whatever would refuse a file from another site. Older
-		// files keep the legacy rule above.
+		// A file from IDENTITY_SINCE on always records its address: without one it is treated as from another site
+		// (refused, without the copy confirmation). Older files keep the legacy rule.
 		$identity_rules = self::records_identity( $data['version'] ?? null );
 
 		if ( ! $allow_foreign_ids && $identity_rules && ! $has_recorded_url
@@ -809,14 +555,8 @@ final class DataImporter {
 
 		if ( ! $allow_foreign_ids
 			&& ( false === $identity || ( $has_recorded_url && null === $identity ) ) ) {
-			// The normalized identity, never the envelope's raw string: the
-			// message is carried through an admin redirect and a CLI warning,
-			// and the file chooses its own bytes.
-			//
-			// Each message leads with the refusal and the remedy: on the job
-			// path it is the failed job's reason, and the Jobs screen renders
-			// only the first ~137 characters beside the row and hides the rest
-			// behind a tooltip, so a diagnosis-first sentence would bury the fix.
+			// The normalised identity, never the file's raw string (it travels through a redirect and a CLI warning). Messages
+			// lead with refusal and remedy: the Jobs screen shows only the first ~137 characters.
 			$theirs = self::site_identity( $recorded_url );
 
 			if ( null === $theirs ) {
@@ -826,18 +566,8 @@ final class DataImporter {
 
 			$ours = (string) ( self::site_identity( get_option( 'home' ) ) ?? self::site_identity( home_url() ) );
 
-			// Replace mode's destructive half is keyed on the row lists the
-			// file carries for its declared sections, not on the rows in them:
-			// tables_to_wipe() plans a DELETE for every unscoped table of a
-			// declared section that the file carries as a list, empty or not.
-			// A foreign bundle that declares its sections and carries only
-			// empty lists therefore passes both row tests below and still
-			// empties this site's tables. The plan is
-			// the thing to test, and it is a pure static over the envelope, so
-			// testing it costs nothing and adds no query. Named apart from the
-			// `$wipe_plan` the replace branch builds further down: this one is
-			// reached only on a refusal, and the accept path still resolves the
-			// plan exactly once.
+			// Replace's wipe follows the row lists the file carries, empty or not, so a foreign file of empty lists would still
+			// empty this site's tables: test the plan (a pure static, no query).
 			$foreign_wipe_plan = $replace ? self::tables_to_wipe( $data ) : [];
 
 			if ( [] !== $foreign_wipe_plan ) {
@@ -864,10 +594,8 @@ final class DataImporter {
 				return $result;
 			}
 
-			// No object IDs, but rows that name a language by its numeric id
-			// and no `languages` section to resolve them against. Nothing maps
-			// them, so a German translation lands under whatever language holds
-			// that id here.
+			// Rows naming a language by id with no languages section to resolve them: a German translation would land under
+			// whatever language has that id here.
 			if ( self::carries_language_refs( $data ) && ! self::has_rows( $data, 'languages' ) ) {
 				$result['errors'][] = sprintf(
 					/* translators: 1: site address recorded in the export file, 2: this site's address. "Languages" names a section checkbox on the export screen: use the same word as that checkbox. The quoted phrase is the import form's checkbox label and must match it word for word. */
@@ -881,14 +609,8 @@ final class DataImporter {
 			}
 		}
 
-		// Data-quality gate: invalid UTF-8, null bytes, cardinality bombs,
-		// oversize values, malformed rows. Fail closed BEFORE any write -
-		// a partially-imported corrupt file is worse than a rejected one.
-		// It is also the pass that decodes every row once, so a row that is
-		// not valid JSON is refused here, before anything is written.
-		//
-		// The same pass notes whether the ID-keyed rows that can carry a
-		// fingerprint carry any, for the rule below.
+		// Data-quality gate, fail closed before any write; it also decodes every row once and notes whether the id-keyed
+		// rows carry fingerprints. Docs: docs-ai/11-code-rationale.md, "DataImporter: the replace transaction".
 		$presence = [
 			'rows' => false,
 			'fp'   => false,
@@ -906,10 +628,7 @@ final class DataImporter {
 			return $result;
 		}
 
-		// A file from IDENTITY_SINCE on fingerprints every ID-keyed row whose
-		// post, term or order existed when it was written. One whose such
-		// rows carry no fingerprint at all cannot be checked against this
-		// site's content, so it is treated as a copy from another site.
+		// Id-keyed rows without any fingerprint cannot be checked against this site's content: treated as foreign.
 		if ( $presence['rows'] && ! $presence['fp'] ) {
 			$result['errors'][] = __( 'Import refused. Tick the copy-confirmation box on the import form (WP-CLI: --force) to import it anyway. The rows of this file that name posts, terms or orders by ID carry no fingerprints, so they cannot be checked against this site\'s content. Tick the box only when this site is a copy of the site the file was exported from and its IDs still match.', 'perflocale' );
 			$result['refused']  = true;
@@ -922,13 +641,8 @@ final class DataImporter {
 		$max_row               = self::max_section_bytes( $limits );
 		$this->strings_carried = $reader->count( 'strings' ) > 0;
 
-		// A replace whose ID-keyed rows mostly name other content here is
-		// the wrong site's file (or a file from before this site's content
-		// was rebuilt). Replace would first clear this site's own rows for
-		// those sections, so the whole file is refused before any write when
-		// more than half of the rows that carry a fingerprint name a
-		// different post, term or order. A merge only adds rows: it skips
-		// those rows and names them (check_fingerprints()).
+		// Replace would first clear this site's rows, so a file whose fingerprinted rows mostly name other content is
+		// refused; Merge only skips and names them (check_fingerprints()).
 		if ( $replace ) {
 			try {
 				[ $checked, $mismatched ] = $this->fingerprint_mismatch_share( $reader, $max_row, $addon['members'] );
@@ -951,9 +665,7 @@ final class DataImporter {
 			}
 		}
 
-		// Merge never changes this site's configuration. Each configuration
-		// part the file carries is counted as skipped and named, and the four
-		// blocks below run in Replace mode only.
+		// Merge never changes configuration: each part the file carries is counted as skipped and named.
 		if ( ! $replace ) {
 			$not_applied = [];
 
@@ -971,55 +683,43 @@ final class DataImporter {
 			}
 		}
 
-		// Import tables.
+		// Tables.
 		if ( isset( $data['data'] ) && is_array( $data['data'] ) ) {
-			// Replace mode wipes the tables that BELONG to the sections in
-			// the export and that the file carries as row lists, whether or
-			// not each list holds rows. Otherwise a table that was empty at
-			// export time would leak post-export rows through the replace. A
-			// table the file does not carry at all is left as it is: the
-			// exporter writes a list for every table of every section it
-			// declares, so only a damaged or hand-made file leaves one out.
-			//
-			// CRITICAL: we restrict the wipe to tables for the EXPORTED
-			// sections only. A user importing a strings-only export with
-			// `replace` expects "replace the strings"; truncating every
-			// PerfLocale table would silently destroy languages, links,
-			// etc., across the entire plugin.
+			// Replace wipes the tables of the exported sections that the file carries as lists, empty or not (an empty list must
+			// not leak later rows), and never others: a strings-only Replace must not empty languages and links.
 			$wpdb = Typed::wpdb();
 
-			// The replace-mode wipe plan: table short-name => type scope
-			// (null means the whole table). Resolved once because it is
-			// needed twice - the loop below applies it, and the abort gate
-			// inside the import loop has to know which tables were only
-			// PARTIALLY cleared.
+			// Table => type scope (null: whole table), resolved once for the wipe and for the abort gate (partly cleared tables).
 			$wipe_plan = $replace ? self::tables_to_wipe( $data ) : [];
 
 			$this->languages_cleared   = array_key_exists( 'languages', $wipe_plan );
 			$this->groups_keep_strings = '!string' === ( $wipe_plan['translation_groups'] ?? null );
 			$this->links_keep_strings  = '!string' === ( $wipe_plan['translation_links'] ?? null );
 
-			// The wipe shares the import's try, so a statement that fails
-			// there reaches the same catch and its ROLLBACK. The file's
-			// configuration is applied only after the COMMIT below.
+			// The wipe shares the import's try, so a failed statement reaches the same ROLLBACK; configuration only after COMMIT.
 			ImportLock::heartbeat();
+
+			if ( $replace ) {
+				ImportLock::hold_for_transaction();
+			}
+
+			// Created before the first write and before START TRANSACTION (on SQLite nothing inside may fail). A reconnect ends
+			// it: Merge stops at the next heartbeat, Replace through the connection guard.
+			$this->work = new ImportWorkTable( $replace ? self::connection_lost_message() : self::merge_lost_message() );
+			$this->work->open();
+
+			if ( ! $replace ) {
+				ImportLock::bind_session( self::merge_lost_message() );
+			}
 
 			try {
 				if ( $replace ) {
-					// Atomic replace: the wipe AND the re-import run inside ONE
-					// transaction so a mid-restore failure rolls back instead of
-					// leaving the tables emptied or half-populated. DELETE (not
-					// TRUNCATE) because TRUNCATE is DDL and implicitly commits - it
-					// would silently end the transaction and re-open the data-loss
-					// window. IDs are preserved either way (replace keeps ids), so
-					// not resetting AUTO_INCREMENT is correct.
-					//
-					// Each statement is checked against false only: wpdb returns 0
-					// for a transaction statement that succeeded and for a DELETE
-					// that found the table already empty. Without the transaction,
-					// every DELETE below would commit on its own.
+					// Wipe and re-import in one transaction, with DELETE (TRUNCATE commits implicitly); ids are kept. Checked against
+					// false only (0 is success). The guard is set first, so a statement resent on a new connection matches nothing.
+					$this->guard = new ConnectionGuard( 'import' );
+
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
+					if ( ! $this->guard->begin() || false === $wpdb->query( 'START TRANSACTION' ) ) {
 						self::log_db_error( 'START TRANSACTION', (string) $wpdb->last_error );
 
 						throw new \RuntimeException( __( 'Replace import aborted: the database could not open a transaction; rolling back so no data is lost.', 'perflocale' ) );
@@ -1027,26 +727,15 @@ final class DataImporter {
 
 					$was_suppressing = $wpdb->suppress_errors( true );
 
-					// finally, not a trailing call: whatever leaves the loop, the
-					// connection's error reporting goes back to how it was found.
+					// finally: the connection's error reporting goes back as found, whatever leaves the loop.
 					try {
 						foreach ( $wipe_plan as $table_name => $type_scope ) {
-							// $full_table is Schema::table() mapped from a class-
-							// constant allow-list, never user input; sanitized to a
-							// bare identifier before interpolation since prepare()
-							// cannot bind a table name.
+							// From a class allow-list, sanitized to a bare identifier: prepare() cannot bind a table name.
 							$full_table = Schema::sanitize_table( Schema::table( $table_name ) );
 
 							if ( $type_scope !== null ) {
-								// Shared polymorphic table: clear ONLY the slice the
-								// exported sections own, so "replace my strings"
-								// leaves every post and term group standing. The type
-								// is bound as a value, so the scope can never widen.
-								//
-								// Links pointing at the groups this drops live in
-								// a table the bundle does NOT own, so they are
-								// left dangling here and reaped after the commit
-								// - see reap_orphan_string_links().
+								// A shared table loses only the slice the sections own (the type bound as a value). Links to the groups this drops
+								// are in a table the file does not own: reaped after the commit (reap_orphan_string_links()).
 								$wipe = str_starts_with( $type_scope, '!' )
 									? $wpdb->prepare( 'DELETE FROM %i WHERE type <> %s', $full_table, substr( $type_scope, 1 ) )
 									: $wpdb->prepare( 'DELETE FROM %i WHERE type = %s', $full_table, $type_scope );
@@ -1054,14 +743,19 @@ final class DataImporter {
 								$wipe = $wpdb->prepare( 'DELETE FROM %i', $full_table );
 							}
 
-							// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The replace wipe, prepared above (table bound with %i, the type as a value).
+							$guarded = $this->connection_guard()->condition();
+
+							if ( null !== $wipe && '' !== $guarded ) {
+								$wipe .= ( null !== $type_scope ? ' AND ' : ' WHERE ' ) . $guarded;
+							}
+
+							$this->stop_unless_connection_kept();
+
+							// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- The replace wipe, prepared above (table bound with %i, the type as a value); the guard's condition is prepared by the guard.
 							$wiped = null === $wipe ? false : $wpdb->query( $wipe );
 
-							// A table left uncleared turns the restore into a merge:
-							// the file's rows that collide skip as duplicates and the
-							// stale rows stay. A DELETE that ended the whole
-							// transaction (a deadlock) would also let the next one
-							// commit on its own, so stop at the first failure.
+							// An uncleared table turns the restore into a merge, and a DELETE that ended the transaction would let the next one
+							// commit alone: stop at the first failure.
 							if ( false === $wiped ) {
 								self::log_db_error( 'clearing ' . $table_name, (string) $wpdb->last_error );
 
@@ -1077,7 +771,12 @@ final class DataImporter {
 					} finally {
 						$wpdb->suppress_errors( $was_suppressing );
 					}
+
+					// A DELETE on a new connection matches nothing, as on an empty table: the marker tells them apart.
+					$this->stop_unless_connection_verified();
 				}
+
+				$this->merge_writing = ! $replace;
 
 				foreach ( DataRegistry::import_tables() as $table_name ) {
 					if ( ! $reader->is_row_list( $table_name ) ) {
@@ -1090,26 +789,16 @@ final class DataImporter {
 						continue;
 					}
 
-					// $replace semantics:
-					// wipe → handled above (covers empty-in-export tables)
-					// keep ids → needed so translation_links FK-ish pointers
-					// into translation_groups stay valid
-					// Signal both via the second arg; import_table still treats
-					// $replace==true as "preserve IDs" but now NO-OPs the wipe
-					// (we already did it).
+					// Replace keeps ids (the links' group ids stay valid); the wipe was done above, so import_table() skips its own.
 					if ( 'translation_links' === $table_name && ! $replace ) {
 						$this->plan_link_anchors( $reader->rows( $table_name, $max_row ) );
 					}
 
-					// A `!type` wipe left that slice in place: the file's rows
-					// of that type are not this section's to restore.
+					// A `!type` wipe kept that slice: the file's rows of that type are not this section's to restore.
 					$scope        = $wipe_plan[ $table_name ] ?? null;
 					$exclude_type = ( is_string( $scope ) && str_starts_with( $scope, '!' ) ) ? substr( $scope, 1 ) : '';
 
 					$table_result = $this->import_table( $table_name, $reader->rows( $table_name, $max_row ), $replace, $sanitize_strings, $exclude_type );
-					if ( 'languages' === $table_name && $table_result['imported'] > 0 ) {
-						$this->languages_changed = true;
-					}
 
 					$result['imported']  += $table_result['imported'];
 					$result['skipped']   += $table_result['skipped'];
@@ -1121,42 +810,12 @@ final class DataImporter {
 						}
 					}
 
-					// Replace mode already DELETEd this table inside the
-					// transaction. If a non-empty export inserted zero rows,
-					// something systematic failed (unknown column, charset,
-					// strict-mode) - committing now would leave the table
-					// permanently empty. Abort so the catch below ROLLBACKs
-					// the wipe and the operator keeps their pre-import data.
-					//
-					// A table whose wipe was SCOPED is the one exception:
-					// only its own slice was cleared, so the rows that
-					// survived can legitimately collide with the incoming
-					// ids on the primary key. `translation_groups` shares
-					// one id-space across post, term and string groups, so
-					// a strings-only bundle whose group ids all happen to
-					// exist on the target as post groups inserts nothing
-					// while nothing is actually wrong: every row
-					// duplicate-SKIPS, and repair_orphaned_translations()
-					// below re-groups the strings that lost their carried
-					// group. Aborting there would roll back an ordinary
-					// partial import. So for a scoped table demand a REAL
-					// insert failure - import_table() counts those
-					// separately from duplicate-entry skips. Unscoped tables
-					// keep the original guard: every one of their rows is
-					// gone, so zero inserts is always fatal.
+					// A wiped table whose non-empty section inserted nothing failed systematically: abort. A scoped table only on a real
+					// insert failure: its surviving rows can collide on ids (one id space for all group types) as an ordinary skip.
 					$scoped_wipe = ( ( $wipe_plan[ $table_name ] ?? null ) !== null );
 
-					// A replace is a RESTORE, and a restore is all-or-nothing.
-					// The pre-import rows for this table were deleted a few
-					// lines above, inside this same transaction, so a row the
-					// database refused is not a row that "failed to merge" -
-					// it is a row the operator no longer has anywhere. Before
-					// this gate, 6,808 of 6,809 links committed and the import
-					// reported success with the error buried in a list.
-					// `failed` counts only REAL errors: duplicate-key skips
-					// (the legitimate collision on a scoped wipe, where rows
-					// of another type survive and share the id space) are
-					// counted separately and never reach here.
+					// A restore is all or nothing: a refused row after its table was deleted is lost, so any real failure aborts
+					// (duplicate skips are counted apart and never reach here).
 					if ( $replace && $table_result['failed'] > 0 ) {
 						throw new \RuntimeException(
 							sprintf(
@@ -1170,14 +829,7 @@ final class DataImporter {
 						);
 					}
 
-					// Systematic failure with no per-row error to point at:
-					// a non-empty section inserted nothing. Unscoped tables
-					// were emptied outright, so zero inserts is always fatal.
-					// A scoped wipe reaching here has failed === 0: every row
-					// duplicate-skipped against surviving rows of another
-					// type, which is an ordinary partial import. Rows left out
-					// on purpose (a different object, a missing language) are
-					// not a systematic failure either.
+					// A wiped (unscoped) table whose section inserted nothing, not counting rows left out on purpose: fatal.
 					if ( $replace && $table_result['imported'] === 0 && ! $scoped_wipe && $row_count > $table_result['dropped'] ) {
 						throw new \RuntimeException(
 							sprintf(
@@ -1191,11 +843,8 @@ final class DataImporter {
 					}
 				}
 
-				// A Replace that cleared or wrote the languages table must leave
-				// exactly one default language: no default leaves the site
-				// without its unprefixed URLs and fallbacks, and a second one
-				// moves them to whichever row is read last. Checked inside the
-				// transaction, so a refusal rolls everything back.
+				// A Replace that touched languages must leave exactly one default (none loses unprefixed URLs and fallbacks, two
+				// pick one by read order); checked inside the transaction.
 				if ( $replace && ( $this->languages_cleared || $this->languages_changed ) ) {
 					$defaults = $this->count_default_languages();
 
@@ -1209,31 +858,47 @@ final class DataImporter {
 				}
 
 				if ( $replace ) {
-					// A refused COMMIT usually means the server has already
-					// discarded the transaction. The catch's ROLLBACK covers one
-					// still open; no configuration has been written yet.
+					$this->stop_unless_connection_verified();
+
+					// A refused COMMIT usually means the server discarded the transaction; the catch's ROLLBACK covers an open one.
+					// No configuration written yet.
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					if ( false === $wpdb->query( 'COMMIT' ) ) {
 						self::log_db_error( 'COMMIT', (string) $wpdb->last_error );
 
 						throw new \RuntimeException( __( 'Replace import not confirmed: the database reported an error while saving it. Run the import again.', 'perflocale' ) );
 					}
+
+					// A COMMIT resent on a new connection committed nothing: the server rolled back with the lost connection.
+					if ( ! $this->connection_guard()->kept() ) {
+						throw new \RuntimeException( self::connection_lost_message() );
+					}
 				}
 			} catch ( \Throwable $e ) {
 				if ( $replace ) {
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$wpdb->query( 'ROLLBACK' );
+
+					// After a lost connection, reads on the new one can stop the import for a reason that is not the real one.
+					if ( null !== $this->guard && ! $this->guard->holds() && self::connection_lost_message() !== $e->getMessage() ) {
+						throw new \RuntimeException( self::connection_lost_message(), 0, $e ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+					}
 				}
 
-				// The tables are back where they started, and the file's
-				// configuration was never applied, so the site is as it was.
+				// Tables back where they were and configuration never applied: the site is as it was.
 				throw $e;
+			} finally {
+				if ( null !== $this->guard ) {
+					$this->guard->end();
+					$this->guard = null;
+				}
+
+				ImportLock::bind_session( '' );
 			}
 
 			ImportLock::heartbeat();
 
-			// A replace that cleared the languages table changed the set of
-			// language codes even when it wrote no row.
+			// Clearing the languages table changed the codes even with no row written.
 			if ( array_key_exists( 'languages', $wipe_plan ) ) {
 				$this->languages_changed = true;
 			}
@@ -1242,30 +907,21 @@ final class DataImporter {
 				$this->replaced_link_tables = true;
 			}
 
-			// A migration source-map row never outlives its group (the sweep
-			// and the group delete cascade to it). A replace that cleared
-			// groups removes the rows whose group is gone, so a re-run of a
-			// WPML, Polylang or TranslatePress migration cannot join a
+			// A replace that cleared groups removes source-map rows whose group is gone, so a migration re-run cannot join a
 			// group by a recorded id.
 			if ( array_key_exists( 'translation_groups', $wipe_plan ) ) {
 				$this->drop_stale_source_map();
 			}
 
-			// Merge mode strands groups: translation_groups have no natural
-			// key, so each re-inserts as a NEW row while its links skip on
-			// the object_lang (type, object_id, language_id) unique key -
-			// leaving the fresh group with nothing pointing at it. (Replace
-			// mode truncates first, so it never strands.) Run ONCE here, after
-			// the whole loop - especially after translation_links - so we
-			// never sweep freshly-imported groups before their links have
-			// landed.
+			// Merge strands groups (no natural key; their links skip on object_lang): swept once, after every table, so no
+			// group is swept before its links land.
 			if ( ! $replace ) {
 				$this->sweep_orphan_groups();
 			}
 		}
 
 		if ( '' !== $this->default_kept ) {
-			// Nothing has written a note yet: this is the report's first.
+			// The report's first note.
 			$result['default_language_kept'] = $this->default_kept;
 			$result['notes']                 = [
 				$replace
@@ -1284,27 +940,21 @@ final class DataImporter {
 			];
 		}
 
-		// Language rows written with $wpdb->insert() fire no language hook, so
-		// the rewrite rules, whose pattern lists the active language codes,
-		// are marked for the rebuild every language change asks for
-		// (CacheInvalidator::on_language_changed() does the same).
+		// $wpdb->insert() fires no language hook: mark the rewrite rebuild a language change needs (as
+		// CacheInvalidator::on_language_changed()).
 		if ( $this->languages_changed ) {
-			update_option( 'perflocale_flush_rules', 1, false );
-			delete_transient( 'perflocale_rewrites_verified' );
+			self::mark_rewrite_flush();
 		}
 
-		// Replace applies the file's configuration once its tables are in
-		// (see apply_configuration() for why not before).
+		// Replace applies the configuration once the tables are in (apply_configuration()).
 		if ( $replace ) {
 			$this->apply_configuration( $data, $result );
 		}
 
 		ImportLock::heartbeat();
 
-		// The options and meta of the declared sections (ExportItems), each
-		// written on its own once the tables and the configuration are in.
-		// The shared row lists carry the add-on rows of a file from before
-		// add-on parts; those belong to the shared Add-on data choice.
+		// The declared sections' options and meta (ExportItems), each on its own after tables and configuration; pre-part
+		// files' add-on rows belong to the shared Add-on data choice.
 		$declared = array_values( array_filter( Typed::strs( $data['sections'] ?? [] ) ) );
 		$lists    = [];
 
@@ -1317,16 +967,9 @@ final class DataImporter {
 		}
 
 		/**
-		 * Whether the import's own meta writes start Sync Fields mirroring.
-		 *
-		 * By default they do not, in Merge and in Replace: each post gets the
-		 * value the file holds for it, so the import reproduces the file. With
-		 * mirroring on, a value the import writes on one member of a
-		 * translation group is copied to its translations as a save would copy
-		 * it (when Sync Fields lists the key), so the result can differ from
-		 * the file: translations get values the file does not give them, a
-		 * Merge can change rows this site already had, and a translation the
-		 * source site held back (stale) is overwritten.
+		 * Filter whether the import's own meta writes start Sync Fields mirroring. Off (default): each post gets the file's
+		 * value, so the import reproduces the file. On: values are copied to translations as a save would, so the result can
+		 * differ from the file (a Merge can change existing rows, a held-back translation is overwritten).
 		 *
 		 * @hook  perflocale/import/sync_fields_mirroring
 		 * @since 1.0.7.3
@@ -1376,9 +1019,7 @@ final class DataImporter {
 			}
 		}
 
-		// A section nothing on this site reads (a newer version's core
-		// section, or an add-on that is not active here) is named in the
-		// report rather than dropped silently.
+		// A section nothing here reads (a newer core section, an inactive add-on) is named, not dropped silently.
 		$unread = [];
 
 		foreach ( array_keys( (array) ( $data['data'] ?? [] ) ) as $table_name ) {
@@ -1392,8 +1033,7 @@ final class DataImporter {
 			$unread[] = $name;
 		}
 
-		// Top-level sections the reader walked over: neither core nor hooked
-		// by an add-on active here.
+		// Top-level sections the reader walked over: neither core nor hooked by an active add-on.
 		foreach ( $reader->skipped() as $name ) {
 			$unread[] = $name;
 		}
@@ -1406,13 +1046,8 @@ final class DataImporter {
 			);
 		}
 
-		// Per-section import hook for addon-shipped data. Fires once for
-		// every top-level key in the envelope that is NOT a core section,
-		// so an addon that registered a `perflocale/export/sections` filter
-		// can hook the matching action to restore its own rows. Uses the same
-		// reserved-key list the exporter enforces so the two can't drift
-		// (addon_settings + disabled_addons included - they are handled above
-		// and must never be dispatched as an addon section).
+		// Fires once per non-core top-level key for add-ons that ship sections (`perflocale/export/sections`), with the
+		// exporter's reserved-key list so the two cannot drift.
 		foreach ( $data as $section_name => $section_data ) {
 			if ( '' === $section_name || in_array( $section_name, DataExporter::RESERVED_SECTION_KEYS, true ) ) {
 				continue;
@@ -1423,17 +1058,8 @@ final class DataImporter {
 			}
 
 			/**
-			 * Restore an addon-shipped envelope section during a data import.
-			 *
-			 * Fires once for each top-level key in the export envelope that
-			 * isn't a core section (settings/roles/data/etc.). Addons that
-			 * register a `perflocale/export/sections` filter to ship their
-			 * data should hook the matching `perflocale/import/section/<name>`
-			 * action to restore it.
-			 *
-			 * The action name is dynamic - `<name>` is the section key the
-			 * addon used in the export. Use the SAME key on both sides so
-			 * round-tripping works automatically.
+			 * Restore an add-on's export section during a data import; fires once per non-core top-level key of the envelope.
+			 * Use the same `<name>` as the `perflocale/export/sections` key, so the round trip works.
 			 *
 			 * @hook  perflocale/import/section/<name>
 			 * @since 1.0.0
@@ -1482,58 +1108,15 @@ final class DataImporter {
 
 		$carries_strings = self::carries_strings( $data );
 
-		// Reap the links left pointing at groups that no longer exist. Two
-		// producers, and the gate has to cover BOTH.
-		//
-		// REPLACE: a strings bundle wipes the type='string' slice of
-		// translation_groups without owning translation_links; and a replace
-		// that cleared the link tables (Translation Links) runs both passes
-		// too, so a string whose group or link it touched is served again.
-		//
-		// MERGE: sweep_orphan_groups() above deletes every type='string'
-		// group that owns no `strings` row, and it runs on EVERY merge
-		// import whatever sections the envelope carried, because the sweep
-		// itself is unconditional. A merge of the `translations` section
-		// alone therefore strands string links while carrying no strings at
-		// all - the shape the old `$carries_strings`-only gate never looked
-		// at, leaving those links to block the UNIQUE object_lang slot the
-		// next repair needs.
-		//
-		// Runs BEFORE the repair below, which cannot re-link a string while a
-		// dangling row still holds its slot in that key. A replace-mode
-		// import that landed no strings ran no sweep and can have stranded
-		// nothing, so it still pays nothing.
+		// Reap links pointing at groups that are gone: a strings Replace or cleared link tables, and every Merge (its
+		// orphan sweep removes string groups without strings). Before the repair, which cannot relink a string whose
+		// object_lang slot a dangling row holds. Docs: docs-ai/11-code-rationale.md, "DataImporter: after the tables".
 		if ( $carries_strings || ! $replace || $this->replaced_link_tables ) {
 			$this->reap_orphan_string_links();
 		}
 
-		// String-graph repair. Two callers, one idempotent pass:
-		//
-		// MERGE: when the target site ALREADY had a string row (same
-		// original_hash), the imported string maps onto the EXISTING row -
-		// which keeps its own group_id - while the imported translation_links
-		// rows were rewritten onto the freshly-inserted (now unowned) group.
-		// The translation value lands but its 'translated' link points at the
-		// wrong group, so it is never served.
-		//
-		// REPLACE: the strings section carries `translation_groups` but NOT
-		// the per-language `translation_links` (see DataExporter::sections()),
-		// because a link holds nothing that isn't derivable from the rows that
-		// did travel. On a restore into the SAME site the links are still
-		// there with their real statuses and this pass finds nothing to do; on
-		// a restore into a DIFFERENT site there are none for the imported
-		// strings, and this is what rebuilds them. It also catches the
-		// residue when a carried group id collided with a post/term group the
-		// target already had, which duplicate-skips the group row.
-		//
-		// repair_orphaned_translations() re-creates the missing
-		// (group, language) links from the value rows; it is idempotent and a
-		// no-op when nothing is orphaned, so the cost on a healthy full-bundle
-		// restore is a scan-and-delete of dangling value rows plus two SELECTs
-		// that return nothing. The `$carries_strings` gate applies to REPLACE
-		// only - a replace of other sections skips the pass entirely, while
-		// merge mode still runs it unconditionally exactly as it did before
-		// the strings section started carrying groups.
+		// String-graph repair (idempotent): a Merge onto an existing string leaves its links on the new unowned group, and a
+		// Replace carries groups but not their links (derivable) into another site; repair_orphaned_translations() rebuilds.
 		if ( ! $replace || $carries_strings || $this->replaced_link_tables ) {
 			$cache = \PerfLocale\Plugin::get_instance()->has( 'cache' )
 				? \PerfLocale\Plugin::get_instance()->get( 'cache' )
@@ -1544,31 +1127,29 @@ final class DataImporter {
 			}
 		}
 
-		// Flush all caches. Routed through the migration helper (which itself
-		// calls CacheManager::flush_all) so the autoloaded eager-link maps for
-		// ALL object types are purged, not just L2 - a plain flush_all() leaves
-		// the pre-import eager maps in wp_options and long-lived CLI/cron
-		// workers keep serving stale group memos. Runs here (inside import(),
-		// while switch_to_blog() is active for network-import) so the
-		// delete_option() calls hit each TARGET blog's options table. After
-		// the reap and the repair, so in files mode the translation files are
-		// generated once, from the repaired links.
+		// Through the migration helper: all eager-link maps, not only L2, inside import() so network-import's
+		// switch_to_blog() targets each blog; after the repair, so files mode generates once.
 		\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
 
-		// Menu and pattern references in translated templates follow the links
-		// this restore wrote: once, for the posts it linked.
-		if ( [] !== $this->linked_posts ) {
-			\PerfLocale\Translation\TemplateBlockRefs::after_restore( array_keys( $this->linked_posts ) );
+		// Template menu and pattern references follow the links this restore wrote, from the work table a page at a time;
+		// without the table (a reconnect) they stay, and the Site Editor notice shows it.
+		if ( null !== $this->work && $this->work->has( ImportWorkTable::LINKED_POST ) ) {
+			try {
+				$types = [];
+
+				foreach ( $this->work->pages( ImportWorkTable::LINKED_POST ) as $page ) {
+					$types += \PerfLocale\Translation\TemplateBlockRefs::restored_types( $page );
+				}
+
+				\PerfLocale\Translation\TemplateBlockRefs::process_restored( $types );
+			} catch ( \RuntimeException $e ) {
+				unset( $e );
+			}
 		}
 
 		/**
-		 * Fires after `DataImporter::import()` has finished restoring rows
-		 * and flushing caches, with the final result stats.
-		 *
-		 * Use this to invalidate addon-side caches, emit audit-log entries,
-		 * or notify a Slack channel that the
-		 * import completed. Fires for BOTH sync and async (data_import job)
-		 * code paths.
+		 * Fires after DataImporter::import() restored rows and flushed caches, for both the inline and the background path
+		 * (add-on caches, audit logs, notifications).
 		 *
 		 * @hook  perflocale/import/completed
 		 * @since 1.0.0
@@ -1580,12 +1161,8 @@ final class DataImporter {
 		 *     sanitized:    int,
 		 *     not_applied?: array<int,string>,
 		 *     notice?:      string,
-		 * } $result The DataImporter result. `sanitized` counts stored
-		 *           string translation, language and translated-slug rows
-		 *           the sanitizers changed because the import ran at the
-		 *           trust level of a user without `unfiltered_html` (always
-		 *           0 for WP-CLI). `not_applied` and `notice` name the
-		 *           configuration a merge import left unapplied.
+		 * } $result The DataImporter result. `sanitized`: rows the untrusted-user sanitizers changed (0 for WP-CLI);
+		 *           `not_applied` and `notice`: configuration a merge left unapplied.
 		 * @param string $file_path Absolute path to the imported file.
 		 * @param bool   $replace   Whether the import ran in replace mode.
 		 */
@@ -1595,17 +1172,37 @@ final class DataImporter {
 	}
 
 	/**
-	 * Apply the file's configuration: settings, add-on settings, the
-	 * disabled-add-on list and the role grants. Replace mode only.
+	 * Mark the rewrite rules, whose pattern lists the language codes, for a rebuild.
 	 *
-	 * Runs AFTER the table transaction has committed (or, for a file that
-	 * carries no tables, straight away). A worker that dies inside the table
-	 * transaction therefore leaves configuration and tables both as they
-	 * were: the database rolls the tables back when the connection closes,
-	 * and nothing of the configuration was written yet. The job's retry runs
-	 * the whole import again. Applied before the tables, the file's settings
-	 * and roles would stay over the old tables whenever the process died
-	 * mid-table: no PHP code runs after a killed worker to put them back.
+	 * @return void
+	 */
+	private static function mark_rewrite_flush(): void {
+		update_option( 'perflocale_flush_rules', 1, false );
+		delete_transient( 'perflocale_rewrites_verified' );
+	}
+
+	/**
+	 * A Merge stopped after it began writing (no transaction, its rows stay): mark the rewrite rules for a new language
+	 * and flush caches, as a finished Merge does; the import's own error is reported. Sweep, reap and the DB-mode repair
+	 * wait for the next run (the error asks for one; a job retries).
+	 *
+	 * @return void
+	 */
+	private function finish_stopped_merge(): void {
+		try {
+			if ( $this->languages_changed ) {
+				self::mark_rewrite_flush();
+			}
+
+			\PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches();
+		} catch ( \Throwable $e ) {
+			unset( $e );
+		}
+	}
+
+	/**
+	 * Apply the file's configuration (settings, add-on settings, disabled add-ons, role grants), Replace only, after the
+	 * table transaction committed: a worker killed inside it leaves both as they were, and the retry runs it all again.
 	 *
 	 * @param array<array-key, mixed> $data   Envelope.
 	 * @param array<string, mixed>    $result Import result (updated).
@@ -1614,33 +1211,17 @@ final class DataImporter {
 	 * @return void
 	 */
 	private function apply_configuration( array $data, array &$result ): void {
-		// Import settings - route through the Settings class so values are
-		// validated against the DEFAULTS whitelist and sanitized per type.
-		// Use the DI singleton (not `new Settings()`) so the in-process
-		// cache held by every other component is updated in-place. A
-		// fresh instance would write wp_options correctly but leave the
-		// existing singleton's `$this->settings` array stale, so any code
-		// later in the same request would still see the pre-import values.
+		// Through the Settings singleton (validated against DEFAULTS and sanitized), so every component's in-process copy
+		// is updated; a fresh instance would leave it stale.
 		if ( isset( $data['settings'] ) && is_array( $data['settings'] ) ) {
 			$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 
-			// Drop keys this build no longer knows BEFORE handing the array to
-			// update(). An export written by an older version legitimately
-			// carries settings for features that have since been removed;
-			// Settings::sanitize() treats an unknown key as a programming
-			// error and fires _doing_it_wrong() for each one, which would spam
-			// a debug-enabled site on an ordinary "restore my backup" action.
-			// The values are dropped either way - this only stops a supported
-			// user flow from being reported as developer error. The secret
-			// keys go too: this site keeps its own API keys.
+			// Drop keys this build does not know first (Settings::sanitize() would fire _doing_it_wrong() for each on a plain
+			// backup restore), and the secret keys: this site keeps its own API keys.
 			$incoming = self::applicable_settings( $data['settings'], array_keys( $settings->get_defaults() ) );
 
-			// Settings that describe THIS site rather than the data - its
-			// domains, its provider endpoints, its uninstall choice, its
-			// paused queue - keep this site's values. A staging export
-			// restored on production must not route production's languages
-			// to staging's hosts. Each key the file carried with a different
-			// value is named in the report.
+			// Settings describing this site (domains, provider endpoints, uninstall choice, paused queue) keep its values, so a
+			// staging file cannot route production's languages to staging; differing keys are named.
 			$kept = [];
 
 			foreach ( self::kept_setting_keys() as $key ) {
@@ -1660,13 +1241,14 @@ final class DataImporter {
 				$result['notes'][]       = self::kept_settings_notice( $kept );
 			}
 
-			if ( $incoming !== [] ) {
-				$settings->update( $incoming );
+			$saved = true;
 
-				// A provider address the update refused (multisite, its key
-				// supplied from outside the database, an importer who is not a
-				// super admin) is named in the report, never dropped silently.
-				$refused = \PerfLocale\Settings::last_update_refused_addresses();
+			if ( $incoming !== [] ) {
+				// False also for an unchanged save; only a held settings lock or a refused write leaves them unapplied.
+				$saved = $settings->update( $incoming ) || \PerfLocale\Settings::last_update_was_noop();
+
+				// A provider address the update refused (multisite, key from outside the database, not a super admin) is named.
+				$refused = $saved ? \PerfLocale\Settings::last_update_refused_addresses() : [];
 
 				if ( [] !== $refused ) {
 					$result['refused_addresses'] = $refused;
@@ -1674,37 +1256,25 @@ final class DataImporter {
 				}
 			}
 
-			++$result['imported'];
+			if ( $saved ) {
+				++$result['imported'];
+			} else {
+				$result['notes'][] = __( 'The settings from the file were not saved: another change to the settings was being saved at the same time. Import the file again to apply them.', 'perflocale' );
+			}
 		}
 
-		// Per-addon settings. Restore as-is - the destination site may
-		// not have every addon installed, but that's fine: an absent
-		// addon's entry sits dormant in the option until the addon is
-		// installed (at which point its own AddonSettings reads pick the
-		// value up). Whole-option write so a stale prior import doesn't
-		// bleed through. Cache is cleared right after so AddonSettings::all()
-		// picks up the fresh option on next read.
+		// Add-on settings restored whole (an absent add-on's entry waits for it), then the cache cleared for the next read.
 		if ( isset( $data['addon_settings'] ) && is_array( $data['addon_settings'] ) ) {
-			// The file's entries pass through the exporter's own redaction, so
-			// a credential a file carries (one the exporter never writes) is
-			// dropped rather than written over this site's. The entry of an
-			// add-on not registered on this site is kept on purpose, for the
-			// day the add-on is installed; its password-type fields are not
-			// known here, so its credential-shaped keys are stripped by name
-			// (DataExporter::CREDENTIAL_KEY_PATTERN) and its other keys kept.
+			// Through the exporter's redaction: a credential in a file is dropped; an unregistered add-on's entry is kept with
+			// its credential-shaped keys stripped by name (DataExporter::CREDENTIAL_KEY_PATTERN).
 			// phpcs:ignore Generic.Commenting.DocComment.MissingShort -- Inline type hint for static analysis; a short description would be noise.
 			/** @var array<string, mixed> $file_addons */
 			$file_addons = $data['addon_settings'];
 			$incoming    = DataExporter::redact_addon_credentials( $file_addons );
 			$current  = (array) get_option( 'perflocale_addon_settings', [] );
 
-			// The exporter REDACTS credential-shaped keys (see
-			// DataExporter::CREDENTIAL_KEY_PATTERN) and password-type fields
-			// (DataExporter::password_setting_keys()), so an imported addon
-			// entry never carries its *_api_key / *_token / passwords. Writing
-			// it verbatim would blank the target's live credentials - turning a
-			// settings restore into a "now re-enter every API key" incident.
-			// Preserve any such key the target still has.
+			// Exports redact credential keys and password fields: writing an entry verbatim would blank the target's live
+			// credentials, so the ones it has are kept.
 			$merged = $current;
 
 			foreach ( $incoming as $addon => $entry ) {
@@ -1716,8 +1286,7 @@ final class DataImporter {
 				$existing_entry = ( isset( $current[ $addon ] ) && is_array( $current[ $addon ] ) ) ? $current[ $addon ] : [];
 				$password_keys  = $existing_entry !== [] ? DataExporter::password_setting_keys( (string) $addon ) : [];
 
-				// The imported entry is authoritative except for the redacted
-				// credential keys restored below.
+				// The file's entry is authoritative except for the redacted credential keys restored below.
 				$base = $entry;
 
 				foreach ( $existing_entry as $key => $value ) {
@@ -1729,27 +1298,30 @@ final class DataImporter {
 				$merged[ $addon ] = $base;
 			}
 
-			// Authoritative about WHICH addons exist too: drop any the export
-			// didn't mention.
+			// Also authoritative about which add-ons exist: drop those the file does not name.
 			$merged = array_intersect_key( $merged, $incoming );
 
-			update_option( 'perflocale_addon_settings', $merged, false );
+			// update_option() is false for an unchanged value and for a refused write; only the second fails.
+			if ( update_option( 'perflocale_addon_settings', $merged, false ) || $merged === $current ) {
+				++$result['imported'];
+			} else {
+				$result['notes'][] = __( 'The add-on settings from the file were not saved: the database refused the change. Import the file again to apply them.', 'perflocale' );
+			}
+
 			\PerfLocale\Addon\AddonSettings::reset_static_caches();
-			++$result['imported'];
 		}
 
-		// Operator's per-addon enable/disable list. Whole-list write so the
-		// target site's intent matches what was exported (an empty list
-		// means "nothing disabled" and must be preserved literally, not
-		// merged with the target's existing disabled set). Routed through
-		// the registry so it gets the same id-validation, byte cap,
-		// write-lock, and bootable-cache flush as the admin/CLI toggles.
+		// The disabled add-on list, whole (an empty list means none disabled), through the registry for its id checks, byte
+		// cap, lock and cache flush.
 		if ( isset( $data['disabled_addons'] ) && is_array( $data['disabled_addons'] ) ) {
-			\PerfLocale\Addon\AddonRegistry::set_disabled_list( $data['disabled_addons'] );
-			++$result['imported'];
+			if ( \PerfLocale\Addon\AddonRegistry::set_disabled_list( $data['disabled_addons'] ) ) {
+				++$result['imported'];
+			} else {
+				$result['notes'][] = __( 'The add-on list from the file was not saved: the database refused the change. Import the file again to apply it.', 'perflocale' );
+			}
 		}
 
-		// Import roles + capabilities snapshot.
+		// Roles and capabilities.
 		if ( isset( $data['roles'] ) && is_array( $data['roles'] ) ) {
 			$dropped = $this->restore_roles( $data['roles'] );
 			++$result['imported'];
@@ -1765,9 +1337,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The settings of a file a Replace import may apply: the keys this build
-	 * knows, without the secret ones (API keys). The exporter never writes a
-	 * secret, so this site's own value always stays.
+	 * The file's settings a Replace may apply: keys this build knows, without the secret ones (this site's stay).
 	 *
 	 * @param array<array-key, mixed>   $file_settings The file's `settings`.
 	 * @param array<int, int|string>    $known         Setting keys this build knows.
@@ -1792,15 +1362,9 @@ final class DataImporter {
 		$defaults = [ 'language_domains', 'mt_libre_url', 'mt_agency_url', 'delete_data_on_uninstall', 'background_paused' ];
 
 		/**
-		 * Filters the settings a Replace import keeps as this site has them.
-		 *
-		 * These settings describe the site rather than its translation data:
-		 * its per-language domains, its machine-translation endpoints, its
-		 * uninstall choice and its paused background queue. A Replace import
-		 * applies the file's other settings and leaves these as they are; the
-		 * import report names each one whose value in the file was different.
-		 * Return an empty array to apply every setting from the file. API
-		 * keys are never in an export file, so they are always kept.
+		 * Filters the settings a Replace import keeps as this site has them: those describing the site, not its data
+		 * (language domains, provider endpoints, uninstall choice, paused queue); the report names any the file had
+		 * differently. Return [] to apply them all; API keys are never in a file.
 		 *
 		 * @hook  perflocale/import/keep_target_settings
 		 * @since 1.0.7.3
@@ -1816,9 +1380,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The setting keys a perflocale/import/keep_target_settings callback
-	 * returned: its non-empty strings, or the defaults when it did not
-	 * return an array.
+	 * The keys a keep_target_settings callback returned: its non-empty strings, or the defaults for a non-array.
 	 *
 	 * @param mixed              $keys     What the filter returned.
 	 * @param array<int, string> $defaults The default keys.
@@ -1853,8 +1415,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The sentence an import report shows for the settings a Replace import
-	 * kept as this site has them.
+	 * The report sentence for the settings a Replace kept as this site has them.
 	 *
 	 * @param array<int, string> $kept Setting keys.
 	 * @return string
@@ -1881,8 +1442,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The sentence an import report shows for the provider address settings
-	 * the settings update refused.
+	 * The report sentence for the provider address settings the update refused.
 	 *
 	 * @param array<int, string> $refused Refused settings (mt_libre_url, mt_agency_url).
 	 * @return string
@@ -1906,16 +1466,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * The configuration keys and members of `data` that no section the file
-	 * declares carries, by DataRegistry::section_transports(). A file without
-	 * `sections` keeps everything, as before section lists existed; one whose
-	 * `sections` is not a list declares nothing.
-	 *
-	 * An add-on part's row lists belong to the Add-on data section; a part
-	 * with its own checkbox also counts as declared when the file names it in
-	 * `addon_groups`, which the exporter writes for every group part it
-	 * exports. A member this version does not know (a newer version's table)
-	 * is left to the unread report.
+	 * The configuration keys and `data` members no declared section carries (DataRegistry::section_transports()). No
+	 * `sections`: everything kept; a non-list declares nothing. Add-on part lists belong to Add-on data, a group part
+	 * also when named in `addon_groups`; an unknown member goes to the unread report.
 	 *
 	 * @param array<array-key, mixed>  $data    Envelope.
 	 * @param array<int, int|string>   $members Members of `data`.
@@ -1972,7 +1525,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * How many failed statements wpdb holds in the global $EZSQL_ERROR.
+	 * The number of failed statements in wpdb's global $EZSQL_ERROR.
 	 *
 	 * @return int
 	 */
@@ -1981,10 +1534,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Drop the duplicate-key failures added to $EZSQL_ERROR after the first
-	 * $from entries: the skips a Merge expects, each about 1 KB, which would
-	 * otherwise grow with the file until the request ends. Any other failure
-	 * is kept, in order.
+	 * Drop the duplicate-key failures added to $EZSQL_ERROR after the first $from (a Merge's expected skips, about 1 KB
+	 * each, would grow with the file); other failures stay, in order.
 	 *
 	 * @param int $from Entries to keep untouched.
 	 * @return void
@@ -2010,38 +1561,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Build the table wipe plan a replace-mode import should apply.
-	 *
-	 * Reads the envelope's `sections` field (an array of section keys
-	 * present in the export) and resolves it through DataExporter::sections()
-	 * to a `table short-name => type scope` map. A null scope means the whole
-	 * table; a string means only the rows whose polymorphic `type` column
-	 * holds that value (see DataExporter::sections()' `type_scope`). An absent
-	 * or empty `sections` list wipes nothing - that's the safer default for a
-	 * malformed envelope than truncating every PerfLocale table.
-	 *
-	 * Two rules keep a partial bundle from over-reaching:
-	 *
-	 * - The WIDEST claim wins. A full bundle selects both `translations`
-	 *   (which owns all of `translation_groups`) and `strings` (which owns
-	 *   only the type='string' slice), so the table is wiped whole - exactly
-	 *   what happened before scoping existed.
-	 * - A scoped slice is wiped only when the envelope actually CARRIES rows
-	 *   for that table. Unscoped tables are wiped when the envelope carries
-	 *   them as a row list, even an empty one, otherwise post-export rows
-	 *   leak through the replace; a table the envelope does not carry at all
-	 *   is kept, as the exporter writes a list for every table of every
-	 *   section it declares. A scope exists precisely because the table is
-	 *   SHARED, and a bundle written before the scope was introduced names
-	 *   the section without carrying the slice. Wiping on its behalf would
-	 *   delete the target's groups with nothing left to restore them.
-	 * - The string slice belongs to String Translations. A file that declares
-	 *   Translation Links without String Translations owns the post and term
-	 *   rows of `translation_groups` and `translation_links` only: those two
-	 *   tables get the scope `!string` (every row whose type is not
-	 *   `string`), and the file's own string rows in them are not imported.
-	 *   The strings, their groups and their links made after the export
-	 *   therefore stay as they are.
+	 * The replace wipe plan from the envelope's `sections` (DataExporter::sections()): table => type scope. None or empty
+	 * wipes nothing. The widest claim wins; a scoped slice is wiped only when the file carries rows for it, an unscoped
+	 * table when carried as a list; Translation Links without String Translations gets `!string`.
 	 *
 	 * @param array<array-key, mixed> $data Envelope; `data` maps each table to
 	 *                                      its rows or to its row count.
@@ -2075,8 +1597,7 @@ final class DataImporter {
 					continue;
 				}
 
-				// A row list is a count (the reader's summary) or the decoded
-				// rows; an absent table is not carried.
+				// A row list is a count (the reader's summary) or the rows; an absent table is not carried.
 				if ( $scope === null && ! is_int( $carried[ $tbl ] ?? null ) && ! is_array( $carried[ $tbl ] ?? null ) ) {
 					continue;
 				}
@@ -2095,9 +1616,7 @@ final class DataImporter {
 			}
 		}
 
-		// Walking the import order keeps dependency order
-		// (parents before children) is preserved even if `sections` arrived
-		// in a weird order.
+		// In import order, so parents come before children whatever order `sections` has.
 		$plan = [];
 		foreach ( DataRegistry::import_tables() as $table_name ) {
 			if ( array_key_exists( $table_name, $scopes ) ) {
@@ -2109,19 +1628,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * What the import does with the add-on data a file carries.
-	 *
-	 * Each add-on part travels as its own row lists
-	 * (`addon_data/<part>/<row list>`, DataRegistry::ADDON_MEMBER_PREFIX). A
-	 * part is read when it is chosen (the shared `addon_data` choice for a
-	 * part without a group, its own part key for a group) and this site
-	 * declares the same part: its rows are matched against that part's
-	 * entries only, so Merge and Replace touch nothing outside it. A part
-	 * this site does not declare is read against the chosen parts of the
-	 * same add-on when it declares any (its groups changed since the
-	 * export); otherwise (its add-on is not active, or declares no such
-	 * data) it is named in `inactive`, chosen or not. A chosen-out part
-	 * that holds rows is named in `unchosen`.
+	 * What the import does with the file's add-on parts (`addon_data/<part>/<row list>`): a chosen part this site
+	 * declares is read against that part's entries only; an undeclared part of an add-on with other parts against those;
+	 * otherwise `inactive`. A chosen-out part with rows is `unchosen`.
 	 *
 	 * @param ImportReader            $reader  Indexed reader.
 	 * @param array<array-key, mixed> $data    Envelope.
@@ -2166,11 +1675,8 @@ final class DataImporter {
 			$grouped = str_contains( $part, '/' );
 			$rows    = $reader->count( $member ) > 0;
 
-			// Not declared here, while its add-on declares other parts (it
-			// added, removed or renamed a group since the export): the rows are
-			// read against the entries of that add-on's parts chosen on this
-			// site. Each row is matched by name, so nothing outside the add-on's
-			// own entries is written.
+			// Not declared here while its add-on declares other parts (groups changed since the export): read against that
+			// add-on's chosen parts, each row matched by name.
 			if ( ! isset( $parts[ $part ] ) ) {
 				$owner    = (string) strtok( $part, '/' );
 				$declared = false;
@@ -2204,8 +1710,7 @@ final class DataImporter {
 					continue;
 				}
 
-				// Its add-on's parts are all chosen out: named as not chosen (the
-				// shared part by the "Add-on data" line above).
+				// All its add-on's parts chosen out: named as not chosen.
 				if ( $declared ) {
 					if ( $rows ) {
 						$out['unchosen'] = array_merge( $out['unchosen'], $unticked );
@@ -2214,9 +1719,7 @@ final class DataImporter {
 					continue;
 				}
 
-				// Its add-on declares nothing here: the import screen has no
-				// checkbox for it, so it is named as not active whatever was
-				// chosen.
+				// Its add-on declares nothing here (no checkbox): named as not active whatever was chosen.
 				if ( $rows ) {
 					/* translators: %s: an add-on's id as the export file names it, for example ext:acme. */
 					$out['inactive'][] = $grouped ? ( $labels[ $part ] ?? $part ) : sprintf( __( 'Add-on data (%s)', 'perflocale' ), $part );
@@ -2245,14 +1748,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Does this envelope carry `strings` rows?
-	 *
-	 * Gates the REPLACE half of both post-import string passes - the
-	 * orphan-link reap and the string-graph repair - so a replace bundle
-	 * that landed no strings doesn't pay for work that has nothing to fix.
-	 * Merge mode runs both unconditionally: its sweep_orphan_groups() call
-	 * is itself unconditional, so any merge import can strand string links
-	 * whether or not the envelope carried strings.
+	 * Does the envelope carry `strings` rows? Gates the Replace half of the string reap and repair; Merge runs both
+	 * always (its orphan sweep can strand links in any merge).
 	 *
 	 * @param array<string,mixed> $data Decoded envelope.
 	 * @return bool True when the envelope's `data` holds at least one strings row.
@@ -2262,7 +1759,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Does this envelope's `data` carry at least one row for a table?
+	 * Does the envelope's `data` carry a row for this table?
 	 *
 	 * @param array<array-key, mixed> $data  Envelope: `data` maps each table
 	 *                                       to its row count (import()), or
@@ -2278,24 +1775,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Does this envelope carry rows keyed by a post, term or string ID?
-	 *
-	 * Every `translation_links` row counts, `type='string'` included: a string
-	 * link's `object_id` is the exporting site's `strings.id`. A merge that
-	 * carries the strings maps it through their `original_hash`, but a file
-	 * with links and no strings can only be read with the exporting site's
-	 * ids. `slug_translations` and `content_hashes` carry the same raw
-	 * `object_id`, as do the post, term and order meta lists and the add-on
-	 * options (form ids) of ExportItems.
-	 *
-	 * The `strings` and `string_translations` sections are not listed: strings
-	 * match on `original_hash`, so they stay portable between sites.
-	 *
-	 * Pure over its argument - no DB access, no memo (the network importer
-	 * reuses one instance across switch_to_blog()).
-	 *
-	 * An add-on part's row lists count when the import reads them: every
-	 * part travels in the Add-on data section, which holds ids.
+	 * Does the envelope carry rows keyed by a post, term or string id: translation_links (string links too: their
+	 * object_id is the source's strings.id), slug_translations, content_hashes, meta lists, add-on parts read? Strings
+	 * match on original_hash and are portable. Pure: network-import reuses one instance across blogs.
 	 *
 	 * @param array<array-key, mixed> $data    Decoded envelope.
 	 * @param array<int, string>      $members The add-on part row lists the import reads.
@@ -2316,8 +1798,7 @@ final class DataImporter {
 			}
 		}
 
-		// The meta row lists name posts, terms and orders; the option rows of
-		// an id-keyed section (Add-on data) name forms.
+		// Meta lists name posts, terms and orders; Add-on data's option rows name forms.
 		foreach ( DataRegistry::ROW_LISTS as $kind => $list ) {
 			if ( 'option' !== $kind && self::has_rows( $data, $list ) ) {
 				return true;
@@ -2330,12 +1811,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Does this envelope carry rows that name a language by its numeric id?
-	 *
-	 * These are the tables whose `language_id` the registry's FK map points at `languages`. The map is
-	 * consulted only for ids captured while the bundle's own `languages`
-	 * section was imported, and only in merge mode, so without that section
-	 * the exporting site's ids are written verbatim.
+	 * Does the envelope carry rows naming a language by numeric id (the tables whose language_id fk_refs() points at
+	 * languages)? Those ids are remapped only while the file's own languages section is imported, in Merge.
 	 *
 	 * @param array<array-key, mixed> $data Decoded envelope.
 	 * @return bool
@@ -2351,28 +1828,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Does the address recorded in a bundle name THIS site?
-	 *
-	 * The COMPARISON both import paths share - the admin/job gate in
-	 * {@see self::import()} and the per-slice guard in
-	 * `wp perflocale network-import` - so neither can grow its own idea of
-	 * what "the same site" means. The null POLICY is the caller's, and each
-	 * one spells it out: null covers two different shapes, and only one of
-	 * them ("no address recorded at all") is the legacy envelope both paths
-	 * wave through.
-	 *
-	 * Scheme-agnostic, because an http → https move does not change which
-	 * site the IDs belong to. Port-sensitive, because two local installs on
-	 * the same host and different ports are different sites.
-	 *
-	 * Compared against the raw `home` option, which is what the exporter
-	 * records, AND against `home_url()`: bundles written before the exporter
-	 * stopped passing the value through the `home_url` filter carry the
-	 * filtered form, which in domain or subdomain mode is a different host.
-	 *
-	 * A matching address is not proof the IDs match - a site rebuilt at the
-	 * same address keeps the address and loses the IDs - and the value comes
-	 * from the file itself. This catches an honest mistake.
+	 * Does the address recorded in a file name this site? The comparison the import gate and network-import's slice guard
+	 * share; null (absent, or no host) is for the caller to judge. Scheme-agnostic, port-sensitive; checked against the
+	 * raw `home` option and home_url() (older files carry the filtered form). Catches an honest mistake, no more.
 	 *
 	 * @param mixed $site_url The envelope's `site_url` value, exactly as the
 	 *                        JSON decoder produced it.
@@ -2397,11 +1855,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Normalize a site address down to the identity the gate compares.
-	 *
-	 * Lowercase host, the port unless it is the scheme's default, and the
-	 * path without a trailing slash. The scheme, query and fragment are
-	 * dropped.
+	 * A site address as the gate compares it: lowercase host, a non-default port, the path without a trailing slash.
 	 *
 	 * @param mixed $url Candidate address. Anything at all: the envelope's
 	 *                   value is whatever the file put there, and the quality
@@ -2421,8 +1875,7 @@ final class DataImporter {
 
 		$port = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
 
-		// A bundle that spells out the scheme's default port and a site that
-		// leaves it implicit are the same address.
+		// An explicit default port and an implicit one are the same address.
 		if ( 80 === $port || 443 === $port ) {
 			$port = 0;
 		}
@@ -2433,7 +1886,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Validate the export data structure.
+	 * Validate the export structure.
 	 *
 	 * @param array<string, mixed> $data Decoded JSON data.
 	 * @return array<int, string> Validation errors (empty = valid).
@@ -2449,8 +1902,7 @@ final class DataImporter {
 			$errors[] = __( 'Export version is missing.', 'perflocale' );
 		}
 
-		// Check version compatibility: block imports from newer major versions
-		// (their schema may have tables/columns this version doesn't support).
+		// Refuse files from a newer major version: their schema may have tables or columns this one lacks.
 		if ( ! empty( $data['version'] ) && defined( 'PERFLOCALE_VERSION' ) ) {
 			$export_major  = (int) explode( '.', (string) $data['version'] )[0];
 			$current_major = (int) explode( '.', PERFLOCALE_VERSION )[0];
@@ -2465,10 +1917,8 @@ final class DataImporter {
 			}
 		}
 
-		// Envelope format-version gate. Bumped only when the JSON shape
-		// changes incompatibly (renamed/removed sections or columns).
-		// Newer-than-known is rejected; unknown/older is accepted because
-		// we validate every section's shape independently below.
+		// The envelope format version changes only with an incompatible shape: newer is refused, older accepted (every
+		// section's shape is validated below).
 		if ( isset( $data['format_version'] ) ) {
 			$incoming = (int) $data['format_version'];
 
@@ -2490,20 +1940,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * The default `max_rows_per_table`, for this process.
-	 *
-	 * The file is read and written in pieces, but a Merge keeps a little
-	 * state for each row until the import ends (RETAINED_BYTES_PER_ROW). So
-	 * the default is the smaller of two ceilings, and never below the 500,000
-	 * rows of earlier versions (LEGACY_MAX_ROWS):
-	 * - size: the most rows the largest file the import screen accepts
-	 *   (`perflocale/import/max_file_bytes`) can hold at MIN_ROW_BYTES a row;
-	 * - memory: the rows whose retained state fits in RETAINED_MEMORY_SHARE
-	 *   percent of what PHP's memory_limit leaves free when the check runs.
-	 *   An unlimited memory_limit (-1) leaves the size ceiling alone.
-	 *
-	 * A file over it is refused before anything is written. A
-	 * `max_rows_per_table` from perflocale/import/quality_limits replaces it.
+	 * The default `max_rows_per_table`: the smaller of the size ceiling (largest accepted file / MIN_ROW_BYTES) and the
+	 * memory ceiling (RETAINED_BYTES_PER_ROW per row within RETAINED_MEMORY_SHARE % of free memory; none without a
+	 * memory_limit), never below LEGACY_MAX_ROWS. A quality_limits value replaces it.
 	 *
 	 * @return int
 	 */
@@ -2514,8 +1953,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The default row ceiling for a size ceiling, a memory limit and the
-	 * memory in use (see default_max_rows()).
+	 * The default row ceiling for a size ceiling, a memory limit and the memory in use (default_max_rows()).
 	 *
 	 * @param int $size_rows Rows the largest accepted file can hold.
 	 * @param int $limit     PHP's memory_limit in bytes; 0 or less for none.
@@ -2529,9 +1967,7 @@ final class DataImporter {
 			return $size_rows;
 		}
 
-		// The share of the free bytes from quotient and remainder, so no step
-		// exceeds the free bytes (a product of them and the share would pass
-		// PHP_INT_MAX on 32-bit PHP and become a float).
+		// The share from quotient and remainder, so no step exceeds the free bytes (the product would overflow on 32-bit PHP).
 		$free        = max( 0, $limit - $used );
 		$memory_rows = intdiv( intdiv( $free, 100 ) * self::RETAINED_MEMORY_SHARE + intdiv( $free % 100 * self::RETAINED_MEMORY_SHARE, 100 ), self::RETAINED_BYTES_PER_ROW );
 
@@ -2539,21 +1975,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Data-quality validation: reject corrupt or hostile payloads BEFORE
-	 * any DB write.
-	 *
-	 * Catches what json_decode() happily accepts but the importer would
-	 * persist verbatim: invalid UTF-8 byte sequences (MySQL truncates the
-	 * value at the bad byte - silent data loss), null bytes (classic
-	 * injection / downstream-corruption vector), cardinality bombs
-	 * (500k-language files exhausting memory or wedging the languages
-	 * UI), oversized single values, and malformed row shapes.
-	 *
-	 * Pure function - no DB access, no WP state beyond __() - so it's
-	 * directly unit-testable and trivially safe to call on any payload.
-	 *
-	 * Error reporting stops after MAX_QUALITY_ERRORS so a garbage file
-	 * produces a readable report, not a megabyte of notices.
+	 * Data-quality check before any write: invalid UTF-8 (MySQL truncates at the bad byte), null bytes, cardinality
+	 * bombs, oversize values and malformed rows, which json_decode() accepts. Pure; reports stop after
+	 * MAX_QUALITY_ERRORS.
 	 *
 	 * @param array<string, mixed> $data   Decoded export envelope.
 	 * @param array<string, int>   $limits Override limits (used by tests):
@@ -2579,13 +2003,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * The data-quality gate over a file read in pieces: the same checks and
-	 * messages as {@see self::find_data_quality_issues()}, with every row
-	 * decoded once and dropped again.
-	 *
-	 * While the rows go by, the ID-keyed rows of $sources are watched:
-	 * $presence['rows'] is set when one names a post, term or order, and
-	 * $presence['fp'] when one carries a fingerprint.
+	 * The data-quality gate over a file read in pieces (the checks and messages of find_data_quality_issues()), each row
+	 * decoded once; also notes whether $sources rows name objects ($presence['rows']) and carry fingerprints ('fp').
 	 *
 	 * @param ImportReader                                  $reader   Indexed reader.
 	 * @param array<string, mixed>                          $data     Envelope (top-level members).
@@ -2635,8 +2054,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Pass rows through, noting whether the ID-keyed ones carry a fingerprint
-	 * (see stream_quality_issues()).
+	 * Pass rows through, noting whether the id-keyed ones carry a fingerprint (stream_quality_issues()).
 	 *
 	 * @param iterable<array-key, mixed>   $rows     Rows.
 	 * @param array{0: string, 1: string}  $source   [ the column naming the object's kind, or '' ; the fixed kind, or '' ].
@@ -2658,8 +2076,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Whether a file's `version` is IDENTITY_SINCE or later (its leading
-	 * numbers; a version that does not start with a number is older).
+	 * Whether a file's `version` is IDENTITY_SINCE or later (by its leading numbers; none means older).
 	 *
 	 * @param mixed $version The envelope's `version`.
 	 * @return bool
@@ -2673,8 +2090,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The row lists whose rows can carry an object fingerprint: list =>
-	 * [ the column naming the object's kind, or '' ; the fixed kind, or '' ].
+	 * Row lists whose rows can carry a fingerprint: list => [ column naming the kind, or '' ; fixed kind, or '' ].
 	 *
 	 * @param array<string, mixed> $members The add-on part row lists the import reads (addon_plan()).
 	 * @return array<string, array{0: string, 1: string}>
@@ -2726,8 +2142,7 @@ final class DataImporter {
 
 		$errors = [];
 
-		// Cardinality gates first - cheap, and they catch the bomb case
-		// before the per-value scan walks half a million rows.
+		// Cardinality first: cheap, and it stops a bomb before the value scan walks it.
 		if ( isset( $shape['languages'] ) && $shape['languages'] > $max_languages ) {
 			$errors[] = sprintf(
 				/* translators: 1: language count in the file, 2: maximum allowed. */
@@ -2762,11 +2177,8 @@ final class DataImporter {
 			return $errors;
 		}
 
-		// Per-value scan: every string in every table row, then in the
-		// settings / addon_settings / roles sections, is checked for invalid
-		// UTF-8, null bytes and oversize. Every row is read here, so a row
-		// that is not valid JSON stops the import before its first write.
-		// Row shape is collected on the way and reported after the values.
+		// Every string of every row, then of settings, add-on settings and roles: invalid UTF-8, null bytes, size. Every
+		// row is read here, so invalid JSON stops the import before a write; shape errors are reported after.
 		$shape_errors = [];
 
 		foreach ( $shape as $table => $count ) {
@@ -2783,9 +2195,7 @@ final class DataImporter {
 						);
 					}
 
-					// A replace keeps each row's id, and an id near the top of
-					// the column's range moves the table's next id there: every
-					// later insert would then fail. Real ids stay far below 2^53.
+					// Replace keeps ids, and an id near the column's top moves the next id there so every later insert fails.
 					if ( is_array( $row ) && isset( $row['id'] ) && ( ! is_numeric( $row['id'] ) || (float) $row['id'] > self::MAX_ROW_ID ) && count( $shape_errors ) < $max_errors ) {
 						$shape_errors[] = sprintf(
 							/* translators: 1: table name, 2: row index. */
@@ -2822,11 +2232,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Check one value, and every string inside it, for a null byte, invalid
-	 * UTF-8 and the size limit.
-	 *
-	 * Budget-passing recursion: each call returns the errors it found,
-	 * capped at $budget, so the cap is enforced at every level.
+	 * Check a value and every string inside it for a null byte, invalid UTF-8 and size; recursion passes the error
+	 * budget down, so the cap holds at every level.
 	 *
 	 * @param mixed  $value     Value.
 	 * @param string $path      JSON path of the value, for the messages.
@@ -2850,9 +2257,7 @@ final class DataImporter {
 				];
 			}
 
-			// preg_match with the `u` modifier fails (returns false) on
-			// invalid UTF-8 - the fastest validity probe PHP offers
-			// without mbstring.
+			// An empty /u pattern fails on invalid UTF-8: the fastest check without mbstring.
 			if ( $value !== '' && preg_match( '//u', $value ) === false ) {
 				return [
 					sprintf(
@@ -2893,20 +2298,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Restore the role + capability snapshot.
-	 *
-	 * Recreates the Translator role with its imported capability map, then
-	 * re-applies the PerfLocale-prefixed caps the file grants to the roles
-	 * an export carries (DataExporter::grant_roles(): administrator, editor,
-	 * the `perflocale/roles/cap_roles` roles and the Shop Manager); grants to
-	 * any other role slug are ignored. Sets `perflocale_caps_version` to the imported value, at most
-	 * TranslatorRole::CAPS_VERSION, so `TranslatorRole::install_caps()` sees
-	 * a matching version on the next admin_init and does not immediately
-	 * rewrite what was just restored, and a file can never mark a capability
-	 * install as done that this version of the plugin has not run.
-	 *
-	 * Foreign caps (anything not prefixed with `perflocale_`) are filtered
-	 * out so an export crafted maliciously can't grant arbitrary WP caps.
+	 * Restore the role snapshot: the Translator role with its imported caps, and the file's `perflocale_` grants to the
+	 * roles an export carries (DataExporter::grant_roles(); other slugs ignored). perflocale_caps_version is set to the
+	 * file's, at most TranslatorRole::CAPS_VERSION, so install_caps() neither rewrites nor skips. Foreign caps dropped.
 	 *
 	 * @param array<string,mixed> $roles Snapshot from DataExporter::snapshot_roles().
 	 * @return array<int, string> Translator capabilities in the file that were not restored (outside the allowlist).
@@ -2914,8 +2308,7 @@ final class DataImporter {
 	private function restore_roles( array $roles ): array {
 		$dropped = [];
 
-		// Translator role: rebuild from imported caps (allow-listed to
-		// `perflocale_*` plus the standard editing caps the role needs).
+		// Translator role from the imported caps, allow-listed to `perflocale_*` and the editing caps it needs.
 		$translator_caps = isset( $roles['translator'] ) && is_array( $roles['translator'] )
 			? $roles['translator']
 			: [];
@@ -2966,8 +2359,7 @@ final class DataImporter {
 
 				foreach ( $grants as $cap => $grant ) {
 					$cap_str = (string) $cap;
-					// Foreign caps filtered defensively - a tampered export
-					// could otherwise grant arbitrary WP caps to admin/editor.
+					// Foreign caps dropped: a tampered export could grant arbitrary caps to admins and editors.
 					if ( ! str_starts_with( $cap_str, 'perflocale_' ) ) {
 						continue;
 					}
@@ -2984,10 +2376,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Map each column of a table to its wpdb placeholder, derived from the SQL
-	 * column TYPE (memoised per request). Integer columns => %d, decimal/float
-	 * => %f, everything else (varchar/text/etc.) => %s, so all-digit string
-	 * content round-trips verbatim instead of being silently int-cast.
+	 * Each column's wpdb placeholder from its SQL type (memoised): integers %d, decimals %f, others %s, so all-digit text
+	 * round-trips verbatim.
 	 *
 	 * @param string $full_table Prefixed table name (from Schema::table()).
 	 * @return array<string, string> column => '%d'|'%f'|'%s'
@@ -3027,12 +2417,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
-	 *
-	 * That text can carry table names with their prefix and the values of the
-	 * failed row. Import results and failed-job rows are shown to every user
-	 * with Jobs access, so the messages stored there say only that a database
-	 * error happened; the detail is here.
+	 * Log a database error's text when WP_DEBUG_LOG is on: it can carry prefixed table names and row values, so results
+	 * and job rows (shown to all Jobs users) say only that a database error happened.
 	 *
 	 * @param string $where What was running, for the log line.
 	 * @param string $error The database error.
@@ -3048,12 +2434,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * The unique keys a table holds now, read in pages of 5,000 rows, as a set
-	 * of row_keys() entries.
-	 *
-	 * Used for the tables {@see self::KEY_LOOKUP} does not list, whose text
-	 * keys compare the way the database's indexes compare them; their size
-	 * bounds the set.
+	 * The unique keys a table holds, read 5,000 rows a page, as row_keys() entries; for the text-keyed tables KEY_LOOKUP
+	 * does not list (small by nature).
 	 *
 	 * @param string $table_name Short table name.
 	 * @param string $full_table Full table name.
@@ -3094,12 +2476,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * The unique keys that the rows of one piece would take and that the
-	 * table already holds, as a set of row_keys() entries.
-	 *
-	 * One query per unique key, on the column {@see self::KEY_LOOKUP} names,
-	 * with the piece's values in the IN list. Rows written earlier in this
-	 * import are found too: they are in the table, on the same connection.
+	 * The unique keys this piece's rows would take that the table holds: one query per key on KEY_LOOKUP's column with
+	 * the piece's values (earlier rows of this import are found too, on the same connection).
 	 *
 	 * @param string                           $table_name  Short table name.
 	 * @param string                           $full_table  Full table name.
@@ -3133,8 +2511,7 @@ final class DataImporter {
 				continue;
 			}
 
-			// Columns, table and key column are bound with %i; the values one
-			// placeholder each: %d for an integer key column, %s otherwise.
+			// Columns, table and key column as %i; values %d for an integer key column, else %s.
 			$select  = implode( ', ', array_fill( 0, count( $columns ), '%i' ) );
 			$numeric = '%d' === ( $col_formats[ $in_col ] ?? '%s' );
 
@@ -3168,14 +2545,10 @@ final class DataImporter {
 	}
 
 	/**
-	 * A row's unique keys as set entries ("key index|normalised values").
-	 * Values compare as the indexes compare them on SQLite (NOCASE) and, for
-	 * ASCII, on MySQL: ASCII letters case-insensitive, trailing spaces
-	 * ignored, slug by its first 191 characters. strtolower(), not
-	 * mb_strtolower(): mbstring is optional, and SQLite folds ASCII only. A
-	 * key that MySQL's collation folds further (non-ASCII case or accents) is
-	 * not found here; its insert fails and the import stops and rolls back.
-	 * A key with a missing or NULL column is left out (NULL never collides).
+	 * A row's unique keys as "key index|normalised values", compared as the indexes compare ASCII.
+	 *
+	 * A key MySQL folds further is missed (its insert fails, the import rolls back); NULL columns leave the key out.
+	 * Docs: docs-ai/11-code-rationale.md, "DataImporter: rows as they are written".
 	 *
 	 * @param string              $table_name Short table name.
 	 * @param array<mixed, mixed> $row        Row (column => value).
@@ -3206,7 +2579,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Import a single table's data, a piece at a time.
+	 * Import one table's rows, a piece at a time.
 	 *
 	 * @param string   $table_name       Short table name.
 	 * @param iterable $rows             The table's rows, decoded one at a time.
@@ -3217,11 +2590,7 @@ final class DataImporter {
 	 * @return array{imported: int, skipped: int, failed: int, dropped: int, errors: array<int, string>, sanitized: int}
 	 *
 	 * @throws \RuntimeException In replace mode, when a row cannot be saved (the caller rolls the import back).
-	 *         `skipped` counts every row that did not insert; `failed` counts
-	 *         the subset that failed for a reason OTHER than a duplicate-key
-	 *         collision. The replace-mode abort gate in import() reads
-	 *         `failed` to tell a systematic insert failure from the benign
-	 *         duplicate-skips a scoped wipe leaves behind.
+	 *         `failed` counts the skips that were not duplicate-key collisions, for import()'s abort gate.
 	 */
 	private function import_table( string $table_name, iterable $rows, bool $replace, bool $sanitize_strings = false, string $exclude_type = '' ): array {
 		global $wpdb;
@@ -3236,47 +2605,27 @@ final class DataImporter {
 			'sanitized' => 0,
 		];
 
-		// Rows this table leaves out on purpose (counted by reason) are not
-		// failed inserts: the zero-insert gate in import_from() discounts them.
+		// Rows left out on purpose (by reason) are not failed inserts: the zero-insert gate discounts them.
 		$reasons_before = array_sum( $this->skip_reasons );
 
-		// Merge-mode is expected to see duplicate-unique-key collisions (e.g.
-		// `languages.slug` already holding "en"). Those are INTENDED skips -
-		// merge adds, it doesn't overwrite. Without this suppression, wpdb
-		// would echo raw SQL errors into the admin UI redirect page.
-		// Truncation is handled by the caller ({@see self::import()}) so
-		// replace covers every imported table, including tables that happened
-		// to be empty at export time. This method is row-insert only.
+		// Merge expects duplicate-key collisions (intended skips); suppressed, or wpdb echoes raw SQL errors into the
+		// redirect page. The wipe is the caller's.
 		$was_suppressing = $wpdb->suppress_errors( true );
 
-		// wpdb keeps every failed statement in the global $EZSQL_ERROR, the
-		// suppressed ones too: about 1 KB for each duplicate a Merge skips,
-		// held until the request ends. Those entries are dropped after each
-		// piece (see forget_duplicate_errors()).
+		// wpdb keeps every failed statement in $EZSQL_ERROR, suppressed ones too (about 1 KB per skipped duplicate):
+		// dropped after each piece (forget_duplicate_errors()).
 		$errors_before = self::db_error_count();
 
 		try {
-			// Pre-fetch the natural-key map for parent tables so duplicate-skip
-			// collisions still populate $id_maps with the existing target id.
-			// Without this, a re-import on a target that already has the same
-			// languages would leave $id_maps['languages'] empty and child FKs
-			// would point at non-existent ids.
+			// Natural-key map of a parent table, so a duplicate-skipped parent still maps to the existing id and child FKs stay
+			// valid.
 			$natural_key_lookup = $this->build_natural_key_lookup( $table_name );
 
-			// One schema fetch for the whole table (identical every row), reused
-			// for format binding and for filtering unknown columns.
+			// One schema read per table, for formats and for dropping unknown columns.
 			$col_formats = $this->column_formats( $full_table );
 
-			// Replace mode writes inside a transaction, where no statement may
-			// fail: on the SQLite Database Integration a failed statement ends
-			// the transaction (rolling back the wipe and every earlier row) and
-			// the statements after it commit one by one. A row whose unique key
-			// is already taken - by a surviving row of a scoped wipe or by an
-			// earlier row of the file - is therefore skipped before it is
-			// written, as the database skipped it on MySQL; any statement that
-			// still fails is a genuine error and aborts the import at once.
-			// Tables with text keys are read whole once; the others are looked
-			// up per piece, so the set never grows with the file.
+			// In Replace no statement may fail (SQLite ends the transaction), so a row whose key is taken is skipped before the
+			// write; any failure left is real and aborts. Text-keyed tables read whole once, others per piece.
 			$whole_keys = ( $replace && ! isset( self::KEY_LOOKUP[ $table_name ] ) ) ? $this->taken_keys( $table_name, $full_table ) : null;
 			$size       = self::batch_size( $table_name );
 			$piece      = [];
@@ -3295,8 +2644,7 @@ final class DataImporter {
 					$piece = [];
 					self::forget_duplicate_errors( $errors_before );
 
-					// A replace writes inside its transaction, where the lock
-					// is not touched.
+					// Not inside Replace's transaction.
 					if ( ! $replace ) {
 						ImportLock::heartbeat();
 					}
@@ -3339,6 +2687,32 @@ final class DataImporter {
 		$fk_refs        = DataRegistry::fk_refs( $table_name );
 		$names_language = in_array( $table_name, DataRegistry::language_ref_tables(), true );
 		$fp_column      = DataExporter::fingerprint_columns()[ $table_name ] ?? null;
+		$work           = $this->work_table();
+
+		// Parent ids this piece's FK columns name, one read per parent table (Merge), and the groups a Replace moved.
+		$fk_maps = [];
+
+		// Merge: file ids of parent rows not saved; a child naming one is left out (it would land on another row here).
+		$not_saved = [];
+
+		if ( ! $replace && [] !== $fk_refs ) {
+			foreach ( $fk_refs as $col => $parent_table ) {
+				$fk_maps[ $parent_table ]   = ( $fk_maps[ $parent_table ] ?? [] ) + $work->get( $work->id_map( $parent_table ), self::column_ints( $piece, $col ) );
+				$not_saved[ $parent_table ] = ( $not_saved[ $parent_table ] ?? [] ) + $work->get( $work->not_saved( $parent_table ), self::column_ints( $piece, $col ) );
+			}
+		}
+
+		$records_parents = ! $replace && $this->is_parent_table( $table_name );
+		$parent_rows     = [];
+
+		$moved_groups = $replace && 'translation_links' === $table_name && $work->has( ImportWorkTable::MOVED_GROUP )
+			? $work->get( ImportWorkTable::MOVED_GROUP, self::column_ints( $piece, 'group_id' ) )
+			: [];
+
+		// This piece's rows for the work table, written once at its end.
+		$linked_posts = [];
+		$piece_map    = [];
+		$piece_moved  = [];
 
 		foreach ( $piece as $row ) {
 			if ( ! is_array( $row ) ) {
@@ -3349,62 +2723,50 @@ final class DataImporter {
 			$old_id   = isset( $row['id'] ) ? (int) $row['id'] : 0;
 			$file_row = $row;
 
-			// Menu and pattern references in translated templates follow the
-			// links this restore wrote, once the import is done.
-			if ( 'translation_links' === $table_name && 'post' === ( $row['type'] ?? '' ) && isset( $row['object_id'] ) && is_numeric( $row['object_id'] ) && (int) $row['object_id'] > 0 ) {
-				$this->linked_posts[ (int) $row['object_id'] ] = true;
+			if ( $records_parents && $old_id > 0 ) {
+				$parent_rows[ $old_id ] = 0;
 			}
 
-			// Rewrite FK columns from old parent id to the new one captured
-			// during the parent table's pass. If a parent id wasn't mapped the
-			// row keeps its export value, which on another site means a
-			// different parent or none at all. That is reached by an ordinary
-			// operator choice: the export form lets any section be unticked,
-			// so a bundle can carry translations, strings or slugs without the
-			// `languages` section their language_id refers to. Replace mode
-			// (the `! $replace` below) never rewrites at all - it restores the
-			// export's ids by design. The site-identity gate in import()
-			// refuses such a bundle from another site unless the operator
-			// confirms this site is a copy of it.
+			// Template menu and pattern references follow the links this restore wrote, after the import.
+			if ( 'translation_links' === $table_name && 'post' === ( $row['type'] ?? '' ) && isset( $row['object_id'] ) && is_numeric( $row['object_id'] ) && (int) $row['object_id'] > 0 ) {
+				$linked_posts[ (int) $row['object_id'] ] = 0;
+			}
+
+			// Merge: FK columns from the old parent id to the new one; an unmapped parent keeps the file's value (a section can
+			// be exported without languages). Replace never rewrites; the identity gate covers foreign files.
 			if ( ! $replace && [] !== $fk_refs ) {
 				foreach ( $fk_refs as $col => $parent_table ) {
-					if ( isset( $row[ $col ], $this->id_maps[ $parent_table ][ (int) $row[ $col ] ] ) ) {
-						$row[ $col ] = $this->id_maps[ $parent_table ][ (int) $row[ $col ] ];
+					if ( isset( $row[ $col ], $fk_maps[ $parent_table ][ (int) $row[ $col ] ] ) ) {
+						$row[ $col ] = $fk_maps[ $parent_table ][ (int) $row[ $col ] ];
+					} elseif ( isset( $row[ $col ], $not_saved[ $parent_table ][ self::fk_int( $row[ $col ] ) ] ) ) {
+						++$result['skipped'];
+						$this->note_skip( 'parent_not_saved' );
+						continue 2;
 					}
 				}
 			}
 
-			// A link of a file group that was written under a new id (a kept
-			// string group holds the file's id) goes into that group.
-			$file_group = $replace && 'translation_links' === $table_name && [] !== $this->moved_groups ? Typed::int( $row['group_id'] ?? null ) : 0;
+			// A link of a group written under a new id (a kept string group holds the file's id) goes into that group.
+			$file_group = [] !== $moved_groups ? Typed::int( $row['group_id'] ?? null ) : 0;
 
-			if ( $file_group > 0 && isset( $this->moved_groups[ $file_group ] ) ) {
-				$row['group_id'] = $this->moved_groups[ $file_group ];
+			if ( $file_group > 0 && isset( $moved_groups[ $file_group ] ) ) {
+				$row['group_id'] = $moved_groups[ $file_group ];
 			}
 
-			// A row that names a language this site does not have would be a
-			// translation in no language: it is left out and counted.
+			// A row naming a language this site lacks would be in no language: left out and counted.
 			if ( $names_language && ! isset( $this->language_ids()[ is_numeric( $row['language_id'] ?? null ) ? (int) $row['language_id'] : 0 ] ) ) {
 				++$result['skipped'];
 				$this->note_skip( 'unknown_language' );
 				continue;
 			}
 
-			// Remove auto-increment ID for clean insert (let MySQL assign new IDs).
-			// Keep ID only in replace mode to preserve references.
+			// Merge: drop the id for a new auto-increment one; Replace keeps it.
 			if ( ! $replace ) {
 				unset( $row['id'] );
 			}
 
-			// Drop columns the target schema doesn't have. An export from a
-			// NEWER minor version can carry an added column (the exporter
-			// deliberately does NOT bump FORMAT_VERSION for backward-compatible
-			// additions), and passing an unknown column to $wpdb->insert makes
-			// MySQL reject EVERY row with error 1054. In replace mode the table
-			// was already wiped inside the transaction, so a systematic failure
-			// would COMMIT an emptied table - silent total data loss. Filtering
-			// to known columns honors the exporter's forward-compat promise and
-			// keeps the insert alive.
+			// Drop columns the target lacks: a newer minor version can add one, and MySQL would refuse every row (1054),
+			// which in Replace would commit an emptied table.
 			$row = array_intersect_key( $row, $col_formats );
 
 			if ( $row === [] ) {
@@ -3412,27 +2774,16 @@ final class DataImporter {
 				continue;
 			}
 
-			// A language is the default or it is not: any value the file
-			// holds is stored as 0 or 1, as the importer's own checks read it.
+			// is_default stored as 0 or 1, as the importer's checks read it.
 			if ( 'languages' === $table_name && array_key_exists( 'is_default', $row ) ) {
 				$row['is_default'] = empty( $row['is_default'] ) ? 0 : 1;
 			}
 
-			// Read before the sanitizer runs: the refusal below is for a code
-			// that sanitizing emptied, not for one the file left empty.
+			// Read before sanitizing: the refusal below is for a code sanitizing emptied.
 			$had_code = $sanitize_strings && 'languages' === $table_name && is_string( $row['slug'] ?? null ) && '' !== $row['slug'];
 
-			// Sanitized after the FK rewrite and the column filter, and before
-			// the insert, so the duplicate-skip lookup below matches the bytes
-			// this row would have stored.
-			//
-			// A sanitized value is stored even when nothing is left of it, except
-			// a language code (see below). Both serving paths treat an empty
-			// translation as untranslated, and UrlConverter treats an empty
-			// translated slug as no translation, whereas skipping a string
-			// translation would leave the bundle's `translated` link with no
-			// value behind it, and a table of nothing but skipped rows would trip
-			// the replace-mode zero-insert abort in import().
+			// After the FK rewrite and column filter, before the duplicate lookup. Stored even when empty (an empty value reads
+			// as untranslated; skipping would leave a link without a value), except a language code (below).
 			$row_sanitized = $sanitize_strings && match ( $table_name ) {
 				'string_translations' => self::sanitize_string_translation_row( $row ),
 				'languages'           => self::sanitize_language_row( $row ),
@@ -3440,29 +2791,8 @@ final class DataImporter {
 				default               => false,
 			};
 
-			// A language code that sanitizing emptied is refused. The code is
-			// the routing key and this table's natural key; storing '' would
-			// turn a language the file names by code into one no URL can reach,
-			// which LanguageRepository::insert() refuses too. A code the file
-			// itself leaves empty is stored, as on the trusted path: update()
-			// lets a language hold '' (the Edit Language form can blank it), so
-			// a site's own export can carry one, and refusing it would roll back
-			// a replace-mode restore of that site. A code that is not a string
-			// is neither sanitized nor refused, so it fares the same on both
-			// paths: a missing code, an array or `false` reaches the column as
-			// '' (wpdb binds a non-scalar or `false` as '', and under
-			// WordPress's SQL modes MySQL fills a missing NOT NULL column with
-			// ''); a number or `true` is bound as text ('12', '1.5', '1'),
-			// which cannot carry markup; and null is sent as NULL, which the
-			// NOT NULL column rejects, so that row counts as failed and a
-			// replace-mode restore rolls back.
-			//
-			// Counted as a failure, so a replace-mode restore rolls back rather
-			// than committing without it. In merge mode the row's locale still
-			// maps its export id onto a language that already has that locale,
-			// as the duplicate-skip path below does; without one, the rows that
-			// name this language keep the export's language_id, as for any
-			// language row that does not insert.
+			// A code sanitizing emptied is refused and counted as a failure (the routing key; '' reaches no URL). A code the
+			// file leaves empty is stored, as on the trusted path; non-string codes fare as there.
 			if ( $had_code && '' === $row['slug'] ) {
 				++$result['skipped'];
 				++$result['failed'];
@@ -3479,21 +2809,15 @@ final class DataImporter {
 					$existing_id = $natural_key_lookup( $row );
 
 					if ( is_int( $existing_id ) && $existing_id > 0 ) {
-						$this->id_maps[ $table_name ][ $old_id ] = $existing_id;
+						$piece_map[ $old_id ] = $existing_id;
 					}
 				}
 
 				continue;
 			}
 
-			// An import that did not clear the languages table (a merge, or a
-			// Replace whose file does not carry the Languages section) never
-			// changes this site's default language. The file's default is
-			// added as an ordinary language when this site already has one;
-			// the languages table keeps one is_default row per site, and
-			// LanguageRepository serves the last one it reads, so a second
-			// default row would move the site's default, its unprefixed URLs,
-			// its x-default hreflang and its fallbacks.
+			// An import that did not clear languages never changes the default: the file's default becomes an ordinary
+			// language (LanguageRepository serves the last default row it reads).
 			$demoted = false;
 
 			if ( 'languages' === $table_name && ! $this->languages_cleared && ! empty( $row['is_default'] ) ) {
@@ -3524,8 +2848,7 @@ final class DataImporter {
 			$prepared = $this->check_merge_links( $prepared, $result );
 		}
 
-		// Replace mode: the keys this piece would take that the table already
-		// holds (see import_table()).
+		// Replace: the keys this piece would take that the table holds (import_table()).
 		$piece_keys = ( $replace && null === $whole_keys ) ? $this->taken_in_piece( $table_name, $full_table, array_column( $prepared, 'row' ), $col_formats ) : [];
 
 		foreach ( $prepared as $entry ) {
@@ -3541,24 +2864,16 @@ final class DataImporter {
 			if ( $replace ) {
 				$keys = self::row_keys( $table_name, $row );
 
-				// The row's few keys first: array_intersect_key() walks its
-				// first argument, and the taken set grows with the table.
+				// The row's few keys first: array_intersect_key() walks its first argument.
 				if ( array_intersect_key( $keys, null !== $whole_keys ? $whole_keys : $piece_keys ) !== [] ) {
-					// translation_groups has one key, its id. When only the
-					// post and term groups were cleared, a taken id is held by
-					// a string group this site kept (or by a group this import
-					// moved there): the file's group is written under a new id
-					// and its links follow it, rather than landing in the
-					// string group.
+					// translation_groups' one key is its id: with only post and term groups cleared, a taken id is a kept string group's
+					// (or one this import moved there), so the file's group gets a new id and its links follow.
 					if ( 'translation_groups' === $table_name && $this->groups_keep_strings && $old_id > 0 && 'string' !== ( $row['type'] ?? null ) ) {
 						unset( $row['id'] );
 						$moved  = true;
 						$new_id = true;
 					} elseif (
-						// Likewise a post or term link whose id alone is taken
-						// (by a kept string link, or by a link this import wrote
-						// under a new id) is written under a new id; its group
-						// and object keys are still checked.
+						// Likewise a post or term link whose id alone is taken gets a new id; its group and object keys are still checked.
 						'translation_links' === $table_name && $this->links_keep_strings && $old_id > 0 && 'string' !== ( $row['type'] ?? null )
 						&& array_intersect_key( self::row_keys( $table_name, array_diff_key( $row, [ 'id' => true ] ) ), null !== $whole_keys ? $whole_keys : $piece_keys ) === []
 					) {
@@ -3571,31 +2886,38 @@ final class DataImporter {
 				}
 			}
 
-			// Build the format array from the COLUMN TYPE, not the value shape.
-			// Value-shape detection (ctype_digit => %d) silently corrupts string
-			// columns holding all-digit content: a leading-zero SKU/zip/EAN like
-			// "00100" int-casts to "100", and magnitudes above PHP_INT_MAX clamp.
-			// String columns must bind as %s so the exported value round-trips
-			// verbatim.
+			// Formats from the column type, not the value: "00100" in a string column must not become 100.
 			$format = [];
 
 			foreach ( $row as $col => $value ) {
 				$format[] = $col_formats[ $col ] ?? '%s';
 			}
 
-			// A merge writes outside a transaction: when a reconnect since the
-			// last row ended the connection lock, it is taken again before
-			// this row, or the import stops here (ImportLock::heartbeat()).
+			// Merge writes outside a transaction: after a reconnect the lock is taken again before this row, or the import
+			// stops (ImportLock::heartbeat()).
 			if ( ! $replace ) {
 				ImportLock::heartbeat();
 			}
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			$inserted = $wpdb->insert( $full_table, $row, $format );
+			// Replace writes through the guard: 0 rows without an error means a new connection, outside the transaction.
+			$guard = $this->guard;
+
+			if ( $replace && null !== $guard ) {
+				$this->stop_unless_connection_kept();
+
+				$inserted = $guard->insert( $full_table, $row, $format );
+
+				if ( 0 === $inserted ) {
+					throw new \RuntimeException( self::connection_lost_message() ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+				}
+			} else {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				$inserted = $wpdb->insert( $full_table, $row, $format );
+			}
 
 			if ( $new_id && $inserted !== false && $wpdb instanceof \wpdb ) {
 				if ( $moved ) {
-					$this->moved_groups[ $old_id ] = $wpdb->insert_id;
+					$piece_moved[ $old_id ] = (int) $wpdb->insert_id;
 				}
 
 				$keys = self::row_keys( $table_name, [ 'id' => $wpdb->insert_id ] + $row );
@@ -3610,8 +2932,7 @@ final class DataImporter {
 			}
 
 			if ( $replace && $inserted === false ) {
-				// Inside the transaction: stop here, so the next statement is
-				// the caller's ROLLBACK.
+				// Inside the transaction: stop, so the next statement is the caller's ROLLBACK.
 				if ( $wpdb instanceof \wpdb ) {
 					self::log_db_error( 'inserting into ' . $table_name . ( $old_id > 0 ? ' (export ID ' . $old_id . ')' : '' ), (string) $wpdb->last_error );
 				}
@@ -3635,6 +2956,11 @@ final class DataImporter {
 			if ( $inserted !== false ) {
 				++$result['imported'];
 
+				// Marked at once: a Merge stopping after this row still flushes the rewrite rules.
+				if ( 'languages' === $table_name ) {
+					$this->languages_changed = true;
+				}
+
 				if ( $row_sanitized ) {
 					++$result['sanitized'];
 				}
@@ -3642,22 +2968,18 @@ final class DataImporter {
 				if ( $demoted ) {
 					$this->default_kept = is_scalar( $row['slug'] ?? null ) ? (string) $row['slug'] : '';
 				} elseif ( 'languages' === $table_name && ! $this->languages_cleared && ! empty( $row['is_default'] ) ) {
-					// A site with no default language takes the file's; any
-					// further default row in the file is then demoted.
+					// A site without a default takes the file's; further default rows of the file are demoted.
 					$this->site_default = is_scalar( $row['slug'] ?? null ) ? (string) $row['slug'] : '';
 				}
 
-				// Capture parent's old→new id mapping for child table rewrites.
+				// Parent old => new id, for the child tables.
 				if ( ! $replace && $old_id > 0 && $this->is_parent_table( $table_name ) ) {
-					$this->id_maps[ $table_name ][ $old_id ] = (int) $wpdb->insert_id;
+					$piece_map[ $old_id ] = (int) $wpdb->insert_id;
 				}
 			} else {
 				++$result['skipped'];
 
-				// A duplicate-unique-key collision is an EXPECTED merge skip.
-				// Anything else (unknown column, charset rejection, strict-mode
-				// zero-date…) is a real failure that must not masquerade as a
-				// benign skip - record it so the caller can react.
+				// A duplicate key is an expected Merge skip; anything else (unknown column, charset, strict mode) is a real failure.
 				$last_error = (string) $wpdb->last_error;
 
 				if ( $last_error !== '' && ! Schema::is_duplicate_key_error( $last_error ) ) {
@@ -3676,52 +2998,140 @@ final class DataImporter {
 					}
 				}
 
-				// Duplicate-skip on a parent: still need the existing id so
-				// child FKs resolve. Look it up by natural key (slug/hash).
-				// Only a merge import gets here: a replace import stopped above.
+				// A duplicate-skipped parent still needs its existing id (by natural key) for the children; Merge only.
 				if ( $old_id > 0 && $natural_key_lookup !== null ) {
-					$existing_id = $natural_key_lookup( $row );
+					$existing_id = Typed::int( $natural_key_lookup( $row ) );
 					if ( $existing_id > 0 ) {
-						$this->id_maps[ $table_name ][ $old_id ] = $existing_id;
+						$piece_map[ $old_id ] = $existing_id;
 					}
 				}
 			}
 		}
 
-		// Free memory once per piece.
-		//
-		// wp_cache_flush_runtime(), NOT wp_cache_flush(). The intent here is
-		// only to drop the in-process object-cache array so a large import
-		// does not grow without bound. wp_cache_flush() does that too - but
-		// on a site with a persistent backend it ALSO empties Redis or
-		// Memcached for the whole site, evicting every other plugin's cached
-		// data every piece.
-		//
-		// With no persistent cache the two are identical (core's default
-		// implementation simply forwards to wp_cache_flush), so this is
-		// strictly a no-op there and a large win where a drop-in is active.
-		// WordPress defines wp_cache_flush_runtime() since 6.1, below the
-		// plugin's minimum.
+		$work->put( $work->id_map( $table_name ), $piece_map );
+		$work->put( $work->not_saved( $table_name ), array_diff_key( $parent_rows, $piece_map ) );
+		$work->put( ImportWorkTable::MOVED_GROUP, $piece_moved );
+		$work->put( ImportWorkTable::LINKED_POST, $linked_posts );
+
+		// Free memory per piece with wp_cache_flush_runtime(), not wp_cache_flush(), which would empty a persistent backend
+		// for the whole site each piece (core 6.1+).
 		\PerfLocale\Cache\CacheManager::flush_runtime();
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 	}
 
 	/**
-	 * Sanitize one imported `string_translations` row in place.
+	 * The connection guard of the open Replace transaction.
 	 *
-	 * `translation` goes through Helper::sanitize_untrusted_string_translation().
-	 * `extra_forms` is a JSON list of plural forms 2..N that every reader
-	 * decodes (StringTranslation::preload_translations(),
-	 * StringTranslationRepository::get_extra_forms_map()), so the check runs on
-	 * the decoded strings: each string at any depth is sanitized and the value
-	 * re-encoded, positions and empty forms intact. A value that does not
-	 * decode to an array is ignored by every reader; it is stored as NULL, the
-	 * column's "no extra forms" state, only when it contains a `<`, so no
-	 * markup is kept that a later change to a reader could expose. Anything
-	 * the sanitizer leaves unchanged keeps its original bytes.
+	 * @return ConnectionGuard
+	 * @throws \LogicException Outside the transaction.
+	 */
+	private function connection_guard(): ConnectionGuard {
+		if ( null === $this->guard ) {
+			throw new \LogicException( 'DataImporter: no connection guard outside the Replace transaction.' );
+		}
+
+		return $this->guard;
+	}
+
+	/**
+	 * The work table of the running import.
+	 *
+	 * @return ImportWorkTable
+	 * @throws \LogicException Outside an import's table phase.
+	 */
+	private function work_table(): ImportWorkTable {
+		if ( null === $this->work ) {
+			throw new \LogicException( 'DataImporter: no work table outside the table phase.' );
+		}
+
+		return $this->work;
+	}
+
+	/**
+	 * Positive integer values of one column of a piece's rows (a superset of the ids its look-ups use).
+	 *
+	 * @param array<array-key, mixed> $rows   Rows (non-arrays are ignored).
+	 * @param string                  $column Column.
+	 * @return array<int, int>
+	 */
+	private static function column_ints( array $rows, string $column ): array {
+		$out = [];
+
+		foreach ( $rows as $row ) {
+			$id = is_array( $row ) && isset( $row[ $column ] ) ? self::fk_int( $row[ $column ] ) : 0;
+
+			if ( $id > 0 ) {
+				$out[] = $id;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * A column value as the FK rewrite's (int) cast reads it (a decoded JSON value).
+	 *
+	 * @param mixed $value Value.
+	 * @return int
+	 */
+	private static function fk_int( $value ): int {
+		if ( is_array( $value ) ) {
+			return [] === $value ? 0 : 1;
+		}
+
+		return is_scalar( $value ) ? (int) $value : 0;
+	}
+
+	/**
+	 * The error of a Merge whose connection was lost while its tables were written.
+	 *
+	 * @return string
+	 */
+	private static function merge_lost_message(): string {
+		return __( 'Import stopped: the connection to the database was lost. The rows imported before that stay; import the file again to add the rest.', 'perflocale' );
+	}
+
+	/**
+	 * The error of a Replace whose connection was lost inside its transaction.
+	 *
+	 * @return string
+	 */
+	private static function connection_lost_message(): string {
+		return __( 'Replace import aborted: the connection to the database was lost; the whole import was rolled back, nothing was changed. Run the import again.', 'perflocale' );
+	}
+
+	/**
+	 * Replace: stop when wpdb has left the transaction's connection (no query), before a read there can drive a
+	 * skip or a write land outside the transaction.
+	 *
+	 * @return void
+	 * @throws \RuntimeException When the connection was lost.
+	 */
+	private function stop_unless_connection_kept(): void {
+		if ( null !== $this->guard && ! $this->guard->holds() ) {
+			throw new \RuntimeException( self::connection_lost_message() ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+		}
+	}
+
+	/**
+	 * Replace: stop unless the transaction's marker is still set on the connection (one read).
+	 *
+	 * @return void
+	 * @throws \RuntimeException When the connection was lost.
+	 */
+	private function stop_unless_connection_verified(): void {
+		if ( null !== $this->guard && ! $this->guard->verify() ) {
+			throw new \RuntimeException( self::connection_lost_message() ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+		}
+	}
+
+	/**
+	 * Sanitize one imported `string_translations` row in place: `translation` through
+	 * Helper::sanitize_untrusted_string_translation(), each string of the decoded `extra_forms` likewise (positions and
+	 * empty forms kept). Undecodable extra_forms with a `<` becomes NULL; unchanged values keep their bytes.
 	 *
 	 * @param array<string, mixed> $row Row, after the unknown-column filter.
-	 * @return bool True when the row was changed.
+	 * @return bool True when sanitizing changed the row.
 	 */
 	private static function sanitize_string_translation_row( array &$row ): bool {
 		$changed = false;
@@ -3759,28 +3169,12 @@ final class DataImporter {
 	}
 
 	/**
-	 * Sanitize one imported `languages` row in place.
-	 *
-	 * Runs the row's string cells through LanguageRepository::sanitize_data(),
-	 * the rules the Languages screen and the REST route store with, so each
-	 * name, format and code is sanitized exactly as those writers sanitize it.
-	 * The code's shape check (LanguageRepository::SLUG_PATTERN, which insert()
-	 * applies to every code and update() to a changed one) is not applied, so
-	 * the import can store a code insert() would refuse: a restore can carry a
-	 * code created before insert() enforced the shape, or the '' that update()
-	 * accepts. Sanitizing still limits a code to what sanitize_key() keeps.
-	 * Only string cells are passed and written back: a JSON number, boolean or
-	 * null cannot carry markup, and the numeric columns are bound as integers
-	 * anyway.
-	 *
-	 * The result can be longer than the input: an unclosed `<` becomes `&lt;`,
-	 * so a value can outgrow its column. wpdb's insert refuses such a
-	 * value before the query, in every SQL mode, and the row counts as failed:
-	 * merge mode reports it and replace mode rolls back. The Languages screen
-	 * writes through the same wpdb call and refuses the same value.
+	 * Sanitize one imported `languages` row's string cells with LanguageRepository::sanitize_data() (as the Languages
+	 * screen and REST store them), without the code's shape check, so a restore can keep an older or empty code. A value
+	 * that outgrows its column (`<` becomes `&lt;`) is refused by wpdb and counts as failed.
 	 *
 	 * @param array<string, mixed> $row Row, after the unknown-column filter.
-	 * @return bool True when the row was changed.
+	 * @return bool True when sanitizing changed the row.
 	 */
 	private static function sanitize_language_row( array &$row ): bool {
 		$changed = false;
@@ -3796,22 +3190,12 @@ final class DataImporter {
 	}
 
 	/**
-	 * Sanitize one imported `slug_translations` row in place.
-	 *
-	 * The same sanitizers SlugTranslationRepository::insert() applies:
-	 * sanitize_title() on the slug, which every slug writer runs, and
-	 * sanitize_key() on the object type. A stored slug becomes part of a
-	 * permalink, so it holds only what core's sanitize_title_with_dashes()
-	 * keeps: lowercase letters, digits, `%`, `_` and `-`. `object_subtype` is
-	 * left as it is, as the repository leaves it, because its readers match
-	 * the raw bytes.
-	 *
-	 * A slug that sanitizes to '' is stored; UrlConverter reads '' as no
-	 * translation. A second such row for the same language, object type and
-	 * subtype collides on the `slug_lookup` key and is skipped as a duplicate.
+	 * Sanitize one imported `slug_translations` row in place as SlugTranslationRepository::insert() does: sanitize_title()
+	 * on the slug, sanitize_key() on the object type, object_subtype raw (readers match its bytes). An empty slug is
+	 * stored (no translation); a second one for the same key collides and is skipped.
 	 *
 	 * @param array<string, mixed> $row Row, after the unknown-column filter.
-	 * @return bool True when the row was changed.
+	 * @return bool True when sanitizing changed the row.
 	 */
 	private static function sanitize_slug_translation_row( array &$row ): bool {
 		$changed = false;
@@ -3838,7 +3222,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Is this a parent table whose ids are referenced elsewhere?
+	 * Whether other tables reference this table's ids.
 	 *
 	 * @param string $table_name Short table name.
 	 * @return bool
@@ -3853,13 +3237,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Closure that resolves a row to an existing parent id on the target
-	 * site via its natural key (e.g. languages.slug, strings.original_hash,
-	 * translation_groups.id).
-	 *
-	 * Returns null when the table has no natural key we can rely on
-	 * (translation_groups uses id alone, so duplicate-skip in merge mode
-	 * is impossible - every row gets a fresh id).
+	 * A closure resolving a row to an existing parent id by natural key (languages.slug or locale,
+	 * strings.original_hash); null for a table without one (translation_groups: every Merge row gets a new id).
 	 *
 	 * @param string $table_name
 	 * @return callable|null fn(array $row): int  ID or 0 if not found.
@@ -3871,14 +3250,8 @@ final class DataImporter {
 			case 'languages':
 				$tbl = Schema::table( 'languages' );
 				return static function ( array $row ) use ( $wpdb, $tbl ): int {
-					// languages has TWO unique keys (slug AND locale). A merge
-					// import of a language whose slug is new but whose locale
-					// already exists (e.g. importing "de-formal"/de_DE onto a
-					// site with "de"/de_DE) fails the INSERT on the locale
-					// unique key; a slug-only recovery would then miss it and
-					// leave child FKs (translation_links.language_id, …)
-					// pointing at a non-existent id. Fall back to locale so the
-					// existing language is mapped correctly.
+					// languages has two unique keys: a new slug with an existing locale fails on the locale, so fall back to it, or
+					// child FKs would name a missing id.
 					// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					if ( ! empty( $row['slug'] ) ) {
 						$id = (int) $wpdb->get_var(
@@ -3924,32 +3297,16 @@ final class DataImporter {
 				};
 
 			default:
-				// translation_groups has no natural key, so merge mode can't
-				// dedup them - each re-inserts as a fresh row and may widow.
-				// sweep_orphan_groups() (called after the merge) reclaims them.
-				// Other parents here have no FK children, so no map needed.
+				// translation_groups has no natural key: merged groups are fresh rows, reclaimed by sweep_orphan_groups(). Other
+				// parents here have no FK children.
 				return null;
 		}
 	}
 
 	/**
-	 * Merge-mode checks on one piece of translation links, before any is
-	 * written.
-	 *
-	 * String links (type `string`) name a `strings.id`, which a merge
-	 * renumbers. Each one is pointed at the string's id on this site through
-	 * the strings' id map, and into that string's own group, so the link
-	 * keeps its status and source. When this import carries strings and a
-	 * link names a string the import did not map, the link is left out: on
-	 * this site that id is a different string or none. A file without strings
-	 * keeps its ids, as on the site that wrote it (the site-identity gate
-	 * covers other sites).
-	 *
-	 * Post and term links: an object has one language. A link that gives an
-	 * object a second language is left out. A link whose group already has a
-	 * member on this site (the same object in the same language) joins that
-	 * member's group, so a translation the file pairs with an existing one is
-	 * paired here too (see plan_link_anchors()).
+	 * Merge checks on one piece of translation links before any is written. String links point at the string's id here
+	 * (through the strings' id map) and its own group; with strings carried, an unmapped one is left out. A post or term
+	 * link giving an object a second language is left out; one whose group has a member here joins that member's group.
 	 *
 	 * @param array<int, array{old_id: int, row: array<string, mixed>, sanitized: bool, demoted: bool, file: array<array-key, mixed>}> $prepared Rows of the piece.
 	 * @param array{imported: int, skipped: int, failed: int, dropped: int, errors: array<int, string>, sanitized: int}                $result   Table result (updated).
@@ -3961,6 +3318,20 @@ final class DataImporter {
 		$links_table   = Schema::table( 'translation_links' );
 		$strings_table = Schema::table( 'strings' );
 		$string_ids    = [];
+		$work          = $this->work_table();
+		$file_strings  = [];
+		$file_groups   = [];
+
+		foreach ( $prepared as $entry ) {
+			if ( 'string' === ( $entry['row']['type'] ?? '' ) ) {
+				$file_strings[] = is_numeric( $entry['file']['object_id'] ?? null ) ? (int) $entry['file']['object_id'] : 0;
+			} else {
+				$file_groups[] = is_numeric( $entry['file']['group_id'] ?? null ) ? (int) $entry['file']['group_id'] : 0;
+			}
+		}
+
+		$strings_map = $work->get( $work->id_map( 'strings' ), $file_strings );
+		$anchors     = $work->get( ImportWorkTable::ANCHOR, $file_groups );
 
 		foreach ( $prepared as $i => $entry ) {
 			if ( 'string' !== ( $entry['row']['type'] ?? '' ) ) {
@@ -3969,9 +3340,9 @@ final class DataImporter {
 
 			$file_string = is_numeric( $entry['file']['object_id'] ?? null ) ? (int) $entry['file']['object_id'] : 0;
 
-			if ( isset( $this->id_maps['strings'][ $file_string ] ) ) {
-				$prepared[ $i ]['row']['object_id'] = $this->id_maps['strings'][ $file_string ];
-				$string_ids[]                       = $this->id_maps['strings'][ $file_string ];
+			if ( isset( $strings_map[ $file_string ] ) ) {
+				$prepared[ $i ]['row']['object_id'] = $strings_map[ $file_string ];
+				$string_ids[]                       = $strings_map[ $file_string ];
 			} elseif ( $this->strings_carried ) {
 				unset( $prepared[ $i ] );
 				++$result['skipped'];
@@ -4052,8 +3423,8 @@ final class DataImporter {
 
 			$file_group = is_numeric( $entry['file']['group_id'] ?? null ) ? (int) $entry['file']['group_id'] : 0;
 
-			if ( ( $this->link_anchor[ $file_group ] ?? 0 ) > 0 ) {
-				$prepared[ $i ]['row']['group_id'] = $this->link_anchor[ $file_group ];
+			if ( ( $anchors[ $file_group ] ?? 0 ) > 0 ) {
+				$prepared[ $i ]['row']['group_id'] = $anchors[ $file_group ];
 			}
 		}
 
@@ -4061,15 +3432,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Leave out the rows whose post or term is a different object here.
-	 *
-	 * A row carries the fingerprint of the object its `object_id` named on
-	 * the site that wrote the file (ObjectFingerprint). When this site has no
-	 * object under that ID, or one that does not match, the row would attach
-	 * a translation, slug or hash to the wrong content: it is left out and
-	 * counted. Rows without a fingerprint (files written before fingerprints
-	 * existed, string links) are not checked. Both modes; one query per kind
-	 * and piece.
+	 * Leave out rows whose post or term is another object here: a row's fingerprint (ObjectFingerprint) must match the
+	 * object at its id, or it would attach to the wrong content. Rows without one (older files, string links) are not
+	 * checked. Both modes; one query per kind and piece.
 	 *
 	 * @param array<int, array{old_id: int, row: array<string, mixed>, sanitized: bool, demoted: bool, file: array<array-key, mixed>}> $prepared    Rows of the piece.
 	 * @param string                                                                                                                   $type_column The column that names the object's kind.
@@ -4125,16 +3490,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Merge mode: find, for each translation group in the file, the group on
-	 * this site that already holds one of its members.
-	 *
-	 * A file group is re-created under a new id, and its links that already
-	 * exist here (same object, same language) are skipped as duplicates. Its
-	 * other members would then land in the new group, apart from the
-	 * translation the file pairs them with. A file group whose members that
-	 * exist here all sit in ONE group of this site joins that group instead;
-	 * members spread over several groups here leave it on its new id. Read
-	 * before the links are written, one query per type and piece.
+	 * Merge: for each file group, the group here that already holds its members. A file group whose existing members all
+	 * sit in one group here joins it (else it keeps its new id), so its other members are not split from their pair.
+	 * Read before the links are written, one query per type and piece.
 	 *
 	 * @param iterable $rows The file's translation links.
 	 * @phpstan-param iterable<array-key, mixed> $rows
@@ -4143,13 +3501,16 @@ final class DataImporter {
 	private function plan_link_anchors( iterable $rows ): void {
 		$wpdb = Typed::wpdb();
 
-		$this->link_anchor = [];
-		$links_table       = Schema::table( 'translation_links' );
-		$size              = self::batch_size( 'translation_links' );
-		$piece             = [];
+		$links_table = Schema::table( 'translation_links' );
+		$size        = self::batch_size( 'translation_links' );
+		$piece       = [];
+		$work        = $this->work_table();
 
-		$plan = function ( array $piece ) use ( $wpdb, $links_table ): void {
-			$want = [];
+		$plan = function ( array $piece ) use ( $wpdb, $links_table, $work ): void {
+			$want      = [];
+			$languages = $work->get( $work->id_map( 'languages' ), self::column_ints( $piece, 'language_id' ) );
+			$anchor    = $work->get( ImportWorkTable::ANCHOR, self::column_ints( $piece, 'group_id' ) );
+			$changed   = [];
 
 			foreach ( $piece as $row ) {
 				if ( ! is_array( $row ) ) {
@@ -4165,7 +3526,7 @@ final class DataImporter {
 					continue;
 				}
 
-				$want[ $type ][ $object ][] = [ $file_group, $this->id_maps['languages'][ $language ] ?? $language ];
+				$want[ $type ][ $object ][] = [ $file_group, $languages[ $language ] ?? $language ];
 			}
 
 			foreach ( $want as $type => $members ) {
@@ -4185,15 +3546,19 @@ final class DataImporter {
 
 							$here = Typed::int( $found['group_id'] );
 
-							if ( ! isset( $this->link_anchor[ $file_group ] ) ) {
-								$this->link_anchor[ $file_group ] = $here;
-							} elseif ( $this->link_anchor[ $file_group ] !== $here ) {
-								$this->link_anchor[ $file_group ] = 0;
+							if ( ! isset( $anchor[ $file_group ] ) ) {
+								$anchor[ $file_group ]  = $here;
+								$changed[ $file_group ] = $here;
+							} elseif ( $anchor[ $file_group ] !== $here ) {
+								$anchor[ $file_group ]  = 0;
+								$changed[ $file_group ] = 0;
 							}
 						}
 					}
 				}
 			}
+
+			$work->put( ImportWorkTable::ANCHOR, $changed );
 		};
 
 		foreach ( $rows as $row ) {
@@ -4211,8 +3576,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * Count a row whose object changed since the export but was recognised,
-	 * by each part that still matched.
+	 * Count a row whose object changed since the export but was recognised, per part that still matched.
 	 *
 	 * @param array<int, string> $parts Matched parts.
 	 * @return void
@@ -4226,8 +3590,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * The sentence for rows whose post or term changed since the export and
-	 * was recognised by a part that did not change; '' when there are none.
+	 * The sentence for rows whose object changed but was recognised by an unchanged part; '' for none.
 	 *
 	 * @param array<string, int> $matched Part => rows, and `_rows` => rows in all.
 	 * @return string
@@ -4272,9 +3635,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Replace mode: how many of the file's ID-keyed rows carry a fingerprint,
-	 * and how many of them name a different object here. Read before any
-	 * write; one query per kind and piece.
+	 * Replace: how many of the file's id-keyed rows carry a fingerprint and how many name another object here; read
+	 * before any write, one query per kind and piece.
 	 *
 	 * @param ImportReader                                     $reader  Indexed reader.
 	 * @param int                                              $max_row Largest row read.
@@ -4427,6 +3789,13 @@ final class DataImporter {
 						$count
 					);
 					break;
+				case 'parent_not_saved':
+					$notes[] = sprintf(
+						/* translators: %d: number of rows */
+						_n( '%d row was not imported because the row it belongs to could not be saved (see the errors above).', '%d rows were not imported because the rows they belong to could not be saved (see the errors above).', $count, 'perflocale' ),
+						$count
+					);
+					break;
 				case 'unmapped_string':
 					$notes[] = sprintf(
 						/* translators: %d: number of string translation links */
@@ -4461,8 +3830,7 @@ final class DataImporter {
 	}
 
 	/**
-	 * How many rows of the languages table are marked default (any non-zero
-	 * is_default, as LanguageRepository reads it).
+	 * Rows of the languages table marked default (any non-zero is_default, as LanguageRepository reads it).
 	 *
 	 * @return int
 	 */
@@ -4488,10 +3856,8 @@ final class DataImporter {
 	}
 
 	/**
-	 * Reclaim widow translation groups stranded by a merge import.
-	 *
-	 * Delegates to the canonical {@see TranslationGroupRepository::sweep_orphan_groups()}
-	 * so the cleanup logic lives in one place (shared with the upgrade self-heal).
+	 * Reclaim groups a merge stranded, through TranslationGroupRepository::sweep_orphan_groups() (shared with the upgrade
+	 * self-heal).
 	 *
 	 * @return void
 	 */
@@ -4517,10 +3883,9 @@ final class DataImporter {
 		$was = $wpdb->suppress_errors( true );
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		// One table per DELETE: the SQLite integration's 2.2.x legacy driver mishandles a DELETE holding JOIN.
 		$sql = $wpdb->prepare(
-			'DELETE m FROM %i m
-			LEFT JOIN %i g ON g.id = m.group_id
-			WHERE g.id IS NULL',
+			'DELETE FROM %i WHERE group_id NOT IN ( SELECT id FROM %i )',
 			Schema::table( 'migration_source_map' ),
 			Schema::table( 'translation_groups' )
 		);
@@ -4534,27 +3899,9 @@ final class DataImporter {
 	}
 
 	/**
-	 * Delete string links whose owning translation group is gone.
-	 *
-	 * The mirror image of {@see self::sweep_orphan_groups()}: that reclaims
-	 * groups nothing points at, this reclaims links pointing at nothing.
-	 * Both shapes are produced by an import - a replace-mode strings bundle
-	 * clears the type='string' slice of `translation_groups` without owning
-	 * `translation_links`, and the merge-mode sweep deletes string groups
-	 * that no longer own a string while leaving their links behind.
-	 *
-	 * Nothing else reclaims them: the sweep only deletes groups, and
-	 * `repair_orphaned_translations()` never deletes a link - its one DELETE
-	 * targets `string_translations` rows whose string is gone, and its two
-	 * write paths INSERT a group (plus the owning string's group_id UPDATE)
-	 * and INSERT IGNORE a link. Left in place they are
-	 * not merely dead weight - they still occupy their slot in the UNIQUE
-	 * `object_lang` (type, object_id, language_id) key, so the repair's
-	 * INSERT IGNORE for the same string under a new group id is silently
-	 * dropped and the translation stops being served.
-	 *
-	 * One statement, bounded to the string slice by the leading column of
-	 * that same key.
+	 * Delete string links whose group is gone (a strings Replace clears groups without owning links; the merge sweep
+	 * deletes string groups and leaves their links). Nothing else reclaims them, and they hold their object_lang slot,
+	 * so the repair's INSERT IGNORE under a new group would be dropped. One statement over the string slice.
 	 *
 	 * @return int Rows deleted.
 	 */
@@ -4564,19 +3911,15 @@ final class DataImporter {
 		$links_table  = Schema::table( 'translation_links' );
 		$groups_table = Schema::table( 'translation_groups' );
 
-		// Table names come from Schema::table() (a class-controlled allow-list)
-		// and travel as %i identifiers; the type is bound as a value. A
-		// single-line ignore annotation would cover only the line after it, so
-		// the multi-line prepare() below needs the disable/enable block form.
+		// Tables from Schema::table() as %i, the type as a value; a multi-line prepare() needs the disable/enable form.
+		// One table per DELETE, as drop_stale_source_map().
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$deleted = $wpdb->query(
 			$wpdb->prepare(
-				'DELETE l FROM %i l
-				LEFT JOIN %i g ON g.id = l.group_id
-				WHERE g.id IS NULL AND l.type = %s',
+				'DELETE FROM %i WHERE type = %s AND group_id NOT IN ( SELECT id FROM %i )',
 				$links_table,
-				$groups_table,
-				'string'
+				'string',
+				$groups_table
 			)
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter

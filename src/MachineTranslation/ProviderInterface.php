@@ -15,9 +15,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Contract for machine translation providers.
- *
- * All providers must implement this interface to be usable
- * by the PerfLocale machine translation system.
  */
 interface ProviderInterface {
 

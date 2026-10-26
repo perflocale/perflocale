@@ -16,16 +16,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Computes purge plans and executes purges for addons.
  *
- * Driven by manifest + (optionally) the live addon class. Enforces a strict
- * prefix namespace on every target so a malicious or buggy addon can't use
- * the uninstaller to drop WP core tables.
- *
- * See HasUninstallTargets for the security model.
+ * Driven by the stored manifest, so a deleted addon's data still goes. Every target must sit in the addon's namespace,
+ * so an addon cannot use the uninstaller to drop core data (see HasUninstallTargets).
  */
 final class AddonUninstaller {
 
 	/** Hard prefix for option names. */
 	private const OPTION_PREFIX = 'perflocale_';
+
+	/**
+	 * Error of a purge whose deferred network targets could not be stored; its manifest is kept for the next pass.
+	 */
+	public const JOURNAL_ERROR = 'deferred network targets not stored; the manifest is kept for the next pass';
 
 	/** Hard prefix for capability names. */
 	private const CAP_PREFIX = 'perflocale_';
@@ -40,17 +42,12 @@ final class AddonUninstaller {
 	private const META_BATCH_SIZE = 1000;
 
 	/**
-	 * Compute a purge plan for an addon - either from its live class or from
-	 * the manifest. Returns a readonly snapshot without touching the DB.
+	 * Compute a purge plan from the manifest, refreshed from the live class when there is one; deletes nothing.
 	 *
 	 * @param string              $addon_id Addon identifier.
 	 * @param AddonInterface|null $addon Live addon instance if known, null if absent.
-	 * @param bool                $single_site_teardown True when ONE subsite is
-	 *     being deleted. The plan then leaves out the targets that are not
-	 *     that subsite's to delete: `site_options` live in wp_sitemeta and
-	 *     `user` meta in wp_usermeta, both shared by the whole network, where
-	 *     the addon is still running on every surviving site. Everything else
-	 *     is per-blog and goes with the blog.
+	 * @param bool                $single_site_teardown True when ONE subsite is being deleted: `site_options`
+	 *     and `user` meta are network-wide and stay for the surviving sites.
 	 * @return PurgePlan
 	 */
 	public static function plan( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false ): PurgePlan {
@@ -58,32 +55,28 @@ final class AddonUninstaller {
 			return PurgePlan::empty( $addon_id );
 		}
 
-		// Prefer live targets when class is present - always up to date.
+		// The live class is current: refresh the manifest from it.
 		if ( $addon instanceof HasUninstallTargets ) {
 			AddonManifestWriter::refresh( $addon );
 		}
 
 		$manifest = AddonManifestWriter::read( $addon_id );
 		if ( null === $manifest ) {
-			// No declarative targets stored. If the live addon has only
-			// custom uninstall (no targets), reflect that in the plan.
+			// No manifest: only a live custom uninstall can still run.
 			if ( $addon instanceof HasCustomUninstall ) {
 				return new PurgePlan( $addon_id, [], [], [], [], [], [], [], 0, true );
 			}
 			return PurgePlan::empty( $addon_id );
 		}
 
-		// Expand short-named tables to full names. A manifest written
-		// directly to the options table (bypassing AddonManifestWriter::
-		// normalize()) could contain short names with SQL metachars - we
-		// still validate here as a second line of defense.
+		// Validated again: a manifest written straight to the options table skipped normalize().
 		$full_tables = [];
 		foreach ( (array) ( $manifest['tables'] ?? [] ) as $short ) {
 			if ( ! is_string( $short ) ) {
 				continue;
 			}
 			if ( 1 !== preg_match( AddonSchemaManager::SHORT_NAME_PATTERN, $short ) ) {
-				// Rejected at the plan layer - no path forward into DROP TABLE.
+				// Never reaches DROP TABLE.
 				continue;
 			}
 			$full_tables[] = AddonSchemaManager::table_name( $addon_id, $short );
@@ -133,27 +126,29 @@ final class AddonUninstaller {
 	 * @param string              $addon_id Addon identifier.
 	 * @param AddonInterface|null $addon Live addon instance if known, null if absent.
 	 * @param bool                $single_site_teardown True when ONE subsite is being
-	 *     deleted: the network-global targets are left out of the plan (see
-	 *     plan()), and so are the network-wide cache flushes.
+	 *     deleted: no network-global targets and no network-wide cache flushes.
+	 * @param bool                $defer_shared True on the network uninstall sweep: the
+	 *     network-global targets are left for the caller to delete once (purge_shared()).
+	 * @param array<string, mixed> $shared Set with $defer_shared: those targets
+	 *     (`site_options`, `user`) and `kept` (the filter kept this addon's data);
+	 *     [] when the purge failed closed.
+	 * @param (callable(array<string, mixed>): bool)|null $journal With $defer_shared: stores $shared durably before
+	 *     the manifest goes; false keeps the manifest and adds an error.
 	 * @return PurgeResult
 	 */
-	public static function purge( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false ): PurgeResult {
-		// The teardown narrowing happens in the plan itself, not only in the
-		// deletes below, so the actions and the addon's own before_uninstall()
-		// are handed the plan that will actually run.
-		$t_start = microtime( true );
-		$plan    = self::plan( $addon_id, $addon, $single_site_teardown );
-		$errors  = [];
+	public static function purge( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false, bool $defer_shared = false, array &$shared = [], ?callable $journal = null ): PurgeResult {
+		// Narrowed in the plan, so the actions and before_uninstall() get the plan that runs.
+		$t_start  = microtime( true );
+		$plan     = self::plan( $addon_id, $addon, $single_site_teardown || $defer_shared );
+		$errors   = [];
+		$shared   = [];
+		$deferred = $defer_shared ? self::shared_targets( $addon_id ) : [];
 
 		/** @hook perflocale/addon/before_uninstall */
 		do_action( 'perflocale/addon/before_uninstall', $addon_id, $plan );
 
 		/**
-		 * Per-addon override of the plugin-level delete_data_on_uninstall
-		 * setting. Defaults to the plugin-level value (passed in via $default).
-		 * Return false to preserve this addon's data even when the plugin-level
-		 * setting is true - the purge short-circuits to an empty result and
-		 * the manifest is left intact so a later reinstall can resume.
+		 * Per-addon override of delete_data_on_uninstall; false keeps this addon's data and its manifest.
 		 *
 		 * @hook perflocale/addon/delete_data_on_uninstall
 		 *
@@ -161,11 +156,7 @@ final class AddonUninstaller {
 		 * @param string $addon_id Addon identifier.
 		 * @param PurgePlan $plan The plan that would be executed.
 		 */
-		// Read the raw option first - the uninstall.php flow may run without
-		// the Settings service fully bootstrapped, and going through
-		// Settings::get() can return defaults (false) even when the stored
-		// value is true. Fall back to the Settings service only when the raw
-		// option is absent (pre-save site state).
+		// The raw option first: uninstall.php runs without a booted Settings service, whose default could win.
 		$plugin_setting = true;
 		$raw_settings   = get_option( 'perflocale_settings', null );
 		if ( is_array( $raw_settings ) && array_key_exists( 'delete_data_on_uninstall', $raw_settings ) ) {
@@ -185,6 +176,13 @@ final class AddonUninstaller {
 
 		if ( ! $should_delete ) {
 			// Short-circuit: no data touched, no manifest cleared.
+			$skip_errors = [ 'skipped_by_filter' ];
+			if ( $defer_shared ) {
+				$shared = $deferred + [ 'kept' => true ];
+				if ( null !== $journal && ! $journal( $shared ) ) {
+					$skip_errors[] = self::JOURNAL_ERROR;
+				}
+			}
 			$result = new PurgeResult(
 				$plan,
 				0,
@@ -195,7 +193,7 @@ final class AddonUninstaller {
 				0,
 				0,
 				( microtime( true ) - $t_start ) * 1000,
-				[ 'skipped_by_filter' ],
+				$skip_errors,
 				false,
 				null
 			);
@@ -209,8 +207,7 @@ final class AddonUninstaller {
 			return $result;
 		}
 
-		// Security: validate hard prefixes - throw on violation (these paths
-		// could wipe WP core data if addon authored maliciously).
+		// A hard target outside the namespace could wipe core data.
 		try {
 			self::validate_hard_prefixes( $addon_id, $plan );
 		} catch ( \InvalidArgumentException $e ) {
@@ -231,14 +228,7 @@ final class AddonUninstaller {
 				null
 			);
 
-			// Notify on this exit too. Every other way out of purge() - the
-			// filter opt-out above and the normal completion below - fires this
-			// action, and HasCustomUninstall documents it as the terminal step
-			// of the purge contract. Staying silent exactly on the failure path
-			// is the worst case for an integrator: the one outcome they most
-			// need to hear about was the one that never arrived. The result
-			// carries the validation message in `errors`, so a listener can
-			// still tell a fail-closed purge from a successful one.
+			// Fired on every exit; `errors` tells a fail-closed purge from a successful one.
 			/** @hook perflocale/addon/uninstalled */
 			do_action( 'perflocale/addon/uninstalled', $addon_id, $result );
 
@@ -257,8 +247,7 @@ final class AddonUninstaller {
 				AddonMigrationErrors::record( $addon_id, 'custom_uninstall', 'run', $custom_err );
 			}
 		} elseif ( $plan->had_custom_uninstall ) {
-			// Manifest said this addon has custom cleanup, but we don't have
-			// the class to run it. Warn the admin.
+			// Custom cleanup cannot run without the class: tell the admin.
 			AddonMigrationErrors::record(
 				$addon_id,
 				'custom_uninstall_skipped',
@@ -268,8 +257,7 @@ final class AddonUninstaller {
 			);
 		}
 
-		// Execute declarative purge, soft-erroring per target so one failure
-		// doesn't abort the rest.
+		// One failed target does not stop the rest.
 		[ $tables_dropped, $table_errors ]        = self::drop_tables( $plan->tables );
 		[ $options_deleted ]                      = self::delete_options( $plan->options );
 		[ $site_options_deleted ]                 = self::delete_site_options( $plan->site_options );
@@ -285,37 +273,26 @@ final class AddonUninstaller {
 			$cap_errors
 		);
 
-		// Drop manifest + stored schema version.
-		AddonManifestWriter::forget( $addon_id );
-		AddonSchemaManager::forget( $addon_id );
+		if ( $defer_shared ) {
+			$shared = $deferred + [ 'kept' => false ];
+		}
 
-		// Flush object-cache groups whose underlying rows we deleted - without
-		// this, same-request reads via get_transient() / get_post_meta() /
-		// get_option() return stale values from the cache even though the
-		// DB rows are gone. Targeted flushes (not a global wp_cache_flush()
-		// which nukes unrelated caches too).
-		//
-		// None of them when ONE subsite is being deleted. On Redis a group
-		// flush reaches every blog, so it would empty every surviving site's
-		// options and transients because one blog went - and there is no
-		// stale read to prevent: the dying blog's keys carry its id, and core
-		// drops its tables right after this.
+		// Drop manifest + stored schema version, once the deferred targets are stored: the manifest is their only source.
+		if ( $defer_shared && null !== $journal && ! $journal( $shared ) ) {
+			$errors[] = self::JOURNAL_ERROR;
+		} else {
+			AddonManifestWriter::forget( $addon_id );
+			AddonSchemaManager::forget( $addon_id );
+		}
+
+		// Flush the groups of deleted rows, or cached copies outlive them; never wp_cache_flush().
+		// Not when one subsite is deleted: a Redis group flush reaches every blog, and the dying blog's keys carry its id.
 		if ( ! $single_site_teardown && ( [] !== $plan->transient_prefixes || [] !== $plan->options ) ) {
 			wp_cache_flush_group( 'options' );
 		}
-		// With a persistent object cache, transients live in the dedicated
-		// 'transient' / 'site-transient' groups, NOT in wp_options - so the
-		// raw DELETE above (and the 'options' flush) miss them entirely and a
-		// same-request get_transient() would still serve the cached value.
-		// Transients are disposable, so flushing those groups is safe and far
-		// narrower than a global wp_cache_flush().
+		// With a persistent cache transients live in their own groups, which the raw DELETE misses.
 		if ( ! $single_site_teardown && [] !== $plan->transient_prefixes && wp_using_ext_object_cache() ) {
-			// Sentinel-verify the flush: some backends silently no-op
-			// wp_cache_flush_group() even when wp_cache_supports() claims
-			// support (e.g. Redis Object Cache with the Predis client), which
-			// would leave no-expiry transients orphaned in the external cache
-			// while the purge report claims success. Probe with a throwaway
-			// key so the failure surfaces in the result's errors.
+			// Probe: some backends ignore the group flush while claiming support (Redis Object Cache with Predis).
 			wp_cache_set( 'perflocale_purge_probe', 1, 'transient', 60 );
 			wp_cache_flush_group( 'transient' );
 			wp_cache_flush_group( 'site-transient' );
@@ -360,6 +337,51 @@ final class AddonUninstaller {
 	}
 
 	/**
+	 * An addon's network-global targets from its manifest: network options and
+	 * user meta keys, each within the namespace the purge enforces.
+	 *
+	 * @param string $addon_id Addon identifier.
+	 * @return array{site_options: array<int, string>, user: array<int, string>}
+	 */
+	private static function shared_targets( string $addon_id ): array {
+		$manifest = AddonManifestWriter::read( $addon_id ) ?? [];
+		$meta     = is_array( $manifest['meta'] ?? null ) ? $manifest['meta'] : [];
+
+		return [
+			'site_options' => array_values( array_filter( (array) ( $manifest['site_options'] ?? [] ), static fn( $o ): bool => is_string( $o ) && str_starts_with( $o, self::OPTION_PREFIX ) ) ),
+			'user'         => array_values( array_filter( (array) ( $meta['user'] ?? [] ), static fn( $k ): bool => is_string( $k ) && ( str_starts_with( $k, 'perflocale_' ) || str_starts_with( $k, '_perflocale_' ) ) ) ),
+		];
+	}
+
+	/**
+	 * Delete network-global addon targets the network uninstall deferred: network options as "<network id>:<name>",
+	 * each on its own network, and user meta keys.
+	 *
+	 * @param array<int, string> $site_options Network options, "<network id>:<name>".
+	 * @param array<int, string> $user_keys    User meta keys.
+	 * @return array<int, string> Errors; empty when every DELETE succeeded.
+	 */
+	public static function purge_shared( array $site_options, array $user_keys ): array {
+		$by_network = [];
+		foreach ( $site_options as $target ) {
+			if ( 1 === preg_match( '/^([1-9][0-9]*):(.+)$/s', $target, $m ) ) {
+				$by_network[ (int) $m[1] ][] = $m[2];
+			}
+		}
+		foreach ( $by_network as $network_id => $names ) {
+			self::delete_site_options( $names, $network_id );
+		}
+
+		[ $deleted, $errors ] = self::delete_meta( [ 'user' => array_values( $user_keys ) ] );
+
+		if ( ( $deleted['user'] ?? 0 ) > 0 ) {
+			wp_cache_flush_group( 'user_meta' );
+		}
+
+		return $errors;
+	}
+
+	/**
 	 * Validate targets that CANNOT contain WP-core names (tables, options,
 	 * site_options, capabilities). Throws on any violation.
 	 *
@@ -373,10 +395,7 @@ final class AddonUninstaller {
 
 		foreach ( $plan->tables as $table ) {
 			if ( ! is_string( $table ) || ! str_starts_with( $table, $expected_table_prefix ) ) {
-				// Exception messages are esc_html'd so that if WP ever
-				// renders this through wp_die() the addon_id/table values
-				// (programmer-controlled but still dynamic) cannot carry
-				// HTML into the error page.
+				// Escaped in case wp_die() renders the message.
 				throw new \InvalidArgumentException(
 					esc_html( "Addon '{$addon_id}' target table '{$table}' is outside its namespace {$expected_table_prefix}*" )
 				);
@@ -422,12 +441,7 @@ final class AddonUninstaller {
 			if ( ! is_string( $t ) || '' === $t ) {
 				continue;
 			}
-			// Defence in depth: the name already passed
-			// validate_hard_prefixes(), but a table identifier cannot be
-			// bound with wpdb::prepare() (placeholders are for values only),
-			// so we additionally strip it to a bare [A-Za-z0-9_] identifier
-			// right before interpolation. A name that doesn't survive intact
-			// is not one of ours and is skipped.
+			// Namespace-checked already; a name sanitize_table() would change is not one of ours.
 			$safe = \PerfLocale\Database\Schema::sanitize_table( $t );
 			if ( $safe !== $t ) {
 				$errors[] = "Refused to drop table with unexpected name: {$t}";
@@ -472,16 +486,17 @@ final class AddonUninstaller {
 	/**
 	 * Delete declared site options (multisite).
 	 *
-	 * @param array<int, string> $options Option names.
+	 * @param array<int, string> $options    Option names.
+	 * @param int|null           $network_id Network; null: the current one.
 	 * @return array{0:int}
 	 */
-	private static function delete_site_options( array $options ): array {
+	private static function delete_site_options( array $options, ?int $network_id = null ): array {
 		$count = 0;
 		foreach ( $options as $name ) {
 			if ( ! is_string( $name ) || ! str_starts_with( $name, self::OPTION_PREFIX ) ) {
 				continue;
 			}
-			if ( delete_site_option( $name ) ) {
+			if ( delete_network_option( $network_id, $name ) ) {
 				++$count;
 			}
 		}
@@ -562,6 +577,7 @@ final class AddonUninstaller {
 			}
 
 			$total = 0;
+			// $table is from the core meta-table map above and $placeholders matches $safe_keys.
 			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$placeholders = implode( ',', array_fill( 0, count( $safe_keys ), '%s' ) );
 
@@ -632,7 +648,7 @@ final class AddonUninstaller {
 			if ( function_exists( 'wp_unschedule_hook' ) ) {
 				$unscheduled = wp_unschedule_hook( $hook );
 				if ( is_int( $unscheduled ) && $unscheduled >= 0 ) {
-					// wp_unschedule_hook returns int, treat as "done".
+					// An int is done.
 					++$count;
 				} elseif ( false !== $unscheduled ) {
 					++$count;
@@ -666,7 +682,7 @@ final class AddonUninstaller {
 			if ( ! is_string( $t ) ) {
 				continue;
 			}
-			// Query only known-safe names (passed validation).
+			// Built by table_name() from validated short names.
 			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			$cnt = $wpdb->get_var(
 				$wpdb->prepare(
@@ -708,9 +724,7 @@ final class AddonUninstaller {
 			}
 			$table        = $tables_map[ $type ];
 			$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
-			// $table comes from a class-local map of WP core meta tables;
-			// $placeholders is a runtime %s-list whose count matches $keys.
-			// Scanner can't see either statically.
+			// $table is from the core meta-table map above and $placeholders matches $keys.
 			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge()/unpacking, which WPCS cannot count; the %i table names lead, then the values in placeholder order.
 			$cnt = (int) $wpdb->get_var(
 				$wpdb->prepare(

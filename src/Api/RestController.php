@@ -14,10 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Base class for PerfLocale REST API controllers.
- *
- * Provides shared utilities: namespace, permission checks, and
- * response formatting.
+ * Base class for PerfLocale REST API controllers: namespace, permission checks, responses.
  */
 abstract class RestController extends \WP_REST_Controller {
 
@@ -142,9 +139,31 @@ abstract class RestController extends \WP_REST_Controller {
 	}
 
 	/**
-	 * Build a paginated WP_REST_Response with the standard WordPress
-	 * `X-WP-Total` and `X-WP-TotalPages` headers so JS clients can paginate
-	 * the same way they do with core post lists.
+	 * Whether the user may read every post; primes 200 at a time, since each read_post check loads its post.
+	 *
+	 * @param int[] $post_ids Post ids; ids below 1 are skipped.
+	 * @return bool
+	 */
+	protected function can_read_posts( array $post_ids ): bool {
+		$ids = array_values( array_unique( array_filter( $post_ids, static fn( int $id ): bool => $id > 0 ) ) );
+
+		foreach ( array_chunk( $ids, 200 ) as $chunk ) {
+			_prime_post_caches( $chunk, false, false );
+
+			foreach ( $chunk as $pid ) {
+				if ( ! current_user_can( 'read_post', $pid ) ) {
+					return false;
+				}
+			}
+
+			\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Paginated response with core's `X-WP-Total` and `X-WP-TotalPages` headers.
 	 *
 	 * @param mixed $data     Response body.
 	 * @param int   $total    Total number of rows matching the query.

@@ -19,18 +19,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Imports what a Polylang site keeps beside its translation groups:
- * - the menu each theme location shows per language (option `polylang`,
- *   `nav_menus`): the menus are labelled and linked the way PerfLocale's
- *   per-language menus are;
- * - string translations (`_pll_strings_translations` on each language term):
- *   the site title and tagline become option-string translations, and the
- *   date and time formats become the language's own formats when it has
- *   none; the rest has no place in PerfLocale and is counted;
- * - post types and taxonomies Polylang translated that PerfLocale does not
- *   treat as translatable yet;
- * - prices that differ between the language versions of a product, which
- *   PerfLocale's price sync would overwrite on the first edit.
+ * Imports what a Polylang site keeps beside its translation groups.
+ *
+ * Per-language theme menus, string translations, the types Polylang translated, and per-language
+ * prices that price sync would overwrite on the first edit.
  */
 final class PolylangSiteData {
 
@@ -55,7 +47,7 @@ final class PolylangSiteData {
 	 * @param \wpdb              $wpdb         Database.
 	 * @param LanguageRepository $languages    PerfLocale languages.
 	 * @param array<string, int> $language_map Polylang slug => PerfLocale language ID.
-	 * @param \Closure|null      $beat         The importer's heartbeat, called after each language's strings and each batch of products so a long step keeps the import lock and its job alive ({@see ImportHeartbeat}).
+	 * @param \Closure|null      $beat         Importer heartbeat: keeps the import lock and its job alive during a long step.
 	 */
 	public function __construct(
 		private readonly \wpdb $wpdb,
@@ -120,9 +112,8 @@ final class PolylangSiteData {
 	/**
 	 * Label and link the menus each theme location shows per language.
 	 *
-	 * A set whose menus already carry another language or link is left
-	 * alone (reported); a menu Polylang showed for two languages stays with
-	 * the first of them.
+	 * A set whose menus carry another language or link is skipped and reported; a menu Polylang
+	 * showed for two languages stays with the first.
 	 *
 	 * @param array<int, string> $notices Import notices, appended to.
 	 * @return int Menu sets linked.
@@ -220,8 +211,7 @@ final class PolylangSiteData {
 				continue;
 			}
 
-			// allowed_classes=false: term meta is user-written data, so no
-			// object is created from it.
+			// Term meta is user-written data: no object is created from it.
 			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false is the mitigation the rule asks for; @ hides the notice for a class it refuses.
 			$pairs = is_serialized( (string) $row->meta_value )
 				? @unserialize( (string) $row->meta_value, [ 'allowed_classes' => false ] )
@@ -288,8 +278,7 @@ final class PolylangSiteData {
 	/**
 	 * Make the post types and taxonomies Polylang translated translatable.
 	 *
-	 * Those are the types Polylang's settings list and the types of the
-	 * posts and terms this import linked, when they are registered.
+	 * Types from Polylang's settings and from the objects this import linked, when registered.
 	 * Attachments stay out: PerfLocale translates media in place.
 	 *
 	 * @param \PerfLocale\Settings $settings PerfLocale settings.
@@ -379,11 +368,8 @@ final class PolylangSiteData {
 	/**
 	 * Switch price sync off when Polylang kept different prices per language.
 	 *
-	 * Price sync copies one language's price fields to the others on every
-	 * product save, so the first edit would overwrite the other languages'
-	 * own prices (a sale price in one language only, say). It is switched
-	 * off once per blog; a later run that finds it on again (the operator's
-	 * choice) keeps it and warns.
+	 * Price sync copies one language's prices to the others on save, so the first edit would overwrite them.
+	 * Switched off once per blog; a later run that finds it on again (the operator's choice) keeps it and warns.
 	 *
 	 * @param \PerfLocale\Settings $settings PerfLocale settings.
 	 * @param array<int, string>   $notices  Import notices, appended to.
@@ -394,12 +380,9 @@ final class PolylangSiteData {
 			return 0;
 		}
 
-		// Every product in a group this import linked, whatever wrote the
-		// other members' links (a product saved under PerfLocale before the
-		// import keeps its own link), in group order. One read: paging it
-		// would scan the post links once per page. The rows are kept as two
-		// lists of integers, and a group's prices are compared once its last
-		// product is read; only the group being read keeps its prices.
+		// Every product of a group this import linked, whoever wrote each member's link, in group order.
+		// One read: paging would rescan the post links per page. A group is compared once its last
+		// product is read, so only the open group keeps its prices.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Values are bound through prepare(); table names through %i.
 		$rows = $this->wpdb->get_results(
 			$this->wpdb->prepare(
@@ -493,14 +476,12 @@ final class PolylangSiteData {
 	}
 
 	/**
-	 * The variations' prices of a page of products, by product: the
-	 * variations are found in one query and their post meta is loaded 500
-	 * at a time, released before the next 500 are loaded.
+	 * The variations' prices of a page of products, by product.
+	 *
+	 * Variation meta is loaded VARIATION_CHUNK at a time, released before the next chunk.
 	 *
 	 * @param array<int, int> $product_ids Product IDs (one page).
-	 * @return array<int, array<int, string>> Variation prices (price_pair())
-	 *                                        by product ID; a product without
-	 *                                        variations is absent.
+	 * @return array<int, array<int, string>> Variation price_pair() values by product ID.
 	 */
 	private static function variation_prices( array $product_ids ): array {
 		if ( $product_ids === [] ) {
@@ -551,8 +532,7 @@ final class PolylangSiteData {
 	/**
 	 * A product's own prices and its variations' prices, as one comparable string.
 	 *
-	 * Variations are compared as a sorted list: their IDs differ between the
-	 * language versions.
+	 * Variations are compared as a sorted list: their IDs differ between language versions.
 	 *
 	 * @param string             $own        The product's price_pair().
 	 * @param array<int, string> $variations Its variations' price_pair() values.

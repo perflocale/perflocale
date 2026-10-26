@@ -17,14 +17,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * REST API endpoints for string translation management.
+ * REST routes for strings: list, scan, bulk machine translation.
  *
- * GET /perflocale/v1/strings - List strings.
- * POST /perflocale/v1/strings/scan - Trigger string scan.
- * POST /perflocale/v1/strings/machine-translate - Queue bulk MT for strings.
- *
- * String translations are WRITTEN via the admin Strings page (AdminController)
- * - there is deliberately no REST write route for individual strings.
+ * Deliberately no REST write route for one string: translations are written on the admin Strings page.
  */
 final class StringsController extends RestController {
 
@@ -41,13 +36,8 @@ final class StringsController extends RestController {
 				'methods'             => \WP_REST_Server::READABLE,
 				'callback'            => [ $this, 'get_strings' ],
 				'permission_callback' => [ $this, 'translate_permissions_check' ],
-				// sanitize_callbacks mirror get_strings() exactly (absint /
-				// sanitize_text_field). Because REST sanitises BEFORE it
-				// type-validates, a non-numeric per_page/offset is coerced to 0
-				// by absint and then passes the integer check - identical to the
-				// handler's own absint() coercion, so no previously-accepted
-				// request is rejected. `page` is intentionally absent: the
-				// handler reads offset, not page.
+				// Sanitizers mirror get_strings(): REST sanitizes before it validates, so absint keeps non-numeric input
+				// accepted as 0. No `page`: the handler reads offset.
 				'args'                => [
 					'per_page' => [
 						'type'              => 'integer',
@@ -97,14 +87,8 @@ final class StringsController extends RestController {
 				'methods'             => \WP_REST_Server::CREATABLE,
 				'callback'            => [ $this, 'machine_translate_strings' ],
 				'permission_callback' => [ $this, 'bulk_mt_permissions_check' ],
-				// Only the unambiguous scalar params are declared. `overwrite` is
-				// deliberately left undeclared: the handler treats ONLY '1'
-				// (string) or true (bool) as "overwrite", so a REST
-				// boolean-coercion would change how 'true'/'0'/1 are read. The
-				// array params (target_lang_ids, string_ids) and the nested
-				// `filter` object are also left to the handler's own (array)
-				// cast - declaring type=array would newly reject a scalar the
-				// (array) cast currently wraps.
+				// `overwrite` stays undeclared: only '1' or true mean overwrite, and REST boolean coercion would change that.
+				// Array params stay undeclared too: type=array would reject a scalar the handler's (array) cast wraps.
 				'args'                => [
 					'mode'        => [
 						'type'              => 'string',
@@ -122,20 +106,9 @@ final class StringsController extends RestController {
 	}
 
 	/**
-	 * Dispatch a bulk MT-translate-strings job.
+	 * Dispatch a bulk string machine-translation job (mode ids, filter or all, plus target_lang_ids).
 	 *
-	 * Accepts one of three selection modes:
-	 *
-	 *   - `mode=ids`    + `string_ids[]=N`             - selected rows
-	 *   - `mode=filter` + `filter={domain,context,search}` - current filter set
-	 *   - `mode=all`                                    - entire strings table
-	 *
-	 * Plus the universal `target_lang_ids[]=N` list. Routes through the
-	 * Dispatcher which decides sync vs async based on the bulk_string_translate
-	 * threshold (default 50 source × target pairs).
-	 *
-	 * Returns `mode=async` + `job_id` for queued runs, or `mode=sync` +
-	 * `result` for inline runs.
+	 * The Dispatcher runs it inline or queues it by its threshold.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
@@ -215,7 +188,7 @@ final class StringsController extends RestController {
 
 			$args['filter'] = [
 				'domain'      => sanitize_text_field( (string) ( $filter['domain'] ?? '' ) ),
-				'context'     => sanitize_text_field( (string) ( $filter['context'] ?? '' ) ),
+				'context'     => is_string( $filter['context'] ?? null ) ? $filter['context'] : '', // As stored: matched exactly, never output.
 				'search'      => sanitize_text_field( (string) ( $filter['search'] ?? '' ) ),
 				'search_mode' => $search_mode,
 				'status'      => $status,
@@ -230,9 +203,7 @@ final class StringsController extends RestController {
 
 		$response = rest_ensure_response( $result );
 
-		// Reflect the dispatch outcome in the HTTP status. Without this a denied
-		// (cap) or errored dispatch returns 200 and the UI reports the failure
-		// as a successful zero-work run. The body still carries mode + error.
+		// The HTTP status reflects a denied or failed dispatch, so the UI does not show it as an empty success.
 		$mode = (string) $result['mode'];
 
 		if ( 'denied' === $mode ) {
@@ -282,15 +253,12 @@ final class StringsController extends RestController {
 
 		$domain = sanitize_text_field( $request->get_param( 'domain' ) ?? '' );
 
-		// Whitelist allowed scan targets - prevents path traversal attacks.
-		// User-supplied paths are NEVER accepted.
+		// Fixed scan targets only: a user-supplied path is never accepted (path traversal).
 		$target = sanitize_key( $request->get_param( 'target' ) ?? 'theme' );
 
 		$path = match ( $target ) {
 			'theme' => get_stylesheet_directory(),
-			// WP_PLUGIN_DIR honours installs that relocate the plugins
-			// directory via the WP_PLUGIN_DIR constant - WP_CONTENT_DIR
-			// would silently miss those.
+			// WP_PLUGIN_DIR, not WP_CONTENT_DIR: it follows a relocated plugins directory.
 			'plugins' => WP_PLUGIN_DIR,
 			'parent' => get_template_directory(),
 			default => get_stylesheet_directory(),
@@ -306,10 +274,7 @@ final class StringsController extends RestController {
 	}
 
 	/**
-	 * Permission gate for bulk string machine translation: a run can
-	 * overwrite every string translation on the site, so it needs
-	 * `perflocale_manage_translations` (as post bulk machine translation
-	 * does) as well as `perflocale_use_mt`.
+	 * Bulk string MT needs `perflocale_manage_translations` as well as `perflocale_use_mt`: it can overwrite every string.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return bool|\WP_Error

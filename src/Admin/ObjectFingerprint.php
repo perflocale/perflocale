@@ -14,36 +14,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * A short description of the post or term an export row names by ID, so an
- * import can tell whether that ID still names the same object.
+ * Fingerprint of the object an export row names by ID, so an import skips rows whose ID names another object here.
  *
- * Translation links, translated slugs, content hashes and the per-object
- * meta sections name a post or term by its numeric ID. On the site that
- * wrote the file, and on a copy of it, the ID names the same object; on a
- * site whose content was rebuilt (a WXR import, a different install at the
- * same address) it names another object or none. The exporter adds an `_fp`
- * field to each such row; the importer compares it with the object the ID
- * names on this site and leaves the row out when they differ. A file
- * without `_fp` (written before fingerprints existed) is imported as before.
- *
- * The comparison tolerates the edits a site makes to its own content: a
- * post matches when its post type is the same and at least one of its GUID,
- * slug or GMT date is unchanged (a slug edit, a draft published, a domain
- * move that rewrote GUIDs each change one); a term matches when its taxonomy
- * is the same and its slug or its name is unchanged. Each part is stored as
- * the first 12 hex digits of its MD5, so the file holds no new text; an
- * empty slug or an unset date is stored as '' and never counts as a match.
- *
- * Shape: `[ 'post', <post_type>, <guid>, <post_name>, <post_date_gmt> ]`,
- * `[ 'term', <taxonomy>, <slug>, <name> ]` or `[ 'order', <type>,
- * <created GMT> ]` (an order matches on its type and creation date), hashed
- * parts as above.
+ * Same type plus one unchanged hashed part is a match (a site's own slug, GUID or date edit must still match).
+ * See docs-ai/11-code-rationale.md, "ObjectFingerprint: id-keyed rows".
  */
 final class ObjectFingerprint {
 
 	/**
-	 * Row field that carries the fingerprint. Not a column of any table, so
-	 * the importer's column filter keeps it out of every insert.
+	 * Row field that carries the fingerprint; no table has it, so the importer's column filter drops it.
 	 */
 	public const FIELD = '_fp';
 
@@ -75,10 +54,7 @@ final class ObjectFingerprint {
 					$out[ Typed::int( $row['ID'] ?? 0 ) ] = [ 'post', Typed::str( $row['post_type'] ?? '' ), self::part( $row['guid'] ?? '' ), self::part( $row['post_name'] ?? '' ), self::part( $row['post_date_gmt'] ?? '' ) ];
 				}
 			} elseif ( 'order' === $kind ) {
-				// An order is described by its type and creation date, read
-				// from the store WooCommerce uses now. HPOS keeps the same
-				// date as the posts table, so a site that switched order
-				// storage since the export still matches.
+				// Read from the active order store: HPOS keeps the posts table's date, so a storage switch still matches.
 				if ( ExportItems::hpos() ) {
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- WooCommerce table bound with %i; ids bound one %d each.
 					$rows = $wpdb->get_results( $wpdb->prepare( "SELECT id, type, date_created_gmt AS created FROM %i WHERE id IN ({$placeholders})", $wpdb->prefix . 'wc_orders', ...$chunk ), ARRAY_A );
@@ -104,14 +80,11 @@ final class ObjectFingerprint {
 	}
 
 	/**
-	 * Whether the object an ID names here is the one the file's fingerprint
-	 * describes.
+	 * Whether the object an ID names here is the one the file's fingerprint describes.
 	 *
 	 * @param mixed                   $file The row's `_fp` value.
 	 * @param array<int, string>|null $here The fingerprint of the object here, or null when there is none.
-	 * @return bool|null True or false; null when the file's value is not a
-	 *                   fingerprint this build reads (the row is then not
-	 *                   checked).
+	 * @return bool|null Null when the file's value is not a fingerprint this build reads (the row is not checked).
 	 */
 	public static function matches( $file, ?array $here ): ?bool {
 		$result = self::compare( $file, $here );
@@ -120,15 +93,12 @@ final class ObjectFingerprint {
 	}
 
 	/**
-	 * Compare a row's fingerprint with the object its ID names here, and say
-	 * which parts matched.
+	 * Compare a row's fingerprint with the object its ID names here, and say which parts matched.
 	 *
 	 * @param mixed                   $file The row's `_fp` value.
 	 * @param array<int, string>|null $here The fingerprint of the object here, or null when there is none.
 	 * @return array{match: bool, parts: array<int, string>, changed: bool}|null Null when the file's value is
-	 *         not a fingerprint this build reads. `parts` names the parts that are equal (`guid`, `slug`,
-	 *         `date`, `name`); `changed` is true when the object matched but a part that the file records
-	 *         differs here (a renamed slug, a published draft, a moved site).
+	 *         not a fingerprint this build reads; `changed`: matched, but a recorded part differs here.
 	 */
 	public static function compare( $file, ?array $here ): ?array {
 		if ( ! is_array( $file ) || ! isset( $file[0], $file[1] ) || ! is_string( $file[0] ) ) {
@@ -181,8 +151,7 @@ final class ObjectFingerprint {
 	}
 
 	/**
-	 * The kind of object (`post` or `term`) a row's type column names, or ''
-	 * for one that has no fingerprint (strings and anything else).
+	 * The kind of object (`post` or `term`) a row's type column names, or '' for one without a fingerprint.
 	 *
 	 * @param mixed $type The row's `type` or `object_type`.
 	 * @return string
@@ -203,8 +172,7 @@ final class ObjectFingerprint {
 	}
 
 	/**
-	 * One hashed part; '' for an empty value or an unset date, which say
-	 * nothing about which object this is (every draft has them).
+	 * One hashed part; '' for an empty value or an unset date, which every draft shares.
 	 *
 	 * @param mixed $value Raw value.
 	 * @return string

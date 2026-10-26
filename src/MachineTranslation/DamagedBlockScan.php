@@ -17,16 +17,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Finds post translations (linked posts whose language is not the default
- * language) whose post_content holds damaged block markup, as
- * BlockStructureGuard::damage() counts it against the default-language source
- * of their group: escaped or left-over block-delimiter text and unbalanced
- * delimiters when the translation holds more of a kind than the source (an
- * article about block markup holds escaped delimiters in every language), and
- * blocks that lost comment attributes their source block has.
+ * Finds post translations whose content holds more damaged block markup of a kind than their default-language source.
  *
- * Writes nothing. Reads the link table by keyset in batches, and per batch only
- * the ID, type and content of the translations in it and of their sources.
+ * Compared with the source because an article about block markup holds escaped delimiters in every language.
+ * Writes nothing; reads the link table by keyset in batches.
  */
 final class DamagedBlockScan {
 
@@ -43,9 +37,7 @@ final class DamagedBlockScan {
 	/**
 	 * One page of the scan: the links after a cursor, at most $batch of them.
 	 *
-	 * Memory is bounded by the page: it holds the page's links, the content of
-	 * its translations and of their sources, and the rows found. Pass `next`
-	 * back as the cursor for the following page; it is null after the last.
+	 * Memory is bounded by the page. Pass `next` back as the cursor; it is null after the last page.
 	 *
 	 * @param LanguageRepository $langs     Language repository.
 	 * @param int                $cursor    Last link ID read (0 = from the start).
@@ -70,9 +62,7 @@ final class DamagedBlockScan {
 
 		$slugs = [];
 
-		// Every language, read past the repository's cached list of all
-		// languages: without a persistent object cache that list is stored in
-		// a transient, a write this read-only scan must not make.
+		// Not the cached language list: without an object cache it is a transient, a write this scan must not make.
 		foreach ( $langs->find_all( [ 'orderby' => 'id' ] ) as $l ) {
 			$vars                                      = get_object_vars( $l );
 			$slugs[ self::int( $vars['id'] ?? null ) ] = self::str( $vars['slug'] ?? null );
@@ -264,9 +254,7 @@ final class DamagedBlockScan {
 	}
 
 	/**
-	 * Stop on a read that failed. A failed read is an error, never an empty
-	 * result: wpdb answers it with no rows and sets last_error (cleared at
-	 * the start of every query).
+	 * Stop on a read that failed: wpdb answers it with no rows and sets last_error (cleared on every query).
 	 *
 	 * @param \wpdb $wpdb  Database.
 	 * @param mixed $found What the read returned.

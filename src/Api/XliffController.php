@@ -17,10 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * REST API endpoints for XLIFF import and export.
- *
- * POST /perflocale/v1/xliff/export - Export translations as XLIFF.
- * POST /perflocale/v1/xliff/import - Import translations from XLIFF.
+ * REST routes for XLIFF export and import.
  */
 final class XliffController extends RestController {
 
@@ -32,8 +29,14 @@ final class XliffController extends RestController {
 	private const PERMISSION_CHUNK = 100;
 
 	/**
-	 * Export requests whose post check passed: the user and post IDs it
-	 * passed for, by request.
+	 * Most distinct posts one export reads.
+	 *
+	 * @var int
+	 */
+	private const MAX_EXPORT_POSTS = 50000;
+
+	/**
+	 * Export requests whose post check passed, with the user and post IDs it passed for.
 	 *
 	 * @var \WeakMap<\WP_REST_Request, array{0: int, 1: string}>|null
 	 */
@@ -52,16 +55,9 @@ final class XliffController extends RestController {
 				'methods'             => \WP_REST_Server::CREATABLE,
 				'callback'            => [ $this, 'export' ],
 				'permission_callback' => [ $this, 'export_permissions_check' ],
-				// Documentation + defense-in-depth. source_lang/target_lang
-				// sanitize_callbacks mirror export()'s sanitize_key exactly;
-				// post_ids stays a bare array (export() maps absint over it -
-				// no scalar sanitizer applies). Not required: the permission
-				// gate already rejects an empty/invalid post_ids set.
+				// Sanitizers mirror export(); nothing is required here because the handler answers missing params.
 				'args'                => [
-					// post_ids: documentation only, no strict type. export()
-					// does array_map( 'absint', (array) $post_ids ), so a scalar
-					// is accepted and wrapped - declaring type=array would newly
-					// reject that currently-valid shape.
+					// No type: export() wraps a scalar post_ids, which type=array would reject.
 					'post_ids'    => [
 						'description' => __( 'IDs of the source posts to export.', 'perflocale' ),
 					],
@@ -86,10 +82,7 @@ final class XliffController extends RestController {
 				'methods'             => \WP_REST_Server::CREATABLE,
 				'callback'            => [ $this, 'import' ],
 				'permission_callback' => [ $this, 'import_export_permissions_check' ],
-				// `xliff` is deliberately schema-typed but NOT given a
-				// sanitize_callback: import() feeds the raw XLIFF XML straight
-				// to the DOM parser, so any REST-layer string sanitiser would
-				// corrupt the document. Documentation only here.
+				// No sanitize_callback on `xliff`: a string sanitizer would corrupt the raw XML the parser reads.
 				'args'                => [
 					'xliff' => [
 						'type'        => 'string',
@@ -101,10 +94,7 @@ final class XliffController extends RestController {
 	}
 
 	/**
-	 * Per-post permission gate for `/xliff/export`. Runs the broad
-	 * import/export cap first, then verifies the caller has `edit_post`
-	 * on every post in the body's `post_ids[]` array. Hoists the
-	 * in-handler loop at export() lines 62-66 to the routing layer.
+	 * Permission gate for `/xliff/export`: the import/export cap, then `edit_post` on every requested post.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return bool|\WP_Error
@@ -115,25 +105,23 @@ final class XliffController extends RestController {
 			return $base;
 		}
 
-		$post_ids = array_map( 'absint', (array) $request->get_param( 'post_ids' ) );
-		$checked  = [ get_current_user_id(), implode( ',', $post_ids ) ];
+		$post_ids = self::requested_post_ids( $request );
+		$too_many = self::too_many_posts( $post_ids );
 
-		// Core runs this check again after the handler, for the response's
-		// Allow header (rest_send_allow_header()). The export released its
-		// posts by then, so the same request, user and posts are answered
-		// from the first check instead of loading every post again.
+		if ( null !== $too_many ) {
+			return $too_many;
+		}
+
+		$checked = [ get_current_user_id(), implode( ',', $post_ids ) ];
+
+		// Core runs this check again for the Allow header after the handler released the posts: answer from the first run.
 		self::$export_allowed ??= new \WeakMap();
 
 		if ( ( self::$export_allowed[ $request ] ?? null ) === $checked ) {
 			return true;
 		}
 
-		// Empty/missing post_ids is a missing-params 400 from the handler;
-		// don't pre-empt it here. Only enforce edit_post on the IDs the
-		// caller did supply.
-		// current_user_can( 'edit_post' ) loads the post, so each chunk's
-		// posts are loaded in one query before its checks. A refused post
-		// ends the check before the next chunk is loaded.
+		// Empty post_ids is left to the handler's 400. Each chunk is primed in one query, as edit_post loads the post.
 		foreach ( array_chunk( $post_ids, self::PERMISSION_CHUNK ) as $chunk ) {
 			$ids = array_values( array_filter( $chunk ) );
 
@@ -164,12 +152,18 @@ final class XliffController extends RestController {
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function export( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
-		$post_ids    = array_map( 'absint', (array) $request->get_param( 'post_ids' ) );
+		$post_ids    = self::requested_post_ids( $request );
 		$source_lang = sanitize_key( $request->get_param( 'source_lang' ) ?? 'en' );
 		$target_lang = sanitize_key( $request->get_param( 'target_lang' ) ?? '' );
 
 		if ( empty( $post_ids ) || $target_lang === '' ) {
 			return $this->error( 'invalid_params', __( 'post_ids and target_lang are required.', 'perflocale' ) );
+		}
+
+		$too_many = self::too_many_posts( $post_ids );
+
+		if ( null !== $too_many ) {
+			return $too_many;
 		}
 
 		// Verify the user can edit each post before exporting its content.
@@ -184,11 +178,7 @@ final class XliffController extends RestController {
 		try {
 			$xliff = $exporter->export( $post_ids, $source_lang, $target_lang );
 		} catch ( \Throwable $e ) {
-			// The export builder needs ext-xmlwriter, which a stripped PHP
-			// build can lack. Nothing above this frame catches, so an
-			// uncaught Error here would end the request as a fatal instead
-			// of a REST envelope. 500 is right: the request was valid and
-			// the server is the part that is missing something.
+			// A PHP build without ext-xmlwriter throws here; nothing above catches, so answer 500 instead of a fatal.
 			return $this->error( 'export_failed', $e->getMessage(), 500 );
 		}
 
@@ -197,6 +187,39 @@ final class XliffController extends RestController {
 				'xliff'    => $xliff,
 				'filename' => sprintf( 'perflocale_%s_%s_%s.xliff', $source_lang, $target_lang, gmdate( 'Ymd' ) ),
 			]
+		);
+	}
+
+	/**
+	 * The requested post ids, each once, in first-seen order.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return array<int, int>
+	 */
+	private static function requested_post_ids( \WP_REST_Request $request ): array {
+		return array_values( array_unique( array_map( 'absint', (array) $request->get_param( 'post_ids' ) ) ) );
+	}
+
+	/**
+	 * The refusal for an export over MAX_EXPORT_POSTS distinct posts, else null.
+	 *
+	 * @param array<int, int> $post_ids Distinct post ids.
+	 * @return \WP_Error|null
+	 */
+	private static function too_many_posts( array $post_ids ): ?\WP_Error {
+		if ( count( $post_ids ) <= self::MAX_EXPORT_POSTS ) {
+			return null;
+		}
+
+		return new \WP_Error(
+			'xliff_too_many_posts',
+			sprintf(
+				/* translators: 1: number of posts requested, 2: most posts per export */
+				__( 'XLIFF export refused: %1$s posts requested, at most %2$s per file. Export them in several requests.', 'perflocale' ),
+				number_format_i18n( count( $post_ids ) ),
+				number_format_i18n( self::MAX_EXPORT_POSTS )
+			),
+			[ 'status' => 400 ]
 		);
 	}
 
@@ -216,15 +239,12 @@ final class XliffController extends RestController {
 		$importer = new XliffImporter();
 
 		try {
-			$result = $importer->import( $xliff_content );
+			$result = $importer->import( $xliff_content, XliffImporter::WEB_MAX_UNITS );
 
 			return $this->success( $result );
 		} catch ( \PerfLocale\Xliff\XliffFormatException $e ) {
-			// The client sent something that can never parse - empty body,
-			// broken XML, declared entities, an unknown trgLang. That is a
-			// 400: retrying the identical request cannot succeed, and a 500
-			// tells an integrator (and every uptime monitor) the opposite.
-			return $this->error( 'invalid_xliff', $e->getMessage(), 400 );
+			// A document that can never parse is the client's error (400, or 413 over the size or unit limit), not a 500.
+			return $this->error( 'invalid_xliff', $e->getMessage(), 413 === $e->getCode() ? 413 : 400 );
 		} catch ( \Throwable $e ) {
 			return $this->error( 'import_failed', $e->getMessage(), 500 );
 		}

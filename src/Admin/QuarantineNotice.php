@@ -16,20 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Shows an admin notice and a Site Health test when one or more addons
- * have been auto-quarantined by the AddonRegistry after repeated boot
- * failures.
+ * Admin notice listing add-ons AddonRegistry quarantined after repeated boot failures.
  *
- * The notice appears on every admin page for admins so broken
- * integrations are impossible to miss. A per-addon "Retry" link calls
- * `AddonRegistry::reset_quarantine()` which clears the failure counter
- * so the addon boots again on the next request - if the underlying
- * issue was fixed, the counter stays cleared; if not, the addon is
- * re-quarantined after another 3 failures.
- *
- * Kept intentionally dependency-light: the quarantine API is public on
- * AddonRegistry, so this class only needs the service container to
- * reach it.
+ * Retry clears the failure counter; an add-on that still fails is quarantined again.
  */
 final class QuarantineNotice {
 
@@ -52,15 +41,11 @@ final class QuarantineNotice {
 		add_action( 'admin_notices', [ $this, 'render_notice' ] );
 		add_action( 'admin_init', [ $this, 'process_retry_action' ] );
 
-		// The Site Health test for quarantined addons lives in
-		// PerfLocale\Admin\SiteHealth alongside the rest of the plugin's
-		// diagnostics - kept out of this class to avoid two entries in
-		// the Status list.
+		// The Site Health test lives in SiteHealth, so the Status list shows it once.
 	}
 
 	/**
-	 * Render the admin notice listing quarantined addons with per-addon
-	 * Retry links.
+	 * Render the notice with a Retry link per quarantined add-on.
 	 *
 	 * @return void
 	 */
@@ -112,8 +97,7 @@ final class QuarantineNotice {
 	}
 
 	/**
-	 * Handle the ?perflocale_retry_addon=<id> link: verify capability
-	 * and nonce, clear the addon's failure counter, redirect clean.
+	 * Handle the Retry link: check nonce and capability, clear the counter, redirect.
 	 *
 	 * @return void
 	 */
@@ -123,13 +107,11 @@ final class QuarantineNotice {
 			return;
 		}
 
-		// Canonical WP order: nonce (CSRF) first, then capability.
-		// `check_admin_referer()` itself dies on failure, so we explicitly
-		// re-check the cap immediately after to keep the gate symmetric.
+		// Nonce first (it dies on failure), then the capability check.
 		check_admin_referer( self::RETRY_NONCE );
 
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$id = sanitize_key( wp_unslash( $_GET[ self::RETRY_ARG ] ) );
@@ -144,7 +126,7 @@ final class QuarantineNotice {
 			$registry->reset_quarantine( $id );
 		}
 
-		// Strip our query args from the current URL and redirect.
+		// Redirect to the current URL without the retry arguments.
 		$redirect = remove_query_arg( [ self::RETRY_ARG, '_wpnonce' ] );
 
 		if ( $redirect === '' ) {

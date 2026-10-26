@@ -157,10 +157,12 @@ final class TermListColumns {
 			$filter_url = add_query_arg( 'post_type', $screen->post_type, $filter_url );
 		}
 
-		Assets::enqueue_script( 'perflocale-term-list-filter', 'term-list-filter.js' );
+		// term-list.js draws the filter from this data (quick_edit_js()
+		// enqueues the same file on this screen; enqueuing again is a no-op).
+		Assets::enqueue_script( 'perflocale-term-list', 'term-list.js', [ 'jquery' ] );
 
 		wp_localize_script(
-			'perflocale-term-list-filter',
+			'perflocale-term-list',
 			'perflocaleTermFilter',
 			[
 				'options'   => $options,
@@ -683,8 +685,10 @@ final class TermListColumns {
 	}
 
 	/**
-	 * Enqueue the script that fills the term Quick Edit language `<select>`
-	 * from row data each time a row's Quick Edit is opened.
+	 * Enqueue the term list script (term-list.js): it fills the term Quick
+	 * Edit language `<select>` from row data each time a row's Quick Edit is
+	 * opened, and draws the language filter when
+	 * inject_term_language_filter() gave it the filter's data.
 	 *
 	 * Mirrors {@see PostListColumns::quick_edit_js()} - same state-shape,
 	 * same `inUse` decoration, but reads from the term row IDs (`tag-{id}`
@@ -704,10 +708,10 @@ final class TermListColumns {
 			return;
 		}
 
-		Assets::enqueue_script( 'perflocale-term-quick-edit', 'term-quick-edit.js', [ 'jquery' ] );
+		Assets::enqueue_script( 'perflocale-term-list', 'term-list.js', [ 'jquery' ] );
 
 		wp_localize_script(
-			'perflocale-term-quick-edit',
+			'perflocale-term-list',
 			'perflocaleTermQeI18n',
 			[
 				'inUse' => __( 'in use', 'perflocale' ),

@@ -14,36 +14,17 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Handles schema migrations between plugin versions.
+ * Runs schema migrations (DB version) and non-DB upgrade tasks (code version).
  *
- * Compares the stored DB version against PERFLOCALE_DB_VERSION and runs
- * any necessary migration methods, plus a separate code-version path for
- * non-DB upgrade tasks (cache flushes, rewrite rule regeneration).
- *
- * No concrete migrate_to_N methods exist on the canonical v1 schema -
- * fresh installs land on the final shape via Schema::create_tables() and
- * Activator::activate(). Future schema bumps add migrate_to_2(),
- * migrate_to_3(), etc. and bump PERFLOCALE_DB_VERSION; the dispatcher
- * below picks them up automatically via method_exists().
+ * No migrate_to_N exists on the v1 schema; a schema bump adds migrate_to_N() (found by method_exists()) and raises
+ * PERFLOCALE_DB_VERSION.
  */
 final class Migrator {
 
 	/**
-	 * Register hooks.
+	 * Register hooks on admin_init, rest_api_init and wp_loaded, so every kind of request migrates.
 	 *
-	 * Coverage matrix:
-	 *   - admin_init        - every wp-admin pageview.
-	 *   - rest_api_init     - every REST request (covers headless / decoupled
-	 *                         frontends that never load wp-admin).
-	 *   - wp_loaded prio 1  - every other request: WP-CLI commands, wp-cron
-	 *                         (DOING_CRON), and public frontend pageviews.
-	 *                         Priority 1 puts us ahead of any code that
-	 *                         depends on the schema being current.
-	 *
-	 * All three handlers are idempotent - `maybe_migrate()` early-returns
-	 * when stored version >= target, `maybe_update()` when stored version
-	 * matches the constant, and `maybe_migrate_addons()` is per-addon
-	 * checksum-gated. Multiple firings during a single request are safe.
+	 * Every handler returns early once current, so firing more than once per request is safe.
 	 *
 	 * @return void
 	 */
@@ -58,20 +39,15 @@ final class Migrator {
 		add_action( 'rest_api_init', [ $this, 'maybe_update' ] );
 		add_action( 'rest_api_init', [ $this, 'maybe_migrate_addons' ] );
 
-		// Catch-all for WP-CLI / wp-cron / frontend-only traffic that never
-		// hits admin_init or rest_api_init. The duplicate firing on admin/REST
-		// requests costs nothing once everything is current; while an add-on
-		// table cannot be created, each firing retries it and logs the
-		// server's refusal.
+		// WP-CLI, cron and front-end requests; priority 1 runs before code that needs the current schema.
+		// While an add-on table cannot be created, each firing retries it and logs the server's refusal.
 		add_action( 'wp_loaded', [ $this, 'maybe_migrate' ], 1 );
 		add_action( 'wp_loaded', [ $this, 'maybe_update' ], 1 );
 		add_action( 'wp_loaded', [ $this, 'maybe_migrate_addons' ], 2 );
 	}
 
 	/**
-	 * Run pending migrations for every registered addon that implements
-	 * HasSchema. Failures are isolated per-addon - one broken addon doesn't
-	 * block others.
+	 * Run pending migrations for every registered addon that implements HasSchema; failures are isolated per addon.
 	 *
 	 * @return void
 	 */
@@ -95,19 +71,13 @@ final class Migrator {
 				continue;
 			}
 
-			// Disabled or quarantined addons must not run migration/manifest
-			// code. refresh()/migrate() call addon-author methods
-			// (get_uninstall_targets(), get_schema_version()) that a
-			// proven-broken addon can throw from - and boot-skipping never
-			// unregisters, so get_addons() still returns them. A disabled
-			// addon's schema simply migrates on the first request after
-			// re-enable (this runs every request).
+			// Disabled or quarantined addons run no addon-author code here (it may throw); get_addons() still lists them.
+			// A disabled addon's schema migrates on the first request after it is enabled again.
 			if ( in_array( (string) $addon_id, $disabled, true ) || in_array( (string) $addon_id, $quarantined, true ) ) {
 				continue;
 			}
 
-			// Skip incompatible addons - their schema shouldn't exist on this
-			// environment anyway.
+			// Incompatible addons: their schema has no place on this site.
 			try {
 				if ( ! $addon->is_compatible() ) {
 					continue;
@@ -116,11 +86,8 @@ final class Migrator {
 				continue;
 			}
 
-			// Refresh the manifest (captures declarative targets) if the addon
-			// opts into either uninstall-related interface. Cheap; checksum-
-			// gated so unchanged manifests don't write. Wrapped so a throw from
-			// addon-author code isolates per-addon instead of fataling out of
-			// wp_loaded, matching this method's documented contract.
+			// Refresh the manifest (checksum-gated, no write when unchanged), then migrate.
+			// A throw from addon-author code is recorded for that addon, never fatal on wp_loaded.
 			try {
 				\PerfLocale\Addon\AddonManifestWriter::refresh( $addon );
 
@@ -146,13 +113,8 @@ final class Migrator {
 			return;
 		}
 
-		// Concurrency guard. maybe_migrate() is hooked on admin_init +
-		// rest_api_init + wp_loaded, so right after an upgrade several parallel
-		// requests can all pass the version gate above and run the SAME
-		// migrate_to_N concurrently - a data-transform step would then race /
-		// double-apply. A short-lived, atomic wp_cache_add mutex lets only the
-		// first request through; the others bail and the migration completes on
-		// that one request (or the next load if it was the loser).
+		// Mutex: after an upgrade parallel requests all pass the version gate and would run the same migrate_to_N
+		// twice; the atomic wp_cache_add() lets only the first through.
 		if ( ! wp_cache_add( 'migrating', 1, 'perflocale', 300 ) ) {
 			return;
 		}
@@ -160,15 +122,8 @@ final class Migrator {
 		$old_version = (string) get_option( 'perflocale_db_version', '0' );
 
 		try {
-			// Run version-specific migrations BEFORE the additive dbDelta so
-			// structural changes (drop-an-index, rename-a-column) complete
-			// cleanly first. Record the version after each step, and only once
-			// that step's migrate_to_N has returned without throwing and the
-			// table post-condition below passes (the same record-per-step
-			// model as AddonSchemaManager). A failure in a LATER step then
-			// never re-runs an already-applied earlier step (which, if not
-			// perfectly idempotent, would corrupt on the second pass). Retry
-			// resumes from exactly the failed version.
+			// Per step: migrate_to_N (before dbDelta, so drops and renames finish first), dbDelta, the table check,
+			// then the version recorded. A later failure never re-runs an applied step; a retry resumes at the failed one.
 			for ( $version = $current_version + 1; $version <= $target_version; $version++ ) {
 				$method = 'migrate_to_' . $version;
 
@@ -182,26 +137,11 @@ final class Migrator {
 					}
 				}
 
-				// Additive column/index changes for this version. dbDelta
-				// reflects the full current schema and is idempotent, so running
-				// it per step is safe.
+				// Additive changes; dbDelta holds the full current schema and is idempotent.
 				Schema::create_tables();
 
-				// dbDelta swallows DDL errors and its return value reports
-				// intent, not outcome - so a create that failed (restricted
-				// grants, disk full, an index the server rejects) would
-				// otherwise be recorded as a completed migration and never
-				// retried. Ask the server what actually exists before
-				// stamping; leaving the version behind means the next request
-				// re-runs this step instead of silently moving on with a
-				// half-provisioned schema.
-				//
-				// This proves the tables exist, not their columns or indexes:
-				// a CREATE is all-or-nothing, but an ALTER on an existing
-				// table can fail and leave the table in place. A step whose
-				// dbDelta adds a column or index must also check that one
-				// here, by name (SHOW COLUMNS / SHOW INDEX), before the
-				// version is recorded.
+				// dbDelta swallows DDL errors: confirm the tables exist before recording, or a failed create is never retried.
+				// Tables only: a step whose dbDelta adds a column or index must also check it here by name before recording.
 				$missing = Schema::missing_tables();
 
 				if ( $missing !== [] ) {
@@ -227,9 +167,7 @@ final class Migrator {
 	/**
 	 * Show a persistent admin notice when a migration fails.
 	 *
-	 * The notice is shown only to users who manage the site's options (the
-	 * network's on multisite), with filesystem paths redacted; the debug log
-	 * keeps the full text.
+	 * Only to users who manage options (network options on multisite), paths redacted; the debug log keeps the full text.
 	 *
 	 * @param int    $version Target version that failed.
 	 * @param string $message Error message.
@@ -263,11 +201,7 @@ final class Migrator {
 	}
 
 	/**
-	 * Detect plugin code version changes and run non-DB upgrade tasks.
-	 *
-	 * Separate from maybe_migrate() which handles DB schema changes only.
-	 * This handles tasks like flushing caches, regenerating translation
-	 * files, or clearing stale transients after a plugin file update.
+	 * Run non-DB upgrade tasks (cache flush, orphan-group sweep, rewrite flush) when the plugin code version changes.
 	 *
 	 * @return void
 	 */
@@ -284,11 +218,8 @@ final class Migrator {
 		if ( $plugin->has( 'cache' ) ) {
 			$plugin->get( 'cache' )->flush_all();
 
-			// One-time self-heal: reclaim widow translation groups that older
-			// builds could leak (a string deleted without cascading its group;
-			// a merge import that stranded groups). Safe + idempotent - after
-			// the first pass there are no orphans, so the version gate above
-			// makes this a no-op until the next upgrade.
+			// Reclaim orphan translation groups (a string deleted without its group, a merge import that stranded some);
+			// idempotent, and the version gate runs it once per upgrade.
 			( new \PerfLocale\Database\Repository\TranslationGroupRepository( $plugin->get( 'cache' ) ) )
 				->sweep_orphan_groups();
 		}

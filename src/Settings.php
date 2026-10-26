@@ -14,10 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Typed wrapper around the perflocale_settings option.
- *
- * Loads the option once per request (static cache) and provides typed getters
- * with defaults for every setting. No DB call is repeated within a request.
+ * Typed wrapper around the perflocale_settings option, loaded once per request.
  */
 final class Settings {
 
@@ -28,6 +25,8 @@ final class Settings {
 
 	/**
 	 * Default values for all settings.
+	 *
+	 * The geo proxy-trust keys are left out on purpose (docs-ai/04-do-not-fix.md 2.21).
 	 */
 	private const DEFAULTS = [
 		// URL & Routing.
@@ -40,17 +39,9 @@ final class Settings {
 		'disable_language_cookie'        => false,
 		'redirect_browser_lang'          => false,
 		'redirect_geo_enabled'           => false,
-		// Edge-hint redirect: when an edge worker (Cloudflare/Vercel/Netlify)
-		// has already mapped country -> language at the edge and forwarded the
-		// decision via the X-PerfLocale-Lang header (or perflocale_edge_lang
-		// cookie), redirect first-time visitors to that language. Routing at
-		// the edge keeps the response cacheable. Requires the global Edge
-		// Integration toggle (`edge_integration_enabled`) to also be on.
+		// Redirect to the edge worker's language hint; needs `edge_integration_enabled` too.
 		'redirect_edge_hint_enabled'     => false,
-		// Order in which the redirect handlers run when more than one is
-		// enabled. First entry wins (registers earlier on `template_redirect`).
-		// Default order: geo first, then browser, edge_hint last. Admins
-		// can drag-reorder in the UI.
+		// First entry wins: it registers earlier on `template_redirect`.
 		'redirect_priority_order'        => [ 'geo', 'browser', 'edge_hint' ],
 		'geo_provider'                   => '',
 		'geo_country_map'                => [],
@@ -66,13 +57,7 @@ final class Settings {
 		'default_translation_status'     => 'empty',
 		'auto_create_stubs'              => false,
 
-		// Abilities API (WP 6.9+). Read abilities are on by default: they are
-		// discovery/lookup operations, capability-gated, and a site owner
-		// comparing agent surfaces otherwise sees zero from PerfLocale while
-		// other plugins register theirs. The two WRITE abilities are separate
-		// and OFF by default - `perflocale/translate-post` SPENDS machine-
-		// translation budget, and "an agent quietly used my provider quota" is
-		// a materially different surprise from "an agent read my language list".
+		// Abilities API: capability-gated reads on; writes off because translate-post spends MT budget.
 		'abilities_enabled'              => true,
 		'abilities_write_enabled'        => false,
 		'sync_fields'                    => [ 'featured_image', 'menu_order' ],
@@ -92,26 +77,15 @@ final class Settings {
 		'mt_agency_url'                  => '',
 		'mt_agency_api_key'              => '',
 		'mt_auto_translate_on_publish'   => false,
-		// Target scope for BOTH auto-translate flows. Empty = every active
-		// language (and languages added later join automatically); an
-		// explicit slug list limits the fan-out.
+		// Both auto-translate flows; empty = every active language, including later ones.
 		'mt_auto_translate_languages'    => [],
 		'mt_auto_translate_on_create'    => false,
 		'mt_monthly_char_limit'          => 500000,
-		// Cost kill-switch for the Strings admin bulk-MT toolbar. ON by
-		// default (consistent with the rest of MT defaulting to "available
-		// once you turn MT on"); flip OFF to hide the toolbar entirely
-		// while still permitting per-row MT in the modal editor.
+		// Cost switch for the Strings bulk-MT toolbar; per-row MT stays available.
 		'mt_bulk_strings_enabled'        => true,
-		// Pre-dispatch budget gate: veto bulk MT dispatches whose estimated
-		// character volume would exceed the monthly cap, BEFORE any provider
-		// spend (see the perflocale/jobs/should_dispatch gate in Bootstrap).
-		// OFF restores the historical run-until-cap behaviour.
+		// Veto a bulk MT dispatch whose estimate exceeds the monthly cap, before any provider spend.
 		'mt_enforce_cap_on_bulk'         => true,
-		// Meta-field MT policy. SEO meta (titles/descriptions/og/twitter) is
-		// short, cheap, high-value: ON. Custom fields (ACF/MetaBox/Pods text
-		// fields) scale with site structure: opt-in. Both feed the curated
-		// perflocale/mt/translatable_meta_keys registry - never the seed list.
+		// MT of SEO meta is cheap (on); custom fields scale with the site (opt-in).
 		'mt_meta_seo'                    => true,
 		'mt_meta_custom_fields'          => false,
 
@@ -119,25 +93,17 @@ final class Settings {
 		'seo_hreflang_enabled'           => true,
 		'seo_hreflang_placement'         => 'head',
 		'seo_x_default'                  => true,
-		// When true, hreflang includes every active language even without a
-		// specific translation (assumes each language root renders 200 via the
-		// missing-translation action / fallback chain). Default false is
-		// conservative: only languages with an actual translation.
+		// True lists every active language in hreflang, assuming each renders 200 via a fallback.
 		'seo_hreflang_include_fallbacks' => false,
 		'seo_sitemap_enabled'            => true,
-		// auto = let the active SEO plugin own its native sitemap if one is
-		// detected, otherwise inject into WP core sitemaps. core = always
-		// inject into WP core only (even when an SEO plugin is active).
-		// plugin = always skip WP core injection (let the SEO plugin
-		// addon handle alternates exclusively). Most users want 'auto'.
+		// Sitemap tree for alternates: auto (SEO plugin's if detected, else core), core or plugin.
 		'seo_sitemap_source'             => 'auto',
 		'seo_plugin'                     => 'none',
 		'seo_og_locale'                  => true,
 
 		// Language Switcher.
 		'switcher_template'              => 'flags_names',
-		// Classic-menu theme locations the switcher is appended to (block
-		// themes use the switcher block instead). Empty = never appended.
+		// Classic-menu locations the switcher is appended to; block themes use the block.
 		'switcher_menu_locations'        => [],
 		'switcher_display'               => 'dropdown',
 		'switcher_layout'                => 'horizontal',
@@ -147,27 +113,12 @@ final class Settings {
 		'switcher_show_untranslated'     => false,
 		'switcher_hide_current'          => true,
 		'switcher_untranslated_link'     => 'homepage',
-		// Dropdown chevron icon next to the trigger label. `single` = one
-		// down chevron (the classic native-select look, default); `double`
-		// = stacked up/down chevrons; `none` = no icon. Themes/addons that
-		// want a custom icon (image, icon-font, brand-specific SVG) should
-		// hook the `perflocale/switcher/arrow_html` filter - that filter
-		// fires for every value including `none`, so it can also INJECT
-		// an arrow even when the user picked "no icon" in the UI.
+		// Dropdown chevron: single, double or none; `perflocale/switcher/arrow_html` fires for all three.
 		'switcher_arrow_style'           => 'single',
-		// Trigger button label format on dropdown switchers. `inherit`
-		// reuses `switcher_name_format` (the options' format), which is
-		// the right default for most sites - trigger and options share a
-		// vocabulary. Set to `slug` for a compact "EN" / "FR" header
-		// pill while keeping full names in the options list, or to
-		// `english` / `native` / `both` to override independently.
+		// Dropdown trigger label format; `inherit` reuses `switcher_name_format`.
 		'switcher_trigger_format'        => 'inherit',
 		'admin_bar_switcher'             => true,
-		// Block Hooks auto-insertion of the language switcher in FSE templates.
-		// Defaults ON: the block.json declares `blockHooks: core/site-title:after`
-		// so themes that use the Site Title block in their header get a working
-		// switcher with zero manual placement. Flip OFF to opt out (recommended
-		// for users who already have a manually-placed switcher block).
+		// Block Hooks insertion of the switcher after core/site-title in block templates.
 		'switcher_auto_insert'           => true,
 
 		// WooCommerce.
@@ -188,21 +139,7 @@ final class Settings {
 		'cache_preload_slugs'            => true,
 		'string_translation_mode'        => 'files',
 
-		// Background processing. See src/Background/ for the runtime.
-		// - background_processing: 'auto' | 'always' | 'never'
-		// Auto = async over per-action threshold; Always = always async;
-		// Never = always run inline (not recommended on large sites).
-		// - background_engine: 'auto' | 'force_wp_cron'
-		// Auto picks Action Scheduler when loaded (≥ 3.4), otherwise
-		// falls back to WP-Cron. Force = use WP-Cron even when AS is
-		// available - escape hatch for sites where AS is misbehaving.
-		// - background_thresholds: [type => int]
-		// Per-action override of the default item-count threshold for
-		// Auto mode. Filter `perflocale/jobs/threshold/<type>` is the
-		// programmatic equivalent.
-		// - background_paused: when true, dispatched jobs are accepted but
-		// workers immediately re-queue them at +5 min instead of running.
-		// Operational escape hatch when something is mis-dispatching.
+		// Background processing: see docs-ai/11-code-rationale.md, "Settings: background processing keys".
 		'background_processing'          => 'auto',
 		'background_engine'              => 'auto',
 		'background_thresholds'          => [],
@@ -214,32 +151,21 @@ final class Settings {
 		'seo_schema_enrichment_enabled'  => true,
 
 		// Modern SEO features.
-		//
-		// Content-Language HTTP header - W3C standard, safe to send.
 		'content_language_header'        => true,
 
-		// data-nosnippet: wraps the content whenever the rendered singular
-		// post's language differs from the URL's language - in practice the
-		// show_default branch of missing_translation_action.
+		// Wraps content in data-nosnippet when the post's language differs from the URL's.
 		'fallback_nosnippet'             => true,
 
-		// Speculation Rules API - prerender the visitor's target translation
-		// when they hover/focus the language switcher. Chromium-only today,
-		// progressive enhancement elsewhere. Experimental → defaults OFF.
+		// Speculation Rules prerender on switcher hover; experimental, so off.
 		'prerender_on_hover'             => false,
 
-		// View Transitions API - smooth cross-document animation on language
-		// switch. Chrome 126+ / Safari 18.2+; progressive enhancement elsewhere.
-		// Experimental → defaults OFF; some themes animate their own content
-		// on nav and can fight with this.
+		// View Transitions on language switch; off because some themes animate navigation themselves.
 		'view_transitions_enabled'       => false,
 
-		// Show the translation-overview widget on the WP admin Dashboard.
-		// Off by default - opt in under Settings → Advanced. Capability-gated
-		// and reads cached counts, so it adds no live queries on dashboard load.
+		// Dashboard translation-overview widget (cached counts).
 		'dashboard_widget_enabled'       => false,
 
-		// Internal - settings schema version for future migrations.
+		// Settings schema version for migrations.
 		'schema_version'                 => 1,
 	];
 
@@ -251,40 +177,21 @@ final class Settings {
 	private ?array $settings = null;
 
 	/**
-	 * Resolved override map, built once at load() time. Keys are setting
-	 * names whose CONSTANT_MAP entry resolves to either an environment
-	 * variable or a PHP constant; values are the resolved string. Read-path
-	 * uses this instead of re-running getenv()/defined()/constant() on
-	 * every get() call.
+	 * Values from the environment, constants or Connectors, resolved once in load().
 	 *
 	 * @var array<string, mixed>|null
 	 */
 	private ?array $constant_overrides = null;
 
 	/**
-	 * Per-language URL prefix memo. Keyed by language ID → computed prefix.
-	 *
-	 * `get_url_prefix()` is called ~115 times per archive render (every
-	 * permalink filter calls it via UrlConverter::add_language_prefix_to_url).
-	 * In locale-prefix mode each call runs `strtolower(str_replace())` over
-	 * the locale string - sub-µs but at 115×/request it adds up. The set of
-	 * inputs is tiny (one per active language, 2-5 typically), so a per-ID
-	 * cache collapses all calls to a single hash lookup after the first.
-	 *
-	 * Reset on `update_option_perflocale_settings` so url_prefix_type
-	 * changes take effect immediately.
+	 * URL prefix by language ID; get_url_prefix() runs for every permalink.
 	 *
 	 * @var array<int, string>
 	 */
 	private array $url_prefix_cache = [];
 
 	/**
-	 * Per-request memo for get_translatable_post_types() / _taxonomies().
-	 *
-	 * Was previously function-level `static`, but that scope can't be cleared
-	 * by reset_cache(), so settings saves within the same request kept seeing
-	 * the old list. Holding them as instance state lets reset_cache() drop
-	 * them in lockstep with $this->settings.
+	 * Memo of get_translatable_post_types(); a property so reset_cache() can clear it.
 	 *
 	 * @var array<int, string>|null
 	 */
@@ -296,18 +203,14 @@ final class Settings {
 	private ?array $translatable_taxonomies_cache = null;
 
 	/**
-	 * Per-post-type cache of get_translatable_meta_keys(). An instance
-	 * property (not a function-static) so reset_cache() - invoked on
-	 * switch_blog and after a settings save - can actually clear it.
+	 * Per-post-type memo of get_translatable_meta_keys(); a property so reset_cache() can clear it.
 	 *
 	 * @var array<string, array<int, string>>
 	 */
 	private array $translatable_meta_keys_cache = [];
 
 	/**
-	 * Per-key origin of the resolved override ('env' or 'constant').
-	 * Populated alongside $constant_overrides; surfaces to the UI via
-	 * get_override_source() so admins see which source supplied the value.
+	 * Per-key origin of the resolved override ('env', 'constant' or 'connector').
 	 *
 	 * @var array<string, string>|null
 	 */
@@ -331,12 +234,7 @@ final class Settings {
 
 		$this->settings = wp_parse_args( $stored, self::DEFAULTS );
 
-		// Pre-resolve every CONSTANT_MAP entry once so get() (called 80-150×
-		// per request) stays a pure array lookup instead of paying
-		// getenv()/defined()/constant() each call. Source priority: env >
-		// constant (wp-config.php) > DB, so containerised hosts keep secrets
-		// out of wp_options without losing the admin-saved fallback. Env /
-		// constant values are trimmed (trailing-newline copy-paste).
+		// Resolved once so get() stays an array lookup. Priority: env, constant, Connectors, database.
 		$this->constant_overrides = [];
 		$this->override_sources   = [];
 
@@ -352,9 +250,7 @@ final class Settings {
 			if ( defined( $constant_name ) ) {
 				$value = constant( $constant_name );
 
-				// Empty constants are treated as "not set" so an explicit
-				// `define('…', '')` in wp-config doesn't override a real
-				// admin-saved value with nothing.
+				// An empty constant is "not set": it must not blank a saved value.
 				if ( ! is_string( $value ) || trim( $value ) !== '' ) {
 					$this->constant_overrides[ $setting_key ] = is_string( $value ) ? trim( $value ) : $value;
 					$this->override_sources[ $setting_key ]   = 'constant';
@@ -362,25 +258,13 @@ final class Settings {
 			}
 		}
 
-		// WP 7.0+ Connectors API: if the host site has a key registered
-		// against a known connector slug, treat that as the highest-priority
-		// source after env+constant. Feature-detected; on WP versions
-		// without the Connectors API this branch is a no-op.
 		$this->maybe_apply_connectors_overrides();
 
 		return $this->settings;
 	}
 
 	/**
-	 * Map of setting keys to WordPress Connectors API slugs (WP 7.0+).
-	 *
-	 * When the Connectors API exposes a key for any of these slugs and the
-	 * matching setting hasn't already been resolved from env / constant, the
-	 * Connectors value wins over the database value. Each slug corresponds to
-	 * the canonical connector name expected by core (`deepl`, `google-cloud-
-	 * translation`, etc.). When the Connectors API is not available (every WP
-	 * release before 7.0, and 7.0 itself until the API ships), this map is
-	 * inert.
+	 * Setting keys mapped to WordPress Connectors API slugs; inert without that API.
 	 */
 	private const CONNECTOR_MAP = [
 		'mt_deepl_api_key'     => 'deepl',
@@ -390,18 +274,7 @@ final class Settings {
 	];
 
 	/**
-	 * Try to populate constant_overrides from the WP 7.0 Connectors API.
-	 *
-	 * Connectors sit between env/constant and the database in the source
-	 * priority chain - env still wins (operators may want to force a value
-	 * for a specific host) and constants still win (defined in wp-config),
-	 * but a key registered in Connectors is preferred over the value an
-	 * admin typed into the PerfLocale settings UI. This gives multi-plugin
-	 * sites a single rotation point.
-	 *
-	 * Inert on stock WP 7.0 (the function isn't shipped yet) and earlier;
-	 * activates automatically once core ships `wp_get_connector` (or the
-	 * equivalent retrieval API), without a plugin update.
+	 * Add Connectors API keys to the overrides: below env and constants, above the database.
 	 *
 	 * @return void
 	 */
@@ -413,15 +286,7 @@ final class Settings {
 		}
 
 		/**
-		 * Filter the setting-key → connector-slug map used to resolve
-		 * Connectors-API values. Defaults to the 4 MT-provider keys.
-		 *
-		 * Use this to route additional API keys through the WP Connectors
-		 * API - for example, geo provider tokens
-		 * (a provider key setting registered by the site)
-		 * or per-currency keys registered by the site.
-		 * Unknown connector slugs simply return null from the resolver and
-		 * fall through to env / constant / DB as usual.
+		 * Filter the setting-key to connector-slug map; an unknown slug falls through to the database.
 		 *
 		 * @hook perflocale/connectors/slug_map
 		 *
@@ -458,28 +323,15 @@ final class Settings {
 	}
 
 	/**
-	 * Locate a callable for retrieving an API key from the WP Connectors API.
+	 * Callable that reads a key from the Connectors API, or null when none exists.
 	 *
-	 * The Connectors API hasn't shipped at the time of writing - the function
-	 * name is whatever core finally settles on. Probe a small set of plausible
-	 * names so a future name change doesn't strand this integration. Custom
-	 * integrators can also short-circuit detection by filtering with their
-	 * own callable.
-	 *
-	 * Returns null when no resolver is available; caller treats that as
-	 * "Connectors not present, skip."
+	 * Probes several function names because core has not settled on one.
 	 *
 	 * @return null|callable(string): ?string
 	 */
 	private function resolve_connectors_callback(): ?callable {
 		/**
-		 * Filter the callable used to look up a key in the WordPress
-		 * Connectors API. Return any callable that accepts a connector slug
-		 * (e.g. 'deepl') and returns a string key, or null/empty when the
-		 * connector isn't registered.
-		 *
-		 * Useful for unit tests, for custom in-house key vaults, and as a
-		 * forward-compatibility shim when core renames the function.
+		 * Filter the callable that maps a connector slug to its key (null when not registered).
 		 *
 		 * @hook perflocale/connectors/resolver
 		 *
@@ -491,12 +343,7 @@ final class Settings {
 			return $custom;
 		}
 
-		// Core's WP 7.0 wp_get_connector() fires _doing_it_wrong for ids that
-		// were never registered - and most sites register none of our MT
-		// providers. Probe for a registration checker (same name-probing as
-		// the getter below, since this plugin supports WP < 7.0) so every
-		// settings load doesn't spray "Connector not found" notices into
-		// debug.log.
+		// wp_get_connector() raises _doing_it_wrong for unregistered ids, so check registration first.
 		$exists_fn = null;
 
 		foreach ( [ 'wp_is_connector_registered', 'wp_connector_is_registered' ] as $probe ) {
@@ -562,8 +409,7 @@ final class Settings {
 	public function get( string $key, mixed $default = null ): mixed {
 		$settings = $this->load();
 
-		// wp-config.php constant override wins. Resolved-once map built in
-		// load() - saves re-running isset(CONSTANT_MAP) + defined() per call.
+		// An external override wins over the stored value.
 		if ( isset( $this->constant_overrides[ $key ] ) ) {
 			return $this->constant_overrides[ $key ];
 		}
@@ -580,12 +426,9 @@ final class Settings {
 	}
 
 	/**
-	 * Check if a setting is currently overridden by either an environment
-	 * variable or a PHP constant (i.e. its DB value is being ignored).
+	 * Whether an environment variable, constant or connector overrides the stored value.
 	 *
-	 * Saving the SettingsPage form should skip writing to the DB for any
-	 * key returning true here - otherwise the admin's edit appears to do
-	 * nothing because the override wins on the next read.
+	 * Saves skip such keys: the override would win on the next read anyway.
 	 *
 	 * @param string $key Setting key.
 	 * @return bool
@@ -599,9 +442,7 @@ final class Settings {
 	 * Identify which external source supplied an overridden value.
 	 *
 	 * @param string $key Setting key.
-	 * @return string|null 'env' if from getenv(), 'constant' if from a PHP
-	 *                     constant, 'connector' if from the WP 7.0+
-	 *                     Connectors API, null when the DB value is in effect.
+	 * @return string|null 'env', 'constant' or 'connector'; null when the stored value is in effect.
 	 */
 	public function get_override_source( string $key ): ?string {
 		$this->load();
@@ -619,9 +460,7 @@ final class Settings {
 	}
 
 	/**
-	 * Update settings.
-	 *
-	 * Merges provided values with existing settings, sanitizes, and saves.
+	 * Update settings: sanitize, merge onto the stored row and save.
 	 *
 	 * @param array<string, mixed> $values Key-value pairs to update.
 	 * @return bool True on success.
@@ -641,14 +480,12 @@ final class Settings {
 	private static array $last_update_refused = [];
 
 	/**
-	 * Writes update() tries before it gives up, each after a lost
-	 * compare-and-set re-reads the row ({@see write_row()}).
+	 * Writes update() tries; each lost compare-and-set re-reads the row.
 	 */
 	private const WRITE_ATTEMPTS = 5;
 
 	/**
-	 * Machine-translation provider address setting => the key setting sent to
-	 * that address.
+	 * Machine-translation provider address setting, mapped to the key setting sent to it.
 	 */
 	private const MT_KEY_FOR_URL = [
 		'mt_libre_url'  => 'mt_libre_api_key',
@@ -660,37 +497,12 @@ final class Settings {
 
 		$sanitized = $this->sanitize( $values );
 
-		// Lock the read-modify-write so two concurrent saves (admin + admin, or
-		// admin + CLI) don't both merge onto the pre-write blob and have the
-		// second writer clobber keys the first changed. 10s TTL covers the
-		// read+merge+write. If another save holds the lock, update() returns
-		// false without writing.
+		// Locked read-modify-write: concurrent saves would overwrite each other's keys.
 		$result = \PerfLocale\Concurrency\Lock::with(
 			'settings_update',
 			10,
 			function () use ( $sanitized ): array {
-				// Inside the critical section, force a fresh DB read, so the
-				// merge starts from what a concurrent writer committed after
-				// this request loaded its options at bootstrap.
-				// reset_cache() drops this object's memo. The option is
-				// autoloaded, so get_option() answers from this request's
-				// `alloptions` copy, loaded at bootstrap, and never consults
-				// the per-key cache entry. Dropping `alloptions` makes both
-				// load() and update_option()'s own old-value comparison see
-				// the committed row; the per-key delete covers a row stored
-				// with autoload off. The reload costs one autoload query in
-				// the saving request (admin, CLI or a background import
-				// worker), never on a front-end read. With a persistent
-				// object cache the delete also evicts the blog's shared
-				// `alloptions` entry, which load() re-adds at once; every
-				// save already evicts it twice through the cache-generation
-				// bumps.
-				// The write is a compare-and-set on the row ({@see write_row()}):
-				// a writer that does not take this lock (a language delete or
-				// rename, a settings import restore) may change the row between
-				// the read above and the write, and an unconditional write would
-				// undo that change. After a lost comparison the row is read
-				// again and the merge redone, a bounded number of times.
+				// Fresh read plus compare-and-set: see docs-ai/11-code-rationale.md, "Settings: update read and write".
 				$expected = false;
 
 				for ( $attempt = 0; ; $attempt++ ) {
@@ -704,10 +516,7 @@ final class Settings {
 
 					self::$last_update_refused = $refused;
 
-					// The first attempt compares against the value the load
-					// above read (no statement); a later one against the row
-					// itself, so a value the options cache or a filter shapes
-					// differently from the row costs one lost attempt only.
+					// Later attempts compare against the row itself: a filtered value costs one attempt only.
 					$written = $this->write_row( $merged, $expected );
 
 					if ( null !== $written || $attempt + 1 >= self::WRITE_ATTEMPTS ) {
@@ -719,25 +528,15 @@ final class Settings {
 
 				$saved = true === $written;
 
-				// Update the in-memory cache only on a successful write - else
-				// a failed write would leave Settings::$settings ahead of the
-				// DB and get() would return unpersisted values. write_row()
-				// also reports a no-op (value already current) as not written;
-				// that case is harmless, so if the merged blob equals $current
-				// we sync the memo anyway.
+				// Memo only what is stored: a failed write must not leave get() ahead of the database.
 				if ( (bool) $saved ) {
 					$this->settings = $merged;
 				} elseif ( $merged === $current ) {
-					// Idempotent no-op save; keep the in-memory cache
-					// aligned so an early get() before the next load()
-					// can't observe a stale entry.
+					// A no-op save: the merged value is already stored.
 					$this->settings = $merged;
 				}
 
-				// Only flag rewrite-rule flush when a URL-affecting setting changed.
-				// Non-URL changes (MT keys, switcher UI options, etc.) don't warrant
-				// a flush - this avoids the rewrite-regeneration cost after trivial
-				// settings saves.
+				// Flush rewrite rules only when a URL-affecting setting changed.
 				if ( (bool) $saved && $this->url_affecting_change( $current, $merged ) ) {
 					update_option( 'perflocale_flush_rules', 1, false );
 				}
@@ -752,10 +551,7 @@ final class Settings {
 		);
 
 		if ( $result === null ) {
-			// Lock unavailable - another save is in flight. Don't silently
-			// drop the user's input; surface as a soft failure and let the
-			// caller retry. The settings page treats `false` as "save
-			// failed" and shows a notice.
+			// Another save holds the lock: report a failure so the caller can retry.
 			return false;
 		}
 
@@ -768,8 +564,7 @@ final class Settings {
 	}
 
 	/**
-	 * The settings row's bytes read from the database, past any cached
-	 * copy; null when there is no row.
+	 * The settings row's bytes read from the database, past any cache; null when there is no row.
 	 *
 	 * @return string|null
 	 */
@@ -787,17 +582,13 @@ final class Settings {
 	}
 
 	/**
-	 * Write the merged settings to their row with a compare-and-set: what
-	 * update_option() does (sanitize_option(), the pre_update_option filters,
-	 * no write when the value is unchanged, add_option() when there is no
-	 * row, the options cache updated, the update_option actions), except
-	 * that the UPDATE matches only while the row still holds $expected.
+	 * Write the merged settings as update_option() would, but only while the row still holds $expected.
 	 *
 	 * @param array<string, mixed> $merged   Settings to store.
 	 * @param string|false|null    $expected The row's bytes the merge was built from; false: the
 	 *                                       value get_option() serves, serialized; null: no row.
 	 * @return bool|null True when written; false when there was nothing to write; null when the
-	 *                   row no longer held $expected (or the write failed).
+	 *                   row did not hold $expected (or the write failed).
 	 */
 	private function write_row( array $merged, $expected ): ?bool {
 		$old_value = get_option( self::OPTION_KEY );
@@ -811,11 +602,7 @@ final class Settings {
 
 
 	/**
-	 * The provider address settings (mt_libre_url, mt_agency_url) whose change
-	 * the most recent {@see update()} refused: on a multisite network, the
-	 * address of a provider whose key is supplied by wp-config.php, the
-	 * environment or the Connectors API, changed by a user who is not a super
-	 * admin ({@see apply_provider_address_rules()}).
+	 * Provider address settings whose change the last update() refused (see apply_provider_address_rules()).
 	 *
 	 * @return array<int, string>
 	 */
@@ -824,17 +611,10 @@ final class Settings {
 	}
 
 	/**
-	 * A machine-translation key goes only to the provider address it was
-	 * entered for. Every writer goes through here (the settings form, the
-	 * settings import, WP-CLI). For each provider address the update changes
-	 * (an address supplied from outside the database never reaches here:
-	 * sanitize() drops it):
-	 * - a key stored in the database is cleared unless the same update
-	 *   carries a non-empty key;
-	 * - a key supplied by wp-config.php, the environment or the Connectors
-	 *   API is the network's on a multisite network: only a super admin or
-	 *   WP-CLI may change the address it is sent to, and anyone else's change
-	 *   is dropped (the stored address stays). Its stored copy is left alone.
+	 * Send a machine-translation key only to the provider address it was entered for.
+	 *
+	 * A changed address clears a stored key unless the update carries one; on multisite only a super
+	 * admin or WP-CLI may re-point an externally supplied key, so anyone else's change is refused.
 	 *
 	 * @param array<string, mixed> $current   Stored settings, read inside the update's lock.
 	 * @param array<string, mixed> $sanitized The update's sanitized values.
@@ -866,18 +646,9 @@ final class Settings {
 	}
 
 	/**
-	 * Whether the most recent {@see update()} wrote nothing because the stored
-	 * value already matched.
+	 * Whether the last update() wrote nothing because the stored value already matched.
 	 *
-	 * update_option() returns false for BOTH a refused write and a no-op, and a
-	 * caller cannot tell them apart from the outside. The distinction matters on
-	 * the settings screen: re-saving a tab without changing anything is the
-	 * common case, and reporting it as a failure would be wrong, while a write
-	 * wpdb actually refused must not be reported as success.
-	 *
-	 * The boolean update() returns is deliberately unchanged - the addon-toggle
-	 * path treats false as a failure and the gate pins that - so this is exposed
-	 * alongside it rather than folded into it.
+	 * update() returns false for both a refused write and a no-op; callers that treat false as a failure rely on that.
 	 */
 	public static function last_update_was_noop(): bool {
 		return self::$last_update_was_noop;
@@ -900,7 +671,7 @@ final class Settings {
 	];
 
 	/**
-	 * Did any URL-affecting setting change between two settings snapshots?
+	 * Whether any URL-affecting setting changed between two snapshots.
 	 *
 	 * @param array<string, mixed> $before Previous settings.
 	 * @param array<string, mixed> $after New settings (merged).
@@ -942,9 +713,7 @@ final class Settings {
 				continue;
 			}
 
-			// Skip keys overridden by env var or PHP constant - don't store
-			// in database, otherwise the admin's edit appears to do nothing
-			// because the override wins on the next read.
+			// An overridden key is not stored: the override would win on the next read.
 			if ( $this->is_overridden( $key ) ) {
 				continue;
 			}
@@ -952,10 +721,7 @@ final class Settings {
 			// HTML-safe keys that use wp_kses_post instead of sanitize_text_field.
 			$is_html_key = false;
 
-			// Keys that store nested associative arrays (not flat string arrays).
-			// Without this dispatch the `is_array( DEFAULTS[$key] )` branch
-			// would flatten them via sanitize_text_field, corrupting the
-			// structure (each row becomes the string "Array").
+			// Nested maps: the flat-array branch would turn each row into the string "Array".
 			$is_nested_array = in_array( $key, [ 'wc_currencies', 'language_fallbacks' ], true );
 
 			$sanitized[ $key ] = match ( true ) {
@@ -973,14 +739,9 @@ final class Settings {
 	}
 
 	/**
-	 * Sanitize a flat settings array - string KEYS included, not just values.
+	 * Sanitize a flat settings array, keys included, and drop non-scalar values.
 	 *
-	 * Flat arrays here are either lists (numeric keys: excluded_paths,
-	 * detection_order, translatable post types/taxonomies) or slug-keyed maps
-	 * (language_domains, geo_country_map). List keys pass through; string
-	 * keys are slugs and get sanitize_key'd so a crafted POST can't smuggle
-	 * arbitrary bytes into stored option keys. Non-scalar values are dropped
-	 * (nested arrays belong to sanitize_nested_array()).
+	 * String keys are slugs: sanitize_key() stops a crafted POST storing arbitrary bytes as option keys.
 	 *
 	 * @param array<int|string, mixed> $value Raw array.
 	 * @return array<int|string, string> Sanitized array.
@@ -1008,9 +769,7 @@ final class Settings {
 	}
 
 	/**
-	 * Sanitize a nested settings array.
-	 *
-	 * Dispatches to the correct sanitizer for each known nested key.
+	 * Sanitize a nested settings array with the sanitizer for its key.
 	 *
 	 * @param string               $key Setting key.
 	 * @param array<string, mixed> $value Raw value array.
@@ -1029,13 +788,7 @@ final class Settings {
 	}
 
 	/**
-	 * Sanitize the per-language fallback-chain map.
-	 *
-	 * Expected input: `[ 'en-us' => [ 'en-gb', 'en-ca', 'de-de' ], ... ]`.
-	 *
-	 * Drops self-references, empty entries, duplicates (preserving order),
-	 * and clips each list to {@see self::MAX_FALLBACK_DEPTH} as a final
-	 * safety net against runaway storage.
+	 * Sanitize the fallback map: no self-references, empties or duplicates; chains clipped to MAX_FALLBACK_DEPTH.
 	 *
 	 * @param array<string, mixed> $raw Raw input.
 	 * @return array<string, array<int, string>>
@@ -1103,19 +856,7 @@ final class Settings {
 				continue;
 			}
 
-			// Validated, not byte-truncated. substr( …, 0, 3 ) on a four-byte
-			// character leaves three bytes of a half-finished UTF-8 sequence.
-			// What actually follows was re-checked against core in 1.0.3, because
-			// the comment here used to claim a data-destruction chain WordPress
-			// does not perform: the invalid value goes into the settings array,
-			// update_option() hands it to wpdb, and wpdb::process_fields() REFUSES
-			// the whole write - strip_invalid_text() changes the value,
-			// process_fields() sees it changed and returns false, and update()
-			// never issues the UPDATE. So the stored blob survives intact; what is
-			// lost is the operator's save, silently (see last_update_was_noop()).
-			// Bad enough to keep guarding against, and now described accurately.
-			// ISO 4217 codes are three ASCII letters by definition, so anything
-			// else is simply not a currency code.
+			// Validated, never byte-truncated: half a UTF-8 character makes wpdb refuse the whole settings write.
 			$raw_code = sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) );
 			$code     = preg_match( '/^[A-Za-z]{3}$/', $raw_code ) === 1 ? strtoupper( $raw_code ) : '';
 
@@ -1130,9 +871,7 @@ final class Settings {
 				'currency_code' => $code,
 				// Not a finite number above zero: refused (rate_to_store()).
 				'exchange_rate' => \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $stored[ $slug ] ?? null, $code ),
-				// Pin this currency's rate against auto-sync. Without persisting
-				// this flag the manual-rate override in MultiCurrency /
-				// ExchangeRateSync was dead - auto-sync always won.
+				// Pins this currency's rate against auto-sync.
 				'manual_rate'   => ! empty( $data['manual_rate'] ),
 				'display'       => in_array( $display, [ 'symbol', 'code' ], true ) ? $display : 'symbol',
 				'position'      => in_array( $position, [ 'default', 'left', 'left_space', 'right', 'right_space' ], true ) ? $position : 'default',
@@ -1178,13 +917,9 @@ final class Settings {
 		$mode = (string) $this->get( 'url_mode' );
 
 		/**
-		 * Override the URL mode in code (e.g. per environment via wp-config).
+		 * Override the URL mode in code; unknown values fall back to the stored setting.
 		 *
-		 * MUST return the same value for every call within a site - every
-		 * generated link, rewrite rule, and cached URL (hreflang alternates
-		 * live 12h) assumes one mode per site. Vary it per environment or
-		 * per blog, never per request. Unknown values fall back to the
-		 * stored setting.
+		 * Vary it per environment or blog, never per request: links, rewrite rules and cached URLs assume one mode.
 		 *
 		 * @hook perflocale/url_mode
 		 * @param string $mode One of 'subdirectory', 'subdomain', 'domain', 'query'.
@@ -1195,10 +930,7 @@ final class Settings {
 	}
 
 	/**
-	 * Get the per-language domain map.
-	 *
-	 * Returns an array of language_slug => domain (e.g., ['en' => 'example.com', 'fr' => 'example.fr']).
-	 * Used for subdomain and per-language domain URL modes.
+	 * Get the language slug to domain map used by the subdomain and domain URL modes.
 	 *
 	 * @return array<string, string>
 	 */
@@ -1232,10 +964,7 @@ final class Settings {
 	}
 
 	/**
-	 * Get the URL prefix for a language object.
-	 *
-	 * Returns the slug (e.g. "fr") or the locale in URL format (e.g. "fr-fr")
-	 * depending on the url_prefix_type setting.
+	 * Get a language's URL prefix: its slug or its locale in URL form (fr-fr), by url_prefix_type.
 	 *
 	 * @param object $language Language object with slug and locale properties.
 	 * @return string URL prefix.
@@ -1279,18 +1008,9 @@ final class Settings {
 	}
 
 	/**
-	 * Get the priority order for the redirect-on-first-visit handlers.
+	 * Get the priority order of the first-visit redirect handlers; a lower index wins.
 	 *
-	 * When both `redirect_browser_lang` and `redirect_geo_enabled` are on,
-	 * the position of each method in this array determines which `template_
-	 * redirect` priority their hooks register at. Lower index = earlier hook
-	 * = wins when both want to redirect.
-	 *
-	 * Wraps the persisted setting with the
-	 * `perflocale/redirect/priority_order` filter so integrators can override
-	 * the order per request without writing to the option.
-	 *
-	 * @return array<int, string> Ordered list of method keys ('geo', 'browser').
+	 * @return array<int, string> Ordered list of method keys ('geo', 'browser', 'edge_hint').
 	 */
 	public function get_redirect_priority_order(): array {
 		$order = (array) $this->get( 'redirect_priority_order' );
@@ -1305,9 +1025,7 @@ final class Settings {
 			}
 		}
 
-		// Backfill any known method missing from the saved order so the array
-		// is always exhaustive - downstream code can `array_search()` without
-		// a "method not in order" edge case.
+		// Always exhaustive, so callers can array_search() any known method.
 		foreach ( $known as $method ) {
 			if ( ! in_array( $method, $cleaned, true ) ) {
 				$cleaned[] = $method;
@@ -1315,11 +1033,7 @@ final class Settings {
 		}
 
 		/**
-		 * Filter the redirect priority order.
-		 *
-		 * Lets integrators override the persisted setting per request -
-		 * e.g. force `geo` first for staff cookie holders, or fall back to
-		 * `browser` while a third-party geo provider is rate-limited.
+		 * Filter the redirect priority order per request.
 		 *
 		 * @param array<int, string> $order Sanitised priority order.
 		 */
@@ -1339,14 +1053,7 @@ final class Settings {
 		/** @hook perflocale/translatable_post_types Filter the translatable post types. */
 		$result = (array) apply_filters( 'perflocale/translatable_post_types', (array) $this->get( 'translatable_post_types' ) );
 
-		// `attachment` is never translatable, whatever is stored or filtered in.
-		// PerfLocale translates media IN PLACE (per-language alt/caption/
-		// description meta on the same attachment, via MediaTranslationManager)
-		// and has no code that duplicates an attachment post. The settings
-		// screen no longer offers the checkbox, but a site that ticked it
-		// before would otherwise stay stuck with every front-end attachment
-		// query language-scoped and no way to turn it off. Dropping it here
-		// makes any stored value inert instead.
+		// Never `attachment`, even if stored or filtered in: media is translated in place.
 		$result = array_values(
 			array_filter(
 				$result,
@@ -1362,39 +1069,9 @@ final class Settings {
 	}
 
 	/**
-	 * Post types the "translate the entire site" surfaces may offer and accept.
+	 * Registered translatable post types the "translate the entire site" surfaces offer and accept.
 	 *
-	 * ⭐ WHY THIS EXISTS - four places used to compute this list independently as
-	 * `get_post_types( [ 'public' => true, 'show_ui' => true ] )` and never
-	 * consulted the translatable list at all:
-	 *   Admin\Pages\TranslationsPage::render_site_translate_panel()
-	 *   Admin\AdminController::process_site_translate()
-	 *   Api\TranslationsController - the estimate branch AND the dispatch branch
-	 *
-	 * That whitelist is wrong in BOTH directions, and both were user-visible:
-	 *
-	 *   - It EXCLUDES everything an addon registers with `show_ui => false`.
-	 *     `wpcf7_contact_form`, `wpforms` and `product_variation` are exactly
-	 *     that, as are the plugin's own `wp_block` and `wp_navigation`. They are
-	 *     listed on the Translations page and then silently discarded by the
-	 *     `array_intersect` on the site-translate path - tick only those and the
-	 *     run redirects to a bare "nothing to do".
-	 *   - It INCLUDES public types the operator never marked translatable
-	 *     (`movie`, `elementor_library`, `oxy_user_library`), offering work the
-	 *     plugin will not do.
-	 *
-	 * The correct set is "what this site is configured to translate", narrowed
-	 * to types that are actually registered right now.
-	 *
-	 * ⚠️ `post_type_exists()` matters: a type can persist in the saved setting
-	 * after the plugin that registered it is deactivated. Passing an
-	 * unregistered name to the job produces a keyset page that matches nothing,
-	 * which reads as a silent no-op - see
-	 * {@see self::get_unregistered_translatable_post_types()} for reporting it.
-	 *
-	 * `attachment` stays excluded: attachments are `post_status = inherit`, so
-	 * the job's publish-only keyset page would select none of them however the
-	 * operator has configured the type.
+	 * Not the public + show_ui list: see docs-ai/11-code-rationale.md, "Settings: site translate post types".
 	 *
 	 * @return array<int, string>
 	 */
@@ -1415,12 +1092,7 @@ final class Settings {
 	}
 
 	/**
-	 * Translatable post types that are NOT currently registered.
-	 *
-	 * The difference between the saved setting and what a request can actually
-	 * act on - i.e. the types {@see self::get_site_translate_post_types()}
-	 * dropped. Surfaced so a dropped selection can say WHY instead of looking
-	 * like a run that found nothing.
+	 * Translatable post types that are not registered, so a dropped selection can say why.
 	 *
 	 * @return array<int, string>
 	 */
@@ -1444,10 +1116,7 @@ final class Settings {
 	 * @return array<int, string>
 	 */
 	public function get_translatable_taxonomies(): array {
-		// Cache per-request, but only after all plugins have loaded (so addon
-		// filters like WooCommerce's pa_* taxonomies are registered). Before
-		// plugins_loaded completes, return without caching to avoid locking
-		// in an incomplete list.
+		// Memoised only after plugins_loaded: earlier, add-on filters are not registered yet.
 		if ( $this->translatable_taxonomies_cache !== null ) {
 			return $this->translatable_taxonomies_cache;
 		}
@@ -1464,22 +1133,13 @@ final class Settings {
 	}
 
 	/**
-	 * Get meta keys that should sync across translations.
-	 *
-	 * Combines the stored `translatable_meta_keys` setting with whatever
-	 * addons contribute through the `perflocale/translatable_meta_keys`
-	 * filter. Used by ContentSync to auto-sync builder/plugin meta keys
-	 * without requiring the user to add each one manually in settings.
+	 * Get meta keys that sync across translations: the setting plus add-on filter entries.
 	 *
 	 * @param string $post_type Post type context for the filter (empty for any).
 	 * @return array<int, string>
 	 */
 	public function get_translatable_meta_keys( string $post_type = '' ): array {
-		// Per-post-type cache. Populated only after plugins_loaded so addon
-		// filters have had a chance to register - mirrors the same pattern
-		// used by get_translatable_post_types()/_taxonomies(). Stored on the
-		// instance (not a function-static) so reset_cache() can clear it on
-		// switch_blog / settings save.
+		// Memoised only after plugins_loaded, as for post types.
 		$key = $post_type === '' ? '__any__' : $post_type;
 
 		if ( isset( $this->translatable_meta_keys_cache[ $key ] ) ) {
@@ -1544,11 +1204,7 @@ final class Settings {
 	}
 
 	/**
-	 * Whether the Strings page bulk-MT toolbar is enabled. Independent of
-	 * mt_enabled (which is the master switch) - defaults ON so existing
-	 * installs that enable MT also get the bulk toolbar without an extra
-	 * settings dance, but admins worried about provider costs can flip
-	 * this OFF to keep per-row MT only.
+	 * Whether the Strings page bulk-MT toolbar is enabled (mt_enabled is the master switch).
 	 *
 	 * @return bool
 	 */
@@ -1575,30 +1231,17 @@ final class Settings {
 	}
 
 	/**
-	 * Max fallback-list length. Admin UI only exposes 4 slots; this cap is
-	 * a safety net for values written directly to the option via API.
+	 * Max fallback-list length; a cap for values written past the 4-slot admin UI.
 	 */
 	public const MAX_FALLBACK_DEPTH = 10;
 
 	/**
-	 * Sentinel stored as the single element of mt_auto_translate_languages
-	 * when the admin unchecks EVERY target language. The empty array already
-	 * means "all active languages" (so languages added later are included
-	 * automatically), which left "none" unrepresentable - saving all-unchecked
-	 * used to silently re-enable every language. Consumers need no special
-	 * handling: no real language uses this slug, so a scope containing only
-	 * this token simply matches nothing.
+	 * Sole element of mt_auto_translate_languages when no target is ticked; the empty array means "all".
 	 */
 	public const MT_SCOPE_NONE = '__none';
 
 	/**
-	 * Get per-language fallback chains as an ordered list of slugs.
-	 *
-	 * Storage shape: `[ 'en-us' => [ 'en-gb', 'en-ca', 'de-de' ], ... ]`.
-	 *
-	 * Guardrails applied on every read: slug-sanitise every entry, drop
-	 * self-references, drop empties, dedupe preserving order, clip to
-	 * {@see self::MAX_FALLBACK_DEPTH} to prevent runaway-length lists.
+	 * Get per-language fallback chains (`[ 'en-us' => [ 'en-gb', 'de-de' ] ]`), normalised on every read.
 	 *
 	 * @return array<string, array<int, string>>
 	 */
@@ -1608,23 +1251,9 @@ final class Settings {
 		$raw = (array) $this->get( 'language_fallbacks' );
 
 		/**
-		 * Filter the whole per-language fallback map before it is normalised.
+		 * Filter the whole fallback map before it is normalised, so a filter cannot add a cycle or an unbounded chain.
 		 *
-		 * Shape: `[ 'en-us' => [ 'en-gb', 'de-de' ], ... ]`. Region-qualified
-		 * slugs are ordinary keys here, so a variation (`en-gb`) gets its own
-		 * chain exactly like a base language does.
-		 *
-		 * ⚠️ `$context` says WHO is asking, because the right answer differs:
-		 * a missing STRING can reasonably borrow from a sibling locale, while a
-		 * missing POST usually should not silently resolve to another language's
-		 * content. Returning a different map per context is supported and the
-		 * per-context result is cached separately.
-		 *
-		 * ⚠️ Whatever this returns is still normalised afterwards - slugs are
-		 * sanitised, self-references and duplicates dropped, and each chain
-		 * clipped to MAX_FALLBACK_DEPTH. A filter therefore cannot introduce a
-		 * cycle or an unbounded chain, which is why the filter runs BEFORE the
-		 * guardrails rather than after them.
+		 * `$context` names the consumer: a string may borrow from a sibling locale where a post should not.
 		 *
 		 * @hook perflocale/language/fallbacks
 		 *
@@ -1635,11 +1264,7 @@ final class Settings {
 		 */
 		$raw = (array) apply_filters( 'perflocale/language/fallbacks', $raw, $context );
 
-		// ⚠️ The cache key carries the CONTEXT as well as the data. Keyed on the
-		// raw option alone - as it was - the first caller's answer would have
-		// been served to every later caller, so a context-aware filter would
-		// have appeared to work and then silently leaked one consumer's chain
-		// into another's for the rest of the request.
+		// Keyed by context too: a context-aware filter must not leak one consumer's chain to another.
 		$key = $context . '|' . md5( (string) wp_json_encode( $raw ) );
 
 		if ( isset( $cache[ $key ] ) ) {
@@ -1690,13 +1315,7 @@ final class Settings {
 	}
 
 	/**
-	 * The fallback chain for ONE language, already normalised.
-	 *
-	 * The per-language filter most callers actually want: it hands you the
-	 * language being resolved instead of making you index a map, and it fires
-	 * AFTER the guardrails, so a chain returned here is re-normalised before it
-	 * is used - a filter cannot reintroduce a self-reference or an over-long
-	 * chain through this door either.
+	 * The normalised fallback chain for one language; the filter's result is normalised again.
 	 *
 	 * @param string $slug    Language slug whose chain is wanted (a variation
 	 *                        such as `en-gb` is just another slug).
@@ -1755,11 +1374,7 @@ final class Settings {
 	}
 
 	/**
-	 * Whether edge-worker integration is enabled.
-	 *
-	 * Controls the `/wp-json/perflocale/v1/config` public endpoint AND
-	 * whether the `edge_hint` detection method (header/cookie hint from
-	 * a Cloudflare Worker / Vercel Edge / Netlify edge) is honoured.
+	 * Whether edge-worker integration (the public config endpoint and the edge_hint method) is enabled.
 	 *
 	 * @return bool
 	 */

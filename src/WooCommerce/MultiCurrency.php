@@ -16,11 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Provides per-language currency settings for WooCommerce.
- *
- * Stores currency code and exchange rate for each language in wp_options
- * and hooks into WooCommerce filters to display prices in the correct
- * currency based on the active language.
+ * Per-language currency and exchange rate for WooCommerce prices, from the wc_currencies setting.
  */
 final class MultiCurrency {
 
@@ -34,7 +30,6 @@ final class MultiCurrency {
 	/**
 	 * Cached exchange rate for the current language.
 	 *
-	 * Avoids repeated Settings + Router lookups on every convert_price() call.
 	 * Dropped when a rendering window changes the language (forget_rate()).
 	 *
 	 * @var float|null
@@ -59,31 +54,19 @@ final class MultiCurrency {
 		add_filter( 'woocommerce_product_variation_get_regular_price', [ $this, 'convert_price' ], 10, 2 );
 		add_filter( 'woocommerce_product_variation_get_sale_price', [ $this, 'convert_price' ], 10, 2 );
 
-		// Variable product price cache: WC caches variation prices in a
-		// transient keyed by a hash. Without including the language, all
-		// languages share the same cached prices and only the first
-		// language to build the cache gets correct conversion.
+		// WC caches variation prices in a transient keyed by this hash: without the language all languages share one.
 		add_filter( 'woocommerce_get_variation_prices_hash', [ $this, 'add_language_to_prices_hash' ], 10, 3 );
 		add_filter( 'woocommerce_variation_prices_price', [ $this, 'convert_variation_prices' ], 10, 3 );
 		add_filter( 'woocommerce_variation_prices_regular_price', [ $this, 'convert_variation_prices' ], 10, 3 );
 		add_filter( 'woocommerce_variation_prices_sale_price', [ $this, 'convert_variation_prices' ], 10, 3 );
 
-		// Shipping costs and fixed-amount coupons are stored in the base currency
-		// and otherwise bypass convert_price(), so the customer would be charged
-		// base-currency NUMBERS relabelled into the per-language currency. Convert
-		// them so the whole order is consistent. (Cart fees added programmatically
-		// by other plugins stay in the base currency - there is no
-		// accumulation-safe filter to scale them; this is the documented limit.)
+		// Shipping and fixed coupon amounts are stored in the base currency and bypass convert_price().
+		// Cart fees added by other plugins stay in the base currency: no accumulation-safe filter scales them.
 		add_filter( 'woocommerce_package_rates', [ $this, 'convert_shipping_rates' ], 100 );
 		add_filter( 'woocommerce_cart_shipping_packages', [ $this, 'add_currency_to_shipping_packages' ] );
 		add_filter( 'woocommerce_coupon_get_amount', [ $this, 'convert_coupon_amount' ], 10, 2 );
 
-		// Minimum/maximum spend thresholds are validated by WC_Discounts in the
-		// BASE currency (get_minimum_amount()/get_maximum_amount()), so without
-		// converting them a "min spend 50 EUR" coupon compares 50 against a cart
-		// total already displayed/charged in the switched currency - rejecting
-		// (or wrongly accepting) valid coupons. Unlike the discount amount these
-		// apply to percentage coupons too, so there is no discount-type gate.
+		// WC_Discounts compares spend limits, stored in the base currency, with the converted cart total.
 		add_filter( 'woocommerce_coupon_get_minimum_amount', [ $this, 'convert_coupon_threshold' ], 10, 2 );
 		add_filter( 'woocommerce_coupon_get_maximum_amount', [ $this, 'convert_coupon_threshold' ], 10, 2 );
 
@@ -91,32 +74,20 @@ final class MultiCurrency {
 		add_filter( 'woocommerce_currency_symbol', [ $this, 'filter_currency_symbol' ], 10, 2 );
 		add_filter( 'woocommerce_price_format', [ $this, 'filter_price_format' ] );
 
-		// Per-currency decimal places. wc_get_price_decimals() applies this
-		// filter, so it governs BOTH the rounding in convert_price() and the
-		// displayed/line-total decimals. Without it a zero-decimal currency
-		// (JPY/KRW/…) renders fractional prices like "¥2608.70".
+		// Per-currency decimals: also sets the rounding in convert_price(), not only the display.
 		add_filter( 'wc_get_price_decimals', [ $this, 'filter_price_decimals' ] );
 
-		// Multisite isolation: $currencies + $cached_rate are populated from
-		// the per-blog `perflocale_settings` option, so on switch_to_blog()
-		// the DI singleton would otherwise keep blog A's exchange rates +
-		// base currency and serve them for blog B's product prices. Mirrors
-		// the Settings::reset_cache() / AddonSettings::reset_static_caches
-		// hooks wired in Bootstrap's multisite switch_blog block.
+		// The cached rows and rate come from the per-blog settings option.
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ $this, 'reset_caches' ] );
 		}
 
-		// The rate memo belongs to the current language. A rendering window
-		// that imposes another language (an order email, with_language())
-		// fires this action when it opens and again when it closes.
+		// The rate memo is per language; a rendering window (order email, with_language()) fires this on open and close.
 		add_action( 'perflocale/language/overridden', [ $this, 'forget_rate' ], 10, 0 );
 	}
 
 	/**
-	 * Drop per-request cached state. Hooked to `switch_blog` on multisite
-	 * so blog A's currency configuration + exchange rate can't leak into
-	 * blog B's product rendering.
+	 * Drop per-request cached state, so one blog's currencies never price another blog's products.
 	 *
 	 * @return void
 	 */
@@ -126,10 +97,9 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * Drop the exchange-rate memo. Hooked to `perflocale/language/overridden`
-	 * so a price read inside a language window uses that language's rate,
-	 * and a read after the window the request language's rate again. The
-	 * currency settings stay loaded: they hold every language.
+	 * Drop the exchange-rate memo when a language window opens or closes.
+	 *
+	 * The currency rows stay loaded: they hold every language.
 	 *
 	 * @return void
 	 */
@@ -146,9 +116,7 @@ final class MultiCurrency {
 	public function filter_currency( mixed $currency ): string {
 		$currency = is_string( $currency ) ? $currency : '';
 
-		// Admin should always show the store's base currency (e.g. EUR),
-		// not the per-language currency. Product prices are entered in the
-		// base currency; showing лв. next to a EUR price field is confusing.
+		// Admin shows the base currency: product prices are entered in it.
 		if ( is_admin() && ! wp_doing_ajax() ) {
 			return $currency;
 		}
@@ -219,10 +187,7 @@ final class MultiCurrency {
 	/**
 	 * Override the decimal places for the current language's currency.
 	 *
-	 * Zero-decimal ISO-4217 currencies (JPY, KRW, …) must render + round as
-	 * integers; the store default of 2 produces nonsense like "¥2608.70" and a
-	 * fractional charged amount. Because wc_get_price_decimals() applies this
-	 * filter, returning 0 here also makes convert_price()'s round() integer-snap.
+	 * Zero-decimal currencies (JPY, KRW) get 0, which also makes convert_price() round to integers.
 	 *
 	 * @param mixed $decimals Store default decimal places.
 	 * @return int
@@ -250,8 +215,7 @@ final class MultiCurrency {
 	 * @return bool
 	 */
 	private static function is_zero_decimal_currency( string $code ): bool {
-		// ISO-4217 currencies with 0 minor units - same set WooCommerce treats
-		// as zero-decimal in get_currencies()/format.
+		// ISO 4217 currencies with no minor unit, as WooCommerce treats them.
 		static $zero = [
 			'BIF',
 			'CLP',
@@ -277,12 +241,8 @@ final class MultiCurrency {
 	/**
 	 * An amount converted at a rate and rounded to the active price decimals.
 	 *
-	 * An amount above zero converts to at least the smallest unit at those
-	 * decimals. Without that floor a store whose price decimals are 0 (JPY,
-	 * KRW, ...) prices a language at a rate below 1 in whole units, so a
-	 * small price or shipping cost becomes 0 and the item free at any
-	 * quantity. Zero and negative amounts, and every amount that does not
-	 * round to zero, convert as rounded.
+	 * An amount above zero converts to at least the smallest unit: at 0 decimals and a rate
+	 * below 1, a small price or shipping cost would otherwise round to 0 and be free.
 	 *
 	 * @param float $amount Amount in the store's base currency.
 	 * @param float $rate   Exchange rate.
@@ -302,8 +262,7 @@ final class MultiCurrency {
 	/**
 	 * Convert a product price using the exchange rate for the current language.
 	 *
-	 * WooCommerce may pass null for unset sale prices (get_prop returns null
-	 * when a property has no value), so the parameter accepts mixed.
+	 * WooCommerce passes null for an unset sale price.
 	 *
 	 * @param mixed       $price Raw price string (or null).
 	 * @param \WC_Product $product WooCommerce product.
@@ -326,11 +285,8 @@ final class MultiCurrency {
 	/**
 	 * Convert flat-rate shipping costs (and their tax) to the active currency.
 	 *
-	 * WC computes package rates fresh from the shipping-zone settings (base
-	 * currency) and caches the RESULT per package, so multiplying here applies
-	 * exactly once per (currency, package) - no accumulation. The currency is
-	 * folded into the package hash by add_currency_to_shipping_packages() so a
-	 * language switch can't reuse the prior currency's cached rates.
+	 * WC caches the computed rates per package, so this converts once per currency and package (no
+	 * accumulation); add_currency_to_shipping_packages() keys that cache by language.
 	 *
 	 * @param array<string, \WC_Shipping_Rate> $rates Calculated package rates.
 	 * @return array<string, \WC_Shipping_Rate>
@@ -368,8 +324,7 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * Make WC's per-session shipping-rate cache currency-aware so a visitor who
-	 * switches language doesn't keep seeing the prior currency's cached rates.
+	 * Key WC's per-session shipping-rate cache by language, so a switch never reuses another currency's rates.
 	 *
 	 * @param array<int, array<string, mixed>> $packages Shipping packages.
 	 * @return array<int, array<string, mixed>>
@@ -393,14 +348,8 @@ final class MultiCurrency {
 	/**
 	 * Convert fixed-amount coupon discounts to the active currency.
 	 *
-	 * Only fixed_cart / fixed_product coupons carry a base-currency monetary
-	 * amount; percentage coupons are proportional to the already-converted line
-	 * totals and must NOT be scaled. The filter receives the coupon's stored
-	 * (base) amount each call and returns base*rate, so there is no accumulation.
-	 *
-	 * A discount takes no floor (convert_amount()): one that rounds to zero
-	 * gives no discount, while a floored one would take the smallest unit off
-	 * a price that convert_amount() floored to that unit and make it free.
+	 * Percentage coupons follow the converted line totals and are not scaled. The filter gets the stored
+	 * amount on each call, so nothing accumulates. No floor: it would make a price floored to one unit free.
 	 *
 	 * @param mixed      $amount Coupon amount.
 	 * @param \WC_Coupon $coupon Coupon.
@@ -425,10 +374,9 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * Convert a coupon minimum/maximum spend threshold into the active
-	 * currency. Mirrors convert_coupon_amount() but with NO discount-type gate
-	 * (spend thresholds apply to every coupon type). An empty threshold ('')
-	 * means "no limit" and is passed through untouched.
+	 * Convert a coupon minimum/maximum spend threshold into the active currency.
+	 *
+	 * Every coupon type, unlike convert_coupon_amount(); '' means no limit and passes through.
 	 *
 	 * @param string|int|float $amount Threshold in base currency.
 	 * @param \WC_Coupon       $coupon Coupon.
@@ -455,9 +403,7 @@ final class MultiCurrency {
 	/**
 	 * Add language slug and exchange rate to the variation prices hash.
 	 *
-	 * WooCommerce caches variable product prices in a transient keyed by
-	 * this hash. Without including the language, all languages share the
-	 * same cache entry and only the first to build it gets correct prices.
+	 * WC keys its variation prices transient by this hash, so without them all languages share one entry.
 	 *
 	 * @param array<int, string> $hash Hash components.
 	 * @param \WC_Product        $product Variable product.
@@ -475,9 +421,6 @@ final class MultiCurrency {
 
 	/**
 	 * Convert a single variation price in the variation price cache builder.
-	 *
-	 * WC's read_price_data() applies this filter per-variation with the raw
-	 * price string, the variation product, and the parent variable product.
 	 *
 	 * @param mixed       $price Raw price string.
 	 * @param \WC_Product $variation Variation product.
@@ -519,10 +462,7 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * Get the exchange rate for the current language.
-	 *
-	 * Returns 1.0 when the current language uses the default currency
-	 * or no currency setting is configured.
+	 * The exchange rate for the current language: 1.0 when it has no currency row.
 	 *
 	 * @return float Exchange rate multiplier.
 	 */
@@ -556,12 +496,36 @@ final class MultiCurrency {
 	}
 
 	/**
+	 * A language's synced rate, only for the store base and its currency now.
+	 * The rate comes from the last-sync record with its pair (one read; a rename moves only the rates option).
+	 *
+	 * @param mixed  $rates The synced rates (ExchangeRateSync::RATES_OPTION, slug => rate).
+	 * @param mixed  $last  The last-sync record (ExchangeRateSync::LAST_SYNC_OPTION: base, codes, slug_rates).
+	 * @param string $slug  Language slug.
+	 * @param string $code  The language's currency now.
+	 * @param string $base  The store base currency now.
+	 * @return float|null Null when there is none or it is for another pair.
+	 */
+	public static function synced_rate( mixed $rates, mixed $last, string $slug, string $code, string $base ): ?float {
+		if ( ! is_array( $rates ) || ! isset( $rates[ $slug ] ) || ! is_array( $last ) || ( $last['base'] ?? null ) !== $base || ! is_array( $last['codes'] ?? null ) ) {
+			return null;
+		}
+
+		// A record without slug_rates binds no number to its pair: the configured rate wins until a sync.
+		if ( ! is_array( $last['slug_rates'] ?? null ) ) {
+			return null;
+		}
+
+		$synced = array_intersect_key( $last['slug_rates'], array_flip( array_keys( $last['codes'], $code, true ) ) );
+
+		return self::usable_rate( reset( $synced ) );
+	}
+
+	/**
 	 * The exchange rate a settings writer stores for one language row.
 	 *
-	 * A submitted rate that is not a finite number above zero is refused: the
-	 * row keeps its stored rate while it stays in the same currency, and
-	 * otherwise gets 1.0, the rate of a row submitted without one. A usable
-	 * rate is stored with the 0.0001 floor.
+	 * An unusable submitted rate keeps the stored rate while the currency stays the same, else 1.0.
+	 * A usable rate is stored with the 0.0001 floor.
 	 *
 	 * @param mixed  $raw    Submitted rate.
 	 * @param mixed  $stored The language's stored currency row, if any.
@@ -579,11 +543,7 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * Load currency settings.
-	 *
-	 * Reads from `perflocale_settings.wc_currencies` (the canonical
-	 * storage). Returns an empty array when the settings service is
-	 * unavailable - callers downstream gate on emptiness.
+	 * Load the currency rows from `perflocale_settings.wc_currencies`; empty without the settings service.
 	 *
 	 * @return array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool, display: string, position: string}>
 	 */
@@ -602,16 +562,12 @@ final class MultiCurrency {
 				$stored = $from_settings;
 			}
 		} catch ( \Throwable $e ) {
-			// Settings service not available during early bootstrap -
-			// return empty so callers fall through to defaults.
+			// No settings service in early bootstrap: no rows.
 			unset( $e );
 		}
 
-		// Load machine-fetched rates from the dedicated option (written by
-		// ExchangeRateSync, kept separate to avoid races with settings
-		// writes). Only consult them when global auto-sync is on; when it
-		// is off the manual rate in wc_currencies is the source of truth
-		// and any leftover RATES_OPTION entries are stale.
+		// Synced rates (their own option, apart from settings writes) apply only while auto-sync is on;
+		// otherwise the rate in wc_currencies wins and leftover synced rates are stale.
 		$auto_sync_on = false;
 
 		try {
@@ -620,16 +576,15 @@ final class MultiCurrency {
 			unset( $e );
 		}
 
-		$auto_rates = $auto_sync_on ? get_option( ExchangeRateSync::RATES_OPTION, [] ) : [];
-
-		if ( ! is_array( $auto_rates ) ) {
-			$auto_rates = [];
+		if ( $auto_sync_on ) {
+			// Both options are not autoloaded: one query for the pair.
+			wp_prime_option_caches( [ ExchangeRateSync::RATES_OPTION, ExchangeRateSync::LAST_SYNC_OPTION ] );
 		}
 
-		// Read the base straight from the option, never through
-		// get_woocommerce_currency(): that filter chain includes this class's
-		// own filter_currency(), which returns the per-LANGUAGE code and would
-		// make the comparison below always false.
+		$auto_rates = $auto_sync_on ? get_option( ExchangeRateSync::RATES_OPTION, [] ) : [];
+		$last_sync  = $auto_sync_on ? get_option( ExchangeRateSync::LAST_SYNC_OPTION, [] ) : [];
+
+		// Not get_woocommerce_currency(): its filter_currency() returns the language's code, not the base.
 		$base_currency = (string) get_option( 'woocommerce_currency', '' );
 
 		$this->currencies = [];
@@ -643,21 +598,14 @@ final class MultiCurrency {
 			$manual_rate = (bool) ( $data['manual_rate'] ?? false );
 			$code        = sanitize_text_field( (string) $data['currency_code'] );
 
-			// A rate that is not a finite number above zero cannot price
-			// anything: a stored one counts as no rate (1.0), a synced one as
-			// no synced rate.
+			// An unusable stored rate counts as 1.0, an unusable synced one as no synced rate.
 			$rate = self::usable_rate( $data['exchange_rate'] ?? 1.0 ) ?? 1.0;
 
-			if ( $auto_sync_on && ! $manual_rate && isset( $auto_rates[ $slug_key ] ) ) {
-				$rate = self::usable_rate( $auto_rates[ $slug_key ] ) ?? $rate;
+			if ( $auto_sync_on && ! $manual_rate ) {
+				$rate = self::synced_rate( $auto_rates, $last_sync, $slug_key, $code, $base_currency ) ?? $rate;
 			}
 
-			// A language priced in the store's BASE currency is by definition
-			// 1:1. Sync skips those codes, so any rate sitting here is stale -
-			// left over from before the language was switched to the base, or
-			// baked into wc_currencies by a settings save - and would silently
-			// mark every price up or down. Applied after the auto-rate merge so
-			// it overrides both sources.
+			// The base currency is 1:1 and sync skips it, so a rate here is stale; after the merge, it overrides both sources.
 			if ( $base_currency !== '' && $code === $base_currency ) {
 				$rate = 1.0;
 			}

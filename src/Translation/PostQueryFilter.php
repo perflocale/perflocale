@@ -20,10 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Filters WP_Query to return only posts in the current language.
- *
- * Joins the translation_links table to WP_Query via the posts_clauses
- * filter to add a language condition without requiring a separate query.
+ * Filters WP_Query to return only posts in the current language, via posts_clauses.
  */
 final class PostQueryFilter {
 
@@ -38,71 +35,9 @@ final class PostQueryFilter {
 	private readonly Settings $settings;
 
 	/**
-	 * Post types that must NEVER be language-scoped by a query filter, even
-	 * when the operator has marked them translatable.
-	 *
-	 * ⭐ WHY. Block templates are INFRASTRUCTURE resolved by SLUG, not content
-	 * browsed by language. Core looks a template up by `post_name` + a
-	 * `wp_theme` term and expects exactly one answer; it has no notion of a
-	 * language variant. Language-scoping that lookup does not filter it, it
-	 * BREAKS it.
-	 *
-	 * ⚠️ The failure is worse than "the translation is not used". Measured on a
-	 * real request: with `wp_template_part` marked translatable, a customised
-	 * header VANISHED on every non-default language and core silently fell back
-	 * to the theme FILE - and it did so with NO TRANSLATION INVOLVED AT ALL.
-	 * The non-strict WHERE below admits a post when its link row matches the
-	 * current language OR when it has no link row; a customised part tagged in
-	 * the default language by `Bootstrap::auto_assign_default_language()`
-	 * satisfies neither on `/de/`. So it is dropped for being LINKED, not for
-	 * being TRANSLATED. This cost a complete, working implementation of
-	 * template translation, which was built, proved, and then backed out.
-	 *
-	 * ⭐ `wp_navigation` is here for the same reason, and its failure is the
-	 * worst of the set because core REACTS to the empty result by WRITING.
-	 * A `<!-- wp:navigation /-->` block with no `ref` - the stock header in
-	 * TT3/TT4 - falls through to
-	 * `WP_Navigation_Fallback::get_most_recently_published_navigation()`,
-	 * which is a plain `new WP_Query( [ 'post_type' => 'wp_navigation',
-	 * 'post_status' => 'publish' ] )` (wp-includes/class-wp-navigation-fallback.php
-	 * :110-123). Once the menu carries a default-language link row that query
-	 * returns ZERO on every other language - measured on a real site: menu #7
-	 * came back on `/`, and `[]` on both `/de/` and `/pl/`.
-	 *
-	 * `get_fallback()` (:70-100) then calls `create_classic_menu_fallback()` or
-	 * `create_default_fallback()`, both of which `wp_insert_post()` a PUBLISHED
-	 * `wp_navigation` - with no capability check and no `is_admin()` guard, on
-	 * an anonymous front-end GET. So the scoped lookup does not merely lose the
-	 * menu: it makes every uncached non-default-language pageview mint a junk
-	 * menu row, and because that new row is unlinked it is visible in EVERY
-	 * language and wins `ORDER BY date DESC` - displacing the real menu on the
-	 * default language too.
-	 *
-	 * Nothing is lost by exempting it: the `ref` path is `get_post( $ref )` and
-	 * was never scoped, and `BlockRefTranslator` (`core/navigation` =>
-	 * `wp_navigation`) already swaps that ref to the translation at render
-	 * time. Scoping the type added no translation and only broke the fallback.
-	 *
-	 * Memoised: `filter_by_language()` runs on essentially every WP_Query in
-	 * the request, so this must not re-run `apply_filters` each time.
-	 *
-	 * ⚠️ KEYED BY BLOG, and an earlier version of this docblock argued the
-	 * opposite - that "one instance per request inside the DI container" made
-	 * an instance memo blog-safe. That is backwards: surviving the whole
-	 * request is exactly WHY the instance is not blog-safe, because it also
-	 * survives switch_to_blog(). An instance memo is only blog-safe when the
-	 * memoised value is blog-independent, and this one is not: it is whatever
-	 * `perflocale/query/never_scoped_post_types` returns, and on multisite the
-	 * filter's callbacks differ per site for the most ordinary reason there is
-	 * - an addon active on one subsite and not another. CF7 active on blog 1
-	 * alone put `wpcf7_contact_form` in the list for blog 2 as well.
-	 *
-	 * Measured on the frozen candidate: a site-dependent filter exempting a
-	 * type on blog 1 only still exempted it on blog 2, which returned the
-	 * English source on a German request until the memo was reset.
-	 *
-	 * The default list IS blog-independent, so the leak needs a site-dependent
-	 * filter to show - but that filter is public API this release introduced.
+	 * Memo of post types never language-scoped, even when translatable, keyed by blog.
+	 * Core resolves templates and the navigation fallback by slug/newest; scoping breaks them (navigation then inserts junk menus).
+	 * Keyed by blog: the filter's callbacks differ per subsite. See docs-ai/11-code-rationale.md, "PostQueryFilter: never-scoped post types".
 	 *
 	 * @var array<int, array<int, string>>
 	 */
@@ -112,9 +47,7 @@ final class PostQueryFilter {
 	 * @return array<int, string>
 	 */
 	private function never_scoped_post_types(): array {
-		// One global read plus an absint on the hottest query path in the
-		// plugin. Cheaper than the apply_filters() it avoids by orders of
-		// magnitude, and on single site it is always the same key.
+		// Hottest query path: memoised so apply_filters() runs once per blog.
 		$blog_id = get_current_blog_id();
 
 		if ( isset( $this->never_scoped_memo[ $blog_id ] ) ) {
@@ -147,22 +80,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Mark the navigation-fallback query core runs next.
-	 *
-	 * ⭐ WHY. A `core/navigation` block with no `ref` (the stock TT4/TT5 header)
-	 * renders `WP_Navigation_Fallback::get_fallback()`: the newest published
-	 * `wp_navigation` post, whatever its language, because the type is never
-	 * language-scoped ({@see self::never_scoped_post_types()}). With
-	 * `wp_navigation` translatable, a menu's translation is created after the
-	 * menu, so once it is published it is the newest: core's pick is then the
-	 * translated menu on every language, the default one included, and the
-	 * Site Editor saves its id as the `ref` of the source header.
-	 *
-	 * Core applies this filter in get_fallback() immediately before that query,
-	 * and nowhere else, so it marks the query without changing core's decision.
-	 * The the_posts callback is attached only here and removes itself on the
-	 * next `wp_navigation` query: a request that renders no ref-less navigation
-	 * block never runs it, and neither does a site where `wp_navigation` is not
-	 * translatable.
+	 * Core applies this filter only just before that query; without it the newest menu (a translation) wins everywhere.
 	 *
 	 * @param mixed $create Whether core may create a fallback menu.
 	 * @return mixed Unchanged.
@@ -176,22 +94,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Keep core's navigation fallback on a default-language menu, and show that
-	 * menu's translation on a translated front-end page.
-	 *
-	 * 1. When core's pick is linked in a language other than the default, the
-	 *    newest published menu in the default language or in none is used
-	 *    instead. With no such menu core's pick stays: the result is never
-	 *    emptied, because an empty result makes core insert a new menu. When
-	 *    the newest menu is already a default-language (or unlinked) one, its
-	 *    language comes from the links UrlConverter's the_posts priming
-	 *    (priority 5) loaded for it, and this step runs no query.
-	 * 2. Outside admin and REST, the menu is mapped through
-	 *    BlockRefTranslator::translated_ref(), the resolution a navigation block
-	 *    with a `ref` gets: a published, non-empty translation in the current
-	 *    language, else the menu itself. It answers 0 without a lookup on the
-	 *    default language. The Site Editor (REST) therefore sees and saves the
-	 *    default-language menu.
+	 * Keep core's navigation fallback on a default-language menu, translated on the front end.
+	 * Never empties the result: an empty result makes core insert a new menu. REST keeps the default menu for the Site Editor.
 	 *
 	 * @param mixed     $posts Posts core found.
 	 * @param \WP_Query $query The query.
@@ -254,9 +158,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * The newest published wp_navigation post linked in the default language or
-	 * not linked at all (the language test of language_where_sql()), in one
-	 * query that also fills the post cache.
+	 * The newest published wp_navigation post in the default language or unlinked.
 	 *
 	 * @param int $default_id Default language ID.
 	 * @return \WP_Post|null
@@ -294,34 +196,22 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Whether a fallback post was loaded by resolve_duplicate_slug().
-	 *
-	 * Set when the current language has no translation and the default-language
-	 * post was loaded instead. Used to suppress WordPress canonical redirect.
+	 * Whether resolve_duplicate_slug() loaded a default-language fallback post.
+	 * Suppresses the canonical redirect.
 	 *
 	 * @var bool
 	 */
 	private bool $loaded_fallback = false;
 
 	/**
-	 * Target language slug for the in-flight REST search request, or '' when
-	 * the request isn't a scoped link-picker call. Set by
-	 * filter_rest_search_query() and consumed by
-	 * filter_rest_search_result_url() to rewrite the per-item URL.
-	 *
-	 * Lives on the instance (not as a static) because PostQueryFilter is a
-	 * singleton inside the plugin's DI container - one instance per request
-	 * - and a static would risk leaking between sub-requests on the same
-	 * process (CLI long-runners, multisite switch_to_blog loops).
+	 * Target language slug of the in-flight scoped REST link-picker search, or ''.
 	 *
 	 * @var string
 	 */
 	private string $rest_search_target_slug = '';
 
 	/**
-	 * Per-request memo for find_slug_candidates(), keyed
-	 * "blog|post_type|slug" (blog-keyed so switch_to_blog() can't serve
-	 * another blog's language ids). Bounded at a handful of entries.
+	 * Per-request memo for find_slug_candidates(), keyed "blog|post_type|slug".
 	 *
 	 * @var array<string, array<int, object>>
 	 */
@@ -335,79 +225,58 @@ final class PostQueryFilter {
 	private ?\PerfLocale\Database\Repository\TranslationGroupRepository $groups_repo = null;
 
 	/**
-	 * Cached map of post-type object_id → language_id for the current blog.
-	 *
-	 * Populated once on first `filter_get_pages()` call and reused for every
-	 * subsequent invocation. A theme using `wp_page_menu()` or a sidebar with
-	 * page-listing widgets can fire `get_pages()` many times per request;
-	 * caching the full map collapses N*(2 queries) into 1 query per request.
+	 * Per-request map of post object_id to language_id, built on the first filter_get_pages() call.
 	 *
 	 * @var array<int, int>|null
 	 */
 	private static ?array $page_language_map_cache = null;
 
 	/**
-	 * Cached request-constants read by filter_get_pages() hot-loop - cleared
-	 * on switch_blog so multisite language context doesn't leak.
+	 * Request constants for the filter_get_pages() loop; cleared on switch_blog.
 	 *
 	 * @var array{lang_id:int, tt:array<int, string>}|null
 	 */
 	private static ?array $get_pages_cfg_cache = null;
 
 	/**
-	 * Cached pre-built JOIN/WHERE SQL fragments keyed by language_id. WP_Query
-	 * runs our posts_clauses filter for every query in a request - archive +
-	 * sidebars + widgets + related-posts easily hit 4–6 queries - and each one
-	 * otherwise rebuilt the same JOIN/WHERE strings (implode + prepare). Cache
-	 * the fragments once per language and splice them in.
+	 * Pre-built language JOIN/WHERE fragments keyed by language_id; cleared on switch_blog.
 	 *
 	 * @var array<int, array{join:string, where:string}>|null
 	 */
 	private static ?array $query_clauses_cache = null;
 
 	/**
-	 * Per-request post_id → language_id memo for detect_post_language_id(),
-	 * keyed by "blog_id:post_id". Class-static so reset_static_caches()
-	 * clears it on switch_blog - without that, a CLI long-runner or REST
-	 * cross-blog hop could read blog A's mapping while serving blog B.
+	 * Per-request "blog_id:post_id" to language_id memo for detect_post_language_id().
 	 *
 	 * @var array<string, int>
 	 */
 	private static array $detect_post_lang_cache = [];
 
 	/**
-	 * Per-request post_id → [language_id => post_id] memo for
-	 * get_translations_map(), keyed by "blog_id:post_id". Same switch_blog-
-	 * safety rationale as $detect_post_lang_cache.
+	 * Per-request "blog_id:post_id" to [language_id => post_id] memo for get_translations_map().
 	 *
 	 * @var array<string, array<int, int>>
 	 */
 	private static array $translations_map_cache = [];
 
 	/**
-	 * Per-request `option_page_for_posts` translation cache, keyed
-	 * "language_id:page_id". Reset on switch_blog with the others below.
+	 * Per-request `option_page_for_posts` translation cache, keyed "language_id:page_id".
 	 *
 	 * @var array<string, int>
 	 */
 	private static array $page_for_posts_cache = [];
 
 	/**
-	 * Per-request adjacent-post (Previous/Next) clause cache, keyed by the
-	 * viewed post id. Static + reset on switch_blog with the others below -
-	 * post ids collide numerically across blogs, so this MUST be cleared on
-	 * blog switch or a neighbour query on blog B could reuse blog A's clause.
+	 * Per-request adjacent-post (Previous/Next) clause cache, keyed by the viewed post id.
+	 * Must be cleared on switch_blog: post ids collide across blogs.
 	 *
 	 * @var array<int, array{join: string, where: string}|null>
 	 */
 	private static array $adjacent_clauses_memo = [];
 
 	/**
-	 * Generational cache group holding paginated found_posts counts. Bumped by
-	 * flush_found_rows_cache() on every content change that can move the count
-	 * (publish-status transition, deletion, translation-link mutation, language
-	 * add/delete), so a cached count is never served stale. See
-	 * optimize_found_rows()/set_found_posts().
+	 * Generational cache group of paginated found_posts counts.
+	 * Bumped on every change that can move a count (status, deletion, links, languages).
 	 */
 	private const FOUND_ROWS_GROUP = 'perflocale_found_rows';
 
@@ -422,35 +291,24 @@ final class PostQueryFilter {
 	private const LISTING_LOOKAHEAD_MIN = 50;
 
 	/**
-	 * Final clauses of the front-end main query on page 2 or later of a listing,
-	 * per blog id; listing_page_exists() derives other languages' row counts from
-	 * them. Written on posts_clauses_request, given the request core built on
-	 * posts_request, confirmed on posts_pre_query, bound to the query by
-	 * spl_object_id(). Keyed by blog id, so a switch_to_blog() between the main
-	 * query and wp_head leaves it in place.
+	 * Final clauses of the front-end main listing query on page 2+, per blog id, for listing_page_exists().
+	 * Keyed by blog, not reset on switch_blog: a switch between the main query and wp_head must keep it.
 	 *
 	 * @var array<int, array{oid: int, language_id: int, confirmed: bool, request: ?string, distinct: string, fields: string, join: string, where: string, groupby: string, orderby: string, limits: string}>
 	 */
 	private static array $main_listing = [];
 
 	/**
-	 * The spl_object_id() of the front-end main query that filter_by_language()
-	 * leaves without a language condition because none of its post types is
-	 * translatable or the perflocale/query/include_all_languages filter opted
-	 * it out, per blog id. Such a listing has the same rows in every language.
+	 * Per blog, the spl_object_id() of a front-end main query left without a language condition.
+	 * Such a listing has the same rows in every language.
 	 *
 	 * @var array<int, int>
 	 */
 	private static array $unscoped_main_listing = [];
 
 	/**
-	 * Per-request map of spl_object_id(WP_Query) → the data needed to reproduce
-	 * WP core's found_posts for that query: the exact COUNT SQL ('sql', only
-	 * built for paginated queries) and whether the query has a LIMIT clause
-	 * ('has_limits', which selects WP's paginated vs count($posts) branch).
-	 * Written in modify_query_clauses() (where the final clauses are known) and
-	 * consumed + unset in set_found_posts() on the_posts. Request-scoped; also
-	 * cleared on switch_blog for defence in depth.
+	 * Per-query (spl_object_id) COUNT SQL and LIMIT flag to reproduce core's found_posts.
+	 * Consumed and unset in set_found_posts().
 	 *
 	 * @var array<int, array{sql: string, has_limits: bool}>
 	 */
@@ -469,16 +327,8 @@ final class PostQueryFilter {
 		self::$translations_map_cache  = [];
 		self::$page_for_posts_cache    = [];
 		self::$adjacent_clauses_memo   = [];
-		// self::$found_rows_data is deliberately NOT cleared here. Its entries
-		// are query-OBJECT-scoped (keyed by spl_object_id) and blog-anchored
-		// (the stashed COUNT SQL bakes in the originating blog's table names),
-		// and they are consumed on the_posts in the originating blog's context.
-		// switch_blog fires for ANY switch_to_blog()/restore_current_blog()
-		// pair - including ones inside third-party callbacks that run between
-		// our posts_clauses_request stash and the_posts - so clearing it here
-		// wiped in-flight main-query counts and zeroed pagination.
-		// self::$main_listing is keyed by blog id and bound to one query
-		// object, so it is not cleared here either.
+		// Not $found_rows_data or $main_listing: query-object scoped, and a third-party
+		// switch_to_blog() pair between stash and the_posts would zero pagination.
 	}
 
 	/**
@@ -525,56 +375,35 @@ final class PostQueryFilter {
 		// Resolve correct page/post when duplicate slugs exist across languages.
 		add_action( 'pre_get_posts', [ $this, 'resolve_duplicate_slug' ], 5 );
 
-		// Mark queries with the current language ID for clause filtering.
-		// Priority 5 ensures the language flag is attached before third-party
-		// plugins hooked at the default priority 10 decide whether to touch
-		// the query - without this, ordering was effectively undefined.
+		// Priority 5: the language flag is set before third-party callbacks at 10 inspect the query.
 		add_action( 'pre_get_posts', [ $this, 'filter_by_language' ], 5 );
 
-		// Sitewide comment feeds (/de/comments/feed/, ?feed=rss2&withcomments=1)
-		// build their OWN comment query - the post-side language clauses never
-		// touch it, so a language-prefixed comments feed served every
-		// language's comments. Scope the comment feed's post JOIN the same way.
+		// Sitewide comment feeds run their own comment query, which the post clauses never touch.
 		add_filter( 'comment_feed_join', [ $this, 'scope_comment_feed_join' ], 10, 2 );
 		add_filter( 'comment_feed_where', [ $this, 'scope_comment_feed_where' ], 10, 2 );
 
 		// Redirect front/blog page slugs to their canonical language root URL.
 		add_action( 'template_redirect', [ $this, 'redirect_front_page_slug' ], 5 );
 
-		// Strip the `perflocale_fb` sentinel at priority 1 so the URL the
-		// user ends up on after a fallback redirect doesn't carry the
-		// internal tracking param. Runs before the fallback handler at the
-		// default priority to guarantee we never re-fire on a sentinel URL.
+		// Priority 1: strip the `perflocale_fb` sentinel before the fallback handler can re-fire on it.
 		add_action( 'template_redirect', [ $this, 'clean_fallback_sentinel' ], 1 );
 
 		// Enforce missing translation action on singular pages.
 		add_action( 'template_redirect', [ $this, 'handle_missing_translation' ] );
 
-		// Prevent WordPress canonical redirect when a fallback post was loaded
-		// intentionally. Without this, WP redirects to the default-language
-		// permalink before handle_missing_translation() can apply the configured action.
+		// Keep core's canonical redirect from preempting handle_missing_translation() on a fallback post.
 		add_filter( 'redirect_canonical', [ $this, 'prevent_fallback_canonical_redirect' ], 10, 2 );
 
-		// Suppress WP core's SQL_CALC_FOUND_ROWS on the front-end main archive
-		// query (priority 6 - after filter_by_language at 5 has attached the
-		// language id). Runs only where PerfLocale's language LEFT JOIN would
-		// otherwise force MySQL to scan every matching row to count them. The
-		// exact count is recovered - generationally cached - in set_found_posts()
-		// so found_posts / max_num_pages stay identical to the SQL_CALC result.
+		// Priority 6, after filter_by_language: replace SQL_CALC_FOUND_ROWS with a cached exact count.
 		add_action( 'pre_get_posts', [ $this, 'optimize_found_rows' ], 6 );
 
 		// Apply language clause to every query that was marked above.
 		add_filter( 'posts_clauses', [ $this, 'modify_query_clauses' ], 10, 2 );
 
-		// Stash the COUNT SQL for optimized queries from the FINAL clauses.
-		// posts_clauses_request fires after every posts_clauses callback (any
-		// priority), so third-party clause edits are included - exactly what
-		// SQL_CALC_FOUND_ROWS would have counted.
+		// COUNT SQL from the final clauses: posts_clauses_request includes every third-party clause edit.
 		add_filter( 'posts_clauses_request', [ $this, 'stash_found_rows_count' ], PHP_INT_MAX, 2 );
 
-		// If another plugin short-circuits the query (posts_pre_query non-null),
-		// drop the stash so set_found_posts() leaves that plugin's own
-		// found_posts value untouched.
+		// A short-circuited query keeps the short-circuiting plugin's own found_posts.
 		add_filter( 'posts_pre_query', [ $this, 'unstash_on_short_circuit' ], PHP_INT_MAX, 2 );
 
 		// Keep the main listing's final clauses on page 2 and later; the hreflang
@@ -583,70 +412,38 @@ final class PostQueryFilter {
 		add_filter( 'posts_request', [ $this, 'capture_main_listing_request' ], PHP_INT_MIN, 2 );
 		add_filter( 'posts_pre_query', [ $this, 'confirm_main_listing' ], PHP_INT_MAX, 2 );
 
-		// Supply found_posts / max_num_pages for queries whose SQL_CALC was
-		// suppressed by optimize_found_rows(). Prio 20 so it runs after the
-		// translation-cache prime (the_posts prio 5) - order is immaterial to
-		// the count, but keeps the prime first.
+		// Supply found_posts / max_num_pages for queries optimize_found_rows() changed.
 		add_filter( 'the_posts', [ $this, 'set_found_posts' ], 20, 2 );
 
-		// Invalidate cached found_posts counts on any change that can move them.
-		// Translation-link mutations are covered by a generation bump inside
-		// TranslationGroupRepository::invalidate_eager_link_map() (the single
-		// point every link path funnels through). These cover the remaining
-		// dimensions: a post crossing the publish boundary, permanent deletion,
-		// and language add/delete.
+		// Invalidate cached counts; link changes bump it in TranslationGroupRepository::invalidate_eager_link_map().
 		add_action( 'transition_post_status', [ $this, 'flush_found_rows_on_transition' ], 10, 2 );
 		add_action( 'deleted_post', [ $this, 'flush_found_rows_on_delete' ], 10, 2 );
 		add_action( 'perflocale/language/added', [ $this, 'flush_found_rows_cache' ] );
 		add_action( 'perflocale/language/deleted', [ $this, 'flush_found_rows_cache' ] );
 
-		// Language-scope the adjacent-post (Previous/Next) links. WP core's
-		// get_adjacent_post() builds raw SQL and never runs a WP_Query, so
-		// neither pre_get_posts nor posts_clauses fire - without these filters
-		// the Prev/Next links on a single post cross languages.
+		// Previous/Next links: get_adjacent_post() runs raw SQL, not a WP_Query.
 		add_filter( 'get_previous_post_join', [ $this, 'filter_adjacent_post_join' ], 10, 5 );
 		add_filter( 'get_next_post_join', [ $this, 'filter_adjacent_post_join' ], 10, 5 );
 		add_filter( 'get_previous_post_where', [ $this, 'filter_adjacent_post_where' ], 10, 5 );
 		add_filter( 'get_next_post_where', [ $this, 'filter_adjacent_post_where' ], 10, 5 );
 
-		// Filter the Gutenberg link-picker / REST search by the EDITED post's
-		// language. The block editor's apiFetch middleware injects a
-		// `perflocale_post=<id>` query param into /wp/v2/search calls, and
-		// this filter maps that to the language whose posts should appear
-		// in the typeahead. Without it, the URL-derived current language
-		// (always empty under /wp-json/) defaults to the site default and
-		// authors editing a DE post see only EN suggestions.
+		// Block editor link picker: scope /wp/v2/search by the edited post (`perflocale_post`), not the URL language.
 		add_filter( 'rest_post_search_query', [ $this, 'filter_rest_search_query' ], 10, 2 );
 
-		// Re-prefix every search-result URL to the queried language. The
-		// search handler builds URLs via get_permalink(), which resolves a
-		// post's "primary" language - wrong when one post is linked to several
-		// languages in one group (corruption / WPML-legacy state). Forcing the
-		// queried language gives the picker a deterministic answer. There's no
-		// per-item search filter, so we walk the dispatched response.
+		// Re-prefix result URLs to the queried language; core has no per-item search filter.
 		add_filter( 'rest_request_after_callbacks', [ $this, 'filter_rest_search_response_urls' ], 10, 3 );
 
 		// Filter get_pages() results by language (used by wp_page_menu fallback).
 		add_filter( 'get_pages', [ $this, 'filter_get_pages' ], 10, 2 );
 
-		// Keep core's navigation fallback (a ref-less core/navigation block) on
-		// a default-language menu; see arm_navigation_fallback().
+		// Keep core's navigation fallback on a default-language menu.
 		add_filter( 'wp_navigation_should_create_fallback', [ $this, 'arm_navigation_fallback' ] );
 
-		// Translation-cache priming for posts in the main query is now done
-		// by UrlConverter::preload_object_languages (the_posts prio 5),
-		// which calls prime_translations() AND extracts per-post language
-		// IDs in one pass. Registering a second the_posts callback here
-		// just to call prime_translations() again was pure overhead - the
-		// L1 cache short-circuited it on every hit. Removed in 1.0.0.
+		// Main-query translation priming lives in UrlConverter::preload_object_languages (the_posts 5).
 	}
 
 	/**
-	 * Resolve the translated front page for language homepages.
-	 *
-	 * When visiting /en/ or /de/, WordPress shows the blog listing because
-	 * it only knows about one static front page. This intercepts the main
-	 * query and points it to the translated front page for that language.
+	 * Point a language homepage main query (/de/) at that language's translated front page.
 	 *
 	 * @param \WP_Query $query The main query.
 	 * @return void
@@ -656,12 +453,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Don't hijack variant requests. /feed/, /robots.txt, /wp-sitemap.xml,
-		// /embed, trackbacks and 404 routing arrive with empty
-		// pagename/name/p/post_type - the same shape the "bare language
-		// homepage" detection below keys on. Without this guard they'd be
-		// rewritten to page_on_front, poisoning is_feed()/is_robots() and
-		// making redirect_canonical 301 them to the page slug.
+		// Feeds, robots, sitemaps, embeds and trackbacks share the bare homepage's empty query shape.
 		if (
 			! empty( $query->is_feed )
 			|| ! empty( $query->is_robots )
@@ -689,24 +481,15 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Detect if this query is for the front page. Two cases:
-		// 1. Language homepage with no specific content: /en/, /de/ - only 'lang' in query_vars.
-		// 2. WordPress's parse_query() already auto-set page_id = page_on_front
-		// (happens when is_home is true and a static front page is configured).
+		// Front page: parse_query() set page_id = page_on_front, or a bare language homepage.
 		$queried_page_id = (int) $query->get( 'page_id' );
 		$is_front_page   = false;
 
 		if ( $queried_page_id === $front_page_id ) {
-			// parse_query already resolved this as the static front page.
+			// Already the static front page.
 			$is_front_page = true;
 		} elseif ( $queried_page_id === 0 ) {
-			// No page_id set - check if it's a bare language homepage.
-			// Exclude archive/taxonomy queries (product_cat, post_tag, etc.)
-			// and singular ones, which WordPress has already flagged by
-			// parse_query() time. That includes attachment requests: core
-			// parses any unknown two-segment path (/x/y/) as `attachment=y`,
-			// and `?attachment_id=N` names one. Both go to WordPress's own
-			// resolution (the attachment, or a 404), not the front page.
+			// Bare language homepage. Core parses any unknown /x/y/ as `attachment=y`: leave that to core.
 			$is_front_page = (
 				! $query->is_archive
 				&& ! $query->is_singular
@@ -726,28 +509,23 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Step 1: Check if the current page_on_front is ALREADY in the current language.
-		// This happens when the default language was changed and page_on_front was swapped.
+		// page_on_front may already be in the current language (after a default-language change).
 		$front_page_lang = $this->get_post_language_id( $front_page_id );
 
 		if ( $front_page_lang === $language_id ) {
-			// The front page IS in the current language - just use it directly.
+			// Use it directly.
 			$target_id = $front_page_id;
 		} else {
-			// Step 2: Find the translation of the front page in the current language.
+			// Find the front page's translation in the current language.
 			$target_id = $this->find_translated_page( $front_page_id, $language_id );
 
-			// Every translation of the front page, published or not, links to
-			// the language root (UrlConverter::filter_page_link()), so
-			// previewing an unpublished one requests the root with preview
-			// args and lands here. find_translated_page() skips it; only a
-			// logged-in preview by a user who can edit it may load it.
+			// Every front-page translation links to the language root, so its preview lands here.
 			if ( ! $target_id ) {
 				$target_id = $this->find_preview_front_page( $query, $front_page_id, $language_id );
 			}
 
 			if ( ! $target_id ) {
-				// No translation found - show the front page as-is.
+				// No translation: show the front page as-is.
 				$this->guard_editor_fallback( $front_page_id );
 				$target_id = $front_page_id;
 			}
@@ -763,11 +541,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Redirect front page slug URLs to their canonical language root.
-	 *
-	 * When a static front page has slug "homepage", visiting /en/homepage/
-	 * would render the same content as /en/. This 301-redirects the slug
-	 * URL to the language root to avoid duplicate content.
+	 * 301-redirect a front page slug URL (/en/homepage/) to its language root.
 	 *
 	 * @return void
 	 */
@@ -776,13 +550,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Don't clobber variant views of the front page. When a static front
-		// page is set, WP routes /feed/, /page/2/, /embed/, /robots.txt,
-		// /wp-sitemap.xml and other special URLs to the front page's post ID
-		// (is_page() is true for all of them because WP's fallback resolver
-		// returns page_on_front). Redirecting those to the bare language root
-		// drops feeds, inner-page pagination, embeds, trackbacks, robots.txt,
-		// and sitemaps.
+		// Core routes feeds, pagination, embeds, robots and sitemaps to page_on_front: never redirect those.
 		if (
 			is_feed()
 			|| is_embed()
@@ -797,9 +565,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Body-preserving methods only. A 301/302 on POST/PUT/DELETE/PATCH
-		// would drop the request body, turning form submissions into GETs
-		// to the canonical URL and silently discarding user data.
+		// GET/HEAD only: a redirect drops a POST body.
 		$method = strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) : 'GET' );
 
 		if ( $method !== 'GET' && $method !== 'HEAD' ) {
@@ -828,23 +594,15 @@ final class PostQueryFilter {
 		}
 
 		if ( ! in_array( $post->ID, $front_page_ids, true ) ) {
-			// Also check by slug - the page might share the front page's slug
-			// but not be linked in the same translation group (e.g., created
-			// independently or with a broken translation link).
+			// Also match by slug: the page may share the slug without being linked.
 			$front_page = get_post( $front_page_id );
 			if ( ! $front_page || $post->post_name !== $front_page->post_name ) {
 				return;
 			}
 		}
 
-		// Belt-and-braces: the queried object is the front page, but that
-		// doesn't guarantee the URL contains the front-page slug - WP's
-		// fallback resolver returns page_on_front for many special URLs
-		// (edge cases the variant-view guards above may not cover).
-		// Only act when the URL *actually* contains a front-page slug
-		// as a path segment. No slug in the URL = nothing to canonicalise.
-		// esc_url_raw (not sanitize_text_field) so percent-encoded non-Latin
-		// front-page slugs survive the segment match.
+		// Act only when a front-page slug is a path segment of the URL.
+		// esc_url_raw, not sanitize_text_field: percent-encoded slugs must survive.
 		$request_path = ( isset( $_SERVER['REQUEST_URI'] ) ? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) ) : '' );
 		$qs_break     = strpos( $request_path, '?' );
 		$request_path = $qs_break !== false ? substr( $request_path, 0, $qs_break ) : $request_path;
@@ -867,19 +625,10 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Build the canonical language root URL. home_url('/') already goes
-		// through our home_url filter, which injects the right prefix for the
-		// active URL mode (subdir slug/locale, subdomain, per-domain, or bare
-		// for a hidden default), so one call covers every combination -
-		// building it as home_url('/'.$slug.'/') would double the prefix in
-		// non-subdirectory modes and 301-loop.
+		// home_url( '/' ) already carries the language prefix for every URL mode; adding a slug 301-loops.
 		$canonical = home_url( '/' );
 
-		// Only redirect if the current URL differs from the canonical. Use
-		// esc_url_raw (NOT sanitize_text_field, which strips %XX octets) and
-		// parse the path the same way as the target so a percent-encoded
-		// (non-Latin) path compares correctly instead of triggering a spurious
-		// redirect.
+		// Compare paths parsed the same way; esc_url_raw keeps %XX octets.
 		$request_uri  = ( isset( $_SERVER['REQUEST_URI'] ) ? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) ) : '' );
 		$qs_pos       = strpos( $request_uri, '?' );
 		$current_path = untrailingslashit( (string) ( wp_parse_url( $request_uri, PHP_URL_PATH ) ?: '/' ) );
@@ -889,8 +638,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Preserve the query string - dropping it breaks UTM attribution,
-		// click IDs, preview tokens, and similar contextual parameters.
+		// Preserve the query string.
 		if ( $qs_pos !== false ) {
 			$canonical .= substr( $request_uri, $qs_pos );
 		}
@@ -906,11 +654,7 @@ final class PostQueryFilter {
 	 * @return int Language ID, or 0 if not linked.
 	 */
 	private function get_post_language_id( int $post_id ): int {
-		// Serve from the translation-link cache, primed for most front-facing
-		// requests (prime_nav_menu, the_posts, or the lazy front-page prime).
-		// get_translations falls through to a dedicated SELECT only when the
-		// group isn't primed - so the hot path is O(1) in memory instead of a
-		// DB round-trip per filter_page_for_posts / handle_missing_translation.
+		// Served from the primed translation-link cache on most front-end requests.
 		$links = $this->get_groups_repo()->get_translations( $post_id, \PerfLocale\Enum\ObjectType::Post );
 
 		foreach ( $links as $link ) {
@@ -923,9 +667,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Find the translated version of a page in a specific language.
-	 *
-	 * Looks up the translation group and finds the post linked to the target language.
+	 * Find the published translation of a page in a specific language.
 	 *
 	 * @param int $source_id Source page ID.
 	 * @param int $language_id Target language ID.
@@ -948,15 +690,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Find the unpublished front-page translation a logged-in editor is
-	 * previewing, or opening without a preview argument, on the language root.
-	 *
-	 * Same status rules as find_preview_target(): without a preview_id only a
-	 * protected status qualifies; a preview_id must name this translation,
-	 * which then qualifies under can_preview_post().
-	 *
-	 * Reads the translation links and post that find_translated_page() has
-	 * just loaded, so it adds no translation or post query of its own.
+	 * Find the unpublished front-page translation a logged-in editor previews on the language root.
+	 * Status rules of find_preview_target(): a preview_id must name this translation.
 	 *
 	 * @param \WP_Query $query         The main query.
 	 * @param int       $front_page_id page_on_front.
@@ -1001,11 +736,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Filter the page_for_posts option to return the translated page ID.
-	 *
-	 * This runs on the 'option_page_for_posts' filter so WordPress sees the
-	 * translated blog page ID during parse_request, BEFORE it decides whether
-	 * to show the blog index or a static page. This ensures the blog template
-	 * is used for translated blog pages like /en/blog/, /de/blog/, etc.
+	 * Core reads it in parse_request to pick the blog index, so a translated blog page gets the blog template.
 	 *
 	 * @param mixed $page_id The page_for_posts option value.
 	 * @return mixed Translated page ID or original.
@@ -1023,11 +754,7 @@ final class PostQueryFilter {
 			return $page_id;
 		}
 
-		// Per-request cache keyed by language + page. CLASS-static (not a
-		// method static) so reset_static_caches() clears it on switch_blog:
-		// language IDs are per-blog auto-increments, so a method static here
-		// would serve blog A's translated posts page to blog B for the same
-		// numeric language id.
+		// Class static, not a method static: reset_static_caches() must clear it on switch_blog.
 		$cache_key = $language_id . ':' . $page_id;
 
 		if ( array_key_exists( $cache_key, self::$page_for_posts_cache ) ) {
@@ -1054,13 +781,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Convert a translated blog page to a proper blog index query.
-	 *
-	 * When page_for_posts is set to a page in one language, visiting the
-	 * blog URL in another language resolves to the translated page. But
-	 * WordPress doesn't recognize it as the blog index because the page ID
-	 * doesn't match page_for_posts. This method detects that case and
-	 * converts the query from a page query to a blog posts query.
+	 * Convert a query for a translation of page_for_posts into a blog index query.
 	 *
 	 * @param \WP_Query $query The main query.
 	 * @return void
@@ -1107,23 +828,11 @@ final class PostQueryFilter {
 		if ( $queried_page_id > 0 && in_array( $queried_page_id, $posts_page_ids, true ) ) {
 			$is_posts_page = true;
 		} elseif ( ! empty( $queried_pagename ) ) {
-			// Check if the pagename matches any translation of the posts page.
-			// Batch-prime first: this runs at pre_get_posts (before the main
-			// query populates the post cache), so each get_post_field() below
-			// would otherwise be a cache-miss single-row SELECT - one per
-			// language, on every hierarchical-page view of no-object-cache
-			// sites.
+			// Prime first: at pre_get_posts the post cache is empty.
 			_prime_post_caches( $posts_page_ids, false, false );
 
 			foreach ( $posts_page_ids as $pid ) {
-				// get_page_uri(), not post_name: `pagename` carries the FULL
-				// path, so a posts page nested under a parent never matched its
-				// own leaf slug and the archive rendered as a singular page
-				// instead. Comparing full URIs also stops a same-named page
-				// under a different parent from being mistaken for it, which a
-				// basename comparison would have allowed. Both sides are the
-				// stored percent-encoded form: get_page_uri() concatenates raw
-				// post_name values, and $queried_pagename was normalised above.
+				// Full URI, not post_name: `pagename` is the full path, and a same-named page elsewhere must not match.
 				if ( get_page_uri( $pid ) === $queried_pagename ) {
 					$is_posts_page = true;
 					break;
@@ -1147,10 +856,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Resolve the correct post when duplicate slugs exist across languages.
-	 *
-	 * WordPress uses get_page_by_path() for pagename queries, which returns
-	 * the first match. We intercept the query before that and set the correct
-	 * page_id based on the current language.
+	 * Runs before core's language-blind get_page_by_path(), which returns the first match.
 	 *
 	 * @param \WP_Query $query The WP_Query instance.
 	 * @return void
@@ -1166,33 +872,17 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Zero-state short-circuit: both slug resolvers below INNER JOIN
-		// translation_groups, so with zero groups they return null and take no
-		// query-mutating branch. has_any_groups() is autoloaded + memoised (no
-		// extra query on group-having sites). Same idiom as the resolvers below.
+		// No groups: every resolver below would return nothing.
 		if ( ! $this->get_groups_repo()->has_any_groups() ) {
 			return;
 		}
 
-		// Handle pagename queries (pages/hierarchical CPTs).
-		//
-		// Normalised to the stored form first: post_name is percent-encoded for
-		// every non-Latin script, the query var is not, and every resolver and
-		// get_page_uri() comparison below matches against post_name. No-op on
-		// ASCII, so Latin-script sites are unaffected.
+		// Pagename queries; normalised to the stored percent-encoded post_name form.
 		$pagename = Helper::normalize_slug_for_query( (string) $query->get( 'pagename' ) );
 
 		if ( ! empty( $pagename ) ) {
-			// For a nested page core sets `pagename` to the FULL path
-			// ("parent/child"), but the three resolvers below match on
-			// `post_name`, which holds only "child". Every lookup therefore
-			// missed at depth >= 1, core's language-blind get_page_by_path()
-			// won, and a translated child page 301'd to its source-language
-			// sibling - unreachable in its own language. Look up by basename,
-			// then require the candidate's own full URI to equal the requested
-			// path, so a same-named page under a different parent can never be
-			// served in its place. Depth 0 keeps the exact previous behaviour:
-			// $lookup is $pagename and there is nothing to verify.
+			// Nested page: look up by basename, then require get_page_uri() to equal the path.
+			// Do not remove the URI checks: a same-basename page under another parent would be served.
 			$lookup_slug = $pagename;
 			$require_uri = '';
 
@@ -1201,14 +891,8 @@ final class PostQueryFilter {
 				$require_uri = trim( (string) $pagename, '/' );
 			}
 
-			// A preview that names a matching post the user can edit loads
-			// exactly that post, ahead of any published page sharing the slug
-			// in this language. Unlike the lookups below, the preview route
-			// checks the path at depth 0 too: page slugs are unique only among
-			// siblings (wp_unique_post_slug() compares post_parent,
-			// wp-includes/post.php:5632), so a top-level URL can share its
-			// basename with a nested page, and this route only runs for
-			// logged-in previews.
+			// A preview_id loads that post first. Only this route checks the path at depth 0 too:
+			// slugs are unique only among siblings. Do not harmonise with the lookups below.
 			$preview_id  = $this->logged_in_preview_id( $query );
 			$preview_uri = $require_uri !== '' ? $require_uri : $lookup_slug;
 
@@ -1233,18 +917,13 @@ final class PostQueryFilter {
 				$query->is_page     = true;
 				$query->is_singular = true;
 
-				// Reset queried_object so WordPress doesn't use the stale
-				// object from parse_request (which resolved to the first
-				// matching slug regardless of language).
+				// Drop parse_request's language-blind queried object.
 				$query->queried_object    = null;
 				$query->queried_object_id = 0;
 				return;
 			}
 
-			// The candidates above are published only, and a new translation
-			// copies its source's slug, so a preview=true link to an unpublished
-			// translation would otherwise fall through to a published sibling.
-			// A page builder's link carries no preview argument: editors get the same lookup.
+			// Published lookup missed: a bare preview link (or a page builder's, without one) to an unpublished translation.
 			if ( $preview_id === 0 || ( $preview_id === -1 && $this->may_edit_unpublished( 'page' ) ) ) {
 				$preview_target = $this->find_preview_target( $lookup_slug, $language_id, 'page', $preview_uri, 0 );
 
@@ -1254,9 +933,7 @@ final class PostQueryFilter {
 				}
 			}
 
-			// No translation in current language - fall back to the default
-			// language post so it loads and handle_missing_translation() can
-			// apply the configured action (show_default / show_404 / redirect).
+			// Load the default-language post so handle_missing_translation() applies the configured action.
 			$fallback_id = $this->find_fallback_post( $lookup_slug, $language_id, 'page' );
 
 			if ( $fallback_id && $require_uri !== '' && get_page_uri( $fallback_id ) !== $require_uri ) {
@@ -1277,13 +954,7 @@ final class PostQueryFilter {
 				return;
 			}
 
-			// Neither the current language nor the default language has this
-			// page. Load *any* sibling (typically the original authored
-			// language) so handle_missing_translation() gets a queried post
-			// and walks the configured fallback chain. Without this, WP
-			// 404s and redirect_guess_404_permalink() beats our handler
-			// with a raw 301 to the canonical sibling - bypassing the
-			// chain + sentinel entirely.
+			// Load any sibling: otherwise redirect_guess_404_permalink() 301s past the fallback chain.
 			$any_id = $this->find_any_translated_post_by_slug( $lookup_slug, 'page', $language_id );
 
 			if ( $any_id && $require_uri !== '' && get_page_uri( $any_id ) !== $require_uri ) {
@@ -1305,8 +976,7 @@ final class PostQueryFilter {
 			}
 		}
 
-		// Handle name queries (regular posts). Same normalisation as the
-		// pagename branch above, for the same reason.
+		// Name queries (regular posts), normalised the same way.
 		$name = Helper::normalize_slug_for_query( (string) $query->get( 'name' ) );
 
 		if ( ! empty( $name ) ) {
@@ -1316,23 +986,15 @@ final class PostQueryFilter {
 				$post_type = 'post';
 			}
 
-			// Core keeps an array post_type query var as an array
-			// (WP::parse_request() only intersects it with the publicly
-			// queryable types), while the preview route and the slug resolvers
-			// below bind one type. A multi-type request is left to core.
+			// A multi-type request is left to core: the resolvers bind one type.
 			if ( ! is_string( $post_type ) ) {
 				return;
 			}
 
 			$preview_id = $this->logged_in_preview_id( $query );
 
-			// A hierarchical type requested through its own query var is turned
-			// into a `pagename` lookup after pre_get_posts, and that lookup adds
-			// its own ID condition: the queried_object_id when one is set, else
-			// the language-blind get_page_by_path() match
-			// (wp-includes/class-wp-query.php:2156-2170, :2186-2217). A post
-			// routed by `p` survives only when it is that same post, so the
-			// preview route leaves these requests to the lookups below.
+			// Core turns a hierarchical own-query-var request into a pagename lookup with its own ID
+			// condition (class-wp-query.php:2156-2217), which a `p` route cannot survive.
 			if ( $preview_id >= 0 && $this->is_own_query_var_request( $query, $post_type ) ) {
 				$preview_id = -1;
 			}
@@ -1367,7 +1029,7 @@ final class PostQueryFilter {
 				}
 			}
 
-			// No translation in current language - fall back to default language.
+			// No translation: fall back to the default language.
 			$fallback_id = $this->find_fallback_post( $name, $language_id, $post_type );
 
 			if ( $fallback_id ) {
@@ -1382,9 +1044,7 @@ final class PostQueryFilter {
 				return;
 			}
 
-			// Last resort: load any sibling so handle_missing_translation()
-			// can walk the fallback chain (see the paging branch above for
-			// the full rationale).
+			// Last resort: any sibling, as in the pagename branch.
 			$any_id = $this->find_any_translated_post_by_slug( $name, $post_type, $language_id );
 
 			if ( $any_id ) {
@@ -1402,14 +1062,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Find the first published post with a matching slug in any language
-	 * other than the given one. Used as a last-resort resolution so our
-	 * missing-translation handler gets a chance to run before WP’s own
-	 * 404-guess 301.
-	 *
-	 * Only returns posts that PerfLocale manages (i.e. have a
-	 * translation_link row). A post with no translation group is not part
-	 * of the multilingual tree and is left alone.
+	 * Find the first published, linked post with this slug in any other language.
 	 *
 	 * @param string $slug Post slug.
 	 * @param string $post_type Post type.
@@ -1417,8 +1070,7 @@ final class PostQueryFilter {
 	 * @return int|null
 	 */
 	private function find_any_translated_post_by_slug( string $slug, string $post_type, int $exclude_language_id ): ?int {
-		// Candidates are ordered p.ID ASC, preserving the old query's
-		// lowest-ID tiebreak.
+		// Lowest ID wins (candidates are ordered by ID).
 		foreach ( $this->find_slug_candidates( $slug, $post_type ) as $row ) {
 			if ( (int) $row->language_id !== $exclude_language_id ) {
 				return (int) $row->ID;
@@ -1429,12 +1081,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * ONE query fetching every published, group-linked post sharing a slug,
-	 * with its language - memoized per (blog, post_type, slug) for the
-	 * request. The three slug resolvers used to each run their own variant
-	 * of this query, so a singular view of UNMANAGED content (no sibling in
-	 * any language) cost three sequential SELECT round trips; they now
-	 * select in PHP over this one result set.
+	 * Every published, linked post sharing a slug, with its language; memoised per blog, type and slug.
+	 * Published only: the preview lookup is separate and must not widen this or its memo.
 	 *
 	 * @param string $slug      Post slug.
 	 * @param string $post_type Post type.
@@ -1448,8 +1096,7 @@ final class PostQueryFilter {
 			return $this->slug_candidates_memo[ $key ];
 		}
 
-		// A request resolves one slug; the cap only guards pathological
-		// loops from third-party code re-querying many slugs.
+		// Cap guards third-party loops over many slugs.
 		if ( count( $this->slug_candidates_memo ) > 8 ) {
 			$this->slug_candidates_memo = [];
 		}
@@ -1502,10 +1149,6 @@ final class PostQueryFilter {
 	/**
 	 * Find a fallback post in the default language when no translation exists.
 	 *
-	 * Used by resolve_duplicate_slug() so the post loads successfully and
-	 * handle_missing_translation() can apply the configured action instead
-	 * of WordPress 404-ing and canonical-redirecting.
-	 *
 	 * @param string $slug Post slug.
 	 * @param int    $language_id Current language ID (to exclude - already checked).
 	 * @param string $post_type Post type.
@@ -1522,13 +1165,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Whether the main query is a preview by a logged-in user, and which post
-	 * it names.
-	 *
-	 * Checks the query flag first, so a request that is not a preview costs
-	 * one property read. WP_Query::parse_query() sets `is_preview` from the
-	 * `preview` query var (wp-includes/class-wp-query.php:1032-1033) before
-	 * get_posts() fires pre_get_posts (:1916).
+	 * Whether the main query is a logged-in preview, and which post it names.
 	 *
 	 * @param \WP_Query $query The main query.
 	 * @return int -1 when this is not a logged-in preview, 0 when the preview
@@ -1540,13 +1177,8 @@ final class PostQueryFilter {
 			return -1;
 		}
 
-		// When a scalar preview_id arrives with preview_nonce, core's
-		// _show_post_preview() has already verified the nonce against this
-		// same (int) cast at init and refused the request on a mismatch
-		// (wp-includes/revision.php:897-903, hooked at
-		// wp-includes/default-filters.php:493). An
-		// array is read as no id here. Without a nonce the id is only a hint:
-		// every caller still requires edit_post on the post it names.
+		// With preview_nonce, core's _show_post_preview() verified this (int) id at init.
+		// Without it the id is only a hint: every caller still requires edit_post.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$preview_id = isset( $_GET['preview_id'] ) && is_scalar( $_GET['preview_id'] ) ? (int) $_GET['preview_id'] : 0;
 
@@ -1598,23 +1230,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Find the post a logged-in editor is previewing under a slug URL.
-	 *
-	 * The slug candidates in find_slug_candidates() are published posts only,
-	 * and its memo feeds public routing, so it is not widened for this. This
-	 * lookup is separate, runs only for a logged-in preview, and is not
-	 * memoised.
-	 *
-	 * With a preview_id the named post is the only candidate. Without one,
-	 * the slug is looked up among the protected statuses (draft, pending,
-	 * future and any custom status registered as protected); private posts
-	 * are not included, so a private translation opened without a preview_id
-	 * is left to the published lookups.
-	 *
-	 * A candidate must have this slug and post type, be linked in the current
-	 * language through a post-type group, match the requested page path when
-	 * one is given, and pass can_preview_post(). WP_Query still applies its
-	 * own status and capability check to whatever is returned
-	 * (wp-includes/class-wp-query.php:3535-3567).
+	 * Not memoised: the answer depends on the current user. Without a preview_id, protected statuses only, never private.
 	 *
 	 * @param string $slug        post_name to match.
 	 * @param int    $language_id Current language ID.
@@ -1690,18 +1306,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Whether a preview may be routed to this post: the current user can edit
-	 * it, and WP_Query's own status gate keeps it for them
-	 * (wp-includes/class-wp-query.php:3535-3567), so the route does not
-	 * replace today's fallback with a post that gate would drop.
-	 *
-	 * Uses the literal caps that gate uses (edit_post and read_post,
-	 * wp-includes/class-wp-query.php:2638-2639). edit_post is always
-	 * required; a public or protected status needs nothing more; a private
-	 * status also needs read_post, which edit_post does not imply. Any other
-	 * status (trash, auto-draft, other internal statuses) is refused, and so
-	 * is an unregistered one, which that gate would show to an editor: such a
-	 * request is left to the lookups that follow.
+	 * Whether a preview may be routed to this post: editable, and kept by WP_Query's own status gate.
+	 * Core's literal caps (edit_post, read_post for private), not Helper::object_permission: a wider check routes posts WP_Query drops.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return bool
@@ -1722,11 +1328,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Point the main query at the post find_preview_target() chose.
-	 *
-	 * Unlike the fallback routes it sets neither `perflocale_all_languages`
-	 * nor $loaded_fallback: the post is linked in the current language, so
-	 * handle_missing_translation() returns at its same-language check instead
-	 * of applying the missing-translation action.
+	 * No fallback flags: the post is in the current language.
 	 *
 	 * @param \WP_Query $query   The main query.
 	 * @param int       $post_id Post to load.
@@ -1750,12 +1352,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Prevent WordPress canonical redirect when a fallback post was loaded.
-	 *
-	 * When resolve_duplicate_slug() loads a default-language post because no
-	 * translation exists, the post's permalink won't match the current URL
-	 * (e.g. /de/product/foo/ vs /en/product/foo/). WordPress's redirect_canonical
-	 * would redirect to the default-language URL before handle_missing_translation()
-	 * can apply the configured action.
+	 * Otherwise it redirects before handle_missing_translation() can apply the configured action.
 	 *
 	 * @param string $redirect_url The redirect URL.
 	 * @param string $requested_url The original requested URL.
@@ -1766,12 +1363,7 @@ final class PostQueryFilter {
 			return false;
 		}
 
-		// Also block when the queried post's language differs from the
-		// current URL language - that's exactly when
-		// handle_missing_translation() wants to take over (fallback chain
-		// walk + configured action). Without this, WP's own canonical
-		// redirect beats our handler to template_redirect and 301s the
-		// visitor straight to the canonical sibling, bypassing our chain.
+		// Also when the post's language differs from the URL's: handle_missing_translation() decides.
 		if ( is_singular() ) {
 			$post = get_queried_object();
 
@@ -1783,11 +1375,7 @@ final class PostQueryFilter {
 					return false;
 				}
 
-				// Attachments are UNMANAGED (no language row), so the
-				// mismatch check above never blocks and core's canonical
-				// redirect permanently ejected /de/<attachment>/ visitors
-				// to the default language. Serve in-place under the prefix
-				// instead - same fallback untranslated posts get.
+				// Unlinked attachments are served in place under a non-default prefix.
 				if ( $current_lang_id > 0 && $post_lang_id === 0 && is_attachment() && ! $this->router->is_default_language() ) {
 					return false;
 				}
@@ -1798,10 +1386,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Filter WP_Query to only return posts in the current language.
-	 *
-	 * Modifies the query by adding a JOIN to translation_links and a
-	 * WHERE clause filtering by the current language ID.
+	 * Mark a WP_Query with the current language ID for modify_query_clauses().
 	 *
 	 * @param \WP_Query $query The WP_Query instance.
 	 * @return void
@@ -1838,69 +1423,23 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// An upstream integration already stamped an explicit language on
-		// this query (e.g. filter_rest_search_query scoping the block
-		// editor's link picker to the EDITED post's language). Overwriting
-		// the stamp with the request-detected language - the default
-		// language on wp-admin's unprefixed REST base - showed only
-		// default-language results with force-prefixed franken-URLs.
+		// Keep an explicit language stamp (filter_rest_search_query()).
 		if ( (int) $query->get( 'perflocale_language_id' ) > 0 ) {
 			return;
 		}
 
-		// Authenticated editor REST reads (site editor Pages data view,
-		// Navigation block link search, inserter queries) run on the
-		// UNPREFIXED REST base, which detection resolves to the default
-		// language - scoping those made every non-default-language page
-		// invisible in the site editor. Mirror the admin list-table
-		// behavior (all languages visible) for users who can edit posts;
-		// explicitly stamped queries (guard above) and anonymous frontend
-		// REST consumers stay language-scoped.
+		// Editor REST reads run on the unprefixed REST base (default language): show all languages, as in admin lists.
 		if ( defined( 'REST_REQUEST' ) && REST_REQUEST && current_user_can( 'edit_posts' ) ) {
 			return;
 		}
 
-		// Skip language filtering on taxonomy archive main queries.
-		// Each language has its own translated terms, so the term association
-		// already scopes posts to the correct language. Adding a post-level
-		// language filter on top causes 404s when the queried term belongs
-		// to a different language than the current URL context.
+		// Taxonomy archives: the term already scopes the posts; a post filter 404s another language's term.
 		if ( $query->is_main_query() && ( $query->is_tax() || $query->is_category() || $query->is_tag() ) ) {
 			return;
 		}
 
-		// Skip language filtering on explicit-ID singular main queries (?p=,
-		// ?page_id= - plain permalinks, previews, shortlinks, and the front
-		// page). The visitor named ONE specific object; applying the language
-		// WHERE here filters it out entirely (it IS linked, just to another
-		// language), the queried object comes back null, and WP core's
-		// redirect_canonical then 301s to the object's own-language canonical
-		// before handle_missing_translation() can walk the fallback chain -
-		// losing the visitor's language even when a sibling translation
-		// exists. Let the object load; the template_redirect handlers apply
-		// the configured language behavior (sibling redirect / fallback / 404).
-		// ⭐ `p` / `page_id` are exempt on ANY query, not just the main one.
-		// Naming an id is naming an id: such a query can only ever return the
-		// one object the caller already identified, so the language WHERE
-		// cannot filter it - it can only delete it. Nothing is leaked either,
-		// because the caller had to hold the id already, exactly as with the
-		// unfiltered `get_post( $id )`.
-		//
-		// This used to require is_main_query(), and that broke WooCommerce's
-		// block-theme single-product template. After the main query has loaded
-		// the product (including via PerfLocale's own default-language
-		// fallback), `ClassicTemplate::render_single_product()` re-queries it in
-		// a SECONDARY query -
-		//   new \WP_Query( [ 'post_type' => 'product', 'p' => get_the_ID() ] )
-		// (woocommerce/src/Blocks/BlockTypes/ClassicTemplate.php:260-265) - and
-		// loops `while ( have_posts() )` with NO else branch. Scoped, that
-		// query returned zero rows on every non-default language, so the header,
-		// breadcrumb and footer rendered while the entire product body - title,
-		// gallery, price, add-to-cart, tabs - silently disappeared.
-		//
-		// `is_attachment` stays main-query-only on purpose: it is a resolved
-		// query FLAG, not an id the caller named, so it does not carry the same
-		// "you already have this object" guarantee.
+		// `p` / `page_id` are exempt on ANY query: a named id can only be deleted by the language WHERE
+		// (WooCommerce re-queries the product by `p` in a secondary query). `is_attachment` stays main-only.
 		if (
 			(int) $query->get( 'p' ) > 0
 			|| (int) $query->get( 'page_id' ) > 0
@@ -1920,16 +1459,11 @@ final class PostQueryFilter {
 			$post_type = [ $post_type ];
 		}
 
-		// Exclude child post types that inherit language from their parent
-		// (e.g. product_variation). They must not be filtered independently.
+		// Child types (product_variation) inherit their parent's language.
 		$child_types = apply_filters( 'perflocale/query/child_post_types', [ 'product_variation' ] );
 		$post_type   = array_diff( (array) $post_type, $child_types );
 
-		// Infrastructure types are resolved by slug, never browsed by language.
-		// This is the site that hid a customised template part on every
-		// non-default language - see never_scoped_post_types(). Deliberately
-		// NOT folded into $child_types above: that seam means "inherits its
-		// language from a parent", and a template has no parent.
+		// Never-scoped types: not folded into $child_types, which means "inherits from a parent".
 		$post_type = array_diff( $post_type, $this->never_scoped_post_types() );
 
 		$translatable = $this->settings->get_translatable_post_types();
@@ -1954,10 +1488,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Record a front-end main query that filter_by_language() leaves without
-	 * a language condition for a reason that holds in every language: none
-	 * of its post types is translatable, or the
-	 * perflocale/query/include_all_languages filter opted it out.
+	 * Record a front-end main query left unscoped for a reason that holds in every language.
 	 *
 	 * @param \WP_Query $query The query.
 	 * @return void
@@ -1969,10 +1500,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Whether this main query lists the same rows in every language: PerfLocale
-	 * left it without a language condition because none of its post types is
-	 * translatable or the perflocale/query/include_all_languages filter opted
-	 * it out, and it still carries no language id.
+	 * Whether this main query lists the same rows in every language (left unscoped, no language id).
 	 *
 	 * @param \WP_Query $query This request's main query.
 	 * @return bool
@@ -1983,11 +1511,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Whether a comment-feed query should be language-scoped, and for which
-	 * language.
-	 *
-	 * Sitewide comment feeds only - a singular post's own comment feed is
-	 * already scoped by its post. Returns 0 to leave the query alone.
+	 * Language ID to scope a sitewide comment feed by, or 0 (singular feeds are scoped by their post).
 	 *
 	 * @param \WP_Query $query The comment feed's query.
 	 * @return int Language ID, or 0 to skip.
@@ -2032,9 +1556,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Restrict a sitewide comment feed to the current language's posts
-	 * (non-strict: comments on unmanaged posts stay visible everywhere,
-	 * matching the frontend fallback semantics).
+	 * Restrict a sitewide comment feed to the current language's posts, plus unmanaged posts.
 	 *
 	 * @param mixed     $where Current WHERE SQL.
 	 * @param \WP_Query $query The comment feed's query.
@@ -2057,23 +1579,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Scope the REST search endpoint (/wp/v2/search) to the language of the
-	 * post being edited.
-	 *
-	 * The block editor sends a `perflocale_post=<id>` param on every search
-	 * call (injected by the apiFetch middleware in editor-sidebar.js). We
-	 * resolve that post to a language ID and stamp it onto the search query
-	 * args. The existing `posts_clauses` filter then applies the JOIN +
-	 * language WHERE so only same-language results are returned, and the
-	 * /de/contact/ URL is the one Gutenberg shows in the typeahead.
-	 *
-	 * When the edited post has no language assignment yet (brand-new draft
-	 * created before any language metabox interaction, untranslated legacy
-	 * content), we fall back to the site's default language. Showing every
-	 * language mixed would produce duplicate-title rows like "/contact/"
-	 * and "/de/contact/" next to each other - confusing UX. Defaulting is
-	 * predictable and mirrors how the rest of the plugin treats unassigned
-	 * posts.
+	 * Scope /wp/v2/search to the language of the edited post (`perflocale_post`).
+	 * An unassigned post uses the default language, not all languages.
 	 *
 	 * @param array<string, mixed> $query_args Query arguments for WP_Query.
 	 * @param \WP_REST_Request     $request    REST request.
@@ -2093,19 +1600,10 @@ final class PostQueryFilter {
 
 		if ( $language_id > 0 ) {
 			$query_args['perflocale_language_id'] = $language_id;
-			// Strict mode: exclude posts with no language assignment. The
-			// default forgiving mode lets unmanaged posts appear in every
-			// language's results so legacy pre-PerfLocale content stays
-			// reachable on the frontend - but the link picker must NOT show
-			// them, because their permalink is the plain (default-lang)
-			// URL. An editor on a /de/ post who picks "/contact/" from the
-			// typeahead has no way to know that link lacks the /de/ prefix.
+			// Strict: an unmanaged post's permalink lacks the language prefix, so the picker must not offer it.
 			$query_args['perflocale_strict_language'] = true;
 
-			// Remember the target slug so the per-item URL filter can
-			// rewrite permalinks into the queried language even when
-			// UrlConverter's per-post lookup picks a different language
-			// for a post that lives in multiple language slots at once.
+			// Target slug for the result URL rewrite.
 			$slug = $this->lookup_language_slug_by_id( $language_id );
 
 			if ( $slug !== '' ) {
@@ -2117,16 +1615,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Force every REST search-result URL into the language the picker is
-	 * scoped to.
-	 *
-	 * Bound on `rest_request_after_callbacks` (fires from dispatch() so it
-	 * runs for both real HTTP requests AND rest_do_request() callers). The
-	 * sibling `rest_post_dispatch` only fires from the HTTP entry point and
-	 * would silently skip internal callers / unit tests. We narrow to the
-	 * search route + an active target slug captured by
-	 * filter_rest_search_query(), so unrelated endpoints (and unscoped
-	 * /wp/v2/search calls) are untouched.
+	 * Force every REST search-result URL into the language the picker is scoped to.
+	 * On rest_request_after_callbacks, not rest_post_dispatch, which skips rest_do_request() callers.
 	 *
 	 * @param \WP_REST_Response $response Outgoing REST response.
 	 * @param array             $handler  Route handler descriptor.
@@ -2175,17 +1665,14 @@ final class PostQueryFilter {
 			$response->set_data( $data );
 		}
 
-		// Single-shot: drop the target slug so a follow-up request on the
-		// same PHP process (CLI long-runner) doesn't reuse stale state.
+		// Single shot.
 		$this->rest_search_target_slug = '';
 
 		return $response;
 	}
 
 	/**
-	 * Look up a language's slug given its primary key id. Single-query and
-	 * cached behind the languages repo - safe to call from a per-request
-	 * hot path.
+	 * Look up an active language's slug by id.
 	 *
 	 * @param int $language_id Language ID.
 	 * @return string Slug, or '' if not found.
@@ -2204,19 +1691,14 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Resolve a post's language id from the translation_links table, falling
-	 * back to the default language when the post has no assignment.
-	 *
-	 * Mirrors TermQueryFilter::detect_post_language_id() so both pickers
-	 * share the same "unassigned → default" policy.
+	 * Resolve a post's language id, or the default language when unassigned.
+	 * Same policy as TermQueryFilter::detect_post_language_id().
 	 *
 	 * @param int $post_id Post ID.
 	 * @return int Language ID (0 only when there is no default language).
 	 */
 	private function detect_post_language_id( int $post_id ): int {
-		// Key by blog_id:post_id and live as a class-static so reset_static_caches()
-		// clears the memo on switch_blog (same Bundle-A pattern TermQueryFilter
-		// uses, which this method's docstring claims to mirror).
+		// Keyed by blog: the same post_id can map to another language on another subsite.
 		$key = get_current_blog_id() . ':' . $post_id;
 
 		if ( isset( self::$detect_post_lang_cache[ $key ] ) ) {
@@ -2239,10 +1721,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Modify query clauses to join translation links and filter by language.
-	 *
-	 * Registered once via register_hooks, applies to every query that has
-	 * the perflocale_language_id set (skips those that don't).
+	 * Join translation links and filter by language on queries marked with perflocale_language_id.
 	 *
 	 * @param array<string, string> $clauses SQL clauses.
 	 * @param \WP_Query             $query The query.
@@ -2255,22 +1734,12 @@ final class PostQueryFilter {
 			return $clauses;
 		}
 
-		// Zero-state short-circuit: with no translation groups on this blog
-		// the LEFT JOIN below is guaranteed to return zero links - and the
-		// language-WHERE clause would then keep every post unchanged. Skip
-		// the JOIN entirely so WP_Query's own SQL stays untouched. The
-		// `has_any_groups()` lookup is sub-µs on warm cache; on real
-		// multilingual sites the check passes and we proceed to the JOIN.
+		// No groups: the clause would keep every post, so leave core's SQL untouched.
 		if ( ! $this->get_groups_repo()->has_any_groups() ) {
 			return $clauses;
 		}
 
-		// Strict mode: callers that need "exactly this language, no unlinked
-		// fallback" set perflocale_strict_language on the query. Used by
-		// MenuManager so the nav-menus Pages/Posts pickers don't leak
-		// unmanaged posts into every menu. Other callers (normal frontend
-		// queries, admin list tables) keep the forgiving fallback so
-		// pre-PerfLocale content still appears.
+		// Strict (perflocale_strict_language): no unlinked fallback, for pickers. Others admit unmanaged posts.
 		$strict    = (bool) $query->get( 'perflocale_strict_language' );
 		$cache_key = $language_id . ( $strict ? ':s' : ':f' );
 
@@ -2286,20 +1755,9 @@ final class PostQueryFilter {
 		$links_table  = Schema::table( 'translation_links' );
 		$groups_table = Schema::table( 'translation_groups' );
 
-		// LEFT JOIN approach: posts match if linked to this language (strict)
-		// OR have no post-type link at all (non-strict/fallback), so MySQL uses
-		// index lookups instead of materializing a NOT IN set. The join onto
-		// translation_groups (type='post') replaces a `group_id IN (…)` list
-		// whose SQL text grew O(n) with group count (~100KB on 10k+ groups);
-		// the indexed join is constant-sized.
-		//
-		// translation_links is polymorphic - object_id is a post OR a term id
-		// - so a post whose ID equals a translated term's id would otherwise
-		// match that term-link on `object_id = posts.ID`, producing a spurious
-		// extra row that double-counts the post (and, via `_g.id IS NULL`,
-		// leaks it across languages). Nesting the type='post' filter into an
-		// INNER JOIN inside the LEFT JOIN restricts the link join to post-typed
-		// links only, so a colliding term row never reaches the result.
+		// LEFT JOIN, not NOT IN. object_id is a post OR term id: the nested INNER JOIN on type 'post'
+		// keeps a colliding term link out (it would duplicate rows and leak across languages).
+		// Table names are Schema::table() values: the fragment is returned to core, so it cannot be prepared.
 		$alias = self::LANGUAGE_ALIAS;
 
 		$join_sql = " LEFT JOIN ( {$links_table} AS {$alias}"
@@ -2307,22 +1765,8 @@ final class PostQueryFilter {
 			. " ON {$alias}_g.id = {$alias}.group_id AND {$alias}_g.type = 'post' )"
 			. " ON {$alias}.object_id = {$wpdb->posts}.ID";
 
-		// WHERE semantics: `{$alias}_g.id IS NOT NULL` = a post-typed link was
-		// found (the nested INNER JOIN already excluded any term-link sharing
-		// the object_id, so IS NULL means genuinely no post link). Strict mode
-		// requires a matching post-typed link in the current language;
-		// non-strict also admits unmanaged posts (no link) for fallback.
-		//
-		// Strict mode still admits posts of NON-translatable types: PerfLocale
-		// never gives them a per-language variant, so their permalink is the
-		// same language-neutral URL in every context. Excluding them would
-		// drop, e.g., a non-translatable CPT from the block-editor link picker
-		// on a translated post even though linking to it is correct.
-		// Subtracting the never-scoped types here is what puts them INSIDE the
-		// strict-mode escape hatch below ("...OR post_type NOT IN (list)"), so a
-		// strict caller admits them unconditionally. Exempting site 1226 alone
-		// is NOT enough: a strict caller sets the language id itself, so this
-		// clause is reached without ever passing through filter_by_language().
+		// Strict still admits non-translatable and never-scoped types (language-neutral URLs). Strict callers
+		// set the language id themselves and skip filter_by_language(), so never-scoped types are subtracted here too.
 		$translatable = array_values(
 			array_diff( $this->settings->get_translatable_post_types(), $this->never_scoped_post_types() )
 		);
@@ -2358,35 +1802,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Record the exact COUNT SQL for a query whose SQL_CALC_FOUND_ROWS was
-	 * suppressed by optimize_found_rows(). set_found_posts() runs it (or serves
-	 * a cached result) on the_posts.
-	 *
-	 * Hooked to `posts_clauses_request` at PHP_INT_MAX - NOT called from
-	 * modify_query_clauses() - so the stashed clauses are the FINAL ones WP
-	 * assembles into the executed query. posts_clauses_request fires after
-	 * every posts_clauses callback at every priority; stashing inside our own
-	 * prio-10 posts_clauses callback would silently diverge from the real query
-	 * whenever another plugin edits clauses at prio 11+ (SQL_CALC_FOUND_ROWS,
-	 * which this replaces, always counted the final query).
-	 *
-	 * Invariant: this only stashes when the query carries the
-	 * `perflocale_optimize_found_rows` flag, which optimize_found_rows() sets
-	 * only after asserting the query is a non-suppressed front-end main query -
-	 * and WP fires posts_clauses_request for every non-suppressed query - so a
-	 * flagged query always gets stashed and set_found_posts() always finds its
-	 * entry.
-	 *
-	 * The COUNT mirrors what SQL_CALC_FOUND_ROWS counts: COUNT(DISTINCT ID) when
-	 * the query is grouped/distinct (tax archives group by ID for de-duplication,
-	 * where SQL_CALC returns the group count), COUNT(*) otherwise. Verified
-	 * byte-identical to found_posts across home/category/tag/author/date archives.
-	 *
-	 * We also record whether the query has a LIMIT clause. WP core only runs a
-	 * found-rows count when `!empty($limits)`; a "show all" / nopaging query
-	 * (empty limits) instead takes found_posts from count($posts). set_found_posts()
-	 * reproduces both branches off this flag, so the count query is built only
-	 * when it will actually be used.
+	 * Record the exact COUNT SQL for a query optimize_found_rows() flagged.
+	 * On posts_clauses_request at PHP_INT_MAX, not in modify_query_clauses(): only the final clauses match what SQL_CALC counted.
 	 *
 	 * @param mixed     $clauses Final WP_Query clauses (array; typed mixed because
 	 *                           any filter callback earlier in the chain may
@@ -2410,11 +1827,7 @@ final class PostQueryFilter {
 			$sql = self::count_sql( $clauses );
 		}
 
-		// Safety valve for CLI long-runners: entries whose query never reaches
-		// the_posts (third-party short-circuits, exotic query shapes) would
-		// otherwise accumulate - and a recycled spl_object_id could then match
-		// a stale entry. No real request has anywhere near this many in-flight
-		// optimized main queries, so a reset here only ever drops dead entries.
+		// Drop dead entries in long runs: a recycled spl_object_id could match one.
 		if ( count( self::$found_rows_data ) > 50 ) {
 			self::$found_rows_data = [];
 		}
@@ -2429,13 +1842,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Drop the found-rows stash when another plugin short-circuits the query.
-	 *
-	 * Hooked to posts_pre_query at PHP_INT_MAX. A non-null return here (e.g.
-	 * ElasticPress serving results from its index) means WP never executes the
-	 * SQL our stashed COUNT mirrors - and the short-circuiting plugin supplies
-	 * its own found_posts. Unstashing makes set_found_posts() bail so that
-	 * value is left untouched instead of being clobbered with a count of a
-	 * query that never ran.
+	 * That plugin (ElasticPress) supplies its own found_posts.
 	 *
 	 * @param array<int, \WP_Post|int>|null $posts Short-circuit result, or null.
 	 * @param \WP_Query                     $query The query.
@@ -2488,8 +1895,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Keep the request core built for the kept main listing, before any
-	 * posts_request callback changes it.
+	 * Keep the request core built for the kept main listing, before posts_request callbacks.
 	 *
 	 * @param mixed     $request The SQL request.
 	 * @param \WP_Query $query   The query.
@@ -2506,10 +1912,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Confirm the kept main-listing clauses are the ones the main query runs:
-	 * drop them when another plugin answers the query (non-null posts_pre_query),
-	 * when a posts_request callback changed the request core built, or when that
-	 * request does not carry the kept JOIN and WHERE.
+	 * Confirm the kept main-listing clauses are the ones the main query runs, else drop them.
 	 *
 	 * @param mixed     $posts Short-circuit result, or null.
 	 * @param \WP_Query $query The query.
@@ -2544,17 +1947,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Whether page N of this request's main listing has rows in each given language.
-	 *
-	 * A page exists in language X when the listing's rows in X outnumber the
-	 * offset of the main query's final LIMIT (0 without one). The rows are those
-	 * of the main query's final JOIN and WHERE with X's language condition in
-	 * place of the current one. Each language is answered from the found-rows
-	 * group: the exact count (the entry X's own main query uses for its
-	 * pagination, which the main query's grouped count stores for every
-	 * language when it counted this listing: count_listing_in_languages()),
-	 * else a stored lower bound, else one bounded row check whose result is
-	 * stored for later pages. Entries carry the group generation and expire
-	 * after an hour.
+	 * Answered from the found-rows group (exact count, else lower bound, else one bounded row check).
 	 *
 	 * @param \WP_Query $query        This request's main query.
 	 * @param int[]     $language_ids Languages to answer.
@@ -2680,12 +2073,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * The kept main-listing clauses of this query and its own language
-	 * condition, when the listing's row counts can be derived from them: the
-	 * record is this query's and confirmed (confirm_main_listing()), the
-	 * language condition appears exactly once in the WHERE, the listing is
-	 * grouped by nothing but the post id, and a DISTINCT listing selects whole
-	 * rows or ids. Null otherwise.
+	 * The kept, confirmed main-listing clauses and own language condition, or null.
+	 * Null unless the condition appears once, GROUP BY is only the post id, and DISTINCT selects rows or ids.
 	 *
 	 * @param \WP_Query $query The main query.
 	 * @return array{clauses: array{oid: int, language_id: int, confirmed: bool, request: ?string, distinct: string, fields: string, join: string, where: string, groupby: string, orderby: string, limits: string}, own: string}|null
@@ -2724,12 +2113,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Rows a bounded check of one language reads at most on a page that
-	 * starts at row $start: the page and the look-ahead, or twice a stored
-	 * lower bound the page has passed, so a crawl through a long listing
-	 * needs few checks. Twice the bound is limited to half again the page and
-	 * look-ahead, so one request past a bound reads at most half again the
-	 * rows of the listing copy it replaces.
+	 * Most rows a bounded check reads: the page plus look-ahead, or twice a passed lower bound.
+	 * Doubling is capped at 1.5x the page plus look-ahead, so a crawl needs few checks without a large read.
 	 *
 	 * @param int      $start     Offset of the page's first row.
 	 * @param int      $lookahead Rows read beyond the page's first row.
@@ -2743,22 +2128,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Count this listing in every active language with one grouped statement,
-	 * and store each language's count where that language's own pagination
-	 * and listing_page_exists() read it.
-	 *
-	 * Runs when the front-end main query on page 2 or later of a listing
-	 * misses its own count and its alternates are decided from the listing's
-	 * row counts, so neither the alternates nor the other languages' own pages
-	 * count the listing again. The statement groups the listing's rows by
-	 * language (0 for a post with no post link, which every language's
-	 * condition admits); a language's count is its own group plus group 0.
-	 * That equals the language's own COUNT when its language condition is a
-	 * conjunct of the WHERE, which a first statement checks: with the
-	 * condition replaced by false, the WHERE must admit no row (MySQL answers
-	 * a conjunctive WHERE with a false conjunct without reading a row).
-	 * Otherwise, or when a statement fails, nothing is stored and null is
-	 * returned, and the caller runs the single COUNT.
+	 * Count this listing in every active language with one grouped statement, and store each count.
+	 * Valid only when the language condition is a conjunct: the 1=0 probe proves it. See docs-ai/11-code-rationale.md, "PostQueryFilter: grouped listing count".
 	 *
 	 * @param \WP_Query                      $query     The main query.
 	 * @param string                         $count_sql The query's own COUNT statement (count_sql()).
@@ -2839,14 +2210,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Store found-rows entries for an hour.
-	 *
-	 * With a persistent object cache each entry goes through CacheManager::set().
-	 * Without one, the value and timeout rows of every entry are written in one
-	 * INSERT ... ON DUPLICATE KEY UPDATE, so an existing (expired) row is updated
-	 * in place and the write is one statement however many languages it holds.
-	 * The rows are the ones set_transient() writes: CacheManager's envelope
-	 * under `_transient_<name>`, the expiry under `_transient_timeout_<name>`,
-	 * neither autoloaded.
+	 * Without an object cache: one upsert of the exact rows set_transient() writes (value + timeout, not autoloaded).
 	 *
 	 * @param \PerfLocale\Cache\CacheManager $cache   Cache manager.
 	 * @param array<string, int>             $entries Value by key in the found-rows group.
@@ -2891,9 +2255,7 @@ final class PostQueryFilter {
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One (%s, %s, 'no') tuple per row, all values bound; the table name through %i.
 		$wpdb->query( $wpdb->prepare( 'INSERT INTO %i (option_name, option_value, autoload) VALUES ' . implode( ', ', array_fill( 0, $row_count, "(%s, %s, 'no')" ) ) . ' ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = VALUES(autoload)', ...$args ) );
 
-		// The rows were written without update_option(). Without a persistent
-		// object cache the options cache lives for this request only: put the
-		// written values in it and take the names out of its negative cache.
+		// Written without update_option(): sync the options cache and its negative cache.
 		$notoptions = wp_cache_get( 'notoptions', 'options' );
 		$notoptions = is_array( $notoptions ) ? $notoptions : [];
 
@@ -2922,9 +2284,7 @@ final class PostQueryFilter {
 
 	/**
 	 * The COUNT statement that reproduces a query's found rows from its final clauses.
-	 *
-	 * The COUNT mirrors what SQL_CALC_FOUND_ROWS counts: COUNT(DISTINCT ID) when
-	 * the query is grouped or distinct, COUNT(*) otherwise.
+	 * Grouped or distinct queries count DISTINCT ID, as SQL_CALC_FOUND_ROWS does.
 	 *
 	 * @param array<mixed> $clauses Final clauses (distinct, groupby, join, where).
 	 * @return string
@@ -2941,13 +2301,7 @@ final class PostQueryFilter {
 		$sql = "SELECT {$select} FROM {$wpdb->posts} "
 			. (string) ( $clauses['join'] ?? '' ) . ' WHERE 1=1 ' . (string) ( $clauses['where'] ?? '' );
 
-		// wpdb::prepare() masks literal % characters with a RANDOM-per-request
-		// {hash} token (placeholder_escape) that wpdb::query() converts back to
-		// % just before execution. LIKE clauses ('%term%') therefore
-		// differ byte-wise on every request even when logically identical -
-		// which would give the count a fresh cache key per request and a 100%
-		// miss rate. Normalize exactly the way wpdb does at execution time so
-		// the key (and the SQL we later run) is stable.
+		// prepare() masks % with a per-request random token: unmask it, or LIKE queries never hit the cache key.
 		return (string) $wpdb->remove_placeholder_escape( $sql );
 	}
 
@@ -2964,14 +2318,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Row count of a listing's final clauses, read no further than $cap rows.
-	 *
-	 * A grouped or distinct listing counts distinct post ids (the COUNT(DISTINCT)
-	 * of count_sql()); any other listing counts joined rows (its COUNT(*)). An
-	 * ungrouped listing is read in type_status_date index order, in the direction
-	 * of the listing's post_date order (descending unless the listing is ordered by
-	 * post_date ascending): the index serves that order over several status ranges
-	 * without a sort, and the direction is the one the listing itself is read in.
-	 * The order changes which rows are read first, never the count.
+	 * The ORDER BY follows the type_status_date index in the listing's direction: it avoids a sort, never changes the count.
 	 *
 	 * @param array<mixed> $clauses Final clauses.
 	 * @param int          $cap     Rows to read at most (>= 1).
@@ -3002,12 +2349,7 @@ final class PostQueryFilter {
 
 	/**
 	 * One found-rows entry, as a number, or null when it is missing or expired.
-	 *
-	 * Without a persistent object cache the entry is read from its option rows,
-	 * which listing_page_exists() has primed: an expired row is a miss and stays
-	 * in place for the next write to update. get_transient() would delete both
-	 * rows on that read. With a persistent object cache, CacheManager's layers
-	 * are read.
+	 * Reads the option rows directly: get_transient() would delete an expired row the next write updates in place.
 	 *
 	 * @param \PerfLocale\Cache\CacheManager $cache Cache manager.
 	 * @param string                         $key   Key in the found-rows group.
@@ -3034,19 +2376,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Suppress WP core's SQL_CALC_FOUND_ROWS on the front-end main archive query.
-	 *
-	 * SQL_CALC_FOUND_ROWS is deprecated (MySQL 8.0.17+) and, combined with the
-	 * language LEFT JOIN this class adds, forces MySQL to scan every matching row
-	 * - ignoring LIMIT - to produce the count. On large sites that turns a
-	 * sub-millisecond indexed LIMIT lookup into a full O(matching-rows) scan on
-	 * every archive view. Suppressing it lets the main query use the index + LIMIT;
-	 * set_found_posts() supplies an exact, cached count so pagination is unchanged.
-	 *
-	 * Scope is deliberately narrow: front-end main query only (excludes admin,
-	 * REST, and secondary queries), not singular, not a search, not an explicit
-	 * no_found_rows opt-out, and only queries PerfLocale actually filters
-	 * (language id attached + translation groups exist). Everything else is
-	 * left 100% untouched.
+	 * With the language LEFT JOIN it scans every matching row; set_found_posts() supplies an exact cached count.
 	 *
 	 * @param \WP_Query $query The query being parsed.
 	 * @return void
@@ -3056,22 +2386,17 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// A search keeps core's count. Its default relevance order already
-		// reads every matching row, so SQL_CALC_FOUND_ROWS adds no scan there,
-		// while a stored count is one more cache entry (two option rows
-		// without a persistent object cache) per distinct search term.
+		// A search reads every row for relevance anyway; a stored count per term would only add rows.
 		if ( $query->is_search() ) {
 			return;
 		}
 
-		// Respect an explicit opt-out (e.g. a caching plugin that computes its
-		// own count) and any query already skipping the count.
+		// Respect an explicit opt-out.
 		if ( $query->get( 'no_found_rows' ) ) {
 			return;
 		}
 
-		// Singular views (single post/page) don't paginate a result set - the
-		// SQL_CALC scan there is trivial and found_posts is irrelevant.
+		// Singular views do not paginate.
 		if (
 			'' !== (string) $query->get( 'name' )
 			|| '' !== (string) $query->get( 'pagename' )
@@ -3081,20 +2406,13 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Non-default `fields` shapes (ids / id=>parent) are only reachable on a
-		// main query via unusual third-party pre_get_posts callbacks, and some
-		// of their code paths skip the_posts - which would leave found_posts at
-		// 0 with no set_found_posts() to supply it. Not worth optimizing; keep
-		// WP's native counting there.
+		// Other `fields` shapes can skip the_posts, which would leave found_posts at 0.
 		$fields = (string) $query->get( 'fields' );
 		if ( $fields !== '' && $fields !== 'all' ) {
 			return;
 		}
 
-		// Only queries carrying PerfLocale's language JOIN suffer the scan. The
-		// id is attached by filter_by_language() at pre_get_posts prio 5; it is
-		// intentionally NOT set for tax/category/tag main queries (which this
-		// class does not language-JOIN), so those keep WP's native behaviour.
+		// Only queries carrying the language JOIN (not taxonomy archives).
 		if ( (int) $query->get( 'perflocale_language_id' ) === 0 ) {
 			return;
 		}
@@ -3104,8 +2422,7 @@ final class PostQueryFilter {
 		}
 
 		/**
-		 * Master switch for the found-rows pagination optimization. Return false
-		 * to keep WP core's SQL_CALC_FOUND_ROWS behaviour for every query.
+		 * Master switch for the found-rows optimization; false keeps core's SQL_CALC_FOUND_ROWS.
 		 *
 		 * @param bool      $enabled Whether to optimize this query. Default true.
 		 * @param \WP_Query $query   The query being parsed.
@@ -3119,13 +2436,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Supply found_posts / max_num_pages for a query whose SQL_CALC was
-	 * suppressed by optimize_found_rows(), reproducing WP core's own
-	 * WP_Query::set_found_posts() branch-for-branch: bail on an empty posts array
-	 * (out-of-range/empty pages keep found_posts at 0); for a LIMITed query use
-	 * the count (generationally cached, or run once and cached); for a
-	 * show-all/nopaging query use count($posts); apply the `found_posts` filter;
-	 * and set max_num_pages only when a LIMIT was present.
+	 * Supply found_posts / max_num_pages for a query optimize_found_rows() changed.
+	 * Mirrors WP_Query::set_found_posts() branch for branch (empty posts, LIMIT, `found_posts` filter).
 	 *
 	 * @param mixed     $posts Posts returned by the query (array in normal flow).
 	 * @param \WP_Query $query The query.
@@ -3140,14 +2452,7 @@ final class PostQueryFilter {
 		$data = self::$found_rows_data[ $oid ] ?? null;
 		unset( self::$found_rows_data[ $oid ] );
 
-		// Mirror WP core: bail on an empty posts array (found_posts stays 0), and
-		// defensively bail if the stash is somehow missing. stash_found_rows_count()
-		// runs on posts_clauses_request at PHP_INT_MAX for every query carrying
-		// the perflocale_optimize_found_rows flag, so a flagged query that
-		// reaches the_posts always has an entry - except when
-		// unstash_on_short_circuit() deliberately removed it because another
-		// plugin short-circuited posts_pre_query and is supplying its own
-		// found_posts. Bailing leaves that value untouched.
+		// Empty posts keep 0, as in core. No stash: a short-circuiting plugin supplies found_posts.
 		if ( $data === null || ( is_array( $posts ) && $posts === [] ) ) {
 			return $posts;
 		}
@@ -3159,27 +2464,14 @@ final class PostQueryFilter {
 				return $posts;
 			}
 
-			// Fold the group generation into the key itself. flush_found_rows_cache()
-			// invalidates by bumping the generation, but only the L2 object-cache key
-			// is generation-prefixed - the L3 transient key is not. On a site with no
-			// persistent object cache the count lives in that transient, so a bare
-			// bump would leave it stale. Embedding the generation in the key changes
-			// the key on every bump, so L1/L2/L3 alike miss the old entry and the
-			// count is recomputed. Orphaned prior-generation transients self-expire
-			// via the TTL.
+			// Generation in the key: only L2 keys are generation-prefixed, so a bump alone leaves the L3 transient stale.
 			$key = self::found_rows_key( $data['sql'] );
 
-			// is_numeric, NOT is_int: the Redis object-cache drop-in stores bare
-			// integers as numeric strings and returns them as strings on a
-			// cross-request read (same-process reads come back from its runtime
-			// cache still typed int, which masks this in CLI tests). A strict
-			// is_int() here rejects every warm read and re-runs the COUNT on
-			// every request.
+			// is_numeric, not is_int: Redis returns stored integers as strings across requests.
 			$cached = $cache->get_cached( $key, self::FOUND_ROWS_GROUP );
 			$count  = is_numeric( $cached ) ? (int) $cached : null;
 
-			// Page 2 and later of a listing whose alternates are decided from its
-			// row counts: every language's count in one statement, stored.
+			// Page 2+: every language's count in one statement.
 			if ( $count === null ) {
 				$count = $this->count_listing_in_languages( $query, $data['sql'], $cache );
 			}
@@ -3190,20 +2482,17 @@ final class PostQueryFilter {
 				$raw   = $wpdb->get_var( $data['sql'] );
 				$count = is_numeric( $raw ) ? (int) $raw : 0;
 
-				// A failed COUNT (get_var() returns null) gives this request 0, as
-				// SQL_CALC_FOUND_ROWS would, and is not cached: other languages' alternates
-				// read this entry as the listing's exact row count.
+				// A failed COUNT gives 0 and is not cached: alternates read this entry as an exact count.
 				if ( is_numeric( $raw ) ) {
 					$cache->set( $key, $count, HOUR_IN_SECONDS, self::FOUND_ROWS_GROUP );
 				}
 			}
 		} else {
-			// No LIMIT (show all / nopaging): WP core counts the returned posts.
+			// No LIMIT: core counts the returned posts.
 			$count = is_array( $posts ) ? count( $posts ) : ( $posts === null ? 0 : 1 );
 		}
 
-		// Re-apply WP core's found_posts filter so plugins that hook it still run
-		// for these queries - WP skips it when no_found_rows is set.
+		// Core skips the found_posts filter when no_found_rows is set.
 		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- 'found_posts' is a WP core hook we deliberately re-apply, not a plugin-defined one.
 		$count = (int) apply_filters_ref_array( 'found_posts', [ $count, $query ] );
 
@@ -3221,22 +2510,14 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Bump the found_posts count-cache generation on a publish-boundary
-	 * transition. Fires on every status change; only a post entering or leaving
-	 * 'publish' can move an archive count, so skip everything else to avoid
-	 * needless cache churn (e.g. draft autosaves, publish→publish edits).
+	 * Bump the found_posts count-cache generation when either status is publish.
 	 *
 	 * @param string $new_status New post status.
 	 * @param string $old_status Old post status.
 	 * @return void
 	 */
 	public function flush_found_rows_on_transition( $new_status, $old_status ): void {
-		// Skip only when NEITHER side is published (draft→draft autosaves etc.).
-		// publish→publish deliberately bumps: editing a published post can move
-		// it between date/author/post-type archives without a status change, so
-		// skipping same-status saves served stale counts (page-2 links that 404)
-		// for up to the cache TTL. WP core bumps its own `last_changed` on these
-		// saves too, so this adds no invalidation the baseline didn't already pay.
+		// publish to publish bumps too: an edit can move a post between date/author archives.
 		if ( $new_status !== 'publish' && $old_status !== 'publish' ) {
 			return;
 		}
@@ -3245,11 +2526,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Bump the count-cache generation when a PUBLISHED post is permanently
-	 * deleted (which fires no transition_post_status). Deleting a draft,
-	 * auto-draft, revision, or already-trashed post can't move a published
-	 * archive count - and those are the bulk of deleted_post fires (revision GC,
-	 * auto-draft cleanup) - so skip them to avoid needless cache churn.
+	 * Bump the count-cache generation when a published post is permanently deleted.
+	 * Deletion fires no transition_post_status.
 	 *
 	 * @param int          $post_id Deleted post ID (unused; kept for the hook signature).
 	 * @param \WP_Post|null $post   The deleted post object (WP 5.5+), or null.
@@ -3264,9 +2542,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Invalidate every cached found_posts count for the current blog by bumping
-	 * the generation token. Cheap (one autoloaded-option write) and per-blog
-	 * isolated; the next archive view recomputes and re-caches.
+	 * Invalidate every cached found_posts count for the current blog (generation bump).
 	 *
 	 * @return void
 	 */
@@ -3307,14 +2583,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Build (and memoise) the JOIN + WHERE that scope a Previous/Next query to
-	 * the VIEWED post's language, mirroring modify_query_clauses()' non-strict
-	 * fallback semantics. Returns null when scoping doesn't apply (admin, a
-	 * non-translatable post type, an unassigned post, or a site with no groups)
-	 * so the filters pass the SQL through untouched.
-	 *
-	 * The JOIN keys on `p.ID` because get_adjacent_post() queries
-	 * `FROM {$wpdb->posts} AS p`, not the bare posts table.
+	 * Memoised JOIN + WHERE scoping a Previous/Next query to the viewed post's language, or null.
+	 * Keys on `p.ID`: get_adjacent_post() aliases the posts table as `p`.
 	 *
 	 * @param \WP_Post|null $post Viewed post.
 	 * @return array{join: string, where: string}|null
@@ -3337,12 +2607,7 @@ final class PostQueryFilter {
 		) {
 			$language_id = $this->get_post_language_id( (int) $post->ID );
 
-			// An UNMANAGED viewed post (no language assignment) must not
-			// drop scoping entirely - the request language still defines
-			// what prev/next should offer, otherwise a /de/ visitor gets
-			// cross-language adjacent links (mirrors modify_query_clauses'
-			// request-language fallback). Unmanaged neighbours stay included
-			// via the OR-IS-NULL clause below either way.
+			// An unmanaged viewed post still scopes by the request language.
 			if ( $language_id === 0 ) {
 				$language_id = $this->router->get_current_language_id();
 			}
@@ -3360,9 +2625,7 @@ final class PostQueryFilter {
 					. " ON {$alias}_g.id = {$alias}.group_id AND {$alias}_g.type = 'post' )"
 					. " ON {$alias}.object_id = p.ID";
 
-				// Non-strict (fallback parity with the frontend loop): same-
-				// language linked posts OR unmanaged posts (no post-link); other
-				// languages are excluded.
+				// Non-strict, as in the front-end loop.
 				$where = $wpdb->prepare(
 					" AND ( ( {$alias}.language_id = %d AND {$alias}_g.id IS NOT NULL ) OR {$alias}_g.id IS NULL )",
 					$language_id
@@ -3383,10 +2646,7 @@ final class PostQueryFilter {
 
 	/**
 	 * Filter get_pages() results by the current language.
-	 *
-	 * WordPress's wp_page_menu() fallback (used by themes like Neve when no
-	 * menu is assigned) calls get_pages() which bypasses WP_Query language
-	 * filtering. This ensures only pages in the current language are returned.
+	 * get_pages() (the wp_page_menu() fallback) bypasses WP_Query filtering.
 	 *
 	 * @param array<int, \WP_Post> $pages Pages returned by get_pages().
 	 * @param array<string, mixed> $args Parsed get_pages() arguments.
@@ -3397,10 +2657,7 @@ final class PostQueryFilter {
 			return $pages;
 		}
 
-		// Cache request-constants (current language + translatable types) so
-		// the 10+ invocations per archive page don't each redo these.
-		// Class-static (not method-static) so reset_static_caches() can nuke
-		// it on switch_blog without stale language context.
+		// Class static so reset_static_caches() clears it on switch_blog.
 		if ( self::$get_pages_cfg_cache === null ) {
 			self::$get_pages_cfg_cache = [
 				'lang_id' => $this->router->get_current_language_id(),
@@ -3411,12 +2668,7 @@ final class PostQueryFilter {
 			return $pages;
 		}
 
-		// get_pages() defaults to 'page' but accepts any hierarchical type
-		// (and WP_Query-style arrays). Translatability is per-type, so gate on
-		// the QUERIED type(s) - a translatable hierarchical CPT must be
-		// filtered even when 'page' itself is not translatable. Unlinked posts
-		// are always KEPT below, so for a mixed array one translatable member
-		// is enough to make filtering both safe and necessary.
+		// Gate on the queried types: one translatable member suffices, as unlinked pages are kept.
 		$queried = (array) ( $args['post_type'] ?? 'page' );
 
 		if ( array_intersect( $queried, self::$get_pages_cfg_cache['tt'] ) === [] ) {
@@ -3424,10 +2676,7 @@ final class PostQueryFilter {
 		}
 		$language_id = self::$get_pages_cfg_cache['lang_id'];
 
-		// Bulk-hydrate the per-page cache for unseen IDs. Scoping the query to
-		// only the IDs in `$pages` (a bounded IN-list, ~100–200µs) avoids
-		// loading the FULL post-type translation_links table (~1.7ms at 1k+
-		// rows) and caches the results for later calls.
+		// Hydrate only the unseen IDs.
 		if ( self::$page_language_map_cache === null ) {
 			self::$page_language_map_cache = [];
 		}
@@ -3445,23 +2694,13 @@ final class PostQueryFilter {
 		if ( $needs_lookup !== [] ) {
 			$this->hydrate_page_language_map( $needs_lookup );
 
-			// Also prime the TRANSLATIONS cache for these pages in the same
-			// batch: the page-list block / wp_list_pages render that called
-			// get_pages will fire filter_page_link for every page next, and
-			// each one needs get_translations(). Without this, every page
-			// pays a cold per-object lookup (~85µs against Redis, more
-			// against the DB) - ~100 menu pages ≈ 9ms per request. One
-			// batched prime makes them all L1 hits.
+			// filter_page_link() runs next for every page and needs its translations.
 			$this->get_groups_repo()->prime_translations( \PerfLocale\Enum\ObjectType::Post, $needs_lookup );
 		}
 
 		$lang_map = self::$page_language_map_cache;
 
-		// Two-pass loop: pass 1 detects whether ANY page needs dropping,
-		// so the common case (all pages already match the current language)
-		// returns the original $pages array unchanged - no allocation, no
-		// rebuild. array_filter always walks every element AND rebuilds
-		// the array even when nothing changes.
+		// Pass 1: return $pages unchanged when nothing is dropped.
 		$needs_filter = false;
 
 		foreach ( $pages as $page ) {
@@ -3493,12 +2732,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Populate `page_language_map_cache` with rows for the given post IDs.
-	 *
-	 * Uses a single IN-list query scoped to exactly the IDs we need -
-	 * scales O(IDs) rather than O(all-translated-posts) as the previous
-	 * full-table scan did. IDs without a translation row get a null
-	 * sentinel so subsequent calls don't re-query them.
+	 * Populate `page_language_map_cache` for the given post IDs; unlinked IDs get null.
 	 *
 	 * @param array<int, int> $post_ids Post IDs to hydrate.
 	 * @return void
@@ -3508,13 +2742,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Zero-state short-circuit: if no translation groups exist on
-		// this blog, the JOIN below is guaranteed to return 0 rows. Seed
-		// the cache with negative entries so subsequent `filter_get_pages`
-		// calls hit the cache instead of repeating this fruitless query.
-		// `has_any_groups()` caches its TRUE answer aggressively (L1 + L2
-		// across requests), so the check is sub-µs on real multilingual
-		// sites and we proceed to the JOIN below.
+		// No groups: negative-cache every ID.
 		$groups_repo = $this->get_groups_repo();
 
 		if ( ! $groups_repo->has_any_groups() ) {
@@ -3527,11 +2755,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Eager-link-map fast path. On sites under the size caps, every
-		// post translation link is already in an alloptions-cached map
-		// (no DB roundtrip per request). Pull the relevant rows from
-		// there instead of repeating the JOIN below. Falls through to
-		// the JOIN on bigger sites where get_eager_link_map returns null.
+		// Eager link map (null above the size caps).
 		$eager_map = $groups_repo->get_eager_link_map( \PerfLocale\Enum\ObjectType::Post );
 
 		if ( is_array( $eager_map ) ) {
@@ -3548,7 +2772,7 @@ final class PostQueryFilter {
 					}
 				}
 
-				// Unmanaged (no translation group) → negative cache.
+				// Unmanaged: negative cache.
 				if ( ! array_key_exists( $pid, self::$page_language_map_cache ) ) {
 					self::$page_language_map_cache[ $pid ] = null;
 				}
@@ -3583,7 +2807,7 @@ final class PostQueryFilter {
 			self::$page_language_map_cache[ (int) $row->object_id ] = (int) $row->language_id;
 		}
 
-		// Negative-cache unmanaged IDs so we don't re-query them next call.
+		// Negative-cache unmanaged IDs.
 		foreach ( $post_ids as $pid ) {
 			if ( ! array_key_exists( $pid, self::$page_language_map_cache ) ) {
 				self::$page_language_map_cache[ $pid ] = null;
@@ -3592,24 +2816,13 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Handle missing translations on singular pages.
-	 *
-	 * When viewing a post/page in a language that has no translation,
-	 * apply the configured missing_translation_action:
-	 * - show_default: show the post as-is in its original language (no redirect)
-	 * - show_404: return a 404 error
-	 * - redirect_default: redirect to the default-language version of the post
-	 *
-	 * Also implements language fallback chain: if the current language
-	 * has a fallback configured, try the fallback language first.
+	 * Apply missing_translation_action (show_default, show_404, redirect_default) on singular pages.
+	 * Walks the language fallback chain first.
 	 *
 	 * @return void
 	 */
 	public function handle_missing_translation(): void {
-		// Re-entry fuse: even if template_redirect somehow fires twice in
-		// one request, never act twice. Cheap; avoids edge-case double
-		// redirects (e.g. interaction with third-party template_redirect
-		// handlers that re-trigger the hook chain).
+		// Re-entry fuse: never act twice in one request.
 		static $handled = false;
 
 		if ( $handled ) {
@@ -3618,10 +2831,7 @@ final class PostQueryFilter {
 
 		$handled = true;
 
-		// Sentinel guard: if this request is the landing point of a
-		// fallback redirect we just issued, never fall back again. Even if
-		// a translation-group inconsistency would otherwise cause a loop,
-		// the presence of `?perflocale_fb=1` short-circuits it.
+		// Landing on our own fallback redirect: never fall back again (loop guard).
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( ! empty( $_GET['perflocale_fb'] ) ) {
 			return;
@@ -3631,10 +2841,7 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Body-preserving methods only. POST/PUT/DELETE/PATCH would lose
-		// their payload through a 302, so we skip the fallback walker on
-		// those entirely - WP handles the request normally, form
-		// submissions reach their handlers.
+		// GET/HEAD only: a redirect drops a POST body.
 		$method = strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) : 'GET' );
 
 		if ( $method !== 'GET' && $method !== 'HEAD' ) {
@@ -3660,14 +2867,11 @@ final class PostQueryFilter {
 			return;
 		}
 
-		// Check if this post IS in the current language.
+		// Is this post in the current language?
 		$post_lang = $this->get_post_language_id( $post->ID );
 		$default   = $this->router->get_default_language();
 
-		// A post with no translation link (a lone item an importer or a plain
-		// WordPress install left unassigned) is default-language content: it
-		// is served on its default-language URL, and elsewhere it is the
-		// default-language version the actions below fall back to.
+		// An unlinked post is default-language content.
 		$unlinked_id = ( $post_lang === 0 && $default !== null ) ? (int) $post->ID : 0;
 
 		if ( $unlinked_id > 0 ) {
@@ -3675,21 +2879,13 @@ final class PostQueryFilter {
 		}
 
 		if ( $post_lang === $language_id ) {
-			return; // Post matches the current language - all good.
+			return; // Post matches the current language.
 		}
 
-		// Post is NOT in the current language - the viewer reached it via
-		// a direct URL with a non-matching prefix (e.g. /en-us/page/ when
-		// no en-US translation exists but a sibling does).
+		// Reached under another language's prefix.
 		$current_slug = $this->router->get_current_slug();
 
-		// Prefer the CURRENT language's own sibling before consulting the
-		// fallback chain. The visitor asked for this language and the group
-		// has a translation in it - they just landed on another language's
-		// slug under this prefix (e.g. /de/<en-slug>/). Redirecting to the
-		// current-language sibling keeps them in the requested language;
-		// walking the fallback chain here would send a German request to the
-		// first chain language (e.g. Polish) even though German exists.
+		// The current language's own sibling wins over the fallback chain.
 		$translations_map = $unlinked_id > 0
 			? [ (int) $default->id => $unlinked_id ]
 			: $this->get_translations_map( $post->ID );
@@ -3711,16 +2907,11 @@ final class PostQueryFilter {
 			}
 		}
 
-		// 'post_query' context - deliberately distinct from 'strings': serving
-		// another language's POST in place of a missing one is a much stronger
-		// claim than borrowing a UI string, and a site may well want one and
-		// not the other. The chain is memoised per context inside Settings.
+		// 'post_query' chain, deliberately separate from the 'strings' chain.
 		$chain = $this->settings->get_fallback_chain( (string) $current_slug, 'post_query' );
 
 		if ( $chain !== [] ) {
-			// The translation-group map loaded above; the walk is pure
-			// in-memory. Loading it primed the post caches, so the publish-
-			// status check below is a cache hit, not a DB round-trip.
+			// The map load primed the post caches.
 			if ( $translations_map !== [] ) {
 				$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository(
 					\PerfLocale\Plugin::get_instance()->get( 'cache' )
@@ -3751,23 +2942,18 @@ final class PostQueryFilter {
 						continue;
 					}
 
-					// If the browser is already on the target URL, stop -
-					// avoids a redirect loop when get_permalink() happens to
-					// return the current URL. (Loop immunity is also enforced
-					// at a higher layer via the `?perflocale_fb=1` sentinel,
-					// but a same-URL short-circuit here is a cheap extra fuse.)
+					// Same-URL fuse against a redirect loop.
 					if ( $this->is_current_url( $target_url ) ) {
 						continue;
 					}
 
 					$this->redirect_to_fallback( $target_url, $current_slug, $try_slug, (int) $post->ID, $target_id );
-					// redirect_to_fallback() calls exit - unreachable below.
+					// redirect_to_fallback() exits.
 				}
 			}
 		}
 
-		// Chain exhausted (or empty) - apply the configured missing-
-		// translation action exactly as before.
+		// Chain exhausted: apply the configured action.
 		$action = $this->settings->get_missing_translation_action();
 
 		if ( $action === 'show_404' ) {
@@ -3781,12 +2967,7 @@ final class PostQueryFilter {
 			if ( $default ) {
 				$default_post_id = (int) ( $translations_map[ (int) $default->id ] ?? 0 );
 
-				// Accept the case where the queried post IS the default-
-				// language sibling (WP found it via slug match when no
-				// current-language translation exists). We still want to
-				// canonicalise the URL to the default-language version -
-				// get_permalink() builds it under the post's own language
-				// regardless of what language was detected on the request.
+				// The queried post may itself be the default-language sibling: still canonicalise its URL.
 				if ( $default_post_id > 0 ) {
 					$default_post = get_post( $default_post_id );
 
@@ -3794,12 +2975,7 @@ final class PostQueryFilter {
 						$default_url = $this->fallback_target_url( $default_post_id, $unlinked_id, $default );
 
 						if ( $default_url !== '' ) {
-							// The browser is already on the default-language URL: a
-							// redirect would come straight back to this request, and
-							// the sentinel is stripped before this check runs, so it
-							// cannot stop the loop. Render the post as it is. Return,
-							// not fall through: the home-page redirect below is for
-							// a post with no default-language version.
+							// Already there: the stripped sentinel cannot stop a loop. Return, not fall through to the home redirect.
 							if ( $this->is_current_url( $default_url ) ) {
 								return;
 							}
@@ -3809,18 +2985,11 @@ final class PostQueryFilter {
 					}
 				}
 
-				// No default-language version at all - redirect to the
-				// default language's homepage. Build the URL from raw
-				// get_option('home') so we bypass our own home_url filter
-				// (which would prefix the *current* detected language
-				// instead of the default).
+				// No default-language version: its homepage, from raw get_option( 'home' ) (home_url adds the current prefix).
 				$home_base = rtrim( (string) get_option( 'home' ), '/' );
 
 				if ( $home_base !== '' ) {
-					// A path prefix only exists in subdirectory mode. Query
-					// mode's default language is always the bare home, and
-					// subdomain/domain modes carry language in the hostname -
-					// concatenating /en/ there builds a URL with no route.
+					// A path prefix exists only in subdirectory mode.
 					$prefix_default = $this->settings->get_url_mode() === 'subdirectory'
 						&& ! $this->settings->hide_default_prefix();
 
@@ -3833,32 +3002,12 @@ final class PostQueryFilter {
 			}
 		}
 
-		// 'show_default' action (default behavior): do nothing - the post is shown as-is
-		// in whatever language it's in. This is the safest fallback.
+		// show_default: the post is shown as-is.
 	}
 
 	/**
-	 * Whether a request for this post in the given language serves content.
-	 *
-	 * Mirrors the decisions handle_missing_translation() makes on that
-	 * request, without redirecting: true when the post type is not
-	 * translatable, when the post is in that language, when that language's
-	 * translation is published (the handler sends the visitor to it), when
-	 * the first language of that language's 'post_query' fallback chain that
-	 * has a published translation is not the default language (the handler
-	 * sends the visitor there), and otherwise only when the
-	 * missing-translation action is show_default. A chain whose first
-	 * published member is the default language answers false: the handler
-	 * sends the visitor to the default-language version, whatever the
-	 * action. show_404 answers with a 404 and redirect_default sends the
-	 * visitor to the default language, so for those it is false. A post with
-	 * no translation link is default-language content, as in the handler.
-	 *
-	 * The first-visit redirects (browser language, GeoIP, edge hint) ask this
-	 * before sending a first-time visitor to a singular URL in another
-	 * language. Reached only on a request that is about to redirect: one
-	 * cached translation-group lookup and a post-cache prime for the group,
-	 * the same lookup the landing request makes.
+	 * Whether a request for this post in the given language serves content, for first-visit redirects.
+	 * Must mirror handle_missing_translation(): a chain landing on the default language is false (it sends the visitor back).
 	 *
 	 * @param \WP_Post $post     Post the request resolved to.
 	 * @param object   $language Language row (id, slug) the visitor would be sent to.
@@ -3920,10 +3069,7 @@ final class PostQueryFilter {
 
 				$target_post = get_post( $target_id );
 
-				// The handler redirects to the first published chain member.
-				// When that member is the default language, the landing sends
-				// the visitor back to the default-language URL the first-visit
-				// redirect starts from.
+				// First published chain member; the default language would send the visitor back.
 				if ( $target_post instanceof \WP_Post && $target_post->post_status === 'publish' ) {
 					return $lang_id !== $default_id;
 				}
@@ -3934,30 +3080,14 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Is the given absolute URL the same request the browser is currently
-	 * making?
-	 *
-	 * Compares the path, the object identity parameters of plain permalinks
-	 * (p / page_id), and the part of the URL that carries the language in the
-	 * active URL mode: the path in subdirectory mode, the host in subdomain
-	 * and domain mode (normalised as language detection normalises it), and
-	 * the language query variable in query mode. Every other query argument
-	 * is ignored: the sentinel parameter on a redirect target always differs,
-	 * and tracking arguments on the request must not count as a different URL.
-	 *
-	 * The scheme is never compared: behind a TLS-terminating proxy that does
-	 * not report HTTPS to WordPress, every https target would differ from the
-	 * http request and the same-URL fuse would never hold. The host is
-	 * compared only in the modes that carry the language in it, so a proxy
-	 * that rewrites the Host header does not disable the fuse in the path and
-	 * query modes.
+	 * Whether an absolute URL is the current request: path, p/page_id, and the language part of the URL mode.
+	 * Never the scheme (TLS proxies), the host only in host modes, and no other query args (sentinel, tracking).
 	 *
 	 * @param string $url Absolute URL to compare against the current request.
 	 * @return bool
 	 */
 	private function is_current_url( string $url ): bool {
-		// esc_url_raw, not sanitize_text_field (which strips %XX octets and
-		// would make a percent-encoded non-Latin request never match $url).
+		// esc_url_raw, not sanitize_text_field: keep %XX octets.
 		$request_uri  = ( isset( $_SERVER['REQUEST_URI'] ) ? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) ) : '/' );
 		$request_path = strtok( $request_uri, '?' ) ?: '/';
 
@@ -3967,12 +3097,7 @@ final class PostQueryFilter {
 			return false;
 		}
 
-		// Paths match - but under plain permalinks the OBJECT identity lives in
-		// the query string, so /es/?p=100 and /es/?p=200 share the path "/es/"
-		// while naming different posts. Compare only the identity params
-		// (p / page_id): tracking junk on the current request must not defeat
-		// the loop fuse, and pretty-permalink URLs (no identity params on
-		// either side) keep the original pure-path semantics.
+		// Plain permalinks carry the object in p/page_id: compare those, not tracking args.
 		$request_query = [];
 		$target_query  = [];
 		$qpos          = strpos( $request_uri, '?' );
@@ -3993,9 +3118,7 @@ final class PostQueryFilter {
 			}
 		}
 
-		// Same path and object: in the host and query modes a sibling in
-		// another language can share both (a translation keeping the source's
-		// slug), and only the language part tells the two URLs apart.
+		// Host and query modes: a sibling can share path and object; only the language part differs.
 		$url_mode = $this->settings->get_url_mode();
 
 		if ( $url_mode === 'subdomain' || $url_mode === 'domain' ) {
@@ -4010,8 +3133,7 @@ final class PostQueryFilter {
 				}
 			}
 		} elseif ( $url_mode === 'query' ) {
-			// Absent on either side reads as '': the default language's URL
-			// carries no language parameter.
+			// Absent reads as '': the default language has no parameter.
 			$query_var    = \PerfLocale\Router\UrlConverter::query_var();
 			$request_lang = $request_query[ $query_var ] ?? '';
 			$target_lang  = $target_query[ $query_var ] ?? '';
@@ -4025,16 +3147,8 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Redirect a visitor on another language's slug to the current language's
-	 * own translation, permanently and in one hop.
-	 *
-	 * The visitor asked for this language and the post has a published
-	 * translation in it: the translation's URL is the address of this content
-	 * in this language, as it is for a renamed slug, so the redirect is
-	 * permanent and carries no fallback sentinel. The loop fuse the sentinel
-	 * gives the fallback chain is replaced by a routing check: the redirect is
-	 * issued only when the target URL resolves to the translation itself.
-	 * Otherwise this returns, and the caller uses the sentinel redirect.
+	 * 301 a visitor on another language's slug to the current language's own translation, without a sentinel.
+	 * Loop fuse: redirects only when the target URL routes to the translation; else returns for the sentinel redirect.
 	 *
 	 * @param string $url          Translation's permalink.
 	 * @param string $slug         Current language slug.
@@ -4068,38 +3182,15 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Carry the request's query string over to a redirect target.
-	 *
-	 * Routing parameters of the request (the fallback sentinel, p / page_id /
-	 * name / pagename / attachment_id, and the language parameter in query
-	 * mode) are dropped: they name the post and language being redirected
-	 * away from.
+	 * Carry the request's query string over to a redirect target, minus its routing parameters.
 	 *
 	 * @param string $url Redirect target.
 	 * @return string Target with the request's other query arguments.
 	 */
 	private function with_passthrough_query( string $url ): string {
-		// Preserve the original request's query string (UTM, click IDs,
-		// previews, etc.) so marketing attribution survives the fallback
-		// redirect. redirect_to_fallback() adds the `perflocale_fb` sentinel on
-		// top; if the original had conflicting values they are overwritten.
-		// esc_url_raw, not sanitize_text_field. _sanitize_text_fields() loops
-		// `preg_replace('/%[a-f0-9]{2}/i', '', …)` until no escape remains, so it
-		// DELETES every percent-escape in the string: a Japanese site search
-		// `?s=%E3%83%8B...` arrives at the redirect target as a bare `?s`, and
-		// `utm_campaign=Fr%C3%BChling` becomes `Frhling`. The sibling
-		// is_current_url() already uses esc_url_raw for exactly this reason, and
-		// so does every REQUEST_URI read in this codebase.
-		//
-		// The '/?' prefix is load-bearing, and its absence was a bug: esc_url()
-		// prepends a scheme to anything that does not look like a path, so a BARE
-		// query string came back as `http://utm_source=nl&…` and parse_str() then
-		// read the first parameter's name as `http://utm_source`. REQUEST_URI
-		// escapes this because it always starts with '/'. Prefixing gives
-		// esc_url_raw a path to recognise; the prefix is stripped straight back
-		// off, and the result is byte-identical to the input for every query
-		// string tested.
-		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Sanitised on the very next line by esc_url_raw(); it cannot be applied here because esc_url() prepends a scheme to a value that does not look like a path, which is the bug this replaced.
+		// esc_url_raw, not sanitize_text_field, which deletes every %XX escape.
+		// The '/?' prefix is required: esc_url() prepends a scheme to a bare query string.
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Sanitised on the next line by esc_url_raw() after the '/?' prefix.
 		$raw_qs     = isset( $_SERVER['QUERY_STRING'] ) ? wp_unslash( (string) $_SERVER['QUERY_STRING'] ) : '';
 		$safe_qs    = $raw_qs === '' ? '' : esc_url_raw( '/?' . $raw_qs );
 		$qs_mark    = strpos( $safe_qs, '?' );
@@ -4111,17 +3202,10 @@ final class PostQueryFilter {
 			parse_str( $request_qs, $passthrough );
 
 			if ( is_array( $passthrough ) && $passthrough !== [] ) {
-				// Never forward `perflocale_fb` - the walker will re-add it,
-				// and the fallback guard must only ever see the walker's own
-				// sentinel, not a value from the incoming request.
+				// The fallback guard must only see the walker's own sentinel.
 				unset( $passthrough['perflocale_fb'] );
 
-				// Never forward WP object-routing params either: they name the
-				// post we are redirecting AWAY from. Under plain permalinks the
-				// TARGET's identity lives in its own ?p=; add_query_arg would
-				// let the stale request's p= clobber it, sending the visitor
-				// straight back to the wrong-language post (redirect ping-pong).
-				// Under pretty permalinks they are dead weight on a pathful URL.
+				// Object-routing params name the old post and would clobber the target's own ?p= (ping-pong).
 				unset(
 					$passthrough['p'],
 					$passthrough['page_id'],
@@ -4130,18 +3214,9 @@ final class PostQueryFilter {
 					$passthrough['attachment_id']
 				);
 
-				// In query mode `lang` IS the language-routing param - as much
-				// the redirected-away-from request's identity as ?p= above. The
-				// target URL already carries the TARGET's own ?lang= (or none
-				// for the default language); re-applying the stale request
-				// value re-triggers the fallback walker on the landing request:
-				// an infinite 302/301 loop, because clean_fallback_sentinel
-				// strips the sentinel before the walker's fuse can hold.
+				// Query mode: a stale language param loops, as clean_fallback_sentinel() strips the sentinel first.
 				if ( $this->settings->get_url_mode() === 'query' ) {
-					// Strip the CONFIGURED name, not the literal 'lang'. With the
-					// name filtered, a hard-coded key left the stale value in the
-					// target URL and the fallback walker re-fired on an identical
-					// URL - the infinite redirect the comment above describes.
+					// The configured name, not the literal 'lang': the name is filterable.
 					unset( $passthrough[ \PerfLocale\Router\UrlConverter::query_var() ] );
 				}
 
@@ -4156,10 +3231,7 @@ final class PostQueryFilter {
 
 	/**
 	 * The URL a missing-translation redirect sends the visitor to for a post.
-	 *
-	 * An unlinked post's permalink carries the visitor's language, so its
-	 * default-language address is that permalink converted to the default
-	 * language.
+	 * An unlinked post's permalink carries the visitor's language, so it is converted to the default.
 	 *
 	 * @param int         $target_id        Post to link to.
 	 * @param int         $unlinked_id      The queried post when it has no translation link, else 0.
@@ -4185,9 +3257,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Issue a fallback redirect. Centralised so the sentinel param,
-	 * redirect-status filter, allow-list, and `exit` all live in one place
-	 * that's hard to get wrong.
+	 * Issue a fallback redirect with the sentinel, the status filter and its allow-list.
 	 *
 	 * @param string $url Target URL (from get_permalink / home_url).
 	 * @param string $from_slug Current language slug.
@@ -4199,25 +3269,14 @@ final class PostQueryFilter {
 	private function redirect_to_fallback( string $url, string $from_slug, string $to_slug, int $from_post_id, int $to_post_id ): void {
 		$url = $this->with_passthrough_query( $url );
 
-		// Append the sentinel so the landing URL never re-triggers the
-		// fallback walker, regardless of any upstream misconfiguration.
+		// The sentinel stops the landing request from re-running the walker.
 		$url = add_query_arg( 'perflocale_fb', '1', $url );
 
 		/**
 		 * Filter the HTTP status code used for language-fallback redirects.
 		 *
-		 * Default 302 (temporary) for a redirect to another language's
-		 * content, so fallbacks naturally stop being served once the real
-		 * translation is published. Sites prioritising SEO consolidation can
-		 * return 301 for permanent redirects. A redirect from another
-		 * language's slug to the current language's own translation
-		 * ($from_slug === $to_slug) defaults to 301 and carries no sentinel
-		 * when the translation's URL routes to it; otherwise it keeps the
-		 * sentinel and the 302 default.
-		 *
-		 * Return values outside the allow-list {301, 302, 307, 308} are
-		 * coerced back to the default - prevents filter misuse from breaking
-		 * browsers (e.g. a rogue 200 wouldn’t redirect at all).
+		 * Default 302, so fallbacks stop once the translation is published; 301 for the current
+		 * language's own translation. Values outside {301, 302, 307, 308} fall back to the default.
 		 *
 		 * @hook perflocale/fallback/redirect_status
 		 * @param int $status Default 302; 301 for the current language's own translation.
@@ -4244,22 +3303,13 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Return a `[language_id =&gt; post_id]` map for every translation of
-	 * the given post, using the already-cached translation-group lookup
-	 * and priming the post cache for the candidates (so subsequent
-	 * `get_post()` calls are free).
-	 *
-	 * Per-request memo: the same post is looked up by the fallback chain
-	 * walker, the `redirect_default` branch, HreflangTags, LanguageSwitcher,
-	 * etc. in a single request. Compute once.
+	 * Memoised `[language_id =&gt; post_id]` map of a post's translations; primes their post cache.
 	 *
 	 * @param int $post_id Source post.
 	 * @return array<int, int>
 	 */
 	private function get_translations_map( int $post_id ): array {
-		// blog_id:post_id key - class-static cleared on switch_blog so a
-		// CLI long-runner or REST cross-blog hop can't serve blog A's map
-		// to blog B (Bundle-A multisite-safety pattern).
+		// Keyed by blog; cleared on switch_blog.
 		$key = get_current_blog_id() . ':' . $post_id;
 
 		if ( isset( self::$translations_map_cache[ $key ] ) ) {
@@ -4286,12 +3336,7 @@ final class PostQueryFilter {
 			$ids[]           = $obj_id;
 		}
 
-		// Batch-prime the post cache so the publish-status + permalink
-		// checks that follow are in-memory hits. $ids is already unique:
-		// get_translations() returns one row per (group_id, language_id)
-		// pair (UNIQUE composite key), and object_id is a function of
-		// that key - so the same post_id can't appear twice in a single
-		// group's link list. array_unique() here was dead work.
+		// Unique already: one row per (group_id, language_id).
 		if ( $ids !== [] && function_exists( '_prime_post_caches' ) ) {
 			_prime_post_caches( $ids, false, false );
 		}
@@ -4302,10 +3347,7 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Strip the `perflocale_fb` sentinel from the URL via a 301 canonical
-	 * redirect so it doesn’t stick in the address bar after a fallback.
-	 *
-	 * Mirrors the pattern used by {@see LanguageRouter::clean_redirect_sentinel()}.
+	 * Strip the `perflocale_fb` sentinel from the URL with a 301.
 	 *
 	 * @return void
 	 */

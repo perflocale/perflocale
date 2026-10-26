@@ -63,14 +63,7 @@ final class SitemapIntegration {
 			return;
 		}
 
-		// `seo_sitemap_source` selects which sitemap tree carries our
-		// hreflang xhtml:link alternates. If a third-party SEO plugin
-		// ships its own sitemap renderer (Yoast / Rank Math / AIOSEO /
-		// SEOPress) AND its addon injects alternates into THAT tree,
-		// injecting into the WP core sitemap as well would emit hreflang
-		// in two parallel sitemap trees with different XML shapes, which
-		// search engines may index as conflicting alternates. Skip the
-		// core injection in those cases.
+		// Alternates go into one sitemap tree only: two trees can read as conflicting alternates.
 		if ( ! $this->should_inject_into_core_sitemap() ) {
 			return;
 		}
@@ -83,42 +76,20 @@ final class SitemapIntegration {
 		add_filter( 'wp_sitemaps_posts_entry', [ $this, 'add_alternate_links' ], 10, 3 );
 		add_filter( 'wp_sitemaps_taxonomies_entry', [ $this, 'add_taxonomy_alternate_links' ], 10, 4 );
 
-		// The blog-home entry (show_on_front=posts) is built by core as a
-		// bare home_url() array that bypasses wp_sitemaps_posts_entry - it
-		// only ever passes through this dedicated filter, so hook it too or
-		// the homepage ships without hreflang alternates in every url_mode.
+		// Core builds the blog-home entry outside wp_sitemaps_posts_entry; only this filter sees it.
 		add_filter( 'wp_sitemaps_posts_show_on_front_entry', [ $this, 'add_home_alternate_links' ] );
 
-		// Register the xhtml namespace for the sitemap XML.
+		// No-op filter: index entries are returned unchanged.
 		add_filter( 'wp_sitemaps_index_entry', [ $this, 'pass_through' ] );
 
-		// Swap WP core's sitemap renderer for our subclass that recognizes
-		// the `xhtml:link` entry key. Core's default renderer silently
-		// drops any field other than loc/lastmod/changefreq/priority, which
-		// is why hreflang-in-sitemap never actually reaches the XML unless
-		// the renderer itself is overridden.
+		// Core's renderer drops the `xhtml:link` key, so it is replaced.
 		add_action( 'wp_sitemaps_init', [ $this, 'swap_renderer' ] );
 	}
 
 	/**
-	 * Decide whether to wire up the WP core sitemap hooks.
+	 * Whether to wire up the core sitemap hooks (`seo_sitemap_source`: core, plugin or auto).
 	 *
-	 * - source = 'core'   → always inject into core.
-	 * - source = 'plugin' → never inject into core.
-	 * - source = 'auto'   → skip core when an SEO plugin (Yoast / Rank
-	 *                       Math / AIOSEO) is detected, since that
-	 *                       plugin's addon already injects alternates
-	 *                       into its own sitemap tree. Otherwise inject
-	 *                       into core.
-	 *
-	 * Detection uses the user-facing `seo_plugin` setting first
-	 * (explicit), then falls back to the plugin's own constant / class
-	 * (defensive - covers users who haven't picked an SEO plugin in
-	 * settings but DO have one active).
-	 *
-	 * Filterable via `perflocale/sitemap/inject_into_core` for sites with
-	 * unusual setups (e.g. a third-party sitemap plugin that PerfLocale
-	 * doesn't recognize).
+	 * Auto skips core when an SEO plugin is set or detected: its add-on fills that plugin's sitemap.
 	 */
 	private function should_inject_into_core_sitemap(): bool {
 		$source = (string) $this->settings->get( 'seo_sitemap_source', 'auto' );
@@ -151,12 +122,7 @@ final class SitemapIntegration {
 	}
 
 	/**
-	 * Swap WP core's sitemap renderer for PerfLocale's subclass that
-	 * supports xhtml:link child elements.
-	 *
-	 * Fires on the `wp_sitemaps_init` action which runs once per request,
-	 * right after WP_Sitemaps is constructed. Safe to swap because
-	 * WP_Sitemaps::$renderer is a public property.
+	 * Swap core's sitemap renderer for the subclass that writes xhtml:link elements.
 	 *
 	 * @param \WP_Sitemaps $sitemaps Core sitemap server instance.
 	 * @return void
@@ -184,21 +150,16 @@ final class SitemapIntegration {
 		$args['perflocale_all_languages']       = true;
 		$args[ SitemapRequest::PAGE_QUERY_VAR ] = true;
 
-		// Registered only once a core post sitemap builds its query, so no
-		// other request gains a the_posts callback. Adding the same callback
-		// again is a no-op.
+		// Only sitemap requests gain a the_posts callback; re-adding it is a no-op.
 		add_filter( 'the_posts', [ $this, 'capture_page_posts' ], 10, 2 );
 
 		return $args;
 	}
 
 	/**
-	 * Record the IDs of the posts a core post sitemap page lists.
+	 * Record the IDs of the posts a core post sitemap page lists (marked query only).
 	 *
-	 * Only the query marked by include_all_languages() is recorded, and it
-	 * replaces the previous page's IDs (an empty page included). Over the
-	 * bulk-prime cap, the page's first entry primes the translation siblings
-	 * of exactly these posts.
+	 * Over the bulk-prime cap, the page's first entry primes the siblings of exactly these posts.
 	 *
 	 * @param mixed $posts Posts the query returned.
 	 * @param mixed $query The query.
@@ -218,22 +179,16 @@ final class SitemapIntegration {
 		$args['perflocale_all_languages']       = true;
 		$args[ SitemapRequest::PAGE_QUERY_VAR ] = true;
 
-		// Registered only once a core taxonomy sitemap builds its query, so
-		// no other request gains a pre_get_terms callback. Adding the same
-		// callback again is a no-op.
+		// Only sitemap requests gain a pre_get_terms callback; re-adding it is a no-op.
 		add_action( 'pre_get_terms', [ $this, 'capture_page_term_query' ] );
 
 		return $args;
 	}
 
 	/**
-	 * Record the term query a core taxonomy sitemap page runs.
+	 * Record the term query a core taxonomy sitemap page runs (marked, whole-term query only).
 	 *
-	 * Only the query marked by include_all_languages_taxonomies() that loads
-	 * whole terms is recorded (not the page-count query), and it replaces the
-	 * previous page's query. Its terms are read by the page's first entry,
-	 * after the query has run: over the bulk-prime cap, that entry primes the
-	 * translation siblings of exactly these terms.
+	 * Over the bulk-prime cap, the page's first entry primes the siblings of exactly these terms.
 	 *
 	 * @param mixed $query The term query.
 	 * @return void
@@ -243,13 +198,9 @@ final class SitemapIntegration {
 	}
 
 	/**
-	 * Add xhtml:link alternates to the blog-home sitemap entry
-	 * (`show_on_front=posts`).
+	 * Add xhtml:link alternates to the blog-home sitemap entry (`show_on_front=posts`).
 	 *
-	 * The blog home exists in every active language (no publish-status
-	 * gate applies), so one alternate per language is emitted, built via
-	 * the mode-aware converter - path prefixes in subdirectory mode,
-	 * `?lang=` in query mode, hosts in subdomain/domain modes.
+	 * The blog home exists in every active language, so each gets an alternate.
 	 *
 	 * @param array<string, mixed> $entry Sitemap entry data (loc only).
 	 * @return array<string, mixed>
@@ -261,12 +212,7 @@ final class SitemapIntegration {
 	/**
 	 * Add xhtml:link alternate entries to a sitemap post entry.
 	 *
-	 * Adds translation URLs as alternate links so search engines understand
-	 * the relationship between language versions of the same content.
-	 *
-	 * Uses batch preloading: when the first post in a sitemap page is
-	 * processed, all translation links for that page are loaded in a
-	 * single query. Subsequent calls use the preloaded cache.
+	 * The page's first entry loads all its translation links in one query.
 	 *
 	 * @param array<string, mixed> $entry Sitemap entry data.
 	 * @param object               $post Post object (WP_Post or stdClass).

@@ -16,14 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Implements a three-layer caching strategy:
+ * Three-layer cache: L1 per-request array, L2 object cache, L3 transients.
  *
- * L1: Static PHP array (per-request, zero cost).
- * L2: WordPress Object Cache (persistent with Redis/Memcached).
- * L3: Transients (fallback, stored in wp_options).
- *
- * Every cache read cascades: L1 → L2 → L3 → loader callable.
- * Every cache write populates all layers.
+ * Reads cascade L1, L2, L3, then the loader; writes fill every layer.
  */
 final class CacheManager {
 
@@ -33,14 +28,9 @@ final class CacheManager {
 	private const GROUP = 'perflocale';
 
 	/**
-	 * Every cache group the plugin uses. flush_all() iterates this set so
-	 * a persistent object cache (Redis, Memcached) gets every plugin-owned
-	 * key dropped - missing a group here strands stale entries past the
-	 * flush until each entry's TTL expires.
+	 * Every cache group the plugin uses.
 	 *
-	 * Add a group here when you introduce a new one; do NOT call
-	 * `wp_cache_*( …, 'perflocale_xxx' )` against a group that isn't in
-	 * this list, or `flush_all()` won't reach it.
+	 * Iterated by flush_all(): a group missing here keeps stale entries past a flush.
 	 *
 	 * @var string[]
 	 */
@@ -56,18 +46,9 @@ final class CacheManager {
 	];
 
 	/**
-	 * The transients flush_all() keeps, as name prefixes: the records whose
-	 * loss changes what the plugin does, not only how fast it does it. A
-	 * notice waiting for one user's next screen, the user an auto-translate
-	 * job reports to, a rate-limit window, a breaker state and the flag that
-	 * keeps the files-mode loader retrying are not cache, and one user's
-	 * Clear cache, import or WP-CLI flush must not take them from another.
+	 * Transient name prefixes flush_all() keeps: state, not cache (notices, rate limits, breakers).
 	 *
-	 * The data registry decides: this list equals
-	 * DataRegistry::flush_kept_transient_prefixes() (the LIKE prefix of every
-	 * transient it classes STATE), which the release gate's rule E13 and the
-	 * unit tests check. A new state transient is declared there with class
-	 * STATE and its prefix added here.
+	 * Must equal DataRegistry::flush_kept_transient_prefixes(); gate rule E13 and the unit tests check it.
 	 *
 	 * @var list<string>
 	 */
@@ -87,20 +68,10 @@ final class CacheManager {
 	];
 
 	/**
-	 * The fixed-name transients flush_all() deletes by name when a persistent
-	 * object cache holds the transients: there they live only in its
-	 * `transient` group, which the wp_options sweep does not reach and which
-	 * cannot be searched by prefix. Without an object cache the sweep deletes
-	 * them with every other `perflocale_*` row.
+	 * Fixed-name transients flush_all() deletes by name under a persistent object cache.
 	 *
-	 * The data registry decides: this list equals
-	 * DataRegistry::flush_deleted_transient_names() (every core transient of
-	 * class DERIVED or LEGACY whose name has no placeholder), which the unit
-	 * tests check. The DERIVED transients whose names carry a placeholder are
-	 * reached another way: the DNS answers through flush_scoped_hash(), the
-	 * WooCommerce variation and copy maps through their epochs (in this
-	 * list), and the `perflocale_{group}_*` and `perflocale_{md5}` rows are
-	 * written only without an object cache.
+	 * There they live only in its `transient` group, which the wp_options sweep misses. Must equal
+	 * DataRegistry::flush_deleted_transient_names() (unit tests check it).
 	 *
 	 * @var list<string>
 	 */
@@ -122,8 +93,6 @@ final class CacheManager {
 
 	/**
 	 * Maximum number of entries in the L1 static cache.
-	 * 5000 accommodates sites with many translated strings (3000+ gettext calls/page)
-	 * without triggering frequent eviction.
 	 */
 	private const MAX_STATIC_ENTRIES = 5000;
 
@@ -133,23 +102,10 @@ final class CacheManager {
 	private const GEN_OPTION_PREFIX = 'perflocale_cgen_';
 
 	/**
-	 * Ceilings for ONE batched L3 INSERT in set_many(). Whichever trips
-	 * first flushes the batch.
+	 * Ceilings for one batched L3 INSERT in set_many(); whichever trips first flushes the batch.
 	 *
-	 * The byte ceiling is what actually matters: MySQL rejects any statement
-	 * over `max_allowed_packet` AND drops the connection, and the floor
-	 * still seen on shared hosting is 1 MB (MySQL's own default through
-	 * 5.6). The budget counts RAW key+payload bytes, so it has to leave room
-	 * for the escaping wpdb::prepare() applies: serialized PHP is quote-heavy
-	 * and measured ~13% larger once escaped, while an adversarial
-	 * all-quotes payload can only double. 256 KB keeps even that worst case
-	 * at half the 1 MB floor. A fixed budget is deliberate - sizing against
-	 * `SELECT @@max_allowed_packet` would add a query to a write path (or
-	 * need a cache of its own) to learn a number this is already far below.
-	 *
-	 * The row ceiling bounds the other axis: thousands of tiny entries (an
-	 * empty link list serializes to ~40 bytes) would otherwise build one
-	 * statement with tens of thousands of placeholders.
+	 * Bytes stay far below the 1 MB max_allowed_packet floor even if escaping doubles them;
+	 * see docs-ai/11-code-rationale.md, "CacheManager: batched L3 writes".
 	 */
 	private const L3_INSERT_MAX_ROWS  = 500;
 	private const L3_INSERT_MAX_BYTES = 262144;
@@ -170,11 +126,9 @@ final class CacheManager {
 	private static array $gen_memo = [];
 
 	/**
-	 * Option counting the announced per-entry invalidations (delete(),
-	 * delete_many(), delete_existing(), delete_autoloaded_options()) of each
-	 * blog, which no generation records: refresh_if_changed() reads it with
-	 * the generations. Not autoloaded; named under the generation prefix so
-	 * the checkpoint's one query reads it.
+	 * Option counting each blog's announced per-entry invalidations, which no generation records.
+	 *
+	 * Not autoloaded; named under the generation prefix so the checkpoint's one query reads it.
 	 */
 	private const CHANGES_OPTION = 'perflocale_cgen__changes';
 
@@ -194,8 +148,7 @@ final class CacheManager {
 	private static bool $announce_registered = false;
 
 	/**
-	 * The change counter of each blog as this process's last checkpoint read
-	 * it.
+	 * The change counter of each blog as this process's last checkpoint read it.
 	 *
 	 * @var array<int, int>
 	 */
@@ -220,17 +173,15 @@ final class CacheManager {
 	private static array $bumped_past = [];
 
 	/**
-	 * How many times wp_load_alloptions() had run in this process (the
-	 * did_filter() count of its pre_wp_load_alloptions filter) when
-	 * flush_runtime() last emptied the runtime object cache, or null when it
-	 * has not.
+	 * The did_filter( 'pre_wp_load_alloptions' ) count when flush_runtime() last emptied the runtime
+	 * object cache, or null when it has not.
 	 *
 	 * @var int|null
 	 */
 	private static ?int $runtime_flushed_at = null;
 
 	/**
-	 * Whether the object-cache drop-in empties its runtime cache itself
+	 * Whether wp_cache_flush_runtime() is not core's stand-in
 	 * (drop_in_flushes_runtime()), or null before the first check.
 	 *
 	 * @var bool|null
@@ -238,10 +189,8 @@ final class CacheManager {
 	private static ?bool $drop_in_flushes_runtime = null;
 
 	/**
-	 * Autoloaded options whose row delete_autoloaded_options() found absent
-	 * while it left the cached-list check out after flush_runtime(), by blog
-	 * id. before_autoloaded_read() checks the list for one of them before
-	 * PerfLocale reads it.
+	 * Autoloaded options delete_autoloaded_options() found absent without the cached-list check (after
+	 * flush_runtime()), by blog id; before_autoloaded_read() checks them before PerfLocale reads one.
 	 *
 	 * @var array<int, array<string, true>>
 	 */
@@ -266,12 +215,8 @@ final class CacheManager {
 	/**
 	 * Register hooks.
 	 *
-	 * One hook, on write requests only (the same test CacheInvalidator uses
-	 * for `save_post`): a status change of a translatable post deletes the
-	 * Translations screen's cached all-language status selections
-	 * (TranslationGroupRepository::on_post_status_transition()). A front-end
-	 * GET registers nothing. Every other hook-based invalidation lives in
-	 * CacheInvalidator.
+	 * Write requests only: a translatable post's status change drops the Translations screen's cached
+	 * status selections. Every other hook-based invalidation lives in CacheInvalidator.
 	 *
 	 * @return void
 	 */
@@ -289,8 +234,8 @@ final class CacheManager {
 	/**
 	 * Get a value from the cache, computing it if not found.
 	 *
-	 * Cascades through all 3 layers. If the value is not found in any layer,
-	 * the $loader callable is invoked and the result is stored in all layers.
+	 * Caches the loader's result even when it is null, so a miss is cached too: a sweep or repair that
+	 * must see current DB truth uses a raw query instead.
 	 *
 	 * @param string   $key Cache key.
 	 * @param callable $loader Callable that computes the value on cache miss.
@@ -299,8 +244,7 @@ final class CacheManager {
 	 * @return mixed
 	 */
 	public function get( string $key, callable $loader, int $ttl = HOUR_IN_SECONDS, string $group = self::GROUP ): mixed {
-		// L1: Static cache (fastest).
-		// Include blog ID for multisite to prevent cross-site cache pollution.
+		// L1: static cache, keyed with the blog ID so multisite blogs never share entries.
 		$full_key = $this->make_static_key( $group, $key );
 
 		if ( array_key_exists( $full_key, $this->static_cache ) ) {
@@ -319,14 +263,8 @@ final class CacheManager {
 			}
 		}
 
-		// L3: Transients.
-		// Transients cannot store null or false reliably (get_transient returns
-		// false on miss AND for stored false/null values). We wrap values in an
-		// array envelope to preserve the original type.
-		// Skip entirely under a persistent external object cache: set() skips
-		// the L3 write in that case (transients route to wp_cache's shared
-		// `transient` group, duplicating L2), so reading L3 here is a wasted
-		// round-trip against the same backend. Mirrors set()'s L3 write guard.
+		// L3: transients, in a ['v' => ...] envelope so a stored null or false differs from a miss.
+		// Skipped under a persistent object cache, as in set(): there transients duplicate L2.
 		if ( ! wp_using_ext_object_cache() ) {
 			$transient_key = $this->transient_key( $key, $group );
 			$envelope      = get_transient( $transient_key );
@@ -336,9 +274,7 @@ final class CacheManager {
 				$this->ensure_static_capacity( $full_key );
 				$this->static_cache[ $full_key ] = $value;
 
-				// Promote to L2 only when L2 reads are actually enabled - the
-				// read path above is gated on object_cache_enabled, so writing
-				// here with it disabled just stores a key nothing ever reads.
+				// Promote to L2 only when L2 reads are enabled.
 				if ( $this->object_cache_enabled ) {
 					wp_cache_set( self::l2_key( $key, $group ), $value, $group, $ttl );
 				}
@@ -356,13 +292,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Read a value from the cache layers WITHOUT computing or writing on miss.
+	 * Read a value from the cache layers without computing or writing on a miss.
 	 *
-	 * Unlike get(), there is no loader and a miss writes nothing - use this when
-	 * a miss must fall through to a non-cacheable path (e.g. a per-key lookup
-	 * whose negative results must not be persisted, which would otherwise flood
-	 * storage). Mirrors get()'s L1->L2->L3 read and L1 promotion on hit; returns
-	 * $default on a full miss.
+	 * For lookups whose negative results must not be persisted; returns $default on a full miss.
 	 *
 	 * @param string $key Cache key.
 	 * @param string $group Cache group.
@@ -423,14 +355,8 @@ final class CacheManager {
 			wp_cache_set( self::l2_key( $key, $group ), $value, $group, $ttl );
 		}
 
-		// L3 - wrap in ['v' => $value] so we can tell a stored null/false from
-		// get_transient()'s "not found" false. Skip L3 entirely under a
-		// persistent object cache: set_transient() would route to wp_cache's
-		// WP-wide "transient" group (shared with other plugins, so flush_all
-		// can't safely wipe it), which none of the plugin's group flushes can
-		// reach - the wp_options sweeps would find zero rows and every group
-		// invalidation would silently no-op. Without ext cache, L3 goes to
-		// wp_options as normal.
+		// L3 in a ['v' => ...] envelope. Skipped under a persistent object cache: transients go to its shared
+		// `transient` group there, which no group flush or wp_options sweep reaches.
 		if ( ! wp_using_ext_object_cache() ) {
 			$transient_key = $this->transient_key( $key, $group );
 			set_transient( $transient_key, [ 'v' => $value ], $ttl );
@@ -438,31 +364,10 @@ final class CacheManager {
 	}
 
 	/**
-	 * Write many entries to L1+L2+L3 in one shot.
+	 * Write many entries to L1, L2 and L3, with L3 as batched multi-row INSERTs.
 	 *
-	 * Equivalent to looping `set()` over `$entries`, but collapses the
-	 * L3 transient writes into multi-row `INSERT ... ON DUPLICATE KEY
-	 * UPDATE` statements. The default `set_transient()` path does TWO
-	 * `update_option` calls per entry (data + timeout), so writing N
-	 * entries costs `N × 2` round-trips. On `prime_translations()`'s cold
-	 * path that's 24 round-trips per page render (12 posts × 2 options
-	 * each) - measurably the dominant cost when no Redis is in play.
-	 * Batched, that work is one query (~150 µs vs ~1.5-2 ms); a set that
-	 * small never comes near the ceilings below.
-	 *
-	 * Batches are bounded by L3_INSERT_MAX_ROWS / L3_INSERT_MAX_BYTES: a
-	 * genuine sitemap prime (3,400 groups) built a SINGLE 5.9 MiB INSERT,
-	 * which a host with the old 1 MB `max_allowed_packet` default answers
-	 * by rejecting the statement AND closing the connection mid-request.
-	 *
-	 * `$drop_timeout_keys` names entries whose L3 row carries an EXPIRED
-	 * `_transient_timeout_` twin (set() writes a twin; set_many() does not).
-	 * A row rewritten here next to such a twin still reads as expired, so the
-	 * next request recomputes and rewrites it again, on every request until a
-	 * sweep removes the twin. Those twins are deleted once every INSERT batch
-	 * has succeeded, so the rewritten row reads like every other set_many()
-	 * row. After a failed batch every twin stays, so a row that may not have
-	 * been rewritten keeps its expiry.
+	 * Expired `_transient_timeout_` twins of $drop_timeout_keys are deleted only after every batch
+	 * succeeds; until then a rewritten row would still read as expired.
 	 *
 	 * @param array<string, mixed> $entries map of cache_key => value
 	 * @param int                  $ttl
@@ -491,30 +396,15 @@ final class CacheManager {
 			$this->static_cache[ $this->make_static_key( $group, $key ) ] = $value;
 		}
 
-		// Re-assert the bound AFTER the batch. The pre-emptive slice above frees
-		// a FIXED 25% (1,250 slots) and is then never re-checked, so any batch
-		// bigger than that - or a warm cache plus a mid-sized batch - lands over
-		// MAX_STATIC_ENTRIES and stays there: measured 6,000 retained from one
-		// 6,000-entry batch and 10,750 after a second disjoint one, against a
-		// documented 5,000 hard bound, and 5,151 from a real cold prime. One
-		// array_slice, O(N), at most once per call - not per entry, no sort.
-		// Drops the OLDEST keys so the entries this call just wrote (the current
-		// render's working set) survive, matching ensure_static_capacity()'s
-		// direction on the single-entry path. L1 is request-local and every
-		// entry still goes to L2/L3 below, so an evicted key is a miss that
-		// re-reads, never a wrong answer.
+		// Re-assert the bound after the batch: the fixed 25% slice above does not cover a large batch.
+		// Drops the oldest keys so this call's entries survive; an evicted key only re-reads from L2/L3.
 		$overflow = count( $this->static_cache ) - self::MAX_STATIC_ENTRIES;
 
 		if ( $overflow > 0 ) {
 			$this->static_cache = array_slice( $this->static_cache, $overflow, null, true );
 		}
 
-		// L2 - wp_cache_set per entry. There's no batched wp_cache API in WP
-		// core (wp_cache_set_multiple exists only on WP 6.0+ AND only when
-		// the active object cache backend implements it), so a tight foreach
-		// is the safe portable path. Each call is sub-microsecond on the
-		// non-persistent default cache; Redis backends are typically pipelined
-		// internally too. Skipped entirely when the setting disables L2.
+		// L2 (skipped if disabled in settings): wp_cache_set_multiple() where available.
 		if ( $this->object_cache_enabled ) {
 			if ( function_exists( 'wp_cache_set_multiple' ) ) {
 				$l2_entries = [];
@@ -529,23 +419,14 @@ final class CacheManager {
 			}
 		}
 
-		// L3 - single multi-row INSERT instead of N × 2 update_option calls.
-		// Skip entirely when a persistent external object cache is active
-		// (Redis et al.): get_transient() reads that backend, not wp_options,
-		// so rows written here would be unreadable dead weight.
+		// L3 - multi-row INSERTs. Skipped under a persistent object cache: get_transient() reads that
+		// backend, so rows written here would never be read.
 		if ( wp_using_ext_object_cache() ) {
 			return;
 		}
 
-		// We INTENTIONALLY skip the `_transient_timeout_*` companion option
-		// that WP's set_transient() writes. CacheInvalidator does explicit
-		// purges on every event that could stale these values, so the
-		// transient mechanism's auto-expiration is unused - writing the
-		// timeout row would just double the wp_options inserts. With
-		// timeout missing, WP's get_transient() falls through to "no
-		// expiration set; return the value" - exactly what we want. An
-		// expired twin a set() left beside a key in $drop_timeout_keys is
-		// deleted after the INSERTs (see the docblock).
+		// No `_transient_timeout_*` row: CacheInvalidator purges on every staling event and a row without one
+		// never expires. Expired twins of $drop_timeout_keys are deleted after the INSERTs.
 		$option_names  = [];
 		$timeout_names = [];
 		$drop_timeouts = array_fill_keys( $drop_timeout_keys, true );
@@ -560,11 +441,7 @@ final class CacheManager {
 			$serialized   = (string) maybe_serialize( [ 'v' => $value ] );
 			$row_bytes    = strlen( $data_name ) + strlen( $serialized );
 
-			// Flush BEFORE appending the row that would breach a ceiling,
-			// never after, so every emitted statement is inside budget. A
-			// lone row bigger than the budget still goes out on its own -
-			// one row can't be split, and set_transient() would hit the
-			// same packet wall with it.
+				// Flush before appending a row that would breach a ceiling; a lone oversized row goes out alone.
 			if (
 				$values_clause !== []
 				&& ( count( $values_clause ) >= self::L3_INSERT_MAX_ROWS
@@ -599,47 +476,20 @@ final class CacheManager {
 			$this->delete_transient_timeout_rows( $timeout_names );
 		}
 
-		// Wipe the WP options cache for the keys we just touched - direct
-		// DB writes don't go through update_option(), so the "options"
-		// wp_cache group can hold a stale positive value for one of these
-		// names that another request had just read.
+		// Raw SQL bypasses update_option(), so drop each name from the options cache.
 		foreach ( $option_names as $name ) {
 			wp_cache_delete( $name, 'options' );
 		}
 
-		// notoptions is WP's negative cache: a single array blob under the
-		// 'options' group's 'notoptions' key listing every option name
-		// that's known to NOT exist. We just INSERTed L3 transient rows
-		// for these names, so any entry in the blob claiming they don't
-		// exist is now wrong. The previous read-modify-write pattern
-		// (wp_cache_get → unset() the names → wp_cache_set) had a TOCTOU
-		// race: two concurrent set_many() calls could each capture the
-		// blob, unset different name sets, and the second writer's set()
-		// would overwrite the first's modifications - leaving some names
-		// still marked as missing, which causes get_transient() to return
-		// false even though the row is present in wp_options. That
-		// surfaces as a permanently-stale negative cache until WP's next
-		// options flush.
-		//
-		// Race-free fix: drop the entire notoptions blob in one atomic
-		// wp_cache_delete(). Marginal cost - the next get_option() call
-		// for any non-existent option rebuilds the blob naturally from a
-		// single DB lookup (sub-millisecond). In exchange we eliminate
-		// the race window entirely. The same trade-off applies under
-		// every persistent object-cache backend (Redis et al.): atomic
-		// delete is universally supported, atomic read-modify-write is
-		// not.
-		wp_cache_delete( 'notoptions', 'options' );
+		// The inserted rows may be listed absent. Only their names: this path runs without a persistent
+		// cache, so the list is this request's own and a whole drop only re-reads every absent option.
+		\PerfLocale\Database\NotOptions::unlist( $option_names );
 	}
 
 	/**
-	 * Emit ONE batched L3 transient INSERT.
+	 * Emit one batched L3 transient INSERT.
 	 *
-	 * Split out of set_many() so its row/byte ceilings have a single place
-	 * to flush to. `ON DUPLICATE KEY UPDATE` keeps the write idempotent for
-	 * keys that already hold a row, which is what makes chunking safe: the
-	 * batches are independent statements, so a re-primed key overwrites
-	 * rather than erroring on the unique option_name index.
+	 * ON DUPLICATE KEY UPDATE keeps each batch independent: a re-primed key overwrites its row.
 	 *
 	 * @param string[]     $values_clause One `(%s, %s, %s)` tuple per row.
 	 * @param array<mixed> $args Flattened bind values matching $values_clause.
@@ -697,9 +547,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Delete a value from all cache layers without announcing a change: for
-	 * a read result that must not stay cached (a failed load), where the
-	 * stored data did not change.
+	 * Delete a value from all cache layers without announcing a change.
+	 *
+	 * For a read result that must not stay cached (a failed load) when the stored data did not change.
 	 *
 	 * @param string $key Cache key.
 	 * @param string $group Cache group.
@@ -714,12 +564,8 @@ final class CacheManager {
 			wp_cache_delete( self::l2_key( $key, $group ), $group );
 		}
 
-		// L3 exists only without a persistent object cache, as in get(),
-		// get_cached(), set(), set_many() and delete_many(). Under one, core
-		// would send this delete to the backend's shared `transient` group,
-		// where nothing of this class is stored. Without one,
-		// delete_transient() removes the options rows, or, while
-		// wp_installing(), the in-memory copy core keeps instead.
+		// L3 exists only without a persistent object cache; under one, core would send this delete to the shared
+		// `transient` group, where this class stores nothing.
 		if ( ! wp_using_ext_object_cache() ) {
 			delete_transient( $this->transient_key( $key, $group ) );
 		}
@@ -728,12 +574,7 @@ final class CacheManager {
 	/**
 	 * Delete several values from all cache layers.
 	 *
-	 * The batch form of delete() for entries stored with a TTL by get()/set():
-	 * L1 entries are dropped, L2 keys go in one wp_cache_delete_multiple(),
-	 * and the L3 rows (value and timeout row of each key) in one prepared
-	 * DELETE per L3_INSERT_MAX_ROWS names, where delete() spends up to four
-	 * queries per key. L3 is skipped under a persistent object cache, which
-	 * get() and set() never use for it.
+	 * The batch form of delete(): one L2 multiple delete and one L3 DELETE per L3_INSERT_MAX_ROWS names.
 	 *
 	 * @param string[] $keys  Cache keys.
 	 * @param string   $group Cache group.
@@ -778,46 +619,24 @@ final class CacheManager {
 			// phpcs:enable
 		}
 
-		// The rows went by raw SQL, so the options cache that get_transient()
-		// reads through drops them by name.
+		// Raw SQL bypasses delete_option(), so drop each name from the options cache.
 		foreach ( $names as $name ) {
 			wp_cache_delete( $name, 'options' );
 		}
 	}
 
 	/**
-	 * Most names one existence SELECT of delete_existing() lists. MariaDB
-	 * turns an IN list of 1,000 values or more into a subquery
-	 * (in_predicate_conversion_threshold); 500 stays well below it.
+	 * Most names in one existence SELECT of delete_existing(): MariaDB turns an IN list of
+	 * 1,000 values or more into a subquery (in_predicate_conversion_threshold).
 	 */
 	private const L3_SELECT_MAX_NAMES = 500;
 
 	/**
-	 * Delete several entries of one group, stored by get()/set() with a TTL,
-	 * from every layer, sending SQL only for the L3 rows that exist.
+	 * Delete entries of one group from every layer, with SQL only for the L3 rows that exist.
 	 *
-	 * L1 entries are dropped. With L2 enabled, the L2 keys go in one
-	 * wp_cache_delete_multiple(), or one wp_cache_delete() each where the
-	 * object cache has no native multiple delete. L3 is skipped under a
-	 * persistent object cache, which get() and set() never use for it, and
-	 * goes through delete_transient() while WordPress is installing.
-	 *
-	 * Otherwise, per L3_SELECT_MAX_NAMES keys, one SELECT reads which value
-	 * rows exist and, only when some do, a second one reads which of their
-	 * timeout rows exist. delete_transient() reads the same rows, so the
-	 * sweep reads nothing it would not read. Each value row found is deleted
-	 * by name, and its timeout row only when that DELETE removed the value
-	 * row and the timeout row was found: the order and condition of
-	 * delete_transient(). No DELETE names a row the SELECTs did not find, and
-	 * the SELECTs are non-locking reads under REPEATABLE READ and READ
-	 * COMMITTED, so inside such a transaction the sweep takes the locks
-	 * delete_transient() would take.
-	 *
-	 * Each deleted row gets the cache handling delete_option() gives it on
-	 * the running WordPress version. The core option and transient actions
-	 * do not fire for these rows, as for delete_many(), set_many() and the
-	 * group sweeps. When a SELECT fails, the keys of its chunk go through
-	 * delete_transient().
+	 * Follows delete_transient()'s order and conditions and never DELETEs a row its non-locking SELECTs did not
+	 * find, so inside a transaction it takes only the locks delete_transient() would; see
+	 * docs-ai/11-code-rationale.md, "CacheManager: delete_existing".
 	 *
 	 * @internal Used by CacheInvalidator's hreflang sweep.
 	 *
@@ -880,8 +699,7 @@ final class CacheManager {
 	}
 
 	/**
-	 * Run delete_transient() for each name of one chunk, with SQL only for
-	 * the rows that exist (see delete_existing()).
+	 * Run delete_transient() for each name of one chunk, with SQL only for the rows that exist.
 	 *
 	 * @param string[] $transients Transient names.
 	 * @return void
@@ -932,10 +750,8 @@ final class CacheManager {
 			return;
 		}
 
-		// delete_option()'s autoload test: the value 'yes' before WordPress 6.6,
-		// and from 6.6 (the release that added wp_autoload_values_to_autoload())
-		// the values that function returns, computed here the way it computes
-		// them: its four defaults through its filter, which can only remove one.
+			// delete_option()'s autoload test: 'yes' without wp_autoload_values_to_autoload(), else that
+			// function's four defaults through its filter, which can only remove one.
 		$autoload_on = [ 'yes' ];
 
 		if ( function_exists( 'wp_autoload_values_to_autoload' ) ) {
@@ -980,8 +796,7 @@ final class CacheManager {
 	}
 
 	/**
-	 * Read which of the named options rows exist, with their autoload
-	 * value, in one SELECT.
+	 * Read which of the named options rows exist, with their autoload value, in one SELECT.
 	 *
 	 * @param string[] $names Option names, at most L3_SELECT_MAX_NAMES.
 	 * @return array<string, string>|null Autoload value by lower-cased name; null when the SELECT fails.
@@ -1031,11 +846,10 @@ final class CacheManager {
 	}
 
 	/**
-	 * The cache handling delete_option() gives a deleted row: an autoloaded
-	 * name leaves the alloptions cache, any other name the options cache,
-	 * and with $record_absent the name goes into notoptions. Only requests
-	 * without a persistent object cache reach it, where all three live for
-	 * the request.
+	 * Give deleted rows delete_option()'s cache handling.
+	 *
+	 * Autoloaded names leave alloptions, others the options cache; with $record_absent the name goes into
+	 * notoptions. Runs only without a persistent object cache, where all three are per request.
 	 *
 	 * @param string $name          Option name.
 	 * @param bool   $autoloaded    Whether the row was autoloaded, by delete_option()'s test.
@@ -1069,37 +883,9 @@ final class CacheManager {
 	/**
 	 * Delete autoloaded options, including a cached copy that has no row.
 	 *
-	 * WordPress's delete_option() takes an option out of the cached
-	 * `alloptions` list only when it finds the row. With a persistent object
-	 * cache that list is shared by every request and each autoloaded-option
-	 * write stores it whole, so a concurrent request can leave a deleted
-	 * option in it: it read the list before the delete and stores it after,
-	 * or its own INSERT was deleted before it stored the list. The option is
-	 * then served from the list with no row behind it, and every later
-	 * delete_option() returns before it reaches the cache. The same holds in
-	 * one process when a transaction that wrote the option rolls back.
-	 *
-	 * When a name's row was already gone and the list this request loaded
-	 * still holds the name, the list is dropped from the object cache and
-	 * the next read rebuilds it from the database. Each request loads the
-	 * list from the object cache when it starts, so a name that a concurrent
-	 * request left in it is found by the next delete of that name in a
-	 * request that starts after it. Dropping is a single delete on every
-	 * object-cache backend, where editing the list would be another
-	 * read-modify-write. Every name's copy under its own key is deleted as
-	 * well, whatever delete_option() returned: get_option() caches a row
-	 * there when the list lacks the name, and delete_option() of an
-	 * autoloaded row leaves that copy. The check reads the list already in
-	 * memory: a name costs delete_option() plus that one cache delete, and
-	 * the list is dropped only for an absent row that it still holds.
-	 *
-	 * After flush_runtime() the list is in memory again only once something
-	 * loads it, and reading it here would fetch the whole list (without a
-	 * persistent object cache, select every autoloaded row) on every batch
-	 * of a job. So until anything in this process loads the list again, the
-	 * check is left out and the absent names are noted for this blog: the
-	 * first call after a load checks the list again, and a read of a noted
-	 * name through before_autoloaded_read() checks it first.
+	 * WordPress's delete_option() leaves a name in the cached `alloptions` list when the row is gone (a concurrent
+	 * request stored the list whole, or a rollback), so the list is dropped (one delete, never an edit) when an
+	 * absent row is still in it; see docs-ai/11-code-rationale.md, "CacheManager: autoloaded option deletes".
 	 *
 	 * @param string[] $names Option names.
 	 * @return void
@@ -1147,15 +933,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Before PerfLocale reads an autoloaded option that it deletes through
-	 * delete_autoloaded_options(): when that delete found no row and left the
-	 * cached-list check out (after flush_runtime()), check the list now and
-	 * drop it when it still holds the option, so the read gets the database
-	 * value instead of a copy without a row.
+	 * Before PerfLocale reads an option delete_autoloaded_options() left unchecked, drop a stale alloptions list.
 	 *
-	 * The read loads the list anyway, so the check adds no fetch. For any
-	 * other option, and in a request that never called flush_runtime(), it
-	 * is one array lookup.
+	 * One array lookup unless the option was noted; the read loads the list anyway.
 	 *
 	 * @param string $name Option name.
 	 * @return void
@@ -1206,15 +986,22 @@ final class CacheManager {
 	}
 
 	/**
-	 * Empty this process's runtime object cache, as batch jobs do between
-	 * batches to bound their memory.
+	 * Empty this process's runtime object cache, as batch jobs do between batches to bound memory.
 	 *
-	 * A persistent object cache keeps its entries and the next read of a key
-	 * fetches it again; without one the next read goes to the database.
+	 * Skipped when wp_cache_flush_runtime() is core's cache-compat stand-in, which calls wp_cache_flush().
 	 *
 	 * @return bool Whether the runtime cache was emptied.
 	 */
 	public static function flush_runtime(): bool {
+		return self::drop_in_flushes_runtime() && self::empty_runtime();
+	}
+
+	/**
+	 * Call wp_cache_flush_runtime(), whichever defines it.
+	 *
+	 * @return bool
+	 */
+	private static function empty_runtime(): bool {
 		if ( ! function_exists( 'wp_cache_flush_runtime' ) || ! wp_cache_flush_runtime() ) {
 			return false;
 		}
@@ -1225,18 +1012,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Release posts a loop has finished with from this process's runtime
-	 * object cache, so a loop over many posts holds one batch at a time.
-	 * Nothing is invalidated: a persistent backend keeps every entry and no
-	 * last_changed key moves.
+	 * Release posts a loop has finished with from this process's runtime object cache; nothing is invalidated.
 	 *
-	 * Without a persistent object cache the posts are deleted from the
-	 * in-memory cache, which is all that cache is. A
-	 * persistent cache offers no way to drop one key from memory only, so
-	 * its runtime copies are dropped together, and only when the drop-in
-	 * implements wp_cache_flush_runtime() itself: core's stand-in for a
-	 * drop-in without one calls wp_cache_flush(), which empties the
-	 * persistent cache.
+	 * A persistent cache cannot drop one key from memory only, so there flush_runtime() drops all.
 	 *
 	 * @param array<int, int> $post_ids Posts the loop has finished with.
 	 * @return void
@@ -1250,15 +1028,12 @@ final class CacheManager {
 			return;
 		}
 
-		if ( self::drop_in_flushes_runtime() ) {
-			self::flush_runtime();
-		}
+		self::flush_runtime();
 	}
 
 	/**
-	 * Whether the object-cache drop-in empties its runtime cache itself: it
-	 * supports 'flush_runtime' and defines wp_cache_flush_runtime(), which
-	 * is then not core's cache-compat.php stand-in.
+	 * Whether wp_cache_flush_runtime() empties only the runtime cache: it is
+	 * core's or the drop-in's own, not core's cache-compat.php stand-in.
 	 *
 	 * @return bool
 	 */
@@ -1266,7 +1041,7 @@ final class CacheManager {
 		if ( self::$drop_in_flushes_runtime === null ) {
 			self::$drop_in_flushes_runtime = false;
 
-			if ( function_exists( 'wp_cache_supports' ) && wp_cache_supports( 'flush_runtime' ) && function_exists( 'wp_cache_flush_runtime' ) ) {
+			if ( function_exists( 'wp_cache_flush_runtime' ) ) {
 				$file = ( new \ReflectionFunction( 'wp_cache_flush_runtime' ) )->getFileName();
 
 				self::$drop_in_flushes_runtime = is_string( $file ) && basename( $file ) !== 'cache-compat.php';
@@ -1278,21 +1053,16 @@ final class CacheManager {
 
 	/**
 	 * Record that this process dropped cached entries of the current blog.
-	 * No query: announce_changes() raises the blog's change counter once the
-	 * invalidations are done, at this process's next checkpoint
-	 * (refresh_if_changed()), at the end of a background job's run, or when
-	 * the request ends. A later group flush of the same blog announces them
-	 * instead (bump_generation()).
+	 *
+	 * No query: announce_changes() raises the blog's change counter at the next checkpoint, job end or shutdown.
 	 *
 	 * @return void
 	 */
 	private static function note_change(): void {
 		self::$changes_pending[ is_multisite() ? get_current_blog_id() : 0 ] = true;
 
-		// WordPress's fatal error handler is a shutdown function registered
-		// before this one; when it shows its error page, wp_die() ends the
-		// process before later shutdown functions run, so the page's
-		// arguments filter announces first.
+		// The fatal error handler's wp_die() ends the process before later shutdown functions run, so the
+		// error page's arguments filter announces first.
 		if ( ! self::$announce_registered ) {
 			self::$announce_registered = true;
 			register_shutdown_function( [ self::class, 'announce_at_shutdown' ] );
@@ -1330,12 +1100,10 @@ final class CacheManager {
 	}
 
 	/**
-	 * Raise the change counter of each blog this process dropped cached
-	 * entries of since the last announcement, one write per blog, so another
-	 * long-running process's next checkpoint sees invalidations no generation
-	 * records. Runs after the invalidations it announces: at this process's
-	 * checkpoints, at the end of a background job's run and when the request
-	 * ends. A blog whose write fails stays pending for the next announcement.
+	 * Raise the change counter of each blog with unannounced entry drops, one write per blog.
+	 *
+	 * Another long-running process's checkpoint then sees invalidations no generation records. A blog whose
+	 * write fails stays pending.
 	 *
 	 * @return bool Whether every pending blog was announced.
 	 */
@@ -1371,25 +1139,10 @@ final class CacheManager {
 	}
 
 	/**
-	 * Bring this process up to date with what other processes changed, when
-	 * they changed anything PerfLocale caches. For long-running processes
-	 * only, at their checkpoints (between batches and items of a WP-CLI
-	 * command or a background job); never on a page request, which is too
-	 * short for another process's change to matter.
+	 * Drop this process's in-memory copies when another process changed cached data.
 	 *
-	 * A PerfLocale write that changes cached data bumps a group generation
-	 * (perflocale_cgen_<group>; a settings save bumps the languages group) or
-	 * drops single entries, which raises the blog's change counter once the
-	 * writing process announces it (announce_changes()). This process first
-	 * announces its own dropped entries, so its own raises are counted as its
-	 * own. It keeps the generations it read (the per-process memo) and an
-	 * in-memory copy of the autoloaded options, so without a checkpoint it
-	 * serves what it read first for as long as it runs. One query reads this blog's generations; when one this process
-	 * uses differs, the memo takes the database values, the
-	 * in-memory caches go (this object's static cache, the per-request memos
-	 * a blog switch resets, Bootstrap::reset_static_state(), the routing
-	 * memos and the runtime object cache) and the next reads load the
-	 * current data. Nothing changed: nothing is dropped.
+	 * Long-running processes only, at checkpoints between batches; never on a page request. One query reads the
+	 * generations and the change counter; see docs-ai/11-code-rationale.md, "CacheManager: checkpoints".
 	 *
 	 * @return bool Whether another process changed anything.
 	 */
@@ -1419,10 +1172,8 @@ final class CacheManager {
 			}
 		}
 
-		// A group this process has not used yet holds nothing in memory: it
-		// takes the committed generation without counting as a change. The
-		// change counter compares with the previous checkpoint's reading plus
-		// the raises this process made since.
+		// A group this process has not used takes the committed generation without counting as a change. The
+		// change counter compares with the last reading plus this process's own raises since.
 		$blog    = is_multisite() ? get_current_blog_id() : 0;
 		$changed = false;
 		$changes = $committed[ substr( self::CHANGES_OPTION, strlen( self::GEN_OPTION_PREFIX ) ) ] ?? 0;
@@ -1454,7 +1205,8 @@ final class CacheManager {
 			return false;
 		}
 
-		self::flush_runtime();
+		// Also through core's stand-in: stale copies here are wrong data, not memory.
+		self::empty_runtime();
 
 		$plugin = \PerfLocale\Plugin::get_instance();
 
@@ -1483,11 +1235,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Whether flush_runtime() emptied the runtime object cache and nothing in
-	 * this process has loaded the autoloaded options list since.
+	 * Whether flush_runtime() emptied the runtime cache and nothing has loaded alloptions since.
 	 *
-	 * Core's wp_load_alloptions() applies pre_wp_load_alloptions first on
-	 * every call, so the filter's count moves with every load, on any blog.
+	 * Core's wp_load_alloptions() applies pre_wp_load_alloptions on every call, so its did_filter() count moves with each load.
 	 *
 	 * @return bool
 	 */
@@ -1496,14 +1246,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Reset only the request-scoped static cache - leaves L2 (wp_cache)
-	 * and L3 (transient) intact.
+	 * Reset only the request-scoped static cache; L2 and L3 stay.
 	 *
-	 * Intended for multisite `switch_blog` handling: in-memory caches keyed
-	 * by the old blog's context must not leak into the new blog, but the
-	 * persistent layers are already blog-scoped by WP, so there's no need
-	 * to touch them. Also safe on uninitialised subsites where our tables
-	 * don't exist yet - this method never runs a DB query.
+	 * For switch_blog: the persistent layers are blog-scoped already, and no query runs (safe on uninitialised subsites).
 	 *
 	 * @return void
 	 */
@@ -1512,22 +1257,10 @@ final class CacheManager {
 	}
 
 	/**
-	 * Current L2 generation for a group.
+	 * Current L2 generation for a group, memoised per process and blog.
 	 *
-	 * Bumping it (see bump_group_generation()) orphans every existing L2 key
-	 * in the group - the plugin's reliable group-flush primitive. It does NOT
-	 * depend on wp_cache_flush_group(), which silently no-ops on common
-	 * object-cache backends (e.g. Redis Object Cache driven by Predis:
-	 * wp_cache_supports('flush_group') returns true yet flush_group() clears
-	 * nothing). The generation lives in an autoloaded option (survives across
-	 * requests) and is memoised per process in self::$gen_memo to avoid a
-	 * get_option() on every L2 access - measured at ~1.6 µs each, which is ~3×
-	 * a warm wp_cache_get() and adds up across the dozens of cache touches on a
-	 * page render. Every bump (instance OR static) updates the memo, so an
-	 * in-process flush is always observed; only a CONCURRENT flush in a
-	 * separate request goes unseen until this (usually short) request ends -
-	 * an acceptable, bounded window given language flushes are rare. Keyed by
-	 * blog so switch_to_blog() needs no reset (the option itself is per-blog).
+	 * Bumping it orphans every L2 key of the group: wp_cache_flush_group() clears nothing on some backends. The
+	 * option stays autoloaded so this read costs no query; see docs-ai/11-code-rationale.md, "CacheManager: generation tokens".
 	 *
 	 * @param string $group Cache group.
 	 * @return int
@@ -1539,15 +1272,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Build the generation-prefixed L2 (object-cache) key. The prefix changes
-	 * when the group's generation is bumped, so prior entries are orphaned and
-	 * aged out by TTL while fresh reads miss and recompute.
+	 * Build the generation-prefixed L2 key; a bump orphans the old prefix's entries.
 	 *
-	 * PUBLIC + static: code that reads/writes a PerfLocale L2 group DIRECTLY
-	 * via wp_cache_*() (the prime_translations batch fast-path,
-	 * Glossary) MUST route its key through here, or it would address
-	 * a different key space than CacheManager and miss every entry (and never
-	 * be reached by a generation bump).
+	 * Code that calls wp_cache_*() on a PerfLocale group directly must build its key here, or no bump reaches it.
 	 *
 	 * @param string $key   Logical cache key.
 	 * @param string $group Cache group.
@@ -1558,13 +1285,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * The md5 that ends the name of a transient keyed by a runtime value (a
-	 * host name; the DNS answers are `perflocale_dns_` and this hash): a
-	 * hash of the value and the default group's generation. flush_all()
-	 * bumps that generation, so it retires every such name on any backend,
-	 * including a persistent object cache, where a transient cannot be found
-	 * by prefix. The generation is an autoloaded option, memoised per
-	 * process, so the name costs no query.
+	 * The md5 ending a transient name keyed by a runtime value (the DNS answers): value plus default-group generation.
+	 *
+	 * The flush_all() bump of that generation retires such names even where a transient cannot be found by prefix.
 	 *
 	 * @param string $value The value the transient is keyed by.
 	 * @return string
@@ -1576,11 +1299,8 @@ final class CacheManager {
 	/**
 	 * The generation bump of the group flushes (flush_*(), invalidate_group()).
 	 *
-	 * A written bump also announces the entries this process dropped on this
-	 * blog before it: a checkpoint compares every generation of self::GROUPS,
-	 * so their change counter write is not needed. The group flushes run
-	 * after their writes commit; a bump made inside a transaction (the eager
-	 * link map's) goes through bump_group_generation() and announces nothing.
+	 * A written bump of a self::GROUPS group also announces this blog's pending entry drops: a checkpoint
+	 * compares every generation. A bump inside a transaction uses bump_group_generation(), which announces nothing.
 	 *
 	 * @param string $group Cache group.
 	 * @return void
@@ -1592,10 +1312,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Increment a group's L2 generation. Static so callers that lack a live
-	 * CacheManager instance (the daily GC,
-	 * SiteCleanup) can flush a group reliably too. State lives entirely in the
-	 * autoloaded option, so there is no instance state to keep in sync.
+	 * Atomically increment a group's L2 generation in the database.
+	 *
+	 * Static so callers without a CacheManager instance (daily GC, SiteCleanup) can flush a group.
 	 *
 	 * @param string $group Cache group.
 	 * @return bool Whether the increment was written.
@@ -1608,36 +1327,22 @@ final class CacheManager {
 		$memo_key = $blog . ':' . $group;
 		$previous = self::$gen_memo[ $memo_key ] ?? null;
 
-		// Increment in the DB, never memo+1. l2_generation() pins the
-		// generation for the whole PHP process, so a long-lived worker
-		// (BulkTranslateJob, SiteTranslateJob, DataImportJob, StringScanJob -
-		// each a single multi-minute invocation) still holds the value it read
-		// at start. Computing next = memo + 1 therefore OVERWRITES every
-		// generation other requests committed in the meantime, rolling the
-		// counter BACKWARD - which re-points l2_key() at an already-populated
-		// keyspace and resurrects stale entries site-wide until their TTL.
-		// INSERT .. ON DUPLICATE KEY UPDATE makes the increment atomic under
-		// the row lock, so generations are strictly monotonic no matter how
-		// many processes bump concurrently. Mirrors the MT usage counter in
-		// AbstractProvider::track_usage_chars(), which solved the same class.
-		//
-		// autoload stays 'yes' - these options are deliberately autoloaded so
-		// l2_generation() costs no query on the read path (see its docblock);
-		// the ON DUPLICATE branch must not touch the autoload column.
+		// Atomic increment in the DB, never memo + 1: a long-lived worker's memo is stale, and memo + 1 would roll
+		// the generation back and resurrect stale entries. Autoload stays 'yes' (the ON DUPLICATE branch never
+		// touches it) so l2_generation() costs no query. A missing row starts at the clock in ms, not 1: after an
+		// uninstall an unflushable cache still holds the earlier install's low generations.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$bumped = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
-				 VALUES (%s, '1', 'yes')
+				 VALUES (%s, %s, 'yes')
 				 ON DUPLICATE KEY UPDATE option_value = option_value + 1",
-				$option
+				$option,
+				(string) (int) ( microtime( true ) * 1000 )
 			)
 		);
 
-		// Read the committed value back, bypassing the options cache (the row
-		// was written with raw SQL, so the cached copy is stale). Memoise THAT
-		// - not a locally-computed guess - so this process addresses the same
-		// keyspace as everyone else for the rest of its run.
+		// Memoise the committed value, read past the stale options cache (the row was written by raw SQL).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$committed = (int) $wpdb->get_var(
 			$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $option )
@@ -1645,7 +1350,11 @@ final class CacheManager {
 
 		wp_cache_delete( $option, 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+		// Unlist only a created row (1 affected; an update gives 2): an existing one is autoloaded, and get_option()
+		// reads the alloptions dropped above before notoptions.
+		if ( 1 === $bumped ) {
+			\PerfLocale\Database\NotOptions::unlist( [ $option ] );
+		}
 
 		if ( null !== $previous && $committed !== $previous + 1 ) {
 			self::$bumped_past[ $blog ] = true;
@@ -1657,10 +1366,7 @@ final class CacheManager {
 	}
 
 	/**
-	 * Reliably invalidate an entire cache group across L1 + L2 on ANY
-	 * object-cache backend. Public entry point for callers that previously
-	 * relied on wp_cache_flush_group() directly. L2 is invalidated by bumping
-	 * the group generation rather than wp_cache_flush_group().
+	 * Invalidate a cache group across L1 and L2 on any object-cache backend, by a generation bump.
 	 *
 	 * @param string $group Cache group (one of self::GROUPS).
 	 * @return void
@@ -1677,19 +1383,15 @@ final class CacheManager {
 		// L2: generation bump - reliable on every backend.
 		$this->bump_generation( $group );
 
-		// L3: without a persistent object cache, values live as transients in
-		// wp_options (generation-versioning only covers L2). Drop this group's
-		// transients by their derived prefix so a same-request read can't
-		// satisfy from a stale L3 envelope. No-op under a persistent cache
-		// (L3 is never written there).
+		// L3: generations cover only L2, so drop this group's transients by prefix; under a persistent object
+		// cache L3 is never written.
 		if ( ! wp_using_ext_object_cache() ) {
 			$this->delete_group_transients( $group );
 		}
 	}
 
 	/**
-	 * Delete every L3 transient belonging to a cache group, matching the
-	 * exact name derive_transient_key() produces (`perflocale_<group>_*`).
+	 * Delete every L3 transient of a cache group (`perflocale_<group>_*`, as derive_transient_key() names them).
 	 *
 	 * @param string $group Cache group.
 	 * @return void
@@ -1699,24 +1401,12 @@ final class CacheManager {
 	}
 
 	/**
-	 * Delete every L3 transient whose name starts with $transient_prefix -
-	 * the data row AND the `_transient_timeout_` twin WP writes beside it.
+	 * Delete every L3 transient whose name starts with $transient_prefix, with its timeout twin.
 	 *
-	 * ONE SELECT + ONE bulk DELETE + per-name cache busts - never a per-row
-	 * delete_transient() loop. Each delete_transient() costs ~3 queries
-	 * (SELECT + DELETE for the data row, DELETE for the timeout row), so on
-	 * a crawled site holding thousands of per-URL hreflang transients the
-	 * loop turned a single term edit into a multi-second admin request. The
-	 * wp_cache_delete() calls are pure memory ops without a drop-in and keep
-	 * same-request get_transient() reads coherent after the raw SQL.
+	 * One SELECT and one bulk DELETE, never a per-row delete_transient() loop (thousands of hreflang rows on a
+	 * crawled site). Names under a $keep prefix are neither deleted nor dropped from any cache.
 	 *
-	 * Names under a $keep prefix are left alone, value and timeout row alike:
-	 * one `NOT LIKE` per kept prefix in the same two statements, so a kept
-	 * name is neither deleted nor dropped from any cache.
-	 *
-	 * @param string       $transient_prefix Transient-name prefix, i.e. the
-	 *                                       option name WITHOUT its
-	 *                                       `_transient_` prefix.
+	 * @param string       $transient_prefix Transient-name prefix (the option name without `_transient_`).
 	 * @param list<string> $keep             Transient-name prefixes to keep.
 	 * @return void
 	 */
@@ -1760,20 +1450,16 @@ final class CacheManager {
 		);
 		// phpcs:enable
 
-		// With a drop-in installed get_transient() reads the object cache's
-		// shared `transient` group instead of wp_options. CacheManager never
-		// writes there (set()/set_many() skip L3 in that mode), but the
-		// plugin's hand-rolled transients do (Site Health counts, the add-on
-		// boot list, DNS lookups), and the rows just deleted are the twins of
-		// those names written before the drop-in appeared, so their
-		// object-cache copies go too. The set shrinks to nothing after the
-		// first sweep (those rows are gone for good), so this costs one
-		// round-trip per such row, once. Kept names are not in the set.
+		// With a drop-in, get_transient() reads the shared `transient` group, where the hand-rolled transients
+		// (Site Health, add-on boot list, DNS) live: each swept row's object-cache copy goes too.
 		$ext_cache = wp_using_ext_object_cache();
+		$swept     = [];
 
 		foreach ( (array) $names as $name ) {
 			$name      = (string) $name;
 			$transient = substr( $name, strlen( '_transient_' ) );
+			$swept[]   = $name;
+			$swept[]   = '_transient_timeout_' . $transient;
 
 			wp_cache_delete( $name, 'options' );
 			wp_cache_delete( '_transient_timeout_' . $transient, 'options' );
@@ -1784,17 +1470,13 @@ final class CacheManager {
 		}
 
 		wp_cache_delete( 'alloptions', 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+		\PerfLocale\Database\NotOptions::unlist( $swept );
 	}
 
 	/**
 	 * Flush all PerfLocale caches, and only those.
 	 *
-	 * Every `perflocale_` transient goes except the state ones
-	 * (FLUSH_KEPT_TRANSIENTS): another user's pending notice, a breaker or a
-	 * rate-limit window survives a flush. A persistent object cache keeps
-	 * every key outside PerfLocale's groups and transients: other plugins'
-	 * data and WordPress's own.
+	 * The state transients in FLUSH_KEPT_TRANSIENTS survive; other plugins' and WordPress's keys are untouched.
 	 *
 	 * @return void
 	 */
@@ -1803,97 +1485,42 @@ final class CacheManager {
 		$this->static_cache = [];
 
 		// L2: bump every group's generation - orphans all existing keys
-		// reliably on any backend. wp_cache_flush_group() is a no-op on
-		// common ones (e.g. Redis Object Cache + Predis), which would
-		// otherwise strand stale entries until each entry's TTL expires.
+		// on any backend, including one whose group flush does nothing.
 		foreach ( self::GROUPS as $group ) {
 			$this->bump_generation( $group );
 		}
 
-		// L3: every `perflocale_*` transient but the kept state ones
-		// (FLUSH_KEPT_TRANSIENTS) in one SELECT + one bulk DELETE,
-		// with the per-name cache busts that keep get_transient() from reading
-		// through to a value we just removed (the reason the original code
-		// looped delete_transient() instead of issuing a wildcard DELETE -
-		// delete_transients_by_prefix() does both, so the loop is no longer
-		// the price of correctness).
-		//
-		// The loop was unbounded and cost ~3 queries + ~1 ms PER ROW: measured
-		// at 30,603 queries / 21.4 s for the 9,061 cached entries on a 10k-post
-		// site, where the whole of flush_all() now runs in 18 queries / 0.5 s
-		// (2 of those queries are this L3 sweep). flush_all() runs
-		// from deactivation, the Migrator's upgrade path and the admin
-		// Clear-cache button, none of which raise max_execution_time - and
-		// `deactivate_{$plugin}` fires BEFORE update_option('active_plugins'),
-		// so timing out there leaves the plugin active with its cron
-		// unscheduled, rewrite_rules deleted and the Translator role stripped.
-		//
-		// It also closes a leak: with a persistent object cache installed,
-		// delete_transient() drops the object-cache entry and deletes NO
-		// wp_options row, so L3 rows written before the drop-in appeared
-		// survived every flush forever (5,659 of them non-expiring on that
-		// same site). The bulk DELETE reaps them.
+		// L3: every `perflocale_*` transient but the kept state ones, in one SELECT and one bulk DELETE: this runs
+		// on deactivation, where a per-row loop can time out before `active_plugins` is updated. The bulk DELETE
+		// also reaps rows written before a persistent object cache appeared; see docs-ai/11-code-rationale.md, "CacheManager: flush_all".
 		$this->delete_transients_by_prefix( 'perflocale_', self::FLUSH_KEPT_TRANSIENTS );
 
-		// With a persistent object cache the transients live only in its
-		// `transient` group, which the sweep above does not reach: the
-		// fixed-name DERIVED and LEGACY ones go by name, in one call. Among
-		// them are the epochs of the stored variation maps and copy maps; a
-		// missing epoch retires every stored map of the blog (InventorySync).
-		// The DNS answers are retired by the generation bump above (see
-		// flush_scoped_hash()).
+		// Under a persistent object cache transients live only in its `transient` group, out of the sweep's
+		// reach: the fixed-name ones go by name. The DNS answers are retired by the generation bump above.
 		if ( wp_using_ext_object_cache() ) {
 			wp_cache_delete_multiple( self::FLUSH_DELETED_TRANSIENTS, 'transient' );
+		} elseif ( wp_cache_supports( 'flush_group' ) ) {
+			// This process's options cache only: it also holds rows another process deleted, which the sweep cannot select.
+			wp_cache_flush_group( 'options' );
 		}
 
-		// L0: the eager link map is a plain autoloaded option, not a
-		// transient, so neither the generation bumps above nor the L3 sweep
-		// touch it - and prime_translations() consults it BEFORE any of
-		// them (its "Step 0 fast-path"), which makes it the effective source
-		// of truth for the language columns it denormalises. A "Clear cache"
-		// that leaves it in place keeps serving the slugs and names from
-		// before whatever the operator was trying to fix, leaving that state
-		// with no user-reachable recovery at all. Pure invalidation: the map
-		// rebuilds lazily in TranslationGroupRepository::get_eager_link_map(),
-		// which re-persists it with autoload still on. Six option deletes,
-		// paid only where flush_all() itself already runs - the admin
-		// Clear-cache button, WP-CLI, deactivation and the version-gated
-		// one-shot in Migrator::maybe_update() - never on a steady-state
-		// request.
-		//
-		// Deleted here rather than through
-		// TranslationGroupRepository::invalidate_eager_link_map() because
-		// flush_all() also runs on deactivation/teardown paths where
-		// constructing a repository is undesirable, and that method
-		// additionally bumps `perflocale_found_rows`, which the generation
-		// loop above already covers. KEEP THIS TYPE LIST IN SYNC WITH
-		// invalidate_eager_link_map().
-		//
-		// The sweep above drops the cached options list, but with a
-		// persistent object cache a concurrent request that read the list
-		// before that drop can store it again, with a map whose row is gone,
-		// before these deletes run. delete_option() returns before it
-		// reaches the cache when the row is gone; delete_autoloaded_options()
-		// then drops the list when it still holds such a map, and deletes
-		// each map's copy under its own key.
-		$eager_options = [];
+		// L0: the eager link map is an autoloaded option that neither the bumps nor the sweep reach, and
+		// prime_translations() reads it first. Deleted inline, not via invalidate_eager_link_map(): deactivation
+		// must not build a repository. Keep this type list in sync with invalidate_eager_link_map().
+		// delete_autoloaded_options() also drops an alloptions list a concurrent request re-stored with a map.
+		self::delete_autoloaded_options(
+			[
+				'perflocale_eager_links_post',
+				'perflocale_eager_links_term',
+				'perflocale_eager_links_option',
+				'perflocale_eager_links_string',
+				'perflocale_eager_links_post_type',
+				'perflocale_eager_links_taxonomy',
+			]
+		);
 
-		foreach ( [ 'post', 'term', 'option', 'string', 'post_type', 'taxonomy' ] as $eager_type ) {
-			$eager_options[] = 'perflocale_eager_links_' . $eager_type;
-		}
-
-		self::delete_autoloaded_options( $eager_options );
-
-		// Deleting the rows is only half of it: get_eager_link_map() consults
-		// a per-process static memo BEFORE the option, so inside the flushing
-		// request the map would be neither cleared nor rebuilt and every
-		// subsequent read would keep answering from pre-flush data. That is
-		// not theoretical - the bulk-term-translate handler and the
-		// TranslatePress importer both flush precisely so their own
-		// idempotency checks see fresh rows. reset_static_caches() is a pure
-		// static (no repository instance, so it stays safe on the
-		// deactivation/teardown paths this method also serves) and clears the
-		// same four in-process memos a "clear everything" is asking for.
+		// get_eager_link_map() reads a static memo before the option, and importers flush so their idempotency
+		// checks see fresh rows. reset_static_caches() is static, so it is safe on teardown paths.
 		\PerfLocale\Database\Repository\TranslationGroupRepository::reset_static_caches();
 
 		/** @hook perflocale/cache/flush_all Fires after all caches are flushed. */
@@ -1903,9 +1530,7 @@ final class CacheManager {
 	/**
 	 * Flush caches for a specific object.
 	 *
-	 * Deletes the object's cached translation links
-	 * (`translations_<type>_<id>` in `perflocale_trans`) from every layer,
-	 * then fires `perflocale/cache/flush_object`.
+	 * Deletes its `translations_<type>_<id>` links from `perflocale_trans`, then fires `perflocale/cache/flush_object`.
 	 *
 	 * @param int    $object_id The object ID.
 	 * @param string $object_type The object type (post, term, etc.).
@@ -1921,46 +1546,14 @@ final class CacheManager {
 	/**
 	 * Flush all translated-slug caches for the current blog.
 	 *
-	 * Mirrors flush_languages() but for SlugTranslationRepository's three
-	 * caching layers:
-	 *   1. Static L1 memo (the in-process $this->static_cache map, keyed
-	 *      `[blog_id:]perflocale_slugs:slug_<type>_<id>_<lang>` - drop
-	 *      every entry whose key contains the group name).
-	 *   2. Persistent L2 (wp_cache group `perflocale_slugs`).
-	 *   3. The zero-state TRUE pin behind has_any_slugs(): the autoloaded
-	 *      option `perflocale_has_any_slugs` and the raw persistent-cache
-	 *      key `has_any_slugs` in group `perflocale_trans`. Both are set
-	 *      when a slug row is seen (the key only while L2 is enabled) and
-	 *      never cleared by normal writes, so after a wholesale slug delete
-	 *      (a removed language taking all its slug rows with it) they may
-	 *      claim rows that are gone. The raw key is written without
-	 *      l2_key(), so no generation bump reaches it; it has to be deleted
-	 *      by name. With both gone, the next request's has_any_slugs() runs
-	 *      a single SELECT 1 LIMIT 1, which re-pins TRUE if any slug row
-	 *      remains.
-	 *
-	 * The in-process copies of that pin are not touched here: the
-	 * repository's per-request memo (SlugTranslationRepository::
-	 * reset_static_caches()) and its L1 entry in `perflocale_trans` (dropped
-	 * by flush_translations()). A recompute within the same request needs
-	 * both reset as well.
-	 *
-	 * LanguageRepository::delete() calls this after the slug_translations
-	 * cascade and then resets both in-process copies. Routing would
-	 * otherwise resolve cached slug→object_id lookups for a language that no
-	 * longer exists, and has_any_slugs() would keep answering TRUE for a
-	 * table that may now be empty. Paths that remove slug rows without
-	 * calling this (post and term deletes, a replace-mode data import) leave
-	 * the pin at TRUE: that costs slug queries that find nothing, never a
-	 * missed translated slug. Writers that add rows without setting the pin
-	 * are harmless too: FALSE is never stored, so the next request's probe
-	 * finds the rows.
+	 * Drops `perflocale_slugs` from every layer and the has_any_slugs() TRUE pin (option and raw L2 key). A
+	 * same-request recompute also needs the in-process pin copies reset;
+	 * see docs-ai/11-code-rationale.md, "CacheManager: has_any_slugs pin".
 	 *
 	 * @return void
 	 */
 	public function flush_slugs(): void {
-		// L1: drop static entries in the 'perflocale_slugs' group. Match
-		// the substring anywhere because keys are `[blog_id:]group:key`.
+		// L1: drop static entries of 'perflocale_slugs' (keys are `[blog_id:]group:key`).
 		$this->static_cache = array_filter(
 			$this->static_cache,
 			static fn( $k ) => strpos( $k, 'perflocale_slugs:' ) === false,
@@ -1968,30 +1561,15 @@ final class CacheManager {
 		);
 
 		// L2: bump the group generation - reliable on every object-cache
-		// backend (unlike wp_cache_flush_group(), which no-ops on Redis
-		// Object Cache + Predis even though wp_cache_supports() claims it).
+		// backend, including one whose group flush does nothing.
 		$this->bump_generation( 'perflocale_slugs' );
 
-		// L3: same shape as flush_languages() - one bulk sweep of the group's
-		// transient rows (data + timeout twin), plus the per-name cache busts
-		// that keep WP's options cache, which get_transient() reads through,
-		// from serving a value the DELETE just removed. Without this, a
-		// same-request get_slug() would still satisfy from the transient and
-		// return the now-deleted language's slug. Transient names follow
-		// derive_transient_key(): for group 'perflocale_slugs' and key
-		// 'slug_<type>_<id>_<lang>' the rows are
-		// `_transient_perflocale_perflocale_slugs_*` (plus an md5 fallback
-		// when the long-key threshold trips - those land under the broader
-		// `_transient_perflocale_*` prefix, but only flush_all() needs to
-		// chase those, and the cost of leaking a tiny number of md5-named
-		// rows on language delete is bounded by the per-language slug count).
+		// L3: bulk-delete the group's transients so a same-request get_slug() cannot return a deleted slug.
+		// Md5-named long keys fall under the broader prefix that only flush_all() sweeps.
 		$this->delete_group_transients( 'perflocale_slugs' );
 
-		// Zero-state TRUE pin: the option and the raw L2 key go together, or
-		// a later has_any_slugs() short-circuits on whichever survived and
-		// never reaches its SELECT 1 LIMIT 1. The key is deleted even while
-		// L2 is off: one written while it was on is read again as soon as it
-		// is switched back on. Both deletes are no-ops when already absent.
+		// Zero-state TRUE pin: the option and the raw L2 key (no l2_key(), so no bump reaches it) go together, or
+		// a survivor short-circuits the recompute. Deleted even with L2 off: a key written while on is read again.
 		delete_option( 'perflocale_has_any_slugs' );
 		wp_cache_delete( 'has_any_slugs', 'perflocale_trans' );
 
@@ -2002,11 +1580,7 @@ final class CacheManager {
 	/**
 	 * Flush every per-object translation-link cache for the current blog.
 	 *
-	 * Mirrors flush_slugs() for the `perflocale_trans` group, which backs
-	 * get_translations()/flush_object() (`translations_<type>_<id>`). Used
-	 * when a wholesale change (e.g. a language delete) removes link rows
-	 * without enumerating each affected sibling object, so per-object
-	 * invalidation can't be targeted.
+	 * For wholesale changes (a language delete) that remove link rows without naming each affected object.
 	 *
 	 * @return void
 	 */
@@ -2021,9 +1595,7 @@ final class CacheManager {
 		// L2: bump the group generation (reliable group-flush on any backend).
 		$this->bump_generation( 'perflocale_trans' );
 
-		// L3: bulk-delete the group's transient rows so a same-request
-		// get_translations() can't satisfy from a stale transient. Mirrors
-		// flush_slugs()'s L3 handling.
+		// L3: bulk-delete the group's transients so a same-request read cannot use a stale one.
 		$this->delete_group_transients( 'perflocale_trans' );
 
 		/** @hook perflocale/cache/flush_translations Fires after translation-link caches are flushed. */
@@ -2040,16 +1612,11 @@ final class CacheManager {
 		// LanguageRepository::get_active / get_default / get_slug_map.
 		$this->delete( 'bootstrap', 'perflocale_langs' );
 
-		// LanguageRepository::find_all() canonical-default path uses this
-		// key. Must invalidate alongside the bootstrap bundle.
+		// LanguageRepository::find_all()'s canonical-default key, invalidated with the bootstrap bundle.
 		$this->delete( 'all_sorted', 'perflocale_langs' );
 
-		// Group-level flush of `perflocale_langs` so dynamic per-id
-		// (`language_<id>`) and per-slug (`language_slug_<slug>`) keys go too -
-		// else a slug rename leaves `language_slug_en` alive in a persistent
-		// cache and find_by_slug('en') returns the pre-rename object until TTL.
-		// Also clears the L1 static cache: keys are `[blog_id:]group:key`, so
-		// match the `perflocale_langs:` substring anywhere (blog-id on multisite).
+		// The whole `perflocale_langs` group, so per-id and per-slug keys go too (a slug rename would otherwise
+		// keep the old slug's entry). L1 keys are `[blog_id:]group:key`, so match the group anywhere.
 		$this->static_cache = array_filter(
 			$this->static_cache,
 			static fn( $k ) => strpos( $k, 'perflocale_langs:' ) === false,
@@ -2058,30 +1625,17 @@ final class CacheManager {
 
 		$this->bump_generation( 'perflocale_langs' );
 
-		// Per-page hreflang HTML chunks are language-set-dependent and
-		// cached at 6h TTL. Without this invalidation, adding/removing/
-		// renaming a language leaves stale hreflang on every cached page
-		// for up to 6 hours.
+		// Cached hreflang chunks depend on the language set.
 		$this->bump_generation( 'perflocale_hreflang' );
 
-		// L3 transient cleanup for two groups: perflocale_langs (language-data
-		// layer) and perflocale_hreflang (per-page chunks). A slug rename that
-		// clears L1+L2 but leaves a stale envelope (`['v' => null]`) in the
-		// options table would have the next request read it via L3 and return
-		// the wrong type - a find_by_slug() fatal on persistent-cache sites.
-		// delete_group_transients derives the doubled `perflocale_perflocale_*`
-		// prefix - a hand-built pattern here once used the single-prefix form
-		// for hreflang and matched ZERO rows, so language add/delete/rename
-		// served stale hreflang for up to 12h on non-persistent-cache sites.
+		// L3 for both groups: a stale envelope left after a slug rename would be read back through L3.
+		// delete_group_transients() derives the doubled `perflocale_perflocale_*` prefix; a hand-built one misses.
 		$this->delete_group_transients( 'perflocale_langs' );
 		$this->delete_group_transients( 'perflocale_hreflang' );
 	}
 
 	/**
 	 * Get a value from L1 static cache only (no fallback).
-	 *
-	 * Useful for checking if a value has been loaded in this request
-	 * without triggering L2/L3 lookups.
 	 *
 	 * @param string $key Cache key.
 	 * @param string $group Cache group.
@@ -2111,10 +1665,7 @@ final class CacheManager {
 	}
 
 	/**
-	 * Whether the L2 (WP object cache) layer is currently active for reads
-	 * and writes. True only when both the user setting allows it AND a
-	 * persistent external object cache (Redis / Memcached / etc.) is in
-	 * place - without persistence, L2 is just an in-memory dupe of L1.
+	 * Whether L2 is active: the setting allows it and a persistent object cache is in place.
 	 *
 	 * @return bool
 	 */
@@ -2123,12 +1674,10 @@ final class CacheManager {
 	}
 
 	/**
-	 * Evict the oldest 25% of L1 entries when the cap is reached and
-	 * $full_key would add a NEW entry. Must run on EVERY L1 insert path -
-	 * including the L2/L3 hit-promotions and set_static() seeding, not just
-	 * set() - because on a warm cache a long-lived process (WP-CLI bulk
-	 * export, queue-runner batch) inserts almost exclusively via promotion,
-	 * so set() alone never fires to bound the array.
+	 * Evict the oldest 25% of L1 entries when the cap is reached and $full_key is new.
+	 *
+	 * Runs on every L1 insert path, including L2/L3 hit promotions: a warm long-lived process inserts mostly by
+	 * promotion.
 	 *
 	 * @param string $full_key Full static cache key about to be written.
 	 * @return void
@@ -2143,9 +1692,6 @@ final class CacheManager {
 	/**
 	 * Build a static cache key with multisite blog ID prefix.
 	 *
-	 * Prevents cross-site cache pollution in multisite setups
-	 * with shared persistent object cache (Redis/Memcached).
-	 *
 	 * @param string $group Cache group.
 	 * @param string $key Cache key.
 	 * @return string Full static cache key.
@@ -2157,15 +1703,9 @@ final class CacheManager {
 	}
 
 	/**
-	 * Generate a transient key, keeping it under 172 characters.
+	 * Generate a transient key under the 172-character transient name limit.
 	 *
-	 * WordPress transient names are limited to 172 characters for the transient
-	 * key itself (191 chars for option_name minus '_transient_' prefix).
-	 *
-	 * Public so adjacent components (e.g. TranslationGroupRepository's
-	 * direct-options prime path) can reproduce the exact key without
-	 * duplicating the length-threshold + md5-fallback logic. Drift between
-	 * two implementations would silently miss transient hits.
+	 * Public so direct-options prime paths (TranslationGroupRepository) build the exact same key.
 	 *
 	 * @param string $key Cache key.
 	 * @param string $group Cache group.
@@ -2182,9 +1722,7 @@ final class CacheManager {
 	}
 
 	/**
-	 * Internal alias to keep the historical private name available for
-	 * backwards-compat with any callers inside this class. New code should
-	 * use derive_transient_key() directly.
+	 * Internal alias of derive_transient_key().
 	 *
 	 * @param string $key Cache key.
 	 * @param string $group Cache group.

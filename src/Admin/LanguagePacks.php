@@ -16,57 +16,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Which WordPress.org language packs are installed for a set of locales.
  *
- * WHAT IT READS (no network request, no write)
- *   - The translation files in WP_LANG_DIR, WP_LANG_DIR/themes and
- *     WP_LANG_DIR/plugins, through the listing core's own translation loader
- *     uses: get_available_languages() for WordPress itself, and
- *     WP_Textdomain_Registry::get_language_files_from_path() (WordPress 6.5+,
- *     cached by core for an hour) or a glob for themes and plugins. The theme
- *     and plugin listings are read only when an item needs them.
- *   - The data of core's last update checks: the site transients
- *     `update_core`, `update_themes` and `update_plugins`. They say which
- *     themes and plugins WordPress.org serves (their `response` and
- *     `no_update` entries) and which language packs it offered (their
- *     `translations` entries, the list Dashboard > Updates installs).
- *   - The site transient `available_translations`, the list of WordPress
- *     translations core caches for three hours when its language selector is
- *     opened. When it is not cached, nothing here asks WordPress.org for it.
- *     It and `update_core` are read only when a locale's WordPress pack is
- *     not installed (they decide nothing else).
- *   - The headers of the themes and plugins a report lists as offered or not
- *     offered, for their names (not read when the caller needs no names).
- *   - The active theme and its parent, and the `active_plugins` option (with
- *     `active_sitewide_plugins` on multisite).
- *
- * STATES, per locale (en_US is the language WordPress is written in and is
- * never checked):
- *   - WordPress itself: `installed` (the locale is in
- *     get_available_languages(), so {locale}.mo or {locale}.l10n.php is in
- *     WP_LANG_DIR), `offered` (core's update data offers the pack),
- *     `not_available` (`available_translations` is cached and has no such
- *     locale) or `missing`.
- *   - The active theme, its parent theme and every plugin active on this
- *     site (network-activated ones included) that core's update data lists:
- *     `installed` ({slug}-{locale}.mo or .l10n.php in WP_LANG_DIR/themes or
- *     WP_LANG_DIR/plugins; {slug} is the theme's directory, or the plugin's
- *     slug in the update data, else its folder), `offered`, `not_offered`
- *     (the last update check offered no pack) or `unchecked` (the WordPress
- *     pack for the locale is not installed, and core's update checks ask only
- *     for installed locales). Themes and plugins the update data does not
- *     list get no language packs from WordPress.org and are left out. Without
- *     update data for themes or plugins (no check of that kind has
- *     completed: the transient has no `no_update` list), none of that kind
- *     is checked.
- *
- * Whether WordPress.org has a theme or plugin pack for a locale is not
- * knowable without asking it: `not_offered` means the last update check
- * offered none, which is also the answer when the locale was installed after
- * that check.
- *
- * Site Health's language-pack test and the hint in a language's row on the
- * Languages screen both read a locale through report() and findings(): Site
- * Health lists every finding, the hint the packs among them that can be
- * installed.
+ * Reads local files and core's last update checks only (no request, no write): `not_offered` means the last
+ * check offered none. See docs-ai/11-code-rationale.md, "LanguagePacks: sources and states".
  *
  * @phpstan-type UpdateData array{last_checked: int, translations: array<mixed>, listed: array<string, mixed>}
  * @phpstan-type Item array{type: string, id: string, slug: string, name: string, state: string}
@@ -116,9 +67,7 @@ final class LanguagePacks {
 		$installed   = array_fill_keys( get_available_languages(), true );
 		$items       = self::items( $theme_data, $plugin_data );
 
-		// The WordPress packs core offered and the list of WordPress
-		// translations matter only for a locale whose WordPress pack is not
-		// installed; neither is read otherwise.
+		// Read only for a locale whose WordPress pack is not installed.
 		$available = null;
 
 		if ( [] !== array_diff_key( $wanted, $installed ) ) {
@@ -190,12 +139,8 @@ final class LanguagePacks {
 	}
 
 	/**
-	 * What a report lists for one locale. Site Health's language-pack test
-	 * and the Languages screen both state a locale from this: the state of
-	 * its WordPress pack, and its theme and plugin packs that are offered or
-	 * not offered. Installed theme and plugin packs are not listed, and
-	 * neither are unchecked ones (they wait on the WordPress pack, which is
-	 * then listed as not installed). `listed` is true when anything is.
+	 * What Site Health and the Languages screen list for one locale: its WordPress pack state and the theme and
+	 * plugin packs offered or not offered (unchecked ones wait on the WordPress pack). `listed`: anything is.
 	 *
 	 * @param array $row One locale of a report.
 	 * @return array{core: string, offered: list<Item>, not_offered: list<Item>, listed: bool}
@@ -236,8 +181,7 @@ final class LanguagePacks {
 	}
 
 	/**
-	 * Dashboard > Updates, where WordPress installs the language packs its
-	 * update checks offer (the network admin's screen on multisite).
+	 * Dashboard > Updates, where WordPress installs offered packs (the network admin's on multisite).
 	 *
 	 * @return string
 	 */
@@ -246,18 +190,9 @@ final class LanguagePacks {
 	}
 
 	/**
-	 * Core's update data of one kind, or null when there is none: the time of
-	 * the check, the language packs it offered, and its `response` and
-	 * `no_update` entries by key.
+	 * Core's update data of one kind (check time, offered packs, listed entries), or null when there is none.
 	 *
-	 * Core stores `last_checked` before it asks WordPress.org, and the
-	 * `response`, `no_update` and `translations` lists of a theme or plugin
-	 * check only when the answer arrives. A site whose check of that kind
-	 * never completed (WordPress.org blocked or unreachable, or the request
-	 * refused) has a transient without `no_update`, which is no update data
-	 * here. A failed check after a completed one keeps the earlier lists.
-	 * `update_core` has no `no_update` list and is read only for the
-	 * WordPress packs it offers.
+	 * Core writes `last_checked` before the request: only a `no_update` list proves a completed check.
 	 *
 	 * @param string $name      Site transient name.
 	 * @param bool   $completed Require the `no_update` list of a completed theme or plugin check.
@@ -419,8 +354,7 @@ final class LanguagePacks {
 	}
 
 	/**
-	 * Display names for the items a report lists (offered or not offered),
-	 * read only for those.
+	 * Display names, read only for the items a report lists (offered or not offered).
 	 *
 	 * @param array $report Report.
 	 * @return array

@@ -17,30 +17,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Translates WooCommerce admin-entered strings (payment gateway titles,
- * shipping method labels) through PerfLocale's String Translation system.
+ * Translates admin-entered WooCommerce strings (gateway titles, shipping labels) that bypass `__()`.
  *
- * WordPress locale switching (handled by LanguageRouter::filter_locale) already
- * translates all WooCommerce UI strings that go through `__()`. This class
- * supplements that by handling custom admin-entered strings stored in the
- * database that do NOT go through WordPress i18n.
- *
- * Translation lookup order:
- * 1. `perflocale/woocommerce/translate_string` filter (developer override).
- * 2. WordPress `gettext` filter - StringTranslation service handles it if the
- * string has been registered in the String Translation admin panel.
- *
- * WooCommerce sanitizes the gateway title and the shipping rate label before
- * these hooks run, so a translation found through `gettext` is passed through
- * the same sanitizer before it takes the original's place
- * ({@see self::sanitize_for_slot()}).
+ * WooCommerce sanitizes these before the hooks run, so a `gettext` translation gets the same sanitizer.
  */
 final class WcStringTranslation {
 
 	/**
-	 * Markup a translated payment gateway title may keep: the rules
-	 * WooCommerce applies to the gateway's own title in
-	 * WC_Payment_Gateway::get_title() (HtmlSanitizer::LOW_HTML_BALANCED_TAGS_NO_LINKS).
+	 * Markup a translated gateway title may keep: WC_Payment_Gateway::get_title()'s own rules.
 	 *
 	 * @var array<string, array<string, true>>
 	 */
@@ -134,9 +118,6 @@ final class WcStringTranslation {
 		 * @hook perflocale/woocommerce/translate_string
 		 * Override WooCommerce string translation for a specific language.
 		 *
-		 * Return a non-empty string to use as the translation. Return null to
-		 * fall through to the default lookup.
-		 *
 		 * @param string|null $translated Null to continue, string to override.
 		 * @param string $text Original text.
 		 * @param string $slug Current language slug.
@@ -148,9 +129,7 @@ final class WcStringTranslation {
 			return $override;
 		}
 
-		// Run through the WordPress gettext filter pipeline.
-		// StringTranslation hooks into `gettext` and will return a translation
-		// if the string has been registered in the String Translation admin panel.
+		// StringTranslation answers on `gettext` for strings registered in String Translation.
 		$translated = (string) apply_filters( 'gettext', $text, $text, 'woocommerce' ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress core 'gettext' filter.
 
 		if ( $translated !== $text ) {
@@ -161,20 +140,10 @@ final class WcStringTranslation {
 	}
 
 	/**
-	 * Pass a translation through the sanitizer WooCommerce applies to the
-	 * value of the hook that is running.
+	 * Pass a translation through the sanitizer WooCommerce applies on the running hook.
 	 *
-	 * - `woocommerce_gateway_title`: WooCommerce's gateway title rules
-	 *   (balanced tags; br, img, p and span only, no links).
-	 * - `woocommerce_shipping_rate_label`: plain text, as WooCommerce's own
-	 *   `sanitize_text_field` filter on that hook makes the label.
-	 * - `woocommerce_cart_shipping_method_full_label`: plain text. The value
-	 *   is that label plus the price markup WooCommerce appends; a
-	 *   translation of it is label text.
-	 *
-	 * Any other hook (the gateway description, whose stored translations are
-	 * already filtered with wp_kses_post, as WooCommerce filters the
-	 * description) and a direct call keep the translation as found.
+	 * A full shipping label's translation is label text, without WooCommerce's price markup: plain text.
+	 * Descriptions keep the translation as found: stored translations are already wp_kses_post-filtered.
 	 *
 	 * @param string $translated Translation found for the original text.
 	 * @return string

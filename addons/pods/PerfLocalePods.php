@@ -12,17 +12,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Pods Framework integration for PerfLocale.
+ * Pods Framework integration: field sync, machine translation and front-end relationship fields.
  *
- * Detects all Pods field types and registers translatable text fields for
- * content sync across translations. Translates pick (relationship) field
- * IDs on the frontend to point to translated posts/terms.
- *
- * Supports Extended post types (meta-based storage). Advanced Content
- * Types with custom table storage are not supported since their data
- * lives outside wp_postmeta.
- *
- * Compatible with Pods 2.x and 3.x.
+ * Meta-based pods only: Advanced Content Types keep their data in custom tables.
  */
 final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 
@@ -44,7 +36,6 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Pod object types that use WordPress meta for storage.
-	 * Advanced Content Types use custom tables - not supported.
 	 *
 	 * @var array<int, string>
 	 */
@@ -109,31 +100,25 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function boot( \PerfLocale\Plugin $plugin ): void {
-		// Register translatable meta keys.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
-		// The value of a password field is not copied into a new translation.
 		add_filter( 'perflocale/translation/excluded_meta_keys', [ $this, 'exclude_password_fields' ], 10, 2 );
 
-		// Translate pick (relationship) fields on the frontend only.
 		if ( ! is_admin() ) {
 			add_filter( 'pods_pods_field', [ $this, 'translate_field_value' ], 10, 4 );
 			add_filter( 'pods_pods_field_related_output_type', [ $this, 'map_display_source' ], PHP_INT_MAX, 4 );
 		}
 
-		// The Pod-config cache is keyed by post type only; on multisite a
-		// shared slug can map to a different Pod per blog, so clear it when
-		// the active blog switches (mirrors the core repositories' resets).
+		// The Pod-config cache is keyed by post type only: clear it per blog (outside Bootstrap's switch_blog registry).
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ self::class, 'reset_static_caches' ] );
 		}
 	}
 
 	/**
-	 * Clear the per-post-type Pod-config cache. Hooked to switch_blog on
-	 * multisite so one blog's Pod definitions never serve another's.
+	 * Clear the per-post-type Pod-config cache on switch_blog.
 	 *
 	 * @return void
 	 */
@@ -149,13 +134,9 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * `perflocale/translation/excluded_meta_keys`: the values of the source
-	 * post type's Pods password fields stay out of a new translation.
+	 * `perflocale/translation/excluded_meta_keys`: keep the source's Pods password field values out of a new translation.
 	 *
-	 * A password field is a password by its type, whatever its name, so the
-	 * credential-name patterns of the meta copy do not catch it. Pods stores
-	 * a field of a meta-based pod as the post meta row of the field's name.
-	 * Runs only when a translation is created.
+	 * A password is known by its field type, not its name, so the credential-name patterns miss it.
 	 *
 	 * @param array<int, string> $excluded  Meta keys that are not copied.
 	 * @param int                $source_id Post the translation is copied from.
@@ -192,9 +173,6 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Detect all translatable Pods fields for a post type.
 	 *
-	 * Loads the pod definition and iterates fields to find text-type
-	 * fields whose values should be translatable.
-	 *
 	 * @param array<int, string> $keys Existing translatable meta keys.
 	 * @param string             $post_type Post type being queried.
 	 * @return array<int, string>
@@ -210,7 +188,6 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 			return $keys;
 		}
 
-		// Only support Extended post types (meta-based storage).
 		$pod_type = $pod->get_arg( 'type' );
 
 		if ( ! in_array( $pod_type, self::SUPPORTED_POD_TYPES, true ) ) {
@@ -233,7 +210,6 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 				continue;
 			}
 
-			// Text-type fields: register meta key directly.
 			if ( in_array( $type, self::TEXT_TYPES, true ) ) {
 				$new_keys[] = $field_name;
 				continue;
@@ -253,9 +229,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Machine-translatable Pods keys: LEAF text/paragraph/wysiwyg fields
-	 * only (code/email/phone/website/oembed/link excluded - not human prose).
-	 * Gated by the mt_meta_custom_fields setting.
+	 * Machine-translatable Pods keys: text, paragraph and wysiwyg fields only (the other types are not prose).
 	 *
 	 * @param array<int, string> $keys      Meta keys.
 	 * @param string             $post_type Post type.
@@ -298,9 +272,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Route Pods plain / paragraph text fields to the provider's text mode so
-	 * the stored translation isn't entity-escaped; wysiwyg fields keep the
-	 * inherited 'html' default. Only ever UPGRADES a key to text.
+	 * Route Pods text and paragraph fields to the provider's text mode; only ever turns a key into text.
 	 *
 	 * @param string $format    Inherited format ('html' default).
 	 * @param string $key       Meta key.
@@ -318,8 +290,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * The set of Pods plain-text (text / paragraph, NOT wysiwyg) field names for
-	 * a post type, built once per request. Blog-keyed for multisite; bounded.
+	 * Pods text and paragraph (not wysiwyg) field names of a post type, memoised per blog.
 	 *
 	 * @param string $post_type Source post type.
 	 * @return array<string, bool> field name => true.
@@ -364,17 +335,9 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Translate Pods field values on the frontend.
+	 * Translate Pods relationship field values on the frontend.
 	 *
-	 * Intercepts relationship (pick) field values and replaces
-	 * post/term IDs with their translated counterparts for the
-	 * current language.
-	 *
-	 * The value is mapped for the outputs that carry IDs: arrays (Pods'
-	 * default), ids and objects. A form read (in_form), a display read
-	 * (the formatted text the Pods shortcode and blocks print) and the
-	 * names, pods and find outputs are returned as they are: a form saves
-	 * what it reads back to the item, and the others carry no ID to map.
+	 * Only the arrays, ids and objects outputs are mapped: a form read saves what it reads back to the item.
 	 *
 	 * @param mixed  $value Field value.
 	 * @param array  $row Current row data.
@@ -387,17 +350,9 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Map the related items a display read formats.
+	 * Map the related items a display read formats; the output type is returned unchanged.
 	 *
-	 * A display read ($pod->display(), a magic tag, the [pods] shortcode and
-	 * the Pods blocks) formats a relationship field before pods_pods_field
-	 * runs. It formats the rows Pods keeps in the item's row under the field
-	 * name, the arrays output. This filter runs at the start of that read:
-	 * it maps those rows to the current language, after reading the field
-	 * once with the arrays output when Pods has not read it yet (the read the
-	 * display would make). Pods then formats and escapes the mapped rows as
-	 * it does any rows, and translate_field_value() puts the item's own rows
-	 * back at the end of the read. The output type is returned unchanged.
+	 * A display read formats the item's cached rows before pods_pods_field runs, so they are mapped here and restored there.
 	 *
 	 * @param mixed $output How Pods outputs the related items.
 	 * @param mixed $row    Current row.
@@ -420,8 +375,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 			return self::$pod_cache[ $post_type ];
 		}
 
-		// Pods can be partially loaded (e.g. during upgrade). Guard the
-		// function_exists check so a missing pods_api() doesn't fatal here.
+		// Pods can be partially loaded, for example during an upgrade.
 		if ( ! function_exists( 'pods_api' ) ) {
 			self::$pod_cache[ $post_type ] = null;
 			return null;

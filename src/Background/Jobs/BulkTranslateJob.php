@@ -10,6 +10,8 @@ declare( strict_types=1 );
 namespace PerfLocale\Background\Jobs;
 
 use PerfLocale\Background\AbstractJob;
+use PerfLocale\MachineTranslation\CallDeadline;
+use PerfLocale\MachineTranslation\DeadlineReachedException;
 use PerfLocale\MachineTranslation\TargetLanguageGuard;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
@@ -20,72 +22,63 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Tier-2 job: translate a set of source posts into one or more target
- * languages using the configured machine-translation provider.
- *
- * Dispatched from the Translations admin page bulk-action handler. Below
- * the threshold the work runs inline so the operator sees counts on the
- * redirect; above it, control returns immediately and the worker hook
- * grinds through the matrix in the background - visible under PerfLocale
- * → Jobs.
- *
- * Args shape:
- *   - 'source_ids'      : int[]  Post IDs to translate FROM (default-lang
- *                                rows; one or more).
- *   - 'target_lang_ids' : int[]  Language IDs to translate INTO.
- *   - 'trigger'         : string Optional. The path that runs the pairs,
- *                                asked about a password-protected source
- *                                (TranslationService::may_send_post()):
- *                                'site_translate' or 'cli_all' (SiteTranslateJob),
- *                                'rest' (the bulk-translate route); absent
- *                                or anything else, 'bulk' (the Translations
- *                                screen's bulk action).
- *
- * Skip rule: a (source, target) pair is skipped when the source already
- * has a translation in that target language - no overwrites.
- *
- * args_size() returns `count(source_ids) * count(target_lang_ids)` - the
- * total number of provider calls this dispatch will potentially fan out
- * to. That matches what an operator intuits as "how big is this job"
- * and pairs naturally with the per-job threshold setting.
- *
- * Run by the background worker, the job runs in slices (see
- * {@see AbstractJob::supports_continuation()}): on a web request a slice
- * stops after SLICE_SECONDS or SLICE_MAX_PAIRS pairs, and the same job
- * continues from the stored counts in the next worker run. Under WP-CLI a
- * slice has no budget and, every RELEASE_EVERY_PAIRS pairs, settles the
- * target-language guard and drops the runtime caches. Inline runs and
- * SiteTranslateJob's chunks run every pair in one call.
+ * Machine-translates source posts (`source_ids`) into languages (`target_lang_ids`), skipping a pair that has a
+ * translation: inline below the threshold, else as a background job run in slices. Args, triggers and slices:
+ * docs-ai/11-code-rationale.md, "BulkTranslateJob: args and slices".
  */
 final class BulkTranslateJob extends AbstractJob {
 
 	/**
-	 * Wall-clock budget of one slice on a web request, in seconds. Leaves
-	 * margin under a 30 s execution or request limit; the same value as
-	 * SiteTranslateJob's chunk budget.
+	 * Wall-clock budget of one web slice, in seconds: margin under a 30 s limit (SiteTranslateJob's chunk budget too).
 	 */
 	private const SLICE_SECONDS = 20;
 
 	/**
-	 * Most pairs one slice runs on a web request, a backstop for work so fast
-	 * that the clock never binds.
+	 * Most pairs one web slice runs: a backstop for work so fast that the clock never binds.
 	 */
 	private const SLICE_MAX_PAIRS = 500;
 
 	/**
-	 * Pairs between two releases under WP-CLI, where a slice has no budget
-	 * by default: each settles the target-language guard and drops the
-	 * runtime caches. Bounds the memory a long run holds.
+	 * Pairs between two releases under WP-CLI (no slice budget there): each settles the target-language guard and drops
+	 * the runtime caches, bounding a long run's memory.
 	 */
 	private const RELEASE_EVERY_PAIRS = TargetLanguageGuard::SETTLE_EVERY;
 
 	/**
-	 * The run's guard against a target language deleted or deactivated
-	 * while it runs ({@see TargetLanguageGuard}).
+	 * The run's guard against a target language deleted or deactivated while it runs (TargetLanguageGuard).
 	 *
 	 * @var TargetLanguageGuard|null
 	 */
 	private ?TargetLanguageGuard $guard = null;
+
+	/**
+	 * Unix time a slice stopped by a provider wait continues at; 0 for at once.
+	 *
+	 * @var int
+	 */
+	private int $continue_at = 0;
+
+	/**
+	 * The slice stopped at the provider deadline inside a pair (not a rate-limit wait).
+	 *
+	 * @var bool
+	 */
+	private bool $unit_stopped = false;
+
+	/**
+	 * Position of the pair a provider deadline stopped this job inside (-1: none); its young pending mark is this
+	 * job's.
+	 *
+	 * @var int
+	 */
+	private int $cut = -1;
+
+	/**
+	 * Translations marked pending (TranslationService::PENDING_META_KEY), read once per run.
+	 *
+	 * @var array<int, bool>|null
+	 */
+	private ?array $pending = null;
 
 	/** {@inheritDoc} */
 	public function get_type(): string {
@@ -95,9 +88,7 @@ final class BulkTranslateJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Same capability the Translations bulk-action handler gates on, so
-	 * the worker re-check inside the job pipeline matches the dispatch-
-	 * side gate.
+	 * The Translations bulk action's capability, so the worker's re-check matches the dispatch gate.
 	 */
 	public function get_required_capability(): string {
 		return 'perflocale_manage_translations';
@@ -106,12 +97,8 @@ final class BulkTranslateJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * 25 is the inline-execution threshold for bulk-translate: below it
-	 * the loop runs synchronously inside the admin request with plenty
-	 * of headroom under PHP's max_execution_time; above it the dispatch
-	 * routes async to dodge PHP-FPM timeouts.
-	 *
-	 * Tunable per site via Settings → Performance → Background Thresholds.
+	 * Below 25 pairs the loop runs inline with headroom under max_execution_time; above, it goes async to avoid PHP-FPM
+	 * timeouts. Tunable under Settings > Performance > Background Thresholds.
 	 */
 	public function get_default_threshold(): int {
 		return 25;
@@ -119,6 +106,11 @@ final class BulkTranslateJob extends AbstractJob {
 
 	/** {@inheritDoc} */
 	public function supports_continuation(): bool {
+		return true;
+	}
+
+	/** {@inheritDoc} */
+	public function resumes_after_kill(): bool {
 		return true;
 	}
 
@@ -131,35 +123,21 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Execute one batch of (source × target) translations.
+	 * Run (source x target) translations: translate_post() per pair, `fast_fail=false` so a retryable error does not
+	 * abort the batch. A worker call (`__perflocale_slice`) is one slice: it resumes from the stored counts and, when
+	 * its budget runs out, returns the counts with `__perflocale_continue => true`.
 	 *
-	 * Per-pair semantics: `translate_post()` per (source, target), skip
-	 * when an existing translation is already present, `fast_fail=false`
-	 * so retryable errors don't abort the whole batch.
-	 *
-	 * With `__perflocale_slice` in the args (a worker run) the call is one
-	 * slice: it resumes from `__perflocale_slice['resume']` and, when its
-	 * budget runs out before the last pair, returns the counts so far with
-	 * `__perflocale_continue => true`.
-	 *
-	 * @param array<string, mixed> $args     `source_ids` + `target_lang_ids`
-	 *                                       per the class-level docblock.
-	 * @param callable             $progress `function(int, int): void` -
-	 *                                       reports (processed, total).
-	 * @return array<string, mixed> `created`, `skipped` (of which
-	 *                               `skipped_permission` were refused for
-	 *                               permissions), `failed`, `first_error`,
-	 *                               `kept` (created rows whose content stayed
-	 *                               in the source language because a "Do not
-	 *                               translate" section was lost) and
-	 *                               `first_warning` (the first such row's
-	 *                               warning).
+	 * @param array<string, mixed> $args     `source_ids` + `target_lang_ids` per the class-level docblock.
+	 * @param callable             $progress `function(int, int): void` - reports (processed, total).
+	 * @return array<string, mixed> `created`, `skipped` (of which `skipped_permission` were refused for permissions),
+	 *                               `failed`, `first_error`, `kept` (created rows left in the source language because a
+	 *                               "Do not translate" section was lost) and `first_warning` (the first such warning).
 	 * @throws \RuntimeException When machine translation is disabled for the site
 	 *                            after the job was queued.
 	 */
 	public function execute( array $args, callable $progress ): array {
-		// Meta-field MT is per-dispatch opt-in (the curated key registry is
-		// additionally setting-gated, so true with everything off is a no-op).
+		// Meta translation is opt-in per dispatch (the key registry is also setting-gated, so true with all off is a
+		// no-op).
 		$include_meta = ! empty( $args['include_meta'] );
 
 		// Which path dispatched the run; only these values are accepted.
@@ -183,21 +161,14 @@ final class BulkTranslateJob extends AbstractJob {
 		$settings = $plugin->get( 'settings' );
 		$cache    = $plugin->get( 'cache' );
 
-		// Re-check the MASTER switch at worker time, not just at dispatch. A
-		// bulk run can sit in the queue for hours; an operator who turns machine
-		// translation off in Settings expects the queued work to stop, not to
-		// keep spending provider budget. WorkerRegistry re-validates the
-		// dispatching user's capability before execute() but knows nothing about
-		// MT settings. Same exception and same message as
-		// BulkStringTranslateJob::execute(), so both bulk paths report an
-		// operator disable identically, and SiteTranslateJob inherits the gate
-		// because it runs every chunk through this method.
+		// The master switch is re-checked at worker time: a run can wait for hours, and turning machine translation off
+		// must stop its spending (WorkerRunner re-checks only the capability). Same exception as
+		// BulkStringTranslateJob::execute(); SiteTranslateJob's chunks pass here too.
 		if ( ! $settings->mt_enabled() ) {
 			throw new \RuntimeException( esc_html__( 'Machine translation is disabled in settings.', 'perflocale' ) );
 		}
 
-		// Resolve language ID → object once so the inner loop is just
-		// dictionary lookups.
+		// Language id -> row once, so the loop only looks up.
 		$lang_repo  = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
 		$lang_by_id = [];
 
@@ -222,7 +193,7 @@ final class BulkTranslateJob extends AbstractJob {
 		// The part of $created whose content was kept in the source language.
 		$kept          = 0;
 		$first_warning = '';
-		// Last FULLY processed source id.
+		// Last fully processed source id.
 		$cursor = 0;
 
 		// Pairs a priming window covers; 0 covers every remaining source.
@@ -230,15 +201,16 @@ final class BulkTranslateJob extends AbstractJob {
 		$before_pair     = null;
 		$slice_seconds   = 0.0;
 		$slice_max_pairs = 0;
+		$deadline        = null;
 		$release_every   = 0;
 		$run_guard       = new TargetLanguageGuard();
 		$slice           = is_array( $args['__perflocale_slice'] ?? null ) ? $args['__perflocale_slice'] : null;
+		$resume          = [];
+		$point           = null;
 
 		if ( null !== $slice ) {
-			// Resume from the checkpoint the previous slice stored: the counts
-			// of this method's result. Pairs run in a fixed order (sources in
-			// dispatch order, each source's targets in order), so `processed`
-			// alone is the position.
+			// Resume from the previous slice's checkpoint: pairs run in a fixed order (sources, then each source's
+			// targets), so `processed` alone is the position.
 			$resume = is_array( $slice['resume'] ?? null ) ? $slice['resume'] : [];
 
 			if ( [] !== $resume ) {
@@ -264,27 +236,7 @@ final class BulkTranslateJob extends AbstractJob {
 
 			$cli = 'cli' === PHP_SAPI;
 
-			/**
-			 * Filter the wall-clock budget of one slice of a background bulk
-			 * translation, in seconds.
-			 *
-			 * A slice stops before its next pair once it has run at least one
-			 * pair and reached this budget or its pair cap; the same job then
-			 * continues in the next worker run. 0 or less: no time budget.
-			 *
-			 * @hook perflocale/jobs/bulk_translate/slice_seconds
-			 * @param float $seconds Default 20 on web requests, 0 under WP-CLI.
-			 */
-			$slice_seconds = (float) apply_filters( 'perflocale/jobs/bulk_translate/slice_seconds', $cli ? 0 : self::SLICE_SECONDS );
-
-			/**
-			 * Filter the most pairs one slice of a background bulk translation
-			 * runs. 0 or less: no pair cap.
-			 *
-			 * @hook perflocale/jobs/bulk_translate/slice_max_pairs
-			 * @param int $pairs Default 500 on web requests, 0 under WP-CLI.
-			 */
-			$slice_max_pairs = (int) apply_filters( 'perflocale/jobs/bulk_translate/slice_max_pairs', $cli ? 0 : self::SLICE_MAX_PAIRS );
+			[ $slice_seconds, $slice_max_pairs, $deadline ] = self::slice_budget( $cli );
 
 			$release_every = $cli ? self::RELEASE_EVERY_PAIRS : 0;
 			$window        = $slice_max_pairs > 0 ? $slice_max_pairs : $release_every;
@@ -293,13 +245,8 @@ final class BulkTranslateJob extends AbstractJob {
 		$start_source = intdiv( $processed, $n_targets );
 		$start_target = $processed % $n_targets;
 
-		// Bulk-prime the L1 translation cache for the sources in one SELECT.
-		// A slice primes the window its pairs can reach, from its first pair.
-		// Without this, get_translation_id() inside the inner loop pays the
-		// cold-path cost (~1-2 ms) on every first hit per source - N source
-		// posts × that cost is wasted work on sites above the
-		// eager-link-map cap. Below the cap this is a no-op (eager map
-		// serves these in µs).
+		// Prime the translation cache for the window this slice can reach in one SELECT; above the eager-link-map cap
+		// each cold get_translation_id() costs about 1-2 ms per source (below it this is a no-op).
 		$prime = static function ( int $from_source, int $from_target ) use ( $repo, $source_ids, $n_targets, $window ): void {
 			$count = $window > 0
 				? intdiv( $from_target + $window + $n_targets - 1, $n_targets )
@@ -330,11 +277,9 @@ final class BulkTranslateJob extends AbstractJob {
 					return true;
 				}
 
-				// Under WP-CLI, every RELEASE_EVERY_PAIRS pairs: settle the
-				// translations written since the last release, drop the
-				// runtime caches and prime the next window. A change another
-				// process made, found by the release, is the run's checkpoint
-				// change too: the next pair reads its target language again.
+				// Under WP-CLI, every RELEASE_EVERY_PAIRS pairs: settle the translations written since, drop the
+				// runtime caches and prime the next window. A change another process made counts as a checkpoint
+				// change: the next pair re-reads its target.
 				if ( $release_every > 0 && $done >= $next_release ) {
 					self::settle_guard( $run_guard, $created, $failed, $first_error );
 
@@ -352,16 +297,9 @@ final class BulkTranslateJob extends AbstractJob {
 
 		$prime( $start_source, $start_target );
 
-		// Throttle progress emission to cap DB writes: a 1000-row dispatch
-		// emitting every row produces 4k+ queries solely for accounting.
-		// Tick every 1% (min 1) so we still get smooth progress in the UI
-		// without flooding the jobs table with progress UPDATEs.
-		// Count-based AND wall-clock-based: the progress callback is the ONLY
-		// place the job/type locks refresh and the cancel/pause probes run.
-		// Under a slow provider (~93-600s per failed row) a pure count-based
-		// gap (total/100 rows) can exceed the 1800s lock TTL - the type lock
-		// gets reclaimed mid-run and a second same-type job starts
-		// concurrently. One microtime comparison per row is the entire cost.
+		// Progress every 1% and by clock: a tick per row costs 4k+ queries on 1000 rows, and the tick is the only place
+		// the locks refresh and cancel/pause probes run, so a slow provider (93-600 s per failed row) must not outlast
+		// the 1800 s lock TTL between ticks.
 		$tick_every   = max( 1, (int) floor( $total / 100 ) );
 		$last_tick    = -1;
 		$last_tick_at = microtime( true );
@@ -378,51 +316,53 @@ final class BulkTranslateJob extends AbstractJob {
 			}
 		};
 
-		// A resumed slice reports its starting position first, so the Jobs
-		// page bar never goes back.
+		// A resumed slice reports its starting position first, so the Jobs page bar never goes back.
 		$tick( $processed );
 
-		// Suspend the eager link map for the loop: every created link
-		// invalidates it, and the next row's get_translation_id read would
-		// otherwise rebuild-and-persist the WHOLE map - O(rows × map size).
-		// Readers fall back to the JOIN path while suspended; one
-		// invalidation after the loop leaves the next request to rebuild a
-		// fresh map once.
+		// Suspend the eager link map for the loop: every created link invalidates it, and rebuilding it per row is
+		// O(rows x map size). Readers use the JOIN path meanwhile; one invalidation after the loop leaves one rebuild.
 		\PerfLocale\Database\Repository\TranslationGroupRepository::suspend_eager_link_map();
 
-		// ⭐ SOURCE-BOUNDARY YIELD. SiteTranslateJob needs to stop on a wall
-		// clock while keeping a resumable, source-atomic cursor. It used to get
-		// that by calling execute() ONCE PER SOURCE - which re-ran everything
-		// above per source and measured 10.55x slower on an all-skip chunk
-		// (120ms/274 queries -> 1,267ms/1,809 queries for 50 sources), because
-		// each call rebuilt the service objects, re-primed, recomputed the
-		// progress threshold against a 10-pair total (so every row ticked), and
-		// ran its own suspend/resume/invalidate cycle: 300 eager-option SELECTs
-		// plus 50 INSERTs and 50 DELETEs.
-		//
-		// Yielding from INSIDE the loop keeps one context, one prime, one
-		// progress policy and one eager-map lifecycle, and still checkpoints
-		// only on a fully-processed source.
-		//
-		// ⚠️ Do NOT instead wrap an outer suspend_eager_link_map() around
-		// repeated calls: suspend/resume set a BOOLEAN, not a nesting counter,
-		// so the inner resume would end the outer scope early.
+		// Source-boundary yield for SiteTranslateJob: one loop lifecycle, a checkpoint only after a whole source; never
+		// an outer suspend_eager_link_map() around repeated calls (a boolean, not a counter).
+		// Why: docs-ai/11-code-rationale.md, "BulkTranslateJob: the source-boundary yield".
 		$yield   = $args['yield_after_source'] ?? null;
 		$stopped = false;
 
-		$this->guard = $run_guard;
+		$this->guard       = $run_guard;
+		$this->continue_at  = 0;
+		$this->unit_stopped = false;
+		$this->pending     = null;
+		$this->cut          = null !== $point ? self::cut_at( $resume, $slice ?? [], $processed ) : -1;
+		$previous_deadline = null !== $deadline ? CallDeadline::set( $deadline ) : null;
+
+		// A worker slice reports its checkpoint before each pair it sends: that pair's position.
+		$save = null === $slice ? null : static function ( int $source_id, string $slug ) use ( &$processed, &$created, &$skipped, &$skipped_permission, &$failed, &$first_error, &$kept, &$first_warning, $progress, $total, $source_ids, $n_targets ): void {
+			$progress(
+				$processed,
+				$total,
+				[
+					'checkpoint' => self::checkpoint_of( $processed, $created, $skipped, $skipped_permission, $failed, $first_error, $kept, $first_warning, $source_ids, $n_targets ),
+					/* translators: 1: post id, 2: target language slug. Names the item a background job was on. */
+					'unit'       => sprintf( __( 'post %1$d into %2$s', 'perflocale' ), $source_id, $slug ),
+				]
+			);
+		};
 
 		try {
-			$stopped = $this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error, is_callable( $yield ) ? $yield : null, $cursor, $skipped_permission, $kept, $first_warning, $start_source, $start_target, $before_pair, $trigger );
+			$stopped = $this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error, is_callable( $yield ) ? $yield : null, $cursor, $skipped_permission, $kept, $first_warning, $start_source, $start_target, $before_pair, $trigger, $save );
 		} finally {
+			if ( null !== $deadline ) {
+				CallDeadline::set( $previous_deadline );
+			}
+
 			\PerfLocale\Database\Repository\TranslationGroupRepository::resume_eager_link_map();
 			\PerfLocale\Plugin::get_instance()->get( 'group_repo' )->invalidate_eager_link_map();
 			$this->settle( $created, $failed, $first_error );
 			$this->guard = null;
 		}
 
-		// Bound worker memory across slices (runtime cache + SAVEQUERIES log
-		// only; persistent cache untouched).
+		// Bound worker memory across slices (runtime cache and SAVEQUERIES log only; persistent cache untouched).
 		if ( null !== $slice ) {
 			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 		}
@@ -441,14 +381,79 @@ final class BulkTranslateJob extends AbstractJob {
 
 		if ( $stopped ) {
 			$result['__perflocale_continue'] = true;
+
+			if ( $this->continue_at > 0 ) {
+				$result['__perflocale_continue_at'] = $this->continue_at;
+			}
+
+			// The worker counts it like a kill at this pair.
+			if ( $this->unit_stopped ) {
+				$result['__perflocale_unit_stop'] = true;
+			}
+
+			// The next slice redoes the pair the deadline stopped inside, under its own young mark.
+			if ( $this->cut === $processed ) {
+				$result['cut'] = $this->cut;
+			}
 		}
 
 		return $result;
 	}
 
 	/**
-	 * Remove the translations written for a target language that is gone
-	 * ({@see TargetLanguageGuard::settle()}) and count each as failed.
+	 * The resume position when this job's own stop left its pair there (a deadline cut, or a kill counted there), else
+	 * -1.
+	 *
+	 * @param array<mixed> $resume    The stored checkpoint.
+	 * @param array<mixed> $slice     The worker's slice args.
+	 * @param int          $processed The resume position.
+	 * @return int
+	 */
+	private static function cut_at( array $resume, array $slice, int $processed ): int {
+		$stops  = is_array( $slice['stops'] ?? null ) ? $slice['stops'] : [];
+		$killed = ( $stops['at'] ?? null ) === $processed && is_int( $stops['count'] ?? null ) && $stops['count'] > 0;
+
+		return $killed || ( $resume['cut'] ?? null ) === $processed ? $processed : -1;
+	}
+
+	/**
+	 * The budget of one slice: seconds and pairs (each 0 for none) and, on a web request, the time its
+	 * provider calls must end by; the seconds also end before the request's limit ({@see CallDeadline}).
+	 *
+	 * @param bool $cli Whether the run is under WP-CLI.
+	 * @return array{0: float, 1: int, 2: float|null}
+	 */
+	private static function slice_budget( bool $cli ): array {
+		/**
+		 * Filter the wall-clock budget of one slice of a background bulk translation, in seconds: a slice stops before
+		 * its next pair once it ran one and reached this or its pair cap. 0 or less: no time budget under WP-CLI; on
+		 * the web never past perflocale/jobs/web_slice_max_seconds (60 s).
+		 *
+		 * @hook perflocale/jobs/bulk_translate/slice_seconds
+		 * @param float $seconds Default 20 on web requests, 0 under WP-CLI.
+		 */
+		$seconds = (float) apply_filters( 'perflocale/jobs/bulk_translate/slice_seconds', $cli ? 0 : self::SLICE_SECONDS );
+
+		/**
+		 * Filter the most pairs one slice of a background bulk translation runs. 0 or less: no pair cap.
+		 *
+		 * @hook perflocale/jobs/bulk_translate/slice_max_pairs
+		 * @param int $pairs Default 500 on web requests, 0 under WP-CLI.
+		 */
+		$pairs = (int) apply_filters( 'perflocale/jobs/bulk_translate/slice_max_pairs', $cli ? 0 : self::SLICE_MAX_PAIRS );
+
+		$deadline = null;
+
+		if ( ! $cli ) {
+			[ $seconds, $deadline ] = CallDeadline::for_slice( $seconds );
+		}
+
+		return [ $seconds, $pairs, $deadline ];
+	}
+
+	/**
+	 * Remove the translations written for a target language that is gone (TargetLanguageGuard::settle()); each counts
+	 * as failed.
 	 *
 	 * @param int    $created     Translations created.
 	 * @param int    $failed      Pairs failed.
@@ -462,8 +467,7 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Settle a run's guard ({@see TargetLanguageGuard::settle()}) and count
-	 * each translation it removed as failed.
+	 * Settle a run's guard (TargetLanguageGuard::settle()) and count each translation it removed as failed.
 	 *
 	 * @param TargetLanguageGuard $guard       The run's guard.
 	 * @param int                 $created     Translations created.
@@ -485,13 +489,8 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * The counts a slice resumes from, when the stored checkpoint matches
-	 * the job.
-	 *
-	 * It matches when `processed` is a position inside the job and `cursor`
-	 * is the last source it fully processed (0 before the first). A caller
-	 * that gets null starts again at the first pair, which is safe: pairs
-	 * already translated are skipped without a provider call.
+	 * The counts a slice resumes from, when the checkpoint matches the job (`processed` inside it, `cursor` the last
+	 * source fully done). Null starts at the first pair, which is safe: translated pairs are skipped without a call.
 	 *
 	 * @param array<mixed>    $resume     Result stored by the previous slice.
 	 * @param array<int, int> $source_ids Source post ids.
@@ -529,24 +528,113 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Whether a source already has a translation in a language this run
-	 * knows (null: none), by the language's id, which a change of the
-	 * language's code leaves as it is.
+	 * The checkpoint at a position: the counts so far and the last source fully done (checkpoint() reads it).
+	 *
+	 * @param int             $processed          Pairs done.
+	 * @param int             $created            Created.
+	 * @param int             $skipped            Skipped.
+	 * @param int             $skipped_permission Skipped for permissions.
+	 * @param int             $failed             Failed.
+	 * @param string          $first_error        First error.
+	 * @param int             $kept               Kept in the source language.
+	 * @param string          $first_warning      First warning.
+	 * @param array<int, int> $source_ids         Source post ids.
+	 * @param int             $n_targets          Target languages (> 0).
+	 * @return array<string, int|string>
+	 */
+	private static function checkpoint_of( int $processed, int $created, int $skipped, int $skipped_permission, int $failed, string $first_error, int $kept, string $first_warning, array $source_ids, int $n_targets ): array {
+		$done = intdiv( $processed, $n_targets );
+
+		return [
+			'created'            => $created,
+			'skipped'            => $skipped,
+			'skipped_permission' => $skipped_permission,
+			'failed'             => $failed,
+			'first_error'        => $first_error,
+			'kept'               => $kept,
+			'first_warning'      => $first_warning,
+			'cursor'             => $done > 0 ? (int) $source_ids[ $done - 1 ] : 0,
+			'processed'          => $processed,
+		];
+	}
+
+	/**
+	 * Whether a source already has a complete translation in a language this run knows (null: none), by the
+	 * language's id. One still marked pending (a worker stopped while writing it) is redone, not skipped.
 	 *
 	 * @param object      $manager   Post translation manager.
 	 * @param int         $source_id Source post id.
 	 * @param object|null $language  Language row.
+	 * @param bool        $own       The pair is the one a deadline stopped this job inside.
 	 * @return bool
 	 */
-	private static function has_translation( object $manager, int $source_id, ?object $language ): bool {
-		$id = null !== $language ? ( get_object_vars( $language )['id'] ?? null ) : null;
+	private function has_translation( object $manager, int $source_id, ?object $language, bool $own = false ): bool {
+		$vars = null !== $language ? get_object_vars( $language ) : [];
+		$id   = $vars['id'] ?? null;
 
-		return is_numeric( $id ) && method_exists( $manager, 'has_translation_in' ) && $manager->has_translation_in( $source_id, (int) $id );
+		if ( ! is_numeric( $id ) || ! method_exists( $manager, 'has_translation_in' ) || ! $manager->has_translation_in( $source_id, (int) $id ) ) {
+			return false;
+		}
+
+		$this->pending ??= self::pending_translations();
+
+		if ( [] === $this->pending || ! is_string( $vars['slug'] ?? null ) ) {
+			return true;
+		}
+
+		$translation = method_exists( $manager, 'get_translation_id' ) ? $manager->get_translation_id( $source_id, $vars['slug'] ) : null;
+
+		return ! $this->unfinished( $translation, $own );
 	}
 
 	/**
-	 * The bulk row loop - split from execute() so the eager-link-map
-	 * suspension can wrap it in a single try/finally.
+	 * Whether a translation's pending mark makes the pair run again: a stopped worker's (older than a lease), or a
+	 * young one on the pair a deadline stopped this job inside ($own).
+	 *
+	 * @param mixed $translation Translation post id.
+	 * @param bool  $own         The pair is the one a deadline stopped this job inside.
+	 * @return bool
+	 */
+	private function unfinished( mixed $translation, bool $own ): bool {
+		$this->pending ??= self::pending_translations();
+		$stale           = is_numeric( $translation ) ? ( $this->pending[ (int) $translation ] ?? null ) : null;
+
+		return true === $stale || ( $own && false === $stale );
+	}
+
+	/**
+	 * Marked translations not saved a minute after the mark (later: a person finished it), by id: true when marked a
+	 * lease ago or more (a stopped worker's), false when younger (a live call's, or a deadline-stopped pair's). One
+	 * read.
+	 *
+	 * @return array<int, bool>
+	 */
+	private static function pending_translations(): array {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return [];
+		}
+
+		$pending = [];
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One indexed read per run, only when a translation exists.
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT m.post_id, m.meta_value, p.post_modified_gmt FROM %i m INNER JOIN %i p ON p.ID = m.post_id WHERE m.meta_key = %s', $wpdb->postmeta, $wpdb->posts, TranslationService::PENDING_META_KEY ), ARRAY_A );
+
+		foreach ( is_array( $rows ) ? $rows : [] as $row ) {
+			$mark  = TranslationService::pending_time( $row['meta_value'] ?? null );
+			$saved = is_string( $row['post_modified_gmt'] ?? null ) ? strtotime( $row['post_modified_gmt'] . ' UTC' ) : false;
+
+			if ( $mark > 0 && is_numeric( $row['post_id'] ?? null ) && false !== $saved && $saved <= $mark + MINUTE_IN_SECONDS ) {
+				$pending[ (int) $row['post_id'] ] = time() - $mark >= \PerfLocale\Background\JobResume::LEASE;
+			}
+		}
+
+		return $pending;
+	}
+
+	/**
+	 * The bulk row loop, apart from execute() so one try/finally wraps the eager-link-map suspension.
 	 *
 	 * @param array<int,int>            $source_ids  Source post IDs.
 	 * @param array<int,int>            $target_ids  Target language IDs.
@@ -562,42 +650,30 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param int                       $skipped     Running skipped count (by ref).
 	 * @param int                       $failed      Running failed count (by ref).
 	 * @param string                    $first_error First error message (by ref).
-	 * @param callable|null             $yield       Called with the just-completed
-	 *                                               source id; returning true stops
-	 *                                               the loop at that boundary.
+	 * @param callable|null             $yield       Called with the just-completed source id; true stops at that boundary.
 	 * @param int                       $cursor      Last FULLY processed source id (by ref).
 	 * @param int               $skipped_permission Part of $skipped refused for permissions (by ref).
-	 * @param int               $kept          Part of $created whose content was kept in the
-	 *                                         source language (by ref).
+	 * @param int               $kept          Part of $created left in the source language (by ref).
 	 * @param string            $first_warning Warning of the first such row (by ref).
 	 * @param int               $start_source  Index in $source_ids of the first pair to run.
 	 * @param int               $start_target  Index in $target_ids of the first pair to run.
-	 * @param callable|null     $before_pair   Called with the next pair's source and target
-	 *                                         indexes before it runs; returning true stops
-	 *                                         the loop before that pair.
-	 * @param string            $trigger       The dispatching path; the pairs of a
-	 *                                         password-protected source it may not send
-	 *                                         (TranslationService::may_send_post()) count
-	 *                                         as skipped.
-	 * @return bool True when $before_pair stopped the loop.
+	 * @param callable|null     $before_pair   Called with the next pair's indexes; true stops the loop before it.
+	 * @param string            $trigger       The dispatching path; a password-protected source it may not send
+	 *                                         (TranslationService::may_send_post()) counts as skipped.
+	 * @param callable|null      $checkpoint    Called with the source id and target slug before a pair is sent.
+	 * @return bool True when $before_pair, or a provider wait past the slice's deadline, stopped the loop.
+	 * @throws DeadlineReachedException In a run without $before_pair (not a slice): the deadline is its caller's.
+	 * @phpstan-impure
 	 */
-	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, TranslationService $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk' ): bool {
-		// `perflocale_use_mt` is the capability that authorises SPENDING the
-		// provider; `perflocale_manage_translations` - the one WorkerRegistry
-		// re-validates at worker time - only authorises running the job. A queued
-		// bulk run can sit for hours, so evaluate the MT capability here instead
-		// of trusting the dispatch-time decision. Evaluated ONCE (the identity
-		// cannot change inside the loop) and folded into the existing per-row
-		// gate, so a revoked capability produces exactly the "skipped" accounting
-		// an unauthorised post already produces rather than a new failure shape.
+	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, TranslationService $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk', ?callable $checkpoint = null ): bool {
+		// `perflocale_use_mt` authorizes spending the provider; WorkerRunner re-checks only
+		// `perflocale_manage_translations`. Read once here (the user cannot change in the loop) and folded into the
+		// per-row gate, so a revoked capability counts as skipped, as an unauthorized post does.
 		$can_use_mt = current_user_can( 'perflocale_use_mt' );
 		$gone_ids   = [];
 
-		// Say WHY the run did nothing. Without this the job completes with every
-		// row "skipped" and an empty error, which reads as "there was nothing to
-		// translate" rather than "the dispatching user lost the capability" - the
-		// operator has no way to tell those apart from the Jobs page or the REST
-		// detail endpoint.
+		// Say why the run did nothing: all "skipped" with no error reads as "nothing to translate", not as a lost
+		// capability.
 		if ( ! $can_use_mt && $first_error === '' ) {
 			$first_error = __( 'Machine translation is not permitted for the dispatching user (perflocale_use_mt).', 'perflocale' );
 		}
@@ -610,9 +686,9 @@ final class BulkTranslateJob extends AbstractJob {
 
 			// Re-check the per-row capability inside the worker. The
 			// dispatch-side capability gate is `perflocale_manage_translations`;
-			// individual posts still respect `edit_post` so a user can't
+			// individual posts still respect edit rights (host-aware) so a user can't
 			// trigger MT for content they couldn't otherwise edit.
-			if ( ! $can_use_mt || ! current_user_can( 'edit_post', $source_id ) ) {
+			if ( ! $can_use_mt || ! \PerfLocale\Helper::user_can_edit_object( (int) $source_id ) ) {
 				if ( null !== $before_pair && $before_pair( $source_index, (int) array_key_first( $targets ) ) ) {
 					return true;
 				}
@@ -622,8 +698,8 @@ final class BulkTranslateJob extends AbstractJob {
 				$processed          += count( $targets );
 				$tick( $processed );
 
-				// A source skipped for permissions is still FULLY processed -
-				// the cursor must pass it or the chain re-reads it forever.
+				// A source skipped for permissions is fully processed: the cursor must pass it or the chain re-reads it
+				// forever.
 				$cursor = (int) $source_id;
 
 				if ( $yield !== null && $yield( (int) $source_id, $processed ) ) {
@@ -633,18 +709,14 @@ final class BulkTranslateJob extends AbstractJob {
 				continue;
 			}
 
-			// Whether the dispatching user may have translations of this source
-			// copied from the group's default-language post. Resolved once per
-			// source, at the first row that would create a translation, and
-			// reused for its remaining targets. A later row can add the
-			// default-language member itself; that copy derives from $source_id,
-			// which the user may edit, so the answer stays sound.
+			// Whether the user may have translations of this source copied from the group's default-language post:
+			// resolved once per source, at its first creating row. A later row adding that member copies from
+			// $source_id, so it holds.
 			$copy_allowed  = null;
 			$create_denied = false;
 
-			// Whether this run may send this source, resolved at its first row
-			// that would be translated, so a source whose rows all exist costs
-			// nothing.
+			// Whether this run may send this source, resolved at its first row to translate (free when every row
+			// exists).
 			$send_allowed = null;
 
 			foreach ( $targets as $target_index => $target_lang_id ) {
@@ -652,29 +724,26 @@ final class BulkTranslateJob extends AbstractJob {
 					return true;
 				}
 
-				// Don't overwrite an existing translation. Checked by the
-				// target's id, before the checkpoint below, so a pair that is
-				// skipped costs no query.
-				if ( ! isset( $gone_ids[ (int) $target_lang_id ] ) && self::has_translation( $manager, (int) $source_id, $lang_by_id[ $target_lang_id ] ?? null ) ) {
+				// Never overwrite an existing translation; checked by the target's id before the checkpoint, so a skip
+				// costs no query.
+				if ( ! isset( $gone_ids[ (int) $target_lang_id ] ) && $this->has_translation( $manager, (int) $source_id, $lang_by_id[ $target_lang_id ] ?? null, $processed === $this->cut ) ) {
 					++$skipped;
 					++$processed;
 					$tick( $processed );
 					continue;
 				}
 
-				// Another process may have changed the languages (or anything
-				// cached) since the run started: after a change, the pair reads
-				// its target as it is now, and a translation written for a
-				// language that has gone since is removed again (settle()).
-				// Runs before every pair that calls the provider or writes.
+				// Before every pair that calls the provider or writes: after a change by another process the pair reads
+				// its target as it is now, and a translation written for a language gone since is removed again
+				// (settle()).
 				$guard     = $this->guard;
 				$refreshed = false;
 
 				if ( null !== $guard && $guard->checkpoint() ) {
 					$this->settle( $created, $failed, $first_error );
 
-					// Every target is read again: a language deleted or
-					// deactivated meanwhile fails its remaining pairs.
+					// Every target is read again: a language deleted or deactivated meanwhile fails its remaining
+					// pairs.
 					foreach ( array_keys( $lang_by_id ) as $known_id ) {
 						$fresh = $guard->live_target( (int) $known_id );
 
@@ -704,9 +773,8 @@ final class BulkTranslateJob extends AbstractJob {
 				$target_lang = $lang_by_id[ $target_lang_id ] ?? null;
 
 				if ( $target_lang === null ) {
-					// Unresolvable language id: count as FAILED (silently
-					// dropping it let a bogus-language site-wide chain grind
-					// through every chunk reporting all-green zeros).
+					// An unresolvable language id counts as failed, so a bad-language chain cannot report all-green
+					// zeros.
 					++$failed;
 					if ( $first_error === '' ) {
 						$first_error = sprintf(
@@ -720,22 +788,20 @@ final class BulkTranslateJob extends AbstractJob {
 					continue;
 				}
 
-				// The languages were read again: the pair's translation is
-				// looked up under the target as it is now.
-				if ( $refreshed && $manager->get_translation_id( $source_id, $target_lang->slug ) !== null ) {
+				// The languages were read again: the pair's translation is looked up under the target as it is now; one
+				// marked pending is redone, as above.
+				$now = $refreshed ? $manager->get_translation_id( $source_id, $target_lang->slug ) : null;
+
+				if ( null !== $now && ! $this->unfinished( $now, $processed === $this->cut ) ) {
 					++$skipped;
 					++$processed;
 					$tick( $processed );
 					continue;
 				}
 
-				// The row creates a translation, which is copied from the group's
-				// default-language post rather than necessarily from $source_id,
-				// so edit_post on $source_id above is not enough, and it inserts
-				// a post of that post's type, so the type's create capability
-				// applies as on the single-create route. A 0 answer (nothing
-				// would be copied) is not remembered: it can depend on the
-				// target.
+				// The row creates a translation copied from the group's default-language post (not necessarily
+				// $source_id) as a post of that type, so the copy permission and the type's create capability apply as
+				// on the single-create route. A 0 answer is not remembered: it can depend on the target.
 				if ( $copy_allowed === null ) {
 					$copy_from = $manager->get_copy_source_id( (int) $source_id, (string) $target_lang->slug );
 
@@ -786,33 +852,17 @@ final class BulkTranslateJob extends AbstractJob {
 				];
 
 				/**
-				 * Short-circuit a single (source post, target language) row
-				 * before the default machine-translation call.
-				 *
-				 * Match WordPress's `pre_*` filter convention: return `null`
-				 * (the default) to let the regular flow run. Return ANY other
-				 * value to skip the default `TranslationService::translate_post()`
-				 * call for this row - the returned value is treated as the
-				 * row's result:
-				 *
-				 *   - `[ 'post_id' => int ]`      - counted as `created`.
-				 *   - `'skip'` or any non-array   - counted as `skipped`.
-				 *   - `false`                     - counted as `skipped`.
-				 *
-				 * Useful for per-row policy decisions: skip products on a
-				 * lock-list, route specific languages through a different
-				 * provider, attach pre-translation metadata, etc.
+				 * Short-circuit one (source post, target language) row before the default machine translation call, as
+				 * WordPress's `pre_*` filters: null runs the default; `['post_id' => int]` counts as created; anything
+				 * else (`'skip'`, `false`, a non-array) as skipped. For per-row policy such as lock-lists.
 				 *
 				 * @hook  perflocale/mt/bulk/before_translate
 				 * @since 1.0.0
 				 *
-				 * @param mixed $pre `null` to run the default flow; any other
-				 *                   value to short-circuit and use as the
-				 *                   row's result.
+				 * @param mixed $pre `null` to run the default flow; any other value is the row's result.
 				 * @param int    $source_id   The source post ID.
 				 * @param string $target_slug The target language slug.
-				 * @param array  $context     Row metadata: target_id, provider,
-				 *                            processed-so-far, total.
+				 * @param array  $context     Row metadata: target_id, provider, processed-so-far, total.
 				 */
 				$pre = apply_filters(
 					'perflocale/mt/bulk/before_translate',
@@ -852,24 +902,27 @@ final class BulkTranslateJob extends AbstractJob {
 				$row_result = [];
 				$row_error  = '';
 
+				if ( null !== $checkpoint ) {
+					$checkpoint( (int) $source_id, TargetLanguageGuard::slug_of( $target_lang ) );
+				}
+
 				try {
-					// fast_fail=false lets the provider's retry loop
-					// catch transient errors (rate limit, network blip).
+					// fast_fail=false lets the provider's retry loop catch transient errors (rate limit, network blip).
 					$inserted   = false;
 					$row_result = $service->translate_post( $source_id, TargetLanguageGuard::slug_of( $target_lang ), '', false, $include_meta, $inserted );
 
 					if ( ! empty( $row_result['post_id'] ) ) {
 						++$created;
 
-						// Only a translation this run inserted: one it updated
-						// existed before the run and is never removed.
+						// Only a translation this run inserted: one it updated existed before the run and is never
+						// removed.
 						if ( $inserted && null !== $this->guard ) {
 							$this->guard->written( is_numeric( $row_result['post_id'] ) ? (int) $row_result['post_id'] : 0, (int) $target_lang_id );
 						}
 
-						// A lost "Do not translate" section keeps the source
-						// content; the row counts as created and is reported.
-						if ( ! empty( $row_result['content_kept_source'] ) ) {
+						// A lost "Do not translate" section or a builder layout keeps the source content; the row
+						// counts as created and is reported.
+						if ( ! empty( $row_result['content_kept_source'] ) || in_array( 'builder', (array) ( $row_result['kept'] ?? [] ), true ) ) {
 							++$kept;
 
 							$row_warnings = array_filter( (array) ( $row_result['warnings'] ?? [] ), 'is_string' );
@@ -886,6 +939,17 @@ final class BulkTranslateJob extends AbstractJob {
 							$first_error = $row_error;
 						}
 					}
+				} catch ( DeadlineReachedException $e ) {
+					// Not the pair's failure: the next slice translates it again.
+					if ( null === $before_pair ) {
+						throw $e;
+					}
+
+					$this->continue_at  = $e->retry_at();
+					$this->unit_stopped = ! $e->paced();
+					$this->cut          = $processed;
+
+					return true;
 				} catch ( \Throwable $e ) {
 					++$failed;
 					$row_error = $e->getMessage();
@@ -896,27 +960,17 @@ final class BulkTranslateJob extends AbstractJob {
 				}
 
 				/**
-				 * Fires after each (source post, target language) row, whether
-				 * the translation succeeded, failed, or was short-circuited
-				 * by `perflocale/mt/bulk/before_translate`.
-				 *
-				 * Use for per-row observability: emit a metric, push to a
-				 * monitoring pipeline, write a workflow event, etc.
+				 * Fires after each (source post, target language) row: translated, failed or short-circuited by
+				 * `perflocale/mt/bulk/before_translate`. For per-row metrics, monitoring or workflow events.
 				 *
 				 * @hook  perflocale/mt/bulk/after_translate
 				 * @since 1.0.0
 				 *
 				 * @param int    $source_id   Source post ID.
 				 * @param string $target_slug Target language slug.
-				 * @param array  $result      The TranslationService result
-				 *                            array (`['post_id' => int]` on
-				 *                            success). Empty array on failure.
-				 * @param array  $context     Row metadata. Includes `error`
-				 *                            (string, empty on success),
-				 *                            `short_circuited` (bool - was
-				 *                            this from before_translate?),
-				 *                            and the keys passed to the
-				 *                            before_translate filter.
+				 * @param array  $result      The TranslationService result (`['post_id' => int]` on success); empty on failure.
+				 * @param array  $context     Row metadata: `error` (empty on success), `short_circuited` (from before_translate) and
+				 *                            the keys passed to the before_translate filter.
 				 */
 				do_action(
 					'perflocale/mt/bulk/after_translate',
@@ -936,8 +990,7 @@ final class BulkTranslateJob extends AbstractJob {
 				$tick( $processed );
 			}
 
-			// Every target for this source has been attempted - only now is it
-			// safe to move the cursor past it.
+			// Every target of this source was attempted: the cursor may pass it.
 			$cursor = (int) $source_id;
 
 			if ( $yield !== null && $yield( (int) $source_id, $processed ) ) {

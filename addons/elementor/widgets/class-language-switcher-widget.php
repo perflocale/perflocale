@@ -12,10 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * PerfLocale Language Switcher widget for Elementor.
- *
- * Renders the language switcher using PerfLocale's shared block renderer
- * with configurable style, display mode, and layout options.
+ * PerfLocale Language Switcher widget for Elementor, rendered by the shared block renderer.
  */
 class PerfLocale_Elementor_Language_Switcher extends \Elementor\Widget_Base {
 

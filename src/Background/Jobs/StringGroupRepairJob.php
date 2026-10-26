@@ -19,31 +19,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Runs {@see SqliteGroupRepair} on a SQLite site, slice by slice, in the job
- * runner (WP-Cron or Action Scheduler), never on a visitor's request.
- *
- * Queued from wp-admin (admin_init, by a user who can manage options; the
- * request only claims the state below and queues the job); `wp perflocale
- * db-migrate` runs the same slices in the foreground. Each execution runs
- * repair slices for up to SLICE_SECONDS and then continues in a new
- * execution. Where the repair stands lives in the repair's own progress
- * option, so a job that stopped anywhere resumes from the last committed
- * slice. A slice that failed (rolled back) fails the execution with that
- * reason; the worker retries it later, and a job that ran out of retries is
- * queued again from the next admin page view.
- *
- * The blog's dispatch state is the option `perflocale_sqlite_string_groups_repair_job`,
- * in the forms of {@see OneTimeDispatch}: absent until the first dispatch,
- * `claim:<unix time>` while a request queues the job, `queued:<job id>:<unix
- * time>` while the job is queued or running, `failed:<unix time>` or
- * `canceled:<unix time>` once its job failed or was canceled, and
- * `done:<unix time>` once the repair finished (written by the repair with
- * its done option).
+ * Runs SqliteGroupRepair on a SQLite site in time slices in the job runner, never on a visitor's request
+ * (`wp perflocale db-migrate` runs the same slices in the foreground). It resumes from the repair's last committed
+ * slice; a failed slice fails the execution for a retry, and a job out of retries is queued again by maybe_dispatch().
  */
 final class StringGroupRepairJob extends AbstractJob {
 
 	/**
-	 * The blog's dispatch state.
+	 * The blog's dispatch state (OneTimeDispatch forms): absent, `claim:`, `queued:<job id>:`, `failed:`, `canceled:`
+	 * or `done:` plus a unix time; the repair writes `done:` with its done option.
 	 */
 	public const OPTION = 'perflocale_sqlite_string_groups_repair_job';
 
@@ -118,12 +102,9 @@ final class StringGroupRepairJob extends AbstractJob {
 	}
 
 	/**
-	 * `admin_init` on a SQLite site: the first wp-admin request of a user
-	 * who can manage options queues the repair, once, and again when the job
-	 * it recorded failed, was canceled or is gone. Decided from the
-	 * autoloaded state option alone; a queued job's row is read at most once
-	 * per {@see OneTimeDispatch::CHECK_EVERY} seconds. The request claims the
-	 * state in one statement and queues the job; it reads no repair data.
+	 * `admin_init` on a SQLite site: queues the repair once for a user who can manage options, and again when its job
+	 * failed, was canceled or is gone. Decided from the autoloaded state alone (a queued job's row is read at most once
+	 * per OneTimeDispatch::CHECK_EVERY); the request claims the state in one statement and reads no repair data.
 	 *
 	 * @return void
 	 */
@@ -134,14 +115,12 @@ final class StringGroupRepairJob extends AbstractJob {
 
 		$state = get_option( self::OPTION, '' );
 
-		// Done, the state of every admin request once the repair ran, stops
-		// here without loading the dispatch class.
+		// Done (every admin request once the repair ran) stops here without loading the dispatch class.
 		if ( ! is_string( $state ) || str_starts_with( $state, 'done:' ) || 'skip' === OneTimeDispatch::decide( $state, time(), 0, true ) || ! current_user_can( self::CAPABILITY ) ) {
 			return;
 		}
 
-		// The repair is done (WP-CLI finished it, or the state was lost):
-		// record done here so that later requests stop at the state.
+		// Done by WP-CLI, or the state was lost: record done so later requests stop at the state.
 		if ( false !== get_option( SqliteGroupRepair::DONE_OPTION, false ) ) {
 			OneTimeDispatch::claim( self::OPTION, $state, 'done:' . time() );
 
@@ -159,8 +138,7 @@ final class StringGroupRepairJob extends AbstractJob {
 	}
 
 	/**
-	 * Queue the repair job and record it as queued over the claim of the
-	 * request that won it ({@see OneTimeDispatch::publish()}).
+	 * Queue the repair job and record it as queued over this request's claim (OneTimeDispatch::publish()).
 	 *
 	 * @param string $claim The claim this request holds.
 	 * @return void
@@ -168,8 +146,7 @@ final class StringGroupRepairJob extends AbstractJob {
 	private static function dispatch( string $claim ): void {
 		$queued = Dispatcher::enqueue( new self(), [] );
 
-		// Not queued (a veto filter, a refused dispatch): no job id, and the
-		// next admin request tries again.
+		// Not queued (a veto filter, a refused dispatch): no job id, and the next admin request tries again.
 		OneTimeDispatch::publish( self::OPTION, $claim, isset( $queued['job_id'] ) && is_string( $queued['job_id'] ) ? $queued['job_id'] : '' );
 	}
 }

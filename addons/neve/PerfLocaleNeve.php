@@ -12,10 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Neve theme integration for PerfLocale.
- *
- * Registers a Language Switcher component in Neve's Header Footer Grid (HFG)
- * builder so users can drag it into any header row via the Customizer.
+ * Neve theme integration: a Language Switcher component in Neve's Header Footer Grid builder.
  */
 final class PerfLocaleNeve implements \PerfLocale\Addon\AddonInterface {
 

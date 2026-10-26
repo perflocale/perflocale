@@ -18,13 +18,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Sends translation requests to an external agency.
  *
- * POSTs content to a configured URL and expects the translated text in
- * the immediate JSON response (`{"translation": "..."}`). The agency must
- * respond synchronously - asynchronous callback workflows are not
- * implemented in core. Addons can hook the
- * `perflocale/mt/agency_async_response` filter to short-circuit the throw
- * and supply a deferred translation (for example by matching the
- * `request_id` against a callback already received out-of-band).
+ * The agency answers synchronously (`{"translation": "..."}`); an add-on supplies an asynchronous
+ * one through `perflocale/mt/agency_async_response`.
  */
 final class ExternalAgencyProvider extends AbstractProvider {
 
@@ -54,11 +49,8 @@ final class ExternalAgencyProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch(). Carried to the agency as a
-	 *   'format' payload field on the text path only: the default payload
-	 *   stays byte-compatible with agency endpoints that validate it
-	 *   strictly, and absence of the field means HTML.
+	 * @param string $format Destination format hint ('html'|'text'). Sent as 'format' for text only: the HTML
+	 *   payload stays what strict agency endpoints validate.
 	 *
 	 * @throws \RuntimeException When the agency URL is unconfigured, the response lacks a translation, or all retries fail.
 	 */
@@ -75,9 +67,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 		/** This filter is documented in src/MachineTranslation/Provider/DeepLProvider.php */
 		$text = (string) apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'external_agency', $target_lang );
 
-		// External agency API shape is site-specific; normalize to BCP 47
-		// dash-form so WP-style underscore locales ('en_US') resolve to
-		// standard codes the agency is most likely to accept.
+		// Dash form ('en-us', not 'en_US'): the BCP 47 shape an agency most likely accepts.
 		$request_id = wp_generate_uuid4();
 		$payload    = [
 			'text'        => $text,
@@ -121,16 +111,10 @@ final class ExternalAgencyProvider extends AbstractProvider {
 		}
 
 		/**
-		 * Filter the response when the agency does not return a synchronous
-		 * translation. Lets an addon implement async-callback support
-		 * out-of-tree by, for example, matching `$request_id` against a
-		 * callback already received out-of-band and returning the cached
-		 * translated text.
+		 * Filter the response when the agency returns no synchronous translation.
 		 *
-		 * Return a non-empty string to use as the translation. Return null
-		 * (the default) to raise a RuntimeException - without an async
-		 * handler the agency must respond synchronously with the
-		 * translation; otherwise nothing meaningful can be persisted.
+		 * Return a non-empty string to use as the translation (for example one a callback delivered for
+		 * `$request_id`); null, the default, throws a RuntimeException.
 		 *
 		 * @hook perflocale/mt/agency_async_response
 		 * @param string|null $translation Default null (= throw).
@@ -197,8 +181,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 			1
 		);
 
-		// This probe only cares that the endpoint answered 2xx - it never
-		// parses the body, so it has to settle the armed success itself.
+		// The probe never parses the body, so it settles the armed success itself.
 		$this->accept_response();
 
 		return true;
@@ -214,11 +197,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Get the agency API key from settings.
-	 *
-	 * Resolved transparently as env var → PHP constant → database via
-	 * Settings::get() (see Settings::CONSTANT_MAP for the env/constant
-	 * name binding: PERFLOCALE_AGENCY_API_KEY ↔ mt_agency_api_key).
+	 * The agency API key: env var or constant PERFLOCALE_AGENCY_API_KEY first, then the database (Settings::get()).
 	 *
 	 * @return string
 	 */

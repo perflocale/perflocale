@@ -19,25 +19,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Puts TranslatePress translations of text outside post content where
- * PerfLocale keeps that text.
+ * Puts TranslatePress translations of text outside post content where PerfLocale keeps that text.
  *
- * TranslatePress translates rendered text and attributes a string to a post
- * only when it was found in that post's content. Everything else is matched
- * here by its exact original text:
- * - term names and descriptions: the term's translation (created when the
- *   term has none in that language);
- * - menu labels: a copy of each menu in a theme location for that language,
- *   linked to the menu it copies;
- * - the site title and tagline: PerfLocale's option strings;
- * - excerpts and WooCommerce short descriptions: the created translation's
- *   excerpt ({@see self::excerpt()}).
- *
- * What matches none of them is counted ({@see self::unmatched_count()}).
- *
- * A dictionary or term read that fails throws a
- * {@see TranslatePressSourceReadException}: a failed read is never taken as
- * "no translation".
+ * Matched by exact original: term names, menu labels (a linked menu copy), site title, tagline and excerpts.
+ * A failed read throws TranslatePressSourceReadException, never taken as "no translation".
  */
 final class TranslatePressDictionary {
 
@@ -59,8 +44,7 @@ final class TranslatePressDictionary {
 	private array $matched = [];
 
 	/**
-	 * What this run wrote so far: term translations created, menu copies
-	 * created, option-string translations stored.
+	 * What this run wrote so far: term translations, menu copies, option-string translations.
 	 *
 	 * @var array{terms: int, menus: int, strings: int}
 	 */
@@ -76,7 +60,7 @@ final class TranslatePressDictionary {
 	 * @param \wpdb         $wpdb       Database.
 	 * @param CacheManager  $cache      Cache manager.
 	 * @param int           $min_status Lowest TranslatePress status imported.
-	 * @param \Closure|null $beat       The importer's heartbeat, called after each batch of terms and each menu so a long step keeps the import lock and its job alive ({@see ImportHeartbeat}).
+	 * @param \Closure|null $beat       The importer's heartbeat, after each term batch and menu, to keep the import lock.
 	 */
 	public function __construct(
 		private readonly \wpdb $wpdb,
@@ -121,10 +105,8 @@ final class TranslatePressDictionary {
 	/**
 	 * The forms a text can have in TranslatePress's dictionary.
 	 *
-	 * TranslatePress stores what the page showed: entities as printed
-	 * (an ampersand as &amp;, &#38; or &#038;), and titles, labels, term
-	 * names and excerpts after wptexturize() (curly quotes, dashes,
-	 * ellipses).
+	 * TranslatePress stores what the page showed: entities as printed (&amp;, &#38; or &#038;), and
+	 * titles, labels, term names and excerpts after wptexturize().
 	 *
 	 * @param string $text Text as stored in WordPress.
 	 * @return list<string>
@@ -158,15 +140,10 @@ final class TranslatePressDictionary {
 	}
 
 	/**
-	 * A translation from the dictionary (entities decoded) as a menu item
-	 * label.
+	 * A decoded dictionary translation as a menu item label.
 	 *
-	 * Markup in it is filtered the way core filters the title of a menu item
-	 * saved by a user without unfiltered_html (wp_kses() with the
-	 * `title_save_pre` allowlist), whoever runs the import: the importer
-	 * usually holds unfiltered_html, so core filters nothing on its writes,
-	 * and the decoded text would otherwise reach every visitor as markup. A
-	 * label without `<` holds no markup and is kept as it is.
+	 * Always kses'd (`title_save_pre`): the importer usually has unfiltered_html, so core would filter nothing
+	 * and decoded text would reach every visitor as markup.
 	 *
 	 * @param string $translated Decoded translation.
 	 * @return string The label, or '' when nothing is left of it.
@@ -182,8 +159,7 @@ final class TranslatePressDictionary {
 	/**
 	 * Exact dictionary matches for a list of originals.
 	 *
-	 * The column's collation compares without case or accents, so every row
-	 * is checked again for an exact match here.
+	 * The column's collation ignores case and accents, so every row is checked again for an exact match.
 	 *
 	 * @param string             $table Dictionary table.
 	 * @param array<int, string> $texts Originals.
@@ -258,10 +234,8 @@ final class TranslatePressDictionary {
 	}
 
 	/**
-	 * An excerpt translated from the dictionary: the whole text, or else
-	 * each text between tags and line breaks that has a translation
-	 * (a WooCommerce short description is HTML; TranslatePress stores the
-	 * text of each element).
+	 * An excerpt translated from the dictionary: whole, or else each text between tags and line breaks
+	 * (a WooCommerce short description is HTML; TranslatePress stores each element's text).
 	 *
 	 * @param string $table   Dictionary table.
 	 * @param string $excerpt Source excerpt.
@@ -300,8 +274,7 @@ final class TranslatePressDictionary {
 			$translated = ( $i % 2 === 1 || trim( $part ) === '' ) ? null : $this->pick( $table, $found, $part );
 
 			if ( $translated !== null ) {
-				// Keep the whitespace around the text; the translation is plain
-				// text inside markup.
+				// Keep the whitespace around the text; the translation is plain text inside markup.
 				preg_match( '/^(\s*).*?(\s*)$/s', $part, $space );
 				$parts[ $i ] = ( $space[1] ?? '' ) . self::as_text_html( $translated ) . ( $space[2] ?? '' );
 				$changed     = true;
@@ -314,10 +287,8 @@ final class TranslatePressDictionary {
 	/**
 	 * Translate term names (and descriptions) of the translatable taxonomies.
 	 *
-	 * A term in the source language that has no translation in the target
-	 * language and whose name has a dictionary translation gets one, created
-	 * the way PerfLocale creates term translations and then renamed. A term
-	 * that already has a translation in that language keeps it.
+	 * A source-language term without a target translation, whose name has one in the dictionary, gets a
+	 * term translation created and renamed; an existing translation is kept.
 	 *
 	 * @param string             $table       Dictionary table.
 	 * @param string             $source_slug Source language slug.
@@ -426,14 +397,9 @@ final class TranslatePressDictionary {
 	}
 
 	/**
-	 * Copy each menu in a theme location into the target language with its
-	 * translated labels, and link the copy to the menu it copies.
+	 * Copy each theme-location menu into the target language with its translated labels, linked to it.
 	 *
-	 * Only a menu with at least one translated label is copied; a menu that
-	 * already points to a menu for that language, or carries another
-	 * language, is left alone. Items that point to a post or term point to
-	 * its translation in the target language when there is one (and then
-	 * show that translation's title unless the item had a label of its own).
+	 * Skips a menu without translated labels, one already linked for that language, or one in another language.
 	 *
 	 * @param string             $table       Dictionary table.
 	 * @param string             $source_slug Source language slug.
@@ -493,8 +459,7 @@ final class TranslatePressDictionary {
 				}
 			}
 
-			// A menu already linked to a menu for this language (an earlier run,
-			// or the site's own) is left alone; its labels still count as placed.
+			// A menu already linked for this language is left alone; its labels still count as placed.
 			$pointer = (int) get_term_meta( $menu_id, '_perflocale_menu_' . $target_slug, true );
 
 			if ( $labels === [] || ( $pointer > 0 && is_nav_menu( $pointer ) ) ) {
@@ -528,8 +493,7 @@ final class TranslatePressDictionary {
 				$own_label = (string) get_post_field( 'post_title', (int) $item->ID, 'raw' );
 				$title     = $labels[ (int) $item->ID ] ?? $own_label;
 
-				// An item without a label of its own shows its object's title;
-				// the translation's title is already in the target language.
+				// An item without its own label shows its object's title, already in the target language.
 				if ( $mapped > 0 && $own_label === '' ) {
 					$title = '';
 				}
@@ -597,8 +561,7 @@ final class TranslatePressDictionary {
 	}
 
 	/**
-	 * Translated dictionary strings of one language that belong to no post
-	 * and matched nothing above.
+	 * Translated dictionary strings of one language that belong to no post and matched nothing above.
 	 *
 	 * @param string $table      Dictionary table.
 	 * @param string $meta_table TranslatePress original-meta table.

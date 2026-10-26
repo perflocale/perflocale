@@ -27,9 +27,7 @@ final class SchemaWrites {
 	private static ?bool $rollback_on_timeout = null;
 
 	/**
-	 * Create or update all plugin tables.
-	 *
-	 * Safe to call multiple times - dbDelta() is idempotent.
+	 * Create or update all plugin tables (dbDelta(), idempotent).
 	 *
 	 * @return void
 	 */
@@ -71,30 +69,9 @@ final class SchemaWrites {
 			KEY type (type)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		// Table 3: Translation links.
-		// `type` mirrors the owning group's type ('post' / 'term' / 'string').
-		// object_id is a POLYMORPHIC id - post, term, and string id-spaces share
-		// the column - so the object-uniqueness key MUST include the type or a
-		// post and a term with a colliding numeric id can't coexist and routine
-		// writes corrupt each other. Shipped inline in the canonical schema.
-		//
-		// `object_lookup` is load-bearing: because `type` leads the UNIQUE
-		// `object_lang`, that key covers NO query that binds only object_id (the
-		// hot per-object shapes bind type on the GROUPS table, never on links).
-		// Without it, main-query language filtering and the found-rows COUNT
-		// degrade to full link-table scans per outer row (~11 s uncached at
-		// 10k posts; ~2 ms with the index). Do not "dedupe" it against
-		// `object_lang` - it is not a leftmost prefix of it.
-		//
-		// Indexes intentionally NOT included (EXPLAIN-verified against real
-		// data - kept here so a future contributor doesn't re-add them):
-		// - `KEY status (status)`: low cardinality (3-4 values); the
-		// planner picks `group_status` for filtered status queries
-		// and ignores the standalone single-column index.
-		// - `KEY group_object (group_id, object_id)`: planner always
-		// picks the UNIQUE `object_lang` for `WHERE group_id = ? AND
-		// object_id = ?` because the UNIQUE on object_id resolves to
-		// ≤1 row before group_id is even checked.
+		// Table 3: Translation links. object_id is polymorphic (post, term, string ids share it), so `object_lang` leads with type.
+		// `object_lookup` serves queries that bind only object_id: not a prefix of `object_lang`, never "dedupe" it.
+		// KEY status and KEY group_object are left out on purpose: docs-ai/04-do-not-fix.md, 2.5.
 		$sql_links = "CREATE TABLE {$prefix}translation_links (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 			group_id BIGINT(20) UNSIGNED NOT NULL,
@@ -114,34 +91,9 @@ final class SchemaWrites {
 			KEY updated_at (updated_at)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		// Table 4: Translatable strings.
-		//
-		// Column sizing:
-		// - context VARCHAR(191) - fits InnoDB's 767-byte per-column index
-		//   limit on legacy MySQL (utf8mb4 × 191 = 764 bytes) so both
-		//   KEY context and KEY domain_context indexes work on every MySQL.
-		//   Practical translation contexts (the _x() 3rd arg) are always
-		//   short identifiers ("menu_item", "post_status", "navigation"),
-		//   so 191 chars is well past what real-world i18n data needs.
-		// - original_hash CHAR(64) ASCII - SHA-256 hex digests use exactly
-		//   64 chars from [0-9a-f]. ASCII charset stores 1 byte/char vs
-		//   utf8mb4's 4; the UNIQUE index drops from 256 → 64 bytes/row.
-		//   latin1_bin collation keeps hash comparisons collation-free at
-		//   1 byte/char. latin1 (NOT ascii) is load-bearing: wpdb's
-		//   get_table_charset() DROPS latin1 from mixed charset sets, so the
-		//   table resolves to utf8mb4 and raw queries carrying multibyte text
-		//   pass wpdb's pre-flight. An ascii hash column poisoned the WHOLE
-		//   table to 'ascii' and made wpdb silently reject every multibyte
-		//   INSERT/SELECT that didn't go through wpdb->insert()'s per-field
-		//   checks (proven: TM store + Strings search dropped non-ASCII).
-		// - last_seen_at: mark-and-sweep GC timestamp. Touched by every
-		//   StringRepository::bulk_insert() (the scanner re-marks rows
-		//   it re-discovers in plugin/theme code) and every
-		//   register_setting_string() (manually-registered strings stay
-		//   fresh as long as the code path that registers them runs).
-		//   The daily GC deletes rows whose last_seen_at is older than
-		//   the filterable retention window (default 90 days) - covers
-		//   the disabled-plugin / removed-theme cleanup case.
+		// Table 4: Translatable strings. context VARCHAR(191) fits the 767-byte index limit of older MySQL in utf8mb4.
+		// original_hash is latin1, never ascii: an ascii column makes wpdb treat the table as ascii and reject multibyte
+		// queries (docs-ai/11-code-rationale.md, "SchemaWrites: latin1 hash columns"). last_seen_at drives the string GC.
 		$sql_strings = "CREATE TABLE {$prefix}strings (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 			domain VARCHAR(100) NOT NULL DEFAULT 'default',
@@ -162,42 +114,9 @@ final class SchemaWrites {
 			KEY last_seen_at (last_seen_at)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		// Table 6: Slug translations.
-		//
-		// Two invariants, both DB-enforced:
-		//
-		// 1. `UNIQUE KEY object_slug (object_type, object_id, language_id)` -
-		// each object has exactly ONE translated slug per language.
-		//
-		// 2. `UNIQUE KEY slug_lookup (language_id, object_type, object_subtype,
-		// slug)` - within a single (language, object_type, object_subtype)
-		// namespace, every translated slug is unique. The `object_subtype`
-		// column captures the WP sub-type that `object_type` alone can't:
-		// - For posts (object_type='post'): the post_type ('post',
-		// 'page', 'product', etc.).
-		// - For terms (object_type='term'): the taxonomy ('category',
-		// 'product_cat', 'post_tag', etc.).
-		//
-		// Without this distinction the second UNIQUE would false-flag
-		// legitimately-separate URL namespaces (e.g. category/uncategorized
-		// vs product_cat/uncategorized sharing a translated slug). Including
-		// the subtype makes the DB invariant match the actual URL-collision
-		// surface, so SlugTranslationRepository::find_unique_slug() can
-		// auto-suffix the genuine same-namespace conflicts and accept the
-		// cross-namespace coincidences as-is.
-		// Column sizing:
-		// - slug is indexed at slug(191), NOT in full. InnoDB's per-COLUMN
-		//   index limit is 767 bytes under REDUNDANT/COMPACT row format
-		//   (MySQL <= 5.6, MariaDB <= 10.1 - both inside WP 6.4's supported
-		//   matrix). utf8mb4 x 200 + 2 length bytes = 802, so indexing the
-		//   full column makes CREATE TABLE fail outright with "Specified key
-		//   was too long; max key length is 767 bytes" - the other eight
-		//   tables create fine, leaving a half-provisioned schema and an
-		//   activation error that misleadingly blames DB permissions.
-		//   191 x 4 + 2 = 766, one byte under the cap, and it is the same
-		//   prefix WordPress core uses for wp_posts.post_name(191) and
-		//   wp_terms.slug(191). The limit is per COLUMN, not per key.
-		//   Keep the column itself VARCHAR(200) to match core's post_name.
+		// Table 6: Slug translations. One slug per object and language; slugs unique per language, type and subtype
+		// (post type or taxonomy), so separate URL namespaces may share a slug.
+		// slug(191) is the 767-byte per-column index limit of older MySQL, as core's post_name(191): docs-ai/04-do-not-fix.md, 2.2.
 		$sql_slugs = "CREATE TABLE {$prefix}slug_translations (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 			object_type VARCHAR(20) NOT NULL,
@@ -212,11 +131,7 @@ final class SchemaWrites {
 
 
 
-		// Table 9: Content hashes - track source content for change detection.
-		// content_hash is a SHA-256 hex digest - 64 chars from [0-9a-f].
-		// latin1 stores 1 byte/char vs utf8mb4's 4, and latin1_bin keeps
-		// hash comparison collation-free. See strings table for why latin1
-		// (not ascii) matters for wpdb's table-charset resolution.
+		// Table 9: Content hashes of source content, for change detection. content_hash is latin1, never ascii (see table 4).
 		$sql_hashes = "CREATE TABLE {$prefix}content_hashes (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 			object_id BIGINT(20) UNSIGNED NOT NULL,
@@ -227,20 +142,8 @@ final class SchemaWrites {
 			UNIQUE KEY object_type_id (object_type, object_id)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		// Table 11: String translations - replaces the per-row
-		// `perflocale_str_<id>_<lang>` option pattern that required a
-		// CONCAT()-join on wp_options (non-indexable, full table scan).
-		// With a proper composite primary key on (string_id, language_id)
-		// every lookup is now a direct index seek.
-		// `extra_forms` holds the JSON-encoded plural forms BEYOND the two
-		// this row's `translation` and its sibling singular/plural rows
-		// cover - i.e. msgstr[2..N] for CLDR languages with 3-6 plural
-		// forms (Polish, Russian, Arabic …). It lives only on the
-		// `plural`-context row and is NULL for every 2-form language and
-		// every non-plural string, so the common case pays zero storage and
-		// the column is never read. See PluralRules + StringTranslation's
-		// form-index selection. Nullable, no index (only ever read
-		// alongside its own row by PRIMARY KEY).
+		// Table 11: String translations, one row per string and language.
+		// extra_forms: JSON plural forms 2..N (msgstr[2+]) on the `plural`-context row of 3-6 form languages; NULL otherwise.
 		$sql_string_translations = "CREATE TABLE {$prefix}string_translations (
 			string_id BIGINT(20) UNSIGNED NOT NULL,
 			language_id BIGINT(20) UNSIGNED NOT NULL,
@@ -251,38 +154,9 @@ final class SchemaWrites {
 			KEY language_id (language_id)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		// Table 11: Background-job state. Dedicated table for typed, indexed
-		// state tracking. Replaces the older option-based store (one row per
-		// job in wp_options) - the option store doesn't allow indexed
-		// queries, so admin filters / stuck-job scans / GDPR sweeps were
-		// O(N) over the full active-index. Typed columns + indexes here
-		// give:
-		// - `uuid`             - external-facing identifier (REST URLs,
-		// Action Scheduler args).
-		// - `version`          - optimistic-concurrency CAS column. Every
-		// mutating UPDATE bumps it AND checks the
-		// prior value, so concurrent writers serialise
-		// at the DB row-lock layer without ever
-		// overwriting each other.
-		// - `status_updated`   - covers stuck-job watchdog
-		// (`WHERE status IN (...) AND updated_at < ?`).
-		// - `type_status`      - admin / CLI filtering by job type + status.
-		// - `created_by`       - GDPR exporter/eraser + per-user admin views.
-		//
-		// LONGTEXT for args/result/log because args can be ~100 KB
-		// (filterable) and a 20-entry log ring buffer can grow past
-		// TEXT's 64 KB limit if entries are near the 500-char cap.
-		//
-		// `updated_at` deliberately has NO `ON UPDATE CURRENT_TIMESTAMP`:
-		// that stamps the MySQL SERVER's clock, while every sibling datetime
-		// is written by PHP in UTC (current_time('mysql', true)) and every
-		// consumer - the stuck-job watchdog, the GC sweeps, hydrate() -
-		// compares it with gmdate(). When the DB timezone is not UTC the two
-		// clocks disagree: on a server behind UTC a row touched a second ago
-		// already looks hours stale, so the watchdog force-fails jobs that
-		// are still running and discards their result. JobState writes
-		// updated_at explicitly on every state change instead; MySQL DDL has
-		// no way to express "ON UPDATE UTC_TIMESTAMP".
+		// Table 11: Background jobs. `version` is the compare-and-set column every mutating UPDATE checks and bumps.
+		// updated_at has no ON UPDATE CURRENT_TIMESTAMP on purpose: that is the server's clock, and readers compare
+		// with PHP UTC; JobState writes it on every change (docs-ai/11-code-rationale.md, "SchemaWrites: jobs updated_at").
 		$sql_jobs = "CREATE TABLE {$prefix}jobs (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 			uuid CHAR(36) NOT NULL,
@@ -313,23 +187,9 @@ final class SchemaWrites {
 			KEY updated_at (updated_at)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		// Table 12: Migration source-map. Pins a source-plugin identifier
-		// (WPML trid, Polylang term_id, etc.) to the translation_groups row
-		// the importer created for it. Lookups happen INSIDE the
-		// create_group() transaction so a partial-failure crash or a
-		// post-import DB restore can't allocate a duplicate group_id for
-		// the same source identifier on retry. Strings already get this
-		// guarantee from REPLACE INTO; this table extends the same
-		// idempotency to posts and terms.
-		//
-		// Columns:
-		//   - migration_type: 'wpml' / 'polylang' / 'trp' (extensible).
-		//   - source_key: per-importer identifier, format up to the
-		//     importer (e.g. WPML uses "<trid>|<element_type>").
-		//   - group_id: translation_groups.id this maps to.
-		//
-		// The UNIQUE (migration_type, source_key) is what makes the
-		// lookup-or-create dance atomic via ON DUPLICATE KEY UPDATE.
+		// Table 12: Migration source map: a source-plugin id (e.g. WPML "<trid>|<element_type>") => its translation group,
+		// read inside create_group()'s transaction so a retried import never makes a second group for one source.
+		// UNIQUE type_key makes the lookup-or-create atomic (ON DUPLICATE KEY UPDATE).
 		$sql_migration_map = "CREATE TABLE {$prefix}migration_source_map (
 			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 			migration_type VARCHAR(20) NOT NULL,
@@ -351,41 +211,31 @@ final class SchemaWrites {
 		dbDelta( $sql_jobs );
 		dbDelta( $sql_migration_map );
 
-		// Schema is now present - clear any cached verdict so the next
-		// tables_exist() re-confirms against the fresh state. Covers both
-		// activation (Activator) and upgrades (Migrator), the two callers.
+		// Clear the cached tables_exist() verdict (activation and upgrade both end here).
 		Schema::flush_tables_exist_cache();
 	}
 
 	/**
-	 * Drop all plugin tables.
+	 * Drop all plugin tables (uninstall only).
 	 *
-	 * Used during uninstall only.
-	 *
+	 * @param array<int, string> $keep Full table names to leave (an addon that kept its data).
 	 * @return void
 	 */
-	public static function drop_tables(): void {
+	public static function drop_tables( array $keep = [] ): void {
 		global $wpdb;
 
 		$prefix = $wpdb->prefix . 'perflocale_';
 
-		// Discover every existing `<prefix>perflocale_*` table rather than
-		// using a hard-coded list. Earlier plugin versions shipped tables
-		// that newer versions removed from the schema (e.g. an `options`
-		// table that lived briefly during early development). A hard-coded
-		// drop list would leave those stranded on upgraded installs.
+		// Every existing `<prefix>perflocale_*` table, not a fixed list: tables gone from the schema are dropped too.
 		// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnsupportedPlaceholder, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$existing = (array) $wpdb->get_col(
 			$wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' )
 		);
 
 		foreach ( $existing as $full_name ) {
-			// $full_name is the DB's own SHOW TABLES output, already filtered
-			// to our prefix; we still strip it to a bare identifier before
-			// interpolation since prepare() cannot bind a table name, and
-			// require it to start with our prefix as a final guard.
+			// SHOW TABLES output, still sanitized and prefix-checked before the DROP.
 			$safe = Schema::sanitize_table( (string) $full_name );
-			if ( $safe === '' || 0 !== strpos( $safe, $prefix ) ) {
+			if ( $safe === '' || 0 !== strpos( $safe, $prefix ) || in_array( $safe, $keep, true ) ) {
 				continue;
 			}
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Teardown DDL: table name is an identifier (sanitized + prefix-checked above) and is bound with %i; DROP has no cache to invalidate.
@@ -398,19 +248,14 @@ final class SchemaWrites {
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		}
 
-		// Tables are gone - drop the cached "installed" verdict so nothing
-		// keeps querying the now-missing tables.
+		// Drop the cached "installed" verdict so nothing queries the missing tables.
 		Schema::flush_tables_exist_cache();
 	}
 
 	/**
 	 * Whether a database error is a duplicate-key (unique index) violation.
 	 *
-	 * MySQL and MariaDB report error 1062 as "Duplicate entry ... for key";
-	 * the SQLite Database Integration passes SQLite's "UNIQUE constraint
-	 * failed: table.column" through. Only those two texts count: SQLSTATE
-	 * 23000 alone also covers NOT NULL and other constraint failures, which
-	 * stay real errors.
+	 * Only MySQL's "Duplicate entry" and SQLite's "UNIQUE constraint failed": SQLSTATE 23000 also covers NOT NULL failures.
 	 *
 	 * @param string $error The database error text (wpdb::$last_error).
 	 * @return bool
@@ -420,11 +265,9 @@ final class SchemaWrites {
 	}
 
 	/**
-	 * The number of failed queries this request has recorded.
+	 * The number of failed queries this request has recorded ($EZSQL_ERROR, kept even with errors suppressed).
 	 *
-	 * Both wpdb and the SQLite Database Integration append every failed query
-	 * to the global $EZSQL_ERROR, also with errors suppressed. Take it when a
-	 * transaction starts and pass it to transaction_lost().
+	 * Take it when a transaction starts and pass it to transaction_lost().
 	 *
 	 * @phpstan-impure
 	 * @return int
@@ -434,21 +277,10 @@ final class SchemaWrites {
 	}
 
 	/**
-	 * Whether a transaction the caller opened can no longer commit as a whole,
-	 * so the caller sends no other statement and rolls back.
+	 * Whether the caller's transaction cannot commit as a whole, so it sends nothing more and rolls back.
 	 *
-	 * On every engine that is when one of the caller's own statements failed
-	 * ($own_failed). It is also a query that failed since $errors was taken
-	 * (query_error_count()), one run by another plugin's hook included, when
-	 * that failure ended the transaction on the shared connection:
-	 * - on the SQLite Database Integration, any failed statement: it rolls the
-	 *   whole transaction back, and the statements after it commit one by one;
-	 * - on MySQL and MariaDB, a deadlock (error 1213), which rolls the whole
-	 *   transaction back, and a lock wait timeout (1205) only while
-	 *   innodb_rollback_on_timeout is ON (by default a timeout rolls back the
-	 *   one statement). Any other failed statement of another plugin leaves
-	 *   the transaction open with every earlier write, so it does not count.
-	 * wpdb records the error text, not its number, so the texts are matched.
+	 * True when its own statement failed, or a failure since $errors (any plugin's) ended the transaction: any on
+	 * SQLite, a deadlock or (innodb_rollback_on_timeout ON) a lock wait timeout on MySQL; see Schema::transaction_lost().
 	 *
 	 * @param int  $errors     query_error_count() when the transaction started.
 	 * @param bool $own_failed Whether one of the caller's own statements failed.
@@ -484,9 +316,9 @@ final class SchemaWrites {
 	}
 
 	/**
-	 * Whether the server rolls back the whole transaction on a lock wait
-	 * timeout (innodb_rollback_on_timeout), read once per request and only
-	 * after a timeout occurred. The variable is read-only at runtime.
+	 * Whether the server rolls back the whole transaction on a lock wait timeout (innodb_rollback_on_timeout).
+	 *
+	 * Read once per request, only after a timeout; the variable is read-only at runtime.
 	 *
 	 * @return bool
 	 */
@@ -503,23 +335,10 @@ final class SchemaWrites {
 	}
 
 	/**
-	 * The `updated_at` assignment that `ON UPDATE CURRENT_TIMESTAMP` makes on
-	 * MySQL and MariaDB, for a site on the SQLite Database Integration, which
-	 * ignores that clause (translation_links, content_hashes and
-	 * string_translations declare it).
+	 * The `updated_at` assignment `ON UPDATE CURRENT_TIMESTAMP` makes, for SQLite, which ignores that clause.
 	 *
-	 * Returns '' on MySQL and MariaDB, so their statements stay as they are.
-	 * On SQLite it returns `, updated_at = CASE WHEN <every assigned column
-	 * keeps its value> THEN updated_at ELSE NOW() END`, to append to the SET or
-	 * ON DUPLICATE KEY UPDATE list: the write time moves only when a value
-	 * changes, as the clause does. SQLite reads every assignment against the
-	 * row as it was, so the fragment may follow the other assignments. Text
-	 * compares as bytes (the integration compares strings case-insensitively).
-	 *
-	 * Each entry of $columns names an assigned column: its expression, the
-	 * expression it is set to (`VALUES(col)`, a SQL literal, or a placeholder
-	 * the caller binds once more), and its kind ('text_null' for a nullable
-	 * text column).
+	 * '' on MySQL; on SQLite a CASE appended to the SET list that moves the time only when a value changes.
+	 * Each $columns entry: the column, the expression it is set to, its kind ('text_null' for a nullable text column).
 	 *
 	 * @param array<int, array{0: literal-string, 1: literal-string, 2: 'int'|'text'|'text_null'}> $columns The assigned columns.
 	 * @param literal-string                                                                       $alias   Table alias with its dot, for a multi-table UPDATE (e.g. 't.').
@@ -546,22 +365,14 @@ final class SchemaWrites {
 	/**
 	 * Tables that create_tables() was supposed to produce but did not.
 	 *
-	 * dbDelta swallows DDL errors and its return value describes intent, not
-	 * outcome, so the only honest post-condition is to ask the server what
-	 * actually exists. Used to avoid stamping a schema version the database
-	 * never reached.
+	 * Asks the server: dbDelta swallows DDL errors, and a version must not be stamped for a schema never reached.
 	 *
 	 * @return string[] Fully-qualified names of the missing tables.
 	 */
 	public static function missing_tables(): array {
 		global $wpdb;
 
-		// One catalog scan, not nine. This is called from the activation and
-		// migration post-conditions and from the Site Health tables card; the
-		// per-table loop it replaces cost ~0.5 ms each on a server with a large
-		// table catalog, which is exactly the kind of server that has one.
-		// A single LIKE over the shared prefix returns every candidate, and the
-		// comparison happens in PHP.
+		// One catalog scan over the shared prefix, compared in PHP: a per-table query is slow on a large catalog.
 		$prefix = $wpdb->prefix . 'perflocale_';
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Schema post-condition; must ask the server, and a cached answer would defeat the purpose.
@@ -569,9 +380,7 @@ final class SchemaWrites {
 			$wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' )
 		);
 
-		// Case-insensitive compare: lower_case_table_names=1 (the Windows and
-		// some macOS default) reports names folded to lower case, and the
-		// prefix can legitimately contain capitals.
+		// Case-insensitive: lower_case_table_names=1 folds names, and the prefix may hold capitals.
 		$have = [];
 
 		foreach ( (array) $found as $name ) {

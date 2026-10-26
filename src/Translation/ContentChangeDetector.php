@@ -22,13 +22,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Monitors source content changes and flags translations as "needs update".
  *
- * Stores a SHA-256 hash of the source post/term content. On each save,
- * compares the new hash with the stored one. If different AND the object
- * is in the default language (i.e. the source), all translations in the
- * group are flagged.
- *
- * Editing a translation does NOT flag the source or other translations -
- * only source changes propagate the "needs_update" status.
+ * Compares a SHA-256 hash of the translatable content on each save: a changed default-language object flags its
+ * translations, a changed translation clears its own flag.
  */
 final class ContentChangeDetector {
 
@@ -81,16 +76,11 @@ final class ContentChangeDetector {
 	 * Check if post content has changed and flag translations.
 	 *
 	 * @param int           $post_id Post ID.
-	 * @param \WP_Post|null $post    Post object; null when core re-read the row after
-	 *                               the write and found it gone, or when a third
-	 *                               party re-fires save_post with one argument.
+	 * @param \WP_Post|null $post    Post object; null when the row is gone or save_post fired with one argument.
 	 * @return void
 	 */
 	public function check_content_change( int $post_id, ?\WP_Post $post = null ): void {
-		// WordPress re-reads the row after the write and hands the hook
-		// whatever it got, which is null when the post was deleted in the
-		// interim; some plugins also fire save_post with one argument. A
-		// non-nullable hint turned either into an uncaught TypeError.
+		// Core hands over its re-read row, null when the post was deleted meanwhile; some plugins pass one argument.
 		if ( ! $post instanceof \WP_Post ) {
 			return;
 		}
@@ -123,11 +113,9 @@ final class ContentChangeDetector {
 		// Content changed - store the new hash.
 		$this->store_hash( $post_id, 'post', $new_hash );
 
-		// Only flag when the SOURCE (default language) post changes.
-		// Editing a translation should not mark the source or other translations.
+		// Only a SOURCE (default language) change flags the group.
 		if ( ! $this->is_default_language_object( $post_id, 'post' ) ) {
-			// ...but it IS the signal that a flagged translation was brought
-			// back up to date. See clear_needs_update().
+			// A changed translation is the signal that it was brought up to date.
 			$this->clear_needs_update( $post_id, ObjectType::Post );
 
 			return;
@@ -171,8 +159,7 @@ final class ContentChangeDetector {
 		$this->store_hash( $term_id, 'term', $new_hash );
 
 		if ( ! $this->is_default_language_object( $term_id, 'term' ) ) {
-			// Same as the post path: the operator just edited a translation,
-			// which is the only signal we get that it is up to date again.
+			// As for posts: an edited translation is up to date again.
 			$this->clear_needs_update( $term_id, ObjectType::Term );
 
 			return;
@@ -228,10 +215,7 @@ final class ContentChangeDetector {
 	}
 
 	/**
-	 * Check if an object belongs to the default language.
-	 *
-	 * Only default-language objects are "sources". Editing a translation
-	 * should not flag siblings as needs_update.
+	 * Check if an object belongs to the default language, the only "source" whose change flags its group.
 	 *
 	 * @param int    $object_id Object ID.
 	 * @param string $object_type 'post' or 'term'.
@@ -393,50 +377,16 @@ final class ContentChangeDetector {
 	/**
 	 * Flag all translations of an object as "needs_update".
 	 *
-	 * Only called when the source (default language) object's content changes.
-	 *
 	 * @param int        $object_id Object ID.
 	 * @param ObjectType $type Object type.
 	 * @return void
 	 */
 	/**
-	 * Clear a stale "Needs update" flag on a translation that was just edited.
+	 * Clear a "Needs update" flag on a translation that was just edited.
 	 *
-	 * `flag_translations()` stamps `needs_update` on every sibling whenever the
-	 * SOURCE changes, and until now nothing in the plugin ever cleared it
-	 * again. `TranslationGroupRepository::update_link_status()` - the only
-	 * status-write entry point - shipped with no production caller at all, and
-	 * no `transition_post_status` handler writes link status either. The result
-	 * was a one-way door: once a translation was flagged, the red badge on the
-	 * Translations screen was permanent, even after the translation had been
-	 * fully retranslated and republished. The Translations screen's own
-	 * reconciliation (TranslationsPage.php around :218-229) only repairs the
-	 * `empty` status, never `needs_update`, so it did not paper over this one.
-	 *
-	 * The signal acted on here is the strongest one available without inventing
-	 * new UI: this object is NOT the source, and its own content hash just
-	 * moved - somebody edited the translation. That is exactly the action the
-	 * badge was asking for.
-	 *
-	 * Deliberately narrow:
-	 *   - only a row currently reading `needs_update` is touched, so `empty`
-	 *     bookkeeping and any status another subsystem owns are left alone.
-	 *     ⚠️ The SELECT below does not achieve that on its own, and the first
-	 *     version of this method wrongly claimed it did. A read here and an
-	 *     unconditional UPDATE there is a two-statement race, and it lost both
-	 *     ways when measured on the frozen candidate: a source re-edit that
-	 *     re-flagged `needs_update` between the two was overwritten with
-	 *     `published`, and so was an unrelated subsystem's `pending`. The
-	 *     precondition passed to update_link_status() is what actually makes
-	 *     the claim true - the SELECT is now only a fast path that skips the
-	 *     UPDATE on the overwhelming majority of saves, where the row reads
-	 *     `empty` or `published` and there is no badge to retire;
-	 *   - the caller has already established `post_status === 'publish'` (and
-	 *     terms have no status), so `published` is the correct landing state;
-	 *   - a no-op when the object carries no link row (language id 0), which is
-	 *     the unmanaged/source-by-convention case;
-	 *   - a post marked stale by ContentSync keeps the status until a person's
-	 *     save clears the mark (ContentSync::keeps_needs_update()).
+	 * ⚠️ Only a row still reading `needs_update` changes: the status read is the update's precondition, so a re-flag or
+	 * another subsystem's status written in between wins.
+	 * See docs-ai/11-code-rationale.md, "ContentChangeDetector: clearing needs update".
 	 *
 	 * @param int        $object_id Post or term ID, per $type.
 	 * @param ObjectType $type      Which id-space $object_id belongs to.
@@ -455,11 +405,7 @@ final class ContentChangeDetector {
 
 		$links_table = Schema::table( 'translation_links' );
 
-		// Fast path only. The correctness of "touch nothing but a flagged row"
-		// rests on the precondition handed to update_link_status() below, not
-		// on this read - see the ⚠️ note in the docblock. What this buys is
-		// skipping the UPDATE entirely on the ordinary save, where the row
-		// reads `empty` or `published` and there is no badge to retire.
+		// Fast path only: correctness rests on the precondition passed to update_link_status() below.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$current = $wpdb->get_var(
 			$wpdb->prepare(
@@ -476,31 +422,18 @@ final class ContentChangeDetector {
 			return;
 		}
 
-		// A translation whose Sync Fields a save of its group skipped keeps
-		// "needs update" until a person's save clears the mark
-		// (ContentSync::SYNC_STALE_META); its changed content settles every
-		// content flag up to the link's last write.
+		// A post marked stale keeps "needs update" until a person's save clears the mark; its content change
+		// still settles every content flag up to the link's last write.
 		if ( $type === ObjectType::Post && ContentSync::keeps_needs_update( $object_id ) ) {
 			return;
 		}
 
-		// Routed through the repository rather than a direct UPDATE so the
-		// per-object cache AND the eager link map are both invalidated and
-		// `perflocale/translation/status_changed` fires - a bare UPDATE here
-		// would leave the switcher and hreflang reading a stale status.
-		//
-		// Constructed from the injected CacheManager rather than fetched from
-		// the container (as flag_translations() does): the container's get()
-		// returns an untyped object, which costs a `method.notFound` that the
-		// gate's static-analysis step counts as fatal-class. Same repository,
-		// same cache, same invalidation - just a type PHPStan can see.
+		// Through the repository so the object cache and link map are invalidated and
+		// `perflocale/translation/status_changed` fires. Built from the injected cache: the container's get() is
+		// untyped, which PHPStan reports as `method.notFound`.
 		$repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $this->cache );
 
-		// The status read above is the PRECONDITION, not just a guard: passing
-		// it back means the UPDATE matches only while the row still reads
-		// `needs_update`, so a write that landed in between wins instead of
-		// being silently overwritten. A false return here is the expected,
-		// correct outcome in that case - the newer status stands.
+		// The PRECONDITION: a status written in between wins, and the false return is then correct.
 		$repo->update_link_status(
 			$object_id,
 			$language_id,
@@ -524,14 +457,9 @@ final class ContentChangeDetector {
 
 		$links_table = Schema::table( 'translation_links' );
 
-		// Update all links in this group EXCEPT the source post. The write
-		// time always moves past the value the link held, also within the
-		// same second: a translation's stale mark stores the link's write
-		// time, and clearing the mark restores its status only while that
-		// time is unchanged (ContentSync::SYNC_STALE_META), so no content
-		// flag can leave it equal. DATE_ADD() rather than `+ INTERVAL`: MySQL
-		// reads the two the same, and the SQLite Database Integration
-		// translates only DATE_ADD().
+		// Every link but the source's. The write time always moves, even within one second: clearing a stale mark
+		// restores its status only while that time is unchanged. DATE_ADD(), not `+ INTERVAL`: the SQLite Database
+		// Integration translates only DATE_ADD().
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->query(
 			$wpdb->prepare(

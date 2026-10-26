@@ -14,15 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Read-only snapshot of what AddonUninstaller::purge() WILL delete.
+ * What AddonUninstaller::purge() will delete, from AddonUninstaller::plan().
  *
- * Produced by AddonUninstaller::plan(). Table names here are FULL names
- * (with {$wpdb->prefix} already applied). Meta keys, option names, etc.
- * are as-declared.
- *
- * estimated_rows is computed by counting rows per target type via indexed
- * COUNT queries - approximate but cheap. Accurate for small sites, may
- * drift on huge sites if concurrent writes happen between plan() and purge().
+ * Table names are full (prefixed), every other name as declared; estimated_rows is an indexed COUNT at plan time.
  */
 final class PurgePlan {
 

@@ -18,10 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds a translation status column to the post list table.
- *
- * Shows color-coded dots for each active language, indicating
- * translation status. Clickable to edit the translation.
+ * Adds the Language and Translations columns, the language filter and the Quick Edit language field.
  */
 final class PostListColumns {
 
@@ -50,8 +47,7 @@ final class PostListColumns {
 	private ?PostTranslationManager $manager = null;
 
 	/**
-	 * Preloaded translations for all posts on the current page.
-	 * Avoids N+1 queries by batch-loading in one query.
+	 * Translations of every post on the current page, loaded in one batch.
 	 *
 	 * @var array<int, array<string, int>>|null
 	 */
@@ -74,28 +70,15 @@ final class PostListColumns {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// ⚠️ Do NOT read get_translatable_post_types() here, and do not move the
-		// per-post-type loop back into this method. This service boots from
-		// Plugin::boot() on `init:0`, several eager services before `addon_registry` (derive the position from the
-		// code, never restate it as a number - the old comment said TEN and drifted)
-		// - so at this point no addon has run boot() and none of their
-		// `perflocale/translatable_post_types` contributions exist yet. Reading
-		// the list here did two kinds of damage: the per-type hooks below were
-		// bound only for core types, AND - because Settings memoises the result
-		// once `plugins_loaded` has fired - the truncated list was frozen for the
-		// whole request, so every later consumer saw it too. On a site with
-		// Contact Form 7 the Translations screen offered no "Contact Forms" entry
-		// in its post-type filter at all, and WooCommerce products vanished from
-		// it unless they had also been ticked in Settings. Deferring to
-		// `admin_init` is what TermListColumns already does for the identical
-		// taxonomy hazard - keep the two symmetrical.
+		// Never read the translatable types here: add-ons have not booted yet, and Settings would memoise the
+		// short list for the request. See docs-ai/11-code-rationale.md, "PostListColumns: deferred type hooks".
 		add_action( 'admin_init', [ $this, 'register_post_type_column_hooks' ] );
 
 		// Language filter dropdown on post list screens.
 		add_action( 'restrict_manage_posts', [ $this, 'render_language_filter' ] );
 		add_action( 'pre_get_posts', [ $this, 'apply_language_filter' ] );
 
-		// Batch-preload translations for all posts on the page to avoid N+1 queries.
+		// One batch of translations for every post on the page.
 		add_action( 'pre_get_posts', [ $this, 'schedule_preload' ] );
 
 		// Quick Edit: language selector.
@@ -108,10 +91,7 @@ final class PostListColumns {
 	/**
 	 * Bind the per-post-type column and status-link hooks.
 	 *
-	 * Public and separately callable so a direct-instantiation caller (the
-	 * `cov-never-loaded` suite runs through `wp eval-file`, where `admin_init`
-	 * never fires) can bind synchronously. Mirrors
-	 * {@see TermListColumns::register_taxonomy_column_hooks()}.
+	 * Public for callers where admin_init never fires (`wp eval-file`), as in TermListColumns.
 	 *
 	 * @return void
 	 */
@@ -122,10 +102,7 @@ final class PostListColumns {
 			add_filter( "manage_{$post_type}_posts_columns", [ $this, 'add_column' ] );
 			add_action( "manage_{$post_type}_posts_custom_column", [ $this, 'render_column' ], 10, 2 );
 
-			// Preserve the language filter in the status links
-			// (All | Published | Draft | ...). `views_edit-{$post_type}` has no
-			// un-suffixed variant - WP_List_Table::views() fires
-			// `views_{$screen->id}` - so this genuinely needs the resolved list.
+			// Keeps the language filter in the status links; this hook exists only per screen id.
 			add_filter( "views_edit-{$post_type}", [ $this, 'append_lang_to_views' ] );
 		}
 	}
@@ -140,9 +117,6 @@ final class PostListColumns {
 	/**
 	 * Append the active language filter parameter to status view links.
 	 *
-	 * Ensures that clicking "All | Published | Draft | ..." preserves
-	 * the currently selected language filter.
-	 *
 	 * @param array<string, string> $views Status view links.
 	 * @return array<string, string>
 	 */
@@ -155,8 +129,7 @@ final class PostListColumns {
 		}
 
 		foreach ( $views as $key => $link ) {
-			// Inject perflocale_lang param into each link's href.
-			// Decode HTML entities first since WP view links contain &amp; in hrefs.
+			// Decode first: core's view links hold &amp; in their hrefs.
 			$views[ $key ] = preg_replace_callback(
 				'/href=["\']([^"\']+)["\']/',
 				static function ( array $m ) use ( $lang_filter ): string {
@@ -233,7 +206,6 @@ final class PostListColumns {
 			return;
 		}
 
-		// Find the language ID.
 		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
 		$lang      = $lang_repo->find_by_slug( $lang_filter );
 
@@ -241,7 +213,7 @@ final class PostListColumns {
 			return;
 		}
 
-		// Store language ID for the posts_clauses filter.
+		// Read by filter_posts_by_language().
 		$query->set( 'perflocale_admin_lang_filter', (int) $lang->id );
 
 		if ( ! has_filter( 'posts_clauses', [ $this, 'filter_posts_by_language' ] ) ) {
@@ -268,6 +240,7 @@ final class PostListColumns {
 		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
 		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
 
+		// Plugin table names from Schema::table(), not input: a fragment returned to core cannot be prepared whole.
 		$clauses['join'] = ( $clauses['join'] ?? '' ) .
 			" INNER JOIN {$links_table} AS pl_flink ON ({$wpdb->posts}.ID = pl_flink.object_id)" .
 			" INNER JOIN {$groups_table} AS pl_fgroup ON (pl_flink.group_id = pl_fgroup.id AND pl_fgroup.type = 'post')";
@@ -291,10 +264,7 @@ final class PostListColumns {
 			return;
 		}
 
-		// The language/translations columns only register for translatable
-		// post types, so the batch preload has zero consumers on other list
-		// screens (Media Library, non-translatable CPTs) - skip the
-		// translation_links SELECT + cache churn there entirely.
+		// Only translatable types have the columns; skip the query on every other list screen.
 		$queried_type = $query->get( 'post_type' );
 		$types        = (array) ( ( $queried_type === '' || $queried_type === null || $queried_type === [] ) ? 'post' : $queried_type );
 
@@ -308,9 +278,7 @@ final class PostListColumns {
 	/**
 	 * Batch-preload translations for all posts in the admin list.
 	 *
-	 * Members that are not WP_Post instances are ignored: the_posts fires
-	 * before WP_Query normalises its members (wp-includes/class-wp-query.php),
-	 * so a sparse result can carry a null member.
+	 * Skips non-WP_Post members: the_posts fires before WP_Query normalises them.
 	 *
 	 * @param array<int, mixed> $posts Posts from the query; non-WP_Post members are skipped.
 	 * @param \WP_Query         $query The query.
@@ -324,12 +292,7 @@ final class PostListColumns {
 		$manager                      = $this->get_manager();
 		$this->preloaded_translations = [];
 
-		// Bulk-prime the L1 (static) cache in ONE SELECT for every post
-		// in the list. Without this, the per-post get_translations()
-		// calls in the loop below each pay the cold-path cost (~1-2 ms
-		// on sites above the eager-link-map cap), turning a 20-row admin
-		// list into 30+ ms of avoidable work. Below the cap this is a
-		// no-op (eager-link-map already serves these as µs).
+		// One SELECT for the whole list above the eager link map's cap; a no-op below it.
 		$post_ids = [];
 
 		foreach ( $posts as $p ) {
@@ -341,7 +304,7 @@ final class PostListColumns {
 		$repo = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 		$repo->prime_translations( \PerfLocale\Enum\ObjectType::Post, $post_ids );
 
-		// Collect all translation IDs so we can prime the WP post cache in one batch.
+		// Every translation id, to prime the post cache in one batch.
 		$all_translation_ids = [];
 
 		foreach ( $posts as $post ) {
@@ -360,8 +323,7 @@ final class PostListColumns {
 			}
 		}
 
-		// Prime WP post cache for all translation IDs at once - makes
-		// the get_post() validation calls in render_column() free.
+		// Makes render_column()'s get_post() checks free.
 		if ( ! empty( $all_translation_ids ) ) {
 			_prime_post_caches( array_unique( $all_translation_ids ), false, false );
 		}
@@ -466,7 +428,8 @@ final class PostListColumns {
 			}
 
 			if ( $translated_id ) {
-				$edit_url = \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id );
+				// A sibling the user may not view gets the badge without a link (its ID stays off the page).
+				$edit_url = \PerfLocale\Helper::user_can_view_object( (int) $translated_id ) ? \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id ) : '';
 
 				if ( $edit_url !== '' ) {
 					/* translators: %s: language name */
@@ -474,11 +437,7 @@ final class PostListColumns {
 					echo esc_html( $slug_upper );
 					echo '</a>';
 				} else {
-					// ⚠️ The translation EXISTS - it just has no editor we can
-					// link to (a non-public post type, or a user without
-					// edit_post on it). Previously nothing was echoed at all,
-					// so a translated row was indistinguishable from an
-					// untranslated one. Show the badge without the link.
+					// Translated but no editor to link to: the badge without a link, so it does not look untranslated.
 					/* translators: %s: language name */
 					echo '<span class="perflocale-badge perflocale-badge--green" title="' . esc_attr( sprintf( __( '%s: translated', 'perflocale' ), $lang->name ) ) . '">';
 					echo esc_html( $slug_upper );
@@ -568,10 +527,7 @@ final class PostListColumns {
 	 * @return void
 	 */
 	public function save_quick_edit_language( int $post_id, ?\WP_Post $post = null ): void {
-		// WordPress re-reads the row after the write and hands the hook
-		// whatever it got, which is null when the post was deleted in the
-		// interim; some plugins also fire save_post with one argument. A
-		// non-nullable hint turned either into an uncaught TypeError.
+		// Nullable: core passes null for a post deleted after the write, and some plugins pass one argument.
 		if ( ! $post instanceof \WP_Post ) {
 			return;
 		}
@@ -580,9 +536,7 @@ final class PostListColumns {
 			return;
 		}
 
-		// Only process the specific post that was quick-edited.
-		// WordPress may fire save_post for sibling translations (via ContentSync),
-		// but $_POST['post_ID'] is always the one the user actually edited.
+		// Only the quick-edited post (post_ID), not a sibling ContentSync saves in this request.
 		$edited_id = isset( $_POST['post_ID'] ) ? absint( $_POST['post_ID'] ) : 0;
 
 		if ( $edited_id !== $post_id ) {
@@ -610,9 +564,7 @@ final class PostListColumns {
 		$manager = $this->get_manager();
 
 		if ( ! $manager->set_post_language( $post_id, $language ) ) {
-			// Quick Edit saves over AJAX - no admin_notices surface exists.
-			// The row re-render shows the unchanged language (visible
-			// feedback); log the cause for the operator.
+			// Quick Edit has no notice: the row shows the unchanged language, and the cause is logged.
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; quick-edit has no notice surface.
 			error_log( sprintf( 'PerfLocale: quick-edit language save failed for post %d (language "%s").', $post_id, $language ) );
 		}

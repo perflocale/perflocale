@@ -35,10 +35,7 @@ $options = [ // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPre
 		),
 	],
 
-	// Dropdown arrow - only meaningful in dropdown mode. Blocksy's option
-	// schema supports `condition` to hide a field unless another field has
-	// a specific value, so the control vanishes from the panel when the
-	// editor picks Inline or Simple instead of Dropdown.
+	// Dropdown arrow: `condition` hides it unless Display Mode is Dropdown.
 	'perflocale_switcher_arrow_style'       => [
 		'label'     => __( 'Dropdown Arrow', 'perflocale' ),
 		'desc'      => __( 'Icon shown next to the language label on the dropdown trigger.', 'perflocale' ),
@@ -55,9 +52,7 @@ $options = [ // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPre
 		'condition' => [ 'perflocale_switcher_display' => 'dropdown' ],
 	],
 
-	// Trigger label format - dropdown-only, same condition gating as
-	// the arrow style above. Empty default = fall through to the
-	// Settings → Switcher value.
+	// Trigger label format: dropdown only; empty uses the Settings > Switcher value.
 	'perflocale_switcher_trigger_format'    => [
 		'label'     => __( 'Trigger Label Format', 'perflocale' ),
 		'desc'      => __( 'Label format on the dropdown trigger button, independent of the options list.', 'perflocale' ),

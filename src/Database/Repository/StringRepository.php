@@ -20,10 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Data access layer for the perflocale_strings table.
- *
- * Stores translatable strings discovered by the scanner, with SHA-256
- * hash-based deduplication for efficient lookups.
+ * Data access for perflocale_strings: scanned and registered strings, deduplicated by a SHA-256 hash.
  */
 final class StringRepository implements RepositoryInterface {
 
@@ -50,11 +47,7 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Resolve the full table name for the current blog.
-	 *
-	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly - capturing the name in the constructor would otherwise
-	 * pin this instance to whichever blog was active at construction.
+	 * The full table name for the current blog, computed per call so switch_to_blog() is followed.
 	 *
 	 * @return string
 	 */
@@ -79,7 +72,7 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Find a string by its hash.
+	 * A string by its hash.
 	 *
 	 * @param string $domain Text domain.
 	 * @param string $context Context.
@@ -102,9 +95,8 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Bulk insert strings (used by the scanner).
-	 *
-	 * Uses INSERT IGNORE to skip duplicates based on the original_hash UNIQUE index.
+	 * Bulk insert strings for the scanner (INSERT IGNORE on the original_hash UNIQUE index), marking existing ones seen.
+	 * Docs: docs-ai/11-code-rationale.md, "StringRepository: scanner inserts and group ids".
 	 *
 	 * @param array     $strings Array of string data.
 	 * @param bool|null $marked  Set to false when strings of this batch that are
@@ -123,7 +115,7 @@ final class StringRepository implements RepositoryInterface {
 			return 0;
 		}
 
-		// Compute hashes and deduplicate within the batch.
+		// Hashes, deduplicated within the batch.
 		$hashed = [];
 
 		foreach ( $strings as $string ) {
@@ -133,7 +125,7 @@ final class StringRepository implements RepositoryInterface {
 				$string['original']
 			);
 
-			// Skip duplicates within the same batch.
+			// A duplicate within the batch.
 			if ( isset( $hashed[ $hash ] ) ) {
 				continue;
 			}
@@ -146,7 +138,7 @@ final class StringRepository implements RepositoryInterface {
 			return 0;
 		}
 
-		// Fetch all existing hashes in one query (batch lookup).
+		// Existing hashes in one query.
 		$hash_list    = array_keys( $hashed );
 		$placeholders = implode( ',', array_fill( 0, count( $hash_list ), '%s' ) );
 
@@ -159,11 +151,7 @@ final class StringRepository implements RepositoryInterface {
 			)
 		);
 
-		// get_col() returns [] both when none of the hashes exist and when the
-		// query failed; only last_error, which wpdb resets at the start of every
-		// query, tells them apart. Read as "none exist", a failure would skip
-		// the touch below and leave live rows looking unseen to the GC, and
-		// every string of the batch would be inserted blind.
+		// [] is also a failed query: read as "none exist" it would skip the seen touch and insert the batch blind.
 		if ( '' !== $this->wpdb->last_error ) {
 			$marked = false;
 
@@ -172,11 +160,43 @@ final class StringRepository implements RepositoryInterface {
 
 		$existing_set = array_flip( $existing );
 
-		// Mark already-existing strings as freshly-seen so the GC's
-		// stale-row sweep doesn't evict them. This is the "mark" half of
-		// the mark-and-sweep: every scanner-rediscovered hash gets its
-		// last_seen_at bumped; rows that the scanner stops finding (e.g.,
-		// a plugin was deleted) keep their old timestamp and age out.
+		// A row whose stored context lost its tags (its hash has them) gets the scanned context back. Compared here, byte
+		// for byte: a PAD SPACE collation reads "button" and "button " as equal.
+		$queued = false;
+
+		foreach ( $existing as $hash ) {
+			$context = is_string( $hash ) ? ( $hashed[ $hash ]['context'] ?? '' ) : '';
+
+			if ( '' === $context || sanitize_text_field( $context ) === $context ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$stored = $this->wpdb->get_var( (string) $this->wpdb->prepare( 'SELECT context FROM %i WHERE original_hash = %s', $this->table(), $hash ) );
+
+			// A context longer than the column is stored cut: no repair.
+			if ( ! is_string( $stored ) || $stored === $context || mb_substr( $context, 0, 191 ) === $stored ) {
+				continue;
+			}
+
+			// Compiled files hold the old context key: their regeneration is queued first, and a refused queue leaves
+			// the row for the next scan.
+			if ( ! $queued && ! self::queue_files_regeneration() ) {
+				continue;
+			}
+
+			$queued = true;
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$this->wpdb->query( (string) $this->wpdb->prepare( 'UPDATE %i SET context = %s WHERE original_hash = %s', $this->table(), $context, $hash ) );
+		}
+
+		// A regeneration that started before these updates may have read the old contexts: one that has not started yet.
+		if ( $queued ) {
+			self::queue_files_regeneration( true );
+		}
+
+		// Mark existing strings seen (the mark half of the GC's mark-and-sweep); strings the scanner stops finding age out.
 		if ( ! empty( $existing ) ) {
 			$touch_placeholders = implode( ',', array_fill( 0, count( $existing ), '%s' ) );
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -188,14 +208,13 @@ final class StringRepository implements RepositoryInterface {
 				)
 			);
 
-			// Only false is a failure. MySQL counts CHANGED rows, so a hash
-			// already touched earlier in the same second reports 0.
+			// Only false fails: MySQL counts changed rows, so a hash touched earlier in the same second reports 0.
 			if ( false === $touched ) {
 				$marked = false;
 			}
 		}
 
-		// Filter to only new strings.
+		// Only new strings.
 		$new_strings = [];
 
 		foreach ( $hashed as $hash => $string ) {
@@ -208,7 +227,7 @@ final class StringRepository implements RepositoryInterface {
 			return 0;
 		}
 
-		// Batch-insert translation groups first (1 query instead of N).
+		// Their groups first, in one query.
 		$groups_table = Schema::table( 'translation_groups' );
 		$count        = count( $new_strings );
 
@@ -216,13 +235,11 @@ final class StringRepository implements RepositoryInterface {
 		$group_args = array_fill( 0, $count, 'string' );
 		$sqlite     = defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' );
 
-		// SQLite: the highest group id before the batch, which the batch's
-		// first id must exceed (see below).
+		// SQLite: the highest group id before the batch, which its first id must exceed.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$prior_max = $sqlite ? (int) $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT MAX(id) FROM %i', $groups_table ) ) : 0;
 
-		// Values bound via prepare(); the table name is bound with the %i
-		// identifier placeholder, so only the generated (%s) list interpolates.
+		// Values bound by prepare(), the table as %i; only the generated (%s) list is interpolated.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Generated placeholder list only; table bound via %i and values are %s-bound below.
 		$rows_affected = $this->wpdb->query(
 			$this->wpdb->prepare( "INSERT INTO %i (type) VALUES {$group_ph}", array_merge( [ $groups_table ], $group_args ) )
@@ -231,14 +248,8 @@ final class StringRepository implements RepositoryInterface {
 		$first_group_id = (int) $this->wpdb->insert_id;
 		$inserted       = 0;
 
-		// On the SQLite Database Integration the id after a multi-row INSERT
-		// is the LAST row's (MySQL and MariaDB give the first), and there is no
-		// @@auto_increment_increment: the batch's ids run up from
-		// insert_id - (count - 1). SQLite writes one statement at a time and
-		// numbers its rows consecutively, so the block is exact; it is still
-		// checked (above the highest id before the batch, and every id a
-		// string group no string uses) before it is trusted, and the per-row
-		// path below takes over when it is not.
+		// SQLite gives the last row's id after a multi-row INSERT and has no increment variable: the block runs back from
+		// insert_id - (count - 1), verified before it is trusted, else the per-row path below.
 		if ( $sqlite && $first_group_id > 0 && $rows_affected === $count ) {
 			$first_group_id -= $count - 1;
 
@@ -255,24 +266,18 @@ final class StringRepository implements RepositoryInterface {
 			);
 
 			if ( $first_group_id <= $prior_max || $fresh !== $count ) {
-				// Not the expected block: the per-row path below takes over. The
-				// batch's rows are left for the empty-group sweep rather than
-				// deleted by an id range that just proved unreliable.
+				// Not the expected block: per row below; the batch's rows are left to the empty-group sweep.
 				$first_group_id = 0;
 			}
 		}
 
-		// Safety: if batch insert failed or returned unexpected count, fall back to individual inserts.
+		// The batch insert failed or counted wrong: insert one by one.
 		if ( $first_group_id === 0 || $rows_affected !== $count ) {
 			foreach ( $new_strings as $string ) {
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 				$group_inserted = $this->wpdb->insert( $groups_table, [ 'type' => 'string' ], [ '%s' ] );
 
-				// If the group insert failed, insert_id is unreliable (it can
-				// hold a PRIOR row's id, not 0, depending on the mysqli driver).
-				// Trusting it here would either link the string to the wrong
-				// group or, on a subsequent string failure, DELETE a valid
-				// earlier group. Skip this string entirely instead.
+				// After a failed group insert insert_id can hold an earlier row's id: skip this string.
 				if ( $group_inserted === false ) {
 					continue;
 				}
@@ -284,14 +289,9 @@ final class StringRepository implements RepositoryInterface {
 					$this->table(),
 					[
 						'domain'        => sanitize_text_field( $string['domain'] ?? 'default' ),
-						'context'       => sanitize_text_field( $string['context'] ?? '' ),
-						// Store the original VERBATIM. It's a source-code gettext
-						// literal whose identity must equal the runtime msgid, and
-						// original_hash is computed from that raw value - so it is
-						// escaped on OUTPUT (esc_html/esc_attr/textContent in the
-						// strings admin), never sanitized on input. wp_kses_post
-						// here entity-encoded &/</> and stripped tags, corrupting
-						// PO/XLIFF export msgids and the admin preview.
+						// As given, like `original`: the hash and the runtime lookup use it; escaped on output.
+						'context'       => (string) ( $string['context'] ?? '' ),
+						// Verbatim: the original is the runtime msgid and the hash's input; escaped on output, never sanitized on input.
 						'original'      => $string['original'],
 						'original_hash' => $string['_hash'],
 						'group_id'      => $group_id,
@@ -304,8 +304,7 @@ final class StringRepository implements RepositoryInterface {
 				if ( $result !== false ) {
 					++$inserted;
 				} elseif ( $group_id > 0 ) {
-					// Reclaim the group we just created for a string that
-					// failed to insert, so it doesn't widow the groups table.
+					// Reclaim the group of a string that failed to insert.
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 					$this->wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
 				}
@@ -315,12 +314,7 @@ final class StringRepository implements RepositoryInterface {
 			return $inserted;
 		}
 
-		// Map each string to its group ID. A single multi-row INSERT assigns
-		// its rows a contiguous block of auto-increment values, but the STEP
-		// between them is @@auto_increment_increment - which is > 1 on
-		// multi-master clusters (Galera / Group Replication, where it equals
-		// the node count). Assuming a step of 1 there would link strings to
-		// nonexistent / wrong group_ids. Read the step once and apply it.
+		// A multi-row INSERT's ids step by @@auto_increment_increment (above 1 on Galera / Group Replication).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$increment     = $sqlite ? 1 : max( 1, (int) $this->wpdb->get_var( 'SELECT @@auto_increment_increment' ) );
 		$index         = 0;
@@ -335,7 +329,8 @@ final class StringRepository implements RepositoryInterface {
 				$this->table(),
 				[
 					'domain'        => sanitize_text_field( $string['domain'] ?? 'default' ),
-					'context'       => sanitize_text_field( $string['context'] ?? '' ),
+					// As given, like `original`: the hash and the runtime lookup use it; escaped on output.
+					'context'       => (string) ( $string['context'] ?? '' ),
 					'original'      => $string['original'],
 					'original_hash' => $string['_hash'],
 					'group_id'      => $group_id,
@@ -348,14 +343,12 @@ final class StringRepository implements RepositoryInterface {
 			if ( $result !== false ) {
 				++$inserted;
 			} else {
-				// String insert failed (e.g. a hash collision raced past the
-				// pre-filter); its pre-allocated group would otherwise widow.
+				// The string insert failed (a hash raced the pre-filter): its group would be left empty.
 				$orphan_groups[] = $group_id;
 			}
 		}
 
-		// Reclaim any groups whose string insert failed - leaving them behind
-		// is what historically bloated the groups table with empty rows.
+		// Reclaim the groups whose string insert failed.
 		if ( $orphan_groups !== [] ) {
 			$ids          = array_map( 'intval', $orphan_groups );
 			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
@@ -376,21 +369,17 @@ final class StringRepository implements RepositoryInterface {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Filters: domain, context, search + search_mode, status, language_id, and
-	 * `missing_translation_language_ids` (int[]: only rows still missing a
-	 * translation in at least one of these languages).
+	 * Filters: domain, context, search + search_mode, status, language_id, and `missing_translation_language_ids`
+	 * (int[]: rows still missing a translation in one of these languages).
 	 */
 	public function find_all( array $args = [] ): array {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$domain      = sanitize_text_field( $args['domain'] ?? '' );
-		$context_f   = sanitize_text_field( $args['context'] ?? '' );
+		$context_f   = is_string( $args['context'] ?? null ) ? $args['context'] : '';
 		$search      = sanitize_text_field( $args['search'] ?? '' );
 		$status      = sanitize_key( $args['status'] ?? '' );
 		$language_id = absint( $args['language_id'] ?? 0 );
-		// `absint()` accepts 0 - without the floor below, a caller that
-		// explicitly passes `limit=0` (or any non-positive) returns an
-		// empty result set even when data exists. Clamp non-positives to
-		// the default 100.
+		// absint() accepts 0, which would return nothing: non-positive limits use 100.
 		$limit = absint( $args['limit'] ?? 100 );
 		if ( $limit < 1 ) {
 			$limit = 100;
@@ -462,7 +451,7 @@ final class StringRepository implements RepositoryInterface {
 					$query_args[] = $pattern;
 					break;
 
-				default: // contains.
+				default: // Contains.
 					$pattern      = '%' . $escaped . '%';
 					$where       .= ' AND (s.original LIKE %s OR s.context LIKE %s OR s.file_path LIKE %s)';
 					$query_args[] = $pattern;
@@ -474,12 +463,8 @@ final class StringRepository implements RepositoryInterface {
 
 		// Translation status filter.
 		$join = '';
-		// JOIN placeholders bind BEFORE the WHERE placeholders in the final
-		// SQL, so their values are collected separately and prepended to the
-		// WHERE values at prepare() time - appending them to $query_args (which
-		// already holds domain/context/search) would bind them out of order.
-		// Table names ride along as %i identifier placeholders (WP 6.2+) and
-		// are pushed at the exact position they appear in the assembled SQL.
+		// JOIN placeholders come before the WHERE placeholders in the SQL: collected apart and prepended at prepare() time.
+		// Tables bind as %i where they appear.
 		$join_args = [];
 
 		if ( $status === 'translated' || $status === 'untranslated' || $status === 'needs_update' ) {
@@ -487,9 +472,7 @@ final class StringRepository implements RepositoryInterface {
 			$groups_table = Schema::table( 'translation_groups' );
 
 			if ( $status === 'needs_update' ) {
-				// EXISTS (not INNER JOIN) so a string with needs_update links
-				// in several languages still returns once - a JOIN would
-				// multiply the row and corrupt pagination/counts.
+				// EXISTS, not a JOIN: a string with needs_update links in several languages returns once.
 				$where .= " AND EXISTS (
 					SELECT 1 FROM %i pl_fl
 					INNER JOIN %i pl_fg ON pl_fg.id = pl_fl.group_id AND pl_fg.type = 'string'
@@ -505,10 +488,7 @@ final class StringRepository implements RepositoryInterface {
 
 				$where .= ' )';
 			} elseif ( $language_id > 0 ) {
-				// Filter for a specific language. Joins the dedicated
-				// string_translations table on its (string_id, language_id)
-				// PRIMARY KEY - index seek instead of a CONCAT-on-options
-				// full scan.
+				// One language: string_translations on its (string_id, language_id) primary key.
 				$st_table = Schema::table( 'string_translations' );
 
 				if ( $status === 'translated' ) {
@@ -537,12 +517,9 @@ final class StringRepository implements RepositoryInterface {
 					$query_args[] = $language_id;
 				}
 			} else {
-				// No language selected - filter across ALL languages.
+				// No language: across all languages.
 				if ( $status === 'translated' ) {
-					// Strings with at least one translation link in any
-					// language. EXISTS (not INNER JOIN) so a string translated
-					// into several languages still returns once - a JOIN would
-					// multiply the row and corrupt pagination/counts.
+					// A translation link in any language; EXISTS so a string returns once.
 					$where .= " AND EXISTS (
 						SELECT 1 FROM %i pl_fl
 						INNER JOIN %i pl_fg ON pl_fg.id = pl_fl.group_id AND pl_fg.type = 'string'
@@ -552,7 +529,7 @@ final class StringRepository implements RepositoryInterface {
 					$query_args[] = $links_table;
 					$query_args[] = $groups_table;
 				} else {
-					// Strings with no translation in any language.
+					// No translation in any language.
 					$where .= " AND s.group_id NOT IN (
 						SELECT pl_fg3.id FROM %i pl_fg3
 						INNER JOIN %i pl_fl3 ON pl_fl3.group_id = pl_fg3.id
@@ -585,15 +562,8 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * WHERE fragment for the `missing_translation_language_ids` argument of
-	 * find_all() and count(): rows with a non-blank original that lack a
-	 * non-empty translation in at least one of the given languages.
-	 *
-	 * This is the bulk machine-translation job's skip-existing rule
-	 * (StringTranslationRepository::get_many() returns non-empty values only),
-	 * so every selected row has work for at least one target. The correlated
-	 * count uses the (string_id, language_id) primary key of
-	 * string_translations.
+	 * WHERE fragment of `missing_translation_language_ids` (find_all(), count()): non-blank originals lacking a non-empty
+	 * translation in one of the languages, the bulk job's skip-existing rule (StringTranslationRepository::get_many()).
 	 *
 	 * @param array<string, mixed> $args Query arguments.
 	 * @return array{0: literal-string, 1: array<int, int|string>} SQL fragment (leading " AND ") and its values, in placeholder order.
@@ -617,10 +587,7 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Count strings matching filter criteria.
-	 *
-	 * Accepts the same filter arguments as find_all(), including
-	 * `missing_translation_language_ids`.
+	 * Count strings matching the find_all() filters.
 	 *
 	 * @param array<string, mixed> $args Filter arguments.
 	 * @return int
@@ -628,7 +595,7 @@ final class StringRepository implements RepositoryInterface {
 	public function count( array $args = [] ): int {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$domain      = sanitize_text_field( $args['domain'] ?? '' );
-		$context_f   = sanitize_text_field( $args['context'] ?? '' );
+		$context_f   = is_string( $args['context'] ?? null ) ? $args['context'] : '';
 		$search      = sanitize_text_field( $args['search'] ?? '' );
 		$status      = sanitize_key( $args['status'] ?? '' );
 		$language_id = absint( $args['language_id'] ?? 0 );
@@ -698,7 +665,7 @@ final class StringRepository implements RepositoryInterface {
 					$query_args[] = $pattern;
 					break;
 
-				default: // contains.
+				default: // Contains.
 					$pattern      = '%' . $escaped . '%';
 					$where       .= ' AND (s.original LIKE %s OR s.context LIKE %s OR s.file_path LIKE %s)';
 					$query_args[] = $pattern;
@@ -716,8 +683,7 @@ final class StringRepository implements RepositoryInterface {
 			$groups_table = Schema::table( 'translation_groups' );
 
 			if ( $status === 'needs_update' ) {
-				// EXISTS (not INNER JOIN) so a string with needs_update links
-				// in several languages is counted once, not once per link.
+				// EXISTS, not a JOIN: counted once, not once per link.
 				$where .= " AND EXISTS (
 					SELECT 1 FROM %i pl_fl
 					INNER JOIN %i pl_fg ON pl_fg.id = pl_fl.group_id AND pl_fg.type = 'string'
@@ -761,8 +727,7 @@ final class StringRepository implements RepositoryInterface {
 					$query_args[] = $language_id;
 				}
 			} elseif ( $status === 'translated' ) {
-					// EXISTS (not INNER JOIN) so a string translated into
-					// several languages is counted once, not once per link.
+					// EXISTS, not a JOIN: counted once, not once per link.
 					$where .= " AND EXISTS (
 						SELECT 1 FROM %i pl_fl
 						INNER JOIN %i pl_fg ON pl_fg.id = pl_fl.group_id AND pl_fg.type = 'string'
@@ -787,15 +752,10 @@ final class StringRepository implements RepositoryInterface {
 		$where                         .= $missing_sql;
 		$query_args                     = array_merge( $query_args, $missing_args );
 
-		// Always apply $join/$where: a status filter (translated, untranslated,
-		// needs_update) can add a clause WITHOUT any bound args, so gating the
-		// filtered query on a non-empty $query_args silently returned the
-		// unfiltered total for those filters.
+		// Always apply $join/$where: a status filter can add a clause with no bound args.
 		$sql = "SELECT COUNT(*) FROM %i s {$join} WHERE {$where}";
 
-		// The table identifiers bind as %i (WP 6.2+), so the argument list is
-		// never empty and every call goes through prepare(). JOIN args bind
-		// ahead of the WHERE args (see find_all()): merge them in SQL order.
+		// The tables bind as %i, so every call goes through prepare(); JOIN args before WHERE args, in SQL order.
 		$all_args = array_merge( [ $this->table() ], $join_args, $query_args );
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -808,10 +768,8 @@ final class StringRepository implements RepositoryInterface {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * With $in_transaction the group row of a string whose insert failed is
-	 * left to the caller's rollback: no statement follows a failed one inside
-	 * a transaction (on the SQLite Database Integration the failure has ended
-	 * the transaction, and a later statement would commit on its own).
+	 * With $in_transaction the group of a string whose insert failed is left to the caller's rollback: nothing follows a
+	 * failed statement inside a transaction (SQLite ends it there).
 	 *
 	 * @param array<string, mixed> $data           domain, context, original, file_path, line_number.
 	 * @param bool                 $in_transaction Whether the caller holds an open transaction it rolls back on a failure.
@@ -825,10 +783,7 @@ final class StringRepository implements RepositoryInterface {
 
 		$groups_table = Schema::table( 'translation_groups' );
 
-		// Sibling bulk_insert() at line ~181 documents that insert_id can hold
-		// a STALE prior row's id on failure (mysqli-driver-dependent), so the
-		// $group_id === 0 check alone isn't a reliable failure signal. Check
-		// the insert() return explicitly first.
+		// insert_id can hold an earlier row's id after a failure: check insert()'s return first.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 		if ( false === $this->wpdb->insert( $groups_table, [ 'type' => 'string' ], [ '%s' ] ) ) {
 			return false;
@@ -844,7 +799,8 @@ final class StringRepository implements RepositoryInterface {
 			$this->table(),
 			[
 				'domain'        => sanitize_text_field( $data['domain'] ?? 'default' ),
-				'context'       => sanitize_text_field( $data['context'] ?? '' ),
+				// As given, like `original`: the hash and the runtime lookup use it; escaped on output.
+				'context'       => is_string( $data['context'] ?? null ) ? $data['context'] : '',
 				'original'      => $data['original'] ?? '',
 				'original_hash' => $hash,
 				'group_id'      => $group_id,
@@ -854,9 +810,7 @@ final class StringRepository implements RepositoryInterface {
 			[ '%s', '%s', '%s', '%s', '%d', '%s', '%d' ]
 		);
 
-		// If the string insert failed (UNIQUE-hash collision, DB error), the
-		// group we just inserted has no owner - it would be a widow. GC it
-		// right away rather than leave schema rot.
+		// The string insert failed: delete the group it would have owned.
 		if ( $result === false ) {
 			if ( ! $in_transaction ) {
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -906,9 +860,7 @@ final class StringRepository implements RepositoryInterface {
 	 * {@inheritDoc}
 	 */
 	public function delete( int $id ): bool {
-		// Capture the owning group before deleting. String groups carry exactly
-		// one string, so deleting the string leaves a widow group that nothing
-		// else sweeps - the health-check deliberately skips string-type groups.
+		// The owning group, read first: a string group holds one string, and nothing else sweeps it.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$group_id = (int) $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT group_id FROM %i WHERE id = %d', $this->table(), $id ) );
 
@@ -923,21 +875,11 @@ final class StringRepository implements RepositoryInterface {
 			return false;
 		}
 
-		// Cascade: drop the string's translations, then its links, then its
-		// now-empty group.
+		// Cascade: translations, links, then the empty group.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->delete( Schema::table( 'string_translations' ), [ 'string_id' => $id ], [ '%d' ] );
 
-		// ⚠️ And the links. Without this, deleting a string through the repository
-		// leaves `translation_links` rows pointing at an id that no longer exists
-		// - the orphan state the health checks and the `string-mode-db` suite
-		// exist to catch, produced by the plugin's own supported delete path.
-		// gc_stale_strings() already cascades to links; a single delete must
-		// agree with it.
-		//
-		// Scoped by BOTH type and object_id: translation_links is polymorphic, so
-		// an unqualified object_id delete would take out a post or term
-		// translation that merely shares the number.
+		// The links too, as gc_stale_strings() does, scoped by type and object_id (the table is polymorphic).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->delete(
 			Schema::table( 'translation_links' ),
@@ -950,16 +892,18 @@ final class StringRepository implements RepositoryInterface {
 
 		if ( $group_id > 0 ) {
 			$groups_table = Schema::table( 'translation_groups' );
-			// Guard with NOT EXISTS so a (defensively) shared group survives.
+			// NOT EXISTS keeps a shared group. One table per DELETE: the SQLite integration's 2.2.x legacy driver rejects
+			// `DELETE g FROM`.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			$this->wpdb->query(
 				$this->wpdb->prepare(
-					"DELETE g FROM %i g
-					WHERE g.id = %d AND g.type = 'string'
-					AND NOT EXISTS ( SELECT 1 FROM %i s WHERE s.group_id = g.id )",
+					"DELETE FROM %i
+					WHERE id = %d AND type = 'string'
+					AND NOT EXISTS ( SELECT 1 FROM %i WHERE group_id = %d )",
 					$groups_table,
 					$group_id,
-					$this->table()
+					$this->table(),
+					$group_id
 				)
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -969,7 +913,38 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Compute the SHA-256 hash for a string's unique identity.
+	 * In files mode, queue the one background regeneration of the compiled files (as after a plugin update).
+	 *
+	 * @param bool $not_started Count only a regeneration that has not started (a running one may have read old rows).
+	 * @return bool False when it could not be queued.
+	 */
+	private static function queue_files_regeneration( bool $not_started = false ): bool {
+		$plugin   = \PerfLocale\Plugin::get_instance();
+		$settings = $plugin->has( 'settings' ) ? $plugin->get( 'settings' ) : null;
+
+		if ( null === $settings || ! method_exists( $settings, 'get' ) || 'files' !== $settings->get( 'string_translation_mode', 'files' ) ) {
+			return true;
+		}
+
+		$hook = \PerfLocale\Bootstrap::FILES_REGENERATE_HOOK;
+
+		if ( $not_started ) {
+			// WP-Cron drops an event before it runs it, maybe in another process: read the cron option again.
+			wp_cache_delete( 'alloptions', 'options' );
+			wp_cache_delete( 'cron', 'options' );
+
+			// Action Scheduler keeps a started action out of 'pending'.
+			$pending = \PerfLocale\Background\JobRunnerFactory::action_scheduler_available() && function_exists( 'as_get_scheduled_actions' )
+				&& [] !== as_get_scheduled_actions( [ 'hook' => \PerfLocale\Bootstrap::FILES_REGENERATE_HOOK, 'args' => [], 'group' => \PerfLocale\Background\ActionSchedulerRunner::GROUP, 'status' => 'pending', 'per_page' => 1 ], 'ids' );
+
+			return $pending || false !== wp_next_scheduled( $hook, [] ) || \PerfLocale\Background\BackgroundEvents::enqueue( $hook );
+		}
+
+		return \PerfLocale\Background\BackgroundEvents::is_scheduled( $hook, [] ) || \PerfLocale\Background\BackgroundEvents::enqueue( $hook );
+	}
+
+	/**
+	 * The SHA-256 of a string's identity.
 	 *
 	 * @param string $domain Text domain.
 	 * @param string $context Context.
@@ -981,13 +956,9 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Register a non-gettext string (e.g. from settings or WC emails).
-	 *
-	 * If the string already exists (same hash), does nothing. If the source text
-	 * changed (same domain+context, different hash), migrates existing translations
-	 * to the new string and marks them as 'needs_update'. When that migration
-	 * stops before moving anything, the new string is removed again, so the next
-	 * registration of the same text retries it.
+	 * Register a non-gettext string (settings, WooCommerce emails). Unchanged: nothing. Changed text (same domain and
+	 * context): translations move to the new string as needs_update; a migration that moved nothing removes the new
+	 * string, so the next registration retries. Docs: docs-ai/11-code-rationale.md, "StringRepository: stale strings and their migration".
 	 *
 	 * @param string $text Original text.
 	 * @param string $domain Text domain.
@@ -999,22 +970,7 @@ final class StringRepository implements RepositoryInterface {
 			return;
 		}
 
-		// Serialize the SELECT-then-INSERT + stale-string-migration sequence
-		// per (domain, context). Without the lock, two concurrent saves of
-		// the SAME setting (e.g. an admin double-clicking Save, or two
-		// admins editing the same setting within the same second) can both
-		// observe `$exists === null`, both proceed to insert NEW string
-		// rows with different hashes, and both call migrate_stale_translations()
-		// on the same $old_strings set - the second migration finds nothing
-		// to move, leaving one of the two new strings dangling without its
-		// migrated translations.
-		//
-		// Lock per (domain, context) - registration within a domain is
-		// rare-but-bursty (theme/plugin init mass-registers strings at
-		// once), so the per-key lock keeps unrelated registrations
-		// uncontended. 5 s TTL covers the SELECT + INSERT + migrate roundtrip
-		// with comfortable headroom; a crashed worker just lets the TTL
-		// expire.
+		// One registration per (domain, context) at a time (5 s TTL): two saves could both insert and race the migration.
 		Lock::with(
 			'register_setting_string_' . md5( $domain . '|' . $context ),
 			5,
@@ -1023,10 +979,7 @@ final class StringRepository implements RepositoryInterface {
 
 				// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-				// If exact hash exists, string is unchanged - nothing to do
-				// except bump last_seen_at so the GC's stale-string sweep
-				// keeps this manually-registered string alive as long as
-				// the code path that registers it runs.
+				// Unchanged: only mark it seen, so the GC keeps it while its code path runs.
 				$exists = $this->wpdb->get_var(
 					$this->wpdb->prepare(
 						'SELECT id FROM %i WHERE original_hash = %s LIMIT 1',
@@ -1046,8 +999,7 @@ final class StringRepository implements RepositoryInterface {
 					return;
 				}
 
-				// Check for old strings with same domain+context but different
-				// hash (source text was changed). Migrate their translations.
+				// Old strings with the same domain and context: the source text changed; migrate their translations.
 				$old_strings = $this->wpdb->get_results(
 					$this->wpdb->prepare(
 						'SELECT id, group_id, original FROM %i WHERE domain = %s AND context = %s AND original_hash != %s',
@@ -1071,28 +1023,17 @@ final class StringRepository implements RepositoryInterface {
 				if ( ! empty( $old_strings ) && $new_string_id ) {
 					$migrated = $this->migrate_stale_translations( $old_strings, $new_string_id );
 
-					// The migration stopped before moving anything. Kept, the new
-					// row would answer every later registration of this text
-					// through the hash check above, and nothing would try again
-					// until the source text changed. Removed, the next
-					// registration - the next save of the setting, or the next
-					// string scan through perflocale/strings/after_scan -
-					// inserts it again and retries the migration.
+					// Moved nothing: kept, the new row would answer every later registration and nothing would retry; removed, the
+					// next save or scan inserts it again and retries.
 					if ( ! $migrated ) {
 						$this->remove_unmigrated_string( $new_string_id, $hash );
 					}
 
-					// A source-text change moved the translation onto a NEW
-					// string hash; without busting the strings cache the
-					// per-language all_string_translations map keeps the old
-					// hash (and lacks the new one), so the changed string reads
-					// UNTRANSLATED until the 6h TTL. Same treatment as
-					// gc_stale_strings().
+					// The translation moved to a new hash: bust the strings cache or the string reads untranslated until the 6 h TTL.
 					$this->cache->invalidate_group( 'perflocale_strings' );
 					$this->cache->invalidate_group( 'perflocale_trans' );
 
-					// Fire hook for each old string that was replaced. Not after a
-					// migration that stopped: nothing was marked needs_update.
+					// The hook per replaced string; not when nothing was marked needs_update.
 					if ( $migrated ) {
 						foreach ( $old_strings as $old ) {
 							/** @hook perflocale/string/needs_update Fires when a string's source text changes and translations are marked as needs_update. */
@@ -1105,34 +1046,14 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Mark-and-sweep GC: delete strings whose last_seen_at is older than
-	 * the configured retention window. Together with the last_seen_at
-	 * touches in bulk_insert() (scanner) and register_setting_string()
-	 * (manual registrations), this guarantees that strings whose source
-	 * is removed (uninstalled plugin, deleted theme, removed code) age out
-	 * automatically.
-	 *
-	 * Safety nets:
-	 *   - Default retention is 90 days (filterable). A long window
-	 *     tolerates rare-but-real code paths that only run a few times
-	 *     a year.
-	 *   - perflocale/strings/manual_contexts filter lets operators
-	 *     blacklist any context value that should NEVER be GC'd
-	 *     (preserves manually-registered settings/email templates even if
-	 *     their register_setting_string code path hasn't run recently).
-	 *   - Cascade: string_translations rows are dropped along with their
-	 *     parent string in the same DELETE…JOIN.
-	 *
-	 * Called from the daily perflocale_jobs_gc cron handler.
+	 * Delete strings unseen longer than the retention window (mark-and-sweep with the touches in bulk_insert() and
+	 * register_setting_string()), cascading to translations; manual contexts and protected domains are kept. Daily.
 	 *
 	 * @return array{strings: int, translations: int} Row counts deleted.
 	 */
 	public function gc_stale_strings(): array {
 		/**
-		 * Retention window in days for unreferenced strings rows. After
-		 * this many days without a last_seen_at touch (no scanner
-		 * rediscovery and no register_setting_string() call), the row is
-		 * eligible for GC.
+		 * Filter the days a string may go unseen (no scan rediscovery, no registration) before the GC may delete it.
 		 *
 		 * @hook perflocale/strings/stale_retention_days
 		 * @param int $days Default 90.
@@ -1148,13 +1069,7 @@ final class StringRepository implements RepositoryInterface {
 			];
 		}
 
-		// Mark-phase gate. last_seen_at is bumped ONLY by a StringScanJob full
-		// scan (manual - there is no automatic scan), so it only signals
-		// liveness AFTER a scan has run. If no full scan has completed within
-		// the retention window, every row's last_seen_at is stale for reasons
-		// unrelated to the string being gone - deleting here would wipe strings
-		// imported via PO/migration or registered once, that the operator
-		// simply never scanned. Skip the sweep until a fresh mark phase exists.
+		// last_seen_at moves only with a full scan: without one inside the window every row looks stale, so no sweep.
 		$last_full_scan = (int) get_option( 'perflocale_strings_last_full_scan', 0 );
 
 		if ( $last_full_scan <= 0 || $last_full_scan < time() - ( $days * DAY_IN_SECONDS ) ) {
@@ -1166,11 +1081,8 @@ final class StringRepository implements RepositoryInterface {
 		}
 
 		/**
-		 * Context values whose strings should never be GC'd, even when
-		 * last_seen_at exceeds the retention window. Use this for
-		 * manually-registered strings (settings labels, addon-registered
-		 * templates) that may be set once and only re-touched if the
-		 * underlying admin code path runs.
+		 * Filter the contexts whose strings are never deleted by the GC (settings labels and other registrations that may
+		 * be touched rarely).
 		 *
 		 * @hook perflocale/strings/manual_contexts
 		 * @param string[] $contexts Default [].
@@ -1180,21 +1092,15 @@ final class StringRepository implements RepositoryInterface {
 			[]
 		);
 
-		// Identifiers (sanitized to a bare [A-Za-z0-9_] token as belt-and-
-		// braces; they are bound below with prepare()'s %i placeholder).
+		// Identifiers sanitized to a bare token as well as bound with %i.
 		$strings_table      = Schema::sanitize_table( $this->table() );
 		$translations_table = Schema::sanitize_table( Schema::table( 'string_translations' ) );
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		/**
-		 * Domains whose strings must NEVER be GC'd. Backed by a persistent
-		 * option (not only a filter) so an addon's protection survives its
-		 * own deactivation: strings owned by an inactive addon (e.g. an
-		 * add-on's dynamic domain) are kept alive only by that
-		 * addon's own touch cron, which stops with it - without a
-		 * persistent exclusion, a routine string scan plus 90 idle days
-		 * would silently delete the addon's entire translation corpus.
+		 * Filter the domains whose strings are never deleted by the GC; backed by an option so an add-on's protection
+		 * outlives its deactivation (its own touch cron stops with it).
 		 *
 		 * @hook perflocale/strings/protected_domains
 		 * @param string[] $domains Option-backed registrations (perflocale_gc_protected_domains).
@@ -1204,9 +1110,7 @@ final class StringRepository implements RepositoryInterface {
 			array_values( array_filter( array_map( 'strval', (array) get_option( 'perflocale_gc_protected_domains', [] ) ) ) )
 		);
 
-		// Discover stale string IDs first so we can both cascade to
-		// string_translations and report the deletion count. Cap at 5,000
-		// per tick to keep the daily GC bounded on huge installs.
+		// The stale ids first, for the cascade and the count; at most 5,000 per run.
 		$context_filter = '';
 		$bind           = [ $days ];
 
@@ -1242,12 +1146,7 @@ final class StringRepository implements RepositoryInterface {
 		$stale_ids = array_map( 'intval', $stale_ids );
 		$id_ph     = implode( ',', array_fill( 0, count( $stale_ids ), '%d' ) );
 
-		// Capture the string-type groups these strings own BEFORE deleting the
-		// rows, so we can drop the now-widowed group + its language links
-		// afterwards. The periodic gc_empty_groups() deliberately skips
-		// type='string' groups (an empty string group is a legit transient
-		// state mid bulk-translate), so without this cascade a deleted string
-		// leaves a permanent widow group + orphan links.
+		// Their string groups, read before the delete: gc_empty_groups() skips string groups, so the cascade drops them.
 		$groups_table    = Schema::sanitize_table( Schema::table( 'translation_groups' ) );
 		$links_table     = Schema::sanitize_table( Schema::table( 'translation_links' ) );
 		$stale_group_ids = array_map(
@@ -1261,9 +1160,7 @@ final class StringRepository implements RepositoryInterface {
 			)
 		);
 
-		// Cascade delete translations first (FK-style), then parent strings.
-		// Table names bound with the %i identifier placeholder (WP 6.2+);
-		// the dynamic id list keeps its %d placeholders ($id_ph).
+		// Translations first, then the strings; tables as %i, the id list as %d.
 		$translations_deleted = (int) $this->wpdb->query(
 			$this->wpdb->prepare(
 				"DELETE FROM %i WHERE string_id IN ({$id_ph})",
@@ -1279,29 +1176,28 @@ final class StringRepository implements RepositoryInterface {
 			)
 		);
 
-		// Drop the widowed string-type groups + their language links. The
-		// NOT EXISTS guard means a group still owned by a surviving string is
-		// never touched (string<->group is 1:1, but stay defensive).
+		// The emptied string groups and their links; NOT IN keeps a group a surviving string owns. One table per DELETE:
+		// the SQLite integration's 2.2.x legacy driver rejects `DELETE g FROM` and mishandles a JOIN.
 		$groups_deleted = 0;
 		if ( $stale_group_ids !== [] ) {
 			$g_ph = implode( ',', array_fill( 0, count( $stale_group_ids ), '%d' ) );
 
 			$this->wpdb->query(
 				$this->wpdb->prepare(
-					"DELETE l FROM %i l
-					 INNER JOIN %i g ON g.id = l.group_id AND g.type = 'string'
-					 WHERE l.group_id IN ({$g_ph})
-					   AND NOT EXISTS ( SELECT 1 FROM %i s WHERE s.group_id = g.id )",
-					array_merge( [ $links_table, $groups_table ], $stale_group_ids, [ $strings_table ] )
+					"DELETE FROM %i
+					 WHERE group_id IN ({$g_ph})
+					   AND group_id IN ( SELECT id FROM %i WHERE type = 'string' )
+					   AND group_id NOT IN ( SELECT group_id FROM %i )",
+					array_merge( [ $links_table ], $stale_group_ids, [ $groups_table, $strings_table ] )
 				)
 			);
 
 			$groups_deleted = (int) $this->wpdb->query(
 				$this->wpdb->prepare(
-					"DELETE g FROM %i g
-					 WHERE g.type = 'string' AND g.id IN ({$g_ph})
-					   AND NOT EXISTS ( SELECT 1 FROM %i s WHERE s.group_id = g.id )
-					   AND NOT EXISTS ( SELECT 1 FROM %i l WHERE l.group_id = g.id )",
+					"DELETE FROM %i
+					 WHERE type = 'string' AND id IN ({$g_ph})
+					   AND id NOT IN ( SELECT group_id FROM %i )
+					   AND id NOT IN ( SELECT group_id FROM %i )",
 					array_merge( [ $groups_table ], $stale_group_ids, [ $strings_table, $links_table ] )
 				)
 			);
@@ -1309,10 +1205,7 @@ final class StringRepository implements RepositoryInterface {
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		if ( $strings_deleted > 0 ) {
-			// Drop the strings + translations cache groups so the next
-			// lookup re-reads from disk rather than serving a stale ID.
-			// Generation bump (not wp_cache_flush_group, which no-ops on
-			// common object caches like Redis Object Cache + Predis).
+			// A generation bump of the strings and translations groups (wp_cache_flush_group() is a no-op on some caches).
 			$this->cache->invalidate_group( 'perflocale_strings' );
 			$this->cache->invalidate_group( 'perflocale_trans' );
 			/** @hook perflocale/strings/gc_complete Fires after the daily strings GC. */
@@ -1327,11 +1220,8 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Migrate translations from old stale strings to a new string.
-	 *
-	 * Links the new string's group in every language that will arrive, then
-	 * moves the translation rows, marking them 'needs_update'. Cleans up old
-	 * string data only after every move succeeded.
+	 * Move the old strings' translations to the new string: link its group in every language first, then move the rows
+	 * as needs_update; old data is cleaned up only after every move succeeded.
 	 *
 	 * @param array<int, object> $old_strings Old string rows (id, group_id, original).
 	 * @param int                $new_string_id New string's ID.
@@ -1358,7 +1248,7 @@ final class StringRepository implements RepositoryInterface {
 
 		$translations_repo = new StringTranslationRepository( $this->cache );
 
-		// Partition: strings whose group survives migration vs orphans.
+		// Strings whose group survives vs orphans.
 		$grouped_ids = [];
 		$group_ids   = [];
 		$orphan_ids  = [];
@@ -1377,45 +1267,24 @@ final class StringRepository implements RepositoryInterface {
 			}
 		}
 
-		// insert() never creates a string without a group, so 0 means the read
-		// above failed (get_var() answers null), and there is no group to link
-		// the translations to.
+		// insert() always gives a group: 0 means the read failed, so there is nothing to link to.
 		if ( $new_group_id <= 0 ) {
 			$this->log_migration_abort( "reading the new string's group", $new_string_id, $all_old_ids );
 			return false;
 		}
 
-		// Set when a translation move fails. Every cleanup DELETE in this
-		// method is gated on it staying false - see the move loop below.
+		// Set when a move fails; every cleanup DELETE below waits for it to stay false.
 		$move_failed = false;
 
 		if ( $grouped_ids !== [] ) {
-			// Bind the id lists with %d placeholders (values are integers, but
-			// prepare() makes that explicit and scanner-verifiable). Table
-			// names bind with %i; only the generated placeholder lists are
+			// Id lists bound as %d, tables as %i; only the generated placeholder lists are
 			// interpolated - hence the surrounding phpcs:disable.
 			$gid_list = array_values( array_unique( array_map( 'intval', $group_ids ) ) );
 			$gid_ph   = implode( ',', array_fill( 0, count( $gid_list ), '%d' ) );
 			$sid_ph   = implode( ',', array_fill( 0, count( $grouped_ids ), '%d' ) );
 
-			// Link the new group BEFORE moving anything. Both serving paths
-			// join a translation to a link on its string's group, so a value
-			// moved onto the new string without one reads untranslated. In
-			// this order a failure, or the request dying, at any step leaves
-			// every translation either on its old, still-linked string or on
-			// the new, already-linked one.
-			//
-			// The languages: every one an old sibling holds a non-empty value
-			// in AND that is linked under an old group, which is what the moves
-			// below carry across. A value that was not linked stays unlinked.
-			//
-			// Run through query(), not get_col( $sql ): get_col() answers []
-			// for a failed query, which reads as "no languages" and lets the
-			// moves run with no links, and when query() returns before it
-			// resets its state (connection not ready, a `query` filter emptied
-			// the SQL) get_col() answers the PREVIOUS query's rows, here the
-			// new string's group id. query() returns an int only when this
-			// query ran without an error.
+			// Link the new group before moving anything (serving needs the link), in every language an old sibling holds a
+			// linked non-empty value in. Through query(), not get_col(), which answers [] or stale rows on a failure.
 			$sql  = $this->wpdb->prepare(
 				"SELECT DISTINCT st.language_id FROM %i st
 				INNER JOIN %i l ON l.language_id = st.language_id AND l.group_id IN ({$gid_ph})
@@ -1432,13 +1301,8 @@ final class StringRepository implements RepositoryInterface {
 			$translated_langs = array_map( 'intval', $this->wpdb->get_col() );
 
 			if ( $translated_langs !== [] ) {
-				// One multi-row INSERT marks every migrated language
-				// needs_update.
-				// `type` mirrors the owning group's type (Schema.php:89). This
-				// path only ever links a string-type group, so the literal is
-				// safe and keeps the placeholder/arg counts unchanged. Omitting
-				// it would insert the schema DEFAULT '' - a row invisible to
-				// every type-qualified lookup.
+				// One multi-row INSERT marks every migrated language needs_update; `type` is 'string' (an omitted type is '',
+				// invisible to every typed lookup).
 				$row_ph = implode( ',', array_fill( 0, count( $translated_langs ), "(%d, %d, %d, 'string', %s, %s)" ) );
 				$args   = [];
 				foreach ( $translated_langs as $lang_id ) {
@@ -1460,14 +1324,8 @@ final class StringRepository implements RepositoryInterface {
 				}
 			}
 
-			// Move every existing translation row from each old string to
-			// the new one. One UPDATE per old string - already minimal.
-			//
-			// A move that FAILS leaves that string's translations on the OLD
-			// string (move_translations() returns -1 and skips its own cleanup
-			// DELETE). Everything after this loop that deletes is therefore
-			// gated on $move_failed: the old rows are the last remaining copy
-			// and there is no transaction to bring them back.
+			// One UPDATE per old string. A failed move keeps that string's rows where they are, so every delete after this
+			// loop waits on $move_failed: those rows are the last copy.
 			foreach ( $grouped_ids as $old_id ) {
 				if ( $translations_repo->move_translations( $old_id, $new_string_id ) < 0 ) {
 					$move_failed = true;
@@ -1486,9 +1344,7 @@ final class StringRepository implements RepositoryInterface {
 				}
 			}
 
-			// Batched cleanup (was: two DELETEs per old string). Skipped when
-			// a move failed, because these DELETEs remove the links and groups
-			// that still point at translations which never made it across.
+			// Batched cleanup, skipped after a failed move: it would delete links and groups still serving those translations.
 			if ( ! $move_failed ) {
 				$this->wpdb->query( $this->wpdb->prepare( "DELETE FROM %i WHERE group_id IN ({$gid_ph})", array_merge( [ $links_table ], $gid_list ) ) );
 				$this->wpdb->query( $this->wpdb->prepare( "DELETE FROM %i WHERE id IN ({$gid_ph})", array_merge( [ $groups_table ], $gid_list ) ) );
@@ -1496,15 +1352,11 @@ final class StringRepository implements RepositoryInterface {
 		}
 
 		if ( $move_failed ) {
-			// Leave the old strings, groups, links and translations exactly
-			// where they are. A migration that did not happen is recoverable -
-			// the operator still has every translation, and the daily
-			// stale-string GC reclaims the rows once they stop being seen. A
-			// half-applied migration that deleted them is not recoverable.
+			// Leave everything in place: a migration that did not happen is recoverable, a half-applied one is not.
 			return true;
 		}
 
-		// Orphaned strings - drop their translations.
+		// Orphaned strings: drop their translations.
 		foreach ( $orphan_ids as $old_id ) {
 			$translations_repo->delete_for_string( $old_id );
 		}
@@ -1521,16 +1373,8 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Log a stale-string migration that stopped before moving anything.
-	 *
-	 * Every translation is still on its old, linked string and is served under
-	 * the old text only. register_setting_string() then removes the new string
-	 * so that the next registration of the same text retries the migration.
-	 * Until a migration succeeds or the old text is registered again, nothing
-	 * re-marks the old strings as seen - the scanner does not find registered
-	 * contexts such as blogname or a WooCommerce attribute label - so, unless
-	 * their domain is protected, the stale-string GC deletes them, with their
-	 * translations, once they have gone unseen for the retention window.
+	 * Log a stale-string migration that stopped before moving anything; the translations stay on their old strings,
+	 * which are not re-marked seen, so the GC deletes them after the window unless their domain is protected.
 	 *
 	 * @param string          $step          What failed.
 	 * @param int             $new_string_id New string's ID.
@@ -1551,42 +1395,55 @@ final class StringRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Remove the string register_setting_string() just inserted, after its
-	 * stale-string migration stopped before moving anything.
-	 *
-	 * Without the row, the next registration of the same text inserts it again
-	 * and retries the migration. The row and its string-type group go in one
-	 * statement, and only while the row still carries this text and neither it
-	 * nor its group holds a translation or a link, so a string that something
-	 * else has started to use in the meantime is kept. A failed removal is
-	 * logged and leaves the row in place: the migration is then retried only by
-	 * the next change to the source text.
+	 * Remove the string register_setting_string() inserted after its migration moved nothing, only while it still has
+	 * this text and group and holds no translation or link; then its group unless a link reached it. A failed removal is
+	 * logged and leaves the row.
 	 *
 	 * @param int    $string_id String inserted by this registration.
 	 * @param string $hash      Its original_hash.
 	 * @return void
 	 */
 	private function remove_unmigrated_string( int $string_id, string $hash ): void {
-		$sql = $this->wpdb->prepare(
-			"DELETE s, g FROM %i s
-			LEFT JOIN %i g ON g.id = s.group_id AND g.type = 'string'
-			WHERE s.id = %d AND s.original_hash = %s
-			  AND NOT EXISTS ( SELECT 1 FROM %i l WHERE l.group_id = s.group_id )
-			  AND NOT EXISTS ( SELECT 1 FROM %i st WHERE st.string_id = s.id )",
-			$this->table(),
-			Schema::table( 'translation_groups' ),
-			$string_id,
-			$hash,
-			Schema::table( 'translation_links' ),
-			Schema::table( 'string_translations' )
-		);
+		// One table per DELETE: the SQLite integration's 2.2.x legacy driver mishandles a DELETE holding JOIN.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		$group_id = $this->wpdb->get_var( $this->wpdb->prepare( 'SELECT group_id FROM %i WHERE id = %d', $this->table(), $string_id ) );
+		$removed  = false;
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql is the prepare() result above.
-		$removed = is_string( $sql ) && '' !== $sql ? $this->wpdb->query( $sql ) : false;
+		if ( '' === $this->wpdb->last_error ) {
+			$group_id = (int) $group_id;
+			$sql      = $this->wpdb->prepare(
+				'DELETE FROM %i
+				WHERE id = %d AND original_hash = %s AND group_id = %d
+				  AND NOT EXISTS ( SELECT 1 FROM %i WHERE group_id = %d )
+				  AND NOT EXISTS ( SELECT 1 FROM %i WHERE string_id = %d )',
+				$this->table(),
+				$string_id,
+				$hash,
+				$group_id,
+				Schema::table( 'translation_links' ),
+				$group_id,
+				Schema::table( 'string_translations' ),
+				$string_id
+			);
+			$removed  = is_string( $sql ) && '' !== $sql ? $this->wpdb->query( $sql ) : false;
+		}
 
 		if ( false !== $removed ) {
+			$sql = 1 === (int) $removed && $group_id > 0 ? $this->wpdb->prepare(
+				"DELETE FROM %i WHERE id = %d AND type = 'string' AND NOT EXISTS ( SELECT 1 FROM %i WHERE group_id = %d )",
+				Schema::table( 'translation_groups' ),
+				$group_id,
+				Schema::table( 'translation_links' ),
+				$group_id
+			) : null;
+
+			if ( is_string( $sql ) && '' !== $sql ) {
+				$this->wpdb->query( $sql );
+			}
+
 			return;
 		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent data-loss point.
 		error_log(

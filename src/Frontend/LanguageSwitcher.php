@@ -18,8 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Provides language switcher output via widget, shortcode,
- * and template tag. Supports multiple display templates.
+ * Language switcher output for the widget, shortcode, template tag and nav menus.
  */
 final class LanguageSwitcher {
 
@@ -59,11 +58,7 @@ final class LanguageSwitcher {
 	public function register_hooks(): void {
 		add_shortcode( 'perflocale_switcher', [ $this, 'shortcode' ] );
 
-		// Ordering-proof widget registration: in admin this service can be
-		// booted AFTER widgets_init (init:1) has already fired, and a
-		// listener attached to a past event never runs - the widget would
-		// silently not exist in Appearance → Widgets or the Legacy Widget
-		// picker.
+		// In admin this service can boot after widgets_init has fired.
 		if ( did_action( 'widgets_init' ) ) {
 			$this->register_widget();
 		} else {
@@ -74,10 +69,7 @@ final class LanguageSwitcher {
 	}
 
 	/**
-	 * Render the language switcher.
-	 *
-	 * Shortcode / widget / template-tag / nav-menu all delegate here, which
-	 * maps snake_case args to camelCase and forwards to LanguageSwitcherBlock.
+	 * Render the language switcher: maps snake_case args to LanguageSwitcherBlock attributes.
 	 *
 	 * @param array<string, mixed> $args Display arguments.
 	 * @return string HTML output.
@@ -95,9 +87,7 @@ final class LanguageSwitcher {
 			'show_native'       => true,
 			'hide_current'      => (bool) $this->settings->get( 'switcher_hide_current', false ),
 			'show_untranslated' => (bool) $this->settings->get( 'switcher_show_untranslated', false ),
-			// Only an explicit per-call class belongs here. The block render
-			// already prepends the global `switcher_class`, so seeding it here
-			// too would emit it twice.
+			// Per-call class only: the block render already adds the global `switcher_class`.
 			'class'             => '',
 		];
 
@@ -110,10 +100,7 @@ final class LanguageSwitcher {
 			'nameFormat'       => $args['name_format'],
 			'triggerFormat'    => $args['trigger_format'],
 			'arrowStyle'       => $args['arrow_style'],
-			// wp_validate_boolean, NOT a raw (bool) cast: shortcode attributes
-			// arrive as strings, and (bool) "false"/"no" is TRUE in PHP - so
-			// hide_current="false" would hide the current language. This also
-			// accepts the real booleans the block render path passes.
+			// Not a (bool) cast: shortcode strings like "false" would be true.
 			'showFlags'        => wp_validate_boolean( $args['show_flags'] ),
 			'showNames'        => wp_validate_boolean( $args['show_names'] ),
 			'hideCurrent'      => wp_validate_boolean( $args['hide_current'] ),
@@ -135,11 +122,7 @@ final class LanguageSwitcher {
 		 */
 		$filtered = apply_filters( 'perflocale/switcher/output', $html, $args );
 
-		// Type-safety nudge: the filter contract is string-in / string-out.
-		// A hook callback returning a non-string would either cause a fatal
-		// in callers that re-pass through kses_switcher() (which is typed),
-		// or silently echo "Array" via implicit string conversion. Surface
-		// the developer mistake here and fall back to the pre-filter HTML.
+		// A non-string would fatal in the typed kses_switcher(): fall back to the unfiltered HTML.
 		if ( ! is_string( $filtered ) ) {
 			_doing_it_wrong(
 				'apply_filters( "perflocale/switcher/output", ... )',
@@ -159,10 +142,9 @@ final class LanguageSwitcher {
 	}
 
 	/**
-	 * Build the attribute string for a per-language switcher link.
+	 * Build the escaped attribute string for a per-language switcher link.
 	 *
-	 * Values are escaped via `esc_attr()` (or `esc_url()` for href). Boolean true
-	 * renders as an HTML boolean attribute; false/null omits the attribute.
+	 * True renders a boolean attribute; false or null omits it.
 	 *
 	 * @param array  $base_attrs   Default attribute map.
 	 * @param object $lang         Language object.
@@ -276,19 +258,11 @@ final class LanguageSwitcher {
 	 * @return string Modified menu items.
 	 */
 	public function add_to_menu( string $items, \stdClass $args ): string {
-		// The operator-facing switch: theme locations picked on the
-		// Language Switcher settings tab. Any selection turns the feature
-		// on for exactly those locations; the filters below keep the
-		// pre-existing programmatic control (and can widen or narrow it).
-		// Verbatim (case-sensitive): nav-menu location slugs may be
-		// mixed-case, and $args->theme_location below is the raw registered
-		// key - lowercasing here would never match e.g. `headerMenu`.
+		// Locations picked in settings, case kept: theme_location is the raw, possibly mixed-case key.
 		$setting_locations = array_values(
 			array_filter(
 				array_map( 'strval', (array) $this->settings->get( 'switcher_menu_locations', [] ) ),
-				// Only drop empties - NOT the default falsy filter, which would
-				// discard a legitimate location slug of "0" that the save side
-				// (an array_intersect against registered keys) keeps.
+				// Not the default falsy filter: a location slug "0" is valid.
 				static fn( string $s ): bool => $s !== ''
 			)
 		);
@@ -325,9 +299,7 @@ final class LanguageSwitcher {
 			return $items;
 		}
 
-		// Resolve per-language URLs only once we know the switcher will render.
-		// get_translations_for_current_page() is request-memoised, so this is
-		// still a memo hit if hreflang / the switcher block ran earlier.
+		// Resolved only when the switcher renders; the lookup is memoized per request.
 		$current_slug = $this->router->get_current_slug();
 		$urls         = $this->url_converter->get_translations_for_current_page();
 
@@ -357,8 +329,7 @@ final class LanguageSwitcher {
 				if ( $untranslated_link === 'no_link' ) {
 					$url = '';
 				} else {
-					// Target language's home, not the current language's -
-					// matches LanguageSwitcherBlock::render().
+					// Target language's home, as in LanguageSwitcherBlock::render().
 					$url = perflocale_home_url( $lang->slug );
 				}
 			}

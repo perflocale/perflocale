@@ -26,23 +26,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class StringsPage {
 
 	/**
-	 * Controls the save form posts that are NOT one of the per-cell inputs:
-	 * `_wpnonce`, `_wp_http_referer`, the `perflocale_save_string_translations`
-	 * flag and the three filter carriers (`domain_filter`, `search`, `paged`)
-	 * - seven with the submit button, which posts into the form through its
-	 * `form` attribute. The remainder is slack: PHP's own cut-off is not exact
-	 * (a 1000-var limit was measured delivering 1001 names on PHP 8.2), and a
-	 * reserve costing 1.6% of a stock host's budget is cheaper than being one
-	 * variable over.
+	 * Inputs the save form posts besides the per-cell ones (seven), plus slack.
+	 *
+	 * PHP's own cut-off is not exact: see docs-ai/11-code-rationale.md, "StringsPage: save form input budget".
 	 *
 	 * @var int
 	 */
 	private const SAVE_FORM_RESERVED_INPUTS = 16;
 
 	/**
-	 * Preloaded plural extra_forms per "string_id_language_id" - populated
-	 * by preload_translation_texts() so the grid renders the extra plural
-	 * inputs without a per-cell query.
+	 * Plural extra_forms per "string_id_language_id", preloaded by preload_translation_texts().
 	 *
 	 * @var array<string, array<int, string>>
 	 */
@@ -62,10 +55,7 @@ final class StringsPage {
 		$hidden_langs = (array) get_user_meta( get_current_user_id(), 'perflocale_strings_hidden_langs', true );
 		$languages    = $lang_repo->get_active();
 
-		// Bulk MT-translate toolbar opt-in: master MT switch on + bulk
-		// kill-switch on (Settings → Addons → Machine Translation → Bulk MT for
-		// Strings) + user has the `perflocale_use_mt` cap + there's at
-		// least one non-default language to translate INTO.
+		// Bulk MT toolbar: MT on, Bulk MT for Strings on, the `perflocale_use_mt` cap and a non-default language.
 		$mt_default_lang = $lang_repo->get_default();
 		$mt_non_default  = array_values( array_filter( $languages, static fn( $l ) => empty( $l->is_default ) ) );
 		$mt_show_toolbar = $settings->mt_enabled()
@@ -76,13 +66,12 @@ final class StringsPage {
 
 		// phpcs:disable WordPress.Security.NonceVerification.Recommended
 		$domain      = isset( $_GET['domain_filter'] ) ? sanitize_text_field( wp_unslash( $_GET['domain_filter'] ) ) : '';
-		$context     = isset( $_GET['context_filter'] ) ? sanitize_text_field( wp_unslash( $_GET['context_filter'] ) ) : '';
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- A stored context is kept as given: matched exactly (prepared), escaped where shown.
+		$context     = isset( $_GET['context_filter'] ) && is_string( $_GET['context_filter'] ) ? (string) wp_unslash( $_GET['context_filter'] ) : '';
 		$search      = isset( $_GET['s'] ) ? sanitize_text_field( wp_unslash( $_GET['s'] ) ) : '';
 		$search_mode = isset( $_GET['search_mode'] ) ? sanitize_key( $_GET['search_mode'] ) : 'contains';
 		$status      = isset( $_GET['status_filter'] ) ? sanitize_key( $_GET['status_filter'] ) : '';
-		// Canonical language filter - the slug form (`?perflocale_lang=de`)
-		// used by the WP admin-bar switcher and every other list page in
-		// the plugin. Resolved to an internal language ID for the repo.
+		// Language filter by slug (`?perflocale_lang=de`), as on every other list page; resolved to an ID.
 		$lang_slug_filter = isset( $_GET['perflocale_lang'] ) ? sanitize_key( $_GET['perflocale_lang'] ) : '';
 		$lang_filter      = 0;
 
@@ -100,9 +89,7 @@ final class StringsPage {
 			delete_transient( 'perflocale_scan_result_' . get_current_user_id() );
 		}
 		$saved = isset( $_GET['saved'] ) ? absint( $_GET['saved'] ) : 0;
-		// Cells the save handler could not write (group INSERT / link upsert
-		// failed). Without this the grid re-renders showing the stored value
-		// and the typed translation is simply gone, with no message at all.
+		// Cells the save handler could not write; without the notice the typed text would vanish silently.
 		$save_failed = isset( $_GET['save_failed'] ) ? absint( $_GET['save_failed'] ) : 0;
 
 		$allowed_modes = [ 'contains', 'not_contains', 'exact', 'starts_with', 'not_starts_with', 'ends_with', 'not_ends_with' ];
@@ -111,16 +98,8 @@ final class StringsPage {
 		}
 		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 
-		// Screen Options accepts up to 999 rows, and the save form below posts
-		// one input per (row × language): 999 rows over five languages is 5,016
-		// controls in ONE POST. PHP stops parsing at `max_input_vars` - 1000 on
-		// a stock host - and silently drops everything past the cut-off. The
-		// nonce, the action flag and the filter carriers are first in the form
-		// so they always survive; the save therefore runs, reports success and
-		// discards every edit that landed in the truncated tail. Nothing
-		// downstream can recover it: by the time admin_init sees the POST the
-		// dropped inputs no longer exist. Bounding the page size here is the
-		// only point at which that is preventable.
+		// Page size capped to max_input_vars: PHP drops inputs past it and the save would report
+		// success without the tail. See docs-ai/11-code-rationale.md, "StringsPage: save form input budget".
 		$per_page = $this->cap_per_page_to_input_vars( $this->get_per_page(), $languages );
 		$offset   = ( $page_num - 1 ) * $per_page;
 
@@ -131,8 +110,6 @@ final class StringsPage {
 			'search_mode'      => $search_mode,
 			'status'           => $status,
 			'language_id'      => $lang_filter,
-			// for every other status (ignored by the repo unless status
-			// matches).
 		];
 
 		$total_items = $string_repo->count( $filter_args );
@@ -179,20 +156,10 @@ final class StringsPage {
 			$sort_args['perflocale_lang'] = $lang_slug_filter;
 		}
 
-		// PO export/import live next to the page heading (alongside the
-		// Documentation link) instead of in the per-row toolbar - they're
-		// page-level actions, not per-result actions, and this matches
-		// WP-admin convention for top-of-page actions. Same non-default
-		// list the MT toolbar uses above.
+		// PO export and import are page-level actions in the header; same language list as the MT toolbar.
 		$non_default_langs = $mt_non_default;
 
-		// The ceiling an operator will actually hit, named on the import form
-		// so the limit is visible BEFORE a doomed upload rather than only
-		// after it. Two ceilings apply and the smaller one binds: what PHP
-		// will accept (`wp_max_upload_size()`, the one that binds on every
-		// stock host) and what the importer will parse
-		// (AdminController::po_max_bytes()). One admin-page-only call to each;
-		// nothing on the front end.
+		// The import form names the binding ceiling: the smaller of PHP's upload limit and po_max_bytes().
 		$po_upload_ceiling = AdminController::format_bytes(
 			min( AdminController::max_upload_bytes(), AdminController::po_max_bytes() )
 		);
@@ -307,22 +274,14 @@ final class StringsPage {
 			<?php endif; ?>
 
 			<?php
-			// PO import flash notice - pulled from a per-user transient so
-			// the redirect back from the import handler doesn't leave
-			// `po_message=…&imported=…&errors=…` query strings in the URL
-			// (mirrors the scan-result transient pattern above).
+			// PO import result from a per-user transient, so the redirect carries no result query args.
 			$po_import_result = get_transient( 'perflocale_po_import_result_' . get_current_user_id() );
 
 			if ( is_array( $po_import_result ) ) {
 				delete_transient( 'perflocale_po_import_result_' . get_current_user_id() );
 			}
 
-			// Error-only messages (no_lang / missing_input / export_fail) still
-			// come through URL params for now - they're set on a redirect from
-			// validation gates BEFORE the importer runs. Read once and let the
-			// browser strip them via history.replaceState below. Pure display
-			// state with sanitize_key - no nonce needed because nothing
-			// mutates based on the value.
+			// Validation errors come as a URL param that JS strips after display; display only, so no nonce.
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$po_message = isset( $_GET['po_message'] ) ? sanitize_key( wp_unslash( (string) $_GET['po_message'] ) ) : '';
 			?>
@@ -339,8 +298,7 @@ final class StringsPage {
 				$sanitized      = (int) ( $po_import_result['sanitized'] ?? 0 );
 				$not_imported   = (int) ( $po_import_result['sanitized_empty'] ?? 0 );
 				$err_messages   = array_filter( (array) ( $po_import_result['error_messages'] ?? [] ), 'is_string' );
-				// Headline: "added/updated/unchanged" + a separate hint for
-				// msgid-only rows so the user understands the breakdown.
+				// Headline counts; msgid-only rows get a separate hint.
 				$primary_changes = $inserted + $updated;
 				?>
 				<div class="notice <?php echo $err > 0 ? 'notice-warning' : 'notice-success'; ?> is-dismissible">
@@ -437,10 +395,7 @@ final class StringsPage {
 				<div class="notice notice-error is-dismissible">
 					<p>
 					<?php
-					// The importer's own ceiling, not PHP's - PHP refuses its
-					// own limit long before the file reaches the gate that
-					// sets this message, so naming a number is what makes the
-					// difference between the two visible.
+					// The importer's own ceiling: a file over PHP's limit never reaches this gate.
 					printf(
 						/* translators: %s: largest PO file the importer will parse, e.g. "50 MB". */
 						esc_html__( 'The uploaded PO file is larger than the importer accepts (limit: %s). Split it into smaller files, or raise the ceiling with the perflocale/po/max_bytes filter.', 'perflocale' ),
@@ -453,11 +408,7 @@ final class StringsPage {
 				<div class="notice notice-error is-dismissible">
 					<p>
 					<?php
-					// PHP refused the upload. The handler forwards only the
-					// numeric UPLOAD_ERR_* code, so nothing user-supplied
-					// travels in the URL and both import forms share one set
-					// of sentences. absint() bounds it; an unmapped code falls
-					// through to upload_error_message()'s default branch.
+					// PHP refused the upload; only the numeric UPLOAD_ERR_* code travels in the URL.
 					// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 					$po_upload_err = isset( $_GET['po_upload_err'] ) ? absint( wp_unslash( $_GET['po_upload_err'] ) ) : UPLOAD_ERR_NO_FILE;
 					echo esc_html( AdminController::upload_error_message( $po_upload_err ) );
@@ -471,8 +422,11 @@ final class StringsPage {
 			<?php endif; ?>
 
 			<?php
+			// After a PO notice, strings-validate.js (Assets enqueues it for
+			// this screen) drops the notice's query arguments from the address
+			// bar; this data is its signal.
 			if ( $po_message !== '' ) {
-				\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-strings-po-cleanup', 'strings-po-cleanup.js' );
+				wp_localize_script( 'perflocale-strings-validate', 'perflocaleStrPo', [ 'cleanup' => '1' ] );
 			}
 			?>
 
@@ -606,10 +560,7 @@ final class StringsPage {
 
 				<?php
 				$has_active_filter = ( $domain !== '' || $context !== '' || $search !== '' || $status !== '' || $lang_slug_filter !== '' );
-				// "Translate all" should confirm against the entire strings
-				// table, not the currently-filtered subset. When filters are
-				// clear this is exactly $total_items, so skip the extra COUNT
-				// query in that case.
+				// "Translate all" confirms against the whole table; without filters that is $total_items.
 				$grand_total = $has_active_filter ? $string_repo->count() : $total_items;
 				?>
 
@@ -746,9 +697,7 @@ final class StringsPage {
 							<?php endif; ?>
 							<?php
 							foreach ( $strings as $string ) :
-								// Comprehensive sprintf token detection (positional, width,
-								// precision, all WP/PHP specifiers). Mirrored client-side
-								// by the strings-validate.js extractor.
+								// Sprintf tokens; strings-validate.js extracts them the same way.
 								$placeholders     = \PerfLocale\Util\SprintfTokens::extract( (string) $string->original );
 								$has_placeholders = ! empty( $placeholders );
 								?>
@@ -779,10 +728,7 @@ final class StringsPage {
 											/**
 											 * Friendly label for a string's context.
 											 *
-											 * A context is an identifier meant for code - `blogname`,
-											 * `attribute_label_size`. It is shown to an operator who is
-											 * looking for their site title, so a domain that knows a
-											 * human name for its contexts can supply one here.
+											 * A context is a code identifier (`blogname`); a domain can give its contexts a human name.
 											 *
 											 * @hook perflocale/strings/context_label
 											 * @param string $label   Context, unchanged by default.
@@ -844,10 +790,8 @@ final class StringsPage {
 												</button>
 											</div>
 											<?php
-											// Extra plural forms (2..N) for a plural-context row in a
-											// language with more than two CLDR plural forms (Polish,
-											// Russian, Arabic …). Form 0 is this string's singular-context
-											// sibling row; form 1 is the input above; these are forms 2..N.
+											// Plural forms 2..N for a language with more than two CLDR forms; form 0 is the
+											// singular-context sibling row, form 1 the input above.
 											$is_plural_row = $string->context === 'plural'
 												|| ( is_string( $string->context ) && str_ends_with( $string->context, ' (plural)' ) );
 											$nplurals      = \PerfLocale\Strings\PluralRules::nplurals( (string) $lang->locale );
@@ -925,24 +869,24 @@ final class StringsPage {
 		</div>
 
 		<?php
-		// The modal and the per-row placeholder check: strings-modal.js. It
-		// reads the extractor of strings-validate.js (enqueued by Assets for
-		// this screen) only when the modal opens or a row changes, so it
-		// carries no dependency that could keep the modal from loading.
-		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-strings-modal', 'strings-modal.js' );
-
+		// The modal and the per-row placeholder check are in
+		// strings-validate.js, which Assets enqueues for this screen; their
+		// strings travel on that handle, printed with it in the footer.
 		wp_localize_script(
-			'perflocale-strings-modal',
+			'perflocale-strings-validate',
 			'perflocaleStrI18n',
 			[
-				'allPresent'   => __( 'All placeholders present.', 'perflocale' ),
+				'allPresent'      => __( 'All placeholders present.', 'perflocale' ),
 				/* translators: %s: comma-separated list of placeholder tokens (e.g. "%1$s, %2$d") missing from the translation. */
-				'someMissing'  => __( 'Missing: %s', 'perflocale' ),
+				'someMissing'     => __( 'Missing: %s', 'perflocale' ),
 				/* translators: %s: comma-separated list of placeholder tokens present in the translation but not in the source string. */
-				'someExtra'    => __( 'Extra (more than source): %s', 'perflocale' ),
-				'applyConfirm' => __( 'Translation has placeholder issues. Apply anyway?', 'perflocale' ),
+				'someExtra'       => __( 'Extra (more than source): %s', 'perflocale' ),
+				'applyConfirm'    => __( 'Translation has placeholder issues. Apply anyway?', 'perflocale' ),
 				/* translators: %s: comma-separated list of placeholder tokens missing from the input field's value. */
-				'inputMissing' => __( 'Missing placeholder(s): %s', 'perflocale' ),
+				'inputMissing'    => __( 'Missing placeholder(s): %s', 'perflocale' ),
+				'translation'     => __( 'Translation', 'perflocale' ),
+				/* translators: %s: language name, label of the Edit Translation field. */
+				'langTranslation' => __( '%s Translation', 'perflocale' ),
 			]
 		);
 	}
@@ -991,33 +935,15 @@ final class StringsPage {
 		$option = $screen ? $screen->get_option( 'per_page', 'option' ) : '';
 		$val    = $option ? (int) get_user_meta( $user, $option, true ) : 0;
 
-		// ⚠️ Clamp on READ. The save-time ceiling cannot touch values stored
-		// BEFORE it existed: measured with max_input_vars=64 (ceiling 25), a
-		// stored 777 still drove posts_per_page=777 and rendered every row.
-		// The protection has to sit where the value is USED. The stored
-		// preference is deliberately not rewritten - only the effective value.
+		// Clamped on read too: a stored value may exceed the save-time ceiling. The stored
+		// preference is not rewritten.
 		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
 	}
 
 	/**
-	 * Bound the grid page size so the save form can never post more inputs
-	 * than PHP will accept.
+	 * Bounds the grid page size so the save form never posts more inputs than PHP accepts.
 	 *
-	 * The form posts one control per (row × language), plus - on a plural row
-	 * in a language with more than two CLDR plural forms - one more per extra
-	 * form. The bound assumes the WORST case, every row a plural row, because
-	 * the page size has to be fixed before the rows are queried and the real
-	 * plural count for the page is not knowable yet. On en/de/pl (Polish has
-	 * three forms) that costs a quarter of the rows and buys a guarantee worth
-	 * more than they are: whatever the browser posts, PHP parses all of it.
-	 *
-	 * `max_input_vars` is applied to $_GET, $_POST and $_COOKIE separately
-	 * (measured on PHP 8.2: 400 query vars and 400 cookies alongside the POST
-	 * left the POST budget untouched), so the reserve only has to cover this
-	 * form's own scalars - see SAVE_FORM_RESERVED_INPUTS.
-	 *
-	 * Default per-page is 20, so on any language set this is a no-op until an
-	 * operator raises the Screen Options value far enough to be in danger.
+	 * Assumes every row is a plural row: the size is fixed before the rows are queried.
 	 *
 	 * @param int                $per_page       Rows per page the operator asked for.
 	 * @param array<int, object> $languages      Active languages; each carries a `locale`.
@@ -1027,13 +953,8 @@ final class StringsPage {
 	private function cap_per_page_to_input_vars( int $per_page, array $languages, ?int $max_input_vars = null ): int {
 		$limit = $max_input_vars ?? (int) ini_get( 'max_input_vars' );
 
-		// There is no "unlimited" value to detect: PHP rejects a negative
-		// max_input_vars and silently falls back to 1000 (measured - `-d
-		// max_input_vars=-1` makes ini_get() report "1000"), and 0 is a real,
-		// pathological setting meaning "accept no input variables at all",
-		// which no row count can rescue. So a non-positive reading only ever
-		// means the ini is unreadable: leave the operator's page size alone
-		// rather than clamp on a value we do not trust.
+		// A non-positive reading means an unreadable ini (PHP has no "unlimited" value): keep the
+		// operator's page size.
 		if ( $limit <= 0 || [] === $languages ) {
 			return $per_page;
 		}
@@ -1055,12 +976,7 @@ final class StringsPage {
 	}
 
 	/**
-	 * Preload translation statuses.
-	 *
-	 * Returns "<string_id>:<lang_id>" → status-string map. The value is the
-	 * link's status column (e.g. 'translated', 'needs_update')
-	 * or the empty string when no link exists. Callers compare against
-	 * specific status values to render flag styling on the strings table.
+	 * Preloads translation statuses: "<string_id>_<lang_id>" to the link's status, no entry without a link.
 	 *
 	 * @param array<int,object>         $strings Strings.
 	 * @param array<int,object>         $languages Languages.
@@ -1144,8 +1060,7 @@ final class StringsPage {
 
 		$st_table = \PerfLocale\Database\Schema::table( 'string_translations' );
 
-		// Single cross-product query against the dedicated table - one index
-		// seek on the (string_id, language_id) PRIMARY KEY per matching row.
+		// One query on the (string_id, language_id) primary key.
 		$s_placeholders = implode( ',', array_fill( 0, count( $string_ids ), '%d' ) );
 		$l_placeholders = implode( ',', array_fill( 0, count( $language_ids ), '%d' ) );
 
@@ -1187,19 +1102,12 @@ final class StringsPage {
 	/**
 	 * Get available domains.
 	 *
-	 * @param CacheManager $cache Cache - accepted for signature parity with
-	 *                           sibling getters; the result is short-lived
-	 *                           page-render data, not memoized here.
+	 * @param CacheManager $cache Unused; kept for signature parity with the sibling getters.
 	 * @return array<int,string>
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- Signature parity with sibling page-data getters.
 	private function get_available_domains( CacheManager $cache ): array {
-		// Cache like the sibling get_available_contexts(): this runs on every
-		// Strings admin page load, and the domain set changes rarely. 5-minute
-		// object-cache TTL (same eventual-consistency contract as contexts).
-		// Generation-folded key so a perflocale_strings bump (strings save /
-		// import / GC / MT) actually invalidates the filter dropdown, not just
-		// the 5-min TTL.
+		// Cached like get_available_contexts(): generation-folded key, so a strings bump invalidates it.
 		$domains_key = \PerfLocale\Cache\CacheManager::l2_key( 'available_domains', 'perflocale_strings' );
 		$cached      = wp_cache_get( $domains_key, 'perflocale_strings' );
 
@@ -1231,15 +1139,9 @@ final class StringsPage {
 	/**
 	 * Get distinct context values from the strings table.
 	 *
-	 * Cached in the 'perflocale_strings' object-cache group under a
-	 * generation-folded key (invalidated by any perflocale_strings generation
-	 * bump) with a 5-minute TTL fallback for new contexts arriving
-	 * via the scanner - the filter dropdown tolerating a ≤5-min-stale
-	 * context list is a fine trade for skipping the DISTINCT scan on
-	 * every page load.
+	 * Generation-folded cache key; the 5-minute TTL covers contexts the scanner adds.
 	 *
-	 * @param CacheManager $cache Cache - accepted for signature parity with
-	 *                           sibling getters; not memoized here.
+	 * @param CacheManager $cache Unused; kept for signature parity with the sibling getters.
 	 * @return array<int,string>
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- Signature parity with sibling page-data getters.
@@ -1291,10 +1193,8 @@ final class StringsPage {
 	 * @return string Path from wp-content/.
 	 */
 	private function full_path( string $path ): string {
-		// Derive the marker from WP_CONTENT_DIR rather than assuming the
-		// directory is named `wp-content` - it is renameable, and on the
-		// "WordPress in its own directory" layout the stored path is not
-		// ABSPATH-relative at all.
+		// Marker from WP_CONTENT_DIR: the directory can be renamed, and with WordPress in its own
+		// directory the stored path is not ABSPATH-relative.
 		$marker = basename( rtrim( (string) WP_CONTENT_DIR, '/\\' ) ) . '/';
 		$pos    = strpos( $path, $marker );
 
@@ -1302,12 +1202,7 @@ final class StringsPage {
 	}
 
 	/**
-	 * Look up existing .mo file translations as placeholder hints.
-	 *
-	 * For each string × language, check if the .mo / .l10n.php files
-	 * already have a translation. Returns a map of "{string_id}_{lang_id}" → translated text.
-	 * These are shown as input placeholders so the admin can see what
-	 * translation already ships with the plugin/theme.
+	 * Translations the .mo / .l10n.php files already ship, shown as input placeholder hints.
 	 *
 	 * @param array<int, object> $strings Strings on the current page.
 	 * @param array<int, object> $languages Active languages.
@@ -1331,16 +1226,8 @@ final class StringsPage {
 				continue;
 			}
 
-			// WP_Locale_Switcher::switch_to_locale() in
-			// wp-includes/class-wp-locale-switcher.php returns false, pushing
-			// nothing, in two cases. In the first, the locale already equals
-			// determine_locale(): its translations are loaded, so they can be
-			// looked up, and there is nothing to restore. In the second, the
-			// locale is not en_US and is not in the list the switcher built from
-			// get_available_languages() when it was constructed (core packs in
-			// WP_LANG_DIR, filterable): nothing was loaded for it, so translate()
-			// would return the current locale's text and present it as this
-			// language's. That language gets no hints.
+			// switch_to_locale() is false for the current locale (lookups work) and for a locale core
+			// has no pack for; there translate() would return the current locale's text, so no hints.
 			$switched = switch_to_locale( $lang->locale );
 
 			if ( ! $switched && determine_locale() !== $lang->locale ) {
@@ -1391,13 +1278,9 @@ final class StringsPage {
 	}
 
 	/**
-	 * Shorten a string for display, without depending on mb_strimwidth().
+	 * Shortens a string for display without mb_strimwidth().
 	 *
-	 * WordPress polyfills mb_substr and mb_strlen (wp-includes/compat.php) but
-	 * ships no mb_strimwidth polyfill at any version, so calling it directly
-	 * is a fatal on a PHP build without ext-mbstring. Site Health reports the
-	 * missing extension rather than preventing it, so this page must not
-	 * assume it.
+	 * Core polyfills mb_substr and mb_strlen but not mb_strimwidth, which fatals without ext-mbstring.
 	 *
 	 * @param string $text  Text to shorten.
 	 * @param int    $limit Maximum length before the ellipsis.

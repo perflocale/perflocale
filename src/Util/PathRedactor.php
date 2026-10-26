@@ -14,25 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Single implementation of the path-redaction rule, shared by every surface
- * that persists or renders a raw PHP error message.
+ * The one path-redaction rule for stored or shown PHP error text.
  *
- * Replaces:
- *   - the WP_CONTENT_DIR prefix → `<content>/`
- *   - the ABSPATH prefix → `<wp>/`
- *   - any remaining `/abs/path/to/file.ext` → `<path>/file.ext`
- *
- * The basename is deliberately kept: `<path>/import.csv` is actionable,
- * `<path>` alone is not.
- *
- * Tuned for the shape PHP actually throws ("... in /var/www/.../Foo.php:1033",
- * "(previously declared in /var/www/.../foo.php:83)"). Directory and file
- * names may hold single spaces ("/home/me/Local Sites/..."): PHP reports a
- * file's real path, which for a symlinked plugin lies outside both known
- * prefixes.
- * Conservative: only sequences that look like absolute Unix paths ending in a
- * recognised extension are matched, so ordinary prose is left alone.
- * Multi-line safe, and never returns a string longer than the input.
+ * WP_CONTENT_DIR becomes `<content>/`, ABSPATH `<wp>/`, any other absolute path ending in a file extension
+ * `<path>/<file>` (the file name is actionable). Names may hold single spaces: a symlinked plugin's real path does.
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
@@ -49,9 +34,7 @@ final class PathRedactor {
 			return $message;
 		}
 
-		// Known prefixes first, longest match wins. On a standard layout
-		// ABSPATH is a strict prefix of WP_CONTENT_DIR, so running the shorter
-		// one first would consume part of the longer one's path.
+		// Longest prefix first: ABSPATH is usually a prefix of WP_CONTENT_DIR.
 		$prefixes = [
 			rtrim( (string) WP_CONTENT_DIR, '/\\' ) . '/' => '<content>/',
 			rtrim( (string) ABSPATH, '/\\' ) . '/'        => '<wp>/',
@@ -62,12 +45,7 @@ final class PathRedactor {
 			$message = str_replace( $prefix, $placeholder, $message );
 		}
 
-		// Anything that escaped the prefix pass (/tmp, /var/log, a path from
-		// another install, a symlinked plugin's real path). Anchored on a
-		// leading boundary so paths already rewritten above are not mangled a
-		// second time, and bounded to avoid pathological backtracking. Words
-		// inside a directory or file name are joined by single spaces; only
-		// the directories are replaced, the file name and what follows stay.
+		// Paths outside both prefixes. The leading boundary skips paths rewritten above; {1,30} bounds backtracking.
 		$message = preg_replace_callback(
 			'#(^|[\s\'",;:()\[\]])/(?:[a-zA-Z0-9._-]+(?: [a-zA-Z0-9._-]+)*/){1,30}([a-zA-Z0-9._-]+(?: [a-zA-Z0-9._-]+)*\.[a-zA-Z0-9]{1,8})#',
 			static fn( array $m ): string => $m[1] . '<path>/' . $m[2],

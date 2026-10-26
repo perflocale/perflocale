@@ -113,13 +113,169 @@
 	// single "Fill in from <source-lang> source" action.
 	var IS_SIBLING     = !! cfg.isSibling;
 	var SOURCE_LANG    = cfg.sourceLang    || '';
-	var SOURCE_POST_ID = cfg.sourcePostId  || 0;
-	var TARGET_POST_ID = cfg.targetPostId  || 0;
+	var SOURCE_POST_ID = Number( cfg.sourcePostId ) || 0;
+	var TARGET_POST_ID = Number( cfg.targetPostId ) || 0;
 	// Editor-canvas-only class applied via the BlockListBlock HOC so the
 	// user's own "Additional CSS classes" field is never touched.
 	var SKIP_VISUAL_CLASS = 'has-perflocale-skip-translation';
 
 	var i18n = cfg.i18n || {};
+
+	// ---------------------------------------------------------------
+	// JavaScript hooks (wp.hooks)
+	// ---------------------------------------------------------------
+
+	/**
+	 * @typedef {Object} Language
+	 * @property {string} slug The language slug.
+	 * @property {string} locale The WordPress locale, e.g. de_DE.
+	 * @property {string} name The English name.
+	 * @property {string} nativeName The native name.
+	 * @property {boolean} isDefault The site's default language.
+	 */
+	/**
+	 * @typedef {Object} PostRef
+	 * @property {number} id The post id.
+	 * @property {string} type The post type.
+	 * @property {?Language} language The post's language; null while it has none or it is not known yet.
+	 */
+	/**
+	 * @typedef {Object} EditorContext
+	 * @property {number} version 1.
+	 * @property {PostRef} post The post open in the editor.
+	 * @property {?{id: number, language: Language}} sourcePost The default-language post this post is a translation of, when the user may view it; else null.
+	 */
+
+	var hookWarned = {};
+	var POST_REF = null;
+
+	// With SCRIPT_DEBUG: one console warning per hook and page load.
+	function hookWarn( name, why ) {
+		if ( cfg.debug && ! hookWarned[ name ] && window.console ) {
+			hookWarned[ name ] = true;
+			window.console.warn( 'PerfLocale: ' + name + ': ' + why );
+		}
+	}
+
+	// wp.hooks.applyFilters in a try/catch: a callback that throws, or a
+	// result `accept` refuses, gives the unfiltered value.
+	function applyFilters( name, value, context, accept ) {
+		var out;
+
+		try {
+			out = wp.hooks.applyFilters( name, value, context );
+		} catch ( e ) {
+			hookWarn( name, 'a callback threw; the unfiltered value is used.' );
+			return value;
+		}
+
+		if ( accept( out ) ) {
+			return out;
+		}
+
+		hookWarn( name, 'a callback returned a value the hook does not accept; the unfiltered value is used.' );
+		return value;
+	}
+
+	// wp.hooks.doAction in a try/catch: a callback that throws does not stop the editor.
+	function doAction( name, context ) {
+		try {
+			wp.hooks.doAction( name, context );
+		} catch ( e ) {
+			hookWarn( name, 'a callback threw.' );
+		}
+	}
+
+	function isBoolean( v ) {
+		return typeof v === 'boolean';
+	}
+
+	// The Language object of an active language slug, or null.
+	function hookLanguage( slug ) {
+		for ( var i = 0; i < LANGUAGES.length; i++ ) {
+			var l = LANGUAGES[ i ];
+
+			if ( l.slug === slug ) {
+				return {
+					slug:       String( l.slug ),
+					locale:     String( l.locale || '' ),
+					name:       String( l.name || '' ),
+					nativeName: String( l.nativeName || l.name || '' ),
+					isDefault:  !! l.isDefault
+				};
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * The post open in the editor, built once.
+	 *
+	 * @returns {PostRef}
+	 */
+	function postRef() {
+		if ( ! POST_REF ) {
+			POST_REF = Object.freeze( {
+				id:       TARGET_POST_ID,
+				type:     String( cfg.postType || '' ),
+				language: POST_SOURCE_LANG ? Object.freeze( hookLanguage( POST_SOURCE_LANG ) ) : null
+			} );
+		}
+
+		return POST_REF;
+	}
+
+	// A frozen deep copy of plain objects and arrays; any other value (a
+	// string, RichTextData or another class instance) as it is. The value
+	// passed in is not frozen.
+	function frozenCopy( v ) {
+		var proto = v && typeof v === 'object' ? Object.getPrototypeOf( v ) : undefined;
+		var o;
+
+		if ( Array.isArray( v ) ) {
+			o = v.map( frozenCopy );
+		} else if ( proto === null || ( proto && Object.getPrototypeOf( proto ) === null ) ) {
+			o = {};
+			Object.keys( v ).forEach( function ( k ) {
+				o[ k ] = frozenCopy( v[ k ] );
+			} );
+		} else {
+			return v;
+		}
+
+		return Object.freeze( o );
+	}
+
+	/**
+	 * The common editor context, with the keys of `extra` added.
+	 *
+	 * @returns {EditorContext}
+	 */
+	function editorContext( extra ) {
+		return Object.assign( {
+			version:    1,
+			post:       postRef(),
+			sourcePost: ( IS_SIBLING && SOURCE_POST_ID > 0 && cfg.sourcePostViewable )
+				? { id: SOURCE_POST_ID, language: hookLanguage( SOURCE_LANG ) }
+				: null
+		}, extra );
+	}
+
+	// The configured provider: { id, name }, or null without one.
+	function hookProvider() {
+		return MT_PROVIDER ? { id: MT_PROVIDER, name: providerLabel() } : null;
+	}
+
+	// { code, message, status } of a failed request; `message` is the text
+	// the notice shows, `status` the HTTP status or null (no response).
+	function hookError( err, message ) {
+		return {
+			code:    ( err && typeof err.code === 'string' ) ? err.code : '',
+			message: message,
+			status:  ( err && err.data && typeof err.data.status === 'number' ) ? err.data.status : null
+		};
+	}
 
 	/**
 	 * Per-block-type attribute(s) that hold editable text. Most core blocks
@@ -339,7 +495,32 @@
 		}
 
 		if ( wp.hooks && typeof wp.hooks.applyFilters === 'function' ) {
-			chain = wp.hooks.applyFilters( 'perflocale.blockToolbar.textAttrs', chain, blockName );
+			/**
+			 * @hook perflocale.blockToolbar.textAttrs
+			 * @kind filter
+			 * @since 1.0.0
+			 * @cardinality render
+			 * @fires Whenever the toolbar reads a block's text (menu, translate, fill from source). Keep the callback pure and fast.
+			 * @param {string[]} chain The attributes that hold the block's text, in order; each one with text is translated and written back to itself.
+			 * @param {string} blockName The block type, e.g. core/paragraph.
+			 * @returns {string[]} A non-empty array of attribute names. Anything else gives [ 'content' ]; a callback that throws gives the unfiltered chain.
+			 * @context {Object} context
+			 * @property {number} context.version 1.
+			 * @property {string} context.blockName The block type.
+			 * @property {PostRef} context.post The post open in the editor.
+			 * @example wp.hooks.addFilter( 'perflocale.blockToolbar.textAttrs', 'acme/quote-card', function ( chain, blockName ) {
+			 *     return blockName === 'acme/quote-card' ? [ 'quoteHtml', 'attribution' ].concat( chain ) : chain;
+			 * } );
+			 */
+			try {
+				chain = wp.hooks.applyFilters( 'perflocale.blockToolbar.textAttrs', chain.slice(), blockName, { version: 1, blockName: blockName, post: postRef() } );
+			} catch ( e ) {
+				hookWarn( 'perflocale.blockToolbar.textAttrs', 'a callback threw; the unfiltered chain is used.' );
+			}
+
+			if ( ! Array.isArray( chain ) || ! chain.length ) {
+				hookWarn( 'perflocale.blockToolbar.textAttrs', 'a callback returned no non-empty array; [ \'content\' ] is used.' );
+			}
 		}
 
 		return Array.isArray( chain ) && chain.length ? chain : [ 'content' ];
@@ -807,6 +988,36 @@
 
 				wp.data.dispatch( 'core/block-editor' ).updateBlockAttributes( clientId, update );
 
+				/**
+				 * @hook perflocale.fillFromSource.completed
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality run
+				 * @fires Block: after Fill in from <language> source wrote the block. Post: once, when the sidebar's Translate from <language> run ended (also with failures).
+				 * @context {EditorContext} context
+				 * @property {string} context.scope 'block' or 'post'.
+				 * @property {?Language} context.sourceLanguage The source post's language.
+				 * @property {?Language} context.targetLanguage This post's language.
+				 * @property {string} [context.clientId] Block: the client id.
+				 * @property {string} [context.blockName] Block: the block type.
+				 * @property {string} [context.source] Block: 'mt' (machine translation), 'tm' (translation memory) or 'kept' (source block marked Do not translate).
+				 * @property {number} [context.blockCount] Post: the blocks of the run.
+				 * @property {number} [context.filledCount] Post: blocks written, kept ones included.
+				 * @property {number} [context.keptCount] Post: written blocks kept as in the source.
+				 * @property {number} [context.failedCount] Post: blocks not written.
+				 * @example wp.hooks.addAction( 'perflocale.fillFromSource.completed', 'acme/log', function ( ctx ) {
+				 *     console.log( ctx.scope, ctx.targetLanguage && ctx.targetLanguage.slug );
+				 * } );
+				 */
+				doAction( 'perflocale.fillFromSource.completed', editorContext( {
+					scope:          'block',
+					sourceLanguage: hookLanguage( SOURCE_LANG ),
+					targetLanguage: hookLanguage( targetLang ),
+					clientId:       clientId,
+					blockName:      realBlock.name,
+					source:         data.source === 'kept' || data.source === 'tm' ? data.source : 'mt'
+				} ) );
+
 				if ( data.source === 'kept' ) {
 					notice( __( 'Kept from the source: this block is marked "Do not translate".', 'perflocale' ), 'success' );
 					return;
@@ -977,7 +1188,9 @@
 	// it back through MT (double-translated garbage, double quota spend).
 	var mtBatchInFlight = false;
 
-	function translateBlocksWithMt( leaves, targetLang, onClose ) {
+	// `run`: { scope: 'block', clientId } from the toolbar, { scope: 'post' }
+	// from the sidebar; without it the run reports scope 'post'.
+	function translateBlocksWithMt( leaves, targetLang, onClose, run ) {
 		if ( ! Array.isArray( leaves ) || leaves.length === 0 ) {
 			notice( __( 'No translatable text found in this section.', 'perflocale' ), 'warning' );
 			onClose && onClose();
@@ -1008,6 +1221,35 @@
 		var doneLeaves = 0;
 		var lastData = null;
 		var PROGRESS_ID = 'perflocale-batch-progress';
+		var runScope = run && run.scope === 'block' ? 'block' : 'post';
+		var runClientId = runScope === 'block' && run.clientId ? String( run.clientId ) : null;
+		var runSources = {};
+
+		/**
+		 * @hook perflocale.machineTranslate.started
+		 * @kind action
+		 * @since 1.0.7.4
+		 * @cardinality run
+		 * @fires Translate to <language> in the toolbar (block) or the sidebar (post), after its checks passed, before the first request.
+		 * @context {EditorContext} context
+		 * @property {string} context.scope 'block' (toolbar) or 'post' (sidebar).
+		 * @property {?string} context.clientId The selected block's client id; null for 'post'.
+		 * @property {?Language} context.sourceLanguage The language translated from.
+		 * @property {?Language} context.targetLanguage The language translated into.
+		 * @property {number} context.blockCount Blocks to translate (Do not translate blocks excluded).
+		 * @property {?{id: string, name: string}} context.provider The configured provider, or null.
+		 * @example wp.hooks.addAction( 'perflocale.machineTranslate.started', 'acme/log', function ( ctx ) {
+		 *     console.log( 'MT', ctx.scope, ctx.blockCount );
+		 * } );
+		 */
+		doAction( 'perflocale.machineTranslate.started', editorContext( {
+			scope:          runScope,
+			clientId:       runClientId,
+			sourceLanguage: hookLanguage( sourceLang ),
+			targetLanguage: hookLanguage( targetLang ),
+			blockCount:     total,
+			provider:       hookProvider()
+		} ) );
 
 		if ( chunks.length === 1 ) {
 			notice(
@@ -1078,6 +1320,7 @@
 					doneLeaves += pass.length;
 					doneCount = countBlocks( leaves.slice( 0, doneLeaves ) );
 					lastData = data;
+					runSources[ data.source === 'tm' ? 'tm' : 'mt' ] = true;
 				} );
 			} );
 		} );
@@ -1102,6 +1345,36 @@
 				if ( srcLabel ) { fullToast += ' · ' + srcLabel; }
 
 				notice( fullToast, 'success', PROGRESS_ID );
+
+				/**
+				 * @hook perflocale.machineTranslate.completed
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality run
+				 * @fires Once, after every chunk of the run was applied.
+				 * @context {EditorContext} context
+				 * @property {string} context.scope 'block' or 'post'.
+				 * @property {?string} context.clientId The block's client id; null for 'post'.
+				 * @property {?Language} context.sourceLanguage The language translated from.
+				 * @property {?Language} context.targetLanguage The language translated into.
+				 * @property {number} context.blockCount Blocks to translate.
+				 * @property {number} context.translatedCount Blocks written (as the success notice shows).
+				 * @property {?{id: string, name: string}} context.provider The configured provider, or null.
+				 * @property {string} context.source 'mt', 'tm' (translation memory) or 'mixed', from the responses.
+				 * @example wp.hooks.addAction( 'perflocale.machineTranslate.completed', 'acme/log', function ( ctx ) {
+				 *     console.log( ctx.translatedCount + ' of ' + ctx.blockCount );
+				 * } );
+				 */
+				doAction( 'perflocale.machineTranslate.completed', editorContext( {
+					scope:           runScope,
+					clientId:        runClientId,
+					sourceLanguage:  hookLanguage( sourceLang ),
+					targetLanguage:  hookLanguage( targetLang ),
+					blockCount:      total,
+					translatedCount: appliedCount,
+					provider:        hookProvider(),
+					source:          runSources.tm ? ( runSources.mt ? 'mixed' : 'tm' ) : 'mt'
+				} ) );
 			} )
 			.catch( function ( err ) {
 				var msg = ( err && err.message ) || __( 'Batch translation failed.', 'perflocale' );
@@ -1116,6 +1389,36 @@
 				}
 
 				notice( msg, 'error', PROGRESS_ID );
+
+				/**
+				 * @hook perflocale.machineTranslate.failed
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality run
+				 * @fires Once, when the run stopped on an error; blocks already written stay.
+				 * @context {EditorContext} context
+				 * @property {string} context.scope 'block' or 'post'.
+				 * @property {?string} context.clientId The block's client id; null for 'post'.
+				 * @property {?Language} context.sourceLanguage The language translated from.
+				 * @property {?Language} context.targetLanguage The language translated into.
+				 * @property {number} context.blockCount Blocks to translate.
+				 * @property {number} context.translatedCount Blocks written before the error.
+				 * @property {?{id: string, name: string}} context.provider The configured provider, or null.
+				 * @property {{code: string, message: string, status: ?number}} context.error code ('' if none), the message the notice shows, HTTP status (null without a response).
+				 * @example wp.hooks.addAction( 'perflocale.machineTranslate.failed', 'acme/log', function ( ctx ) {
+				 *     console.warn( ctx.error.code, ctx.error.message );
+				 * } );
+				 */
+				doAction( 'perflocale.machineTranslate.failed', editorContext( {
+					scope:           runScope,
+					clientId:        runClientId,
+					sourceLanguage:  hookLanguage( sourceLang ),
+					targetLanguage:  hookLanguage( targetLang ),
+					blockCount:      total,
+					translatedCount: appliedCount,
+					provider:        hookProvider(),
+					error:           hookError( err, msg )
+				} ) );
 			} )
 			.finally( function () {
 				mtBatchInFlight = false;
@@ -1213,10 +1516,6 @@
 	}
 
 	// ---------------------------------------------------------------
-	// Action: TM suggestions modal
-	// ---------------------------------------------------------------
-
-	// ---------------------------------------------------------------
 	// Toolbar dropdown - the HOC that wraps every supported block
 	// ---------------------------------------------------------------
 
@@ -1233,6 +1532,32 @@
 			var wrapOpen = useState( false );
 			var showWrap = wrapOpen[0];
 			var setShowWrap = wrapOpen[1];
+
+			// After the component's own state hooks, so the answer never
+			// changes React's hook order.
+			/**
+			 * @hook perflocale.blockToolbar.showControls
+			 * @kind filter
+			 * @since 1.0.7.4
+			 * @cardinality render
+			 * @fires On every render of the selected block's PerfLocale toolbar menu, where PerfLocale shows it. Keep the callback pure and fast.
+			 * @param {boolean} value true.
+			 * @returns {boolean} false hides the menu for this block (translate items and the Do not translate toggle); anything but a boolean is ignored. It cannot show the menu where PerfLocale leaves it out or change what is translated or saved.
+			 * @context {EditorContext} context
+			 * @property {string} context.blockName The block type.
+			 * @property {string} context.clientId The block's client id.
+			 * @property {Object} context.attributes The block's attributes (read only).
+			 * @property {boolean} context.isSkipMarked The block is marked Do not translate.
+			 * @example wp.hooks.addFilter( 'perflocale.blockToolbar.showControls', 'acme/no-toolbar', function ( show, ctx ) {
+			 *     return ctx.blockName === 'core/code' ? false : show;
+			 * } );
+			 */
+			var showControls = applyFilters( 'perflocale.blockToolbar.showControls', true, editorContext( {
+				blockName:    props.name,
+				clientId:     props.clientId,
+				attributes:   frozenCopy( props.attributes ),
+				isSkipMarked: isSkipMarked( props.attributes )
+			} ), isBoolean );
 
 
 			// Hide whichever language we'll be translating FROM - it makes
@@ -1331,7 +1656,8 @@
 									translateBlocksWithMt(
 										collectTranslatableBlocks( props.clientId ),
 										lang.slug,
-										onClose
+										onClose,
+										{ scope: 'block', clientId: props.clientId }
 									);
 								}
 							}, sprintf(
@@ -1398,7 +1724,7 @@
 				);
 			}
 
-			var toolbar = el( BlockControls, { group: 'other' },
+			var toolbar = showControls && el( BlockControls, { group: 'other' },
 				el( ToolbarGroup, null,
 					el( ToolbarDropdownMenu, {
 						icon: 'translation',
@@ -1598,6 +1924,20 @@
 					notice( summary, 'warning' );
 				}
 
+				/**
+				 * @hook perflocale.fillFromSource.completed
+				 * Post scope; documented at the block-scope call above.
+				 */
+				doAction( 'perflocale.fillFromSource.completed', editorContext( {
+					scope:          'post',
+					sourceLanguage: hookLanguage( SOURCE_LANG ),
+					targetLanguage: hookLanguage( targetLang ),
+					blockCount:     blocks.length,
+					filledCount:    success,
+					keptCount:      kept,
+					failedCount:    failed
+				} ) );
+
 				onDone && onDone();
 				return;
 			}
@@ -1662,6 +2002,7 @@
 		 * @param {Array} leaves - output of collect()
 		 * @param {string} targetLang
 		 * @param {function|null} onClose
+		 * @param {Object} [run] - { scope: 'block', clientId } or { scope: 'post' } (the default)
 		 */
 		translate: translateBlocksWithMt,
 

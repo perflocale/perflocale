@@ -15,94 +15,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * One declaration per stored item: the tables with their columns, options
- * (exact names and name patterns), network options, transients, post, term,
- * user and order meta, files under uploads/perflocale/, cron hooks and the
- * keys of `perflocale_settings`. Each entry says what the item is, who owns
- * it, which export section carries it or why it stays out, how an import
- * treats it, what uninstall does with it, and whether a new translation
- * copies it and Sync Fields may mirror it.
- *
- * Pure data. The class holds literal constants and static query methods that
- * use PHP core functions only: it references no other class and calls no
- * WordPress function, apart from the guarded `apply_filters()` calls that read
- * the extension entries ({@see self::extension_entries()}); the check of an
- * extension name against WordPress core names reads the table prefix from
- * `$GLOBALS['wpdb']` when it is there. `uninstall.php`
- * loads this file by hand, without the autoloader, and the release gate's
- * static check (tools/release-gate/gate-exim.php) loads it in a plain PHP
- * process; both rely on that.
- *
- * Never loaded on a visitor request: only the export, import, uninstall,
- * deactivation, translation-create and Sync Fields save paths read it, and
- * the autoloader compiles a class only on its first reference. The gate's
- * rule E8 keeps the list of files that may reference it.
- *
- * Entry shape (every key required, `note` and `gap` optional):
- *
- *   kind        table, option, network_option, transient, site_transient,
- *               post_meta, term_meta, user_meta, order_meta, file, cron.
- *               The keys of `perflocale_settings` are in SETTINGS.
- *   name        Exact name, or a pattern with placeholders (PLACEHOLDERS).
- *   owner       core, wc (src/WooCommerce), wp-core (WordPress writes it for
- *               the plugin), addon:<dir> (a bundled add-on); extension
- *               entries also pro or ext:<slug>.
- *   class       USER, CONFIG, SECRET, DERIVED, STATE, DIAG, LEGACY (only read
- *               or deleted, written by earlier builds), FOREIGN (a name the
- *               plugin writes that another system owns), NAMESPACE (the
- *               uninstall sweep of a whole prefix, never a stored item).
- *   export      The export section that carries it, or null.
- *   not_exported  Why it stays out of the export (NOT_EXPORTED), or null.
- *               Exactly one of export and not_exported is set.
- *   import      null, or merge / replace / ids / object (see IMPORT_*).
- *               Required when export is set.
- *   uninstall   data (deleted by a full-data uninstall), always (deleted in
- *               both modes), last (deleted last, only by a clean full-data
- *               purge), own_step (deleted by a dedicated step of the purge,
- *               not by the generic sweep), keep.
- *   scope       blog, network, network_final (user meta: swept once after
- *               the network walk, never on a single subsite teardown).
- *   copy        post_meta: yes, no, if_synced (copied onto a new translation
- *               only when Sync Fields lists it); n/a for other kinds.
- *   sync        post_meta: never, if_listed (Sync Fields may list it); n/a
- *               for other kinds.
- *   deactivate  cron: clear (Deactivator unschedules it) or keep. option:
- *               clear (deactivation deletes it; WordPress or the plugin
- *               writes it again when next needed) or n/a. n/a for other
- *               kinds.
- *   fixture     The step of the export/import lane fixture that produces it,
- *               or none:<reason>.
- *   since       Plugin version that introduced it.
- *   gap         The audit gap id (G-n) while the export does not carry it
- *               yet: the registry already names the section, and the
- *               exporter skips the entry until the commit that closes the
- *               gap removes this key.
- *   note        Free text.
- *   sanitize_import  Extension entries only: the callable the importer
- *               passes each imported value through before it stores it,
- *               `fn( mixed $value, string $name ): mixed`. Required for an
- *               extension entry that is exported (into Add-on data).
- *   group       Extension entries exported into Add-on data only: the
- *               add-on's own checkbox on the export and import screens,
- *               `[ 'id' => <GROUP_ID_PATTERN>, 'label' => <text> ]`. The
- *               entries of one owner and group id travel and are chosen
- *               together, apart from the shared "Add-on data" checkbox;
- *               they share one label. PerfLocale's own entries have none.
- *
- * Entry ids are `<kind>:<name>`.
+ * One declaration per stored item, id `<kind>:<name>`: owner, export section or why not, import, uninstall, copy and sync rules.
+ * Pure data (no class references, no WordPress calls but guarded apply_filters()): uninstall.php and the gate load it without the
+ * autoloader. Never loaded on a visitor request (gate rule E8). Entry shape: docs-ai/11-code-rationale.md, "DataRegistry: entry shape".
  */
 final class DataRegistry {
 
 	/**
-	 * Version of the entry shape. Bumped when a key is added, removed or
-	 * changes meaning, so a tool reading the registry can refuse a shape it
-	 * does not know.
+	 * Version of the entry shape, raised when a key is added, removed or changes meaning, so a tool can refuse an unknown shape.
 	 */
 	public const REGISTRY_VERSION = 2;
 
 	/**
-	 * The filter through which add-ons and extensions declare their stored
-	 * data. See {@see self::extension_entries()}.
+	 * The filter through which add-ons and extensions declare their stored data (extension_entries()).
 	 */
 	public const EXTENSION_FILTER = 'perflocale/data_registry/entries';
 
@@ -133,11 +58,9 @@ final class DataRegistry {
 	public const DEACTIVATE = [ 'clear', 'keep' ];
 
 	/**
-	 * What CacheManager::flush_all() does with a transient of each class:
-	 * keeps a STATE one, deletes a DERIVED one (rebuilt when next needed)
-	 * and a LEGACY one (read by nothing); a NAMESPACE entry is the uninstall
-	 * sweep, not a stored item. A transient of another class has no rule
-	 * (the release gate's rule E13).
+	 * What CacheManager::flush_all() does with a transient of each class: STATE kept, DERIVED and LEGACY deleted.
+	 *
+	 * NAMESPACE is the uninstall sweep, not a stored item; a transient of another class has no rule (gate rule E13).
 	 */
 	public const FLUSH_TRANSIENT_CLASSES = [
 		'STATE'     => 'keep',
@@ -172,41 +95,30 @@ final class DataRegistry {
 	public const GROUP_LABEL_MAX_BYTES = 200;
 
 	/**
-	 * Where add-on data sits in the file. Each add-on's data is a part,
-	 * keyed `<owner>` (the shared "Add-on data" checkbox) or
-	 * `<owner>/<group id>` (its own checkbox), and each part travels as its
-	 * own row lists inside `data`, one member per row list:
-	 * `addon_data/<part>/<row list>` (ROW_LISTS values). The envelope member
-	 * ADDON_GROUPS_KEY, next to `sections`, maps each exported group part to
-	 * its label; it is written only when the file carries a group.
+	 * The `data` member prefix of add-on data: each part (`<owner>`, or `<owner>/<group id>` with its own checkbox)
+	 * travels as its own row lists, `addon_data/<part>/<row list>`.
 	 */
 	public const ADDON_MEMBER_PREFIX = 'addon_data/';
 
 	/**
-	 * Envelope member that names the group parts a file carries: part =>
-	 * label.
+	 * Envelope member next to `sections` naming the group parts a file carries (part => label); written only for a group.
 	 */
 	public const ADDON_GROUPS_KEY = 'addon_groups';
 
 	/**
-	 * Column classes of TABLES. `fk:<table>` and `object_ref:<type column>`
-	 * carry their target after the colon.
+	 * Column classes of TABLES; `fk:<table>` and `object_ref:<type column>` carry their target after the colon.
 	 */
 	public const COLUMN_CLASSES = [ 'pk', 'user', 'natural_key', 'timestamp', 'derived', 'state' ];
 
 	/**
-	 * How a Merge import treats a table's rows: natural_key (look the row up
-	 * by its natural key, insert when absent, map its id), fk_map (a new row
-	 * per source row, ids mapped), skip_on_unique (insert, skip a row that
-	 * hits a unique key).
+	 * How a Merge import treats a table's rows: natural_key (look up, insert when absent, map the id),
+	 * fk_map (a new row per source row, ids mapped), skip_on_unique (skip a row that hits a unique key).
 	 */
 	public const TABLE_MERGE = [ 'natural_key', 'fk_map', 'skip_on_unique' ];
 
 	/**
-	 * Classes of the keys of `perflocale_settings`: portable (exported,
-	 * applied by a Replace import), secret (removed from the file; the target
-	 * keeps its own value), site_specific (exported; describes this site, a
-	 * Replace keeps the target's value), state (exported, ignored on import).
+	 * Classes of the `perflocale_settings` keys: portable (exported, applied by Replace), secret (never in the file),
+	 * site_specific (exported; a Replace keeps the target's value), state (exported, ignored on import).
 	 */
 	public const SETTING_CLASSES = [ 'portable', 'secret', 'site_specific', 'state' ];
 
@@ -229,8 +141,7 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Two sample values per placeholder: the overlap check expands every
-	 * pattern with them and tests the result against every other entry.
+	 * Two sample values per placeholder: the overlap check expands every pattern with them.
 	 */
 	public const PLACEHOLDER_SAMPLES = [
 		'{id}'     => [ '7', '1234' ],
@@ -248,30 +159,21 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Kinds an extension entry may declare. Tables, files and the settings
-	 * keys belong to the core schema; an add-on with its own table declares
-	 * it through HasSchema and HasUninstallTargets.
+	 * Kinds an extension entry may declare; an add-on's own table goes through HasSchema and HasUninstallTargets.
 	 */
 	public const EXTENSION_KINDS = [ 'option', 'network_option', 'transient', 'site_transient', 'post_meta', 'term_meta', 'user_meta', 'order_meta', 'cron' ];
 
 	/**
-	 * Names that look like a credential: the exporter's own redaction
-	 * pattern (DataExporter::CREDENTIAL_KEY_PATTERN, kept equal by the
-	 * release gate's rule E7). An extension entry exported into Add-on data
-	 * may not have such a name unless perflocale/data_registry/is_secret
-	 * declares it not secret.
+	 * Names that look like a credential: DataExporter::CREDENTIAL_KEY_PATTERN, kept equal by gate rule E7.
+	 *
+	 * An exported extension entry may not have one unless perflocale/data_registry/is_secret declares it not secret.
 	 */
 	public const CREDENTIAL_NAME_PATTERN = '/_api_?key|_secret|_password|_credentials?|_encrypted|_token(?:_|$)|_auth(?:_|$)|_key$/i';
 
 	/**
-	 * WordPress core option names an exported extension entry may not take:
-	 * the options populate_options() installs, the role list, the cron
-	 * array, the keys and salts wp_salt() and recovery mode store, core's
-	 * one-time tokens, the theme, widget, menu and update state core keeps
-	 * per site, and the core widgets' instance options. `{token}` stands for
-	 * a theme slug, a taxonomy name, or what core's auto_update_ options
-	 * cover. Compared without regard to case: the option_name column's
-	 * collation is case-insensitive.
+	 * WordPress core option names an exported extension entry may not take (installed options, roles, cron, salts, tokens,
+	 * per-site theme, widget, menu and update state). `{token}` is a theme slug, taxonomy or auto_update_ suffix.
+	 * Compared case-insensitively, as the option_name collation compares.
 	 */
 	public const WP_CORE_OPTIONS = [
 		'siteurl',
@@ -430,9 +332,7 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Meta keys WordPress core owns, which an exported extension entry may
-	 * not take (post, term, user or order meta). `{wpdb}` stands for the
-	 * table prefix; the other placeholders are those of PLACEHOLDERS.
+	 * Meta keys WordPress core owns, which an exported extension entry may not take; `{wpdb}` is the table prefix.
 	 */
 	public const WP_CORE_META = [
 		'_wp_{type}',
@@ -475,14 +375,8 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Export sections: label (as the export screen shows it), live (the
-	 * exporter writes it; a planned section is declared ahead of the commit
-	 * that builds its writer), id_keyed (its rows hold post, term,
-	 * attachment, order or form ids, so the importer's site-address gate
-	 * applies), extensible (an extension entry may name it). Order is the
-	 * order of the export screen.
-	 *
-	 * Where a section's data sits in the file: {@see self::section_transports()}.
+	 * Export sections in screen order: label, live (false: declared ahead of its writer), id_keyed (rows hold post, term,
+	 * attachment, order or form ids, so the import's site-address gate applies), extensible (extension entries may use it).
 	 */
 	public const EXPORT_SECTIONS = [
 		'settings'     => [
@@ -554,13 +448,9 @@ final class DataRegistry {
 	];
 
 	/**
-	 * The file's layout: everything a section carries travels inside the
-	 * envelope's `data` object, as one row list per table (`data.<table>`)
-	 * and, for options and meta, as one of these row lists next to them,
-	 * whatever the section: entry kind => row list. Option rows are
-	 * `{ "name", "value" }`; meta rows `{ "object_id", "meta_key",
-	 * "meta_value", "_fp" }` (the object's fingerprint). An importer that
-	 * does not know a row list skips it.
+	 * Row lists of options and meta in the envelope's `data`, next to `data.<table>`, whatever the section: kind => list.
+	 * Option rows `{ name, value }`; meta rows `{ object_id, meta_key, meta_value, _fp }` (`_fp`: the object's fingerprint).
+	 * An importer skips a row list it does not know.
 	 */
 	public const ROW_LISTS = [
 		'option'     => 'options',
@@ -570,10 +460,8 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Exported entries that travel under their own top-level envelope key
-	 * instead (each a key of DataExporter::RESERVED_SECTION_KEYS): entry id
-	 * => envelope key. `roles` is the role snapshot (caps_version, the
-	 * Translator role's caps, the perflocale_* grants of the cap roles).
+	 * Exported entries under their own top-level envelope key (DataExporter::RESERVED_SECTION_KEYS): entry id => key.
+	 * `roles` is the role snapshot: caps_version, the Translator role's caps, the cap roles' perflocale_* grants.
 	 */
 	public const ENVELOPE_KEYS = [
 		'option:perflocale_settings'        => 'settings',
@@ -584,27 +472,9 @@ final class DataRegistry {
 	];
 
 	/**
-	 * The plugin's tables, one row per table (short name, without the
-	 * `{prefix}perflocale_` part).
+	 * The plugin's tables by short name (no `{prefix}perflocale_`): import order, sections, columns, keys and import rules.
 	 *
-	 * Fields of each row:
-	 *
-	 * import_order  Position in the import (parents first); null when the
-	 *               table is not exported.
-	 * sections      Export section => the type_scope that section owns of
-	 *               the table (null: the whole table). A table claimed
-	 *               without a scope by any selected section exports whole.
-	 * columns       Column => class (COLUMN_CLASSES, `fk:<table>`,
-	 *               `object_ref:<type column>`), in DDL order.
-	 * unique        Every unique key, the primary key first, as column lists.
-	 * natural_key   Columns that identify a row across sites (fk and
-	 *               object_ref columns mapped through their target's natural
-	 *               key); `@members` for a group (its sorted member tuples).
-	 * merge         TABLE_MERGE value, null when not imported.
-	 * replace       wipe_and_insert (scoped to the section), null when not
-	 *               imported.
-	 * compare       Column => exact, natural or ignore, where the round-trip
-	 *               comparison differs from the column class default.
+	 * Row fields: docs-ai/11-code-rationale.md, "DataRegistry: table rows".
 	 */
 	public const TABLES = [
 		'languages'            => [
@@ -901,8 +771,7 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Every stored item, entry id => entry. See the class docblock for the
-	 * entry shape.
+	 * Every stored item, entry id => entry (shape: docs-ai/11-code-rationale.md, "DataRegistry: entry shape").
 	 */
 	public const ENTRIES = [
 		'table:languages'                                  => [
@@ -1295,6 +1164,22 @@ final class DataRegistry {
 			'deactivate'   => 'n/a',
 			'fixture'      => 'none:WP-Cron engine only: deliveries are coalesced here only when the background engine is not Action Scheduler',
 			'since'        => '1.0.0',
+		],
+		'option:perflocale_web_limit_refused'              => [
+			'kind'         => 'option',
+			'name'         => 'perflocale_web_limit_refused',
+			'owner'        => 'core',
+			'class'        => 'DIAG',
+			'export'       => null,
+			'not_exported' => 'transient_state',
+			'import'       => null,
+			'uninstall'    => 'data',
+			'scope'        => 'blog',
+			'copy'         => 'n/a',
+			'sync'         => 'n/a',
+			'deactivate'   => 'n/a',
+			'fixture'      => 'none:written only when a migration, import, export or scan is refused on a host with a short request limit',
+			'since'        => '1.0.7.4',
 		],
 		'option:perflocale_webhook_failures'               => [
 			'kind'         => 'option',
@@ -1898,6 +1783,23 @@ final class DataRegistry {
 			'deactivate'   => 'n/a',
 			'fixture'      => 'F4',
 			'since'        => '1.0.0',
+		],
+		'option:perflocale_stockset_{id}'                  => [
+			'kind'         => 'option',
+			'name'         => 'perflocale_stockset_{id}',
+			'owner'        => 'wc',
+			'class'        => 'STATE',
+			'export'       => null,
+			'not_exported' => 'transient_state',
+			'import'       => null,
+			'uninstall'    => 'data',
+			'scope'        => 'blog',
+			'copy'         => 'n/a',
+			'sync'         => 'n/a',
+			'deactivate'   => 'n/a',
+			'fixture'      => 'none:written only while a stock alignment holds a copy group\'s locks and a stock SET\'s mirror is skipped',
+			'since'        => '1.0.7.4',
+			'note'         => 'StockSetMarker: a stock SET whose mirror a stock alignment\'s locks skipped; the alignment replays and clears it (the next alignment of the group clears one written after its last check).',
 		],
 		'option:perflocale_import_uploads'                 => [
 			'kind'         => 'option',
@@ -2606,9 +2508,9 @@ final class DataRegistry {
 			'copy'         => 'n/a',
 			'sync'         => 'n/a',
 			'deactivate'   => 'n/a',
-			'fixture'      => 'none:written by a publish with auto-translate, taken by its job within a day',
+			'fixture'      => 'none:legacy: written by 1.0.7.3 on publish, taken when its queued event runs',
 			'since'        => '1.0.7.3',
-			'note'         => 'The user who published a post, for the auto-translate job that runs later without a user (MtCreateNotice).',
+			'note'         => 'The user who published a post, for the event 1.0.7.3 queued (MtCreateNotice); the job of that event runs as this user.',
 		],
 		'transient:perflocale_import_notice_{user}_{token}' => [
 			'kind'         => 'transient',
@@ -2965,6 +2867,28 @@ final class DataRegistry {
 			'since'        => '1.0.0',
 			'note'         => 'Not copied onto a new translation from 1.0.7.3 (D4).',
 		],
+		'post_meta:_perflocale_mt_pending'                 => [
+			'kind'         => 'post_meta',
+			'name'         => '_perflocale_mt_pending',
+			'owner'        => 'core',
+			'class'        => 'STATE',
+			'export'       => 'item_flags',
+			'not_exported' => null,
+			'import'       => [
+				'merge'   => 'insert_if_absent',
+				'replace' => 'overwrite',
+				'ids'     => 'same_site',
+				'object'  => 'translatable_post',
+			],
+			'uninstall'    => 'data',
+			'scope'        => 'blog',
+			'copy'         => 'no',
+			'sync'         => 'never',
+			'deactivate'   => 'n/a',
+			'fixture'      => 'none:failure path: left only when a worker stops while a machine translation is written (LANE-BG-KILL L-PST-1)',
+			'since'        => '1.0.7.4',
+			'note'         => 'Exported only once older than a lease (a stopped worker\'s), so a restore keeps the translation marked for redo.',
+		],
 		'post_meta:_perflocale_meta_copy_errors'           => [
 			'kind'         => 'post_meta',
 			'name'         => '_perflocale_meta_copy_errors',
@@ -3249,6 +3173,23 @@ final class DataRegistry {
 			'since'        => '1.0.0',
 			'note'         => 'The WooCommerce stock status; Inventory Sync writes it with the stock.',
 		],
+		'post_meta:_variation_description'                 => [
+			'kind'         => 'post_meta',
+			'name'         => '_variation_description',
+			'owner'        => 'addon:woocommerce',
+			'class'        => 'FOREIGN',
+			'export'       => null,
+			'not_exported' => 'foreign',
+			'import'       => null,
+			'uninstall'    => 'keep',
+			'scope'        => 'blog',
+			'copy'         => 'yes',
+			'sync'         => 'if_listed',
+			'deactivate'   => 'n/a',
+			'fixture'      => 'none:meta of another plugin',
+			'since'        => '1.0.7.4',
+			'note'         => 'The WooCommerce variation description; the WooCommerce add-on writes it again with its backslashes after its own variation saves (a translation\'s clone, a machine-translated description), because WooCommerce\'s variation data store passes it to update_post_meta() unslashed.',
+		],
 		'post_meta:_elementor_css'                         => [
 			'kind'         => 'post_meta',
 			'name'         => '_elementor_css',
@@ -3333,6 +3274,23 @@ final class DataRegistry {
 			'fixture'      => 'none:meta of another plugin',
 			'since'        => '1.0.0',
 			'note'         => 'The Oxygen 6 / Breakdance dependency cache; deleted with the CSS path cache.',
+		],
+		'user_meta:perflocale_mt_notice_{id}_{id}'         => [
+			'kind'         => 'user_meta',
+			'name'         => 'perflocale_mt_notice_{id}_{id}',
+			'owner'        => 'core',
+			'class'        => 'STATE',
+			'export'       => null,
+			'not_exported' => 'transient_state',
+			'import'       => null,
+			'uninstall'    => 'data',
+			'scope'        => 'network_final',
+			'copy'         => 'n/a',
+			'sync'         => 'n/a',
+			'deactivate'   => 'n/a',
+			'fixture'      => 'none:written only next to a machine translation notice record, deleted when the notice is shown',
+			'since'        => '1.0.7.4',
+			'note'         => 'Blog id and post id: a machine translation notice (transient perflocale_mt_create_notice_{user}_{id}) waits for this user until the stored expiry (MtCreateNotice). Lives only as long as that transient, so the export leaves it out like the record.',
 		],
 		'user_meta:{prefix}capabilities'                   => [
 			'kind'         => 'user_meta',
@@ -3547,7 +3505,7 @@ final class DataRegistry {
 			'copy'         => 'n/a',
 			'sync'         => 'n/a',
 			'deactivate'   => 'clear',
-			'fixture'      => 'none:auto-translate on publish only: scheduled when a published post is machine-translated automatically',
+			'fixture'      => 'none:legacy: scheduled by 1.0.7.3 and earlier on publish; each event left now queues an auto_translate job',
 			'since'        => '1.0.0',
 		],
 		'cron:perflocale_regenerate_translation_files'     => [
@@ -3841,6 +3799,22 @@ final class DataRegistry {
 			'fixture'      => 'none:background job only: scheduled when a bulk translation runs as a job (above the Auto threshold or Always)',
 			'since'        => '1.0.0',
 		],
+		'cron:perflocale_job_run_auto_translate'           => [
+			'kind'         => 'cron',
+			'name'         => 'perflocale_job_run_auto_translate',
+			'owner'        => 'core',
+			'class'        => 'STATE',
+			'export'       => null,
+			'not_exported' => 'transient_state',
+			'import'       => null,
+			'uninstall'    => 'always',
+			'scope'        => 'blog',
+			'copy'         => 'n/a',
+			'sync'         => 'n/a',
+			'deactivate'   => 'clear',
+			'fixture'      => 'none:background job only: scheduled when a published post is machine-translated automatically',
+			'since'        => '1.0.7.4',
+		],
 		'cron:perflocale_job_run_bulk_string_translate'    => [
 			'kind'         => 'cron',
 			'name'         => 'perflocale_job_run_bulk_string_translate',
@@ -3923,6 +3897,38 @@ final class DataRegistry {
 			'since'        => '1.0.7.3',
 			'note'         => 'Cleared on deactivation like every job hook; after reactivation the job is run again by the resume handler. The containers it had not reached keep naming what they named (the Site Editor notice shows them).',
 		],
+		'cron:perflocale_job_run_wc_stock_check'           => [
+			'kind'         => 'cron',
+			'name'         => 'perflocale_job_run_wc_stock_check',
+			'owner'        => 'wc',
+			'class'        => 'STATE',
+			'export'       => null,
+			'not_exported' => 'transient_state',
+			'import'       => null,
+			'uninstall'    => 'always',
+			'scope'        => 'blog',
+			'copy'         => 'n/a',
+			'sync'         => 'n/a',
+			'deactivate'   => 'clear',
+			'fixture'      => 'none:background job only: scheduled when a WooCommerce stock check runs as a job (above the Auto threshold or Always)',
+			'since'        => '1.0.7.4',
+		],
+		'cron:perflocale_job_run_wc_stock_align'           => [
+			'kind'         => 'cron',
+			'name'         => 'perflocale_job_run_wc_stock_align',
+			'owner'        => 'wc',
+			'class'        => 'STATE',
+			'export'       => null,
+			'not_exported' => 'transient_state',
+			'import'       => null,
+			'uninstall'    => 'always',
+			'scope'        => 'blog',
+			'copy'         => 'n/a',
+			'sync'         => 'n/a',
+			'deactivate'   => 'clear',
+			'fixture'      => 'none:background job only: scheduled when a WooCommerce stock alignment runs as a job (above the Auto threshold or Always)',
+			'since'        => '1.0.7.4',
+		],
 		'cron:perflocale_job_run_sqlite_group_repair'      => [
 			'kind'         => 'cron',
 			'name'         => 'perflocale_job_run_sqlite_group_repair',
@@ -3960,12 +3966,7 @@ final class DataRegistry {
 	];
 
 	/**
-	 * Per-request results of the query methods, one store per result type:
-	 * every entry (`entries`), the entries of a kind (`kind`, kind =>
-	 * entries), entry-name regular expressions (`regex`, name => regex),
-	 * the export sections (`sections`, '0' or '1' => sections), the import
-	 * order (`tables`) and the uninstall LIKE patterns (`likes`, mode =>
-	 * patterns).
+	 * Per-request results of the query methods, one store per result type.
 	 *
 	 * @var array{entries?: array<string, array<string, mixed>>, kind?: array<string, array<string, array<string, mixed>>>, regex?: array<string, string>, sections?: array<string, array<string, array{label: string, tables: list<string>, type_scope?: array<string, string>}>>, tables?: list<string>, likes?: array<string, list<string>>, parts?: array<string, array{owner: string, group: string|null, label: string|null, entries: array<string, array<string, mixed>>}>}
 	 */
@@ -4030,28 +4031,10 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Entries an add-on or extension declares, after validation.
+	 * Entries an add-on or extension declares, after validation; read once per request, none without WordPress loaded.
 	 *
-	 * Read once per request, on the first call after `init`-time hooks are in
-	 * place (the registry is read only on admin, cron and CLI paths). Without
-	 * WordPress loaded (the release gate's static check, a bare PHP process)
-	 * there are none.
-	 *
-	 * An extension entry may only ADD: it is refused when its id is a core
-	 * id, when its name overlaps a core entry of the same kind, when its kind
-	 * is not in EXTENSION_KINDS, when it would export into a section that is
-	 * not live and extensible, when a SECRET entry names an export section,
-	 * when an exported entry's name looks like a credential (unless
-	 * perflocale/data_registry/is_secret declares it not secret) or is a
-	 * WordPress core option or meta key (WP_CORE_OPTIONS, WP_CORE_META), or
-	 * when any field fails {@see self::validate_entry()}. A refused entry
-	 * is left out and listed by {@see self::rejected_extensions()}; it never
-	 * changes how core data is exported, imported, copied, synced or
-	 * deleted.
-	 *
-	 * Uninstall runs with the plugin's files only (uninstall.php loads no
-	 * add-on), so it never sees extension entries: an add-on that needs its
-	 * data removed on uninstall also declares it through HasUninstallTargets.
+	 * Add-only: a refused entry is left out and listed by rejected_extensions() (docs-ai/11-code-rationale.md, "DataRegistry: extension entries").
+	 * Uninstall loads no add-on and never sees them: an add-on also declares its uninstall data through HasUninstallTargets.
 	 *
 	 * @return array<string, array<string, mixed>>
 	 */
@@ -4068,41 +4051,10 @@ final class DataRegistry {
 		}
 
 		/**
-		 * Filter the stored data an add-on, Pro or another extension declares
-		 * to the data registry, so the export, import, translation-copy and
-		 * Sync Fields rules treat it as declared.
+		 * Filter the stored data an add-on, Pro or another extension declares, so export, import, copy and Sync Fields treat it as declared.
 		 *
-		 * Each entry is keyed `<kind>:<name>` and has every key of a core
-		 * entry (see the DataRegistry class docblock): kind (option,
-		 * network_option, transient, site_transient, post_meta, term_meta,
-		 * user_meta, order_meta or cron), name, owner (`addon:<id>`, `pro` or
-		 * `ext:<slug>`), class, export, not_exported, import, uninstall (data or
-		 * keep, always for cron), scope, copy, sync, deactivate, fixture and
-		 * since. Entries are only added: one that collides with or overlaps a
-		 * PerfLocale entry, or fails validation, is ignored.
-		 *
-		 * Sync 'never' for keys outside the _perflocale_ namespace is enforced
-		 * when Settings are saved; to keep such a key out of a sync started
-		 * another way, also remove it in the perflocale/sync_fields filter.
-		 *
-		 * An entry that is exported (only into the Add-on data section) must
-		 * also declare `sanitize_import`: a callable the importer passes each
-		 * imported value through before it stores it,
-		 * `fn( mixed $value, string $name ): mixed` (the value as the file
-		 * holds it, the stored name). An exporting entry without one, or with
-		 * one that is not callable, is ignored and listed with that reason.
-		 * So is an exporting entry whose name is a WordPress core option or
-		 * meta key, or looks like a credential (see
-		 * perflocale/data_registry/is_secret).
-		 *
-		 * By default every add-on's exported data is chosen with the one
-		 * "Add-on data" checkbox of the export and import screens. An entry
-		 * exported into Add-on data may instead declare `group`,
-		 * `[ 'id' => 'my-addon', 'label' => __( 'My add-on', 'my-addon' ) ]`:
-		 * the entries of one owner and group id then get their own checkbox
-		 * with that label and leave the shared one. The id is 1 to 40
-		 * lowercase letters, digits, - or _; every entry of a group gives the
-		 * same label.
+		 * Entries `<kind>:<name>` with every core entry key; exported ones need `sanitize_import` and may declare a `group`.
+		 * They only add: a colliding, overlapping or invalid entry is ignored (docs-ai/11-code-rationale.md, "DataRegistry: extension entries").
 		 *
 		 * @hook perflocale/data_registry/entries
 		 * @param array<string, array<string, mixed>> $entries Entry id => entry. Default: [].
@@ -4112,14 +4064,10 @@ final class DataRegistry {
 
 		foreach ( self::credential_named_exports( $raw ) as $id => $name ) {
 			/**
-			 * Filters whether an extension entry exported into Add-on data
-			 * holds a secret, for an entry whose name looks like a credential
-			 * (the names the export redaction strips: `_api_key`, `_secret`,
-			 * `_password`, `_token`, a name ending in `_key`, ...). Such an
-			 * entry is refused, so its value never travels in an export file.
-			 * Return false only for a name that holds no secret (for example
-			 * a `_token_count` counter); the entry is then exported and
-			 * imported like any other.
+			 * Filters whether an exported extension entry whose name looks like a credential holds a secret.
+			 *
+			 * True refuses the entry, so its value never travels in an export file; return false only for a name that
+			 * holds no secret (a `_token_count` counter), and the entry is exported like any other.
 			 *
 			 * @hook  perflocale/data_registry/is_secret
 			 * @since 1.0.7.3
@@ -4143,8 +4091,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The entries of a filter result that export and whose names look like a
-	 * credential: entry id => name.
+	 * The entries of a filter result that export and whose names look like a credential: entry id => name.
 	 *
 	 * @param mixed $raw What the filter returned.
 	 * @return array<string, string>
@@ -4162,13 +4109,10 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Split a filter result into accepted and refused extension entries.
-	 * Holds no state: {@see self::extension_entries()} stores the result.
+	 * Split a filter result into accepted and refused extension entries (stateless; extension_entries() stores it).
 	 *
 	 * @param mixed        $raw        What the filter returned.
-	 * @param list<string> $not_secret Entry ids whose credential-shaped names
-	 *                                 perflocale/data_registry/is_secret
-	 *                                 declared not secret.
+	 * @param list<string> $not_secret Entry ids whose credential-shaped names is_secret declared not secret.
 	 * @return array{accepted: array<string, array<string, mixed>>, rejected: array<string, list<string>>}
 	 */
 	public static function sort_extensions( $raw, array $not_secret = [] ): array {
@@ -4250,8 +4194,7 @@ final class DataRegistry {
 	 *
 	 * @param string               $id         Entry id.
 	 * @param array<string, mixed> $entry      Entry.
-	 * @param bool                 $not_secret Its credential-shaped name was
-	 *                                         declared not secret.
+	 * @param bool                 $not_secret Its credential-shaped name was declared not secret.
 	 * @return list<string>
 	 */
 	private static function extension_problems( string $id, array $entry, bool $not_secret = false ): array {
@@ -4334,9 +4277,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Whether a name can stand for a WordPress core option (kinds option and
-	 * network_option) or a core meta key (the meta kinds), compared without
-	 * regard to case, as the database compares option names and meta keys.
+	 * Whether a name can stand for a WordPress core option or meta key, case-insensitively, as the database compares them.
 	 *
 	 * @param string $kind Entry kind.
 	 * @param string $name Entry name.
@@ -4351,8 +4292,7 @@ final class DataRegistry {
 			return false;
 		}
 
-		// The site's own table prefix when WordPress is loaded, and the
-		// default one.
+		// The site's own table prefix when WordPress is loaded, and the default one.
 		$db       = $GLOBALS['wpdb'] ?? null;
 		$prefix   = is_object( $db ) ? ( get_object_vars( $db )['base_prefix'] ?? null ) : null;
 		$prefixes = array_unique( [ 'wp_', is_string( $prefix ) && '' !== $prefix ? $prefix : 'wp_' ] );
@@ -4369,8 +4309,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Problems of one entry's shape and values (empty when it is valid).
-	 * Shared by the extension filter and the release gate's rule E3.
+	 * Problems of one entry's shape and values (empty when valid); shared by the extension filter and gate rule E3.
 	 *
 	 * @param string               $id    Entry id.
 	 * @param array<string, mixed> $entry Entry.
@@ -4624,9 +4563,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * EXPORT_SECTIONS as its declared shape: the flags are booleans a
-	 * section may set either way (a planned section is not live), whatever
-	 * the current list holds.
+	 * EXPORT_SECTIONS typed as its declared shape: each flag may be either boolean, whatever the current list holds.
 	 *
 	 * @return array<string, array{label: string, live: bool, id_keyed: bool, extensible: bool}>
 	 */
@@ -4635,9 +4572,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * A string field of an entry: the value when it is a string, '' otherwise
-	 * (every field the query methods read as text is a string in an entry
-	 * that passed validate_entry()).
+	 * A string field of an entry: the value when it is a string, '' otherwise (validated entries hold strings there).
 	 *
 	 * @param mixed $value Field value.
 	 * @return string
@@ -4686,8 +4621,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The literal text of a name up to its first placeholder (the whole
-	 * name when it has none). Unescaped: a SQL caller applies esc_like().
+	 * The literal text of a name up to its first placeholder (all of it without one); unescaped, a SQL caller applies esc_like().
 	 *
 	 * @param string $pattern Entry name.
 	 * @return string
@@ -4699,8 +4633,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Names that stand for a pattern: two expansions with the fixed samples
-	 * of PLACEHOLDER_SAMPLES (the name itself when it has no placeholder).
+	 * Names that stand for a pattern: two expansions with PLACEHOLDER_SAMPLES (the name itself without a placeholder).
 	 *
 	 * @param string $pattern Entry name.
 	 * @return list<string>
@@ -4745,8 +4678,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The entry a stored name belongs to, or null. NAMESPACE entries never
-	 * match: a name only they cover is an undeclared item.
+	 * The entry a stored name belongs to, or null; NAMESPACE entries never match (a name only they cover is undeclared).
 	 *
 	 * @param string $kind A KINDS value, or `setting` for a key of
 	 *     `perflocale_settings`.
@@ -4769,9 +4701,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Pairs of entries of one kind that can stand for the same name, and
-	 * uninstall LIKE prefixes that reach an entry uninstall must keep. Empty
-	 * on a sound registry (the release gate's rule E10).
+	 * Pairs of entries of one kind that can stand for the same name, and uninstall LIKE prefixes that reach a kept entry.
+	 *
+	 * Empty on a sound registry (gate rule E10).
 	 *
 	 * @param array<string, array<string, mixed>>|null $entries Entries to
 	 *     check, default the core entries.
@@ -4826,13 +4758,9 @@ final class DataRegistry {
 	/* ------------------------------------------------------------ cache flush */
 
 	/**
-	 * The transients a cache flush keeps, as LIKE prefixes (unescaped): the
-	 * literal head of every core transient entry of class STATE under
-	 * FLUSH_SWEEP_PREFIX, sorted, leaving out a prefix that another one
-	 * already covers. CacheManager::FLUSH_KEPT_TRANSIENTS holds this list.
+	 * The transients a cache flush keeps (CacheManager::FLUSH_KEPT_TRANSIENTS): sorted, unescaped LIKE prefixes of core STATE transients.
 	 *
-	 * Core entries only: an extension's transient under FLUSH_SWEEP_PREFIX
-	 * is flushed whatever its class.
+	 * Core entries only: an extension's transient under FLUSH_SWEEP_PREFIX is flushed whatever its class.
 	 *
 	 * @param array<string, array<string, mixed>>|null $entries Entries, default
 	 *     the core entries.
@@ -4868,10 +4796,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The transients a cache flush deletes by name under a persistent object
-	 * cache: every core transient entry under FLUSH_SWEEP_PREFIX whose class
-	 * FLUSH_TRANSIENT_CLASSES deletes and whose name has no placeholder,
-	 * sorted. CacheManager::FLUSH_DELETED_TRANSIENTS holds this list.
+	 * The transients a cache flush deletes by name under a persistent object cache (CacheManager::FLUSH_DELETED_TRANSIENTS).
+	 *
+	 * Core transients under FLUSH_SWEEP_PREFIX of a deleted class and without a placeholder, sorted.
 	 *
 	 * @param array<string, array<string, mixed>>|null $entries Entries, default
 	 *     the core entries.
@@ -4899,14 +4826,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * What is wrong with a list of kept flush prefixes, one line each; empty
-	 * when it is sound (the release gate's rule E13):
-	 *   - a transient entry of a class FLUSH_TRANSIENT_CLASSES does not name;
-	 *   - a prefix the registry keeps that the list leaves out, or one the
-	 *     list keeps that the registry does not;
-	 *   - a kept prefix that reaches a transient a flush deletes (one of its
-	 *     sample names starts with the prefix, or the prefix followed by a
-	 *     sample token is one of its names).
+	 * What is wrong with a list of kept flush prefixes, one line each; empty when sound (gate rule E13).
+	 *
+	 * Checks: a transient class with no flush rule, a prefix only one side keeps, a kept prefix that reaches a deleted transient.
 	 *
 	 * @param array<mixed>                             $kept    The list
 	 *     (CacheManager::FLUSH_KEPT_TRANSIENTS).
@@ -4973,9 +4895,8 @@ final class DataRegistry {
 	/* ------------------------------------------------------------ export sections and tables */
 
 	/**
-	 * Export sections in screen order: key => label, tables and, where a
-	 * section owns only a slice of a shared table, type_scope (table =>
-	 * value of its `type` column). The shape of the exporter's section list.
+	 * Export sections in screen order, the exporter's section list: label, tables, and type_scope (table => `type`
+	 * value) where a section owns only a slice of a shared table.
 	 *
 	 * @param bool $include_planned Also the sections whose writer is not
 	 *     built yet.
@@ -5205,10 +5126,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Where an exported entry sits in the file: its envelope key
-	 * (ENVELOPE_KEYS), `data.<table>` for a table, `data.<row list>`
-	 * (ROW_LISTS) for an option or meta entry. Null for an entry that is not
-	 * exported, or whose kind has no place in the file.
+	 * Where an exported entry sits in the file: its envelope key, `data.<table>`, or `data.<row list>` (an add-on part's own).
+	 *
+	 * Null when it is not exported or its kind has no place in the file.
 	 *
 	 * @param string $id Entry id.
 	 * @return string|null
@@ -5240,9 +5160,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The callable an imported value of an entry passes through before the
-	 * importer stores it: the extension entry's `sanitize_import`, or null
-	 * (core entries are sanitized by the importer's own rules).
+	 * The extension entry's `sanitize_import` callable for imported values, or null (core entries use the importer's rules).
 	 *
 	 * @param string $id Entry id.
 	 * @return callable|null
@@ -5254,9 +5172,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The places of the file a section fills, in file order: its envelope
-	 * keys, then `data.<table>` per table in import order, then
-	 * `data.<row list>` in ROW_LISTS order.
+	 * The places of the file a section fills, in file order: envelope keys, `data.<table>` lists, then `data.<row list>` lists.
 	 *
 	 * @param string $section Section key.
 	 * @return list<string>
@@ -5293,8 +5209,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The places of the file one add-on part fills:
-	 * `data.addon_data/<part>/<row list>`, in ROW_LISTS order.
+	 * The places of the file one add-on part fills: `data.addon_data/<part>/<row list>`, in ROW_LISTS order.
 	 *
 	 * @param string $part Part key (addon_parts()).
 	 * @return list<string>
@@ -5310,9 +5225,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The shared option and meta row lists a set of sections writes inside
-	 * `data`, in ROW_LISTS order (envelope-key entries and add-on parts
-	 * excluded: an add-on part has its own row lists, part_row_lists()).
+	 * The shared option and meta row lists a set of sections writes in `data`, in ROW_LISTS order.
+	 *
+	 * Envelope-key entries and add-on parts excluded (a part has its own lists, part_row_lists()).
 	 *
 	 * @param string ...$sections Section keys.
 	 * @return list<string>
@@ -5352,9 +5267,7 @@ final class DataRegistry {
 	/* ------------------------------------------------------------ add-on parts */
 
 	/**
-	 * The add-on part an entry travels in: `<owner>`, or `<owner>/<group
-	 * id>` when it declares a group. Null for an entry outside the Add-on
-	 * data section.
+	 * The add-on part an entry travels in, `<owner>` or `<owner>/<group id>`; null outside the Add-on data section.
 	 *
 	 * @param array<string, mixed> $entry Entry.
 	 * @return string|null
@@ -5371,9 +5284,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Every add-on part, in entry order: part => owner, group id (null for
-	 * the shared "Add-on data" checkbox), label (null likewise) and its
-	 * entries.
+	 * Every add-on part in entry order: part => owner, group id and label (null for the shared checkbox), entries.
 	 *
 	 * @return array<string, array{owner: string, group: string|null, label: string|null, entries: array<string, array<string, mixed>>}>
 	 */
@@ -5454,10 +5365,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * A `data` member read as an add-on part's row list: [ part, row list ],
-	 * or null when the name is not one (the part's owner must have an
-	 * owner's shape, the group id GROUP_ID_PATTERN, the list a ROW_LISTS
-	 * value).
+	 * A `data` member read as an add-on part's row list, [ part, row list ], or null when the name is not one.
 	 *
 	 * @param string $member Member name.
 	 * @return array{0: string, 1: string}|null
@@ -5500,32 +5408,12 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Class of one settings key, or null for a key the registry does not
-	 * know.
-	 *
-	 * @param string $key Settings key.
-	 * @return string|null
-	 */
-	public static function setting_class( string $key ): ?string {
-		return self::SETTINGS[ $key ] ?? null;
-	}
-
-	/**
 	 * Settings keys that hold a credential.
 	 *
 	 * @return list<string>
 	 */
 	public static function secret_settings(): array {
 		return array_keys( self::SETTINGS, 'secret', true );
-	}
-
-	/**
-	 * Settings keys that describe this site rather than its content.
-	 *
-	 * @return list<string>
-	 */
-	public static function site_specific_settings(): array {
-		return array_keys( self::SETTINGS, 'site_specific', true );
 	}
 
 	/* ------------------------------------------------------------ uninstall */
@@ -5541,10 +5429,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Exact option names the generic option sweep deletes, leaving out the
-	 * ones an option LIKE of {@see self::uninstall_option_likes()} already
-	 * reaches and `perflocale_settings` (deleted last, see
-	 * {@see self::uninstall_last_options()}).
+	 * Exact option names the generic option sweep deletes, minus those an uninstall_option_likes() pattern reaches.
+	 *
+	 * Options deleted last (`perflocale_settings`) are in uninstall_last_options().
 	 *
 	 * @param string $mode delete or preserve.
 	 * @return list<string>
@@ -5586,11 +5473,9 @@ final class DataRegistry {
 	}
 
 	/**
-	 * LIKE patterns over the options table that the uninstall sweep deletes:
-	 * `%` is the wildcard, every other character literal (the caller escapes
-	 * each piece between the `%` with esc_like()). Transient entries give
-	 * their value and timeout rows. A pattern another pattern already covers
-	 * is left out.
+	 * LIKE patterns over the options table that the uninstall sweep deletes, covered ones left out.
+	 *
+	 * `%` is the only wildcard: the caller escapes each piece between with esc_like(). Transients give value and timeout rows.
 	 *
 	 * @param string $mode delete or preserve.
 	 * @return list<string>
@@ -5627,9 +5512,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Literal key prefixes the uninstall sweep deletes from one meta table
-	 * (`meta_key LIKE <esc_like(prefix)>%`). A prefix another one covers is
-	 * left out.
+	 * Literal key prefixes the uninstall sweep deletes from one meta table (`meta_key LIKE <esc_like(prefix)>%`), covered ones left out.
 	 *
 	 * @param string $meta_type post, term, user or order.
 	 * @return list<string>
@@ -5652,8 +5535,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Network options (wp_sitemeta) the network uninstall deletes once the
-	 * sweep completes.
+	 * Network options (wp_sitemeta) the network uninstall deletes once the sweep completes.
 	 *
 	 * @return list<string>
 	 */
@@ -5670,8 +5552,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * The user-meta keys of the plugin's admin preferences: the fixed list
-	 * the personal-data export and erase use.
+	 * The user-meta keys of the plugin's admin preferences, the fixed list of the personal-data export and erase.
 	 *
 	 * @return list<string>
 	 */
@@ -5721,8 +5602,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Post-meta key prefixes never copied onto a new translation (entries
-	 * with a placeholder, up to it).
+	 * Post-meta key prefixes never copied onto a new translation (entries with a placeholder, up to it).
 	 *
 	 * @return list<string>
 	 */
@@ -5731,8 +5611,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Post-meta keys copied onto a new translation only when Sync Fields
-	 * lists them.
+	 * Post-meta keys copied onto a new translation only when Sync Fields lists them.
 	 *
 	 * @return list<string>
 	 */
@@ -5750,9 +5629,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Whether Sync Fields must refuse a meta key: a declared entry with sync
-	 * never, or any key of the plugin's own post-meta namespace that no entry
-	 * lets Sync Fields list.
+	 * Whether Sync Fields must refuse a meta key: an entry with sync never, or a key of the plugin's own namespace no entry lists.
 	 *
 	 * @param string $key Meta key.
 	 * @return bool
@@ -5775,8 +5652,7 @@ final class DataRegistry {
 			}
 		}
 
-		// Any other key that starts with a namespace's literal prefix: the
-		// namespace's rule (SyncMeta::is_never_synced() is the same check).
+		// Any other key under a namespace's literal prefix takes its rule (SyncMeta::is_never_synced() is the same check).
 		foreach ( $post_meta as $e ) {
 			if ( 'NAMESPACE' === $e['class'] && str_starts_with( $key, self::to_like_prefix( self::text( $e['name'] ) ) ) ) {
 				return 'never' === $e['sync'];
@@ -5791,8 +5667,7 @@ final class DataRegistry {
 	 *
 	 * @param string $field    copy or sync.
 	 * @param string $value    Wanted value.
-	 * @param bool   $prefixes True: the prefixes of pattern entries; false:
-	 *     the exact names.
+	 * @param bool   $prefixes True: the prefixes of pattern entries; false: the exact names.
 	 * @return list<string>
 	 */
 	private static function post_meta_names( string $field, string $value, bool $prefixes ): array {
@@ -5814,9 +5689,9 @@ final class DataRegistry {
 	/* ------------------------------------------------------------ round trip */
 
 	/**
-	 * Entries a restore through export and import does not bring back:
-	 * not exported (or not yet, `gap`) and not regenerated (DERIVED). The
-	 * round-trip report prints the list so each loss is visible and owned.
+	 * Entries an export and import round trip does not bring back: not exported (or `gap`) and not DERIVED.
+	 *
+	 * The round-trip report prints the list so each loss is visible and owned.
 	 *
 	 * @return list<string> Entry ids.
 	 */
@@ -5839,8 +5714,7 @@ final class DataRegistry {
 	/* ------------------------------------------------------------ helpers */
 
 	/**
-	 * Whether one of the LIKE patterns matches a name (LIKE semantics with
-	 * `%` as the only wildcard).
+	 * Whether one of the LIKE patterns matches a name (`%` the only wildcard).
 	 *
 	 * @param array<int, string> $likes LIKE patterns.
 	 * @param string             $name  Name.
@@ -5859,8 +5733,7 @@ final class DataRegistry {
 	}
 
 	/**
-	 * Drop duplicates and the LIKE patterns another trailing-`%` pattern
-	 * already covers, keeping the first-seen order.
+	 * Drop duplicates and the LIKE patterns another trailing-`%` pattern covers, in first-seen order.
 	 *
 	 * @param array<int, string> $likes LIKE patterns.
 	 * @return list<string>

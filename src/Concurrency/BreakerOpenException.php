@@ -14,13 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Typed exception so callers can `catch (BreakerOpenException $e)` and
- * route to a graceful-degradation path (use TM, return cached result,
- * surface "service temporarily unavailable" to the user) WITHOUT
- * conflating with genuine downstream errors.
+ * An open breaker refused a call: callers can degrade gracefully without treating it as a downstream error.
  *
- * Carries the breaker key so logs and admin notices can name the open
- * circuit without re-reading the breaker state.
+ * Carries the breaker key so logs and notices can name the open circuit.
  */
 final class BreakerOpenException extends \RuntimeException {
 

@@ -14,33 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The data an export carries outside PerfLocale's tables: per-language media
- * text, menu languages, per-item flags, the Gravity Forms translations, the
- * language-code redirects, the webhooks (without their secrets) and the
- * capability ledgers.
+ * Exports and imports the options and meta outside PerfLocale's tables, as row lists inside `data` (webhooks without secrets).
  *
- * In the file they travel as four row lists inside `data`, next to the
- * tables, so they are read in pieces like the tables and an older importer
- * skips them (it imports only the tables it knows):
- *
- * - `options`: `{ "name": <option name>, "value": <JSON value> }`;
- * - `post_meta`, `term_meta`, `order_meta`: `{ "object_id": <id>,
- *   "meta_key": <key>, "meta_value": <stored string>, "_fp": <fingerprint> }`.
- *
- * Add-on data travels per add-on part, in row lists of the same shapes named
- * `addon_data/<part>/<row list>` (DataRegistry::ADDON_MEMBER_PREFIX).
- *
- * Which section carries which item is the data registry's
- * (DataExporter::row_list_items() reads it). Import behaviour,
- * per item: a merge adds what this site does not have yet (the redirect map
- * gains the codes it lacks); a replace writes the file's value over this
- * site's for every option and every (object, key) the file carries, and
- * leaves the rest as it is. Items whose merge rule is `never` (the webhooks,
- * the capability ledgers) are configuration, applied by replace only. Every row is checked before it is
- * written: the key must belong to a section the file declares, the object
- * must exist here with the expected type and the same fingerprint, and the
- * value must have the shape the plugin itself stores (meta values are never
- * unserialized; a serialized value is refused).
+ * Every imported row is checked (declared section, object type and fingerprint, stored shape); meta is never unserialized.
+ * See docs-ai/11-code-rationale.md, "ExportItems: row lists and import rules".
  */
 final class ExportItems {
 
@@ -56,6 +33,16 @@ final class ExportItems {
 	 * Meta rows read per query on export.
 	 */
 	private const EXPORT_BATCH = 1000;
+
+	/**
+	 * A machine translation's pending mark (TranslationService::PENDING_META_KEY): "<time>", or "<time>:c" while created.
+	 */
+	private const PENDING_KEY = '_perflocale_mt_pending';
+
+	/**
+	 * The shape of a pending mark.
+	 */
+	private const PENDING_SHAPE = '/^[1-9][0-9]{0,18}(?::c)?$/D';
 
 	/**
 	 * The rows of one row list, for the exporter.
@@ -109,9 +96,7 @@ final class ExportItems {
 				}
 
 				if ( 'perflocale_webhooks' === $name ) {
-					// The webhooks travel only in an export by a user who may
-					// register them; an import without the row keeps the
-					// target's own.
+					// Only a user who may register webhooks exports them; an import without the row keeps the target's own.
 					if ( ! self::may_carry_webhooks() ) {
 						continue;
 					}
@@ -128,9 +113,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * Whether the current user may export or import the webhooks: one who
-	 * may register them ({@see \PerfLocale\Api\WebhookController::user_can_register()}),
-	 * or WP-CLI run without a user.
+	 * Whether the current user may export or import the webhooks: one who may register them, or WP-CLI without a user.
 	 *
 	 * @return bool
 	 */
@@ -178,8 +161,7 @@ final class ExportItems {
 			$last        = 0;
 
 			do {
-				// The key is matched by its literal prefix (an index range on
-				// meta_key) and then exactly by its pattern below.
+				// LIKE on the literal prefix uses the meta_key index; the pattern below matches exactly.
 				$key_arg = $placeholder ? $wpdb->esc_like( self::like_prefix( $item[1] ) ) . '%' : $item[1];
 				$rows    = self::meta_page( $wpdb, $table, $id_col, $object_col, $join, $placeholder, $key_arg, $last );
 
@@ -196,7 +178,9 @@ final class ExportItems {
 				$keep = [];
 
 				foreach ( $rows as $row ) {
-					if ( 1 === preg_match( self::item_regex( $item ), Typed::str( $row['meta_key'] ?? '' ) ) ) {
+					$key = Typed::str( $row['meta_key'] ?? '' );
+
+					if ( 1 === preg_match( self::item_regex( $item ), $key ) && ( self::PENDING_KEY !== $key || self::stopped_mark( Typed::str( $row['meta_value'] ?? '' ) ) ) ) {
 						$keep[] = $row;
 					}
 				}
@@ -222,9 +206,19 @@ final class ExportItems {
 	}
 
 	/**
-	 * One page of meta rows after a meta id: the rows whose key is the
-	 * name, or starts with the prefix (LIKE), joined to the order table for
-	 * orders. Four literal statements, every identifier bound with %i.
+	 * Whether a pending mark is a stopped worker's: older than a lease (younger: a live call writes the translation).
+	 *
+	 * @param string $value Mark.
+	 * @return bool
+	 */
+	private static function stopped_mark( string $value ): bool {
+		return 1 === preg_match( self::PENDING_SHAPE, $value ) && time() - (int) $value >= \PerfLocale\Background\JobResume::LEASE;
+	}
+
+	/**
+	 * One page of meta rows after a meta id, by exact key or LIKE prefix, joined to the order table for orders.
+	 *
+	 * Four literal statements, so every identifier is bound with %i.
 	 *
 	 * @param \wpdb                                       $wpdb       Database.
 	 * @param string                                      $table      Meta table.
@@ -255,8 +249,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * Where one meta kind is stored: [ meta table, meta row id column,
-	 * object id column, join to the order table (orders only) ].
+	 * Where one meta kind is stored: [ meta table, meta id column, object id column, order table join or null ].
 	 *
 	 * @param string $pseudo `post_meta`, `term_meta` or `order_meta`.
 	 * @return array{0: string, 1: string, 2: string, 3: array{0: string, 1: string, 2: string}|null}
@@ -319,10 +312,7 @@ final class ExportItems {
 	/**
 	 * Import the items of the declared sections from their row lists.
 	 *
-	 * Runs after the table import has committed (and after Replace applied
-	 * the settings and roles), so a failure here never leaves tables and
-	 * items out of step: each item is written on its own and the import is
-	 * safe to run again.
+	 * Runs after the table import commits; each item is written on its own, so a failure here is safe to run again.
 	 *
 	 * @param ImportReader                                                                                                         $reader  Indexed reader.
 	 * @param array<string, array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string}>> $lists   `data` member => the items it may carry: a row list and the items of the declared sections (DataExporter::row_list_items()), or an add-on part's row list and that part's items (DataExporter::part_items()).
@@ -347,8 +337,7 @@ final class ExportItems {
 				continue;
 			}
 
-			// An add-on part's member (`addon_data/<part>/<row list>`) holds
-			// rows of the row list its name ends with.
+			// An add-on part's member (`addon_data/<part>/<row list>`) holds rows of the list its name ends with.
 			$slash  = strrpos( $member, '/' );
 			$pseudo = false === $slash ? $member : substr( $member, $slash + 1 );
 			$piece  = [];
@@ -405,8 +394,7 @@ final class ExportItems {
 			return;
 		}
 
-		// Rows whose key belongs to a declared section: [ object id, meta
-		// key, row, item ].
+		// Rows whose key belongs to a declared section: [ object id, meta key, row, item ].
 		$rows = [];
 
 		foreach ( $piece as $row ) {
@@ -490,9 +478,7 @@ final class ExportItems {
 			return;
 		}
 
-		// Configuration (the registry's merge rule `never`): a merge never
-		// changes it (the merge notice covers the settings and roles
-		// sections these belong to).
+		// Merge rule `never` (configuration): a merge never changes it; the merge notice covers its sections.
 		if ( ! $replace && 'never' === ( $item[3] ?? null ) ) {
 			++$out['skipped'];
 			return;
@@ -533,12 +519,9 @@ final class ExportItems {
 	}
 
 	/**
-	 * An option an add-on declared in the data registry (Add-on data), stored
-	 * only after the entry's own import sanitizer has passed the value: the
-	 * registry refuses such an entry for export when it has none, so nothing
-	 * the plugin cannot check reaches the database. The entry's merge rule
-	 * decides a merge (insert_if_absent: only when this site has no value;
-	 * union_keys: the keys this site lacks); a replace writes the value.
+	 * An add-on's registry option, stored only after the entry's own import sanitizer passed the value.
+	 *
+	 * Merge: insert_if_absent writes only when this site has none, union_keys adds the keys it lacks; replace writes.
 	 *
 	 * @param string                                                                                    $name      Option name.
 	 * @param mixed                                                                                     $value     File value (decoded JSON: arrays and scalars only).
@@ -573,9 +556,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * The language-code redirect map: old code => new code, both shaped like
-	 * a language code. A merge adds the codes this site has no redirect for;
-	 * a replace writes the file's map.
+	 * The language-code redirect map (old code => new code): a merge adds the codes this site lacks, a replace writes the file's.
 	 *
 	 * @param mixed $value   File value.
 	 * @param bool  $replace Replace mode.
@@ -601,8 +582,7 @@ final class ExportItems {
 		$current = (array) get_option( \PerfLocale\Database\Repository\LanguageRepository::REDIRECTS_OPTION, [] );
 		$next    = $replace ? $clean : $current + $clean;
 
-		// The map is read on every front-end request; LanguageRepository
-		// keeps at most 50 codes, the newest last.
+		// Read on every front-end request: at most 50 codes, newest last, as LanguageRepository keeps it.
 		$next = array_slice( $next, -50, null, true );
 
 		if ( $next === $current ) {
@@ -613,9 +593,9 @@ final class ExportItems {
 	}
 
 	/**
-	 * The webhooks (replace only), for a user who may register them. A
-	 * webhook whose address this site already has keeps this site's secret;
-	 * any other gets a new random one, because the file carries none.
+	 * The webhooks (replace only), for a user who may register them.
+	 *
+	 * The file carries no secrets: a known address keeps this site's secret, any other gets a new random one.
 	 *
 	 * @param mixed                                                                                                                   $value File value.
 	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>} $out   Result (updated).
@@ -684,14 +664,12 @@ final class ExportItems {
 			return false;
 		}
 
-		// Not autoloaded: the secrets stay out of alloptions (as
-		// WebhookController stores them).
+		// Not autoloaded, as WebhookController stores it: the secrets stay out of alloptions.
 		return update_option( 'perflocale_webhooks', $next, false );
 	}
 
 	/**
-	 * The Translator capability ledger (replace only), limited to the
-	 * capabilities a roles restore may grant.
+	 * The Translator capability ledger (replace only), limited to the capabilities a roles restore may grant.
 	 *
 	 * @param mixed $value File value.
 	 * @return bool|null
@@ -735,14 +713,12 @@ final class ExportItems {
 			return false;
 		}
 
-		// Autoloaded, as TranslatorRole stores it (read on every admin_init
-		// of a WooCommerce site).
+		// Autoloaded, as TranslatorRole stores it: read on every admin_init of a WooCommerce site.
 		return update_option( 'perflocale_shop_manager_caps', $next, true );
 	}
 
 	/**
-	 * Capability => grant, PerfLocale capabilities and the editing
-	 * capabilities the Translator role needs only.
+	 * Capability => grant, only PerfLocale capabilities and the editing capabilities the Translator role needs.
 	 *
 	 * @param mixed $map Raw map.
 	 * @return array<string, bool>
@@ -793,9 +769,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * One form's Gravity Forms translations, through the add-on's own save
-	 * (which sanitizes every value). Needs Gravity Forms and the add-on
-	 * active and the form to exist here.
+	 * One form's Gravity Forms translations, through the add-on's own save, which sanitizes every value.
 	 *
 	 * @param int                                                                                                                     $form_id Form ID.
 	 * @param mixed                                                                                                                   $value   Language code => translations.
@@ -844,9 +818,9 @@ final class ExportItems {
 	}
 
 	/**
-	 * The value to store for a meta row, or null when the file's value is
-	 * not one the plugin stores under that key. Never unserialized: a
-	 * serialized value is refused.
+	 * The value to store for a meta row, or null when the plugin stores no such value under that key.
+	 *
+	 * Never unserialized: a serialized value is refused.
 	 *
 	 * @param string        $key       Meta key.
 	 * @param mixed         $value     File value.
@@ -864,8 +838,7 @@ final class ExportItems {
 			return null;
 		}
 
-		// An add-on's own meta (a registry extension entry): its import
-		// sanitizer decides, and only a scalar result is stored.
+		// An add-on's registry meta: its import sanitizer decides, and only a scalar result is stored.
 		if ( null !== $sanitizer ) {
 			$clean = call_user_func( $sanitizer, $value, $key );
 
@@ -890,6 +863,10 @@ final class ExportItems {
 			return 'yes' === $value ? 'yes' : null;
 		}
 
+		if ( self::PENDING_KEY === $key ) {
+			return 1 === preg_match( self::PENDING_SHAPE, $value ) ? $value : null;
+		}
+
 		if ( str_starts_with( $key, '_perflocale_menu_' ) ) {
 			$id   = absint( $value );
 			$term = $id > 0 ? get_term( $id, 'nav_menu' ) : null;
@@ -907,8 +884,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * Write one meta value: a merge adds it when the object has none; a
-	 * replace writes the file's value over this site's.
+	 * Write one meta value: a merge adds it when the object has none; a replace writes the file's value over this site's.
 	 *
 	 * @param string $pseudo  Meta kind.
 	 * @param int    $id      Object ID.
@@ -921,8 +897,7 @@ final class ExportItems {
 		if ( 'order_meta' === $pseudo ) {
 			$order = function_exists( 'wc_get_order' ) ? wc_get_order( $id ) : false;
 
-			// A WooCommerce order (WC_Order): its meta API, checked method by
-			// method, so the check needs no WooCommerce class here.
+			// WC_Order's meta API, checked by method, so the check needs no WooCommerce class here.
 			if ( ! is_object( $order ) || ! method_exists( $order, 'get_meta' ) || ! method_exists( $order, 'update_meta_data' ) || ! method_exists( $order, 'save_meta_data' ) ) {
 				return false;
 			}
@@ -933,8 +908,7 @@ final class ExportItems {
 				return false;
 			}
 
-			// save_meta_data(), not save(): one meta row, no order resave
-			// (EmailTranslation writes the order language the same way).
+			// save_meta_data(), not save(): one meta row, no order resave (as EmailTranslation does).
 			$order->update_meta_data( $key, $value );
 			$order->save_meta_data();
 
@@ -990,9 +964,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * Whether an object of this type may carry an item for that object kind.
-	 * An item that names no object kind (an add-on's meta) fits any object
-	 * that exists.
+	 * Whether an object of this type may carry an item for that object kind; no kind (add-on meta) fits any existing object.
 	 *
 	 * @param string|null $kind Item object kind (attachment, nav_menu, ...), or null.
 	 * @param string|null $type The object's type here, null when it does not exist.
@@ -1081,8 +1053,7 @@ final class ExportItems {
 	}
 
 	/**
-	 * The regular expression an item's name stands for: the registry's own
-	 * (every placeholder it knows), or this class's for {lang} and {id}.
+	 * The regular expression an item's name stands for: the registry's own, or this class's for {lang} and {id}.
 	 *
 	 * @param array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string} $item Item.
 	 * @return string

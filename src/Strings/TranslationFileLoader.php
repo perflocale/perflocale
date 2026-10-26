@@ -16,13 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Serves string translations from generated .l10n.php cache files
- * via the gettext filter.
- *
- * Unlike the database mode (StringTranslation), this reads from a single
- * PHP file per locale - zero database queries, OPcache friendly.
- * The gettext filter ensures translations work regardless of whether
- * the theme/plugin uses .mo files, .l10n.php files, or JIT loading.
+ * Serves string translations from generated .l10n.php files through the gettext filters (files mode).
  */
 final class TranslationFileLoader {
 
@@ -46,9 +40,7 @@ final class TranslationFileLoader {
 	private bool $loaded = false;
 
 	/**
-	 * Whether a loaded domain is served through the gettext filters. Option
-	 * strings (OptionStrings::DOMAIN) are read through get_translation()
-	 * directly, so a locale whose only file is theirs needs no gettext filter.
+	 * Whether a loaded domain needs the gettext filters; option strings are read through get_translation().
 	 *
 	 * @var bool
 	 */
@@ -69,7 +61,7 @@ final class TranslationFileLoader {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Defer until language is detected - avoids wasted filter calls during early WP init.
+		// Deferred until the language is detected.
 		add_action( 'perflocale/language/detected', [ $this, 'activate' ] );
 	}
 
@@ -79,11 +71,7 @@ final class TranslationFileLoader {
 	 * @return void
 	 */
 	public function activate(): void {
-		// Fast-path: on the default language WordPress is already serving
-		// source strings in that language - no `__()` replacement needed.
-		// Skip the entire load pipeline (filesystem scan + file I/O) because
-		// the gettext filter has nothing to do. Saves ~200–300µs on every
-		// default-language frontend request.
+		// The default language serves source strings: skip loading entirely.
 		$current = $this->router->get_current_language();
 		$default = $this->router->get_default_language();
 
@@ -96,11 +84,7 @@ final class TranslationFileLoader {
 			return;
 		}
 
-		// Load translations FIRST - if there's nothing gettext can serve,
-		// skip the gettext filter registration entirely. gettext fires on
-		// every `__()` call (easily thousands per page), so avoiding the 4
-		// callbacks when the user has no translation files (or only option
-		// strings, read without gettext) is a real win.
+		// Load first: gettext fires on every __() call, so register the filters only when they can serve something.
 		$this->load_translations();
 
 		if ( empty( $this->translations ) || ! $this->gettext_domains ) {
@@ -114,11 +98,7 @@ final class TranslationFileLoader {
 	}
 
 	/**
-	 * Filter gettext to serve translated strings from file cache.
-	 *
-	 * Parameters are typed as mixed because WordPress may pass null
-	 * when plugins call __( null ), which triggers PHP 8.1+ deprecation
-	 * warnings for null-to-string coercion.
+	 * Filter gettext to serve translated strings from file cache; mixed because plugins may call __( null ).
 	 *
 	 * @param mixed $translation Translated text (from .mo files).
 	 * @param mixed $text Original text.
@@ -153,12 +133,7 @@ final class TranslationFileLoader {
 			return (string) $translation;
 		}
 
-		// A user context that happens to collide with a synthetic plural
-		// context ('plural' or '<ctx> (plural)') would resolve to the plural
-		// row's NUL-joined multi-form value. Return the first form (the primary
-		// plural translation) rather than leaking embedded NUL bytes. Costs one
-		// strpos only on a found _x()-with-context value; the far hotter
-		// no-context translate_string() path can never hit a plural entry.
+		// A context equal to a synthetic plural context hits a NUL-joined plural row: return its first form.
 		$nul = strpos( $hit, "\0" );
 
 		return $nul === false ? $hit : substr( $hit, 0, $nul );
@@ -243,11 +218,7 @@ final class TranslationFileLoader {
 	}
 
 	/**
-	 * Resolve a plural translation for form index >=1 from the file cache.
-	 *
-	 * The generator NUL-joins a plural row's forms (form1\0form2\0…); split
-	 * and pick the requested index, falling back to form 1 when a specific
-	 * form is absent.
+	 * Resolve a plural translation for form index >=1 from the NUL-joined forms the generator writes.
 	 *
 	 * @param string $original     Plural original text.
 	 * @param string $domain       Text domain.
@@ -263,22 +234,19 @@ final class TranslationFileLoader {
 		}
 
 		if ( strpos( $value, "\0" ) === false ) {
-			// 2-form language / no extra forms - the value IS form 1.
+			// Two-form language: the value is form 1.
 			return $value;
 		}
 
 		$forms = explode( "\0", $value );
 		$pick  = $forms[ $form_index - 1 ] ?? '';
 
-		// A missing OR empty form falls back to form 1 (gettext behaviour for
-		// a partially-translated plural), never an empty string.
+		// A missing or empty form falls back to form 1, as gettext does.
 		return ( is_string( $pick ) && $pick !== '' ) ? $pick : $forms[0];
 	}
 
 	/**
-	 * Look up a translation from the file-based cache.
-	 *
-	 * Lazy-loads translations on the first call from .l10n.php files.
+	 * Look up a translation from the file-based cache, loading it on first use.
 	 *
 	 * @param string $text Original text.
 	 * @param string $domain Text domain.
@@ -298,19 +266,9 @@ final class TranslationFileLoader {
 	}
 
 	/**
-	 * Build the translations-map composite key.
+	 * Build the translations-map key: the raw pre-image of StringRepository::compute_hash(), unhashed.
 	 *
-	 * Keying by the raw `domain|context|text` composite (the exact pre-image
-	 * StringRepository::compute_hash() would feed to SHA-256, same '|'
-	 * separator) keeps identical identity semantics while removing a full
-	 * SHA-256 from every __()/_e()/_x()/_n() call - the hottest per-request
-	 * path (500–1500 gettext fires per translated page). The in-memory writer
-	 * (load_translations), the on-disk writer (TranslationFileGenerator's
-	 * combined bundle), and the reader (get_translation) all share this one
-	 * helper so the key expressions can never drift. Combined bundles PERSIST
-	 * these keys, so any format change must bump
-	 * TranslationFileGenerator::COMBINED_VERSION - a stale-format bundle is
-	 * then rejected and rebuilt instead of silently missing every lookup.
+	 * Combined bundles persist these keys: a format change must bump TranslationFileGenerator::COMBINED_VERSION.
 	 *
 	 * @param string $domain  Text domain.
 	 * @param string $context Gettext context ('' when none).
@@ -323,9 +281,6 @@ final class TranslationFileLoader {
 
 	/**
 	 * Load all translations from .l10n.php files for the current locale.
-	 *
-	 * Reads all domain files, builds a hash map for O(1) lookups.
-	 * PHP files are cached by OPcache for maximum performance.
 	 *
 	 * @return void
 	 */
@@ -341,41 +296,21 @@ final class TranslationFileLoader {
 		$dir    = $this->get_translations_dir();
 
 		if ( ! is_dir( $dir ) ) {
-			// Don't set $loaded - allow retry if the directory is
-			// created later (e.g., after translation file generation).
+			// Not marked loaded: the directory may be created later.
 			return;
 		}
 
-		// The generator names bundles with sanitize_file_name( $locale ), so
-		// the suffix must be built the same way or free-text locales (e.g.
-		// containing a space) would never match the files on disk.
+		// Built like the generator's file names, or free-text locales never match.
 		$suffix = '-' . sanitize_file_name( $locale ) . '.l10n.php';
 
-		// Prefer the generator's manifest (an autoloaded, per-blog option
-		// listing exactly the .l10n.php basenames it wrote) over a per-request
-		// directory glob (~13µs of syscall). The generator is the sole writer
-		// of this directory, so the manifest reflects disk by construction; the
-		// per-file realpath guard below still skips anything removed
-		// out-of-band, so this is glob-equivalent for reads. Fall back to glob
-		// when the manifest is absent (first request before the first
-		// generation, or a legacy install).
+		// The generator's manifest (sole writer of the directory) replaces a glob; glob only when it is absent.
 		$manifest = get_option( TranslationFileGenerator::MANIFEST_OPTION );
 
-		// Equals TranslationFileGenerator::combined_basename( $locale ) -
-		// derived from $suffix to avoid a second sanitize_file_name() call.
+		// Equals TranslationFileGenerator::combined_basename( $locale ).
 		$combined_name = TranslationFileGenerator::COMBINED_PREFIX . $suffix;
 
-		// Combined-bundle fast path: the generator additionally emits one
-		// per-locale file already keyed in map_key() format, so a single
-		// include (an OPcache-shared array) replaces the per-domain walk
-		// below. That walk pays is_string + explode + concat + hash-insert
-		// per message on every non-default-language request and is O(total
-		// strings) - the dominant files-mode cost at the scale files mode is
-		// chosen for. The bundle is trusted only when the manifest lists it:
-		// the generator deletes a stale bundle before touching any per-domain
-		// file and writes the manifest last, so listed + present ⟹ current.
-		// Any failure (bundle missing mid-regeneration, format-version
-		// mismatch after an upgrade) falls through to the per-domain path.
+		// Combined bundle: trusted only when the manifest lists it (written last, after a stale bundle is deleted).
+		// See docs-ai/11-code-rationale.md, "TranslationFileLoader: combined bundle trust".
 		if ( is_array( $manifest ) && in_array( $combined_name, $manifest, true ) ) {
 			$combined  = $dir . '/' . $combined_name;
 			$dir_real  = realpath( $dir );
@@ -400,9 +335,7 @@ final class TranslationFileLoader {
 					$this->loaded       = true;
 					$this->translations = $data['map'];
 
-					// The manifest lists one per-domain file for every domain
-					// the bundle holds, so it names the domains without a walk
-					// over the map.
+					// The manifest names the bundle's domains, so no walk over the map.
 					foreach ( $manifest as $name ) {
 						if ( is_string( $name ) && $name !== $combined_name && str_ends_with( $name, $suffix )
 							&& self::is_gettext_domain( substr( $name, 0, -strlen( $suffix ) ) )
@@ -435,9 +368,7 @@ final class TranslationFileLoader {
 		}
 
 		if ( ! is_array( $files ) || empty( $files ) ) {
-			// If file generation is in progress (mode was just switched to
-			// "files"), don't lock $loaded=true - allow the next request to
-			// retry once files are written.
+			// While generation runs, stay unloaded so the next request retries.
 			if ( ! get_transient( 'perflocale_strings_regenerating' ) ) {
 				$this->loaded = true;
 			}
@@ -447,19 +378,13 @@ final class TranslationFileLoader {
 
 		$this->loaded = true;
 
-		// Resolve the canonical translations directory once. Files whose
-		// realpath doesn't live inside this directory are rejected below
-		// (defence in depth against symlink escapes - the glob can't
-		// otherwise reach outside, and an `include` must never follow a
-		// symlink out of this directory).
+		// An include must never follow a symlink out of this directory.
 		$dir_real = realpath( $dir );
 
 		foreach ( $files as $file ) {
 			$basename = basename( $file );
 
-			// The combined bundle shares the locale suffix (so locale-wide
-			// cleanup globs catch it) but is not a per-domain file - reaching
-			// here means it wasn't trusted above, so don't parse it at all.
+			// The untrusted combined bundle shares the locale suffix but is not a per-domain file.
 			if ( $basename === $combined_name ) {
 				continue;
 			}
@@ -476,9 +401,7 @@ final class TranslationFileLoader {
 				continue; // Broken symlink or missing parent - skip silently.
 			}
 
-			// Strict prefix check: the resolved file must sit inside the
-			// resolved translations directory. Trailing separator prevents
-			// `/foo` matching `/foobar`.
+			// The trailing separator stops `/foo` matching `/foobar`.
 			if ( strncmp( $file_real, $dir_real . DIRECTORY_SEPARATOR, strlen( $dir_real ) + 1 ) !== 0 ) {
 				continue;
 			}
@@ -501,11 +424,7 @@ final class TranslationFileLoader {
 					continue;
 				}
 
-				// Parse context from key format: context\x04original. A purely
-				// numeric source key (e.g. '42') is stored by PHP as an int
-				// array key, so guard str_contains() on is_string() and stringify
-				// the key below - the read side (get_translation) always passes a
-				// string $text, so the write key must stringify to match, never skip.
+				// Key format context\x04original; a numeric key arrives as int and is stringified, never skipped.
 				$context = '';
 
 				if ( is_string( $original ) && str_contains( $original, "\x04" ) ) {
@@ -543,12 +462,7 @@ final class TranslationFileLoader {
 	}
 
 	/**
-	 * Drop the per-blog memo.
-	 *
-	 * The container registers this class as a shared singleton, but its
-	 * translation memo is per-BLOG data. Without a reset on `switch_blog` a
-	 * multisite request that switches blogs keeps serving the previous blog's
-	 * strings. Hooked in Bootstrap alongside the other switch_blog resets.
+	 * Drop the per-blog memo on `switch_blog` (Bootstrap's reset registry): the service is a shared singleton.
 	 *
 	 * @return void
 	 */

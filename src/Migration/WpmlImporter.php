@@ -27,9 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Imports translation data from WPML.
  *
- * Reads WPML's icl_translations and icl_strings tables, maps language
- * codes to PerfLocale language IDs, and creates translation groups
- * and links for posts, terms, and strings.
+ * Reads WPML's tables and creates PerfLocale groups and links for posts, terms and strings.
  *
  * @phpstan-type ImportResult array{posts: int, terms: int, strings: int, errors: array<int, string>, blocked: bool, preflight: array<string, mixed>, menus: int, orders: int, term_languages: array{found: int, fixed: int, left: int, examples: list<string>}, skipped_kinds: array<string, int>, skipped: array<string, int>, skipped_examples: array<string, list<string>>, protected_domains: list<string>, strings_sanitized: int, strings_rejected: int}
  */
@@ -38,7 +36,7 @@ final class WpmlImporter {
 	use ImportHeartbeat;
 
 	/**
-	 * The import's stages, in the order it runs them ({@see ImportHeartbeat}).
+	 * The import's stages, in the order it runs them.
 	 */
 	private const PROGRESS_STAGES = [ 'posts', 'terms', 'term_check', 'strings', 'orders' ];
 
@@ -63,20 +61,14 @@ final class WpmlImporter {
 	private readonly StringRepository $strings;
 
 	/**
-	 * Source-map repository for idempotency across DB restores +
-	 * partial-failure crashes. The map pins WPML trids to the
-	 * translation_groups row PerfLocale created for them - so a re-run
-	 * after a restore finds the prior mapping and reuses the group_id
-	 * instead of allocating a duplicate.
+	 * Source map: WPML trid => PerfLocale group, so a re-run after a DB restore or a crash reuses the group.
 	 *
 	 * @var MigrationSourceMapRepository
 	 */
 	private readonly MigrationSourceMapRepository $source_map;
 
 	/**
-	 * Cache manager kept on the instance so we can construct additional
-	 * repositories (e.g. StringTranslationRepository) lazily during string
-	 * import without passing the cache through every call chain.
+	 * Cache manager, for the repositories the string import creates.
 	 *
 	 * @var CacheManager
 	 */
@@ -144,24 +136,21 @@ final class WpmlImporter {
 	private array $skipped_examples = [];
 
 	/**
-	 * Rows left out because their item is listed in another set, as
-	 * icl_translations.translation_id => true.
+	 * Rows left out because their item is listed in another set, as translation_id => true.
 	 *
 	 * @var array<int, true>
 	 */
 	private array $rows_in_other_sets = [];
 
 	/**
-	 * Whether string translations are stored through
-	 * Helper::sanitize_untrusted_string_translation().
+	 * Whether string translations go through Helper::sanitize_untrusted_string_translation().
 	 *
 	 * @var bool
 	 */
 	private bool $sanitize_strings = false;
 
 	/**
-	 * String translations of this run that were stored after the sanitizer
-	 * changed them.
+	 * String translations of this run stored after the sanitizer changed them.
 	 *
 	 * @var int
 	 */
@@ -178,16 +167,14 @@ final class WpmlImporter {
 	private const REJECTED_EXAMPLE_CHARS = 60;
 
 	/**
-	 * String translations of this run that were not stored because the
-	 * sanitizer left them empty.
+	 * String translations of this run not stored because the sanitizer left them empty.
 	 *
 	 * @var int
 	 */
 	private int $strings_rejected = 0;
 
 	/**
-	 * The originals of the first REJECTED_EXAMPLES of those translations,
-	 * each cut to REJECTED_EXAMPLE_CHARS characters.
+	 * Originals of the first REJECTED_EXAMPLES rejected translations, cut to REJECTED_EXAMPLE_CHARS characters.
 	 *
 	 * @var list<string>
 	 */
@@ -210,16 +197,10 @@ final class WpmlImporter {
 	}
 
 	/**
-	 * Store each imported string translation through
-	 * Helper::sanitize_untrusted_string_translation().
+	 * Sanitize imported string translations with Helper::sanitize_untrusted_string_translation().
 	 *
-	 * Only the translation is sanitized; the original keeps WPML's bytes,
-	 * because the string's hash is computed from it and must match the
-	 * msgid gettext looks up. A translation the sanitizer leaves empty is
-	 * not stored; its original string is still created, so it can be
-	 * translated on the Strings page. The caller decides: the migration job
-	 * passes true for a user without `unfiltered_html`; WP-CLI does not call
-	 * this and keeps WPML's bytes.
+	 * Only the translation: the original keeps WPML's bytes, as its hash must match gettext's msgid.
+	 * An emptied translation is not stored, its original is. The job sets it for users without `unfiltered_html`.
 	 *
 	 * @param bool $sanitize Whether to sanitize.
 	 * @return void
@@ -268,10 +249,8 @@ final class WpmlImporter {
 	/**
 	 * Run the full WPML import.
 	 *
-	 * The first import on a blog refuses to start (`blocked`, nothing
-	 * written) when WPML's default language is not PerfLocale's default, or
-	 * when WPML has content in a language PerfLocale does not have. Once an
-	 * import has run, the same findings are reported and the import runs.
+	 * The first import on a blog is `blocked` (nothing written) on a default-language mismatch or WPML
+	 * content in a language PerfLocale lacks; once an import has run, these are only reported.
 	 *
 	 * @return ImportResult
 	 */
@@ -513,6 +492,23 @@ final class WpmlImporter {
 			}
 		}
 
+		// A failed read looks like an empty answer, so the checks above may have missed a problem.
+		$read_errors = $reader->read_errors();
+
+		if ( $read_errors !== [] ) {
+			self::log_db_error( 'reading WPML settings', implode( ' | ', $read_errors ) );
+
+			$problems[] = [
+				'level'   => 'warning',
+				'code'    => 'settings_read_error',
+				'message' => sprintf(
+					/* translators: %s: source plugin name */
+					__( 'Some %s settings could not be read because of a database error, so the language checks may be incomplete. Re-run the import.', 'perflocale' ),
+					'WPML'
+				),
+			];
+		}
+
 		$blocking = false;
 
 		foreach ( $problems as $problem ) {
@@ -584,10 +580,8 @@ final class WpmlImporter {
 	/**
 	 * The active PerfLocale language a WPML code maps to, or null.
 	 *
-	 * An exact slug match first. Then WPML's own locale for the code equal to a
-	 * language's locale, which maps codes such as zh-hans (zh_CN) that are
-	 * neither a slug nor a locale prefix. Then a locale that starts with the
-	 * code ("pt-br" → pt_BR).
+	 * Exact slug, then WPML's own locale for the code (maps zh-hans, neither slug nor prefix, to
+	 * zh_CN), then a locale that starts with the code ("pt-br" → pt_BR).
 	 *
 	 * @param string        $code   WPML language code.
 	 * @param array<object> $active Active PerfLocale languages.
@@ -638,9 +632,8 @@ final class WpmlImporter {
 	/**
 	 * WPML element types the import leaves out.
 	 *
-	 * Menu items and attachments (WPML Media's per-language copies) are not
-	 * grouped by PerfLocale, and translation_priority and product_visibility
-	 * are WPML's and WooCommerce's internal taxonomies.
+	 * PerfLocale does not group menu items or attachments (WPML Media copies); translation_priority
+	 * and product_visibility are WPML's and WooCommerce's internal taxonomies.
 	 *
 	 * @return list<string>
 	 */
@@ -747,9 +740,8 @@ final class WpmlImporter {
 	/**
 	 * The error left by the source read that just ran, or '' when it worked.
 	 *
-	 * A failed get_col()/get_results() returns [] exactly as an empty result
-	 * does; only last_error tells them apart, and the next query resets it,
-	 * so call this straight after the read.
+	 * A failed read returns [] like an empty one; only last_error tells them apart and the next
+	 * query resets it, so call this straight after the read.
 	 *
 	 * @phpstan-impure
 	 *
@@ -762,10 +754,8 @@ final class WpmlImporter {
 	/**
 	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
 	 *
-	 * That text can carry table names with their prefix and row values.
-	 * Migration results and job rows are shown to every user with Jobs
-	 * access, so the messages stored there say only that a database error
-	 * happened; the detail is here.
+	 * The text can hold prefixed table names and row values, and results are shown to every user
+	 * with Jobs access, so stored messages only say that a database error happened.
 	 *
 	 * @param string $where What was running, for the log line.
 	 * @param string $error The database error.
@@ -837,11 +827,8 @@ final class WpmlImporter {
 			$wpml_langs = [];
 		}
 
-		// Union in languages that appear ONLY in icl_string_translations. A
-		// language activated for admin/theme string translation but with no
-		// translated posts yet has NO icl_translations rows - building the map
-		// from icl_translations alone would leave those string translations
-		// unmapped and silently dropped at the $lang_id === null skip.
+		// Add languages found only in icl_string_translations: a language with string translations
+		// but no translated posts has no icl_translations rows, and its strings would be skipped.
 		$str_trans_table = $this->wpdb->prefix . 'icl_string_translations';
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -874,31 +861,22 @@ final class WpmlImporter {
 
 		$active_languages = $this->languages->get_active();
 
-		// Guard against two WPML codes resolving to the SAME PerfLocale id (an
-		// exact slug match on one plus a locale-prefix match on another, e.g.
-		// 'pt' + 'pt-br' against a single Portuguese language). One object per
-		// (group, language) is a hard invariant - a second code sharing the id
-		// would make link_object() evict the first sibling's link from every
-		// shared trid. Keep the first claimant, skip and report the rest.
+		// Two WPML codes may resolve to one PerfLocale language ('pt' and 'pt-br'); link_object() would
+		// then evict the first code's links, so the first claimant wins and the rest are reported.
 		// Mirrors PolylangImporter::build_language_map().
 		$claimed_by = [];
 
 		foreach ( $wpml_langs as $wpml_code ) {
 			$wpml_code = sanitize_text_field( $wpml_code );
 
-			// Skip blank codes. WPML's icl_translations carries rows with an
-			// empty language_code (orphaned auto-draft / comment / package
-			// element rows). A blank code would prefix-match every locale and
-			// import every blank/NULL-code row as the site default. Leaving ''
-			// unmapped makes those rows skip cleanly.
+			// WPML keeps orphaned rows with an empty language_code; a blank code would prefix-match
+			// every locale and import those rows as the default language.
 			if ( $wpml_code === '' ) {
 				continue;
 			}
 
-			// Slug, then WPML's own locale for the code, then a locale prefix;
-			// see match_language(). The slug pass comes first so a language
-			// whose locale merely starts with the code (en_GB for "en") never
-			// shadows the language whose slug is the code.
+			// The slug pass of match_language() comes first, so a locale that merely starts with the
+			// code (en_GB for "en") never shadows the language whose slug is the code.
 			$matched = $this->match_language( $wpml_code, $active_languages );
 
 			if ( $matched !== null ) {
@@ -929,8 +907,7 @@ final class WpmlImporter {
 	/**
 	 * Import post translations from WPML.
 	 *
-	 * Groups WPML translations by trid and creates PerfLocale
-	 * translation groups with links for each language version.
+	 * One PerfLocale group per WPML trid, with a link per language version.
 	 *
 	 * @param array<string, mixed> $result Import result (passed by reference for errors).
 	 * @phpstan-param ImportResult $result
@@ -941,10 +918,7 @@ final class WpmlImporter {
 		$icl_table = $this->wpdb->prefix . 'icl_translations';
 		$imported  = 0;
 
-		// Bounded memory: fetch DISTINCT trids first (one BIGINT per row),
-		// chunk them, then per chunk SELECT only those trids' rows and process
-		// - rather than one big SELECT holding every row in memory before
-		// grouping (~15 MB of PHP arrays on a 50k-post bilingual install).
+		// Bounded memory: the distinct trids first, then each batch's rows only.
 
 		[ $skip_sql, $skip_values ] = $this->skipped_types_clause( 'element_type' );
 
@@ -976,8 +950,7 @@ final class WpmlImporter {
 		$this->beat( 'posts', 0, count( $trids ) );
 
 		foreach ( $batches as $batch_index => $batch ) {
-			// $placeholders is a generated '%d,%d,...' string sized to the
-			// current batch - safe to interpolate into the IN() clause.
+			// Generated %d placeholders sized to the batch, safe to interpolate.
 			$placeholders = implode( ',', array_fill( 0, count( $batch ), '%d' ) );
 
 			// The icl_translations table identifier is class-controlled and bound to the current blog's wpdb prefix.
@@ -1015,9 +988,7 @@ final class WpmlImporter {
 
 			$imported += $this->process_trid_groups( ObjectType::Post, $groups_by_trid, $result );
 
-			// Bound worker memory on huge legacy sites: drop runtime object-cache
-			// copies + SAVEQUERIES log accumulated by this batch (re-fetched on
-			// demand; persistent cache untouched).
+			// Drop this batch's runtime cache and SAVEQUERIES log; the persistent cache is untouched.
 			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 			$this->beat( 'posts', min( count( $trids ), ( $batch_index + 1 ) * $batch_size ), count( $trids ) );
 		}
@@ -1031,31 +1002,8 @@ final class WpmlImporter {
 	/**
 	 * Group and link one batch of WPML translation sets (trids) of posts or terms.
 	 *
-	 * WPML writes an icl_translations row (with authoritative language) for
-	 * every element, including untranslated ones that form a single-row
-	 * trid. A lone default-language item needs no group: PerfLocale's
-	 * default-language fallback resolves it. A lone item in any other
-	 * language gets a group, or it would be served as the default language.
-	 *
-	 * A row is never linked in a way that silently moves or unlinks another
-	 * item. These rows are skipped and counted in the result's `skipped`
-	 * map ({@see skip_row()}):
-	 * - `missing_object`: the post or term no longer exists;
-	 * - `unmapped_language`: the language has no PerfLocale language;
-	 * - `duplicate_language` / `duplicate_item`: a second row of a language,
-	 *   or of an item, the set already has (the row with the lowest WPML
-	 *   translation_id is kept);
-	 * - `several_sets`: the item is listed in another set too
-	 *   ({@see find_rows_in_several_sets()});
-	 * - `language_taken`: the group the set reuses holds one of the set's
-	 *   languages for an item that is not in the set, so linking would unlink
-	 *   that item; the whole set is left as it is;
-	 * - `other_set_group`: the group the set would join through its items is
-	 *   recorded for another WPML set that WPML still lists; the whole set is
-	 *   left as it is and is not recorded onto that group;
-	 * - `split_groups`: the set's items sit in two or more PerfLocale groups
-	 *   that also hold items outside the set, so linking them together would
-	 *   move an item away from the others; the whole set is left as it is.
+	 * A lone default-language item gets no group; a row that would move or unlink another item is
+	 * skipped and counted: docs-ai/11-code-rationale.md, "WpmlImporter: skip reasons".
 	 *
 	 * @param ObjectType                     $type           Post or Term.
 	 * @param array<array<int, object>>      $groups_by_trid trid => rows, in translation_id order.
@@ -1132,25 +1080,19 @@ final class WpmlImporter {
 
 			$first = $members[0];
 
-			// A single-row trid is only worth a group when its language is
-			// non-default.
+			// A single-row trid needs a group only in a non-default language.
 			if ( count( $trid_rows ) < 2 && $first['lang'] === $default_lang_id ) {
 				continue;
 			}
 
-			// Reuse path #1: the source map (committed in the same transaction
-			// as the group). Confirm the group still exists: a row left by a
-			// pre-cascade delete or a manual removal must not link items to a
-			// dead group. Reuse path #2: a group the set's items already
-			// belong to (a group PerfLocale gave them on save, or an import
-			// from before the source map existed), see member_group().
+			// Reuse the source map's group only if it exists (a stale row must not link to a dead
+			// group), else a group the set's items already belong to (member_group()).
 			$source_key = $trid . '|' . $kind;
 			$mapped_id  = $this->source_map->get_group_id( 'wpml', $source_key );
 			$existing   = $mapped_id !== null ? $this->groups->find( $mapped_id ) : null;
 
-			// A recorded group that no longer fits the set (another kind of
-			// group, or one holding other items in the set's languages) is
-			// counted and not used; the writes below replace the record.
+			// A recorded group that does not fit the set (another kind, or other items in the set's
+			// languages) is counted and not used; the writes below replace the record.
 			if ( $existing && ! SourceMapCheck::group_fits( $type, (int) $mapped_id, array_column( $members, 'object' ), array_flip( array_column( $members, 'lang' ) ) ) ) {
 				$this->skip_row( 'stale_source_map', $trid, $kind, $first['object'] );
 				$existing = null;
@@ -1174,10 +1116,8 @@ final class WpmlImporter {
 				$group_id   = (int) $existing->id;
 				$seed_index = 0;
 
-				// A group recorded for another WPML set is that set's: joining it
-				// would merge two WPML sets into one group. A recorded set whose
-				// trid WPML no longer lists (its tables were rebuilt) owns
-				// nothing any more.
+				// A group recorded for another WPML set is that set's: joining would merge two sets.
+				// A recorded trid that WPML does not list (rebuilt tables) owns nothing.
 				$other_keys = $mapped_id !== $group_id
 					? array_values( array_diff( $this->source_map->keys_for_group( 'wpml', $group_id ), [ $source_key ] ) )
 					: [];
@@ -1198,9 +1138,7 @@ final class WpmlImporter {
 					continue;
 				}
 
-				// Converge the source map on the reuse path too (INSERT .. ON
-				// DUPLICATE KEY UPDATE: idempotent, also repairs a stale row),
-				// keeping one key per group.
+				// Converge the source map on the reuse path too (idempotent upsert), one key per group.
 				if ( $mapped_id !== $group_id ) {
 					foreach ( $other_keys as $stale_key ) {
 						$this->source_map->delete_key( 'wpml', $stale_key );
@@ -1241,16 +1179,13 @@ final class WpmlImporter {
 				++$imported;
 			}
 
-			// Link every member - including the first when an existing group is
-			// reused, since it may sit in another group or under another
-			// language, and link_object() moves it.
+			// Link every member, the first too on a reused group: link_object() moves it from
+			// another group or language.
 			for ( $i = $seed_index, $count = count( $members ); $i < $count; $i++ ) {
 				$member = $members[ $i ];
 
-				// Skip a member already in this group with this language: BOTH
-				// halves matter. PerfLocale files every new post under the default
-				// language on save, so an item can sit in this group under the
-				// wrong language.
+				// Skip only when group and language both match: a save files every new post under the
+				// default language, so an item can sit in this group under the wrong language.
 				$already = $this->groups->find_link_for_object( $member['object'], $type );
 
 				if ( $already
@@ -1283,13 +1218,8 @@ final class WpmlImporter {
 	/**
 	 * The PerfLocale group a set with no recorded group joins, from its items' groups.
 	 *
-	 * With one group among the items, that group. With several, the one that
-	 * also holds items outside the set (the others hold set items only, so
-	 * moving those leaves nothing behind); when none does, the group of the
-	 * first item that has one. When two or more hold items outside the set,
-	 * every choice would move a set item away from items that stay behind.
-	 * The result does not depend on the order of the set's rows, except for
-	 * which of several set-only groups is kept.
+	 * The one group that also holds items outside the set, else the first item's group; refused when
+	 * two hold outside items, as any choice would move a set item away from them.
 	 *
 	 * @param list<array{row: object, object: int, lang: int}> $members The set's items.
 	 * @param ObjectType                                       $type    Post or Term.
@@ -1340,8 +1270,7 @@ final class WpmlImporter {
 	/**
 	 * Whether WPML still lists any of these source-map keys' trids.
 	 *
-	 * A key that is not of the "<trid>|<kind>" form, or a read error, counts
-	 * as listed.
+	 * A key not of the "<trid>|<kind>" form, or a read error, counts as listed.
 	 *
 	 * @param string[] $keys Source-map keys.
 	 * @return bool
@@ -1377,9 +1306,8 @@ final class WpmlImporter {
 	/**
 	 * Whether linking a set into an existing group would unlink an item outside the set.
 	 *
-	 * The link_object() call replaces the group's link for a language. When that link
-	 * belongs to an item the WPML set does not list, the replacement unlinks
-	 * it without a word (served as the default language from then on).
+	 * The link_object() call replaces the group's link for a language; an item outside the set
+	 * holding it would be silently unlinked (served as the default language).
 	 *
 	 * @param int                                              $group_id Group the set would join.
 	 * @param list<array{row: object, object: int, lang: int}> $members  The set's items.
@@ -1409,10 +1337,8 @@ final class WpmlImporter {
 	/**
 	 * The link status an imported item gets.
 	 *
-	 * A post's comes from its real status: a WPML draft translation under a
-	 * published source must not be imported as published, or hreflang and
-	 * the switcher would offer a public URL for a non-public post. Every
-	 * non-publish state is Draft. Terms are Published.
+	 * Posts take their real status, so hreflang and the switcher never offer a non-public post:
+	 * publish is Published, any other state Draft. Terms are Published.
 	 *
 	 * @param ObjectType $type      Post or Term.
 	 * @param int        $object_id Post or term ID.
@@ -1429,17 +1355,8 @@ final class WpmlImporter {
 	/**
 	 * Find the rows of items WPML lists in more than one translation set.
 	 *
-	 * A post or term belongs to one PerfLocale group, so only one of its rows
-	 * can be imported. WPML leaves such rows after a post-type change or when
-	 * a plugin re-registers an item. The row kept is:
-	 * - the only row whose element type matches the item's real post type or
-	 *   taxonomy, when exactly one does;
-	 * - otherwise, when the remaining rows all give the item one language,
-	 *   the row in the largest set (then the lowest trid);
-	 * - otherwise none: all of the item's rows are skipped and its links stay
-	 *   as they are.
-	 * Every other row is counted as `several_sets` and left out by
-	 * {@see process_trid_groups()}. One read per import and kind.
+	 * An item joins one PerfLocale group, so one row is kept and the rest count as `several_sets`:
+	 * docs-ai/11-code-rationale.md, "WpmlImporter: items in several sets".
 	 *
 	 * @param ObjectType $type Post or Term.
 	 * @return void
@@ -1537,7 +1454,7 @@ final class WpmlImporter {
 	/**
 	 * Count one skipped icl_translations row under its reason, with a few examples.
 	 *
-	 * @param string $reason    Reason key (see {@see process_trid_groups()}).
+	 * @param string $reason    Reason key (see process_trid_groups()).
 	 * @param int    $trid      WPML trid.
 	 * @param string $kind      post or term.
 	 * @param int    $object_id Post or term ID (term_taxonomy_id when the term is missing).
@@ -1617,10 +1534,7 @@ final class WpmlImporter {
 	}
 
 	/**
-	 * Resolve the per-batch chunk size for both post + term import paths.
-	 * Filterable via `perflocale/migration/wpml/batch_size`. Default 100
-	 * trids per batch - at ~2 langs each that's ~200 wp_icl_translations
-	 * rows per SELECT. Clamped to 10–1000.
+	 * Trids per batch for the post and term imports, clamped to 10-1000.
 	 *
 	 * @return int
 	 */
@@ -1628,11 +1542,7 @@ final class WpmlImporter {
 		/**
 		 * Per-batch chunk size during WPML migration. Default 100 trids.
 		 *
-		 * Lower = smaller memory peak per batch, more SELECT round-trips.
-		 * Higher = bigger memory peak, fewer round-trips. The bottleneck on
-		 * large migrations is typically the per-row `get_post` /
-		 * `find_for_object` chain, not the SELECT, so the default sits in
-		 * the middle of the safe range.
+		 * Lower means a smaller memory peak per batch and more SELECT round trips.
 		 *
 		 * @hook perflocale/migration/wpml/batch_size
 		 * @param int $size Default 100.
@@ -1656,7 +1566,7 @@ final class WpmlImporter {
 		[ $skip_sql, $skip_values ] = $this->skipped_types_clause( 'element_type' );
 		[ $skip_sql_icl ]           = $this->skipped_types_clause( 'icl.element_type' );
 
-		// Same batched-fetch refactor as import_post_translations.
+		// Bounded memory: the distinct trids first, as in import_post_translations().
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$trids = $this->wpdb->get_col(
 			$this->wpdb->prepare(
@@ -1685,16 +1595,11 @@ final class WpmlImporter {
 		$this->beat( 'terms', 0, count( $trids ) );
 
 		foreach ( $batches as $batch_index => $batch ) {
-			// $placeholders is a generated '%d,%d,...' string sized to the
-			// current batch - safe to interpolate into the IN() clause.
+			// Generated %d placeholders sized to the batch, safe to interpolate.
 			$placeholders = implode( ',', array_fill( 0, count( $batch ), '%d' ) );
 
 			// The icl_translations table identifier is class-controlled and bound to the current blog's wpdb prefix.
-			// WPML stores the TERM TAXONOMY id (not the term_id) in
-			// icl_translations.element_id for taxonomy rows. Resolve the real
-			// term_id via wp_term_taxonomy so the group links to a term WP can
-			// actually find - using element_id directly links the wrong term
-			// (term_id != term_taxonomy_id on most sites) or silently no-ops.
+			// For taxonomy rows element_id is the term_taxonomy_id: resolve the real term_id.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders -- Replacements are assembled with array_merge()/unpacking, which WPCS cannot count; the %i table names lead, then the values in placeholder order.
 			$rows = $this->wpdb->get_results(
 				$this->wpdb->prepare(
@@ -1728,9 +1633,7 @@ final class WpmlImporter {
 
 			$imported += $this->process_trid_groups( ObjectType::Term, $groups_by_trid, $result );
 
-			// Bound worker memory on huge legacy sites: drop runtime object-cache
-			// copies + SAVEQUERIES log accumulated by this batch (re-fetched on
-			// demand; persistent cache untouched).
+			// Drop this batch's runtime cache and SAVEQUERIES log; the persistent cache is untouched.
 			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 			$this->beat( 'terms', min( count( $trids ), ( $batch_index + 1 ) * $batch_size ), count( $trids ) );
 		}
@@ -1744,10 +1647,8 @@ final class WpmlImporter {
 	/**
 	 * Give the menus of one WPML nav_menu translation set their PerfLocale languages and links.
 	 *
-	 * MenuManager picks the menu for the visitor's language from term meta
-	 * only, so the translation group alone changes nothing on the front end.
-	 * A menu WPML had in one language only gets no language: its items keep
-	 * being pointed at each language's pages, as for any shared menu.
+	 * MenuManager picks a menu by its term meta only, so the group alone changes nothing on the
+	 * front end. A menu WPML had in one language only gets no language and stays shared.
 	 *
 	 * @param array<int, object>   $trid_rows The trid's icl_translations rows.
 	 * @param array<string, mixed> $result    Import result (menus, errors).
@@ -1817,24 +1718,11 @@ final class WpmlImporter {
 			return 0;
 		}
 
-		// Hoist the StringTranslationRepository OUT of the per-row loop. The
-		// repo is stateless beyond its CacheManager dependency, so a single
-		// instance services every iteration. Previously a `new` ran on every
-		// row - measurable on a 50k-string WPML site (50k allocations of
-		// objects + their wp_cache_get bootstraps) and pure waste.
+		// One repository instance for every row.
 		$str_trans = new \PerfLocale\Database\Repository\StringTranslationRepository( $this->cache );
 
-		// Keyset-paginated batch loop. Replaces a single SELECT that pulled
-		// every WPML string translation into PHP memory at once - which on
-		// a 50k-string WPML export was ~25 MB of PHP arrays before the loop
-		// even started running and reliably OOM'd the default 256M PHP
-		// memory limit. WHERE s.id > $last_id + ORDER BY s.id ASC + LIMIT N
-		// is also faster than OFFSET-based pagination because the index seek
-		// is constant per batch instead of linear in the offset.
-		//
-		// Batch size is filterable so very-large-string sites can tune it
-		// down (longer per-string values) or hosted environments with
-		// generous memory can crank it up to reduce DB round-trips.
+		// Keyset pagination on st.id: one SELECT of every row exhausts memory on large sites, and
+		// an OFFSET seek grows with the offset. The batch size is filterable.
 		$batch_size = (int) apply_filters( 'perflocale/migration/wpml_string_batch_size', 500 );
 
 		if ( $batch_size < 1 ) {
@@ -1854,11 +1742,8 @@ final class WpmlImporter {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$rows = $this->wpdb->get_results(
 				$this->wpdb->prepare(
-					// WPML's icl_strings has NO `domain_name` column: the text
-					// domain lives in `context` and the gettext msgctxt in
-					// `gettext_context`. Selecting the nonexistent column made
-					// the whole query error → zero WPML string translations
-					// imported. Alias to the names the consumer already expects.
+					// The icl_strings table has no `domain_name` column: the domain is `context` and the
+					// msgctxt `gettext_context`, aliased to the names the batch code reads.
 					"SELECT s.id, s.value, s.context AS domain_name, s.gettext_context AS string_context,
 							st.id AS st_id, st.language, st.value AS translated_value
 					FROM %i s
@@ -1872,18 +1757,13 @@ final class WpmlImporter {
 					$strings_table,
 					$str_trans_table,
 					10, // ICL_TM_COMPLETE
-					3,  // ICL_TM_NEEDS_UPDATE - WPML still SERVES these (existing
-					// translation shown, flagged for review); status=10 alone
-						// silently dropped every needs-update translation.
+					3,  // ICL_TM_NEEDS_UPDATE: WPML still serves these, flagged for review.
 					$last_id,
 					$batch_size
 				)
 			);
 
-			// A non-empty last_error means the batch SELECT itself failed (a
-			// WPML schema the aliases don't match, or a missing
-			// icl_string_translations table). Surface it instead of breaking
-			// out as if the import cleanly finished with zero rows.
+			// A failed batch SELECT (schema mismatch, missing table) is reported, not taken as the end.
 			if ( $this->wpdb->last_error !== '' ) {
 				self::log_db_error( 'reading string translations', $this->wpdb->last_error );
 
@@ -1901,20 +1781,14 @@ final class WpmlImporter {
 
 			$imported += $this->import_string_batch( $rows, $str_trans, $domains, $skipped_unmapped, $skipped_insert, $link_failures );
 
-			// Advance keyset cursor. Even if the last batch was short, we
-			// still capture the highest id so a partial-fail+restart can
-			// resume cleanly (file/data import jobs use the same idiom).
+			// Advance the keyset cursor.
 			$last_id   = (int) end( $rows )->st_id;
 			$row_count = count( $rows );
 
-			// Release the batch array reference so PHP can reclaim the
-			// memory before the next iteration. Critical on big sites:
-			// without this, gc_collect_cycles() can leave the previous
-			// batch in scope until the do-while condition is evaluated.
+			// Free the batch before the next one is read.
 			unset( $rows );
 
-			// Bound worker memory between streamed batches (runtime cache +
-			// SAVEQUERIES log only; persistent cache untouched).
+			// Drop this batch's runtime cache and SAVEQUERIES log; the persistent cache is untouched.
 			\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 
 			$done += $row_count;
@@ -1925,9 +1799,7 @@ final class WpmlImporter {
 
 			$this->beat( 'strings', $done, $total );
 
-			// Partial batch → end of data. Avoids one wasted round-trip
-			// that would just return zero rows under the cursor we just
-			// advanced past.
+			// A short batch is the last one: skip the empty round trip.
 			if ( $row_count < $batch_size ) {
 				break;
 			}
@@ -1976,14 +1848,8 @@ final class WpmlImporter {
 	/**
 	 * Import one batch of WPML string translations.
 	 *
-	 * Reads the batch's strings, translations and links with one query each
-	 * and writes inside one transaction, so a batch costs a few round trips
-	 * and one commit instead of several commits per row. Every row ends as a
-	 * row-by-row import leaves it: a missing string is created, an existing
-	 * translation is never replaced, and the link is written unless it
-	 * already links this string as an imported translation. A row whose
-	 * translation the sanitizer leaves empty still has its string created,
-	 * with no translation and no link for that row.
+	 * One read per kind and one transaction per batch, with the row-by-row result: a missing string
+	 * is created, an existing translation is kept, a link is written unless already imported.
 	 *
 	 * @param object[]                    $rows             Batch rows: id, value, domain_name, string_context, st_id, language, translated_value.
 	 * @param StringTranslationRepository $str_trans        Translations.
@@ -2040,14 +1906,8 @@ final class WpmlImporter {
 			return 0;
 		}
 
-		// One transaction per batch, which must never go on once it is lost
-		// (Schema::transaction_lost(): a failed statement of the batch, or any
-		// failed query that ended the transaction: on SQLite every one, after
-		// which later statements commit one by one; on MySQL a deadlock).
-		// write_string_batch() checks after every statement and stops at once;
-		// the batch is then rolled back and written again outside a
-		// transaction, row by row where the batch form failed, as an import
-		// without a transaction writes it.
+		// A lost transaction (Schema::transaction_lost()) must not go on: write_string_batch() stops at
+		// once, then the batch is rolled back and written again without a transaction.
 		$counters = [ $domains, $skipped_insert, $link_failures, $this->strings_sanitized ];
 		$errors   = Schema::query_error_count();
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One transaction per batch.
@@ -2083,11 +1943,10 @@ final class WpmlImporter {
 	}
 
 	/**
-	 * Write one prepared batch of WPML string translations (see
-	 * import_string_batch()). With $in_transaction it stops as soon as the
-	 * transaction is lost, before sending another statement, and answers
-	 * null; without it a failed batch write falls back to one write per row,
-	 * as before.
+	 * Write one prepared batch of WPML string translations.
+	 *
+	 * In a transaction it returns null once the transaction is lost, before the next statement;
+	 * outside one, a failed batch write falls back to one write per row.
 	 *
 	 * @param array                       $items          Translations to write.
 	 * @param array                       $originals      Strings to create without a translation.
@@ -2255,11 +2114,8 @@ final class WpmlImporter {
 			}
 		}
 
-		// The value row alone is never served: the gettext map, the
-		// files-mode generator and the strings screen all join
-		// translation_links. A link is written unless it already links
-		// this string as an imported translation; a failed write is
-		// counted, because that translation is stored but shown nowhere.
+		// Only a link makes a value served (the gettext map, files mode and the Strings screen join
+		// translation_links), so a failed link write is counted.
 		$to_link = [];
 		$moved   = [];
 
@@ -2319,8 +2175,7 @@ final class WpmlImporter {
 	}
 
 	/**
-	 * Count a string translation the sanitizer left empty, keeping the first
-	 * few originals, cut short, as examples.
+	 * Count a string translation the sanitizer left empty, keeping a few short originals as examples.
 	 *
 	 * @param string $original The translation's original.
 	 * @return void
@@ -2334,8 +2189,7 @@ final class WpmlImporter {
 	}
 
 	/**
-	 * The sentence for string translations an import did not store because
-	 * removing HTML that is not allowed left them empty; empty for a count of 0.
+	 * The notice for translations the HTML sanitizer left empty; '' for a count of 0.
 	 *
 	 * @param int $count Translations not stored.
 	 * @return string
@@ -2413,13 +2267,8 @@ final class WpmlImporter {
 	/**
 	 * Keep the string GC away from the domains this import filled.
 	 *
-	 * The GC deletes strings the scanner has not seen for 90 days once a full
-	 * scan ran; WPML's domains (admin texts, widgets, theme and plugin option
-	 * strings) are never scanned, so their imported translations would all be
-	 * deleted. Imported domains are added to `perflocale_gc_protected_domains`,
-	 * which the GC honours, except domains the scanner owns (a row with a real
-	 * file path): those follow the scan, which keeps a string while it is
-	 * still in the code. Entries are only ever added.
+	 * The GC deletes strings unseen by the scanner for 90 days, and WPML's domains are never scanned:
+	 * see docs-ai/11-code-rationale.md, "WpmlImporter: GC-protected domains".
 	 *
 	 * @param string[] $domains Domains holding an imported string or translation.
 	 * @return list<string> Domains added to the option.
@@ -2474,12 +2323,8 @@ final class WpmlImporter {
 	/**
 	 * Re-attach imported posts that sit on a category or tag of another language.
 	 *
-	 * WPML hid such assignments; PerfLocale lists a post under every term it is
-	 * attached to, whatever the term's language. Each affected post goes
-	 * through TermAssignmentFilter::normalize_post_terms(), which swaps a
-	 * wrong-language term for its translation in the post's language and
-	 * leaves it in place when there is none. A term without a language link
-	 * counts as the default language.
+	 * WPML hid them, PerfLocale lists them. normalize_post_terms() swaps the term for its translation
+	 * or leaves it; a term without a language link counts as the default language.
 	 *
 	 * @param array<string, mixed> $result Import result (term_languages, errors).
 	 * @phpstan-param ImportResult $result
@@ -2642,8 +2487,7 @@ final class WpmlImporter {
 	/**
 	 * Copy WPML's order language (`wpml_language`) to PerfLocale's order meta.
 	 *
-	 * Orders only, and only those without a PerfLocale language yet
-	 * ({@see OrderLanguageCopy}).
+	 * Only orders without a PerfLocale language (OrderLanguageCopy).
 	 *
 	 * @param array<string, mixed> $result Import result (errors).
 	 * @phpstan-param ImportResult $result

@@ -21,11 +21,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Renders a filterable table of all translatable content with
- * per-language translation status badges.
- *
- * Uses an inline simplified WP_List_Table pattern without extending
- * the core class directly.
+ * Renders the filterable table of translatable content with per-language status badges (a simplified list table,
+ * not a WP_List_Table subclass).
  */
 final class TranslationsPage {
 
@@ -35,6 +32,16 @@ final class TranslationsPage {
 	 * @var Settings
 	 */
 	private readonly Settings $settings;
+
+	/**
+	 * Most rows a list longer than one page is checked over to page and count it by the rows the user may view.
+	 */
+	private const VIEW_CHECK_MAX = 2000;
+
+	/**
+	 * Whether the list's count includes rows the host refuses the user (past VIEW_CHECK_MAX rows): not shown.
+	 */
+	private bool $count_hidden = false;
 
 	/**
 	 * Constructor.
@@ -59,15 +66,13 @@ final class TranslationsPage {
 		$languages  = $lang_repo->get_active();
 		$post_types = $this->settings->get_translatable_post_types();
 
-		// User column-visibility preference (matches Strings page pattern).
+		// The user's hidden language columns (as on the Strings screen).
 		$hidden_langs = (array) get_user_meta( get_current_user_id(), 'perflocale_translations_hidden_langs', true );
 
-		// Read filters (no nonce needed for read-only filtering).
+		// Read-only filters: no nonce.
 		// phpcs:disable WordPress.Security.NonceVerification.Recommended
 		$filter_post_type = isset( $_GET['post_type_filter'] ) ? sanitize_text_field( wp_unslash( $_GET['post_type_filter'] ) ) : '';
-		// Canonical language filter - the slug form (`?perflocale_lang=de`)
-		// used by the WP admin-bar switcher and every other list page in
-		// the plugin. Resolved to an internal language ID for the repo.
+		// The language filter's slug form (`?perflocale_lang=de`), as the admin bar switcher and every list screen use it.
 		$lang_slug_filter = isset( $_GET['perflocale_lang'] ) ? sanitize_key( $_GET['perflocale_lang'] ) : '';
 		$filter_language  = 0;
 
@@ -75,25 +80,19 @@ final class TranslationsPage {
 			$resolved        = $lang_repo->find_by_slug( $lang_slug_filter );
 			$filter_language = $resolved ? (int) $resolved->id : 0;
 		}
-		// One of the statuses the filter offers, or none. The all-language
-		// selector caches one result per status, and a status change of a
-		// translatable post deletes exactly those entries.
+		// A status the filter offers, or none; the all-language selector caches one result per status.
 		$filter_status_raw = isset( $_GET['status_filter'] ) ? sanitize_key( wp_unslash( $_GET['status_filter'] ) ) : '';
 		$filter_status     = $filter_status_raw !== ''
 			? ( TranslationStatus::tryFrom( $filter_status_raw )?->value ?? '' )
 			: '';
-		// Source / provenance filter (translation_links.source). Validated against
-		// SourceType::tryFrom so URL injection cannot smuggle arbitrary values
-		// into matches_filters().
+		// Source filter (translation_links.source), validated with SourceType::tryFrom().
 		$filter_source_raw = isset( $_GET['source_filter'] ) ? sanitize_key( wp_unslash( $_GET['source_filter'] ) ) : '';
 		$filter_source     = $filter_source_raw !== ''
 			? ( \PerfLocale\Enum\SourceType::tryFrom( $filter_source_raw )?->value ?? '' )
 			: '';
 		$search            = isset( $_GET['s'] ) ? sanitize_text_field( wp_unslash( $_GET['s'] ) ) : '';
 		$paged             = isset( $_GET['paged'] ) ? max( 1, absint( $_GET['paged'] ) ) : 1;
-		// Sorting - allow-listed orderby → WP_Query orderby mapping. Anything
-		// outside the list falls back to the default (modified DESC) so the
-		// URL can't inject arbitrary SQL column refs.
+		// Allow-listed orderby => WP_Query orderby; anything else sorts by modified DESC.
 		$sort_map    = [
 			'id'    => 'ID',
 			'title' => 'title',
@@ -106,7 +105,7 @@ final class TranslationsPage {
 
 		$per_page = $this->get_per_page();
 
-		// Build query args.
+		// Query args.
 		$query_post_types = $filter_post_type !== '' && in_array( $filter_post_type, $post_types, true )
 			? [ $filter_post_type ]
 			: $post_types;
@@ -118,49 +117,28 @@ final class TranslationsPage {
 			'paged'                  => $paged,
 			'orderby'                => $orderby_wp,
 			'order'                  => $order,
-			// Custom flag picked up by the posts_where filter below - hides
-			// non-default-language translations so each group shows once
-			// (as its default-language source row). Orphan posts (no links
-			// at all) remain visible.
+			// Read by the posts_where filter below: only each group's default-language source row is listed (posts without
+			// links stay visible).
 			'perflocale_only_source' => true,
 		];
 
-		// Title-only search via the s parameter - scoped to post_title via
-		// the 's' query WP_Query handles natively. Cheaper than meta search
-		// and matches what the user typed in the title field.
+		// Title search through WP_Query's `s`.
 		if ( $search !== '' ) {
 			$query_args['s'] = $search;
 		}
 
-		// Register the one-shot filter that appends a NOT IN subquery
-		// excluding every post_id that exists in translation_links with a
-		// non-default language. Scoped by the `perflocale_only_source`
-		// query var so it never leaks to unrelated queries.
+		// One-shot posts_where filter excluding non-default-language translations, scoped by `perflocale_only_source`.
 		$this->register_source_only_filter( $lang_repo );
 
-		// Rows the current user may not read stay off the list and out of its
-		// count (run_list_query()). '' for a user who may read every row.
-		$unreadable_where = $this->unreadable_rows_where( $query_post_types );
+		// Rows the user may not read are neither listed nor counted (run_list_query()); '' when every row is readable.
+		$unreadable_where = $this->unreadable_rows_where( $query_post_types ) . $this->non_mapped_unreadable_where( $query_post_types );
 
-		// Push language + status filters down to SQL so WP_Query's found_posts
-		// reflects the filtered result size (prevents paginator advertising
-		// pages that are all filtered out post-query). When either filter is
-		// active we resolve the matching source object IDs up front and pass
-		// them via `post__in`, which causes WP to compute pagination against
-		// the filtered ID set instead of the entire post_type row count.
-		// The source filter is applied client-side via matches_filters();
-		// the count drift is mild and the join cost wasn't worth the repo
-		// surface area at the time.
+		// Language and status filters resolve matching ids up front and go in as `post__in`, so found_posts and the
+		// paginator count the filtered set. The source filter runs in PHP (matches_filters()); its count drift is mild.
 		$filter_active = ( $filter_language > 0 || $filter_status !== '' );
 
-		// The source-only filter registered above discards every object whose
-		// link is not the default language, so the ID resolution can be bound
-		// to that language up front instead of loading every language's rows
-		// into PHP and then throwing most of them away. 0 when the site has no
-		// default language - in which case that filter is not registered
-		// either, and the unbounded behaviour is still correct. The
-		// all-language status filter in matches_filters() skips this
-		// language's link the same way the SQL selector does.
+		// The source-only filter keeps default-language links only, so id resolution is bound to that language (0 without
+		// one, and then that filter is not registered). The all-language status filter skips this language's link too.
 		$default_lang       = $lang_repo->get_default();
 		$source_language_id = ( $default_lang && ! empty( $default_lang->id ) ) ? (int) $default_lang->id : 0;
 
@@ -177,15 +155,14 @@ final class TranslationsPage {
 			);
 
 			if ( empty( $matching_ids ) ) {
-				// No matches. Empty-state path without triggering a real WP_Query.
+				// No matches: the empty state without a WP_Query.
 				$posts       = [];
 				$total       = 0;
 				$total_pages = 0;
 				$query       = null;
 			} else {
 				$query_args['post__in'] = $matching_ids;
-				// Preserve ordering requested (modified DESC) instead of
-				// ordering by post__in sequence - that's the user intent.
+				// Keep the requested order (modified DESC), not the post__in order.
 				$query       = $this->run_list_query( $query_args, $unreadable_where );
 				$posts       = $query->posts;
 				$total       = $query->found_posts;
@@ -203,13 +180,8 @@ final class TranslationsPage {
 			? $group_repo->get_translations_for_objects( $visible_ids, \PerfLocale\Enum\ObjectType::Post )
 			: [];
 
-		// Resolve each link's effective status (TranslationStatus::effective(),
-		// the PHP twin of the SQL the status filter and the counts use) so the
-		// table cells and the status filter agree. Done once here at
-		// collection time, not per-row, to keep matches_filters()
-		// pure (no DB calls inside the filter loop). _prime_post_caches()
-		// pulls every linked post into the WP cache in a single query, so
-		// the get_post() calls inside the loop are O(1).
+		// Each link's effective status (TranslationStatus::effective(), the PHP twin of the filters' SQL), once here so
+		// matches_filters() stays pure; _prime_post_caches() makes the get_post() calls cache hits.
 		if ( ! empty( $batch_map ) ) {
 			$linked_ids = [];
 			foreach ( $batch_map as $links ) {
@@ -225,10 +197,8 @@ final class TranslationsPage {
 				_prime_post_caches( array_keys( $linked_ids ), false, false );
 			}
 
-			// Reconcile the stored status against the post's real status with the
-			// same definition TranslationLinkRepository::effective_status_sql()
-			// gives the Dashboard, `wp perflocale status` and the status filter,
-			// so they all report the same status for the same link.
+			// The same status definition as TranslationLinkRepository::effective_status_sql(), so the Dashboard, `wp
+			// perflocale status` and the filter agree.
 			foreach ( $batch_map as $links ) {
 				foreach ( $links as $link ) {
 					$linked_post  = get_post( (int) ( $link->object_id ?? 0 ) );
@@ -238,9 +208,13 @@ final class TranslationsPage {
 					);
 				}
 			}
+
+			if ( is_array( $batch_map ) ) {
+				$batch_map = self::mask_unviewable_siblings( $batch_map );
+			}
 		}
 
-		// Base URL args used for pagination + filter + sort persistence.
+		// URL args kept for pagination, filters and sorting.
 		$base_args = array_filter(
 			[
 				'page'             => 'perflocale-translations',
@@ -274,9 +248,7 @@ final class TranslationsPage {
 
 			$mt_available = \PerfLocale\Admin\AdminController::bulk_mt_translate_available();
 
-			// Resolve the active provider's display name so the bulk-action
-			// label reads "Translate via DeepL into…" instead of a generic
-			// "MT-translate" - admins can see at a glance which API will run.
+			// The provider's name, so the bulk label says "Translate via DeepL into...".
 			$mt_provider_name = '';
 			if ( $mt_available ) {
 				try {
@@ -370,11 +342,7 @@ final class TranslationsPage {
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html__( 'Machine translation is unavailable. Configure a provider with a valid API key under Settings → Addons → Machine Translation.', 'perflocale' ); ?></p></div>
 			<?php
 			/*
-			 * ⚠️ These three used to redirect with `perflocale_bulk=<key>`, which
-			 * NOTHING reads - this block switches on `$_GET['message']`. Every
-			 * failed "Translate the entire site" therefore bounced the operator
-			 * back to a silent page. The handler now uses the `message` key, and
-			 * these arms give each outcome words.
+			 * Outcomes of "Translate the entire site", redirected with the `message` key this block reads.
 			 */
 			?>
 			<?php elseif ( $bulk_message === 'site_translate_empty' ) : ?>
@@ -432,19 +400,8 @@ final class TranslationsPage {
 
 			<?php
 			/*
-			 * Discoverability hint for the non-public content types.
-			 *
-			 * These ship OFF, and the support thread that produced the feature was
-			 * someone who could not find HOW to translate a synced pattern. A hint is
-			 * the cheap half of that problem: tell the people who actually have such
-			 * content, and nobody else.
-			 *
-			 * ⚠️ COST. This runs ONLY while rendering this screen - never on the front
-			 * end, never on another admin page, never on cron. It asks nothing at all
-			 * when both types are already enabled, and otherwise uses
-			 * wp_count_posts(), whose per-status counts core keeps in the object
-			 * cache and invalidates on save - so on a warm cache it costs no query,
-			 * and on a cold one far less than this screen's own listing query.
+			 * Hint for the non-public content types (off by default), shown only to sites that have such content. Runs only on
+			 * this screen; with both types enabled it asks nothing, else wp_count_posts(), which core caches.
 			 */
 			$hint_candidates = [];
 
@@ -458,9 +415,7 @@ final class TranslationsPage {
 				$hint_counts = [];
 
 				foreach ( $hint_candidates as $hint_type => $hint_label ) {
-					// wp_count_posts() rather than a hand-written COUNT: core caches
-					// the per-status counts in the object cache and invalidates them
-					// on save, so on a warm cache this costs no query at all.
+					// wp_count_posts(), not a COUNT: core caches the per-status counts and invalidates them on save.
 					$hint_counts_obj = wp_count_posts( $hint_type );
 					$hint_found      = (int) ( $hint_counts_obj->publish ?? 0 );
 
@@ -535,17 +490,15 @@ final class TranslationsPage {
 			</div>
 
 			<?php
-			// Bulk-actions form + bar. The form is declared OUTSIDE the
-			// table; checkboxes inside the table bind to it via the HTML5
-			// `form="..."` attribute. Same pattern as Glossary/Assignments.
+			// The bulk form is outside the table; the row checkboxes bind to it with the HTML5 `form` attribute.
 			$bulk_form_id = 'perflocale-translations-bulk';
+			$check_column = current_user_can( 'perflocale_manage_translations' );
 			?>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-translations' ) ); ?>" id="<?php echo esc_attr( $bulk_form_id ); ?>" class="perflocale-bulk-form" data-perflocale-bulk-form>
 				<?php wp_nonce_field( 'perflocale_translations_bulk' ); ?>
 				<input type="hidden" name="perflocale_translations_action" value="bulk">
 				<?php
-				// Replay current filters so the redirect after the bulk action
-				// returns to the same view.
+				// Replay the filters so the redirect returns to the same view.
 				foreach ( [
 					'post_type_filter' => $filter_post_type,
 					'status_filter'    => $filter_status,
@@ -562,68 +515,20 @@ final class TranslationsPage {
 				}
 				?>
 				<?php
-				// ⭐ COMPLETENESS MARKER - must be the LAST field in the form.
-				// PHP silently discards input past `max_input_vars`, so if this
-				// arrives the browser sent everything before it too. A recursive
-				// element COUNT cannot prove the same thing: it also counts array
-				// containers, so an intact 63-field submission was being refused
-				// as "truncated" at a limit of 64.
+				// Completeness marker, the last field: PHP drops input past max_input_vars, so its arrival proves the rest arrived
+				// (an element count would also count array containers).
 				?>
 				<input type="hidden" name="perflocale_form_end" value="1">
 			</form>
 
 			<div class="tablenav top perflocale-bulk-tablenav-top">
-				<div class="alignleft actions bulkactions perflocale-bulkactions">
-					<label for="perflocale-bulk-action-top" class="screen-reader-text"><?php echo esc_html__( 'Select bulk action', 'perflocale' ); ?></label>
-					<select id="perflocale-bulk-action-top" name="bulk_action" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-select>
-						<option value=""><?php echo esc_html__( 'Bulk actions', 'perflocale' ); ?></option>
-						<?php if ( $mt_available ) : ?>
-							<option value="mt_translate">
-							<?php
-							if ( $mt_provider_name !== '' ) {
-								printf(
-									/* translators: %s: machine-translation provider display name (e.g. "DeepL", "Google Translate") */
-									esc_html__( 'Translate via %s', 'perflocale' ),
-									esc_html( $mt_provider_name )
-								);
-							} else {
-								esc_html_e( 'Machine-translate', 'perflocale' );
-							}
-							?>
-							</option>
-						<?php endif; ?>
-						<option value="mark_needs_update"><?php echo esc_html__( 'Mark as Needs Update', 'perflocale' ); ?></option>
-					</select>
-
-					<select name="bulk_value" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-value-target-lang hidden aria-label="<?php echo esc_attr__( 'Target language', 'perflocale' ); ?>">
-						<option value="all"><?php echo esc_html__( 'All target languages', 'perflocale' ); ?></option>
-						<?php
-						foreach ( $languages as $l ) :
-							if ( ! empty( $l->is_default ) ) {
-								continue; // can't translate INTO the source language
-							}
-							?>
-							<option value="<?php echo esc_attr( $l->slug ); ?>">
-								<?php echo esc_html( \PerfLocale\Helper::get_flag_emoji( $l ) . ' ' . ( $l->native_name ?: $l->name ) ); ?>
-							</option>
-						<?php endforeach; ?>
-					</select>
-
-					<button type="submit" class="button action" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-apply>
-						<?php echo esc_html__( 'Apply', 'perflocale' ); ?>
-					</button>
-
-					<?php if ( $mt_available ) : ?>
-						<label class="perflocale-bulk-meta-toggle" data-perflocale-bulk-meta hidden>
-							<input type="checkbox" name="include_meta" value="1" form="<?php echo esc_attr( $bulk_form_id ); ?>" checked>
-							<?php echo esc_html__( 'Include SEO/custom fields', 'perflocale' ); ?>
-						</label>
-					<?php endif; ?>
-				</div>
+				<?php $this->render_bulk_actions( $bulk_form_id, $mt_available, $mt_provider_name, $languages ); ?>
 				<div class="alignright perflocale-str-toolbar__count perflocale-str-toolbar__count--inline">
 				<?php
+				if ( ! $this->count_hidden ) {
 					/* translators: %s: total item count (assignments, posts, or terms - i18n-formatted, may be wrapped in <strong>). */
 					printf( esc_html__( '%s items', 'perflocale' ), '<strong>' . esc_html( number_format_i18n( $total ) ) . '</strong>' );
+				}
 				?>
 				</div>
 			</div>
@@ -632,7 +537,9 @@ final class TranslationsPage {
 			<table class="wp-list-table widefat fixed striped perflocale-translations-table">
 				<caption class="screen-reader-text"><?php echo esc_html__( 'Translation Status by Language', 'perflocale' ); ?></caption>
 				<colgroup>
-					<col class="check-column">
+					<?php if ( $check_column ) : ?>
+						<col class="check-column">
+					<?php endif; ?>
 					<col class="perflocale-col-title">
 					<col class="perflocale-col-type">
 					<?php foreach ( $visible_langs as $language ) : ?>
@@ -641,18 +548,9 @@ final class TranslationsPage {
 				</colgroup>
 				<thead>
 					<tr>
-						<th class="manage-column column-cb check-column" scope="col">
-							<label class="perflocale-cb-label" for="perflocale-tr-cb-select-all-1">
-								<input id="perflocale-tr-cb-select-all-1" type="checkbox" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-select-all>
-								<span class="screen-reader-text"><?php echo esc_html__( 'Select All', 'perflocale' ); ?></span>
-							</label>
-						</th>
+						<?php $this->render_select_all_cell( $bulk_form_id ); ?>
 						<?php
-						// ID column dropped - the source post ID is always
-						// available via `View`/`Edit` links and the page-source
-						// of the linked URL, and the visual real-estate is
-						// better used by the title row-actions (Edit | View
-						// hover affordances) and the wider language matrix.
+						// No ID column: the source id is on the View and Edit links, and the room goes to the language matrix.
 						echo wp_kses_post( $this->sort_th( 'title', __( 'Title', 'perflocale' ), $orderby_key, $order, $base_args, 'perflocale-col-title' ) );
 						echo wp_kses_post( $this->sort_th( 'type', __( 'Type', 'perflocale' ), $orderby_key, $order, $base_args, 'perflocale-col-type' ) );
 						?>
@@ -673,12 +571,8 @@ final class TranslationsPage {
 					</tr>
 				</thead>
 				<?php
-				// Pre-compute the visible row set so the empty-state check, the
-				// rendered rows, and the colspan all agree. The source filter is
-				// applied here at PHP level (language + status are SQL-pushed
-				// up-stream via resolve_filtered_object_ids); without this
-				// pre-pass the foreach would silently `continue` past every row
-				// and the operator would see "X items" + zero rendered rows.
+				// The visible rows, computed once so the empty state, the rows and the colspan agree (the source filter applies
+				// here; language and status were applied in SQL).
 				$visible_rows                   = [];
 				$active_language_ids_for_filter = array_map( static fn( $l ) => (int) $l->id, $languages );
 
@@ -713,7 +607,7 @@ final class TranslationsPage {
 				<tbody>
 					<?php if ( empty( $visible_rows ) ) : ?>
 						<tr>
-							<td class="perflocale-empty-row" colspan="<?php echo absint( 3 + count( $visible_langs ) ); ?>">
+							<td class="perflocale-empty-row" colspan="<?php echo absint( ( $check_column ? 3 : 2 ) + count( $visible_langs ) ); ?>">
 								<?php if ( $search !== '' && ! $any_filter_active ) : ?>
 									<?php
 									/* translators: %s: search query */
@@ -745,20 +639,7 @@ final class TranslationsPage {
 							}
 							?>
 							<tr>
-								<th scope="row" class="check-column">
-									<label class="perflocale-cb-label" for="perflocale-tr-cb-<?php echo absint( $post->ID ); ?>">
-										<input id="perflocale-tr-cb-<?php echo absint( $post->ID ); ?>" type="checkbox" name="ids[]" value="<?php echo absint( $post->ID ); ?>" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-row>
-										<span class="screen-reader-text">
-											<?php
-											printf(
-												/* translators: %s: row label being selected (post title or source term). */
-												esc_html__( 'Select %s', 'perflocale' ),
-												esc_html( $post_title )
-											);
-											?>
-										</span>
-									</label>
-								</th>
+								<?php $this->render_row_check_cell( $bulk_form_id, (int) $post->ID, $post_title ); ?>
 								<td class="perflocale-col-title has-row-actions column-primary">
 									<strong>
 										<?php if ( $edit_url !== '' ) : ?>
@@ -804,14 +685,8 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Render a single language-column cell for a source post's row.
-	 *
-	 * The badge shows `link.status` as render() resolved it: the link's
-	 * effective status (TranslationStatus::effective() - empty / draft /
-	 * pending / published / needs_update, from the linked post's status with
-	 * a stored needs_update kept).
-	 *
-	 * A linked post that was deleted / trashed shows Empty.
+	 * Render one language cell of a source row: a badge of the link's effective status as render() resolved it
+	 * (TranslationStatus::effective()); a deleted or trashed linked post shows Empty.
 	 *
 	 * @param object|null $link translation_links row for this language (or null).
 	 * @param \WP_Post    $post The source post being rendered.
@@ -822,14 +697,14 @@ final class TranslationsPage {
 		$badge_tone    = 'empty';
 		$cross_link_id = 0;
 
-		if ( $link && ! empty( $link->object_id ) ) {
-			// Verify the linked post exists + isn't trashed. If it's gone,
-			// the link row is orphaned and we should just show "Empty".
+		if ( $link && ! empty( $link->perflocale_hidden ) ) {
+			$badge_label = __( 'Translated', 'perflocale' );
+		} elseif ( $link && ! empty( $link->object_id ) ) {
+			// A linked post that is gone or trashed: the link is orphaned, show Empty.
 			$linked_post = get_post( (int) $link->object_id );
 
 			if ( $linked_post instanceof \WP_Post && $linked_post->post_status !== 'trash' ) {
-				// $link->status is the effective status resolved during batch
-				// collection in render().
+				// The effective status resolved in render().
 				$link_status = (string) ( $link->status ?? '' );
 				$status_enum = TranslationStatus::tryFrom( $link_status );
 
@@ -851,15 +726,7 @@ final class TranslationsPage {
 			}
 		}
 
-		// AI quality score → small badge alongside the status badge when
-		// scoring is enabled and the persisted score is at-or-below the
-		// configured threshold. Orthogonal to the status (a Published
-		$review_badge = '';
-
-		// Resolve the edit URL once. Linkable when this column points at a
-		// DIFFERENT post (a sibling translation) - clicking the source-row's
-		// own column would just re-open the title link, so leave that as a
-		// plain span.
+		// A link only when the column names another post (a sibling); the row's own column would repeat the title link.
 		$edit_url = '';
 
 		if ( $cross_link_id > 0 ) {
@@ -870,18 +737,13 @@ final class TranslationsPage {
 			}
 		}
 
-		// External-link icon (Dashicons), kept INSIDE the badge as the user
-		// requested. Aria-hidden because the wrapping `<a>` already has its
-		// own descriptive aria-label.
+		// External-link icon inside the badge; aria-hidden, as the <a> has its own label.
 		$icon = '<span class="dashicons dashicons-external perflocale-status-badge__icon" aria-hidden="true"></span>';
 
 		if ( $edit_url !== '' ) {
-			// $icon is a hard-coded `<span class="dashicons …">` string defined
-			// a few lines above - no user input is ever interpolated into it,
-			// so feeding it through esc_html() would mangle the markup, and
-			// wp_kses() would strip the dashicons class. Print verbatim.
+			// $icon is a fixed string from above: esc_html() would break it and wp_kses() strip the dashicons class.
 			printf(
-				'<a class="perflocale-status-badge perflocale-status-badge--%1$s perflocale-status-badge--linked" href="%2$s" aria-label="%3$s"><span class="perflocale-status-badge__label">%4$s</span>%5$s</a>%6$s',
+				'<a class="perflocale-status-badge perflocale-status-badge--%1$s perflocale-status-badge--linked" href="%2$s" aria-label="%3$s"><span class="perflocale-status-badge__label">%4$s</span>%5$s</a>',
 				esc_attr( $badge_tone ),
 				esc_url( $edit_url ),
 				esc_attr(
@@ -900,54 +762,72 @@ final class TranslationsPage {
 							'aria-hidden' => [],
 						],
 					]
-				),
-				wp_kses(
-					$review_badge,
-					[
-						'a'    => [
-							'class'      => [],
-							'href'       => [],
-							'title'      => [],
-							'aria-label' => [],
-						],
-						'span' => [
-							'class'      => [],
-							'title'      => [],
-							'aria-label' => [],
-						],
-					]
 				)
 			);
 			return;
 		}
 
 		printf(
-			'<span class="perflocale-status-badge perflocale-status-badge--%s"><span class="perflocale-status-badge__label">%s</span></span>%s',
+			'<span class="perflocale-status-badge perflocale-status-badge--%s"><span class="perflocale-status-badge__label">%s</span></span>',
 			esc_attr( $badge_tone ),
-			esc_html( $badge_label ),
-			wp_kses(
-				$review_badge,
-				[
-					'a'    => [
-						'class'      => [],
-						'href'       => [],
-						'title'      => [],
-						'aria-label' => [],
-					],
-					'span' => [
-						'class'      => [],
-						'title'      => [],
-						'aria-label' => [],
-					],
-				]
-			)
+			esc_html( $badge_label )
 		);
 	}
 
 	/**
-	 * Build a sortable `<th>` for the posts table. Follows the same markup
-	 * WP core uses in WP_List_Table so the active-sort triangle + hover
-	 * styling inherits the admin stylesheet automatically.
+	 * Whether the user may see a sibling; an unregistered type (an inactive builder's) gets core's own read_post
+	 * fallback, edit_others_posts, without core's doing-it-wrong notice.
+	 *
+	 * @param int $object_id Sibling post.
+	 * @return bool
+	 */
+	private static function sibling_viewable( int $object_id ): bool {
+		$type = get_post_type( $object_id );
+
+		if ( false === $type ) {
+			return false;
+		}
+
+		return post_type_exists( $type ) ? \PerfLocale\Helper::user_can_view_object( $object_id ) : current_user_can( 'edit_others_posts' );
+	}
+
+	/**
+	 * Replace each linked sibling the user may not view with a link that names only its language.
+	 *
+	 * The cell then shows "Translated" with no ID, status, source or link, and no status or source filter matches it.
+	 *
+	 * @param array<mixed> $batch_map Source post ID => its translation links.
+	 * @return array<mixed>
+	 */
+	private static function mask_unviewable_siblings( array $batch_map ): array {
+		foreach ( $batch_map as $source_id => $links ) {
+			if ( ! is_array( $links ) ) {
+				continue;
+			}
+
+			foreach ( $links as $i => $link ) {
+				$vars      = is_object( $link ) ? get_object_vars( $link ) : [];
+				$object_id = is_numeric( $vars['object_id'] ?? null ) ? (int) $vars['object_id'] : 0;
+
+				if ( $object_id > 0 && $object_id !== (int) $source_id && ! self::sibling_viewable( $object_id ) ) {
+					$links[ $i ] = (object) [
+						'language_id'       => is_numeric( $vars['language_id'] ?? null ) ? (int) $vars['language_id'] : 0,
+						'object_id'         => 0,
+						'status'            => '',
+						'source'            => '',
+						'perflocale_hidden' => true,
+					];
+				}
+			}
+
+			$batch_map[ $source_id ] = $links;
+		}
+
+		return $batch_map;
+	}
+
+	/**
+	 * A sortable `<th>` with WP_List_Table's markup, so the admin styles apply.
 	 *
 	 * @param string               $column Allow-listed column key (id/title/type).
 	 * @param string               $label Translated header label.
@@ -986,18 +866,115 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Run the screen's list query, with the condition from
-	 * unreadable_rows_where() appended to its WHERE clause, so the rows the
-	 * user may not read are neither listed nor counted in `found_posts`.
-	 *
-	 * The posts_where callback is attached for this one query only and acts
-	 * only on a query carrying `perflocale_only_source` (this screen's).
+	 * Run the list query with unreadable_rows_where() appended (this query only, `perflocale_only_source`), so rows the
+	 * user may not read are neither listed nor counted. A listed post its host refuses drops the type's view set and
+	 * the list runs again; a list longer than one page is paged and counted by viewable rows (viewable_ids()).
 	 *
 	 * @param array<string, mixed> $query_args       WP_Query arguments.
 	 * @param string               $unreadable_where Condition from unreadable_rows_where().
 	 * @return \WP_Query
 	 */
 	private function run_list_query( array $query_args, string $unreadable_where ): \WP_Query {
+		$query = $this->list_query_where( $query_args, $unreadable_where );
+		$stale = $this->revoked_view_types( $query->posts );
+
+		if ( [] !== $stale ) {
+			array_map( [ $this, 'forget_view_set' ], $stale );
+			$types            = array_values( array_filter( (array) ( $query_args['post_type'] ?? [] ), 'is_string' ) );
+			$unreadable_where = $this->unreadable_rows_where( $types ) . $this->non_mapped_unreadable_where( $types );
+			$query            = $this->list_query_where( $query_args, $unreadable_where );
+		}
+
+		// A refused row on any page shifts every later page and the count: both come from the viewable rows.
+		$one_page = $query->found_posts <= count( $query->posts );
+		$ids      = $one_page ? null : $this->viewable_ids( $query_args, $unreadable_where );
+
+		if ( null !== $ids ) {
+			$per  = is_int( $query_args['posts_per_page'] ?? null ) ? max( 1, $query_args['posts_per_page'] ) : 20;
+			$at   = is_int( $query_args['paged'] ?? null ) ? max( 1, $query_args['paged'] ) : 1;
+			$page = array_slice( $ids, ( $at - 1 ) * $per, $per );
+
+			_prime_post_caches( $page, false, false );
+			$query->posts         = array_values( array_filter( array_map( 'get_post', $page ) ) );
+			$query->post_count    = count( $query->posts );
+			$query->found_posts   = count( $ids );
+			$query->max_num_pages = (int) ceil( count( $ids ) / $per );
+
+			return $query;
+		}
+
+		$denied = $this->refused_mapped_ids( $query->posts );
+
+		if ( [] === $denied ) {
+			return $query;
+		}
+
+		// No refill from the next page: its first row would then show on both pages.
+		$query->posts       = array_values( array_filter( $query->posts, static fn( $p ): bool => ! ( $p instanceof \WP_Post && in_array( $p->ID, $denied, true ) ) ) );
+		$query->post_count  = count( $query->posts );
+		$this->count_hidden = ! $one_page;
+
+		if ( $one_page ) {
+			$query->found_posts = $query->post_count;
+		}
+
+		return $query;
+	}
+
+	/**
+	 * IDs of the whole list in its order without the mapped-type posts the host refuses, null past VIEW_CHECK_MAX rows.
+	 *
+	 * @param array<string, mixed> $query_args       WP_Query arguments.
+	 * @param string               $unreadable_where Condition from unreadable_rows_where().
+	 * @return array<int, int>|null
+	 */
+	private function viewable_ids( array $query_args, string $unreadable_where ): ?array {
+		$all = $this->list_query_where( [ 'fields' => 'ids', 'posts_per_page' => self::VIEW_CHECK_MAX + 1, 'paged' => 1, 'no_found_rows' => true ] + $query_args, $unreadable_where )->posts;
+
+		if ( count( $all ) > self::VIEW_CHECK_MAX ) {
+			return null;
+		}
+
+		$out = [];
+
+		foreach ( array_chunk( array_values( array_filter( $all, 'is_int' ) ), 200 ) as $chunk ) {
+			_prime_post_caches( $chunk, false, false );
+			$refused = $this->refused_mapped_ids( array_map( 'get_post', $chunk ) );
+			$out     = array_merge( $out, array_values( array_diff( $chunk, $refused ) ) );
+			\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Listed posts of types with map_meta_cap the user may not view: a host refusal core's caps cannot show.
+	 *
+	 * @param array<mixed> $posts Posts the list query returned.
+	 * @return array<int, int>
+	 */
+	private function refused_mapped_ids( array $posts ): array {
+		$ids = [];
+
+		foreach ( $posts as $post ) {
+			$type_object = $post instanceof \WP_Post ? get_post_type_object( $post->post_type ) : null;
+
+			if ( $post instanceof \WP_Post && $type_object && $type_object->map_meta_cap && ! \PerfLocale\Helper::user_can_view_object( $post->ID ) ) {
+				$ids[] = $post->ID;
+			}
+		}
+
+		return $ids;
+	}
+
+	/**
+	 * The list query with the condition appended for this one query.
+	 *
+	 * @param array<string, mixed> $query_args       WP_Query arguments.
+	 * @param string               $unreadable_where Condition to append.
+	 * @return \WP_Query
+	 */
+	private function list_query_where( array $query_args, string $unreadable_where ): \WP_Query {
 		if ( $unreadable_where === '' ) {
 			return new \WP_Query( $query_args );
 		}
@@ -1016,19 +993,10 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * WHERE condition that leaves out the posts the current user may not
-	 * read, or '' when they may read every post of these types.
+	 * WHERE condition leaving out posts the user may not read ('' when they may read all of these types).
 	 *
-	 * Follows core's read_post mapping (map_meta_cap()) for a post another
-	 * user wrote in a status that is not public, per post type: a private
-	 * status needs read_private_posts; any other status needs
-	 * edit_others_posts, and `future` also edit_published_posts. Posts in a
-	 * public status and the user's own posts stay listed. Each capability is
-	 * checked once per post type, so this costs no query and no per-row
-	 * check, and a user who holds them all (an administrator; an editor for
-	 * posts and pages) gets ''. A post type registered without map_meta_cap
-	 * maps read_post to one capability for all its posts and is not filtered
-	 * here.
+	 * Core's read_post mapping for other users' non-public posts, once per type: private needs read_private_posts,
+	 * others edit_others_posts (`future` also edit_published_posts); no map_meta_cap: non_mapped_unreadable_where().
 	 *
 	 * @param array<int, string> $post_types Post types the list queries.
 	 * @return string `' AND NOT ( … )'` or ''.
@@ -1094,26 +1062,293 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Register a scoped posts_where filter that hides non-default-language
-	 * translation rows when WP_Query is invoked with the
-	 * `perflocale_only_source` query var set.
+	 * WHERE condition that keeps, of each post type without map_meta_cap, only the posts the user may view.
 	 *
-	 * Uses a prepared subquery - no user input reaches the SQL string.
-	 * Registering once per render() is idempotent: WordPress de-dupes
-	 * identical closure references, but we also guard via a static flag.
+	 * Each post is checked by its host (Helper::user_can_view_object()), cached per user. The shorter id list
+	 * is bound; the NOT IN form admits only live posts up to the highest id the check read.
+	 *
+	 * @param array<int, string> $post_types Post types the list queries.
+	 * @return string One `' AND ( … )'` per such type, or ''.
+	 */
+	private function non_mapped_unreadable_where( array $post_types ): string {
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		$where = '';
+
+		foreach ( $post_types as $post_type ) {
+			$type_object = get_post_type_object( (string) $post_type );
+
+			if ( ! $type_object || $type_object->map_meta_cap ) {
+				continue;
+			}
+
+			[ $viewable, $max, $ids ] = $this->non_mapped_view_set( (string) $post_type );
+
+			if ( $viewable && [] === $ids ) {
+				$where .= (string) $wpdb->prepare( ' AND %i.post_type <> %s', $wpdb->posts, (string) $post_type );
+
+				continue;
+			}
+
+			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.PreparedSQL.NotPrepared -- $placeholders is a generated %d list bound to $ids.
+			if ( $viewable ) {
+				$where .= (string) $wpdb->prepare(
+					' AND ( %i.post_type <> %s OR %i.ID IN (' . $placeholders . ') )',
+					$wpdb->posts,
+					(string) $post_type,
+					$wpdb->posts,
+					...$ids
+				);
+
+				continue;
+			}
+
+			$where .= (string) $wpdb->prepare( " AND ( %i.post_type <> %s OR ( %i.post_status NOT IN ('trash', 'auto-draft') AND %i.ID <= %d", $wpdb->posts, (string) $post_type, $wpdb->posts, $wpdb->posts, $max );
+
+			if ( [] !== $ids ) {
+				$where .= (string) $wpdb->prepare( ' AND %i.ID NOT IN (' . $placeholders . ')', $wpdb->posts, ...$ids );
+			}
+			// phpcs:enable WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.PreparedSQL.NotPrepared
+
+			$where .= ' ) )';
+		}
+
+		return $where;
+	}
+
+	/**
+	 * The user's view of one type, kept 600 s: [ true, max, viewable ] or [ false, max, others ], stamped with the
+	 * user's caps and the type's rows; with a persistent cache prefixed `<last_changed>:<expiry>:` to skip the rows stamp.
+	 *
+	 * @param string $post_type Post type registered without map_meta_cap.
+	 * @return array{0: bool, 1: int, 2: array<int, int>} Ids newest first; max is the highest id the check read.
+	 */
+	private function non_mapped_view_set( string $post_type ): array {
+		$user   = wp_get_current_user();
+		$ext    = wp_using_ext_object_cache();
+		$cache  = Plugin::get_instance()->cache();
+		$name   = $cache->derive_transient_key( 'translations_readable_' . (int) $user->ID . '_' . $post_type, 'perflocale' );
+		$sign   = [ get_current_blog_id(), (int) $user->ID, $user->allcaps, $post_type ];
+		$stored = $ext ? wp_cache_get( $name, 'perflocale' ) : get_transient( $name );
+		$stored = is_string( $stored ) ? $stored : '';
+		$fast   = '';
+		$expiry = 0;
+
+		if ( $ext ) {
+			$fast                      = md5( (string) wp_json_encode( [ ...$sign, wp_cache_get_last_changed( 'posts' ) ] ) );
+			[ $was, $expiry, $stored ] = array_pad( explode( ':', $stored, 3 ), 3, '' );
+			$expiry                    = (int) $expiry > time() ? (int) $expiry : 0;
+			$stored                    = $expiry > 0 ? $stored : '';
+			$set                       = $was === $fast && '' !== $stored ? self::unpack_view_set( substr( $stored, 33 ) ) : null;
+
+			if ( null !== $set ) {
+				return $set;
+			}
+		}
+
+		$rows = $this->non_mapped_rows_stamp( $post_type );
+
+		if ( null === $rows ) {
+			return $this->check_non_mapped_ids( $post_type );
+		}
+
+		$stamp = md5( (string) wp_json_encode( [ ...$sign, $rows ] ) ) . ':';
+		$set   = str_starts_with( $stored, $stamp ) ? self::unpack_view_set( substr( $stored, 33 ) ) : null;
+
+		if ( null === $set ) {
+			$set    = $this->check_non_mapped_ids( $post_type );
+			$stored = $stamp . self::pack_view_set( $set );
+			$expiry = time() + 10 * MINUTE_IN_SECONDS;
+
+			if ( ! $ext ) {
+				set_transient( $name, $stored, 10 * MINUTE_IN_SECONDS );
+			}
+		}
+
+		// Stamped again under this last_changed, never past the set's own expiry.
+		if ( $ext ) {
+			wp_cache_set( $name, $fast . ':' . $expiry . ':' . $stored, 'perflocale', max( 1, $expiry - time() ) );
+		}
+
+		return $set;
+	}
+
+	/**
+	 * Drop the current user's stored view set of one type, on the path in use.
+	 *
+	 * @param string $post_type Post type.
+	 * @return void
+	 */
+	private function forget_view_set( string $post_type ): void {
+		$cache = Plugin::get_instance()->cache();
+		$name  = $cache->derive_transient_key( 'translations_readable_' . (int) wp_get_current_user()->ID . '_' . $post_type, 'perflocale' );
+
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete( $name, 'perflocale' );
+
+			return;
+		}
+
+		delete_transient( $name );
+	}
+
+	/**
+	 * Types without map_meta_cap with a listed post the user may not view any more (one host check per listed post).
+	 *
+	 * @param array<mixed> $posts Posts the list query returned.
+	 * @return array<int, string>
+	 */
+	private function revoked_view_types( array $posts ): array {
+		$stale = [];
+
+		foreach ( $posts as $post ) {
+			if ( ! $post instanceof \WP_Post || isset( $stale[ $post->post_type ] ) ) {
+				continue;
+			}
+
+			$type        = $post->post_type;
+			$type_object = get_post_type_object( $type );
+
+			if ( $type_object && ! $type_object->map_meta_cap && ! \PerfLocale\Helper::user_can_view_object( $post->ID ) ) {
+				$stale[ $type ] = $type;
+			}
+		}
+
+		return array_values( $stale );
+	}
+
+	/**
+	 * A view set as stored: `<i|n>:<max>:<ids>` (i: the viewable ids, n: the others).
+	 *
+	 * @param array{0: bool, 1: int, 2: array<int, int>} $set View set.
+	 * @return string
+	 */
+	private static function pack_view_set( array $set ): string {
+		return ( $set[0] ? 'i' : 'n' ) . ':' . $set[1] . ':' . implode( ',', $set[2] );
+	}
+
+	/**
+	 * A stored view set, or null unless it reads back the same (positive ids, no stray byte). No regex: a repeated
+	 * group exhausts the PCRE JIT stack on thousands of ids.
+	 *
+	 * @param string $packed Stored value without the stamp.
+	 * @return array{0: bool, 1: int, 2: array<int, int>}|null
+	 */
+	private static function unpack_view_set( string $packed ): ?array {
+		$parts = explode( ':', $packed );
+
+		if ( 3 !== count( $parts ) || ! in_array( $parts[0], [ 'i', 'n' ], true ) ) {
+			return null;
+		}
+
+		$max = (int) $parts[1];
+		$ids = '' === $parts[2] ? [] : array_map( 'intval', explode( ',', $parts[2] ) );
+
+		if ( (string) $max !== $parts[1] || $max < 0 || implode( ',', $ids ) !== $parts[2] || ( [] !== $ids && min( $ids ) < 1 ) ) {
+			return null;
+		}
+
+		return [ 'i' === $parts[0], $max, $ids ];
+	}
+
+	/**
+	 * Every live post of one type checked for the user (Helper::user_can_view_object()) as a view set; trash and
+	 * auto-drafts count as not viewable, and the shorter id list is kept.
+	 *
+	 * @param string $post_type Post type registered without map_meta_cap.
+	 * @return array{0: bool, 1: int, 2: array<int, int>}
+	 */
+	private function check_non_mapped_ids( string $post_type ): array {
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- cached per user by the caller.
+		$rows    = $wpdb->get_results( $wpdb->prepare( 'SELECT ID, post_status FROM %i WHERE post_type = %s ORDER BY ID DESC', $wpdb->posts, $post_type ), ARRAY_A );
+		$live    = [];
+		$others  = [];
+		$allowed = [];
+		$max     = 0;
+
+		foreach ( is_array( $rows ) ? $rows : [] as $row ) {
+			$id = isset( $row['ID'] ) && is_numeric( $row['ID'] ) ? (int) $row['ID'] : 0;
+
+			if ( $id < 1 ) {
+				continue;
+			}
+
+			$max = max( $max, $id );
+
+			if ( in_array( $row['post_status'] ?? '', [ 'trash', 'auto-draft' ], true ) ) {
+				$others[] = $id;
+			} else {
+				$live[] = $id;
+			}
+		}
+
+		foreach ( array_chunk( $live, 100 ) as $chunk ) {
+			_prime_post_caches( $chunk, false, false );
+
+			foreach ( $chunk as $id ) {
+				if ( \PerfLocale\Helper::user_can_view_object( $id ) ) {
+					$allowed[] = $id;
+				} else {
+					$others[] = $id;
+				}
+			}
+
+			\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
+		}
+
+		rsort( $others );
+
+		if ( [] === $allowed ) {
+			return [ true, $max, [] ];
+		}
+
+		return count( $others ) < count( $allowed ) ? [ false, $max, $others ] : [ true, $max, $allowed ];
+	}
+
+	/**
+	 * A stamp of one type's rows: per post status the count, id sum, author sum and newest edit.
+	 *
+	 * @param string $post_type Post type.
+	 * @return array<int, array<mixed>>|null Null when the query fails.
+	 */
+	private function non_mapped_rows_stamp( string $post_type ): ?array {
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- validates the stored list on each view.
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT post_status, COUNT(*) AS n, SUM(ID) AS ids, SUM(post_author) AS authors, MAX(post_modified_gmt) AS modified FROM %i WHERE post_type = %s AND post_status NOT IN ('trash', 'auto-draft') GROUP BY post_status ORDER BY post_status", $wpdb->posts, $post_type ), ARRAY_A );
+
+		return is_array( $rows ) && '' === $wpdb->last_error ? $rows : null;
+	}
+
+	/**
+	 * Register the posts_where filter that hides non-default-language translations for a WP_Query with
+	 * `perflocale_only_source` (a prepared subquery, once per blog).
 	 *
 	 * @param LanguageRepository $lang_repo Language repository (for default lang).
 	 * @return void
 	 */
 	private function register_source_only_filter( LanguageRepository $lang_repo ): void {
-		// Keyed by blog, NOT a bare bool. The closure below captures this blog's
-		// $wpdb->posts, its two plugin table names and its default-language id,
-		// so every blog visited in a process registers its own closure. With a
-		// single flag, a second blog would keep the first blog's closure and the
-		// Translations screen would filter against another blog's tables (too
-		// few rows, and an "IN/ALL/ANY subquery" error in $wpdb->last_error).
-		// Same shape as
-		// {@see \PerfLocale\Database\Repository\TranslationGroupRepository::eager_memo_key()}.
+		// Per blog, not one flag: the closure captures this blog's tables and default language, and a single flag would
+		// filter another blog against the first blog's tables (as TranslationGroupRepository::eager_memo_key()).
 		static $registered = [];
 
 		$blog_key = get_current_blog_id();
@@ -1134,10 +1369,7 @@ final class TranslationsPage {
 		$default_id   = (int) $default_lang->id;
 		$type         = \PerfLocale\Enum\ObjectType::Post->value;
 
-		// Pre-build the prepared subquery once. $type and $default_id are
-		// the only dynamic values and both are placeholder-bound.
-		// wpdb->prepare() can return null on placeholder mismatch - cast to
-		// empty string so the .= concat below stays a string operation.
+		// Built once, both values bound; prepare() can return null, so cast to string.
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$subquery = (string) $wpdb->prepare(
 			" AND {$wpdb->posts}.ID NOT IN (
@@ -1156,10 +1388,7 @@ final class TranslationsPage {
 		add_filter(
 			'posts_where',
 			static function ( string $where, \WP_Query $q ) use ( $subquery, $blog_key ): string {
-				// Belt and braces: even keyed per blog, a closure registered on
-				// one blog stays on the `posts_where` hook after a
-				// switch_to_blog(). Refuse to contribute its baked-in table
-				// names anywhere but the blog it was built for.
+				// A closure stays on `posts_where` after switch_to_blog(): only its own blog gets its table names.
 				if ( get_current_blog_id() !== $blog_key ) {
 					return $where;
 				}
@@ -1178,7 +1407,7 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Read per-page from screen options (WP user-meta), fall back to 20.
+	 * Rows per page from the screen options, else 20.
 	 *
 	 * @return int
 	 */
@@ -1188,19 +1417,129 @@ final class TranslationsPage {
 		$option = $screen ? $screen->get_option( 'per_page', 'option' ) : '';
 		$val    = $option ? (int) get_user_meta( $user, $option, true ) : 0;
 
-		// ⚠️ Clamp on READ. The save-time ceiling cannot touch values stored
-		// BEFORE it existed: measured with max_input_vars=64 (ceiling 25), a
-		// stored 777 still drove posts_per_page=777 and rendered every row.
-		// The protection has to sit where the value is USED. The stored
-		// preference is deliberately not rewritten - only the effective value.
+		// Clamped on read: a value stored before the save-time ceiling existed would still list every row. The stored
+		// preference itself is left as is.
 		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
 	}
 
 	/**
-	 * "Translate the entire site" panel: language + post-type selection, a
-	 * MANDATORY estimate step (the Start button unlocks only after a
-	 * non-over-budget estimate), then a nonce'd POST that dispatches the
-	 * chunked SiteTranslateJob background chain.
+	 * The select-all header cell of the Translations list, for managers only (the checkboxes feed the bulk actions).
+	 *
+	 * @param string $bulk_form_id Id of the bulk form.
+	 * @return void
+	 */
+	private function render_select_all_cell( string $bulk_form_id ): void {
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			return;
+		}
+		?>
+						<th class="manage-column column-cb check-column" scope="col">
+							<label class="perflocale-cb-label" for="perflocale-tr-cb-select-all-1">
+								<input id="perflocale-tr-cb-select-all-1" type="checkbox" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-select-all>
+								<span class="screen-reader-text"><?php echo esc_html__( 'Select All', 'perflocale' ); ?></span>
+							</label>
+						</th>
+		<?php
+	}
+
+	/**
+	 * A row's checkbox cell of the Translations list, for managers only.
+	 *
+	 * @param string $bulk_form_id Id of the bulk form.
+	 * @param int    $post_id      Source post ID.
+	 * @param string $post_title   Row label.
+	 * @return void
+	 */
+	private function render_row_check_cell( string $bulk_form_id, int $post_id, string $post_title ): void {
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			return;
+		}
+		?>
+								<th scope="row" class="check-column">
+									<label class="perflocale-cb-label" for="perflocale-tr-cb-<?php echo absint( $post_id ); ?>">
+										<input id="perflocale-tr-cb-<?php echo absint( $post_id ); ?>" type="checkbox" name="ids[]" value="<?php echo absint( $post_id ); ?>" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-row>
+										<span class="screen-reader-text">
+											<?php
+											printf(
+												/* translators: %s: row label being selected (post title or source term). */
+												esc_html__( 'Select %s', 'perflocale' ),
+												esc_html( $post_title )
+											);
+											?>
+										</span>
+									</label>
+								</th>
+		<?php
+	}
+
+	/**
+	 * Bulk action select, target language, Apply and the meta toggle of the Translations list, for managers only.
+	 *
+	 * @param string                    $bulk_form_id     Id of the form the controls submit.
+	 * @param bool                      $mt_available     Whether bulk MT can run.
+	 * @param string                    $mt_provider_name Active provider display name.
+	 * @param array<int|string, object> $languages        Active language rows.
+	 * @return void
+	 */
+	private function render_bulk_actions( string $bulk_form_id, bool $mt_available, string $mt_provider_name, array $languages ): void {
+		// The bulk form handler requires this capability for every action.
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			return;
+		}
+		?>
+			<div class="alignleft actions bulkactions perflocale-bulkactions">
+				<label for="perflocale-bulk-action-top" class="screen-reader-text"><?php echo esc_html__( 'Select bulk action', 'perflocale' ); ?></label>
+				<select id="perflocale-bulk-action-top" name="bulk_action" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-select>
+					<option value=""><?php echo esc_html__( 'Bulk actions', 'perflocale' ); ?></option>
+					<?php if ( $mt_available ) : ?>
+						<option value="mt_translate">
+						<?php
+						if ( $mt_provider_name !== '' ) {
+							printf(
+								/* translators: %s: machine-translation provider display name (e.g. "DeepL", "Google Translate") */
+								esc_html__( 'Translate via %s', 'perflocale' ),
+								esc_html( $mt_provider_name )
+							);
+						} else {
+							esc_html_e( 'Machine-translate', 'perflocale' );
+						}
+						?>
+						</option>
+					<?php endif; ?>
+					<option value="mark_needs_update"><?php echo esc_html__( 'Mark as Needs Update', 'perflocale' ); ?></option>
+				</select>
+
+				<select name="bulk_value" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-value-target-lang hidden aria-label="<?php echo esc_attr__( 'Target language', 'perflocale' ); ?>">
+					<option value="all"><?php echo esc_html__( 'All target languages', 'perflocale' ); ?></option>
+					<?php
+					foreach ( $languages as $l ) :
+						if ( ! empty( $l->is_default ) ) {
+							continue; // The source language is never a target.
+						}
+						?>
+						<option value="<?php echo esc_attr( $l->slug ); ?>">
+							<?php echo esc_html( \PerfLocale\Helper::get_flag_emoji( $l ) . ' ' . ( $l->native_name ?: $l->name ) ); ?>
+						</option>
+					<?php endforeach; ?>
+				</select>
+
+				<button type="submit" class="button action" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-apply>
+					<?php echo esc_html__( 'Apply', 'perflocale' ); ?>
+				</button>
+
+				<?php if ( $mt_available ) : ?>
+					<label class="perflocale-bulk-meta-toggle" data-perflocale-bulk-meta hidden>
+						<input type="checkbox" name="include_meta" value="1" form="<?php echo esc_attr( $bulk_form_id ); ?>" checked>
+						<?php echo esc_html__( 'Include SEO/custom fields', 'perflocale' ); ?>
+					</label>
+				<?php endif; ?>
+			</div>
+		<?php
+	}
+
+	/**
+	 * The "Translate the entire site" panel: languages and post types, a required estimate (Start unlocks only within
+	 * budget), then a nonce'd POST that dispatches the SiteTranslateJob chain.
 	 *
 	 * @param bool                      $mt_available     Whether bulk MT can run.
 	 * @param string                    $mt_provider_name Active provider display name.
@@ -1212,10 +1551,7 @@ final class TranslationsPage {
 			return;
 		}
 
-		// ⭐ Offer exactly what the handler will accept - see
-		// Settings::get_site_translate_post_types(). Offering `public + show_ui`
-		// here meant the panel listed types the plugin refuses to translate and
-		// hid every addon type it would happily translate.
+		// Offer exactly what the handler accepts: Settings::get_site_translate_post_types().
 		$public_types = [];
 
 		foreach ( $this->settings->get_site_translate_post_types() as $pt_name ) {
@@ -1280,12 +1616,8 @@ final class TranslationsPage {
 					<?php echo esc_html__( 'Runs as a resumable background job in bounded chunks; existing translations are never overwritten. Track progress under PerfLocale → Jobs.', 'perflocale' ); ?>
 				</p>
 				<?php
-				// ⭐ COMPLETENESS MARKER - must be the LAST field in the form.
-				// PHP silently discards input past `max_input_vars`, so if this
-				// arrives the browser sent everything before it too. A recursive
-				// element COUNT cannot prove the same thing: it also counts array
-				// containers, so an intact 63-field submission was being refused
-				// as "truncated" at a limit of 64.
+				// Completeness marker, the last field: PHP drops input past max_input_vars, so its arrival proves the rest arrived
+				// (an element count would also count array containers).
 				?>
 				<input type="hidden" name="perflocale_form_end" value="1">
 			</form>
@@ -1294,7 +1626,7 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Render the WordPress-standard tablenav (bottom) with paginate_links().
+	 * The bottom tablenav with paginate_links().
 	 *
 	 * @param int                  $current Current page.
 	 * @param int                  $total_pages Total pages.
@@ -1312,9 +1644,7 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Core pagination block reused by top + bottom tablenav. Uses
-	 * paginate_links() for the numbered prev/1/2/…/N/next style that
-	 * matches StringsPage.
+	 * The pagination of both tablenavs (paginate_links(), as StringsPage).
 	 *
 	 * @param int                  $current Current page.
 	 * @param int                  $total_pages Total pages.
@@ -1442,16 +1772,8 @@ final class TranslationsPage {
 	 * @return bool True if the post matches all active filters.
 	 */
 	/**
-	 * Resolve the post IDs that match the active (language, status) filter
-	 * combination at the SQL level. The returned set is used as `post__in`
-	 * in WP_Query so pagination counts reflect filtered reality.
-	 *
-	 * Branches (mirror the matches_filters() semantics):
-	 * - language > 0, status='empty' : posts MISSING the language
-	 * - language > 0, status=other : posts with a translation in that language at that status
-	 * - language > 0, status='' : posts WITH the language (any status)
-	 * - language=0, status='empty' : posts missing at least one active language
-	 * - language=0, status=other : posts with ANY translation at that status
+	 * Post ids matching the language and status filters in SQL, used as `post__in` so pagination counts the filtered
+	 * set (the same cases as matches_filters(): a language missing or present at a status, any missing, any at a status).
 	 *
 	 * @param TranslationGroupRepository $group_repo Repository.
 	 * @param int                        $filter_language Language filter.
@@ -1494,12 +1816,12 @@ final class TranslationsPage {
 			);
 		}
 
-		// No filter - caller shouldn't have invoked us.
+		// No filter: not called then.
 		return [];
 	}
 
 	/**
-	 * Check if a post's translations match the current language/status filters.
+	 * Whether a post's translations match the language, status and source filters.
 	 *
 	 * @param array<int, object> $translation_map Language ID => link map.
 	 * @param int                $filter_language Language ID filter (0 = all).
@@ -1521,10 +1843,7 @@ final class TranslationsPage {
 		string $filter_source = '',
 		int $source_language_id = 0
 	): bool {
-		// Source filter intersects with the other filters: a row passes iff
-		// at least one of its links matches both the source and the other
-		// active filters. Pre-filter the map by source so the existing
-		// language/status logic naturally agrees.
+		// A row passes when one of its links matches the source and the other filters: pre-filter the map by source.
 		if ( $filter_source !== '' ) {
 			$translation_map = array_filter(
 				$translation_map,
@@ -1536,18 +1855,15 @@ final class TranslationsPage {
 			}
 		}
 
-		// No filters active - always match.
+		// No filters: match.
 		if ( $filter_language === 0 && $filter_status === '' ) {
 			return true;
 		}
 
-		// Filter by specific language.
+		// One language.
 		if ( $filter_language > 0 ) {
 			if ( ! isset( $translation_map[ $filter_language ] ) ) {
-				// No translation for this language - only matches the 'empty'
-				// status filter. Don't also match when status_filter is empty,
-				// or the language dropdown alone becomes a no-op: picking
-				// "German" alone should narrow to posts that have German.
+				// No translation in it: matches only the 'empty' status (the language filter alone narrows to posts that have it).
 				return $filter_status === 'empty';
 			}
 
@@ -1558,11 +1874,9 @@ final class TranslationsPage {
 			return true;
 		}
 
-		// Filter by status across all languages.
+		// Status across all languages.
 		if ( $filter_status === 'empty' ) {
-			// Match if any active language is missing a translation - not
-			// unconditionally true, or status='empty' + "All Languages" would
-			// be a no-op.
+			// Any active language missing, or 'empty' with all languages would match everything.
 			foreach ( $active_language_ids as $lid ) {
 				if ( ! isset( $translation_map[ $lid ] ) ) {
 					return true;

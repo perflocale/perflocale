@@ -17,30 +17,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Resolves the admin edit URL and the front-end view URL for an object that
- * PerfLocale can translate.
+ * Resolves the admin edit URL and the front-end view URL of a translatable object.
  *
- * ⚠️ WHY THIS EXISTS. Core's helpers quietly assume a PUBLIC post type, and
- * every post type an addon contributes through `perflocale/translatable_post_types`
- * is non-public:
- *
- *   - `get_edit_post_link()` builds from the post type's `_edit_link`, which
- *     WordPress only populates when `show_ui` is true. For `wpcf7_contact_form`,
- *     `wpforms` and `product_variation` it returns null - and the Classic Editor
- *     plugin then filters that empty string into the RELATIVE href
- *     `?classic-editor`, which a browser resolves against whatever page it is
- *     on. That is worse than a dead link: it looks real, and it silently
- *     navigated users back to admin.php with no error.
- *   - `get_permalink()` returns a URL for a non-viewable type too
- *     (`/wpcf7_contact_form/contact-form-1/`), which 404s - so an emptiness
- *     check cannot tell a real link from a dead one.
- *
- * Both helpers below therefore refuse anything that is not an absolute http(s)
- * URL, and expose a filter so an addon can point its own type at the editor or
- * front-end route that actually owns it.
- *
- * Callers must treat '' as "render no link" - never as an error. A translation
- * with no reachable editor is a normal state, not a failure.
+ * Core's helpers return relative or 404 URLs for non-public add-on types: see
+ * docs-ai/11-code-rationale.md, "ObjectLinks: non-public post types". '' means "render no link".
  */
 final class ObjectLinks {
 
@@ -70,9 +50,7 @@ final class ObjectLinks {
 		/**
 		 * Filter the admin URL used to edit a translatable object.
 		 *
-		 * Return an absolute admin URL for a post type whose editor is not
-		 * WordPress's own - a form builder, a page builder - or '' to render
-		 * the object without a link rather than with a broken one.
+		 * Return an absolute admin URL for a type with its own editor, or '' for no link.
 		 *
 		 * @hook perflocale/admin/edit_post_link Filter the edit URL for a translatable object.
 		 * @param string $url       URL core resolved, '' when it could not.
@@ -96,10 +74,7 @@ final class ObjectLinks {
 		/**
 		 * Filter the front-end URL used to preview a translatable object.
 		 *
-		 * ⚠️ Viewability alone is not the whole answer: `product_variation` is
-		 * NOT publicly queryable, yet its permalink works because WooCommerce
-		 * maps it onto the parent product. Addons use this to restore their own
-		 * type; nothing else may resurrect a dead permalink.
+		 * Add-ons restore a working permalink of a non-viewable type here (`product_variation`).
 		 *
 		 * @hook perflocale/admin/view_post_link Filter the front-end URL for a translatable object.
 		 * @param string   $url  URL resolved so far, '' when the type is not viewable.
@@ -113,14 +88,13 @@ final class ObjectLinks {
 	/**
 	 * Reject anything that is not an absolute http(s) URL.
 	 *
-	 * ⚠️ A relative result resolves against the current page and reads as a
-	 * working link. Returning '' is always the safer answer.
+	 * A relative result resolves against the current page and looks like a working link.
 	 *
 	 * @param mixed $url Candidate returned by a filter.
 	 * @return string
 	 */
 	private static function absolute( $url ): string {
-		// Preserve valid URI objects that the previous string cast accepted.
+		// A Stringable URI object counts as its string.
 		if ( $url instanceof Stringable ) {
 			$url = (string) $url;
 		}
@@ -129,8 +103,7 @@ final class ObjectLinks {
 			return '';
 		}
 
-		// A scheme prefix alone also accepts 'https://' and 'https:///editor'.
-		// Require a parsed host without DNS or outbound HTTP.
+		// The scheme check alone accepts 'https://' and 'https:///editor': require a parsed host.
 		$parts = wp_parse_url( $url );
 
 		if ( ! is_array( $parts ) || ! isset( $parts['host'] ) || $parts['host'] === '' ) {

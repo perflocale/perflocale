@@ -15,49 +15,10 @@ use PerfLocale\Database\Schema;
 defined( 'ABSPATH' ) || exit;
 
 /**
- * Gives every string its own translation group again on a site that ran the
- * strings scan on the SQLite Database Integration before the scan read the
- * batch's group ids correctly there.
+ * Gives every string its own translation group again on SQLite sites, in four phases of one-transaction slices.
  *
- * Such a scan linked strings to groups shared with other strings, to groups
- * that did not exist, and left groups without a string. A string's
- * translations live in string_translations by string id and are intact; its
- * links (translation_links, type 'string', object_id = the string id) say
- * which language is translated and are what the files generator and the
- * Strings screen read by group. The repair has four phases:
- *
- *   1. groups: each string whose group is missing, not a string group, or
- *      shared with a lower-id string gets a new string group of its own;
- *   2. links: every string link outside its string's group is moved there
- *      by changing its group alone, so the row keeps its id, status, source
- *      and times. A link whose place is held by another misplaced link moves
- *      after that one; a ring of such links moves through a temporary group
- *      that the same slice deletes again. A link whose place is held by a
- *      link that is not misplaced stays where it is (counted as left);
- *   3. unlinked: every translated (string, language) pair without any link
- *      gets one, status 'translated', source 'manual' (a pair whose place
- *      another link holds is skipped and counted);
- *   4. empty_groups: the string groups no string and no link uses are
- *      deleted (only groups that existed when the repair started: a scan
- *      running alongside may hold a new group it has not linked yet).
- *
- * The work runs in slices of batch_size() items. A slice is one transaction
- * holding its writes and the progress (phase, cursor, counts in
- * PROGRESS_OPTION), so a slice that is killed or fails leaves nothing of
- * itself and the next slice starts where the last committed one stopped. On
- * the SQLite Database Integration one failed statement rolls the whole
- * transaction back and the statements after it would commit one by one, so
- * no statement in a slice is expected to fail: unique places are read before
- * the writes, and every read and write is checked. The first failure rolls
- * back and stops the slice with an exception. A phase starts only after
- * the previous one's last slice committed. DONE_OPTION is written only after
- * the last slice committed and a read of the committed rows found no string
- * and no link left to repair (verify()).
- *
- * It runs only on SQLite (DB_ENGINE 'sqlite'), as the background job
- * {@see \PerfLocale\Background\Jobs\StringGroupRepairJob} (queued from
- * wp-admin) or in the foreground through `wp perflocale db-migrate`, never on
- * a visitor request. Once done, a run does nothing.
+ * The SQLite driver rolls back on one failed statement and autocommits the rest, so no statement may fail.
+ * Phases, slices and checks: docs-ai/11-code-rationale.md, "SqliteGroupRepair: phases and slices".
  */
 final class SqliteGroupRepair {
 
@@ -67,8 +28,7 @@ final class SqliteGroupRepair {
 	public const DONE_OPTION = 'perflocale_sqlite_string_groups_repaired';
 
 	/**
-	 * Option holding the phase, cursor and counts of an unfinished repair
-	 * (JSON, not autoloaded). Written in each slice's transaction.
+	 * Phase, cursor and counts of an unfinished repair (JSON, not autoloaded), written in each slice's transaction.
 	 */
 	public const PROGRESS_OPTION = 'perflocale_sqlite_string_groups_repair';
 
@@ -83,15 +43,12 @@ final class SqliteGroupRepair {
 	private const BATCH = 500;
 
 	/**
-	 * Statements the chained moves of one phase 2 slice may run, per item of
-	 * the slice: the bound on how long the slice holds the write lock. One
-	 * chain of the longest allowed length needs at most about half of it.
+	 * Statements the chained moves of one phase 2 slice may run, per item: bounds the slice's write lock.
 	 */
 	private const CHAIN_STATEMENTS_PER_ITEM = 4;
 
 	/**
-	 * The phases in order, with the percent of the whole repair reported at
-	 * each one's start.
+	 * The phases in order, with the percent reported at each one's start.
 	 */
 	private const PHASES = [
 		'groups'       => 0,
@@ -143,10 +100,7 @@ final class SqliteGroupRepair {
 		/**
 		 * Items the SQLite string-group repair handles per slice.
 		 *
-		 * Each slice is one transaction: a larger slice means fewer
-		 * transactions and progress writes, a smaller one a shorter write
-		 * lock on the database and less work redone after an interruption.
-		 * Clamped to 50-5000.
+		 * Each slice is one transaction: smaller means a shorter write lock, larger fewer commits. Clamped to 50-5000.
 		 *
 		 * @hook  perflocale/strings/sqlite_repair_batch_size
 		 * @since 1.0.7.3
@@ -161,17 +115,12 @@ final class SqliteGroupRepair {
 	/**
 	 * Run one slice of the repair.
 	 *
-	 * Status 'more': a slice committed and work is left; 'complete': the
-	 * repair finished (this call wrote DONE_OPTION); 'busy': another process
-	 * holds the repair lock; 'not_needed': not SQLite, or already done.
+	 * Status 'more' (work left), 'complete' (this call wrote DONE_OPTION), 'busy' (locked) or 'not_needed'.
 	 *
-	 * @param bool $foreground_files In files mode, compile the files in this
-	 *                               process after the last slice (WP-CLI)
-	 *                               instead of queueing a background run.
+	 * @param bool $foreground_files In files mode, compile the files here after the last slice (WP-CLI).
 	 * @return array{status: string, percent: int, groups_created: int, links_moved: int, links_written: int, groups_deleted: int, links_left: int, pairs_skipped: int}
 	 *
-	 * @throws \RuntimeException When a read or write of the slice failed: the
-	 *                           slice was rolled back and nothing is recorded.
+	 * @throws \RuntimeException When a read or write failed: the slice was rolled back.
 	 */
 	public static function run_slice( bool $foreground_files = false ): array {
 		global $wpdb;
@@ -205,13 +154,11 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * One slice: read the progress, do one batch of the current phase,
-	 * store the progress, commit.
+	 * One slice: read the progress, do one batch of the current phase, store the progress, commit.
 	 *
 	 * @param \wpdb $wpdb Database.
 	 * @param int   $size Items per slice.
-	 * @return array<string, mixed>|null The progress after the slice, or null
-	 *                                   when DONE_OPTION is already stored.
+	 * @return array<string, mixed>|null The progress after the slice, or null when already done.
 	 *
 	 * @throws \RuntimeException On the first failed statement (rolled back).
 	 */
@@ -245,8 +192,7 @@ final class SqliteGroupRepair {
 			$exists   = isset( $values[ self::PROGRESS_OPTION ] );
 			$progress = ( $exists ? self::decode( $values[ self::PROGRESS_OPTION ] ) : null ) ?? self::start( $wpdb );
 
-			// The last slice committed, and the process stopped before
-			// complete() ran: nothing is left to write.
+			// The last slice committed but complete() did not run: nothing is left to write.
 			if ( 'done' === $progress['phase'] ) {
 				$wpdb->query( 'ROLLBACK' );
 
@@ -280,8 +226,7 @@ final class SqliteGroupRepair {
 				self::fail();
 			}
 		} catch ( \RuntimeException $e ) {
-			// Ends the transaction on every engine; on SQLite a failed
-			// statement has ended it already and this is a no-op.
+			// On SQLite a failed statement already ended the transaction; elsewhere this ends it.
 			$wpdb->query( 'ROLLBACK' );
 
 			throw $e;
@@ -298,9 +243,7 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * The progress of a repair that starts now: phase 1, and the largest ids
-	 * of the tables it walks (the groups one bounds phase 4; all three scale
-	 * the reported percent).
+	 * The progress of a new repair: phase 1 and the largest ids it walks (max_group bounds phase 4).
 	 *
 	 * @param \wpdb $wpdb Database.
 	 * @return array<string, mixed>
@@ -340,9 +283,7 @@ final class SqliteGroupRepair {
 	/**
 	 * Phase 1: a new string group for each of the next strings that need one.
 	 *
-	 * The groups are written in one statement while this transaction holds
-	 * the database's write lock, so the rows above the largest id read
-	 * before it are this statement's rows.
+	 * One INSERT under this transaction's write lock, so the ids above the MAX(id) read before it are its rows.
 	 *
 	 * @param \wpdb                $wpdb     Database.
 	 * @param array<string, mixed> $progress Progress.
@@ -407,17 +348,10 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * Phase 2: move the next misplaced string links into their own string's
-	 * group, as whole rows: only group_id changes, and updated_at is set to
-	 * itself, so it stays on MySQL's ON UPDATE clause too.
+	 * Phase 2: move the next misplaced string links into their own string's group.
 	 *
-	 * After phase 1 every string has a group of its own, and a string has at
-	 * most one link per language (UNIQUE type, object_id, language_id), so
-	 * no two links have the same place (group, language). The links whose
-	 * place was free when the batch was read move in one statement; a link
-	 * whose place was held moves through move_chain(). The chained moves share
-	 * one statement budget per slice: when it runs out, the slice ends and the
-	 * next one starts at the first link not handled.
+	 * Only group_id changes; `updated_at = updated_at` keeps MySQL's ON UPDATE from touching it.
+	 * Free places move in one statement, held ones through move_chain() within the slice's budget.
 	 *
 	 * @param \wpdb                $wpdb     Database.
 	 * @param array<string, mixed> $progress Progress.
@@ -517,9 +451,7 @@ final class SqliteGroupRepair {
 		$progress['links_moved'] = self::int( $progress['links_moved'] ?? 0 ) + $moved;
 		$progress['links_left']  = self::int( $progress['links_left'] ?? 0 ) + $left;
 
-		// The budget ran out: the next slice reads again from the first link
-		// not handled. A link this slice moved is in its own group and is not
-		// read again; one it left has a lower id.
+		// Budget spent: restart at the first link not handled. Moved links sit in their own group; left ones have lower ids.
 		if ( $stop > 0 ) {
 			return array_merge( $progress, [ 'after' => $stop - 1 ] );
 		}
@@ -530,26 +462,15 @@ final class SqliteGroupRepair {
 	/**
 	 * Move a misplaced link whose place is held, with the links in the way.
 	 *
-	 * Follows the holders: each holder is a misplaced string link too, so it
-	 * has a place of its own. The chain ends at a free place (the links then
-	 * move from the last to the first, each into the place the next one
-	 * left) or comes back to the first link (a ring: the first link waits in
-	 * a temporary group while the others move, then takes its place, and the
-	 * temporary group is deleted). Each place is read before its write.
-	 *
-	 * Every read and write is taken from the slice's statement budget; the
-	 * writes are taken together, before the first one, so a chain is moved
-	 * whole or not at all.
+	 * Moves from a free place back to the first link; a ring parks the first link in a temporary group.
+	 * The writes are taken from the budget together, before the first one, so a chain moves whole or not at all.
 	 *
 	 * @param \wpdb        $wpdb   Database.
 	 * @param array<mixed> $first  The link (id, group_id, language_id, own_group).
 	 * @param int          $limit  Most links in one chain.
 	 * @param int          $budget Statements the slice may still run.
-	 * @return array<int, int>|null Ids of the links moved; empty when the first
-	 *                              link stays (a place is held by a link that
-	 *                              is not misplaced, or the chain is too long);
-	 *                              null when the budget ran out before the
-	 *                              chain was settled (nothing was written).
+	 * @return array<int, int>|null Ids of the links moved; empty when the first link stays (held place or too long);
+	 *                              null when the budget ran out (nothing written).
 	 *
 	 * @throws \RuntimeException On a failed read or write.
 	 */
@@ -641,8 +562,7 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * Phase 3: a link for each of the next translated (string, language)
-	 * pairs that have none, in the string's group.
+	 * Phase 3: a link in the string's group for each of the next translated (string, language) pairs without one.
 	 *
 	 * @param \wpdb                $wpdb     Database.
 	 * @param array<string, mixed> $progress Progress.
@@ -722,8 +642,9 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * Phase 4: delete the next string groups nothing uses, among those that
-	 * existed when the repair started.
+	 * Phase 4: delete the next unused string groups, only up to max_group.
+	 *
+	 * A scan running alongside may hold a newer group it has not linked yet.
 	 *
 	 * @param \wpdb                $wpdb     Database.
 	 * @param array<string, mixed> $progress Progress.
@@ -802,13 +723,9 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * The read that must pass before the repair is recorded as done, after
-	 * the last slice committed: no string needs a group of its own, and no
-	 * string link is outside its string's group other than the links phase
-	 * 2 left where they were. When links are still misplaced (written there
-	 * after phase 2 read them), the progress is dropped, so the next run
-	 * starts again from phase 1, and the run stops with an error. When the
-	 * read itself fails, the progress stays and the next run reads again.
+	 * The check of the committed rows that must pass before the repair is recorded as done.
+	 *
+	 * Work left drops the progress (restart from phase 1); a failed read keeps it, so the next run reads again.
 	 *
 	 * @param \wpdb $wpdb Database.
 	 * @param int   $left Links phase 2 left where they were.
@@ -854,9 +771,7 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * After the last slice committed: record the repair as done, drop its
-	 * progress, the cached string maps and links, and have the compiled files
-	 * written again in files mode (in the background, or here for WP-CLI).
+	 * Record the repair as done, drop its progress and caches, and recompile the files in files mode.
 	 *
 	 * @param bool $foreground_files Compile the files in this process.
 	 * @return void
@@ -869,8 +784,7 @@ final class SqliteGroupRepair {
 		$plugin = \PerfLocale\Plugin::get_instance();
 		$cache  = $plugin->has( 'cache' ) ? $plugin->get( 'cache' ) : null;
 
-		// Every language's string map, an inactive one's too (it can be in a
-		// fallback chain), and the cached links.
+		// Every language's string map, inactive ones too (fallback chains), and the cached links.
 		if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
 			$cache->invalidate_group( 'perflocale_strings' );
 			$cache->invalidate_group( 'perflocale_trans' );
@@ -948,9 +862,7 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * Drop the request's cached copies of the repair's options: a slice
-	 * reads and writes them with SQL of its own, and a rolled-back slice must
-	 * not leave a cached value behind.
+	 * Drop the cached copies of the repair's options: a slice uses raw SQL, and a rollback must leave no cached value.
 	 *
 	 * @return void
 	 */
@@ -967,8 +879,7 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * Stop the slice when the read that just ran failed (wpdb clears
-	 * last_error at the start of every query).
+	 * Stop the slice when the read that just ran failed (wpdb clears last_error at every query).
 	 *
 	 * @phpstan-impure
 	 *
@@ -984,8 +895,7 @@ final class SqliteGroupRepair {
 	}
 
 	/**
-	 * Stop the slice when a write failed or changed another number of rows
-	 * than it had to.
+	 * Stop the slice when a write failed or changed another number of rows than it had to.
 	 *
 	 * @param mixed $result   What wpdb returned (rows changed, or false).
 	 * @param int   $expected Rows the write had to change.

@@ -12,11 +12,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Kadence theme integration for PerfLocale.
+ * Kadence theme integration: a Language Switcher element in Kadence's header builder.
  *
- * Registers a Language Switcher element in Kadence's header/footer builder
- * with full configurable settings in the Customizer, reading defaults
- * from the plugin's global Language Switcher settings.
+ * Customizer defaults come from the plugin's global switcher settings.
  */
 final class PerfLocaleKadence implements \PerfLocale\Addon\AddonInterface {
 
@@ -468,8 +466,7 @@ final class PerfLocaleKadence implements \PerfLocale\Addon\AddonInterface {
 		$html = $block->render( $render_args );
 
 		if ( ! empty( $html ) ) {
-			// kses_switcher() returns wp_kses()-sanitized switcher markup;
-			// printf %3$s is the already-sanitized output.
+			// %3$s is kses_switcher() output, already sanitized.
 			printf(
 				'<div class="%1$s" data-section="%2$s">%3$s</div>',
 				esc_attr( 'site-header-item site-header-focus-item site-header-item-language-switcher' ),

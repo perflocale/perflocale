@@ -32,8 +32,7 @@ final class CustomizerIntegration {
 	/**
 	 * Enqueue the switcher's frontend CSS during wp_enqueue_scripts.
 	 *
-	 * Needed because the floating switcher is echoed in wp_footer, after
-	 * LanguageSwitcherBlock::render()'s own enqueue call would be too late.
+	 * The floating switcher renders in wp_footer, too late for the head stylesheets.
 	 *
 	 * @return void
 	 */
@@ -435,16 +434,7 @@ final class CustomizerIntegration {
 
 		$safe_html = LanguageSwitcherBlock::kses_switcher( $html );
 
-		/*
-		 * The block suppresses itself whenever it has nothing to offer - on an
-		 * untranslated page with "hide current language" on and untranslated
-		 * languages hidden, every option is skipped and render() returns ''.
-		 * The wrapper below is `position: fixed; z-index: 9999` with a border,
-		 * padding and a shadow, so echoing it around an empty string left a
-		 * small blank pill pinned over the page on every such view, covering
-		 * whatever sat in that corner. Checked after kses, not before, because
-		 * the sanitiser is what decides what actually reaches the page.
-		 */
+		// Nothing to show after kses: no empty fixed-position box.
 		if ( trim( $safe_html ) === '' ) {
 			return;
 		}
@@ -460,11 +450,8 @@ final class CustomizerIntegration {
 		}
 
 		echo '<div class="' . esc_attr( $classes ) . '">';
-		// Re-wrapped at the sink deliberately, even though $safe_html already went
-		// through kses above: the wordpress.org scanner is annotation-blind, so an
-		// `echo` of a bare variable reads as unescaped output no matter what the
-		// phpcs:ignore says. kses_switcher() memoises by hash, so the second pass is
-		// free. Do not hoist this back out.
+		// Re-escaped at the sink on purpose: the wordpress.org scanner ignores phpcs:ignore.
+		// The second kses_switcher() pass is a memo hit.
 		echo LanguageSwitcherBlock::kses_switcher( $safe_html ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
 		echo '</div>';
 	}
@@ -482,15 +469,7 @@ final class CustomizerIntegration {
 	/**
 	 * Sanitize position value.
 	 *
-	 * Typed `mixed`, like sanitize_checkbox() above, because a customizer
-	 * sanitize callback is handed the RAW value out of the `customized`
-	 * JSON payload: WP_Customize_Manager::validate_setting_values() skips
-	 * only null before calling WP_Customize_Setting::sanitize(), so an
-	 * array (or any other JSON shape) reaches this filter unconverted and
-	 * a declared `string $value` threw a TypeError at argument binding -
-	 * a 500 out of the customizer instead of a rejected value. Anything
-	 * that is not one of the four known positions falls back to the
-	 * default, which is what an unrecognised string already did.
+	 * Typed mixed: the Customizer passes the raw JSON value, and a string type would throw a TypeError.
 	 *
 	 * @param mixed $value Value.
 	 * @return string

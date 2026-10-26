@@ -14,34 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Rebuilds a post field in a target language from the TranslatePress
- * translations attributed to the post (original => translation), replacing
- * only whole units the way TranslatePress replaced them on the page:
+ * Rebuilds a post field in a target language from the post's TranslatePress pairs, whole units only.
  *
- * - a text run between tags, comments and shortcode tags, compared after
- *   TranslatePress's trim (ASCII whitespace, and a no-break space or
- *   `&nbsp;` at either edge), whose surrounding whitespace is kept; a run
- *   with line breaks that matches nothing whole is tried line by line
- *   (wpautop turns those lines into paragraphs or lines of their own);
- * - the whole value of a title, aria-label or alt attribute, a placeholder
- *   on an input or textarea, and a value on a submit, button or reset input;
- * - a string value in a block comment's attributes, unless its key names
- *   markup, a link, style, colour or size, or the value looks like a URL;
- * - a quoted shortcode attribute value, with the same exclusions;
- * - an original that holds markup (a TranslatePress translation block): the
- *   inner HTML of one block-level element that contains no other block-level
- *   element, compared the way TranslatePress compares blocks (tags stripped,
- *   entities decoded, whitespace collapsed); in a field without block markup
- *   (classic content), also a paragraph that wpautop makes when the field
- *   renders ({@see self::paragraphs()}), whose text then keeps its units in
- *   a language without that block's translation.
- *
- * Text is compared through {@see TranslatePressDictionary::forms()}.
- * Script, style and textarea contents, other comments, URLs and every other
- * attribute keep their bytes, and so does any unit without a translation.
- *
- * No database access. A field is split once ({@see self::parse()}) and then
- * rendered once per language ({@see self::render()}).
+ * Units are the ones TranslatePress replaced on the page: docs-ai/11-code-rationale.md,
+ * "TranslatePressContentRebuilder: units it replaces". No database access; parse once, render per language.
  *
  * @phpstan-type Parsed array{
  *     pieces: list<string>,
@@ -57,8 +33,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class TranslatePressContentRebuilder {
 
 	/**
-	 * Elements TranslatePress can merge into a translation block (its merge
-	 * rules' top parents).
+	 * Elements TranslatePress can merge into a translation block (its merge rules' top parents).
 	 */
 	private const BLOCK_PARENTS = [ 'p', 'div', 'li', 'ol', 'ul', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7', 'body', 'footer', 'article', 'main', 'iframe', 'section', 'figure', 'figcaption', 'blockquote', 'cite', 'tr', 'td', 'th', 'table', 'tbody', 'thead', 'tfoot', 'form', 'label' ];
 
@@ -68,20 +43,17 @@ final class TranslatePressContentRebuilder {
 	private const VOID_ELEMENTS = [ 'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr' ];
 
 	/**
-	 * The block-level element names of wpautop() (a regex group): it ends a
-	 * paragraph before their opening tags and after their closing tags.
+	 * The block-level element names of wpautop() (a regex group): paragraphs end around their tags.
 	 */
 	private const AUTOP_BLOCKS = '(?:table|thead|tfoot|caption|col|colgroup|tbody|tr|td|th|div|dl|dd|dt|ul|ol|li|pre|form|map|area|blockquote|address|style|p|h[1-6]|hr|fieldset|legend|section|article|aside|hgroup|header|footer|nav|figure|figcaption|details|menu|summary)';
 
 	/**
-	 * Keys whose values (and everything under them) are never text: markup,
-	 * references, links and style. Compared lowercased.
+	 * Keys whose values (and everything under them) are never text. Compared lowercased.
 	 */
 	private const EXCLUDED_KEYS = [ 'classname', 'class', 'anchor', 'slug', 'ref', 'id', 'url', 'href', 'src', 'rel', 'tagname', 'align', 'layout', 'style' ];
 
 	/**
-	 * Key endings of colour, size and slug keys (textColor, fontSize,
-	 * sizeSlug, minHeight). Compared lowercased.
+	 * Key endings of colour, size and slug keys (textColor, fontSize, minHeight). Compared lowercased.
 	 */
 	private const EXCLUDED_KEY_ENDINGS = [ 'color', 'gradient', 'size', 'slug', 'width', 'height' ];
 
@@ -91,8 +63,7 @@ final class TranslatePressContentRebuilder {
 	private const JSON_MAX_DEPTH = 8;
 
 	/**
-	 * Most texts whose forms are remembered until the next forget(); texts
-	 * beyond it get their forms computed on each lookup.
+	 * Most texts whose forms are remembered until the next forget(); beyond it they are computed per lookup.
 	 */
 	private const FORMS_MEMO_MAX = 16384;
 
@@ -313,8 +284,7 @@ final class TranslatePressContentRebuilder {
 		// Pieces inside a translated block: its translation replaced them whole.
 		$inside = [];
 
-		// Classic paragraphs with a translation block in this language, cut
-		// out of the pieces they start and end in: [ from, to, translation ].
+		// Classic paragraphs with a translation block here, cut out of their pieces: [ from, to, translation ].
 		$cuts = [];
 
 		foreach ( $block_pairs === [] ? [] : $parsed['paragraphs'] as [ $first, $from, $last, $to, $keys ] ) {
@@ -477,8 +447,7 @@ final class TranslatePressContentRebuilder {
 	}
 
 	/**
-	 * Pairs split into text pairs and translation-block pairs (an original
-	 * that holds markup), the latter keyed the way blocks are compared.
+	 * Pairs split into text pairs and translation-block pairs (original holds markup), keyed as blocks compare.
 	 *
 	 * @param array<string, string> $pairs Original => translation.
 	 * @return array{0: array<string, string>, 1: array<string, string>}
@@ -506,25 +475,13 @@ final class TranslatePressContentRebuilder {
 	}
 
 	/**
-	 * The paragraphs wpautop makes of a field without block markup (classic
-	 * content) that can each be a translation block of their own:
-	 * TranslatePress stores one as the paragraph's inner HTML, and the raw
-	 * field holds that without the paragraph's tags.
+	 * The wpautop paragraphs of a classic field that can each be a translation block of their own.
 	 *
-	 * A paragraph ends where wpautop ends it: at a blank line, at two br tags
-	 * with only white space between them, before a block-level opening tag
-	 * and after a block-level closing tag or a bare hr. It counts when it
-	 * starts with no element open and outside every enclosing shortcode, ends
-	 * with no element open, holds a tag or a line break (so its HTML holds
-	 * markup), and holds no block-level tag, top parent of a TranslatePress
-	 * block, comment, shortcode tag, script, style, textarea or closing tag
-	 * without an open element. wpautop reads a "<" that starts no tag (an
-	 * unclosed comment, a stray "<") as a tag up to the next ">", so no
-	 * paragraph counts from there on.
+	 * Which ones count: docs-ai/11-code-rationale.md, "TranslatePressContentRebuilder: classic paragraphs".
 	 *
 	 * @param string             $field  Raw field value.
 	 * @param array<int, string> $pieces The field's pieces.
-	 * @return list<array{0: int, 1: int, 2: int, 3: int, 4: list<string>}> For each paragraph's trimmed text: the piece it starts in and the byte offset there, the piece it ends in and the byte offset after it there, and its keys.
+	 * @return list<array{0: int, 1: int, 2: int, 3: int, 4: list<string>}> Per trimmed paragraph: start piece and offset, end piece and offset after it, keys.
 	 */
 	private static function paragraphs( string $field, array $pieces ): array {
 		// Piece indexes of the closing shortcode tags, by name, and the next one to compare with.
@@ -726,8 +683,7 @@ final class TranslatePressContentRebuilder {
 	}
 
 	/**
-	 * Text between tokens in one language, as {@see self::render()} renders
-	 * a text piece: translated whole, or line by line.
+	 * Text between tokens in one language, as render() renders a text piece: whole, or line by line.
 	 *
 	 * @param string                $text  Text.
 	 * @param array<string, string> $pairs Text pairs.
@@ -818,9 +774,9 @@ final class TranslatePressContentRebuilder {
 	}
 
 	/**
-	 * The split pattern: comments, script, style and textarea elements,
-	 * tags (quote-aware) and registered shortcode tags. What lies between
-	 * them is text. Every repetition is possessive, so a split is linear.
+	 * The split pattern: comments, raw-text elements, quote-aware tags and registered shortcode tags.
+	 *
+	 * Every repetition is possessive, so a split stays linear (no backtracking blow-up).
 	 *
 	 * @return string
 	 */
@@ -850,8 +806,7 @@ final class TranslatePressContentRebuilder {
 	}
 
 	/**
-	 * A text split as TranslatePress trims it: ASCII whitespace, and a
-	 * no-break space or `&nbsp;` at either edge, repeated until none is left.
+	 * A text split as TranslatePress trims it: ASCII whitespace and an edge no-break space or `&nbsp;`, repeated.
 	 *
 	 * @param string $text Text.
 	 * @return array{0: string, 1: string, 2: string} Leading part, core, trailing part.
@@ -885,8 +840,7 @@ final class TranslatePressContentRebuilder {
 	}
 
 	/**
-	 * A translation block's text the way TranslatePress compares blocks:
-	 * trimmed, tags stripped, entities decoded, whitespace collapsed.
+	 * A translation block's text as TranslatePress compares blocks: trimmed, tags stripped, decoded, collapsed.
 	 *
 	 * @param string $html Inner HTML or original.
 	 * @return string

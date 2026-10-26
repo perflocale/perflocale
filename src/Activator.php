@@ -17,32 +17,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Handles plugin activation tasks.
- *
- * Creates database tables, seeds default language, and sets initial options.
- * Idempotent - safe to run multiple times.
+ * Handles plugin activation: tables, the default language and initial options; safe to run again.
  */
 final class Activator {
 
 	/**
 	 * Run activation tasks.
 	 *
-	 * @param bool $fatal_on_missing_table When true (activation-hook path),
-	 *                                     wp_die() if a critical table is
-	 *                                     missing - that's the contract the
-	 *                                     activation flow expects so the user
-	 *                                     sees the failure immediately.
-	 *                                     When false (called from
-	 *                                     `wp_initialize_site`, an upgrade
-	 *                                     handler, etc.), log + return so a
-	 *                                     dbDelta failure on a tiny subsite
-	 *                                     doesn't kill a network-admin
-	 *                                     site-creation request mid-flight.
-	 * @return bool True on success. False when a required table is missing
-	 *              (non-fatal mode only; fatal mode wp_die()s), or when the
-	 *              site still has no language after the seed. Every later
-	 *              step still runs in that second case, so the caller decides
-	 *              what to refuse.
+	 * @param bool $fatal_on_missing_table True on the activation hook: wp_die() at a missing table. False for
+	 *                                     site creation and network loops: log and return, so one site does not
+	 *                                     end the request.
+	 * @return bool False for a missing table (non-fatal mode) or a site still without a language; in the second
+	 *              case every later step has still run, so the caller decides what to refuse.
 	 */
 	public static function activate( bool $fatal_on_missing_table = true ): bool {
 		// Suppress any output from dbDelta() during table creation.
@@ -50,15 +36,9 @@ final class Activator {
 		Schema::create_tables();
 		ob_end_clean();
 
-		// Verify critical tables were actually created. dbDelta() can fail
-		// silently on hosts with restrictive DB permissions.
+		// dbDelta() can fail silently for some tables: every Schema table is checked.
 		global $wpdb;
 
-		// Every table defined in Schema.php must exist after activation. A
-		// host with restrictive DB perms could let dbDelta succeed on some
-		// tables and silently fail on others - verifying ALL of them
-		// surfaces partial-create failures at activation time instead of
-		// the first feature read against a missing table.
 		$required = [
 			'languages',
 			'translation_groups',
@@ -100,22 +80,9 @@ final class Activator {
 			}
 		}
 
-		// Store the current DB and plugin versions. autoload=false because
-		// both values are only read by Migrator::maybe_migrate() on
-		// admin_init + rest_api_init paths, not by any frontend request -
-		// no need to carry them in alloptions on every page load.
-		// Autoloaded: both are tiny ints read by Migrator::maybe_migrate /
-		// maybe_update on wp_loaded - i.e. EVERY request - so a non-autoloaded
-		// row costs one options-table SELECT per request on sites without a
-		// persistent object cache.
-		// Only stamp the DB version on a FRESH install (no stored value). If a
-		// value is already present it belongs to the schema actually on disk:
-		// overwriting it with the new constant would make Migrator's
-		// `$current_version >= $target_version` gate short-circuit and silently
-		// skip every migration step. That happens on two ordinary flows -
-		// deactivate → replace the plugin files → reactivate, and Delete plugin
-		// in the default preserve mode (which keeps the tables and the option).
-		// Harmless while DB_VERSION is 1, load-bearing from the first bump on.
+		// Both versions autoloaded: the Migrator reads them on every request.
+		// The DB version is stamped only on a fresh install: a stored one describes the schema on disk, and overwriting
+		// it after a file replacement or a preserve-mode delete would make the Migrator skip every migration.
 		if ( ! get_option( 'perflocale_db_version' ) ) {
 			update_option( 'perflocale_db_version', PERFLOCALE_DB_VERSION, true );
 		} else {
@@ -124,16 +91,10 @@ final class Activator {
 
 		update_option( 'perflocale_version', PERFLOCALE_VERSION, true );
 
-		// Seed default language (English) if no languages exist yet.
+		// Seed English when no language exists.
 		$seeded = self::seed_default_language();
 
-		// Install the Translator role and grant the perflocale_* caps to
-		// administrators + editors right now, while we have a request.
-		// Without this, the caps would only land on the next admin_init -
-		// and the very first /wp-admin redirect after activation would
-		// 403 because the current user's $allcaps cache was built before
-		// the role caps existed. The admin_init handler stays in place
-		// as the upgrade / self-heal path; install_caps() is idempotent.
+		// Caps now, not on the next admin_init: the first redirect after activation would 403 otherwise.
 		TranslatorRole::install_caps();
 
 		// WooCommerce's Shop Manager gets perflocale_translate once per site;
@@ -145,91 +106,38 @@ final class Activator {
 		// stamps perflocale_version, so its version gate never opens.
 		\PerfLocale\Frontend\OptionStrings::register_source_strings();
 
-		// Initialize default settings and hot-path options. The
-		// `perflocale_flush_rules` flag is initialized in this same block via
-		// add_option() + set_autoload(), so no separate update_option() call
-		// is needed up here.
-		// The ~4 KB settings blob is read on nearly every frontend request
-		// (language routing, hreflang, URL rewriting) so carrying it inside
-		// the bundled `alloptions` fetch is cheaper than a dedicated SELECT
-		// per request. Same for addon failures (read on every admin boot)
-		// and flush-rules flag (read on every init).
-		//
-		// Webhooks are NOT autoloaded - the option contains HMAC secrets,
-		// and we don't want those sitting in `alloptions` on every page load.
-		// The dispatcher reads the option once on plugins_loaded; the extra
-		// SELECT is paid for by sites that have webhooks configured (rare).
-		// Mirror of the autoload=false in WebhookController::register_webhook
-		// and ::delete_webhook so fresh activations don't temporarily land
-		// the option in alloptions before the first write flips it.
-		//
-		// add_option() is atomic - avoids TOCTOU race on multisite. The
-		// set_autoload() follow-ups are idempotent no-ops unless a prior
-		// activation on the same site created the row with the wrong flag.
+		// Options read on most requests are autoloaded; webhooks are not, since they hold HMAC secrets.
+		// add_option() seeds missing rows, with no insert-only guarantee under a concurrent insert;
+		// set_autoload() repairs a row an earlier activation created with the wrong flag.
 		$settings = new Settings();
 		add_option( 'perflocale_settings', $settings->get_defaults(), '', true );
 		add_option( 'perflocale_webhooks', [], '', false );
 		add_option( 'perflocale_addon_failures', [], '', true );
-		// Seeded so the default nothing-disabled state doesn't cost a
-		// guaranteed-miss options SELECT in AddonRegistry::get_disabled() on
-		// every request of a non-object-cache install (notoptions is
-		// per-request there).
+		// Seeded, or get_disabled() misses the options table on every request without a persistent cache.
 		add_option( 'perflocale_disabled_addons', [], '', true );
 		add_option( 'perflocale_flush_rules', 1, '', true );
 		// Retire the stored variation maps and copy maps a persistent object
 		// cache may still hold from an earlier activation (InventorySync).
 		delete_transient( \PerfLocale\WooCommerce\InventorySync::STORED_MAP_EPOCH );
 		delete_transient( \PerfLocale\WooCommerce\InventorySync::COPY_MAP_EPOCH );
+		self::retire_cache_generations();
 		self::set_autoload( 'perflocale_settings', 'yes' );
 		self::set_autoload( 'perflocale_webhooks', 'no' );
 		self::set_autoload( 'perflocale_addon_failures', 'yes' );
 		self::set_autoload( 'perflocale_disabled_addons', 'yes' );
 		self::set_autoload( 'perflocale_flush_rules', 'yes' );
-		// Version guards are read every request (Migrator on wp_loaded) /
-		// every admin request (caps guard on admin_init) - heal pre-existing
-		// rows that were created with autoload off.
+		// Version guards, read on every request or admin request.
 		self::set_autoload( 'perflocale_db_version', 'yes' );
 		self::set_autoload( 'perflocale_version', 'yes' );
 		self::set_autoload( 'perflocale_caps_version', 'yes' );
 
-		// Schedule a one-shot resume sweep on the very next cron tick.
-		// {@see \PerfLocale\Deactivator::deactivate()} unschedules every
-		// worker hook to keep WP-Cron clean while the plugin is off, but
-		// the JobState option rows survive deactivation. Without this
-		// reschedule, jobs that were `queued` or `running` at deactivate
-		// time would have no worker event waiting to fire after
-		// reactivation. {@see \PerfLocale\Background\Resumer::resume()}
-		// is the cron handler (registered in Bootstrap) that walks the
-		// index and re-enqueues each survivor.
-		//
-		// Scheduling at time() not time()+0 because some hosts trip on
-		// "you scheduled a past event"; +0 is fine in core but the +0
-		// idiom is explicit. The cron event is single-fire - no risk of
-		// the resume running on a steady-state interval.
-		//
-		// Idempotent: if the hook is already scheduled (rapid double-
-		// activate), BackgroundEvents::is_scheduled checks both engines
-		// (AS + WP-Cron) before enqueueing again. Routed through
-		// BackgroundEvents so AS picks it up when loaded (catches the
-		// resume even if the next request happens during a cold-cache
-		// window where WP-Cron wouldn't fire).
-		//
-		// Note on timing: `register_activation_hook` callbacks fire very
-		// early in the request lifecycle - before `action_scheduler_init`
-		// has run, so `JobRunnerFactory::action_scheduler_available()`
-		// returns false here. The resume event lands on WP-Cron, never
-		// AS, regardless of the engine setting. That's fine for a
-		// single one-shot event; the next request loads the plugin
-		// normally and Bootstrap's recurring schedules go through AS as
-		// usual.
+		// Deactivation unschedules every worker but keeps the job rows: one Resumer event re-enqueues queued and running jobs.
+		// It lands on WP-Cron, since Action Scheduler is not initialised during activation.
 		if ( ! \PerfLocale\Background\BackgroundEvents::is_scheduled( \PerfLocale\Background\Resumer::HOOK ) ) {
 			\PerfLocale\Background\BackgroundEvents::enqueue( \PerfLocale\Background\Resumer::HOOK );
 		}
 
-		// Make sure the plugin's `uploads/perflocale/` parent dir exists and
-		// carries its `.htaccess` + `index.php` protection files. Subdirs
-		// (temp / exports / translations) are created lazily by their
-		// consumers and harden themselves on creation.
+		// The protected `uploads/perflocale/` parent; its subdirectories are created and hardened on first use.
 		try {
 			\PerfLocale\Helper::ensure_uploads_base_dir();
 		} catch ( \Throwable $e ) {
@@ -283,19 +191,11 @@ final class Activator {
 			[ '%s', '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%s' ]
 		);
 
-		// Surface the failure so the operator can see what broke during
-		// activation. Without this, a failed insert (disk-full, charset
-		// mismatch, constraint violation) leaves the site with zero
-		// languages - which breaks routing, the language switcher,
-		// hreflang emission, and every translation feature - and the
-		// admin gets no signal at all about why.
+		// A site without a language breaks routing and every translation feature: report why.
 		if ( false === $inserted ) {
 			$reason = (string) $wpdb->last_error;
 
-			// Judge by what the table holds, not by the INSERT: a second
-			// activation of the same site at the same moment inserts the
-			// row first, and ours then fails on the unique slug key with
-			// the site correctly seeded.
+			// Judged by the table, not the INSERT: a concurrent activation may have seeded it first (unique slug).
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Activation only, failure path only.
 			$after = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
 
@@ -305,20 +205,14 @@ final class Activator {
 
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log( sprintf( 'PerfLocale Activator: failed to seed default English language on blog %d. wpdb error: %s', (int) get_current_blog_id(), $reason ) );
-			// Re-raise as a notice via the WP activation-error mechanism
-			// when called from `register_activation_hook`. The constant
-			// is set by core during the activation request.
+			// Not during core's activation sandbox scrape or AJAX.
 			if ( function_exists( 'wp_die' ) && defined( 'WP_SANDBOX_SCRAPING' ) === false && ! wp_doing_ajax() ) {
 				$message = sprintf(
 					/* translators: %s: detailed database error message from wpdb. */
 					__( 'PerfLocale could not seed the default English language. Database error: %s', 'perflocale' ),
 					esc_html( $reason )
 				);
-				// Use a notice rather than wp_die so a partial activation
-				// can still complete and the admin can fix manually -
-				// dying here would also kill the activation hook and
-				// leave the plugin in an inconsistent half-activated
-				// state.
+				// A notice, not wp_die(): dying here would leave the plugin half-activated.
 				add_action(
 					'admin_notices',
 					static function () use ( $message ): void {
@@ -334,11 +228,18 @@ final class Activator {
 	}
 
 	/**
-	 * Flip the autoload flag on an existing option without touching its value.
+	 * Move every L2 generation past an earlier install's: a missing one starts at the clock, never at 0.
 	 *
-	 * Uses WP 6.4+ `wp_set_option_autoload_values` when available, falls back
-	 * to a direct wpdb UPDATE for older versions. Safe no-op when the option
-	 * doesn't exist yet.
+	 * @return void
+	 */
+	private static function retire_cache_generations(): void {
+		foreach ( \PerfLocale\Cache\CacheManager::GROUPS as $group ) {
+			\PerfLocale\Cache\CacheManager::bump_group_generation( $group );
+		}
+	}
+
+	/**
+	 * Flip the autoload flag of an existing option without touching its value; no-op for a missing option.
 	 *
 	 * @param string $name Option name.
 	 * @param string $autoload Either 'yes' or 'no'.

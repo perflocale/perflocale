@@ -1,6 +1,6 @@
 <?php
 /**
- * Admin asset manager.
+ * Admin assets.
  *
  * @package PerfLocale
  */
@@ -14,10 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Enqueues admin CSS and JavaScript only on PerfLocale admin pages.
- *
- * Uses the $hook parameter to restrict loading - no assets are loaded
- * on unrelated admin pages.
+ * Enqueues admin CSS and JavaScript on PerfLocale screens only, each screen with only what it uses.
  */
 final class Assets {
 
@@ -43,6 +40,71 @@ final class Assets {
 	}
 
 	/**
+	 * One target language of a bulk machine-translation screen: its id and the Language object fields the screen's
+	 * JavaScript hooks pass ({ slug, locale, name, nativeName, isDefault }).
+	 *
+	 * @param object $lang Language object.
+	 * @return array{id: int, slug: string, locale: string, name: string, nativeName: string, isDefault: bool}
+	 */
+	public static function mt_target( object $lang ): array {
+		$str    = static fn( $v ): string => is_scalar( $v ) ? (string) $v : '';
+		$slug   = $str( $lang->slug ?? '' );
+		$name   = $str( $lang->name ?? '' );
+		$name   = '' !== $name ? $name : $slug;
+		$native = $str( $lang->native_name ?? '' );
+
+		return [
+			'id'         => is_numeric( $lang->id ?? null ) ? (int) $lang->id : 0,
+			'slug'       => $slug,
+			'locale'     => $str( $lang->locale ?? '' ),
+			'name'       => $name,
+			'nativeName' => '' !== $native ? $native : $name,
+			'isDefault'  => ! empty( $lang->is_default ),
+		];
+	}
+
+	/**
+	 * The counts of an in-request bulk machine translation's result notice (message=bulk_mt_done) for the
+	 * perflocale.translations.bulkFinished hook; null otherwise. Read from the notice's query args only: core removes
+	 * `message` from the address after the load, so a reload shows neither again.
+	 *
+	 * @return array{posts: int, target: string, translated: int, skipped: int, failed: int}|null
+	 */
+	public static function translations_bulk_finished(): ?array {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- read-only: the counts of the notice this load shows.
+		$arg = static fn( string $key ): string => isset( $_GET[ $key ] ) && is_string( $_GET[ $key ] ) ? sanitize_key( wp_unslash( $_GET[ $key ] ) ) : '';
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		if ( 'bulk_mt_done' !== $arg( 'message' ) ) {
+			return null;
+		}
+
+		return [
+			'posts'      => absint( $arg( 'posts' ) ),
+			'target'     => $arg( 'target' ),
+			'translated' => absint( $arg( 'created' ) ),
+			'skipped'    => absint( $arg( 'skipped' ) ),
+			'failed'     => absint( $arg( 'failed' ) ),
+		];
+	}
+
+	/**
+	 * Make an enqueued script load after one a screen adds later (the Settings Translation tab adds the bulk request
+	 * helper to admin-settings.js); footer scripts print after the screen, so it holds for this request.
+	 *
+	 * @param string $handle Script that needs $dep.
+	 * @param string $dep    Script it needs.
+	 * @return void
+	 */
+	public static function add_dependency( string $handle, string $dep ): void {
+		$script = wp_scripts()->query( $handle );
+
+		if ( $script instanceof \_WP_Dependency && ! in_array( $dep, $script->deps, true ) ) {
+			$script->deps[] = $dep;
+		}
+	}
+
+	/**
 	 * Register hooks.
 	 *
 	 * @return void
@@ -52,7 +114,7 @@ final class Assets {
 	}
 
 	/**
-	 * Conditionally enqueue admin assets.
+	 * Enqueue the admin assets of the current screen.
 	 *
 	 * @param string $hook The current admin page hook.
 	 * @return void
@@ -81,10 +143,8 @@ final class Assets {
 			}
 
 			if ( $needs_css ) {
-				// List-tables need only the badge ruleset - ship the ~1.5 KB
-				// dedicated file rather than the full ~92 KB admin.css. The
-				// extracted styles stay in sync with admin.css's
-				// "Translation Status Badges" section.
+				// List tables need only the badge rules: the small dedicated file, kept in sync with admin.css's "Translation
+				// Status Badges" section.
 				wp_enqueue_style(
 					'perflocale-list-badges',
 					PERFLOCALE_URL . 'assets/css/list-badges.css',
@@ -93,10 +153,7 @@ final class Assets {
 				);
 			}
 
-			// Dashboard widget styles - ONLY on the main Dashboard
-			// (index.php), and only when the widget is enabled and the
-			// user can manage translations. Matches the gate in
-			// DashboardWidget so the CSS never ships when the widget won't.
+			// Dashboard widget styles on the Dashboard only, under the widget's own gate (enabled, can manage translations).
 			if (
 				$hook === 'index.php'
 				&& (bool) $settings->get( 'dashboard_widget_enabled', false )
@@ -110,8 +167,7 @@ final class Assets {
 				);
 			}
 
-			// Carrier handle for `perflocale-admin`: lets adjacent screens
-			// receive inline CSS/JS attachments without downloading any file.
+			// The `perflocale-admin` carrier handle lets nearby screens get inline CSS and JS without downloading a file.
 			$needs_carrier = (
 				$hook === 'post.php'
 				|| $hook === 'post-new.php'
@@ -128,23 +184,13 @@ final class Assets {
 				wp_enqueue_script( 'perflocale-admin' );
 			}
 
-			// JS Abilities shim - registers each PHP-side ability with the
-			// WordPress JS Abilities API (WP 7.0+) so Gutenberg sidebar tools,
-			// custom block-toolbar plugins, etc. can invoke them via
-			// `wp.abilities.invoke()`. Feature-detected on the client (no-op
-			// when the JS API isn't shipped yet). Only enqueued on screens
-			// that might host editor extensions, not on plain post-list pages.
+			// The JS Abilities shim registers the PHP abilities with the WordPress JS Abilities API (7.0+) for editor tools;
+			// feature-detected in the browser, enqueued only on editor screens.
 			$default_screens = [ 'post.php', 'post-new.php', 'site-editor.php' ];
 
 			/**
-			 * Filter the admin screens where the JS Abilities shim is enqueued.
-			 *
-			 * Power users building custom block-editor-like screens (Greenshift,
-			 * Bricks Builder, custom CPT editor canvases) can opt those hooks
-			 * into the shim by adding them here. The shim is itself
-			 * feature-detected on the client, so on a screen where
-			 * `wp.abilities.register` isn't loaded the script is a silent
-			 * no-op - no error path to worry about.
+			 * Filter the admin screens that get the JS Abilities shim (for custom editor screens such as Greenshift or Bricks);
+			 * without `wp.abilities.register` the script does nothing.
 			 *
 			 * @hook perflocale/abilities/js_screens
 			 *
@@ -159,10 +205,7 @@ final class Assets {
 			return;
 		}
 
-		// Shared admin CSS (custom properties, badges, metabox, toasts,
-		// dialog overlay, Gutenberg panel, responsive). The handle keeps
-		// the historical 'perflocale-admin' name so wp_add_inline_style()
-		// attachments from page classes keep landing on a loaded handle.
+		// Shared admin CSS; the handle stays 'perflocale-admin' so page classes' wp_add_inline_style() land on a loaded handle.
 		wp_enqueue_style(
 			'perflocale-admin',
 			PERFLOCALE_URL . 'assets/css/admin-core.css',
@@ -170,15 +213,8 @@ final class Assets {
 			PERFLOCALE_VERSION
 		);
 
-		// Page-specific CSS - each PerfLocale screen loads only its own
-		// ruleset on top of the shared core instead of the historical
-		// monolithic admin.css (~92 KB on every screen). The split is
-		// rule-level, generated by selector→emitter ownership analysis:
-		// every rule whose perflocale-* classes are emitted by exactly
-		// one Pages/*.php lives in that page's chunk; everything shared,
-		// ambiguous, or emitted by non-page components (MetaBox, JS,
-		// blocks) lives in admin-core.css. Jobs renders entirely from
-		// shared rules, so it carries no chunk of its own.
+		// Each screen loads its own rule chunk on top of the shared core: a rule whose classes only one Pages/*.php emits
+		// lives in that page's chunk, everything else in admin-core.css. Jobs uses shared rules only.
 		$page_css = [
 			'toplevel_page_perflocale'                 => 'dashboard',
 			'perflocale_page_perflocale-languages'     => 'languages',
@@ -199,13 +235,8 @@ final class Assets {
 			);
 		}
 
-		// Addons screen only: the filter tab strip is one non-wrapping row that
-		// scrolls sideways when narrow, and this draws its scroll indicator.
-		// The native scrollbar cannot do that job - iOS and Android render
-		// scrollbars as transient overlays and iOS ignores
-		// ::-webkit-scrollbar - so the CSS hides it and we draw our own.
-		// Footer-loaded and dependency-free: it only reads layout and writes
-		// two inline styles.
+		// Addons screen: the tab strip scrolls sideways when narrow and this draws its scroll indicator (iOS and Android
+		// show scrollbars only as overlays and iOS ignores ::-webkit-scrollbar).
 		if ( 'perflocale_page_perflocale-addons' === $hook ) {
 			wp_enqueue_script(
 				'perflocale-addons-tabs-scroll',
@@ -216,18 +247,12 @@ final class Assets {
 			);
 		}
 
-		// `perflocale-admin` is a carrier-only handle (no script file). It
-		// holds the localized `perflocaleAdmin` payload and serves as a
-		// dependency for adjacent admin scripts (bulk-actions,
-		// strings-validate, languages-reorder).
+		// A carrier handle with no file: holds the `perflocaleAdmin` payload and is a dependency of nearby admin scripts.
 		wp_register_script( 'perflocale-admin', false, [], PERFLOCALE_VERSION, true );
 		wp_enqueue_script( 'perflocale-admin' );
 
-		// Shared delegated handlers for data-perflocale-{confirm,copy,submit-busy}
-		// and the <details data-perflocale-popover> dismissal.
-		// One small file ships the JS that page templates trigger via
-		// data-attributes - keeps PHP free of inline `onclick=` (repo
-		// rule).
+		// Delegated handlers for data-perflocale-{confirm,copy,submit-busy} and <details data-perflocale-popover>, so PHP
+		// templates need no inline onclick.
 		wp_enqueue_script(
 			'perflocale-admin-actions',
 			PERFLOCALE_URL . 'assets/js/admin-actions.js',
@@ -236,11 +261,8 @@ final class Assets {
 			true
 		);
 
-		// Localize script with nonce and AJAX URL. The two nonces serve
-		// different transports: `nonce` (action `perflocale_nonce`) is
-		// consumed by admin-ajax handlers as `_ajax_nonce`; `restNonce`
-		// (the standard `wp_rest` action) is required by the WP REST
-		// cookie-auth check via the `X-WP-Nonce` header.
+		// `nonce` (action `perflocale_nonce`) is admin-ajax's `_ajax_nonce`; `restNonce` (`wp_rest`) is the REST cookie
+		// auth's `X-WP-Nonce`.
 		wp_localize_script(
 			'perflocale-admin',
 			'perflocaleAdmin',
@@ -264,9 +286,7 @@ final class Assets {
 			]
 		);
 
-		// Bulk-actions UI: only loaded on the Translations page, which
-		// ships the bulk-action bar. Vanilla JS, ~140 lines, no deps.
-		// Keeps the dead-bytes guarantee on every other plugin admin page.
+		// The bulk-action bar exists only on the Translations screen.
 		$bulk_screens = [
 			'perflocale_page_perflocale-translations',
 		];
@@ -291,18 +311,18 @@ final class Assets {
 			);
 		}
 
-		// Translations-page MT estimates (bulk-action confirm + the
-		// "Translate the entire site" panel). Gated exactly like the
-		// Strings bulk-MT toolbar so no dead JS ships when MT is off.
+		// Translations screen estimates (bulk confirm, the whole-site panel), gated like the Strings bulk toolbar so no JS
+		// ships with machine translation off.
 		if ( $hook === 'perflocale_page_perflocale-translations' ) {
 			$plugin   = \PerfLocale\Plugin::get_instance();
 			$settings = $plugin->has( 'settings' ) ? $plugin->get( 'settings' ) : null;
 
 			if ( $settings && $settings->mt_enabled() && current_user_can( 'perflocale_manage_translations' ) ) {
+				// wp-hooks: the script fires perflocale.translations.bulkSubmitted and perflocale.translations.bulkFinished.
 				wp_enqueue_script(
 					'perflocale-translations-bulk-mt',
 					PERFLOCALE_URL . 'assets/js/translations-bulk-mt.js',
-					[],
+					[ 'wp-hooks' ],
 					PERFLOCALE_VERSION,
 					true
 				);
@@ -314,10 +334,7 @@ final class Assets {
 					if ( ! empty( $lang->is_default ) ) {
 						continue;
 					}
-					$mt_targets[] = [
-						'id'   => (int) $lang->id,
-						'slug' => (string) $lang->slug,
-					];
+					$mt_targets[] = self::mt_target( $lang );
 				}
 
 				wp_localize_script(
@@ -328,27 +345,29 @@ final class Assets {
 						'bulkUrl'     => rest_url( 'perflocale/v1/translations/bulk-translate' ),
 						'nonce'       => wp_create_nonce( 'wp_rest' ),
 						'targets'     => $mt_targets,
+						'bulkFinished' => self::translations_bulk_finished(),
+						// SCRIPT_DEBUG: a hook callback that throws is reported once per hook in the console.
+						'debug'       => defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG,
 						'i18n'        => [
 							/* translators: 1: item count, 2: character count, 3: skipped count */
-							'confirmEstimate' => __( 'Machine-translate %1$s items (~%2$s characters; %3$s already translated will be skipped)?', 'perflocale' ),
-							'confirmPlain'    => __( 'Machine-translate the selected items? Existing translations are skipped.', 'perflocale' ),
+							'confirmEstimate'    => __( 'Machine-translate %1$s items (~%2$s characters; %3$s already translated will be skipped)?', 'perflocale' ),
+							'confirmPlain'       => __( 'Machine-translate the selected items? Existing translations are skipped.', 'perflocale' ),
 							/* translators: 1: estimated characters, 2: remaining monthly characters */
-							'overBudget'      => __( 'Needs ~%1$s characters but only %2$s remain in the monthly limit. Raise it under Settings → Addons → Machine Translation.', 'perflocale' ),
+							'overBudget'         => __( 'Needs ~%1$s characters but only %2$s remain in the monthly limit. Raise it under Settings → Addons → Machine Translation.', 'perflocale' ),
 							/* translators: 1: item count, 2: character count, 3: skipped count */
-							'estimateResult'  => __( '%1$s items, ~%2$s characters (%3$s already translated will be skipped).', 'perflocale' ),
-							'estimating'      => __( 'Estimating…', 'perflocale' ),
-							'pickSelection'   => __( 'Pick at least one language and one post type.', 'perflocale' ),
-							'genericError'    => __( 'Could not fetch the estimate.', 'perflocale' ),
+							'estimateResult'     => __( '%1$s items, ~%2$s characters (%3$s already translated will be skipped).', 'perflocale' ),
+							'estimating'         => __( 'Estimating…', 'perflocale' ),
+							/* translators: %s: number of posts checked so far. */
+							'estimatingProgress' => __( 'Estimating… %s posts checked.', 'perflocale' ),
+							'pickSelection'      => __( 'Pick at least one language and one post type.', 'perflocale' ),
+							'genericError'       => __( 'Could not fetch the estimate.', 'perflocale' ),
 						],
 					]
 				);
 			}
 		}
 
-		// Drag-and-drop dropzone is used on the Strings (PO import),
-		// Glossary (CSV import), and Settings (data import) screens.
-		// Loading its CSS/JS on every PerfLocale admin page would ship
-		// dead bytes to Dashboard, Languages, Translations, etc.
+		// The dropzone is used on the Strings (PO import) and Settings (data import) screens only.
 		$dropzone_screens = [
 			'perflocale_page_perflocale-strings',
 			'perflocale_page_perflocale-settings',
@@ -370,18 +389,9 @@ final class Assets {
 			);
 		}
 
-		// Settings page progressive enhancements (e.g. Switcher tab's
-		// display-mode-dependent row visibility), and the import form's
-		// upload in pieces for a file larger than PHP accepts in one request.
+		// Settings screen enhancements (switcher rows by display mode) and the import form's upload in pieces, in one file
+		// so a per-script cost other plugins add to each script tag is paid once.
 		if ( $hook === 'perflocale_page_perflocale-settings' ) {
-			wp_enqueue_script(
-				'perflocale-import-upload',
-				PERFLOCALE_URL . 'assets/js/import-upload.js',
-				[],
-				PERFLOCALE_VERSION,
-				true
-			);
-
 			wp_enqueue_script(
 				'perflocale-admin-settings',
 				PERFLOCALE_URL . 'assets/js/admin-settings.js',
@@ -391,9 +401,8 @@ final class Assets {
 			);
 		}
 
-		// Sprintf-placeholder validator: only on the Strings admin page,
-		// because it's the only screen that ships an Edit Translation modal
-		// with real-time chip feedback.
+		// Placeholder validator, the Edit Translation modal and the per-row check, on the Strings screen only (StringsPage
+		// localizes the modal's strings onto this handle).
 		if ( $hook === 'perflocale_page_perflocale-strings' ) {
 			wp_enqueue_script(
 				'perflocale-strings-validate',
@@ -403,18 +412,16 @@ final class Assets {
 				true
 			);
 
-			// Bulk MT-translate dispatcher: only loaded when MT is on AND
-			// the bulk-strings kill-switch is on (so disabling the
-			// toolbar via Settings → Addons → Machine Translation → Bulk MT for
-			// Strings doesn't ship dead JS to the page).
+			// Bulk string translation: only with machine translation on and its Strings bulk switch on.
 			$plugin   = \PerfLocale\Plugin::get_instance();
 			$settings = $plugin->has( 'settings' ) ? $plugin->get( 'settings' ) : null;
 
 			if ( $settings && $settings->mt_enabled() && $settings->mt_bulk_strings_enabled() && current_user_can( 'perflocale_use_mt' ) ) {
+				// wp-hooks: the script fires perflocale.strings.bulkQueued and perflocale.strings.bulkFinished.
 				wp_enqueue_script(
 					'perflocale-strings-bulk-mt',
 					PERFLOCALE_URL . 'assets/js/strings-bulk-mt.js',
-					[ 'perflocale-admin' ],
+					[ 'perflocale-admin', 'wp-hooks' ],
 					PERFLOCALE_VERSION,
 					true
 				);
@@ -425,14 +432,10 @@ final class Assets {
 
 				foreach ( $active as $lang ) {
 					if ( ! empty( $lang->is_default ) ) {
-						continue; // Source language - can't be a target.
+						continue; // The source language is never a target.
 					}
 
-					$mt_targets[] = [
-						'id'   => (int) $lang->id,
-						'slug' => (string) $lang->slug,
-						'name' => (string) ( $lang->native_name ?: ( $lang->name ?: $lang->slug ) ),
-					];
+					$mt_targets[] = self::mt_target( $lang );
 				}
 
 				wp_localize_script(
@@ -444,9 +447,10 @@ final class Assets {
 						'nonce'    => wp_create_nonce( 'wp_rest' ),
 						'targets'  => $mt_targets,
 						'provider' => (string) $settings->get_mt_provider(),
-						// The most strings one dispatch translates; the confirm
-						// dialogs show the selection cut at it, as the job runs it.
-						'runCap'   => \PerfLocale\Background\Jobs\BulkStringTranslateJob::max_per_dispatch(),
+						// Most strings one dispatch translates; the confirm dialogs cut the selection there, as the job does.
+						'runCap'   => \PerfLocale\Background\Jobs\BulkStringCap::max_per_dispatch(),
+						// SCRIPT_DEBUG: a hook callback that throws is reported once per hook in the console.
+						'debug'    => defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG,
 						'i18n'     => [
 							'pickTargets'     => __( 'Pick at least one target language.', 'perflocale' ),
 							'pickStrings'     => __( 'Pick at least one string row first.', 'perflocale' ),
@@ -463,7 +467,7 @@ final class Assets {
 							'maxExceeded'     => sprintf(
 								/* translators: %s: the most strings one run translates, for example 5,000. */
 								__( 'Selection exceeds the per-dispatch cap (%s strings per run). Narrow the filter or split the run.', 'perflocale' ),
-								number_format_i18n( \PerfLocale\Background\Jobs\BulkStringTranslateJob::max_per_dispatch() )
+								number_format_i18n( \PerfLocale\Background\Jobs\BulkStringCap::max_per_dispatch() )
 							),
 							'queued'          => __( 'Bulk MT job queued. Redirecting to Jobs page…', 'perflocale' ),
 							/* translators: 1: translated count, 2: skipped count, 3: failed count */
@@ -481,9 +485,7 @@ final class Assets {
 			}
 		}
 
-		// Searchable language-preset combobox: only on the Languages
-		// add/edit form. The 250-language data array + custom combobox
-		// JS+CSS is dead weight on every other PerfLocale admin page.
+		// The language preset combobox (250-language data) on the Languages add/edit form only.
 		if ( $hook === 'perflocale_page_perflocale-languages' ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only screen routing
 			$action = isset( $_GET['action'] ) ? sanitize_key( wp_unslash( $_GET['action'] ) ) : '';
@@ -513,9 +515,7 @@ final class Assets {
 				);
 			}
 
-			// Drag-and-drop reorder: only on the list view (no `action`).
-			// The handle CSS lives in admin.css (already enqueued above);
-			// only the JS is page-specific.
+			// Drag-and-drop reorder on the list view only (no `action`); its CSS is in the shared admin CSS.
 			if ( $action === '' ) {
 				wp_enqueue_script(
 					'perflocale-languages-reorder',
@@ -529,19 +529,13 @@ final class Assets {
 	}
 
 	/**
-	 * Enqueue the JS Abilities shim with a localized list of registered
-	 * abilities + their schemas. The shim itself feature-detects the
-	 * JS-side Abilities API at runtime, so this is safe to enqueue
-	 * unconditionally - on WP versions without `wp.abilities.register`
-	 * (every release through 7.0.x at the time of writing) it costs one
-	 * extra small script and zero behaviour.
+	 * Enqueue the JS Abilities shim with the registered abilities and their schemas; it feature-detects the JS
+	 * Abilities API, so without it the cost is one small script.
 	 *
 	 * @return void
 	 */
 	private function maybe_enqueue_abilities_shim(): void {
-		// AbilitiesRegistrar only registers when `wp_register_ability`
-		// exists. No point enqueueing the JS shim if the PHP side never
-		// registered anything either.
+		// No PHP abilities were registered without `wp_register_ability`: no shim.
 		if ( ! function_exists( 'wp_register_ability' ) ) {
 			return;
 		}
@@ -555,16 +549,8 @@ final class Assets {
 		$payload = [ 'abilities' => $abilities ];
 
 		/**
-		 * Filter the payload localized into the JS Abilities shim.
-		 *
-		 * Use this to add or remove abilities from the JS-side registration
-		 * without touching the PHP-side `AbilitiesRegistrar`. A common case:
-		 * an enterprise install that wants `translate-post` invokable only
-		 * server-side, not from `wp.abilities` - strip it here and the JS
-		 * shim won't register it.
-		 *
-		 * The payload shape is `[ 'abilities' => [ { name, label, ... }, ... ] ]`.
-		 * Returning an empty `abilities` array skips JS registration entirely.
+		 * Filter the payload of the JS Abilities shim, `[ 'abilities' => [ { name, label, ... } ] ]`, for example to keep
+		 * `translate-post` server-side only; an empty `abilities` list skips JS registration.
 		 *
 		 * @hook perflocale/abilities/js_payload
 		 *
@@ -592,14 +578,12 @@ final class Assets {
 	}
 
 	/**
-	 * Walk the WP Abilities registry and pull every `perflocale/*` entry,
-	 * shaped for the JS shim's input.
+	 * Every `perflocale/*` ability in the WP Abilities registry, shaped for the JS shim.
 	 *
 	 * @return array<int, array{name:string,label:string,description:string,inputSchema:?array,outputSchema:?array,readonly:bool,destructive:bool,idempotent:bool}>
 	 */
 	private function collect_registered_abilities(): array {
-		// Called by name: the Abilities API (WP 6.9+) is optional; the
-		// function_exists() guard is the real safety check.
+		// Called by name: the Abilities API (WP 6.9+) is optional; function_exists() guards it.
 		$get_abilities = 'wp_get_abilities';
 
 		if ( ! function_exists( $get_abilities ) ) {
@@ -652,9 +636,8 @@ final class Assets {
 				'description'  => (string) $get( $ability, 'description', '' ),
 				'inputSchema'  => $get( $ability, 'input_schema', null ),
 				'outputSchema' => $get( $ability, 'output_schema', null ),
-				// Behavioral annotations drive the JS shim's REST method
-				// selection, mirroring core's Abilities run-controller:
-				// readonly => GET, destructive+idempotent => DELETE, else POST.
+				// The annotations choose the shim's REST method as core's run controller does: readonly GET, destructive and
+				// idempotent DELETE, else POST.
 				'readonly'     => ! empty( $annotations['readonly'] ),
 				'destructive'  => ! empty( $annotations['destructive'] ),
 				'idempotent'   => ! empty( $annotations['idempotent'] ),
@@ -665,7 +648,7 @@ final class Assets {
 	}
 
 	/**
-	 * Check if the current page is a PerfLocale admin page.
+	 * Whether this is a PerfLocale admin screen.
 	 *
 	 * @param string $hook Current admin page hook.
 	 * @return bool

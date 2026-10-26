@@ -16,24 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Looks up + records `(migration_type, source_key) -> group_id` mappings.
- *
- * Pins a source-plugin identifier (WPML trid, Polylang term_id, etc.) to
- * the translation_groups row the importer created for it, so a partial-
- * failure crash or a post-import DB restore can't allocate a duplicate
- * group_id on retry. Strings already get this guarantee from REPLACE
- * INTO; this table extends the same idempotency to posts and terms.
- *
- * The UNIQUE (migration_type, source_key) constraint backs the
- * lookup-or-create dance: every write uses ON DUPLICATE KEY UPDATE so
- * concurrent imports converge to a single row per source identifier.
- *
- * Used by:
- *   - {@see \PerfLocale\Database\Repository\TranslationGroupRepository::create_group()}
- *     writes the mapping inside its own create_group transaction.
- *   - {@see \PerfLocale\Migration\WpmlImporter} and
- *     {@see \PerfLocale\Migration\PolylangImporter} look up before
- *     creating a new group, so re-runs reuse existing IDs.
+ * `(migration_type, source_key) -> group_id`: pins a source plugin's id (WPML trid, Polylang term_id) to the group
+ * the importer created, so a retry after a crash or restore reuses it. Writes upsert on the UNIQUE (type, key), so
+ * concurrent imports converge; create_group() writes it in its own transaction, the importers read it first.
  */
 final class MigrationSourceMapRepository {
 
@@ -52,14 +37,7 @@ final class MigrationSourceMapRepository {
 	}
 
 	/**
-	 * Resolve the full table name for the current blog.
-	 *
-	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly - capturing the name in the constructor would otherwise pin
-	 * this instance to whichever blog was active at construction. Same rule
-	 * as every sibling repository; today's callers build the repo inside the
-	 * blog they operate on, so this is the convention holding rather than a
-	 * bug being fixed.
+	 * The full table name for the current blog, computed per call so switch_to_blog() is followed.
 	 *
 	 * @return string
 	 */
@@ -68,8 +46,7 @@ final class MigrationSourceMapRepository {
 	}
 
 	/**
-	 * Resolve a previously-recorded mapping, or null when nothing's been
-	 * stored for this (type, key) pair yet.
+	 * The recorded group of a (type, key) pair, or null.
 	 *
 	 * @param string $migration_type Importer identifier (e.g. 'wpml', 'polylang', 'trp').
 	 * @param string $source_key     Per-importer natural key (e.g. WPML "<trid>|<element_type>").
@@ -101,15 +78,8 @@ final class MigrationSourceMapRepository {
 	}
 
 	/**
-	 * Record a `(type, key) -> group_id` mapping.
-	 *
-	 * Uses `INSERT … ON DUPLICATE KEY UPDATE` so re-importers (and crash
-	 * recovery paths) converge to the most-recent mapping without
-	 * touching the existing row's id or created_at.
-	 *
-	 * Called from {@see TranslationGroupRepository::create_group()} INSIDE
-	 * the same transaction that creates the group row, so the mapping and
-	 * the group are atomically committed together.
+	 * Record a `(type, key) -> group_id` mapping with an upsert (re-runs converge; id and created_at kept). Called by
+	 * create_group() inside its transaction, so mapping and group commit together.
 	 *
 	 * @param string $migration_type Importer identifier.
 	 * @param string $source_key     Per-importer natural key.
@@ -139,9 +109,7 @@ final class MigrationSourceMapRepository {
 	}
 
 	/**
-	 * Source keys of one migration type that map onto a group.
-	 *
-	 * Read through the `group_id` index; at most `$limit` keys.
+	 * Source keys of one migration type that map onto a group (through the `group_id` index, at most `$limit`).
 	 *
 	 * @param string $migration_type Importer identifier.
 	 * @param int    $group_id       translation_groups.id.
@@ -194,9 +162,7 @@ final class MigrationSourceMapRepository {
 	}
 
 	/**
-	 * Clear every mapping for one migration type. Used by the operator-
-	 * driven `--force-restart` flow when they want a clean re-import
-	 * (e.g. after intentionally restoring a backup to a known-good state).
+	 * Clear every mapping of one migration type (`--force-restart`, for a clean re-import).
 	 *
 	 * @param string $migration_type Importer identifier.
 	 * @return int Number of rows deleted.

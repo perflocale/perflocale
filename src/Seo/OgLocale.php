@@ -18,16 +18,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Shared og:locale logic.
+ * Emits og:locale:alternate for the page's other translations.
  *
- * The page's own og:locale is left to the active SEO plugin: PerfLocale
- * filters WordPress's `locale` (see Bootstrap), so every SEO plugin that
- * derives og:locale from get_locale() already emits the current language's
- * locale without any per-plugin help. What no SEO plugin emits is
- * og:locale:alternate for the page's *other* translations, so
- * {@see self::emit_alternates()} adds those once from the core.
- *
- * Gated on the `seo_og_locale` setting via {@see self::enabled()}.
+ * The page's own og:locale comes from the SEO plugin, which reads the filtered `locale`.
  */
 final class OgLocale {
 
@@ -47,12 +40,9 @@ final class OgLocale {
 	}
 
 	/**
-	 * Whether a known OG-emitting SEO plugin is active.
+	 * Whether a known OG-emitting SEO plugin is active (same detection as the add-ons).
 	 *
-	 * Used to gate og:locale:alternate emission: alternates only make sense
-	 * alongside an existing og:* block, so on a site with no SEO plugin we
-	 * skip them rather than emit lone alternate tags. Mirrors the detection
-	 * each addon's is_compatible() uses. Memoized per request.
+	 * Alternates without an SEO plugin's og:* block would stand alone, so they are skipped.
 	 *
 	 * @return bool
 	 */
@@ -75,22 +65,14 @@ final class OgLocale {
 	}
 
 	/**
-	 * Locales of the current page's other translations, for og:locale:alternate.
+	 * Deduplicated locales of the current page's other translations, for og:locale:alternate.
 	 *
-	 * Reuses {@see \PerfLocale\Router\UrlConverter::get_translations_for_current_page()},
-	 * which is already memoized per request and shared with the hreflang and
-	 * language-switcher output, so this adds no extra query when those have
-	 * run. Returns deduplicated WordPress-form locales excluding the current
-	 * language's. Memoized per request.
+	 * Reuses the per-request translation set shared with hreflang and the switcher.
 	 *
 	 * @return array<int, string>
 	 */
 	public static function alternate_locales(): array {
-		// Blog-keyed per-request memo - the alternate og:locale set is per-blog
-		// (active languages + their locales differ). Keying by blog id means a
-		// mid-request switch_to_blog() gets its own entry instead of blog A's,
-		// with no switch_blog reset needed (a plain function-local static would
-		// leak across the switch since no reset can reach it).
+		// Keyed by blog: no switch_blog reset can reach a function-local static.
 		static $cached_by_blog = [];
 
 		$blog_key = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
@@ -125,12 +107,7 @@ final class OgLocale {
 			}
 		}
 
-		// `_perflocale_seo_exclude` must hide a translation from EVERY search
-		// signal, not just hreflang: an og:locale:alternate naming a locale the
-		// hreflang set deliberately omits contradicts it. Mirrors the same
-		// two-part contract as HreflangTags - emit nothing FROM an excluded
-		// page, and skip excluded siblings. The flagged-id set is empty on
-		// almost every site, so the common cost is one memoised lookup.
+		// SEO exclusion applies here as in HreflangTags: nothing from an excluded page, no excluded siblings.
 		$excluded_slugs = [];
 
 		if ( is_singular() && Helper::seo_excluded_post_ids() !== [] ) {
@@ -174,9 +151,7 @@ final class OgLocale {
 	/**
 	 * Emit og:locale:alternate meta tags for the current page's translations.
 	 *
-	 * Emitted once from the core (not per addon) since alternate tags are
-	 * plugin-agnostic and unique-keyed OG-tag arrays can't carry repeats.
-	 * Gated on an active SEO plugin so no-SEO-plugin sites stay clean.
+	 * Emitted here, not per add-on: SEO plugins' unique-keyed OG arrays cannot carry repeats.
 	 *
 	 * @return void
 	 */

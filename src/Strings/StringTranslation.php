@@ -18,13 +18,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Intercepts gettext calls (__(), _e(), etc.) and serves translations
- * from the plugin's string tables (perflocale_strings +
- * perflocale_string_translations).
+ * Serves gettext calls from the plugin's string tables (database mode).
  *
- * Uses lazy loading: translations are loaded on the first gettext call
- * (after language detection has completed on parse_request), not on
- * wp_loaded (which fires before parse_request).
+ * Loads on language detection (parse_request), not wp_loaded, which fires before the language is known.
  */
 final class StringTranslation {
 
@@ -39,18 +35,14 @@ final class StringTranslation {
 	private readonly CacheManager $cache;
 
 	/**
-	 * Reserved key under which the extra-plural-forms sub-map lives inside
-	 * $translations. A NUL prefix guarantees it can never collide with a
-	 * 64-hex sha256 original_hash.
+	 * Reserved $translations key of the extra-plural-forms sub-map; the NUL prefix never collides with a hash.
 	 */
 	private const EXTRA_FORMS_KEY = "\0pfl_extra_forms";
 
 	/**
-	 * Reserved key holding whether the map has a row a gettext filter can
-	 * serve ('1') or not ('0'). Rows of OptionStrings' domain are read through get_translation()
-	 * directly, so a map holding only those (a site title translation) needs
-	 * no gettext filter. A map without the key (cached before the key
-	 * existed) counts as having gettext rows.
+	 * Reserved key: '1' when the map has a row the gettext filters serve, '0' when only OptionStrings rows.
+	 *
+	 * A map without the key (an older cache entry) counts as having gettext rows.
 	 */
 	private const GETTEXT_ROWS_KEY = "\0pfl_gettext_rows";
 
@@ -92,27 +84,19 @@ final class StringTranslation {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Defer gettext filter registration until language is detected.
-		// This avoids hundreds of wasted filter calls during early WP init
-		// (before parse_request fires and language is known).
+		// Register the gettext filters only once the language is known.
 		add_action( 'perflocale/language/detected', [ $this, 'activate' ] );
 	}
 
 	/**
 	 * Activate gettext filters and eagerly preload translations.
 	 *
-	 * Called when language detection completes (on parse_request).
-	 * By this point the language is guaranteed to be available.
+	 * Runs on perflocale/language/detected, so the language is known.
 	 *
 	 * @return void
 	 */
 	public function activate(): void {
-		// Fast-path: on the default language WordPress already serves source
-		// strings in that language - no gettext swap needed. Skip the preload
-		// query + filter registration entirely to save ~200µs on every
-		// default-language frontend request (database mode's preload query is
-		// a 4-table JOIN even on warm cache). Same principle as the analogous
-		// skip in TranslationFileLoader::activate.
+		// The default language serves source strings: no preload and no filters (as TranslationFileLoader::activate).
 		$current = $this->router->get_current_language();
 		$default = $this->router->get_default_language();
 
@@ -125,11 +109,7 @@ final class StringTranslation {
 			return;
 		}
 
-		// Preload first - if there are no DB translations for this language,
-		// or only rows that are read without gettext (option strings), skip
-		// registering the gettext filters entirely. This avoids adding
-		// overhead to every __() call (300-800 per page) when gettext has
-		// nothing to serve.
+		// Preload first: without gettext rows the filters are not added, sparing every __() call.
 		$this->preload_translations();
 
 		if ( $this->has_gettext_rows() ) {
@@ -158,8 +138,7 @@ final class StringTranslation {
 
 		$this->loaded = true;
 
-		// Load ALL translated text into memory in a SINGLE query.
-		// JOINs strings → groups → links → wp_options to get hash → translation in one pass.
+		// Every translation of the language, hash => text, in one query.
 		$preloaded = $this->cache->get(
 			"all_string_translations_{$language_id}",
 			function () use ( $language_id ): array {
@@ -171,20 +150,8 @@ final class StringTranslation {
 				$groups_table  = Schema::table( 'translation_groups' );
 				$st_table      = Schema::table( 'string_translations' );
 
-				// Single query: drive the plan from string_translations FIRST
-				// so the (string_id, language_id) PRIMARY KEY narrows the
-				// result set to "translated entries for this language" before
-				// we touch strings / groups / translation_links. The earlier
-				// version started from `strings` and applied the language
-				// filter via INNER JOIN + post-filter `WHERE st.translation != ''`,
-				// which left the planner unable to use the language_id index
-				// efficiently and meant a full strings-table scan on cold
-				// caches with 5k+ entries (50–150ms per fresh PHP worker).
-				//
-				// Driving from `st` flips the plan to: index range scan on
-				// (string_id, language_id) for `language_id = ?`, then key-
-				// lookup on each `s.id` and `l.group_id`. Same result, ~10×
-				// faster on the cold path; warm path is unaffected (cache hit).
+				// Driven from string_translations, so its key narrows to this language before the other joins.
+				// See docs-ai/11-code-rationale.md, "StringTranslation: preload query plan".
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$results = $wpdb->get_results(
 					$wpdb->prepare(
@@ -212,11 +179,8 @@ final class StringTranslation {
 
 				if ( is_array( $results ) ) {
 					foreach ( $results as $row ) {
-						// Skip internal, output-buffer-served domains (a leading
-						// "_", such as "_pfl_dyn") - not gettext-
-						// resolved, so they must not populate the map (which would
-						// register the gettext filters on otherwise-untranslated
-						// languages).
+						// Internal "_" domains (`_pfl_dyn`) are served by the output buffer, not gettext:
+						// they must not make the map non-empty and register the filters.
 						if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
 							continue;
 						}
@@ -224,10 +188,7 @@ final class StringTranslation {
 						$map[ $row->original_hash ] = $row->translated_text;
 						$gettext                    = $gettext || self::is_gettext_domain( (string) $row->domain );
 
-						// Plural forms 2..N (Polish/Russian/Arabic) live in the
-						// plural-context row's extra_forms JSON - NULL for every
-						// 2-form language, so this branch is skipped for almost
-						// all rows.
+						// Plural forms 2..N live in the plural row's extra_forms JSON (NULL for 2-form languages).
 						if ( isset( $row->extra_forms ) && $row->extra_forms !== null && $row->extra_forms !== '' ) {
 							$decoded = json_decode( (string) $row->extra_forms, true );
 
@@ -238,11 +199,7 @@ final class StringTranslation {
 					}
 				}
 
-				// Fold the (usually empty) extra-forms map into the cached
-				// structure under a reserved key that can NEVER collide with a
-				// 64-hex sha256 hash, so every existing hash lookup is
-				// untouched and old cached blobs (which lack the key) simply
-				// resolve to "no extra forms".
+				// Extra forms go under a reserved key; a cached map without it has no extra forms.
 				if ( $extra !== [] ) {
 					$map[ self::EXTRA_FORMS_KEY ] = $extra;
 				}
@@ -258,19 +215,11 @@ final class StringTranslation {
 			'perflocale_strings'
 		);
 
-		// A persistent object cache can hand back something that is no longer
-		// the array we stored - a truncated Redis payload, or a drop-in that
-		// reports a hit but returns false for a value it could not unserialize.
-		// $translations is a TYPED property, so assigning that straight through
-		// throws at the ASSIGNMENT: a fatal on every front-end request for as
-		// long as the poisoned entry lives, not a degraded page. Treat a
-		// non-array payload as "no translations" - the same defensive shape
-		// LanguageRepository::find() uses for its non-object payloads -
-		// so the request finishes serving source strings instead of white-
-		// screening. A well-formed array is passed through UNCHANGED.
+		// An object cache can return a non-array (truncated payload, failed unserialize): assigning it to the
+		// typed property would fatal every request, so it counts as "no translations".
 		$this->translations = is_array( $preloaded ) ? $preloaded : [];
 
-		// Load fallback language translations to fill gaps (only if fallbacks are configured).
+		// Fill gaps from fallback languages, when configured.
 		$settings  = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 		$fallbacks = (array) $settings->get( 'language_fallbacks' );
 
@@ -282,8 +231,7 @@ final class StringTranslation {
 	/**
 	 * Load fallback language translations for strings missing in the current language.
 	 *
-	 * If the current language has a fallback configured, loads that language's
-	 * translations and merges them (current language takes priority).
+	 * The current language, then earlier chain entries, win over later ones.
 	 *
 	 * @param int $language_id Current language ID.
 	 * @return void
@@ -291,8 +239,7 @@ final class StringTranslation {
 	private function load_fallback_translations( int $language_id ): void {
 		$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 		$slug     = $this->router->get_current_slug();
-		// 'strings' context: a missing string may legitimately borrow from a
-		// sibling locale, which is a different judgement from post content.
+		// 'strings' context: a string may borrow from a sibling locale, unlike post content.
 		$chain    = $settings->get_fallback_chain( (string) $slug, 'strings' );
 
 		if ( empty( $chain ) ) {
@@ -301,9 +248,7 @@ final class StringTranslation {
 
 		$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository( $this->cache );
 
-		// Walk the configured fallback chain. The current language (already
-		// loaded) and earlier chain entries win; each subsequent language only
-		// fills the gaps that remain.
+		// Each later language only fills the gaps that remain.
 		foreach ( (array) $chain as $fallback_slug ) {
 			$fallback_lang = $lang_repo->find_by_slug( sanitize_key( (string) $fallback_slug ) );
 
@@ -348,11 +293,7 @@ final class StringTranslation {
 
 					if ( is_array( $results ) ) {
 						foreach ( $results as $row ) {
-							// Skip internal, output-buffer-served domains (a
-							// leading "_", such as "_pfl_dyn") -
-							// they're not gettext-resolved, so they must not
-							// populate the map (which would register the gettext
-							// filters on otherwise-untranslated languages).
+							// Internal "_" domains are not gettext-served: they must not register the filters.
 							if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
 								continue;
 							}
@@ -386,15 +327,9 @@ final class StringTranslation {
 				'perflocale_strings'
 			);
 
-			// Same corrupted-payload guard as the primary map above: this map
-			// is spliced and then `+=`d into a typed array property, and both
-			// operations fatal on a non-array. `! empty()` alone would let the
-			// string "GARBAGE" through.
+			// Same non-array guard as the primary map: splicing and `+=` fatal on a non-array.
 			if ( is_array( $fallback_translations ) && $fallback_translations !== [] ) {
-				// The extra-forms sub-map needs a PER-HASH merge (primary
-				// hash wins), not the whole-key `+=` - otherwise the primary
-				// language's EXTRA_FORMS_KEY entry would block every fallback
-				// plural, or vice-versa. Splice it out, merge separately.
+				// Extra forms merge per hash, not by the whole-key `+=`, which would drop one side's plurals.
 				$fallback_extra = $fallback_translations[ self::EXTRA_FORMS_KEY ] ?? [];
 				unset( $fallback_translations[ self::EXTRA_FORMS_KEY ] );
 
@@ -402,13 +337,8 @@ final class StringTranslation {
 				$gettext_rows = $this->has_gettext_rows() || '0' !== ( $fallback_translations[ self::GETTEXT_ROWS_KEY ] ?? '1' );
 				unset( $fallback_translations[ self::GETTEXT_ROWS_KEY ] );
 
-				// A fallback's extra forms may only ride along when the WHOLE
-				// row comes from the fallback (the primary map lacks the hash,
-				// evaluated BEFORE the merge below fills it). If the primary
-				// has its own form-1 translation but no extra forms, attaching
-				// the fallback's forms 2..N would serve a MIXED-language plural
-				// set (form 1 in the primary language, "many" in the fallback
-				// language) - same-language form-1 fallback is the lesser evil.
+				// Fallback extra forms only when the whole row comes from the fallback (checked before the merge):
+				// else forms 2..N would be in another language than form 1.
 				$adoptable_extra = [];
 
 				if ( is_array( $fallback_extra ) && $fallback_extra !== [] ) {
@@ -425,8 +355,7 @@ final class StringTranslation {
 
 				if ( $adoptable_extra !== [] ) {
 					$primary_extra = $this->translations[ self::EXTRA_FORMS_KEY ] ?? [];
-					// `+` keeps the primary hash's forms and fills only the
-					// hashes the primary lacks.
+					// `+` keeps the primary's forms and fills only the hashes it lacks.
 					$this->translations[ self::EXTRA_FORMS_KEY ] = ( is_array( $primary_extra ) ? $primary_extra : [] ) + $adoptable_extra;
 				}
 			}
@@ -459,9 +388,7 @@ final class StringTranslation {
 	/**
 	 * Filter gettext to serve translated strings.
 	 *
-	 * Parameters are typed as mixed because WordPress may pass null
-	 * when plugins call __( null ), which triggers PHP 8.1+ deprecation
-	 * warnings for null-to-string coercion.
+	 * Mixed parameters: WordPress may pass null (a plugin calling __( null )), which a string type rejects.
 	 *
 	 * @param mixed $translation Translated text (from .mo files).
 	 * @param mixed $text Original text.
@@ -496,8 +423,7 @@ final class StringTranslation {
 	/**
 	 * Filter ngettext to serve translated plural strings.
 	 *
-	 * WordPress has already selected the correct form (singular/plural)
-	 * based on $number. We look up the translation for that form.
+	 * The form comes from the current language's CLDR rule for $number.
 	 *
 	 * @param mixed $translation Translated text (from .mo files).
 	 * @param mixed $single Singular original text.
@@ -509,9 +435,7 @@ final class StringTranslation {
 	public function translate_plural_string( mixed $translation, mixed $single, mixed $plural, mixed $number, mixed $domain ): string {
 		$form_index = $this->plural_form_index( (int) $number );
 
-		// Form 0 = singular row; forms 1..N = plural row (translation column
-		// for form 1, extra_forms for 2..N). The scanner stores _n() strings
-		// under context 'singular' / 'plural'.
+		// Form 0 is the 'singular' row; forms 1..N the 'plural' row (the scanner's _n() contexts).
 		if ( $form_index === 0 ) {
 			$original = $single;
 			if ( ! is_string( $original ) || $original === '' ) {
@@ -543,8 +467,7 @@ final class StringTranslation {
 		$form_index = $this->plural_form_index( (int) $number );
 		$base_ctx   = (string) ( $context ?? '' );
 
-		// _nx() strings: singular under the actual context, plural forms
-		// under "context (plural)" (or plain "plural" when no context).
+		// _nx(): singular under the context, plural under "context (plural)", or 'singular' / 'plural'.
 		if ( $form_index === 0 ) {
 			$original = $single;
 			if ( ! is_string( $original ) || $original === '' ) {
@@ -582,10 +505,7 @@ final class StringTranslation {
 	/**
 	 * Resolve a plural translation for a given form index (>=1).
 	 *
-	 * Form 1 is the plural row's own `translation`; forms 2..N come from
-	 * that row's `extra_forms` JSON (loaded into the reserved sub-map).
-	 * Falls back to form 1 when a specific extra form is absent - the
-	 * partially-translated-plural behaviour, matching gettext.
+	 * Form 1 is the plural row's translation, forms 2..N its extra_forms; a missing form falls back to form 1.
 	 *
 	 * @param string $original     The plural original text.
 	 * @param string $domain       Text domain.
@@ -614,11 +534,7 @@ final class StringTranslation {
 				$candidate = $extra_map[ $hash ][ $form_index - 2 ] ?? '';
 
 				if ( is_string( $candidate ) && $candidate !== '' ) {
-					// Forms 0 and 1 pass through get_translation()'s
-					// perflocale/string/translate filter; run forms 2..N through
-					// the same filter so a listener (e.g. a glossary marker)
-					// sees every plural form consistently, not just the first
-					// two. Cold path (plural, form >= 2 only) - no hot-path cost.
+					// The same filter as forms 0 and 1 in get_translation(), so listeners see every form.
 					if ( has_filter( 'perflocale/string/translate' ) ) {
 						$candidate = (string) apply_filters(
 							'perflocale/string/translate',
@@ -640,14 +556,7 @@ final class StringTranslation {
 	/**
 	 * Look up a string translation from the preloaded cache.
 	 *
-	 * Lazy-loads translations on the first call. By this point,
-	 * parse_request has already fired and the language is detected.
-	 *
-	 * Uses a per-request hash cache to avoid re-computing SHA-256
-	 * for strings that appear multiple times (common in loops).
-	 *
-	 * Public so external code (e.g., WooCommerce attribute label filter)
-	 * can look up translations for strings that bypass WordPress i18n.
+	 * Public for strings that bypass WordPress i18n (WooCommerce attribute labels, option strings).
 	 *
 	 * @param string $text Original text.
 	 * @param string $domain Text domain.
@@ -665,8 +574,7 @@ final class StringTranslation {
 			return null;
 		}
 
-		// Per-request hash cache - avoids recomputing SHA-256 for repeated strings.
-		// Key is a cheap concatenation; value is the expensive SHA-256 hash.
+		// Per-request memo of the SHA-256 of repeated strings.
 		$cache_key = $domain . '|' . $context . '|' . $text;
 
 		if ( isset( $this->hash_cache[ $cache_key ] ) ) {
@@ -686,8 +594,7 @@ final class StringTranslation {
 			return null;
 		}
 
-		// Only apply the filter if there are actual listeners - this fires
-		// 300-800 times per page, so skip the overhead when nobody is listening.
+		// Hot path (hundreds of calls per page): apply the filter only when it has listeners.
 		if ( has_filter( 'perflocale/string/translate' ) ) {
 			/**
 			 * Filter a translated string before returning it.
@@ -712,10 +619,7 @@ final class StringTranslation {
 	/**
 	 * Drop the per-blog memo.
 	 *
-	 * The container registers this class as a shared singleton, but its
-	 * translation memo is per-BLOG data. Without a reset on `switch_blog` a
-	 * multisite request that switches blogs keeps serving the previous blog's
-	 * strings. Hooked in Bootstrap alongside the other switch_blog resets.
+	 * A shared singleton with per-blog data: without this reset on `switch_blog` blog 2 serves blog 1's strings.
 	 *
 	 * @return void
 	 */

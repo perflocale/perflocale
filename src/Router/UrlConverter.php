@@ -22,11 +22,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Converts URLs between languages by injecting the correct language
- * prefix and substituting translated slugs.
- *
- * Hooks into permalink filters to automatically add language prefixes
- * to all WordPress-generated URLs.
+ * Converts URLs between languages: language prefix, host or query arg, and translated slugs.
  */
 final class UrlConverter {
 
@@ -58,27 +54,15 @@ final class UrlConverter {
 	private bool $filtering = false;
 
 	/**
-	 * Soft cap for the per-request static memo arrays.
-	 *
-	 * Each memo below grows one entry per unique input. On a pathological
-	 * request (e.g. a sitemap rebuild walking 10k posts, or a long-running
-	 * WP-CLI command) these can balloon to a large arrays over the course
-	 * of one PHP process. Cap the size and slice the oldest 25% when hit,
-	 * mirroring the eviction pattern in CacheManager::set().
+	 * Soft cap for the per-request static memo arrays; cap_cache() drops the oldest 25%.
 	 */
 	private const MAX_CACHE_ENTRIES = 500;
 
 	/**
-	 * Cap on each blog's queue of term IDs awaiting a slug prime.
+	 * Cap on each blog's queue of term IDs awaiting a slug prime; queueing past it flushes that blog's queue.
 	 *
-	 * Queueing past it runs that blog's queued prime first. The bound is per
-	 * blog, not across blogs: a long-running process (WP-CLI, queue runners)
-	 * that reads terms on several blogs without building links keeps up to
-	 * this many IDs for each blog it visited. It also keeps each batch's IN
-	 * list and L1 writes within what a single preload_term_languages() call
-	 * may issue. Both hold only while that method's per-call guard on the
-	 * count of missing IDs admits no more than this cap, because the IDs of
-	 * the call that triggered the prime are queued after it.
+	 * Per blog, not in total. Keep it equal to the per-call `count( $missing )` guard in
+	 * preload_term_languages(): the triggering call's IDs are queued after the flush. Raise one, raise both.
 	 */
 	private const MAX_PENDING_TERM_SLUG_IDS = 500;
 
@@ -88,17 +72,7 @@ final class UrlConverter {
 	public const DEFAULT_QUERY_VAR = 'lang';
 
 	/**
-	 * Per-request memoized read of `permalink_structure`.
-	 *
-	 * The option lives in WP's autoload cache so the underlying read is
-	 * cheap (~1 µs), but it's called from convert(), resolve_query_string_url(),
-	 * and the trailingslashit guard at line ~1131 - each of which runs once
-	 * per permalink/page-link/post-type-link filter pass, i.e. dozens of
-	 * times per page render. A single static memo collapses the work to one
-	 * read per request. reset_static_caches() clears the memo on switch_blog
-	 * (each multisite blog can have its own permalink_structure) and on
-	 * language CRUD (no direct relation but consistent with the other
-	 * memos in this class).
+	 * Per-request memo of whether `permalink_structure` is set.
 	 *
 	 * @return bool
 	 */
@@ -113,9 +87,8 @@ final class UrlConverter {
 	/**
 	 * Clear every request-scoped static memo this class owns.
 	 *
-	 * Called on switch_blog (multisite isolation) and on language CRUD
-	 * events (so URL building after a programmatic add / rename / delete
-	 * picks up the new state for the rest of the request).
+	 * Runs on switch_blog, language CRUD and perflocale/language/overridden. It leaves
+	 * $pending_term_slug_ids alone on purpose (see that property).
 	 *
 	 * @return void
 	 */
@@ -145,17 +118,8 @@ final class UrlConverter {
 	/**
 	 * Language query variable name used by query-parameter URL mode.
 	 *
-	 * Filterable so a site already using `lang` for something else (Polylang
-	 * leftovers, a theme, a page builder) can move PerfLocale out of the way
-	 * without touching rewrite rules. The result is passed through
-	 * sanitize_key() and falls back to the default when a filter returns
-	 * something unusable, so the value is always a safe query-arg name.
-	 *
-	 * The writer (UrlConverter), the reader (LanguageRouter), the rewrite
-	 * rules (RewriteManager), the fallback redirect walker (PostQueryFilter)
-	 * and the Site Health rewrite probe all call this, so they cannot disagree
-	 * about which variable to use. Bootstrap primes it during load so admin
-	 * and front-end requests freeze the same value at the same moment.
+	 * Every writer and reader of the variable (router, rewrite rules, redirects, Site Health) calls this, so
+	 * they cannot disagree. Bootstrap primes it during load.
 	 *
 	 * @since 1.0.1
 	 *
@@ -169,22 +133,8 @@ final class UrlConverter {
 		/**
 		 * Filters the query variable used for query-parameter URL mode.
 		 *
-		 * Fires once per request per blog. The returned value is passed
-		 * through sanitize_key(); an empty or non-string result falls back
-		 * to the default.
-		 *
-		 * REGISTER THIS FROM AN MU-PLUGIN. The name is resolved during
-		 * PerfLocale's own load (Bootstrap primes it next to
-		 * detect_locale_early), because query-mode language detection has to
-		 * read the request before `plugins_loaded` fires. A filter added from
-		 * an ordinary plugin or a theme's functions.php runs too late and is
-		 * ignored - silently, because there is nothing to warn about at that
-		 * point. mu-plugins load first, so that is the supported home for it.
-		 *
-		 * Renaming this on a live site changes stored rewrite rules in
-		 * subdirectory mode, so flush permalinks (Settings > Permalinks)
-		 * after adding or changing the filter. Existing URLs carrying the
-		 * old name stop resolving, so treat a rename as a URL change.
+		 * Register it from an mu-plugin: it is read during PerfLocale's load, before `plugins_loaded`.
+		 * Flush permalinks after changing it; URLs carrying the old name stop resolving.
 		 *
 		 * @since 1.0.1
 		 *
@@ -200,13 +150,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Per-request URL-config snapshot (mode, default language, hide-default,
-	 * translate-slugs), shared by every URL-conversion entry point so the
-	 * ~200+ conversions on a render dispatch Settings::get + the
-	 * perflocale/url_mode filter once instead of per call. Class-level memo
-	 * so reset_static_caches() invalidates it when settings or languages
-	 * mutate mid-request; the url_mode filter's contract guarantees the
-	 * value is request-stable.
+	 * Per-request URL config snapshot shared by every conversion entry point.
+	 *
+	 * Class-static so reset_static_caches() clears it; the url_mode filter is request-stable by contract.
 	 *
 	 * @return array{url_mode: string, default: ?object, hide_default: bool, translate_slugs: bool}
 	 */
@@ -226,10 +172,6 @@ final class UrlConverter {
 	/**
 	 * Evict the oldest 25% of entries when the cap is reached.
 	 *
-	 * Called from every write site on the capped memos. The check is
-	 * O(1) for under-cap writes (just count()), so the overhead is
-	 * negligible in the common case.
-	 *
 	 * @param array<string, mixed> $cache Reference to the memo array.
 	 * @return void
 	 */
@@ -244,27 +186,13 @@ final class UrlConverter {
 	/**
 	 * Should every link filter on this request return the input URL unchanged?
 	 *
-	 * Returns true when the current request can't possibly result in a
-	 * link-rewrite - i.e., subdirectory mode + hide_default_prefix +
-	 * visitor on default language + no translation groups exist + no
-	 * translated slugs exist. In that state, every filter_*_link / filter_home_url
-	 * call would just produce the same URL back after a 5-7 µs round-trip
-	 * through resolve_object_language + inject_prefix. The memo collapses
-	 * the whole filter chain to a single isset() per call.
-	 *
-	 * Memoized per request; reset on `switch_blog` so the answer is
-	 * recomputed for the new blog's context.
+	 * True only in subdirectory mode with a hidden default prefix or in query mode, with the visitor on the
+	 * default language, no translation groups and no translated slugs. Memoized until reset_static_caches().
 	 *
 	 * @return bool
 	 */
 	private function should_skip_url_modification(): bool {
-		// During site install / upgrade / multisite subsite creation
-		// (wp_initialize_site sets wp_installing() true for its whole run) the
-		// blog's perflocale tables may not exist yet, and there is nothing to
-		// translate anyway. Skip URL modification - and the has_any_slugs() /
-		// has_any_groups() probes that would otherwise query not-yet-created
-		// tables and log DB errors - without memoizing, so normal detection
-		// resumes for real requests once installation finishes.
+		// During install or subsite creation the plugin's tables may not exist: skip, without memoizing.
 		if ( wp_installing() ) {
 			return true;
 		}
@@ -273,10 +201,7 @@ final class UrlConverter {
 			return self::$skip_url_modification_memo;
 		}
 
-		// Only two shapes can produce universally-unchanged URLs: subdirectory
-		// with a hidden default prefix, and query mode (whose default language
-		// never carries the ?lang= parameter). Subdomain / domain modes always
-		// rewrite the host.
+		// Subdomain and domain modes always rewrite the host.
 		$skip_mode = $this->settings->get_url_mode();
 
 		if ( $skip_mode !== 'subdirectory' && $skip_mode !== 'query' ) {
@@ -294,9 +219,7 @@ final class UrlConverter {
 			return self::$skip_url_modification_memo;
 		}
 
-		// At least one translated slug would require us to rewrite even
-		// for the default language. Cheap check via the slug repo's
-		// has_any_slugs() (cached aggressively).
+		// A translated slug changes default-language URLs too.
 		if ( $this->settings->translate_slugs_enabled() ) {
 			$slug_repo = new SlugTranslationRepository( $this->cache );
 
@@ -306,8 +229,7 @@ final class UrlConverter {
 			}
 		}
 
-		// At least one group means some post lives in a non-default
-		// language and would need prefixing.
+		// A group means some post is in a non-default language.
 		if ( self::$lazy_group_repo === null ) {
 			self::$lazy_group_repo = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 		}
@@ -322,174 +244,118 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Batch-preloaded object language cache.
-	 *
-	 * Populated by preload_object_languages() on the_posts hook.
-	 * Keyed by "{type}_{id}" → language object.
+	 * Batch-preloaded object languages, keyed "{type}_{id}"; filled on the_posts.
 	 *
 	 * @var array<string, object|null>
 	 */
 	private static array $object_language_cache = [];
 
 	/**
-	 * Term IDs whose slug prime is queued, keyed by blog ID, then term ID.
+	 * Term IDs whose slug prime is queued, keyed by blog ID, then term ID (docs-ai/04-do-not-fix.md 2.31).
 	 *
-	 * The term prime in preload_term_languages() queues here instead of
-	 * querying slugs, because most term reads (WooCommerce product data,
-	 * block-template lookups) never build a link. The SELECT runs when
-	 * SlugManager::get_slug() reads the slug of a queued term
-	 * (flush_pending_term_slug_prime()), or sooner when queueing would take
-	 * the blog's queue past MAX_PENDING_TERM_SLUG_IDS.
-	 *
-	 * Keyed by blog: the prime reads the current blog's slug table and
-	 * languages, and term IDs repeat across blogs, so each blog flushes only
-	 * its own IDs. Deliberately NOT cleared by reset_static_caches(), which
-	 * runs on switch_blog, language CRUD and the order-email language
-	 * override: the queue holds only term IDs, and the prime reads the
-	 * active languages when it runs, so nothing in it goes stale there,
-	 * while dropping queued IDs would send their slug reads to the per-key
-	 * path, which costs more than the batch.
+	 * Keyed by blog because term IDs repeat across blogs. NOT cleared by reset_static_caches(): it holds only
+	 * IDs, the prime reads languages when it runs, and dropping them sends slug reads to the per-key path.
 	 *
 	 * @var array<int, array<int, true>>
 	 */
 	private static array $pending_term_slug_ids = [];
 
 	/**
-	 * Per-request memoization for filter_home_url().
-	 *
-	 * WordPress calls home_url() hundreds of times per page render (nav, feed
-	 * links, asset URLs, theme fragments, widgets). The same (url, path) input
-	 * produces the same output deterministically during a request, so caching
-	 * collapses the work. Keyed by "{url}|{path}".
+	 * Per-request memo for filter_home_url(), keyed "{url}|{path}".
 	 *
 	 * @var array<string, string>
 	 */
 	private static array $home_url_memo = [];
 
 	/**
-	 * Per-request memo of the parsed home host for subdomain/domain mode.
-	 * Class-static (not function-static) so reset_static_caches() clears it
-	 * on switch_blog - home_url()'s host differs per blog on multisite.
+	 * Parsed home host for subdomain/domain mode; per blog, so reset_static_caches() clears it on switch_blog.
 	 *
 	 * @var string|null
 	 */
 	private static ?string $home_host = null;
 
 	/**
-	 * Per-request memo of the home URL's host[:port] for domain mode, where
-	 * apply_domain() serves an unmapped default language on it. Class-static
-	 * so reset_static_caches() clears it on switch_blog - the home host
-	 * differs per blog on multisite.
+	 * Home URL host[:port] for domain mode, where apply_domain() serves an unmapped default language.
+	 * Per blog, so reset_static_caches() clears it on switch_blog.
 	 *
 	 * @var string|null
 	 */
 	private static ?string $home_authority = null;
 
 	/**
-	 * Per-request slug => language-object map used by convert(). Class-static
-	 * so reset_static_caches() clears it on language CRUD (matching
-	 * $lang_id_map) - otherwise convert() would serve a stale language set
-	 * after a programmatic add/rename/delete within the same request.
+	 * Slug => language object map for convert(); class-static so language CRUD clears it.
 	 *
 	 * @var array<string, object>|null
 	 */
 	private static ?array $lang_map = null;
 
 	/**
-	 * Memoised name of the language query variable.
-	 *
-	 * The perflocale/url/query_var filter fires ONCE per request (per blog,
-	 * since reset_static_caches() clears this on switch_blog) no matter how
-	 * many URLs get built, so a render that converts 200 URLs pays for one
-	 * apply_filters call, not 200. Every later read is a property hit.
+	 * Memoised name of the language query variable; cleared on switch_blog.
 	 *
 	 * @var string|null
 	 */
 	private static ?string $query_var_memo = null;
 
 	/**
-	 * Home-URL path, read by convert(). Class-static so reset_static_caches()
-	 * clears it on switch_blog, because each blog of a network has its own
-	 * home URL.
+	 * Home URL path for convert(); per blog, so cleared on switch_blog.
 	 *
 	 * @var string|null
 	 */
 	private static ?string $home_path = null;
 
 	/**
-	 * Home URL without its trailing slash, read with this class's home_url
-	 * filter suppressed. inject_prefix() adds a language prefix after this
-	 * base and the hidden-default branch of add_language_prefix_to_url()
-	 * removes one after the same base; whichever runs first fills it.
-	 * Class-static so reset_static_caches() clears it on switch_blog, on
-	 * language CRUD and on the language override.
+	 * Home URL without its trailing slash, read with this class's home_url filter suppressed.
+	 * Shared by inject_prefix() and the hidden-default branch of add_language_prefix_to_url().
 	 *
 	 * @var string|null
 	 */
 	private static ?string $home_trimmed = null;
 
 	/**
-	 * Per-request list of active-language URL prefixes (strip_prefix). Class-
-	 * static so reset_static_caches() clears it on switch_blog AND language
-	 * CRUD - active languages/prefixes are per-blog and change on CRUD.
+	 * Active-language URL prefixes for strip_prefix(); per blog and changed by language CRUD.
 	 *
 	 * @var array<int, string>|null
 	 */
 	private static ?array $sorted_prefixes = null;
 
 	/**
-	 * Per-request memo of the `permalink_structure` option's truthiness. Class-
-	 * static so reset_static_caches() clears it on switch_blog - each blog on
-	 * multisite has its own permalink_structure (some use plain, some pretty).
+	 * Memo of whether `permalink_structure` is set; per blog on multisite.
 	 *
 	 * @var bool|null
 	 */
 	private static ?bool $has_pretty_permalinks_memo = null;
 
 	/**
-	 * Per-request memo for is_front_page_translation(). Class-static so
-	 * reset_static_caches() clears it on switch_blog AND on language CRUD -
-	 * the front-page id and its translation group can both change cross-blog,
-	 * and a language delete in-request changes group membership.
+	 * Per-request memo for is_front_page_translation(); cleared on switch_blog and on language CRUD,
+	 * because a language delete changes group membership.
 	 *
 	 * @var array<int, bool>
 	 */
 	private static array $front_page_translation_memo = [];
 
 	/**
-	 * wp_navigation post IDs whose items were already batch-primed this
-	 * request (Navigation-block path). Class-static + reset on switch_blog:
-	 * the refs are per-blog post IDs.
+	 * wp_navigation post IDs whose items were batch-primed this request; per-blog IDs, cleared on switch_blog.
 	 *
 	 * @var array<int, bool>
 	 */
 	private static array $primed_nav_refs = [];
 
 	/**
-	 * One-shot prime guard for the front-page translation group. Same lifetime
-	 * rules as $front_page_translation_memo above.
+	 * One-shot prime guard for the front-page translation group; same lifetime as $front_page_translation_memo.
 	 *
 	 * @var bool
 	 */
 	private static bool $front_page_translation_primed = false;
 
 	/**
-	 * Per-request memoization for filter_post_permalink() / filter_page_link().
-	 *
-	 * Archive + nav menus call post_link once per post - but on sites with
-	 * multiple sidebar widgets or cross-linked content, the same permalink can
-	 * be requested multiple times. Keyed by "{object_type}_{object_id}_{url}".
+	 * Per-request memo for the post, page and CPT link filters, keyed "{type}_{id}_{url}".
 	 *
 	 * @var array<string, string>
 	 */
 	private static array $object_permalink_memo = [];
 
 	/**
-	 * Per-request is_admin() result.
-	 *
-	 * is_admin() is called 200+ times per request through filter_home_url
-	 * (every nav menu link, every asset URL). The admin/frontend split
-	 * can't flip mid-request, so cache the boolean once.
+	 * Per-request is_admin() result; the admin/front-end split cannot flip mid-request.
 	 *
 	 * @var bool|null
 	 */
@@ -498,78 +364,36 @@ final class UrlConverter {
 	/**
 	 * Per-request cache of Settings::get_excluded_paths().
 	 *
-	 * The excluded-paths list is settings-driven but stable for the
-	 * request lifetime. Cached once instead of rebuilt per memo-miss.
-	 *
 	 * @var array<int, string>|null
 	 */
 	private static ?array $excluded_paths_cached = null;
 
 	/**
-	 * Per-request memo of "does this request need any URL modification at all?"
-	 *
-	 * Many sites land in a state where every link-filter call resolves to
-	 * "return URL unchanged":
-	 *
-	 *   - subdirectory URL mode
-	 *   - hide_default_prefix is on
-	 *   - visitor is on the default language
-	 *   - no translation groups exist on this blog (no post lives in
-	 *     another language → resolve_object_language always returns
-	 *     "current language" = default)
-	 *   - no translated slugs exist (or translate_slugs is off)
-	 *
-	 * On those requests the 115+ link-filter invocations each end up
-	 * paying ~5-7 µs to compute "same URL back". This memo lets each
-	 * filter short-circuit to a single isset() check instead.
-	 *
-	 * `null` = not yet determined, `true` = skip URL modification entirely,
-	 * `false` = run the normal filter logic.
+	 * Per-request memo of should_skip_url_modification(): null unknown, true skip, false run the filters.
 	 *
 	 * @var bool|null
 	 */
 	private static ?bool $skip_url_modification_memo = null;
 
 	/**
-	 * Per-request lang_id → language object map.
-	 *
-	 * Built lazily on first cold-path use of preload_object_languages so it
-	 * can substitute for a separate LanguageRepository::find_many() DB call.
-	 * Sourced from router's already-loaded active languages, so this is pure
-	 * in-memory reuse.
+	 * Per-request lang_id => language object map, built from the router's active languages (no DB call).
 	 *
 	 * @var array<int, object>|null
 	 */
 	private static ?array $lang_id_map = null;
 
 	/**
-	 * Lazily-resolved translation-group repository, reused across sub-queries.
+	 * Lazily resolved translation-group repository, reused across sub-queries.
 	 *
-	 * preload_object_languages() runs on every WP_Query - 4–6× per request on
-	 * archive pages with sidebars/widgets. Resolving the repo inside the hot
-	 * path adds ~10–20µs per call; holding it static collapses that to
-	 * resolve-once-per-request.
-	 *
-	 * reset_static_caches() nulls this alongside the data memos, but that is
-	 * housekeeping, NOT blog isolation: Plugin::get() memoises its services
-	 * and nothing clears the container on `switch_blog`, so re-resolving hands
-	 * back the very same instance. Blog isolation for this repo comes from
-	 * TranslationGroupRepository::reset_static_caches(), which Bootstrap hooks
-	 * to `switch_blog` to clear the repo's own class-static caches. What DOES
-	 * need the reset here is self::$object_language_cache, whose keys are
-	 * "{type}_{object_id}" and therefore collide across blogs.
+	 * Resetting it is housekeeping, not blog isolation: the container returns the same instance and the repo
+	 * clears its own caches on switch_blog. The cross-blog risk is $object_language_cache, keyed without blog.
 	 *
 	 * @var TranslationGroupRepository|null
 	 */
 	private static ?TranslationGroupRepository $lazy_group_repo = null;
 
 	/**
-	 * Per-request URL-config snapshot consumed by add_language_prefix_to_url().
-	 *
-	 * The values (url_mode, default language, hide_default, translate_slugs)
-	 * are stable for the duration of a single request unless settings or
-	 * languages are mutated programmatically - in which case
-	 * reset_static_caches() clears this memo alongside the others.
+	 * Per-request URL config snapshot for url_config(); reset_static_caches() clears it.
 	 *
 	 * @var array{url_mode:string,default:?object,hide_default:bool,translate_slugs:bool}|null
 	 */
@@ -603,49 +427,26 @@ final class UrlConverter {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Batch preload object languages for all posts in a WP_Query result.
-		// This eliminates N+1 queries in resolve_object_language() when
-		// rendering permalinks on archive pages with multiple posts.
+		// Batch preload object languages for every WP_Query result (avoids N+1 in resolve_object_language()).
 		add_filter( 'the_posts', [ $this, 'preload_object_languages' ], 5, 2 );
 
-		// Nav-menu items aren't covered by the the_posts prime above, so each
-		// menu link would cost its own transient read. The permalink filters
-		// fire during wp_setup_nav_menu_item's array_map - before
-		// wp_get_nav_menu_items - so hook pre_wp_nav_menu (which runs earlier),
-		// look the items up ourselves, and prime their caches first.
+		// The permalink filters fire inside wp_setup_nav_menu_item, before wp_get_nav_menu_items, so the nav
+		// menu prime hooks pre_wp_nav_menu, which runs earlier.
 		add_filter( 'pre_wp_nav_menu', [ $this, 'prime_nav_menu_items_early' ], 10, 2 );
 
-		// Block themes never call wp_nav_menu(): the Navigation block renders
-		// navigation-link/submenu blocks (usually from a wp_navigation post
-		// via `ref`), so the prime above never fires there and every menu
-		// link pays a cold per-object lookup. Collect the referenced object
-		// IDs before the block renders and batch-prime the same caches.
+		// Block themes render the Navigation block, not wp_nav_menu(): prime its items before it renders.
 		add_filter( 'pre_render_block', [ $this, 'prime_navigation_block_items' ], 10, 2 );
 
-		// Navigation-link/submenu anchors render the SAVED `url` attribute
-		// verbatim - core never calls get_permalink() for them, so the
-		// permalink filters can't localize them and every explicit menu item
-		// sent translated-page visitors back to the default language. Swap
-		// the href for the current-language sibling's permalink at render
-		// (rides the caches primed above).
+		// Navigation-link anchors render the saved `url` verbatim, without get_permalink(): swap in the
+		// current-language sibling's permalink.
 		add_filter( 'render_block_core/navigation-link', [ $this, 'localize_navigation_link_block' ], 10, 2 );
 		add_filter( 'render_block_core/navigation-submenu', [ $this, 'localize_navigation_link_block' ], 10, 2 );
 
-		// REST pagination Link headers (and _links hrefs) are built from the
-		// UNPREFIXED rest_url() base even when the request entered via
-		// /<lang>/wp-json/ - an API client following rel=next silently
-		// switched from the language-scoped collection to the
-		// default-language one mid-pagination (different totals, different
-		// content). Re-insert the ENTRY prefix, keyed on how the request
-		// came in so wp-admin's unprefixed editor base stays untouched.
-		// Three args: the third is the blog id, which the callback needs to
-		// leave a SIBLING blog's REST base alone on multisite.
+		// REST Link headers use the unprefixed rest_url() base: re-insert the entry prefix, keyed on how the
+		// request came in. The third arg (blog id) leaves a sibling blog's REST base alone on multisite.
 		add_filter( 'rest_url', [ $this, 'preserve_rest_language_prefix' ], 10, 3 );
 
-		// Term-side analog of the the_posts prime: every term list a page
-		// renders (per-post category links, tag/category widgets + blocks,
-		// Woo product-category lists) fires filter_term_link per term, each
-		// costing its own translation lookup without this batch prime.
+		// Term analog of the the_posts prime: every rendered term list fires filter_term_link per term.
 		add_filter( 'get_terms', [ $this, 'preload_term_languages' ], 5 );
 		add_filter( 'get_the_terms', [ $this, 'preload_term_languages' ], 5 );
 
@@ -655,42 +456,24 @@ final class UrlConverter {
 			fn( int $term_id ) => $this->flush_pending_term_slug_prime( $term_id )
 		);
 
-		// WP's oEmbed controller resolves the URL via url_to_postid(), whose
-		// internal query is language-scoped to the REQUEST language, so a /de/
-		// post URL resolves to 0, and which reads a language root such as /de/
-		// as a listing. resolve_oembed_post_id() resolves both.
+		// The oEmbed controller's url_to_postid() is scoped to the request language and reads /de/ as a listing.
 		add_filter( 'oembed_request_post_id', [ $this, 'resolve_oembed_post_id' ], 10, 2 );
 
 		$reset_static = [ self::class, 'reset_static_caches' ];
 
-		// Reset static cache on blog switch to prevent multisite contamination.
-		// Gated behind is_multisite() - switch_to_blog() is a no-op on
-		// single-site, but still fires the action; without the gate, any
-		// third-party plugin's switch_to_blog(get_current_blog_id()) call
-		// would needlessly wipe our per-request memos mid-request.
+		// Multisite only: single-site switch_to_blog() still fires switch_blog and would wipe the memos needlessly.
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', $reset_static );
 		}
 
-		// Invalidate data-derived memos when languages mutate mid-request.
-		// $lang_id_map + $object_language_cache contain language-object
-		// snapshots whose slug / locale / prefix can rename, and URL
-		// memos (home_url_memo / object_permalink_memo) bake those same
-		// snapshots into their output. Without invalidation, any URL
-		// built after a programmatic add / rename / delete keeps using
-		// the pre-change snapshot for the rest of the request.
+		// Language CRUD: the language snapshots baked into these memos would go stale for the rest of the request.
 		add_action( 'perflocale/language/added', $reset_static );
 		add_action( 'perflocale/language/updated', $reset_static );
 		add_action( 'perflocale/language/slug_renamed', $reset_static );
 		add_action( 'perflocale/language/deleted', $reset_static );
 
-		// The order-email render window swaps the current language via
-		// LanguageRouter::override_current_language() from cron / admin /
-		// gateway-webhook contexts. The home_url / object-permalink / object-
-		// language memos (and the is_default_language()-folded skip memo) bake
-		// in the current language, so wipe them when the override - and its
-		// restore - fires, or URLs built for one order's language leak into
-		// another order rendered in the same worker request.
+		// The order-email render window overrides the current language, which the memos bake in: a URL built
+		// for one order's language would leak into the next order rendered in the same request.
 		add_action( 'perflocale/language/overridden', $reset_static );
 
 		// Filter all permalink-generating functions to add language identifier.
@@ -698,12 +481,7 @@ final class UrlConverter {
 		add_filter( 'page_link', [ $this, 'filter_page_link' ], 10, 2 );
 		add_filter( 'post_type_link', [ $this, 'filter_post_type_link' ], 10, 2 );
 
-		// Attachment pages were the ONE frontend object type whose links
-		// never carried a language prefix - visiting one from a /de/ page
-		// silently ejected the visitor to the default language (and core's
-		// canonical redirect made the ejection permanent). Same fallback
-		// semantics as untranslated posts: unmanaged attachments resolve to
-		// the CURRENT language's prefix.
+		// Attachment pages get the current language's prefix, like unmanaged posts, so a /de/ visitor stays on /de/.
 		add_filter( 'attachment_link', [ $this, 'filter_attachment_link' ], 10, 2 );
 		add_filter( 'term_link', [ $this, 'filter_term_link' ], 10, 3 );
 		add_filter( 'home_url', [ $this, 'filter_home_url' ], 10, 4 );
@@ -715,14 +493,8 @@ final class UrlConverter {
 		add_filter( 'day_link', [ $this, 'add_language_prefix' ] );
 		add_filter( 'search_link', [ $this, 'add_language_prefix' ] );
 
-		// Query mode: home_url() is deliberately left untouched (see
-		// filter_home_url), so the two places where core DERIVES URLs from a
-		// base need their own handling. (1) The GET search form: the browser
-		// replaces the action URL's query string with the form fields, which
-		// would silently drop ?lang= - inject it as a hidden field instead.
-		// (2) Core extends permalinks by appending path segments AFTER
-		// trailingslashit(get_permalink()) - on a ?lang=-carrying permalink
-		// the segment lands inside the parameter value; relocate it.
+		// Query mode leaves home_url() untouched, so URLs core derives from a base need repair: the GET search
+		// form drops ?lang= (inject a hidden field), and appended segments land inside the ?lang= value.
 		add_filter( 'get_search_form', [ $this, 'inject_search_form_lang_field' ], 20 );
 		add_filter( 'render_block_core/search', [ $this, 'inject_search_form_lang_field' ], 20 );
 		add_filter( 'post_comments_feed_link', [ $this, 'repair_query_lang_url' ] );
@@ -737,15 +509,12 @@ final class UrlConverter {
 		add_filter( 'rank_math/frontend/prev_rel_link', [ $this, 'repair_query_lang_url_html' ] );
 		add_filter( 'wpseo_adjacent_rel_url', [ $this, 'repair_query_lang_url' ] );
 
-		// WooCommerce AJAX endpoints are built from the (query-mode-unfiltered)
-		// home URL, so fragments/add-to-cart requests would lose the language
-		// - and with it per-language strings and currency. Carry it explicitly.
+		// WooCommerce AJAX endpoints come from the home URL, which query mode leaves unfiltered: carry the language.
 		add_filter( 'woocommerce_ajax_get_endpoint', [ $this, 'add_lang_to_wc_ajax_endpoint' ] );
 
 		if ( $this->settings->translate_slugs_enabled() ) {
-			// Resolve translated taxonomy slugs in incoming URLs so WordPress
-			// can find the term by its database slug. Priority 3 runs after
-			// LanguageRouter (priority 1) so the language is already detected.
+			// Map translated taxonomy slugs in incoming URLs to database slugs; priority 3 runs after
+			// LanguageRouter (priority 1).
 			add_action( 'parse_request', [ $this, 'resolve_translated_taxonomy_slugs' ], 3 );
 
 			// Redirect term archives from their database slug to the translated slug.
@@ -784,25 +553,11 @@ final class UrlConverter {
 	/**
 	 * Filter page links to add language prefix.
 	 *
-	 * Both parameters are deliberately untyped. `get_page_link()` is the ONE
-	 * permalink builder in core that does not guard its post lookup: it runs
-	 * `$post = get_post( $post );` and then fires this filter with
-	 * `$post->ID` - so when the id does not resolve (a page that was deleted
-	 * after some plugin stored its id) PHP 8 emits "Attempt to read property
-	 * ID on null", `$post->ID` evaluates to NULL, and a declared `int
-	 * $post_id` threw a TypeError at ARGUMENT BINDING, before any guard in
-	 * this body could run - turning core's warning into a fatal. Unpatched
-	 * WordPress returns `home_url( '/?page_id=' )` there, so handing the
-	 * input back UNCHANGED restores exactly the plugin-inactive behaviour.
-	 * (`get_permalink()` is safe - it bails on `empty( $post->ID )` first -
-	 * but everest-forms, ultimate-addons-for-gutenberg, wp-fastest-cache,
-	 * oxygen and polylang all call `get_page_link()` directly with a stored
-	 * page id.)
+	 * Untyped: get_page_link() fires this with a null ID for a missing page, and a typed parameter would fatal.
+	 * The input is then returned unchanged, as core does without the plugin.
 	 *
-	 * @param mixed $link    The page link (any type; an earlier filter may
-	 *                       have replaced it).
-	 * @param mixed $post_id The page ID, or NULL when core could not resolve
-	 *                       the post.
+	 * @param mixed $link    The page link (an earlier filter may have changed its type).
+	 * @param mixed $post_id The page ID, or null when core could not resolve the post.
 	 * @return mixed Filtered link, or the input unchanged.
 	 */
 	public function filter_page_link( $link, $post_id = 0 ) {
@@ -810,10 +565,7 @@ final class UrlConverter {
 			return $link;
 		}
 
-		// is_numeric() rejects the NULL core passes for an unresolvable page
-		// and any array/object a sloppy caller could produce, so the (int)
-		// cast below cannot fatal. Numeric strings and floats still coerce
-		// exactly as the previous `int $post_id` declaration did.
+		// is_numeric() rejects core's null and any array, so the (int) cast cannot fatal.
 		if ( ! is_string( $link ) || ! is_numeric( $post_id ) ) {
 			return $link;
 		}
@@ -829,8 +581,7 @@ final class UrlConverter {
 			return self::$object_permalink_memo[ $memo_key ];
 		}
 
-		// Front page translations should return the language root URL,
-		// not the slug URL (e.g., /en/ instead of /en/homepage/).
+		// A front page translation links to the language root (/en/), not its slug.
 		if ( $this->is_front_page_translation( $post_id ) ) {
 			$lang_obj = $this->resolve_object_language( $post_id, 'post' );
 
@@ -848,11 +599,7 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Prefix attachment-page links with the language, mirroring the
-	 * untranslated-post fallback (attachments are rarely translated, so
-	 * the CURRENT request language wins - a /de/ page links to
-	 * /de/<attachment>/, which serves 200 in-language instead of ejecting
-	 * the visitor via core's canonical redirect).
+	 * Prefix attachment-page links with the current request language, as for untranslated posts.
 	 *
 	 * @param mixed $link    Attachment page URL.
 	 * @param mixed $post_id Attachment ID.
@@ -903,18 +650,10 @@ final class UrlConverter {
 	/**
 	 * Filter term links.
 	 *
-	 * `$term` is typed `object`, not `\WP_Term`, for the same reason
-	 * filter_post_permalink() is: core does not normalise it. `get_term_link()`
-	 * only converts a NON-object argument (`if ( ! is_object( $term ) )`), so
-	 * any object a caller hands it - an stdClass row from a direct
-	 * `$wpdb->get_results()` on `wp_terms`, or a `(object)` cast - reaches this
-	 * filter verbatim and a declared `\WP_Term` threw a TypeError at ARGUMENT
-	 * BINDING. Unlike the `page_link` case no installed host was proven to do
-	 * it, but core accepts the shape and we would be the only thing that
-	 * fatals on it, so the input is handed back UNCHANGED instead.
+	 * Untyped: core passes any caller object (such as an stdClass row) through verbatim, and a typed
+	 * parameter would fatal; unusable input is returned unchanged.
 	 *
-	 * @param mixed $link     The term link (any type; `category_link` /
-	 *                        `tag_link` fire immediately before this filter).
+	 * @param mixed $link     The term link (any type).
 	 * @param mixed $term     The term object.
 	 * @param mixed $taxonomy The taxonomy slug. Unused.
 	 * @return mixed Filtered link, or the input unchanged.
@@ -948,18 +687,8 @@ final class UrlConverter {
 	/**
 	 * Resolve translated taxonomy slugs in incoming request query variables.
 	 *
-	 * When a URL uses a translated slug (e.g. /product-category/uncategorized/
-	 * instead of /product-category/uncategorized-de/), WordPress can't find
-	 * the term because the database slug differs. This action replaces
-	 * translated slugs with the actual database slugs before WP_Query runs.
-	 *
-	 * A hierarchical taxonomy's query var carries the FULL nested path
-	 * ('parent/child'), not just the term's own slug, because the rewrite rule
-	 * captures everything after the taxonomy base. The lookup below therefore
-	 * has to read it the same way WP_Query::parse_tax_query() eventually does
-	 * - through wp_basename() - or it misses on every nested archive.
-	 *
-	 * Hooked to parse_request at priority 3 (after LanguageRouter at 1).
+	 * A hierarchical taxonomy's query var holds the full 'parent/child' path: read it through wp_basename(),
+	 * as WP_Query::parse_tax_query() does, or every nested archive misses. Hooked to parse_request at 3.
 	 *
 	 * @param \WP $wp The WordPress environment instance.
 	 * @return void
@@ -971,22 +700,8 @@ final class UrlConverter {
 			return;
 		}
 
-		/*
-		 * Build a map of taxonomy query_var → taxonomy slug, alongside the list
-		 * of query vars whose rewrite is hierarchical - the exact flag
-		 * WP_Query::parse_tax_query() tests before it basenames the value.
-		 * Collecting it here keeps get_taxonomy() out of the loop below.
-		 *
-		 * Deliberately NOT memoised in a function-local static. This method is
-		 * hooked to `parse_request`, so it runs once per request and the memo
-		 * could only ever save the cost of one rebuild - measured at 0.4µs. In
-		 * exchange a static would hold two kinds of stale data no invalidation
-		 * in this plugin can reach: the registered taxonomies differ per blog on
-		 * a network (a static survives switch_to_blog()), and the translatable
-		 * list is a setting, so it also survived Settings::reset_cache(), which
-		 * is what a settings save and switch_blog both fire. Half a microsecond
-		 * is not worth two staleness axes.
-		 */
+		// Taxonomy query_var => taxonomy map, plus the hierarchical query vars. Deliberately not memoised in a
+		// static: taxonomies differ per blog and the translatable list is a setting.
 		$tax_query_vars  = [];
 		$hier_query_vars = [];
 
@@ -996,10 +711,7 @@ final class UrlConverter {
 			if ( $tax_obj && $tax_obj->query_var ) {
 				$tax_query_vars[ $tax_obj->query_var ] = $taxonomy;
 
-				// `rewrite` is false when a taxonomy opts out of rewrites;
-				// reading the offset through empty() is deliberate, and is
-				// what core does, so that case evaluates false rather than
-				// warning.
+				// Read through empty(), as core does: `rewrite` is false when a taxonomy opts out.
 				if ( ! empty( $tax_obj->rewrite['hierarchical'] ) ) {
 					$hier_query_vars[] = (string) $tax_obj->query_var;
 				}
@@ -1011,33 +723,19 @@ final class UrlConverter {
 				continue;
 			}
 
-			// Core delivers this urldecoded (parse_str in class-wp.php), while
-			// slug_translations.slug holds the sanitize_title() form. Without
-			// this the lookup below missed on every non-ASCII term slug and the
-			// visitor silently got the source-language archive. No-op on ASCII.
+			// Core delivers this urldecoded; slug_translations holds the sanitize_title() form.
 			$slug = Helper::normalize_slug_for_query( $wp->query_vars[ $qv ] );
 
-			// Reduce a nested path ('parent/child') to the term's own segment.
-			// WP_Query::parse_tax_query() applies exactly this reduction - the
-			// same wp_basename(), under the same rewrite['hierarchical'] test -
-			// but only later, when it builds the tax query, so matching the raw
-			// value here misses on every archive at depth >= 1 and the request
-			// silently falls through to the source-language term. At depth 0
-			// wp_basename() is the identity, so flat archives are unaffected.
+			// Reduce 'parent/child' to the term's own segment, as WP_Query::parse_tax_query() does later.
 			if ( in_array( $qv, $hier_query_vars, true ) ) {
 				$slug = wp_basename( $slug );
 			}
 
-			// Resolve translated slug → DB slug, filtered by taxonomy.
-			// Multiple taxonomies can share the same display slug (e.g. "uncategorized"
-			// exists in both 'category' and 'product_cat'). A taxonomy-aware lookup
-			// ensures we find the correct term.
+			// Taxonomy-aware: "uncategorized" can exist in both category and product_cat.
 			$db_slug = $this->resolve_term_slug_for_taxonomy( $slug, $taxonomy, $language_id );
 
 			if ( $db_slug !== null && $db_slug !== $slug ) {
-				// Writing the bare DB slug back - ancestors dropped - is safe:
-				// parse_tax_query() discards them with wp_basename() anyway, so
-				// the tax query core builds is identical either way.
+				// Writing the bare DB slug back is safe: parse_tax_query() drops ancestors with wp_basename().
 				$wp->query_vars[ $qv ] = $db_slug;
 			}
 		}
@@ -1046,11 +744,7 @@ final class UrlConverter {
 	/**
 	 * Resolve a translated slug to the database slug for a specific taxonomy.
 	 *
-	 * Filters by object_subtype so terms in different taxonomies can share
-	 * a translated slug without conflict (e.g. category/uncategorized and
-	 * product_cat/uncategorized both translating to "sin-categoria"). The
-	 * slug_lookup UNIQUE index guarantees one matching row per
-	 * (language_id, 'term', taxonomy, slug).
+	 * Filters by object_subtype so taxonomies can share a translated slug; slug_lookup's UNIQUE index gives one row.
 	 *
 	 * @param string $slug Translated slug from the URL.
 	 * @param string $taxonomy Taxonomy to match against.
@@ -1062,12 +756,7 @@ final class UrlConverter {
 
 		$st_table = \PerfLocale\Database\Schema::table( 'slug_translations' );
 
-		// With object_subtype filtering at the slug_translations level, the
-		// resolver only needs the wp_terms join to look up the canonical
-		// db slug - wp_term_taxonomy is no longer required for namespace
-		// scoping because slug_lookup's UNIQUE on
-		// (language_id, object_type, object_subtype, slug) already
-		// guarantees one row.
+		// The slug_lookup UNIQUE key (language_id, object_type, object_subtype, slug) gives one row: no term_taxonomy join.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table names from Schema::table() are safe.
 		$result = $wpdb->get_row(
 			$wpdb->prepare(
@@ -1094,23 +783,8 @@ final class UrlConverter {
 	/**
 	 * Redirect term archive pages from the database slug to the translated slug.
 	 *
-	 * When a term has a translated slug (e.g. "tutorials" instead of
-	 * "tutorials-fr"), visiting the database slug URL should 301-redirect
-	 * to the canonical translated-slug URL. Applies to all translatable
-	 * taxonomies: categories, tags, product categories, attributes, etc.
-	 *
-	 * Only the term base of the request path identifies the term. A feed of
-	 * the archive (`/feed/`, `/feed/atom/`) and page 2 or later
-	 * (`/page/3/`) add a suffix after that base: a request whose base is
-	 * already the canonical one is left alone, and a request on the
-	 * database slug keeps its suffix in the redirect, so it lands on the
-	 * same page or feed under the translated slug.
-	 *
-	 * In query URL mode the canonical URL carries the language in its own
-	 * query string (`?lang=fr`). The request's query arguments are merged
-	 * into it, so the target has a single query string in which the
-	 * canonical's values win. In the path and host modes the canonical has
-	 * no query string and the request's query string is appended verbatim.
+	 * A feed or page 2+ suffix after the term base is kept in the redirect. In query mode the request's query
+	 * args are merged into the canonical's, whose values win; otherwise the query string is appended verbatim.
 	 *
 	 * @return void
 	 */
@@ -1147,29 +821,21 @@ final class UrlConverter {
 
 		$translated_slug = $this->slug_manager->get_slug( 'term', $term->term_id, $language_id );
 
-		// '' is treated as "no translation", matching the guard in
-		// add_language_prefix_to_url() - a stale cache or partial migration can
-		// store '' instead of null, and the two consumers must agree or the
-		// canonical URL and this redirect diverge.
+		// '' means "no translation", as in add_language_prefix_to_url(): both must agree or the canonical URL
+		// and this redirect diverge.
 		if ( $translated_slug === null || $translated_slug === '' || $translated_slug === $term->slug ) {
 			return;
 		}
 
-		// Build the canonical URL with the translated slug.
-		// get_term_link() applies filter_term_link() → replace_slug_in_url(),
-		// so $canonical uses the translated slug.
+		// get_term_link() runs filter_term_link(), so $canonical carries the translated slug.
 		$canonical = get_term_link( $term );
 
 		if ( is_wp_error( $canonical ) ) {
 			return;
 		}
 
-		// Compare canonical path with current request path. Use esc_url_raw
-		// (NOT sanitize_text_field) on the request URI: sanitize_text_field
-		// strips %XX octets, so a non-Latin (percent-encoded) slug path would
-		// never equal the canonical path and the 301 below would fire on every
-		// request - an infinite redirect loop. Parse the path the same way as
-		// the canonical so the comparison is symmetric.
+		// esc_url_raw(), not sanitize_text_field(): the latter strips %XX octets, so a percent-encoded slug path
+		// would never match the canonical and the 301 would loop.
 		$canonical_path = untrailingslashit( (string) ( wp_parse_url( $canonical, PHP_URL_PATH ) ?: '' ) );
 		$request_uri    = ( isset( $_SERVER['REQUEST_URI'] ) ? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) ) : '' );
 		$qpos           = strpos( $request_uri, '?' );
@@ -1179,14 +845,8 @@ final class UrlConverter {
 			return; // Already at canonical URL.
 		}
 
-		// Feed and pagination suffix. It is recognised only on the requests
-		// core itself treats as a feed or as page 2+ (the conditions
-		// redirect_canonical() uses), so a term slugged `feed` or `atom` is
-		// never cut on its own archive, `?paged=N` and `/embed/` requests get
-		// the plain redirect, and `/page/1/` redirects to the page-1 URL. The
-		// patterns come from $wp_rewrite, so feeds added with add_feed() and a
-		// changed pagination base match too. Both paths are untrailingslashed
-		// above, so the patterns anchor on the end.
+		// Feed and page 2+ suffix, recognised only where redirect_canonical() would, so a term slugged `feed`
+		// is never cut. Patterns come from $wp_rewrite (add_feed(), pagination base) and anchor on the end.
 		global $wp_rewrite;
 
 		$suffix         = '';
@@ -1204,9 +864,7 @@ final class UrlConverter {
 		}
 
 		if ( $suffix_pattern !== '' ) {
-			// A feed or page 2+ of the canonical URL. The rest of the path
-			// after the canonical base is matched as a whole: a term whose
-			// slug is `feed` keeps its own `/feed/feed/` feed.
+			// The whole rest after the canonical base must match: a term slugged `feed` keeps its `/feed/feed/`.
 			if ( str_starts_with( $request_path, $canonical_path . '/' )
 				&& preg_match( '#^' . $suffix_pattern . '$#', substr( $request_path, strlen( $canonical_path ) ) ) === 1
 			) {
@@ -1218,9 +876,7 @@ final class UrlConverter {
 			}
 		}
 
-		// The target is the canonical URL plus the request's suffix, in the
-		// canonical's trailing-slash style. Loop-proof: the target's base is
-		// $canonical_path, so the next request returns above.
+		// Canonical URL plus the request's suffix. Loop-proof: the target's base is $canonical_path.
 		$query_pos       = strpos( $canonical, '?' );
 		$target          = $query_pos !== false ? substr( $canonical, 0, $query_pos ) : $canonical;
 		$canonical_query = $query_pos !== false ? substr( $canonical, $query_pos + 1 ) : '';
@@ -1230,18 +886,13 @@ final class UrlConverter {
 		}
 
 		if ( $canonical_query === '' ) {
-			// Preserve the query string so UTM/tracking/preview params survive
-			// the slug-translation canonical redirect. Appended verbatim.
+			// Keep UTM, tracking and preview params, appended verbatim.
 			if ( $qpos !== false ) {
 				$target .= substr( $request_uri, $qpos );
 			}
 		} else {
-			// Query URL mode. Appending the request's query string would add a
-			// second `?` (`?lang=fr?lang=fr`), whose `lang` value no language
-			// matches, so the visitor would get the default language. Every
-			// key the canonical sets is removed from the request's arguments,
-			// then the canonical's arguments are added: one query string, and
-			// the canonical's language wins.
+			// Query URL mode: appending would add a second `?` whose `lang` matches nothing. Drop the
+			// canonical's keys from the request args, then add the canonical's, so its language wins.
 			$canonical_args = [];
 			wp_parse_str( $canonical_query, $canonical_args );
 
@@ -1259,19 +910,8 @@ final class UrlConverter {
 	/**
 	 * Filter home_url to add language prefix.
 	 *
-	 * Only adds prefix for non-admin, non-REST paths, and only for THIS blog.
-	 *
-	 * Every parameter is deliberately untyped. `get_home_url()` forwards the
-	 * caller's `$path`, `$scheme` and `$blog_id` arguments to apply_filters()
-	 * verbatim - it never casts them - and the filter fires from
-	 * class-wp-hook.php, a file with no `strict_types`, so PHP's coercive rules
-	 * apply: bools, ints and floats coerce to a `string $path` harmlessly, but
-	 * null and array do NOT. A theme calling `home_url( $x )` with a null `$x`
-	 * therefore made a declared `string $path` throw a TypeError at ARGUMENT
-	 * BINDING - before any guard in this body could run - fataling the whole
-	 * page for as long as the plugin was active. Values are normalized below
-	 * instead, and `$url` is handed back UNCHANGED whenever it is not a usable
-	 * string.
+	 * Only for non-admin, non-REST paths of this blog. Untyped: core forwards the caller's raw arguments, and
+	 * a null `$path` would fatal a typed parameter; an unusable `$url` is returned unchanged.
 	 *
 	 * @param mixed $url     The complete home URL.
 	 * @param mixed $path    Path relative to home (any type; core forwards it raw).
@@ -1288,44 +928,22 @@ final class UrlConverter {
 			return $url;
 		}
 
-		// Another blog's home URL is not ours to localize. get_home_url() runs
-		// its switch_to_blog() / restore_current_blog() pair BEFORE firing this
-		// filter, so by the time we see the URL the current blog - and with it
-		// every memo in this class, the language state, and the home host/path
-		// we prefix against - belongs to the CALLING blog, not to $blog_id.
-		// Unguarded, a visitor on the network main site's German page got
-		// `get_home_url( 2 )` back as `example.com/de/sub/` instead of the
-		// sibling's real `example.com/sub/`, and in subdomain / domain modes as
-		// `de.example.com` - the sibling's hostname discarded outright. The
-		// unprefixed URL core just computed is the only correct answer we have
-		// for a blog whose languages we have not loaded.
-		//
-		// is_numeric() rejects both the null core passes for "current blog" and
-		// the arrays/objects a sloppy caller could pass, so the (int) cast that
-		// follows can never fatal on an object. is_multisite() keeps single-site
-		// behaviour byte-identical: there core ignores $blog_id entirely and
-		// really did return THIS site's home URL.
+		// Another blog's home URL is not ours: get_home_url() restores the calling blog before this filter
+		// fires, so every memo, language and home host here belongs to the caller. is_numeric() rejects null
+		// ("current blog") and arrays; single-site core ignores $blog_id.
 		if ( is_numeric( $blog_id ) && (int) $blog_id > 0 && (int) $blog_id !== get_current_blog_id() && is_multisite() ) {
 			return $url;
 		}
 
-		// Non-string paths become '' - which is exactly how core treated them
-		// when it built $url a moment ago (`get_home_url()` appends the path
-		// only `if ( $path && is_string( $path ) )`). Normalizing the same way
-		// keeps the excluded-path comparison below matching the URL that was
-		// actually produced.
+		// Non-string paths become '', as get_home_url() treated them, so the excluded-path check matches.
 		$path = is_string( $path ) ? $path : '';
 
-		// Universal skip on requests that can't produce a rewritten URL.
-		// home_url() is hit 200+ times per archive render, so cutting the
-		// whole filter chain to a single isset() check is worth a lot.
+		// Universal skip on requests that cannot produce a rewritten URL.
 		if ( $this->should_skip_url_modification() ) {
 			return $url;
 		}
 
-		// is_admin() is called 200+ times per request through this filter on
-		// any archive render. Cache the result per-request - the admin /
-		// frontend distinction can't flip mid-request.
+		// The admin/front-end split cannot flip mid-request.
 		if ( self::$is_admin_cached === null ) {
 			self::$is_admin_cached = is_admin();
 		}
@@ -1334,30 +952,19 @@ final class UrlConverter {
 			return $url;
 		}
 
-		// Query mode NEVER rewrites home_url(): it is a BASE builder that WP
-		// core concatenates further path segments onto (pagination links, REST
-		// discovery, feed links, the search-form action) - appending ?lang=
-		// here lands those segments INSIDE the parameter value and corrupts
-		// the URL. The language parameter is attached at final-URL filters
-		// instead: post/page/term links, author+date archive links, the
-		// search-form hidden field, and convert() for switcher/hreflang.
+		// Query mode never rewrites home_url(): core appends path segments to it, which would land inside
+		// ?lang=. Final-URL filters, the search-form field and convert() attach the language instead.
 		if ( $this->url_config()['url_mode'] === 'query' ) {
 			return $url;
 		}
 
-		// Per-request memo: WP fires `home_url` 100+ times per archive render
-		// (nav menus, asset URLs, widgets) with a small set of distinct inputs.
-		// Caching collapses all repeated work into one compute per unique pair.
+		// Per-request memo keyed by url and path: home_url fires many times per render with few distinct inputs.
 		$memo_key = $url . '|' . $path;
 		if ( isset( self::$home_url_memo[ $memo_key ] ) ) {
 			return self::$home_url_memo[ $memo_key ];
 		}
 
-		// Don't prefix wp-admin, wp-json, or other excluded paths. The
-		// excluded-paths list is settings-driven but stable for the request
-		// lifetime, so cache the already-normalized needles once (rtrim +
-		// empty-drop hoisted out of the per-miss loop) instead of asking
-		// Settings to rebuild the list on every memo miss.
+		// Don't prefix wp-admin, wp-json or other excluded paths; the normalized needles are cached per request.
 		if ( self::$excluded_paths_cached === null ) {
 			$needles = [];
 
@@ -1372,9 +979,7 @@ final class UrlConverter {
 			self::$excluded_paths_cached = $needles;
 		}
 
-		// Shared with LanguageRouter so the two cannot drift apart again, and
-		// decoding on both sides so a non-Latin excluded path actually matches
-		// the encoded form a browser sends. See Helper::path_matches_excluded().
+		// Shared with LanguageRouter so both match the same paths; decoded so a non-Latin excluded path matches.
 		if ( Helper::path_matches_excluded( $path, self::$excluded_paths_cached ) ) {
 			self::cap_cache( self::$home_url_memo );
 			self::$home_url_memo[ $memo_key ] = $url;
@@ -1387,14 +992,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Keep rest_url() output on the language-prefixed REST base the request
-	 * actually entered through.
+	 * Keep rest_url() output on the language-prefixed REST base the request entered through.
 	 *
-	 * Applies only during a REST request whose REQUEST_URI starts with an
-	 * active language's subdirectory prefix before /wp-json - the shape a
-	 * language-scoped API consumer used. Everything else (wp-admin's
-	 * unprefixed editor base, frontend rest_url() prints, other URL modes)
-	 * passes through untouched.
+	 * Only during a REST request that entered via /<lang>/wp-json; wp-admin's unprefixed base passes through.
 	 *
 	 * @param mixed $url     REST URL being built.
 	 * @param mixed $path    REST route being built. Unused.
@@ -1406,18 +1006,8 @@ final class UrlConverter {
 			return $url;
 		}
 
-		// A sibling blog's REST base carries no language of ours. The
-		// re-insert pattern below is built from the ENTRY blog's home path, and
-		// on a SUBDOMAIN multisite every blog's home path is empty - so the
-		// pattern matches a sibling's base too and stamped the entry blog's
-		// language onto it: a request to `main.example.com/de/wp-json/…` turned
-		// `get_rest_url( 3 )` into `sub2.example.com/de/wp-json/…` for a blog
-		// whose only language is English, i.e. a guaranteed 404. (A
-		// subdirectory network is accidentally immune, because the differing
-		// home paths make the pattern miss.) Same guard, and same reasoning, as
-		// filter_home_url(): is_numeric() rejects null and any array/object so
-		// the (int) cast cannot fatal, and is_multisite() leaves single-site
-		// behaviour untouched.
+		// A sibling blog's REST base carries no language of ours: on a subdomain network every home path is
+		// empty, so the pattern below would match a sibling's base too. Same guard as filter_home_url().
 		if ( is_numeric( $blog_id ) && (int) $blog_id > 0 && (int) $blog_id !== get_current_blog_id() && is_multisite() ) {
 			return $url;
 		}
@@ -1429,9 +1019,8 @@ final class UrlConverter {
 			$entry_prefix = '';
 			$request_uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Prefix-matched against the active-language slug set only.
 
-			// Strip a WP-in-subfolder home path ('/blog') so the prefix segment
-			// is compared at the site root - rest_url() re-inserts after the
-			// same path below. Bypass our own home_url filter via the raw option.
+			// Strip a WP-in-subfolder home path so the prefix is compared at the site root. Reads the raw
+			// option to bypass our own home_url filter.
 			$home_path = rtrim( (string) ( wp_parse_url( (string) get_option( 'home' ), PHP_URL_PATH ) ?: '' ), '/' );
 			$to_match  = $request_uri;
 
@@ -1442,10 +1031,7 @@ final class UrlConverter {
 			if ( preg_match( '#^/([a-z0-9_-]+)/wp-json(?:/|\?|$)#i', $to_match, $m ) ) {
 				$segment = strtolower( $m[1] );
 
-				// Match the entry segment against BOTH the slug and the
-				// configured prefix (locale form 'de-de' in url_prefix_type=
-				// locale, where /de-de/wp-json/ is the canonical REST base and
-				// /de/wp-json/ 404s). Store the form that actually appeared.
+				// Match the slug and the configured prefix (locale form 'de-de'); store the form that appeared.
 				foreach ( $this->router->get_active_languages() as $lang ) {
 					$prefix = strtolower( $this->settings->get_url_prefix( $lang ) );
 
@@ -1502,20 +1088,13 @@ final class UrlConverter {
 			return $this->apply_domain( $url, $current );
 		}
 
-		// Query mode: the default language always stays on clean URLs (the
-		// ?lang= parameter only marks non-default languages, mirroring the
-		// hidden default prefix in subdirectory mode).
+		// Query mode: the default language stays on clean URLs, like the hidden default prefix.
 		if ( $url_mode === 'query' ) {
 			if ( $this->router->is_default_language() ) {
 				return $url;
 			}
 
-			// get_url_prefix() honours the URL Prefix Format setting, so query
-			// mode now emits `?lang=en-us` when the site is set to full locale,
-			// matching what path and subdomain modes put in the URL. It is
-			// memoised per language id, so this is a hash hit, not a query.
-			// Old `?lang=en` URLs keep resolving: the reader accepts the slug
-			// and the locale form (see LanguageRouter::prefix_map()).
+			// get_url_prefix() honours the URL Prefix Format setting; the reader accepts slug and locale forms.
 			return add_query_arg( self::query_var(), $this->settings->get_url_prefix( $current ), remove_query_arg( self::query_var(), $url ) );
 		}
 
@@ -1530,25 +1109,8 @@ final class UrlConverter {
 	/**
 	 * Inject a hidden `lang` field into GET search forms (query URL mode).
 	 *
-	 * A GET form submission replaces the action URL's entire query string
-	 * with the form's fields, so a ?lang= carried on the action would be
-	 * dropped and every search from a non-default-language page would land
-	 * on default-language results. The hidden field makes the browser carry
-	 * the language itself. Default language needs no field (clean URLs).
-	 *
-	 * A non-string input is returned UNCHANGED rather than cast. `get_search_form`
-	 * is one of the few core filters with an explicit null contract:
-	 *
-	 *     $result = apply_filters( 'get_search_form', $form, $args );
-	 *     if ( null === $result ) { $result = $form; }
-	 *
-	 * i.e. NULL means "use the default form" - the guard core added for
-	 * callbacks that forget to `return`. Casting here turned that NULL into ''
-	 * before core could see it, core's fallback never fired, and
-	 * get_search_form() echoed nothing: the search form vanished from the page
-	 * on any site running such a callback at a priority below ours. The same
-	 * method is also hooked to `render_block_core/search`, where the input is
-	 * always a string and this guard never fires.
+	 * A GET form replaces the action's query string, dropping ?lang=. A non-string is returned unchanged:
+	 * core reads a null `get_search_form` result as "use the default form", and a cast would blank it.
 	 *
 	 * @param mixed $form Search form HTML.
 	 * @return mixed Form HTML, or the input unchanged.
@@ -1577,9 +1139,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Append the current language to WooCommerce AJAX endpoint URLs (query
-	 * URL mode). Plain string append - add_query_arg() would URL-encode the
-	 * literal %%endpoint%% placeholder WC substitutes client-side.
+	 * Append the current language to WooCommerce AJAX endpoint URLs (query URL mode).
+	 *
+	 * Plain append: add_query_arg() would encode the %%endpoint%% placeholder WC fills client-side.
 	 *
 	 * @param string $endpoint WC AJAX endpoint URL.
 	 * @return string
@@ -1605,12 +1167,8 @@ final class UrlConverter {
 	/**
 	 * Relocate path segments that WP core appended AFTER a ?lang= parameter.
 	 *
-	 * Core builds derived URLs as trailingslashit( get_permalink() ) . 'seg/'
-	 * (per-post comments feed, comment pagination, multipage posts, embeds).
-	 * On a query-mode permalink that produces `/post/?lang=de/seg/` - the
-	 * segment is swallowed into the parameter value. Rewrite it to the
-	 * canonical `/post/seg/?lang=de` form. URLs without the corruption
-	 * signature pass through untouched, as does every other URL mode.
+	 * Core appends segments to trailingslashit( get_permalink() ), so `/post/?lang=de/seg/` becomes
+	 * `/post/seg/?lang=de`. Other URLs and modes pass through.
 	 *
 	 * @param string $url Derived URL.
 	 * @return string
@@ -1632,15 +1190,12 @@ final class UrlConverter {
 			$url
 		);
 
-		// The relocation can leave a doubled slash at the join point
-		// (trailingslashit'd permalink + leading-slash segment). Collapse it
-		// everywhere except the scheme separator.
+		// Collapse a doubled slash at the join point, except after the scheme.
 		return (string) preg_replace( '#(?<!:)//+#', '/', $url );
 	}
 
 	/**
-	 * repair_query_lang_url() applied to href attributes inside link HTML
-	 * (wp_link_pages_link passes rendered anchors, not bare URLs).
+	 * Apply repair_query_lang_url() to href attributes in link HTML (wp_link_pages_link passes anchors).
 	 *
 	 * @param string $html Link HTML.
 	 * @return string
@@ -1662,34 +1217,14 @@ final class UrlConverter {
 	/**
 	 * Convert a URL to a specific target language.
 	 *
-	 * This is the main public API for URL conversion.
-	 *
 	 * @param string $url URL to convert.
 	 * @param string $target_slug Target language slug.
-	 * @return string Converted URL, or $url unchanged when $target_slug is not
-	 *                an active language on this site. That rejected-slug path
-	 *                returns early and does NOT fire the
-	 *                `perflocale/url/convert` filter, because no conversion
-	 *                took place.
+	 * @return string Converted URL, or $url unchanged and unfiltered when $target_slug is not an active language.
 	 */
 	public function convert( string $url, string $target_slug ): string {
-		// Resolve the target language first and refuse a slug this site does
-		// not route. $target_slug is public API surface - perflocale_home_url()
-		// and perflocale_get_term_link() pass theme input straight through, and
-		// the url-convert ability takes it over REST - and every branch below
-		// interpolates the slug verbatim (as the path prefix, or as ?lang=), so
-		// a typo like 'fr' on an en/de/pl site produced /fr/, which routes
-		// nowhere: WP's canonical guesser prefix-matches that segment against an
-		// unrelated post and 301s the visitor onto it. Handing the input back
-		// untouched is the safe answer - the caller already holds a URL that
-		// resolves, so a typo degrades to "no conversion" rather than to a
-		// redirect onto the wrong content. Falling back to the default language
-		// was rejected: it would quietly retarget every link built from the typo
-		// and hide the mistake from the theme author. The map is class-static -
-		// built once per request, cleared by reset_static_caches() on language
-		// CRUD and switch_blog - so the guard costs a single array lookup per
-		// call and fetches the language list at most once, however many links
-		// the page converts.
+		// Refuse a slug this site does not route: it is public API input, and /fr/ on an en/de site 301s via
+		// WP's canonical guesser onto an unrelated post. Returning the input is deliberate (a default-language
+		// fallback would hide the typo). The map is class-static, cleared by reset_static_caches().
 		if ( self::$lang_map === null ) {
 			self::$lang_map = [];
 
@@ -1701,23 +1236,14 @@ final class UrlConverter {
 		$target_lang_obj = self::$lang_map[ $target_slug ] ?? null;
 
 		if ( $target_lang_obj === null ) {
-			// Deliberately returns BEFORE the perflocale/url/convert filter at the
-			// end of this method. That hook's contract is "the URL we converted",
-			// and nothing was converted here; firing it with the raw input plus a
-			// $target_slug this site does not route would ask every listener to
-			// post-process a URL for a language that does not exist on this site.
-			// The malformed-URL return below is unfiltered for the same reason.
-			// Listeners that need to see rejected slugs should filter the
-			// caller's input instead.
+			// Deliberately before the perflocale/url/convert filter: its contract is "the URL we converted".
 			return $url;
 		}
 
 		$current_slug = $this->router->get_current_slug();
 		$default      = $this->router->get_default_language();
 
-		// Parse the URL. This method is hot - once per hreflang link and per
-		// language-switcher alternate (N × languages per page) - so wp_parse_url
-		// and the home_url() parse are lifted/cached to run once, not per call.
+		// Hot path (per hreflang link and switcher alternate): parse once, home path cached.
 		$parsed = wp_parse_url( $url );
 
 		if ( $parsed === false ) {
@@ -1726,12 +1252,7 @@ final class UrlConverter {
 
 		$path = $parsed['path'] ?? '/';
 
-		// Cache the home-URL path for the request (constant across convert()
-		// calls). Compute home_url() with $this->filtering=true so
-		// filter_home_url() short-circuits to raw WP_HOME - otherwise on a
-		// non-default-language page our own filter adds the language prefix,
-		// the path strip below fails to match, and home_url() prepends it a
-		// second time (the doubled-path bug).
+		// Read home_url() with $this->filtering set, or our own filter adds the prefix and it doubles below.
 		if ( self::$home_path === null ) {
 			$this->filtering = true;
 			try {
@@ -1748,17 +1269,8 @@ final class UrlConverter {
 			$path = substr( $path, strlen( rtrim( $home, '/' ) ) );
 		}
 
-		// Strip whatever active-language prefix the path currently has, not
-		// just the current one - a caller may hand us a URL already prefixed
-		// for another language (PostQueryFilter rewriting REST link-picker
-		// results, or an hreflang generator across all languages). The result
-		// is the canonical prefix-free path before we add the target prefix.
-		// ONLY in subdirectory mode: it is the sole mode that carries the
-		// language in the PATH. In query / subdomain / domain modes the
-		// language lives in ?lang= or the host, so a first segment that merely
-		// LOOKS like a language slug (a real page slugged "de" or "it") is
-		// content and must survive. Resolve the mode once (also reused for the
-		// target-prefix decision below).
+		// Strip any active-language prefix (callers may pass another language's URL), in subdirectory mode
+		// only: in the other modes a first segment like "de" is a real page slug.
 		$cfg      = $this->url_config();
 		$url_mode = $cfg['url_mode'];
 
@@ -1769,10 +1281,7 @@ final class UrlConverter {
 		// Add target language prefix (unless it's the default and prefix is hidden).
 		$hide_default = $cfg['hide_default'];
 
-		// Subdomain + domain modes change the host (handled in the URL
-		// reconstruction below) and never touch the path; query mode carries
-		// the language in ?lang= (appended below) and never touches the path
-		// either. Only the subdirectory mode needs a language prefix on it.
+		// Only subdirectory mode puts the language in the path; host modes and query mode leave it alone.
 		$host_routed  = ( $url_mode === 'subdomain' || $url_mode === 'domain' );
 		$query_routed = $url_mode === 'query';
 
@@ -1804,9 +1313,7 @@ final class UrlConverter {
 			$new_url = $this->apply_domain( $new_url, $target_lang_obj );
 		}
 
-		// Re-add query string if present. In query mode, drop any stale lang
-		// parameter the input URL carried first - the target language's own
-		// parameter is appended below.
+		// Re-add the query string; in query mode drop a stale lang parameter first.
 		$query_string = (string) ( $parsed['query'] ?? '' );
 
 		if ( $query_routed && $query_string !== '' ) {
@@ -1819,11 +1326,9 @@ final class UrlConverter {
 			$new_url .= '?' . $query_string;
 		}
 
-		// Query mode: append the target language parameter (default language
-		// stays clean - exactly one canonical variant per language).
+		// Query mode: append the target language parameter; the default language stays clean.
 		if ( $query_routed && ! ( $default !== null && $target_slug === $default->slug ) ) {
-			// Emit the configured prefix form (slug or full locale), not the raw
-			// slug - see the note at the is_default branch above.
+			// Emit the configured prefix form (slug or full locale), not the raw slug.
 			$new_url = add_query_arg( self::query_var(), $this->settings->get_url_prefix( $target_lang_obj ), $new_url );
 		}
 
@@ -1850,12 +1355,8 @@ final class UrlConverter {
 	 * @return array<string, string> language_slug => URL map.
 	 */
 	public function get_translations_for_current_page(): array {
-		// Per-request cache - called by LanguageSwitcher, HreflangTags, and
-		// LanguageSwitcherBlock independently on the same page. Blog-KEYED so a
-		// mid-request switch_to_blog() can't hand blog B the alternate URLs
-		// computed for blog A (host / prefix / translated slugs are per-blog); a
-		// plain function-local static would leak across the switch because no
-		// reset can reach it. Blog-keying self-corrects with no switch_blog hook.
+		// Per-request cache keyed by blog: alternate URLs are per blog, and a function-local static is out of
+		// reach of any switch_blog reset.
 		static $cached_by_blog = [];
 
 		$blog_key = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
@@ -1875,8 +1376,7 @@ final class UrlConverter {
 				$repo  = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 				$links = $repo->get_translations( $post_id, \PerfLocale\Enum\ObjectType::Post );
 
-				// Batch-prime the WP post cache for all translation IDs at once,
-				// so the individual get_post() calls below are free (cache hits).
+				// Batch-prime the post cache so the get_post() calls below hit it.
 				$link_ids = [];
 
 				foreach ( $links as $link ) {
@@ -1918,9 +1418,7 @@ final class UrlConverter {
 				$is_front_page = is_front_page();
 
 				if ( ! $is_front_page && $front_page_id > 0 ) {
-					// Check if the front page is a sibling in the same translation
-					// group - reuse the $links we already fetched instead of
-					// querying the front page's group separately.
+					// The front page may be a sibling in this group: reuse $links.
 					foreach ( $links as $fg_link ) {
 						if ( (int) $fg_link->object_id === $front_page_id ) {
 							$is_front_page = true;
@@ -1941,14 +1439,10 @@ final class UrlConverter {
 						// Front page: use the root URL for that language.
 						$urls[ $lang->slug ] = $this->convert( trailingslashit( $home ), $lang->slug );
 					} else {
-						// Use get_permalink() to get the full URL including the
-						// post type base (e.g. /product/ for WC products). Building
-						// the URL from just the slug drops the CPT base.
+						// get_permalink() keeps the post type base (/product/), which a slug-only URL drops.
 						$permalink = get_permalink( $post->ID );
 
-						// get_permalink() returns string|false; skip a false so the
-						// map stays a clean slug=>URL(string) set (matches @return
-						// and avoids emitting an empty href for that language).
+						// get_permalink() can return false: skip it rather than emit an empty href.
 						if ( is_string( $permalink ) && $permalink !== '' ) {
 							$urls[ $lang->slug ] = $permalink;
 						}
@@ -1970,12 +1464,8 @@ final class UrlConverter {
 			}
 		}
 
-		// For term archives, resolve the translated TERM in each language and
-		// use get_term_link() so the alternate points at the canonical
-		// translated slug (e.g. /de/category/uncategorized-de/). The generic
-		// prefix-swap below would emit /de/category/uncategorized/ (source slug
-		// under a language prefix), which 301-redirects to the canonical - a
-		// conflicting hreflang signal vs the sitemap (which uses get_term_link).
+		// Term archives: link each translated term through get_term_link(), so the alternate carries the
+		// translated slug as the sitemap does; the generic prefix swap below would emit a URL that 301s.
 		if ( is_tax() || is_category() || is_tag() ) {
 			$term = get_queried_object();
 
@@ -1983,11 +1473,7 @@ final class UrlConverter {
 				$repo  = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 				$links = $repo->get_translations( (int) $term->term_id, \PerfLocale\Enum\ObjectType::Term );
 
-				// Batch-prime the sibling terms: only the queried term is in
-				// the term cache, so each get_term() below would otherwise be
-				// a cache-miss single-row SELECT per language on
-				// no-object-cache sites (mirrors the singular branch's
-				// _prime_post_caches).
+				// Batch-prime the sibling terms, or each get_term() below is a SELECT without an object cache.
 				$sibling_ids = [];
 				foreach ( $links as $link ) {
 					if ( ! empty( $link->language_slug ) ) {
@@ -2024,10 +1510,8 @@ final class UrlConverter {
 		// For archives, home, search, etc. - generate URLs for all languages.
 		$current = $this->get_current_url();
 
-		// A term archive without links whose link is a query string (a
-		// taxonomy without pretty permalinks, or Plain permalinks): the term
-		// is identified by that query string, which get_current_url() drops.
-		// Its server-built link keeps it; pretty links keep the request URL.
+		// A term archive without links whose link is a query string (plain permalinks): get_current_url() drops
+		// that query string, so use the server-built link.
 		if ( ( is_tax() || is_category() || is_tag() ) && get_queried_object() instanceof \WP_Term ) {
 			$term_link = get_term_link( get_queried_object() );
 
@@ -2047,10 +1531,8 @@ final class UrlConverter {
 	/**
 	 * The rewrite endpoint the main query was routed through, if any.
 	 *
-	 * An endpoint's query var is public, so a query string (`?orders=1`) sets
-	 * it on any URL. With pretty permalinks the var therefore counts only
-	 * when the matched rewrite rule carries it; with plain permalinks, where
-	 * endpoints are query vars, only on a page.
+	 * A query string can set any endpoint var, so with pretty permalinks it counts only when the matched rule
+	 * carries it; with plain permalinks only on a page.
 	 *
 	 * @return array{var: string, name: string, value: string}|null Query var,
 	 *         endpoint slug and value (`view-order` / `123`), or null.
@@ -2138,12 +1620,7 @@ final class UrlConverter {
 	 * @return string URL with language prefix.
 	 */
 	private function inject_prefix( string $url, string $prefix ): string {
-		// Cache the un-filtered home URL + trimmed form per-request. Without
-		// this, `inject_prefix` calls home_url() every invocation - on archive
-		// pages with 30+ permalinks that's 30+ trips through WP's home_url
-		// filter chain (our own filter is suppressed via $this->filtering, but
-		// every OTHER plugin's home_url hook still runs). One compute per
-		// request, reused everywhere.
+		// Unfiltered home URL, cached per request: other plugins' home_url hooks still run on every call.
 		if ( self::$home_trimmed === null ) {
 			$this->filtering = true;
 			try {
@@ -2154,9 +1631,7 @@ final class UrlConverter {
 		}
 		$home_url_trimmed = self::$home_trimmed;
 
-		// Check if the URL already has a language prefix. Use str_contains +
-		// str_starts_with (cheap, no regex) instead of preg_match with pattern
-		// compilation on every call.
+		// Return a URL that already carries this prefix unchanged.
 		$already_prefixed = $home_url_trimmed . '/' . $prefix;
 		if ( $url === $already_prefixed
 			|| str_starts_with( $url, $already_prefixed . '/' ) ) {
@@ -2166,23 +1641,15 @@ final class UrlConverter {
 		// Insert the prefix after the home URL.
 		if ( str_starts_with( $url, $home_url_trimmed ) ) {
 			$remainder = substr( $url, strlen( $home_url_trimmed ) );
-			// Strip any existing language prefix that filter_home_url() may have
-			// added. Without this, a URL already prefixed with the current
-			// language (e.g. /de/) would get the post's language prefix
-			// prepended, producing doubled prefixes like /en/de/product/foo/.
+			// Strip a prefix filter_home_url() may have added, or /en/de/product/foo/ results.
 			$remainder = $this->strip_language_prefix_from_path( $remainder );
 
 			$url = $home_url_trimmed . '/' . $prefix . $remainder;
 		}
 
-		// Ensure trailing slash when permalinks are enabled (WP convention).
-		// permalink_structure is in WP's options autoload cache (cheap get),
-		// but calling get_option() 30+ times per request is still wasteful.
+		// Trailing slash when permalinks are enabled (WP convention).
 		if ( self::has_pretty_permalinks() ) {
-			// Operate on the PATH portion only - slicing $end as a length here
-			// was the original bug: substr($url, $end-20, $end) overshoots into
-			// the query/fragment, and trailingslashit() on the whole URL would
-			// append a slash AFTER the query (e.g. `?foo=bar/`).
+			// Work on the path only: trailingslashit() on the whole URL would put the slash after the query.
 			$qpos = strpos( $url, '?' );
 			$frag = strpos( $url, '#' );
 			$end  = false !== $qpos ? $qpos : ( false !== $frag ? $frag : strlen( $url ) );
@@ -2205,17 +1672,11 @@ final class UrlConverter {
 	/**
 	 * Strip an existing language prefix from a URL path.
 	 *
-	 * Used by inject_prefix() to avoid doubled prefixes when filter_home_url()
-	 * already added the current language prefix to the URL.
-	 *
 	 * @param string $path Path portion after the home URL (e.g. /de/product/foo/).
 	 * @return string Path without any language prefix.
 	 */
 	private function strip_language_prefix_from_path( string $path ): string {
-		// Per-request cache of active language prefixes, sorted longest-first so
-		// 'en-gb' matches before 'en'. str_starts_with against this short cached
-		// list is 5–10× faster than compiling + running a regex per call, which
-		// adds up on archive pages with 30+ permalinks.
+		// Active-language prefixes, longest first so 'en-gb' matches before 'en'.
 		if ( self::$sorted_prefixes === null ) {
 			self::$sorted_prefixes = [];
 
@@ -2265,10 +1726,7 @@ final class UrlConverter {
 	 * @return string URL with subdomain.
 	 */
 	private function apply_subdomain( string $url, object $language ): string {
-		// home_url() is request-constant within a blog, but apply_subdomain()
-		// runs once per language per converted URL (N× on a switcher/hreflang
-		// page). Memoise the parsed host. Class-static so reset_static_caches()
-		// clears it on switch_blog - the home host differs per blog on multisite.
+		// Parsed home host, memoised (runs per language per converted URL); per blog, cleared on switch_blog.
 		if ( self::$home_host === null ) {
 			$this->filtering = true;
 			try {
@@ -2303,12 +1761,8 @@ final class UrlConverter {
 	/**
 	 * Apply per-language domain to a URL (e.g., example.com → example.fr).
 	 *
-	 * The default language without a domain of its own is served on the
-	 * site's own host (the `home` option), as in subdomain mode. On a
-	 * language domain, home_url() already carries that language's host, so
-	 * a default-language link has to be moved back to the home host rather
-	 * than left where it was built. A non-default language without a domain
-	 * has no host that serves it, and its URLs are returned unchanged.
+	 * A default language without its own domain is served on the home host, so its links built on a
+	 * language domain move back there. A non-default language without a domain is returned unchanged.
 	 *
 	 * @param string $url URL to modify.
 	 * @param object $language Language object.
@@ -2320,11 +1774,8 @@ final class UrlConverter {
 		if ( empty( $target_domain ) ) {
 			$target_domain = self::$home_authority ?? $this->home_authority();
 
-			// A link already on the home host stays there, whatever its
-			// language: two anchored prefix checks, no parse. Every
-			// default-language link built on the home host returns here. The
-			// check is anchored at the start of the URL: the home address can
-			// also appear in a query value of a link on another host.
+			// A link already on the home host stays there. Anchored at the start: the home address can also
+			// appear in a query value of a link on another host.
 			if (
 				$target_domain === ''
 				|| str_starts_with( $url, 'https://' . $target_domain . '/' )
@@ -2343,12 +1794,8 @@ final class UrlConverter {
 		$parsed = wp_parse_url( $url );
 		$host   = $parsed['host'] ?? '';
 
-		// Replace host AND port together. wp_parse_url() returns the host
-		// without its port, so replacing the bare host would leave the source
-		// URL's port dangling after a target that carries its own
-		// (host:8875:8875 on nonstandard-port sites - staging/dev). Configured
-		// domains are typically portless (production 80/443), where this is
-		// byte-identical to the old behaviour.
+		// Replace host and port together: wp_parse_url() returns the host without its port, so replacing the
+		// bare host would leave the source port after a target that carries its own.
 		$source = $host . ( isset( $parsed['port'] ) ? ':' . (int) $parsed['port'] : '' );
 
 		if ( $host !== '' && $source !== $target_domain ) {
@@ -2361,10 +1808,7 @@ final class UrlConverter {
 	/**
 	 * Host, with its port when it has one, of the site's own home URL.
 	 *
-	 * Read with this class's home_url filter suppressed, so it is the stored
-	 * `home` value and never the current language's host. Memoised in a
-	 * class static that reset_static_caches() clears on switch_blog, because
-	 * each blog of a network has its own home host.
+	 * Read with this class's home_url filter suppressed: the stored `home`, never a language host. Per blog.
 	 *
 	 * @return string Authority such as `example.com` or `example.com:8443`, or '' when home has no host.
 	 */
@@ -2388,17 +1832,15 @@ final class UrlConverter {
 	/**
 	 * Resolve a query-string URL to its pretty permalink equivalent.
 	 *
-	 * WordPress returns ?page_id=X or ?p=X for draft/pending/future posts.
-	 * When pretty permalinks are enabled, this constructs the proper URL
-	 * from the post slug so language prefixes are applied correctly.
+	 * WordPress returns ?page_id=X or ?p=X for draft, pending and future posts; with pretty permalinks the
+	 * URL is built from the slug so language prefixes apply.
 	 *
 	 * @param string $url URL that may contain query-string format.
 	 * @param int    $post_id Post ID.
 	 * @return string Resolved pretty URL or original URL.
 	 */
 	private function resolve_query_string_url( string $url, int $post_id ): string {
-		// Fast path: pretty permalinks (the default) produce URLs without '?'.
-		// Bail before the get_option() + regex on every permalink filter call.
+		// Fast path: pretty permalink URLs have no '?'.
 		if ( strpos( $url, '?' ) === false ) {
 			return $url;
 		}
@@ -2407,16 +1849,8 @@ final class UrlConverter {
 			return $url;
 		}
 
-		// Only act on query-string URLs (?page_id=X or ?p=X).
-		//
-		// ⚠️ This MUST parse the query and test the actual keys. A substring
-		// test for 'p=' matches the tail of any parameter whose name ends in
-		// "p" - and WooCommerce variation links are built from attribute
-		// parameters, so `?attribute_pa_group=large` (…"grou p=") matched and
-		// every variation URL on the store was rewritten to a fabricated
-		// /product_variation/<slug>/ path that 404s. Same for top, grip, cup,
-		// strap, wrap, step, map. This runs from `filter_post_type_link`, so
-		// it reached shop loops, the cart, order emails, schema and sitemaps.
+		// Only ?page_id=X or ?p=X. Parse and test the keys: a substring 'p=' test matches parameters such as
+		// WooCommerce's `?attribute_pa_group=large` and breaks every variation URL.
 		$query = (string) wp_parse_url( $url, PHP_URL_QUERY );
 
 		if ( $query === '' ) {
@@ -2449,15 +1883,8 @@ final class UrlConverter {
 			return trailingslashit( $home . '/' . $page_path );
 		}
 
-		// Posts / CPTs: use the permalink structure to build the URL.
-		//
-		// ⚠️ Do not invent a structure for a custom post type. The previous
-		// default of '/<post_type>/%postname%/' produced a path with no
-		// matching rewrite rule whenever the type was registered with
-		// `rewrite => false` or a custom slug - a clean-looking URL that 404s.
-		// Ask WP_Rewrite what the type actually registered, and when it has no
-		// permastruct leave the query-string URL alone: an ugly URL that works
-		// beats a pretty one that does not.
+		// Posts and CPTs: use the structure the type registered. Never invent one: without a permastruct keep
+		// the working query-string URL rather than a pretty one that 404s.
 		if ( $post->post_type === 'post' ) {
 			$struct = (string) get_option( 'permalink_structure' );
 		} else {
@@ -2523,9 +1950,7 @@ final class UrlConverter {
 		} elseif ( $url_mode === 'domain' ) {
 			$url = $this->apply_domain( $url, $language );
 		} elseif ( $url_mode === 'query' ) {
-			// Query mode: the object's language rides in ?lang=. The default
-			// language always stays clean (no parameter) so the canonical URL
-			// set has exactly one variant per language.
+			// Query mode: the default language stays clean (no parameter), one canonical URL per language.
 			$url = remove_query_arg( self::query_var(), $url );
 
 			if ( ! ( $default !== null && $language->slug === $default->slug ) ) {
@@ -2540,9 +1965,8 @@ final class UrlConverter {
 			if ( ! $is_default ) {
 				$url = $this->inject_prefix( $url, $this->settings->get_url_prefix( $language ) );
 			} else {
-				// Default language with hidden prefix: remove any prefix that
-				// filter_home_url() added for the visitor's current language,
-				// after the same stored base inject_prefix() adds prefixes to.
+				// Hidden default: remove a prefix filter_home_url() added for the visitor's language, after the
+				// same stored base inject_prefix() uses.
 				if ( self::$home_trimmed === null ) {
 					$this->filtering = true;
 					try {
@@ -2568,10 +1992,7 @@ final class UrlConverter {
 		if ( $cfg['translate_slugs'] ) {
 			$translated_slug = $this->slug_manager->get_slug( $object_type, $object_id, (int) $language->id );
 
-			// Treat empty string the same as null ("no translation"). A stale
-			// cache or partial migration may have stored '' instead of null;
-			// without this guard `replace_slug_in_url` would strip the
-			// original slug from the URL (e.g. /de/shop/ → /de//).
+			// '' means "no translation", as in redirect_term_to_translated_slug(); else the slug is stripped (/de//).
 			if ( $translated_slug !== null && $translated_slug !== '' ) {
 				$url = $this->replace_slug_in_url( $url, $object_id, $object_type, $translated_slug );
 			}
@@ -2581,17 +2002,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Pre-fetch menu items and prime caches BEFORE wp_setup_nav_menu_item
-	 * runs its array_map and triggers a cascade of get_permalink()
-	 * (filter_page_link) calls - each of which would otherwise fire a
-	 * separate transient read for each linked post.
+	 * Prime caches for a classic menu's linked posts before wp_setup_nav_menu_item builds their permalinks.
 	 *
-	 * Hooked to `pre_wp_nav_menu`, which fires at the top of `wp_nav_menu()`
-	 * before the menu is located or its items are fetched. Returning null
-	 * leaves the short-circuit behaviour of the filter unchanged (WP will
-	 * continue to call wp_get_nav_menu_items as normal), but by then we've
-	 * already populated the per-post caches so every downstream permalink
-	 * filter lands on an L1 hit.
+	 * Hooked to `pre_wp_nav_menu`, which fires before the items are fetched; never short-circuits.
 	 *
 	 * @param \stdClass|string|null $output Existing short-circuit value (null = let WP continue).
 	 * @param object|array|string   $args wp_nav_menu arguments.
@@ -2602,12 +2015,7 @@ final class UrlConverter {
 			return $output;
 		}
 
-		// Static memo - multiple widgets on a page can fire wp_nav_menu
-		// with different menus, but priming twice for the same menu ID is
-		// wasted work. BLOG-KEYED so a mid-request switch_to_blog() can't make
-		// blog B skip a prime because blog A already primed a menu whose
-		// (per-blog, low-numbered) term_id collides - self-correcting, no
-		// reset hook needed (same pattern as HreflangTags/OgLocale).
+		// Primed menus keyed by blog: menu term IDs collide across blogs, and no reset reaches a static.
 		static $primed_menus = [];
 		$primed_blog         = is_multisite() ? get_current_blog_id() : 0;
 		if ( ! isset( $primed_menus[ $primed_blog ] ) ) {
@@ -2632,9 +2040,7 @@ final class UrlConverter {
 
 		$primed_menus[ $primed_blog ][ (int) $menu->term_id ] = true;
 
-		// Fetch just the post IDs the menu references - a lean query keyed on
-		// the menu term relationship. We don't need the full wp_setup-
-		// decorated items, just object_ids for the prime.
+		// Only the post IDs the menu references, not the full menu items.
 		global $wpdb;
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -2650,13 +2056,7 @@ final class UrlConverter {
 			)
 		);
 
-		// SQL above is `SELECT DISTINCT pm.meta_value` - values are already
-		// deduped at the database layer. intval() can only normalize
-		// strings to ints, never multiply them, and the downstream
-		// prime_translations + IN-clause SQL handle duplicate ids
-		// idempotently, so a PHP-side array_unique() here would just be
-		// dead work on every menu prime. Filter > 0 still applies to drop
-		// the impossible-but-harmless 0-rows.
+		// DISTINCT already dedupes and the prime handles duplicates: no array_unique().
 		$post_ids = array_values( array_filter( array_map( 'intval', (array) $post_ids_raw ), static fn( int $id ): bool => $id > 0 ) );
 
 		if ( $post_ids === [] ) {
@@ -2669,15 +2069,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Batch-prime the post IDs a Navigation block references, BEFORE the
-	 * block renders its navigation-link/submenu children (each of which
-	 * calls get_permalink → our permalink filters → get_translations).
+	 * Batch-prime the post IDs a Navigation block references, before its link blocks render.
 	 *
-	 * Block themes never call wp_nav_menu(), so prime_nav_menu_items_early
-	 * can't cover them. The Navigation block's items either sit in its
-	 * innerBlocks directly or in a `wp_navigation` post referenced by the
-	 * `ref` attribute; both shapes are walked here. Returning null leaves
-	 * rendering untouched - this only warms caches.
+	 * Walks the inner blocks and the `ref` wp_navigation post; never short-circuits rendering.
 	 *
 	 * @param string|null $pre_render   Pre-render short-circuit value (null = render normally).
 	 * @param mixed       $parsed_block The block being rendered.
@@ -2697,14 +2091,8 @@ final class UrlConverter {
 		$blocks = isset( $parsed_block['innerBlocks'] ) && is_array( $parsed_block['innerBlocks'] ) ? $parsed_block['innerBlocks'] : [];
 
 		if ( $ref > 0 ) {
-			// ⚠️ Prime the menu that will actually RENDER, not the one the block
-			// was saved with. BlockRefTranslator swaps a translated
-			// `wp_navigation` in on `render_block_data`, which fires AFTER this
-			// `pre_render_block` pass - so priming $ref here would warm the
-			// source menu's items and then watch the translated menu render,
-			// turning one batched query into one lookup per menu item on exactly
-			// the pages that use the feature. The translator memoises, so asking
-			// twice costs no query.
+			// Prime the menu that will render, not the saved one: BlockRefTranslator swaps the ref on
+			// render_block_data, after this pre_render_block pass. The translator memoises.
 			$plugin = \PerfLocale\Plugin::get_instance();
 
 			if ( $plugin->has( 'block_ref_translator' ) ) {
@@ -2742,9 +2130,7 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Recursively collect post-type object IDs from navigation-link /
-	 * navigation-submenu blocks (taxonomy links resolve through a different
-	 * cache path and are left to their own filters).
+	 * Recursively collect post-type object IDs from navigation-link and navigation-submenu blocks.
 	 *
 	 * @param array<mixed>   $blocks   Parsed block list.
 	 * @param array<int,int> $post_ids Collector (by reference).
@@ -2776,9 +2162,6 @@ final class UrlConverter {
 	/**
 	 * Prime translation-link + slug caches for a set of post IDs.
 	 *
-	 * Extracted out of prime_nav_menu_items_early so we can call the same
-	 * batched priming code path from multiple hooks if needed.
-	 *
 	 * @param array<int, int> $post_ids Post IDs to prime.
 	 * @return void
 	 */
@@ -2794,17 +2177,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Point a rendered navigation-link / navigation-submenu anchor at the
-	 * current language's sibling of the linked object.
+	 * Point a rendered navigation-link or navigation-submenu anchor at the current language's sibling.
 	 *
-	 * Core renders these blocks from the SAVED `url` attribute (the object's
-	 * permalink at save time, in the language it was authored in) and never
-	 * calls get_permalink() - so on a translated page every explicit menu
-	 * item pointed back to the default language. When the linked post/term
-	 * has a published sibling in the current language, rewrite the anchor's
-	 * href to that sibling's permalink (which routes through the plugin's
-	 * mode-aware URL filters). No sibling → the saved URL stands and the
-	 * missing-translation handling applies as usual.
+	 * Core renders the saved `url` and never calls get_permalink(). Without a published sibling the saved URL stands.
 	 *
 	 * @param mixed $block_content Rendered block HTML.
 	 * @param mixed $block         Parsed block (attrs carry id/kind).
@@ -2862,10 +2237,7 @@ final class UrlConverter {
 			return $block_content;
 		}
 
-		// Rewrite only the FIRST anchor: for navigation-link that is the
-		// item itself; for navigation-submenu it is the parent link (child
-		// items are separate navigation-link blocks, each filtered on their
-		// own render pass before the submenu wraps them).
+		// Only the first anchor: a submenu's children are separate navigation-link blocks, filtered on their own.
 		$processor = new \WP_HTML_Tag_Processor( $block_content );
 
 		if ( $processor->next_tag( 'a' ) ) {
@@ -2879,22 +2251,8 @@ final class UrlConverter {
 	/**
 	 * Resolve a URL WordPress could not resolve to its post ID for oEmbed.
 	 *
-	 * WP's oEmbed controller resolves ?url= via url_to_postid(), whose internal
-	 * WP_Query is language-scoped by PostQueryFilter to the current request's
-	 * language, so a URL in another language (e.g. /de/ while the REST request
-	 * resolved to the default language) returns 0 and the endpoint 404s. The
-	 * URL is resolved again with language scoping suspended, so it maps to its
-	 * own post whatever the request language. The suspension is removed in
-	 * finally: an exception from another plugin's url_to_postid or
-	 * pre_get_posts callback, caught by its caller, would otherwise leave every
-	 * later query of the request unscoped.
-	 *
-	 * url_to_postid() reads a language root (/de/, or de.example.com/ in
-	 * subdomain mode) as no post, so a URL still unresolved is checked as a
-	 * language root last; see front_page_for_language_root().
-	 *
-	 * Runs only from the oembed_request_post_id filter, and does work only
-	 * when WordPress resolved nothing.
+	 * url_to_postid() is scoped to the request language, so retry with scoping suspended (removed in finally,
+	 * or a caught exception leaves the request unscoped), then try a language root.
 	 *
 	 * @param int    $post_id Post ID WP resolved (0 when it could not).
 	 * @param string $url     The requested URL.
@@ -2926,13 +2284,8 @@ final class UrlConverter {
 	/**
 	 * Static front page shown at the language root a URL addresses.
 	 *
-	 * The default language gives page_on_front. Another language gives the
-	 * member of page_on_front's translation group in that language, but only
-	 * while the post itself is published and publicly viewable; the stored
-	 * link status is not read. Every other case gives 0: no static front
-	 * page, a URL that is no language root of this site, a language with no
-	 * such member, or a member that is a draft, pending, scheduled, private
-	 * or not viewable.
+	 * The default language gives page_on_front; another gives its published, publicly viewable group member
+	 * (the stored link status is not read). Anything else gives 0.
 	 *
 	 * @param string $url URL to resolve.
 	 * @return int Post ID, or 0.
@@ -2993,26 +2346,10 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Slug of the active language whose root a URL is, by the URL mode's
-	 * routing rules.
+	 * Slug of the active language whose root a URL is, by the URL mode's routing rules.
 	 *
-	 * A root has no query string, an http or https scheme, and:
-	 *  - subdirectory mode: the home host and port, and a path of the home
-	 *    path followed by one prefix of the router's prefix map and an
-	 *    optional slash. The home path alone is the default language's root
-	 *    when its prefix is hidden.
-	 *  - subdomain mode: the home path and port, on the language's subdomain
-	 *    of the home host, or on the home host for the default language.
-	 *  - domain mode: the home path on the domain configured for the
-	 *    language (its port included when it names one), or on the home host
-	 *    and port for the default language.
-	 * Query mode has no root this method recognises: the root URLs of that
-	 * mode differ only in their query string, and url_to_postid() already
-	 * resolves the bare home URL to page_on_front.
-	 *
-	 * Hosts are compared after LanguageRouter::normalize_host(); the home URL
-	 * is read with this class's home_url filter suppressed. Another host or
-	 * port is rejected here, independently of url_to_postid()'s own checks.
+	 * Query mode has none: url_to_postid() already resolves the bare home URL. Another host or port is
+	 * rejected here, independently of url_to_postid()'s own checks.
 	 *
 	 * @param string             $url       URL to check.
 	 * @param array<string, int> $languages Active languages, slug => id.
@@ -3126,11 +2463,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Prime slug translations for a batch of object IDs across every active
-	 * language with null-sentinels for untranslated pairs. Extracted from
-	 * prime_menu_post_ids so it can be reused independently of the
-	 * translation-link prime; the term leg runs the queue that
-	 * preload_term_languages() fills (prime_pending_term_slugs()).
+	 * Prime slug translations for object IDs across every active language, with null sentinels for gaps.
+	 *
+	 * The term leg runs the queue preload_term_languages() fills (prime_pending_term_slugs()).
 	 *
 	 * @param array<int, int> $object_ids Object IDs to prime.
 	 * @param string          $object_type Object type ('post' or 'term').
@@ -3168,8 +2503,7 @@ final class UrlConverter {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$pid_ph  = implode( ',', array_fill( 0, count( $object_ids ), '%d' ) );
 		$lang_ph = implode( ',', array_fill( 0, count( $lang_ids ), '%d' ) );
-		// $slug_table leads: it binds the %i, which precedes the %s object_type
-		// and the two %d id lists. prepare() consumes $args strictly in order.
+		// Order matches the placeholders: %i, %s, then the two %d lists.
 		$args = array_merge( [ $slug_table, $object_type ], $object_ids, $lang_ids );
 
 		$rows = $wpdb->get_results(
@@ -3183,9 +2517,7 @@ final class UrlConverter {
 		);
 		// phpcs:enable
 
-		// A failed SELECT proves nothing about which pairs are untranslated.
-		// Seed nothing, so each read runs its own lookup instead of taking a
-		// null sentinel for "no translation".
+		// A failed SELECT proves nothing: seed no null sentinels, so each read runs its own lookup.
 		if ( ! is_array( $rows ) || '' !== $wpdb->last_error ) {
 			return;
 		}
@@ -3198,8 +2530,7 @@ final class UrlConverter {
 
 		foreach ( $object_ids as $pid ) {
 			foreach ( $lang_ids as $lid ) {
-				// Key format must match SlugTranslationRepository::get_slug's
-				// read key exactly ("slug_{type}_{id}_{lang}").
+				// Must match SlugTranslationRepository::get_slug()'s read key ("slug_{type}_{id}_{lang}").
 				$cache_key = "slug_{$object_type}_{$pid}_{$lid}";
 				$value     = $found[ $pid . ':' . $lid ] ?? null;
 				$this->cache->set_static( $cache_key, $value, 'perflocale_slugs' );
@@ -3210,9 +2541,7 @@ final class UrlConverter {
 	/**
 	 * Batch preload language slugs for all posts in a WP_Query result.
 	 *
-	 * This eliminates N+1 queries when rendering permalink lists (archives,
-	 * search results, etc.). The preloaded data is consumed by
-	 * resolve_object_language().
+	 * Avoids N+1 queries on permalink lists; resolve_object_language() reads the result.
 	 *
 	 * @param array<int, \WP_Post> $posts Posts from WP_Query.
 	 * @param \WP_Query            $query The query.
@@ -3223,11 +2552,7 @@ final class UrlConverter {
 			return $posts;
 		}
 
-		// Fast-path detector: walk $posts once, collect only the IDs whose
-		// language we haven't already cached for this request. On sub-queries
-		// (sidebars / related / widgets) every ID is already primed by the
-		// main query, so $missing_ids ends up empty and we return without
-		// touching repos or the DB.
+		// Only IDs not cached this request; sub-queries usually find them all primed and return here.
 		$missing_ids = [];
 
 		foreach ( $posts as $p ) {
@@ -3242,19 +2567,14 @@ final class UrlConverter {
 			return $posts;
 		}
 
-		// Repositories are stateless wrappers over the shared cache manager;
-		// cache the instances on the UrlConverter so sub-queries don't pay
-		// the object-construction cost 4-6× per request.
+		// Hold the repository instance across sub-queries.
 		if ( self::$lazy_group_repo === null ) {
 			self::$lazy_group_repo = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 		}
 
 		$repo = self::$lazy_group_repo;
 
-		// Build a lang_id → language object map from the router's already-
-		// loaded active-languages list. Avoids a LanguageRepository::find_many()
-		// roundtrip on every cold-path invocation. Active language count is
-		// tiny (typically 2-5) so this is pure in-memory work.
+		// lang_id => language map from the router's active languages, instead of a find_many() query.
 		if ( self::$lang_id_map === null ) {
 			$map = [];
 
@@ -3271,8 +2591,7 @@ final class UrlConverter {
 
 		$lang_map = self::$lang_id_map;
 
-		// Prime only the missing IDs - no need to re-prime siblings we've
-		// already resolved in this request.
+		// Prime only the missing IDs.
 		$repo->prime_translations( ObjectType::Post, $missing_ids );
 
 		$current = $this->router->get_current_language();
@@ -3291,9 +2610,7 @@ final class UrlConverter {
 				}
 			}
 
-			// Unmanaged posts (no translation link) get the visitor's
-			// current language so resolve_object_language can short-
-			// circuit without a second repo pass.
+			// Unmanaged posts get the visitor's current language, so resolve_object_language() can short-circuit.
 			self::$object_language_cache[ 'post_' . $pid ] = $lang ?? $current;
 		}
 
@@ -3301,19 +2618,9 @@ final class UrlConverter {
 	}
 
 	/**
-	 * Batch-prime TERM translations + languages - the term-side analog of
-	 * preload_object_languages(). Without it every distinct term rendered
-	 * on a page (per-post category links, category/tag widgets and blocks,
-	 * Woo product-category lists) pays its own get_translations() lookup
-	 * inside filter_term_link - a JOIN each on no-object-cache sites.
+	 * Batch-prime term translations and languages, the term analog of preload_object_languages().
 	 *
-	 * Translations and languages are primed here. The terms' slug prime is
-	 * only queued (queue_term_slug_prime()) and runs when one of their slugs
-	 * is read.
-	 *
-	 * Hooked to `get_terms` and `get_the_terms`; tolerant of both signatures
-	 * (terms may be WP_Term objects, ids, or other field shapes - anything
-	 * non-batchable passes through untouched).
+	 * The slug prime is only queued (queue_term_slug_prime()). Non-ID term shapes pass through untouched.
 	 *
 	 * @param array<int, mixed>|mixed $terms Terms from the query (shape varies by 'fields').
 	 * @return array<int, mixed>|mixed Unmodified $terms.
@@ -3341,9 +2648,8 @@ final class UrlConverter {
 			}
 		}
 
-		// Pathological unbounded term queries (thousands of ids) would bloat
-		// the L1 maps for little rendering benefit - let those fall back to
-		// the per-term path, which negative-caches as it goes.
+		// Huge term lists take the per-term path rather than bloat the L1 maps. This 500 must equal
+		// MAX_PENDING_TERM_SLUG_IDS.
 		if ( $missing === [] || count( $missing ) > 500 ) {
 			return $terms;
 		}
@@ -3372,21 +2678,8 @@ final class UrlConverter {
 
 		$repo->prime_translations( ObjectType::Term, $missing );
 
-		// Terms get the same multi-language slug prime posts have: without
-		// it, every unique rendered term link on a translate-slugs site pays
-		// its own per-(term, language) repository read inside
-		// SlugManager::get_slug. The prime is queued, not run here: a
-		// listing reads terms for every item (WooCommerce product data,
-		// template-part lookups) while building few or no term links, and
-		// on a warm persistent cache each of those reads would otherwise
-		// issue its own SELECT for slugs nothing reads. The queue runs, as
-		// one SELECT, when get_slug() reads a queued term.
-		// Gated like SlugManager::preload_slugs, which also bails on
-		// is_admin(): is_admin() requests still run filter_term_link, so
-		// their term links resolve one (term, language) at a time through
-		// SlugManager::get_slug (in-memory memo, then the repository's cached
-		// read). Both gate reads are memoized (url_config + the repo's
-		// has_any_slugs verdict).
+		// Queued, not run: most term reads (WooCommerce product data, template parts) build no link. Gated like
+		// SlugManager::preload_slugs() on is_admin(); admin term links resolve per key. Both gate reads are memoized.
 		if ( ! is_admin()
 			&& $this->url_config()['translate_slugs']
 			&& $this->slug_manager->has_any_slugs() ) {
@@ -3418,15 +2711,8 @@ final class UrlConverter {
 	/**
 	 * Queue term IDs for the current blog's deferred slug prime.
 	 *
-	 * The queue is a keyed set, so repeated IDs (a term seen by several
-	 * get_the_terms calls, or re-queued after an object_language_cache
-	 * eviction) are stored once. When adding new IDs would take the queue
-	 * past MAX_PENDING_TERM_SLUG_IDS, the queued prime runs first.
-	 *
-	 * IDs queued from inside that prime's SELECT (a `query` filter that reads
-	 * terms) are replaced by this call's IDs rather than kept: their slug
-	 * reads take the per-key path, with the same values, and the queue stays
-	 * within the cap.
+	 * A keyed set, so repeated IDs are stored once; passing MAX_PENDING_TERM_SLUG_IDS runs the queued prime first.
+	 * IDs queued from inside that prime's SELECT are replaced, not kept, so the queue stays within the cap.
 	 *
 	 * @param array<int, int> $term_ids Term IDs, duplicates allowed.
 	 * @return void
@@ -3451,13 +2737,8 @@ final class UrlConverter {
 	/**
 	 * Run the current blog's queued term slug prime when $term_id is queued.
 	 *
-	 * Registered with SlugManager, which calls it just before a term slug
-	 * read that missed its in-memory memo. All of the blog's queued IDs share
-	 * one SELECT; a read of a term that is not queued leaves the queue for a
-	 * later read. A prime runs only when the queue is non-empty and empties
-	 * it, and the queue only fills through a queue_term_slug_prime() call that
-	 * added an ID, so a request never runs more of these SELECTs than it made
-	 * such calls.
+	 * Called by SlugManager::get_slug() after its memo misses. A prime runs only on a non-empty queue and
+	 * empties it, so a request never runs more of these SELECTs than queueing calls that added an ID.
 	 *
 	 * @param int $term_id ID of the term whose slug is about to be read.
 	 * @return void
@@ -3473,8 +2754,7 @@ final class UrlConverter {
 	/**
 	 * Prime the slugs of every term queued for a blog, and empty its queue.
 	 *
-	 * The queue is emptied before the query so nothing reached during the
-	 * prime can run it a second time.
+	 * Emptied before the query so nothing reached during the prime can run it again.
 	 *
 	 * @param int $blog_id Blog whose queue to run; must be the current blog.
 	 * @return void
@@ -3490,17 +2770,13 @@ final class UrlConverter {
 	/**
 	 * Check if a page is the static front page or a translation of it.
 	 *
-	 * Checks both translation group membership and slug match as a
-	 * fallback for pages not linked in the same translation group.
+	 * Falls back to a slug match for pages not linked in the front page's translation group.
 	 *
 	 * @param int $post_id Page ID.
 	 * @return bool
 	 */
 	private function is_front_page_translation( int $post_id ): bool {
-		// Class-static memo so reset_static_caches() (hooked to switch_blog +
-		// perflocale/language/{added,updated,slug_renamed,deleted}) wipes it
-		// when the blog or language set changes mid-request - page_on_front +
-		// translation group membership are both per-blog and CRUD-sensitive.
+		// Class-static memo: page_on_front and group membership are per blog and change with language CRUD.
 		if ( isset( self::$front_page_translation_memo[ $post_id ] ) ) {
 			return self::$front_page_translation_memo[ $post_id ];
 		}
@@ -3518,11 +2794,8 @@ final class UrlConverter {
 			return true;
 		}
 
-		// Lazy prime of the front-page translation group. Runs during `init`
-		// when WooCommerce / BlockPatterns build shop/cart/checkout permalinks
-		// - before the_posts and wp_get_nav_menu_items fire - so without it
-		// each init hits its own transient read. One prime covers the rest of
-		// the request via the sibling-cascade in prime_translations().
+		// Lazy prime of the front-page group: WooCommerce and block patterns build permalinks during `init`,
+		// before the_posts and the nav-menu prime.
 		if ( ! self::$front_page_translation_primed ) {
 			self::$front_page_translation_primed = true;
 
@@ -3572,17 +2845,8 @@ final class UrlConverter {
 			return self::$object_language_cache[ $cache_key ];
 		}
 
-		// Fallback: single lookup for objects not in the preloaded batch
-		// (e.g., individual get_permalink() calls outside a loop).
-		//
-		// These two function-local statics are NOT a blog-affinity hazard even
-		// though nothing resets them: Plugin::get() memoises its services and
-		// the container is never cleared on `switch_blog`, so re-resolving
-		// would hand back these exact instances anyway (verified: identical
-		// spl_object_id across all four blogs of a subdomain network). The
-		// blog-affine state is self::$object_language_cache above - keyed
-		// "{type}_{object_id}", which collides across blogs - and THAT is
-		// cleared by reset_static_caches() on switch_blog.
+		// Fallback: single lookup for objects outside a preloaded batch. These statics need no blog reset: the
+		// container returns the same instances on every blog; the blog-affine state is $object_language_cache.
 		static $repo      = null;
 		static $lang_repo = null;
 
@@ -3622,10 +2886,7 @@ final class UrlConverter {
 	 * @return string URL with translated slug.
 	 */
 	private function replace_slug_in_url( string $url, int $object_id, string $object_type, string $translated_slug ): string {
-		// Belt-and-braces: never replace a real slug with an empty one. Empty
-		// `$translated_slug` indicates "no translation available" (mirrors the
-		// caller-side guard in `add_language_prefix_to_url`). Without this
-		// check, a stale cache row could turn /de/shop/ into /de//.
+		// Never replace a real slug with an empty one ('' means "no translation"), or /de/shop/ becomes /de//.
 		if ( $translated_slug === '' ) {
 			return $url;
 		}
@@ -3691,19 +2952,11 @@ final class UrlConverter {
 	private function get_current_url(): string {
 		$scheme = is_ssl() ? 'https' : 'http';
 		$host   = sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ?? '' ) );
-		// esc_url_raw, NOT sanitize_text_field: the latter strips %XX octets,
-		// corrupting percent-encoded (non-Latin) request paths used to build
-		// hreflang / switcher / og:url alternates.
+		// esc_url_raw(), not sanitize_text_field(), which strips %XX octets from non-Latin paths.
 		$uri = esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
 
-		// Drop the query string + fragment. This URL seeds the per-language
-		// alternates for home / date / author / post-type archives consumed by
-		// hreflang, the switcher, og:url, schema, and the speculation-rules
-		// prerender list - all of which need the CANONICAL page URL. The
-		// singular and taxonomy branches already produce query-less permalinks;
-		// without this strip, the first visitor's ?utm_… would be baked into
-		// HreflangTags' 12h-cached alternate set (its cache key deliberately
-		// excludes the query string) and served to every subsequent visitor.
+		// Drop the query string and fragment: alternates need the canonical URL, and HreflangTags caches them
+		// under a key without the query string, so one visitor's ?utm_ would be served to everyone.
 		$qpos = strpos( $uri, '?' );
 		if ( $qpos !== false ) {
 			$uri = substr( $uri, 0, $qpos );
@@ -3713,21 +2966,15 @@ final class UrlConverter {
 			$uri = substr( $uri, 0, $fpos );
 		}
 
-		// Search results are the one archive whose identity LIVES in the query
-		// string: re-append `s` alone so the language switcher targets the same
-		// search in the other language instead of its bare home page. Safe for
-		// the query-string strip above - HreflangTags skips is_search()
-		// entirely (never cached/emitted), and og:url/schema on a search page
-		// are computed per-request.
+		// Search results live in the query string: re-append `s` alone. Safe for the strip above: HreflangTags
+		// skips is_search(), and og:url and schema are computed per request on a search page.
 		if ( is_search() ) {
 			$term = get_search_query( false );
 
 			if ( $term !== '' ) {
 				$uri .= '?s=' . rawurlencode( $term );
 
-				// A scoped search (WooCommerce product search: ?s=x&post_type=product)
-				// is a different result set than the blog search - without the
-				// scope, the switcher would land visitors on the wrong search.
+				// A scoped search (?post_type=product) is a different result set: keep the scope.
 				$post_type = get_query_var( 'post_type' );
 
 				if ( is_string( $post_type ) && $post_type !== '' ) {

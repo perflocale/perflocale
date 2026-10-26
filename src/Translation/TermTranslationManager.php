@@ -22,22 +22,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Manages translation relationships between terms across languages.
- *
- * Same group-based linking pattern as PostTranslationManager but
- * operates on taxonomy terms.
+ * Creates and links term translations (PostTranslationManager's group model, for taxonomy terms).
  */
 final class TermTranslationManager {
 
 	/**
-	 * Longest slug sanitize_title() will hand back.
+	 * Longest slug sanitize_title() hands back (utf8_uri_encode( $title, 200 )).
 	 *
-	 * Core's sanitize_title_with_dashes() runs its input through
-	 * utf8_uri_encode( $title, 200 ), so anything longer comes back cut to 200
-	 * characters. The cut is not merely cosmetic here: every slug this class
-	 * builds is "<base>-<suffix>", so when the base sits at (or one short of)
-	 * the cap it is the suffix that gets shaved off and the result sanitizes
-	 * straight back to the base it was derived from.
+	 * The cap cuts a "<base>-<suffix>" slug's suffix first, so room is reserved before appending.
 	 */
 	private const SLUG_MAX_LENGTH = 200;
 
@@ -45,6 +37,26 @@ final class TermTranslationManager {
 	 * Highest "-N" suffix force_insert_term() walks to before giving up.
 	 */
 	private const MAX_SLUG_SUFFIX = 999;
+
+	/**
+	 * Request age (s) after which adoption stops on a web request: margin under a 30 s limit (no limit under WP-CLI).
+	 */
+	private const ADOPT_SECONDS = 20;
+
+	/**
+	 * Moves every adoption may make whatever the request's age, so a late create still adopts a small family.
+	 */
+	private const ADOPT_MIN_MOVES = 25;
+
+	/**
+	 * Seconds every adoption may run from its own start (see ADOPT_MIN_MOVES).
+	 */
+	private const ADOPT_MIN_SECONDS = 2;
+
+	/**
+	 * Source children read per query during adoption.
+	 */
+	private const ADOPT_PAGE = 500;
 
 	/**
 	 * Values of translation_links.source written by the importers.
@@ -69,6 +81,19 @@ final class TermTranslationManager {
 	private readonly CacheManager $cache;
 
 	/**
+	 * Hierarchy served to core per blog and taxonomy while an adoption moves terms: two rebuilds per adoption, not
+	 * one per move.
+	 *
+	 * @var array<int, array<string, array<int, array<int>>>>
+	 */
+	private array $hierarchy = [];
+
+	/**
+	 * Term set_parent() is updating; another term's edit makes the served hierarchy stale.
+	 */
+	private int $moving = 0;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param CacheManager $cache Cache manager.
@@ -80,14 +105,9 @@ final class TermTranslationManager {
 	}
 
 	/**
-	 * Strip a trailing "-<language-slug>" from a term slug to recover the
-	 * canonical base - but ONLY when the suffix is an actual active language
-	 * slug. The previous `/-[a-z]{2,3}$/` matched any short trailing word
-	 * ("green-tea" → "green", "how-to" → "how", "sci-fi" → "sci"), so merely
-	 * creating a translation rewrote the source term's canonical display slug
-	 * and started 301-redirecting its live public URL. It also failed the
-	 * inverse - regioned/longer slugs ("pt-br", "zh-hans") were never stripped.
-	 * Anchoring to the real language slugs fixes both directions.
+	 * Strip a trailing "-<language-slug>" from a term slug, only when it is an active language's slug.
+	 *
+	 * A generic `-[a-z]{2,3}` match would strip words ("green-tea") and miss "pt-br", moving public URLs.
 	 *
 	 * @param string $slug Term slug, possibly language-suffixed.
 	 * @return string Base slug (unchanged when no genuine language suffix).
@@ -111,28 +131,14 @@ final class TermTranslationManager {
 	}
 
 	/**
-	 * Shorten a slug base so that $reserve further characters still survive
-	 * sanitize_title()'s SLUG_MAX_LENGTH cap.
+	 * Shorten a slug base so that $reserve further characters survive the SLUG_MAX_LENGTH cap.
 	 *
-	 * The cap is applied to the finished string, so a suffix appended to an
-	 * over-long base is exactly the part that gets cut. Reserving the room up
-	 * front is what keeps "<base>-<language>" distinct from "<base>", and what
-	 * keeps force_insert_term()'s "-N" walk able to reach a slug it has not
-	 * already tried.
-	 *
-	 * The cut itself is delegated to {@see \PerfLocale\Helper::truncate_slug()},
-	 * which never lands inside a percent-escape. An earlier version cut with
-	 * byte substr() and relied on sanitize_title() to "drop the orphaned %".
-	 * It does drop the %, but it KEEPS the hex digits that followed, so the
-	 * slug silently became different bytes rather than shorter ones: every
-	 * Japanese, Chinese or Korean term name of 24 characters and up, and every
-	 * Russian or Arabic one of 45 and up, was stored as mojibake that no later
-	 * sanitising repaired.
+	 * Cuts with Helper::truncate_slug(), never inside a percent-escape: sanitize_title() drops an orphaned
+	 * `%` but keeps its hex digits, which stores multibyte names as mojibake.
 	 *
 	 * @param string $base    Sanitized slug base.
 	 * @param int    $reserve Characters to keep free for the suffix.
-	 * @return string Base shortened just enough; unchanged when it already fits
-	 *                (or when $reserve leaves no room at all, which no caller does).
+	 * @return string Base shortened just enough; unchanged when it fits or $reserve leaves no room.
 	 */
 	private function reserve_slug_room( string $base, int $reserve ): string {
 		$max = self::SLUG_MAX_LENGTH - $reserve;
@@ -151,24 +157,11 @@ final class TermTranslationManager {
 	 * @param string     $taxonomy Taxonomy slug.
 	 * @param string     $target_slug Target language slug.
 	 * @param bool       $copy_content Whether to copy name/description.
-	 * @param SourceType $source Provenance tag for the new
-	 *     translation_links row. Manual is the default for the metabox /
-	 *     REST manual flows; auto-translate-on-save passes
-	 *     MachineTranslation.
-	 * @param bool|null  $created Set to true when this call inserted the
-	 *     translation it returns, false otherwise. A translation this call did
-	 *     not create can be another author's, and the caller's own earlier
-	 *     reads may not have shown it: a caller that writes into the returned
-	 *     term must check this first.
-	 * @return int|false Term ID of the translation: newly created, or one
-	 *     already linked in the target language, which may be another
-	 *     process's. False on failure. Also false when another process holds
-	 *     the creation lock and this call gets no answer: the lock was still
-	 *     held when the wait budget ran out, or read free but could not be
-	 *     taken; or this call did not wait (this process already holds a
-	 *     creation lock, as a term create inside a post create does, or has
-	 *     spent its wait budget) and this process knows of no linked
-	 *     translation.
+	 * @param SourceType $source Provenance tag for the new link (auto-translate passes MachineTranslation).
+	 * @param bool|null  $created Set to true when this call inserted the translation it returns. Check it
+	 *     before writing into the term: one this call did not create can be another author's.
+	 * @return int|false Term ID of the new or already-linked translation (maybe another process's); false on
+	 *     failure, or when the creation lock is held elsewhere and no linked translation is known.
 	 */
 	public function create_translation(
 		int $source_id,
@@ -191,32 +184,18 @@ final class TermTranslationManager {
 			return false;
 		}
 
-		// Fast path: existing translation present. Skip the lock for
-		// the common "translation already exists" case.
+		// Fast path: an existing translation needs no lock.
 		$existing = $this->get_translation_id( $source_id, $target_slug );
 		if ( $existing !== null ) {
 			return $existing;
 		}
 
-		// Acquire a per-(source_id, target_slug) lock. Two concurrent
-		// callers for the same target-language translation of the same
-		// source term can otherwise both pass the existing-check, both
-		// run `wp_insert_term()`, and either (a) WP's name-uniqueness
-		// rejects the second insert (recoverable) OR (b) we fall back
-		// to `force_insert_term()` which writes raw via $wpdb and would
-		// create duplicate term rows.
-		//
-		// Lock key intentionally narrow - term IDs in wp_terms are
-		// globally unique across taxonomies, so source_id is sufficient
-		// to scope the contention; we still include target_slug so
-		// different target-language translations of the same term don't
-		// serialise against each other.
+		// Lock per (source_id, target_slug), not per group: two callers could both pass the check and
+		// force_insert_term() would write duplicate rows. Term ids are unique across taxonomies.
 		/**
 		 * @hook perflocale/translation/create_term_lock_ttl
 		 *
-		 * Lock TTL (seconds) for the create_translation() critical
-		 * section in TermTranslationManager. Default 30 - terms have no
-		 * meta/featured-image copy step so the inserts are quick.
+		 * Lock TTL (seconds) of term create_translation(); default 30 (terms have no meta or image copy).
 		 *
 		 * @param int $ttl Default 30.
 		 */
@@ -235,9 +214,7 @@ final class TermTranslationManager {
 	}
 
 	/**
-	 * Body of create_translation() executed under the
-	 * per-(source_id, target_slug) lock. Re-checks existence inside the
-	 * lock, against the database, before inserting anything.
+	 * Body of create_translation() under its lock: re-checks existence in the database before any insert.
 	 *
 	 * @param int        $source_id      Source term ID.
 	 * @param string     $taxonomy       Taxonomy slug.
@@ -246,13 +223,9 @@ final class TermTranslationManager {
 	 * @param bool       $copy_content   Whether to copy source description.
 	 * @param SourceType $source         Provenance tag.
 	 * @param \WP_Term   $source_term    Source term object (resolved by caller).
-	 * @param bool       $inserted       Set to true once a new term is inserted
-	 *                                   and linked.
-	 * @return int|false New term ID; the ID of a term already linked in the
-	 *                   target language, which another process may have
-	 *                   created after this process last read the group; or
-	 *                   false on failure, including no answer from the
-	 *                   existence query.
+	 * @param bool       $inserted       Set to true once a new term is inserted and linked.
+	 * @return int|false New term ID, a term already linked in the target language (maybe another
+	 *                   process's), or false on failure or no answer from the existence query.
 	 */
 	private function do_create_translation(
 		int $source_id,
@@ -264,15 +237,8 @@ final class TermTranslationManager {
 		\WP_Term $source_term,
 		bool &$inserted
 	): int|false {
-		// Re-check existing INSIDE the lock, and read the database to do it.
-		// get_translation_id() answers from this process's memo, filled before
-		// the lock was taken - by the public method's fast path, or much
-		// earlier by a batch that primed it - and blind to a translation
-		// another process has linked since. Inserting on that answer would
-		// write a second term (force_insert_term() walks past the taken slug),
-		// and linking it would take the language's slot from the other
-		// translation. No answer from the database returns false for the same
-		// reason: inserting on an unknown answer risks that duplicate.
+		// Re-check in the database, never get_translation_id(): its memo predates the lock and misses another
+		// process's link, and a second term would take that language's slot. No answer: false, never an insert.
 		$language_id = (int) $target_lang->id;
 		$linked      = $this->groups->find_translation_link_uncached( $source_id, ObjectType::Term, $language_id );
 
@@ -281,8 +247,7 @@ final class TermTranslationManager {
 		}
 
 		if ( $linked !== null ) {
-			// Later reads in this process must not answer from the view that
-			// missed it.
+			// Later reads in this process must not answer from the view that missed it.
 			if ( $this->get_translation_id( $source_id, $target_slug ) !== $linked['object_id'] ) {
 				$this->groups->forget_stale_group( $linked['group_id'], ObjectType::Term );
 			}
@@ -303,13 +268,8 @@ final class TermTranslationManager {
 		// Remove an existing language suffix from the base slug.
 		$base_slug = $this->strip_language_suffix( $base_slug );
 
-		// Reserve room for "-<language>" inside sanitize_title()'s cap instead of
-		// appending and letting the cap cut. Appending first is what turns a
-		// 199/200-character base into a slug identical to the source term's own
-		// (the "-de" is shaved back to nothing), and a 198-character one into a
-		// slug carrying a meaningless "-d". $base_slug itself stays full length:
-		// it is the public display slug recorded via SlugManager below, and only
-		// the internal wp_terms slug needs to fit.
+		// Reserve room for "-<language>" before appending: the cap would cut the suffix and leave the source's slug.
+		// $base_slug stays full length: it is the display slug recorded below; only the wp_terms slug must fit.
 		$slug = $this->reserve_slug_room( $base_slug, strlen( $target_slug ) + 1 ) . '-' . $target_slug;
 
 		$args = [
@@ -317,33 +277,21 @@ final class TermTranslationManager {
 		];
 
 		if ( $copy_content ) {
-			// Description comes from the resolved default-language source, not
-			// the caller-passed term, so name/slug/description all seed from the
-			// same source (creating an FR term from a DE term's context must not
-			// mix the EN name with the DE description).
+			// From the resolved default-language source, so name, slug and description never mix two languages.
 			$args['description'] = $content_source->description;
 		}
 
 		// Handle hierarchical terms - translate parent if exists.
 		if ( $source_term->parent > 0 ) {
-			$parent_translation = $this->get_translation_id( $source_term->parent, $target_slug );
+			$parent_translation = $this->parent_translation( (int) $source_term->parent, $language_id, $target_slug, $taxonomy, true );
 
-			// A translation_links row can outlive its term (deleted while
-			// PerfLocale was not loaded, or by direct SQL), and wp_insert_term()
-			// refuses a parent that does not exist. A parent translation that is
-			// gone, or not in this taxonomy, is treated like one not created
-			// yet: the child goes in at the top level.
-			if ( $parent_translation !== null && get_term( $parent_translation, $taxonomy ) instanceof \WP_Term ) {
+			if ( $parent_translation > 0 ) {
 				$args['parent'] = $parent_translation;
 			}
 		}
 
-		// wp_insert_term() unslashes name + description internally, so it
-		// needs SLASHED input; the term name/description come UNSLASHED from
-		// get_term(). Without wp_slash a backslash in a term name/description
-		// is silently stripped in the translation sibling. The force_insert_term
-		// fallback below writes via raw $wpdb->insert (no unslash) and MUST keep
-		// the raw values - so slash only for this call.
+		// wp_insert_term() unslashes name and description, get_term() values are unslashed: slash for this call
+		// only. The force_insert_term() fallback writes raw with $wpdb->insert() and must keep the raw values.
 		$slashed_args                = $args;
 		$slashed_args['description'] = isset( $args['description'] ) ? wp_slash( $args['description'] ) : null;
 		if ( $slashed_args['description'] === null ) {
@@ -355,17 +303,9 @@ final class TermTranslationManager {
 		if ( is_wp_error( $result ) ) {
 			$code = (string) $result->get_error_code();
 
-			// Two errors fall through to the raw insert, and both mean the
-			// explicit slug is already taken in this taxonomy:
-			// - term_exists: a same-name term at this level holds it;
-			// - db_insert_error with the slug taken: wp_unique_term_slug()
-			// appended the parent's slug or "-N" with no length check, and
-			// wpdb refused a slug longer than the column.
-			// Any other error (a pre_insert_term veto, a missing parent, a name
-			// that sanitizes to nothing, a failed insert of a free slug) is
-			// WordPress or a site filter refusing the term, and inserting it
-			// anyway would bypass that refusal. The bulk and post-copy callers
-			// only count or drop a false, hence the log.
+			// Only term_exists and db_insert_error with the slug taken (wp_unique_term_slug() overran the column) mean
+			// a taken slug; any other error is WordPress or a filter refusing the term, never bypassed. Logged: the bulk
+			// and post-copy callers only count a false.
 			$slug_overflow = 'db_insert_error' === $code && get_term_by( 'slug', $slug, $taxonomy ) instanceof \WP_Term;
 
 			if ( 'term_exists' !== $code && ! $slug_overflow ) {
@@ -385,9 +325,7 @@ final class TermTranslationManager {
 				return false;
 			}
 
-			// Slug taken - force-insert via wpdb under the first free "-N"
-			// slug. Raw $wpdb->insert does NOT unslash, so pass the ORIGINAL
-			// unslashed $name / $args (never the slashed copy).
+			// Slug taken: force-insert under the first free "-N" slug, with the unslashed $name and $args.
 			$new_term_id = $this->force_insert_term( $name, $taxonomy, $slug, $args );
 
 			if ( ! $new_term_id ) {
@@ -397,10 +335,7 @@ final class TermTranslationManager {
 			$new_term_id = $result['term_id'];
 		}
 
-		// Link terms. A failure here would leave the freshly-created term as an
-		// orphan (a wp_terms row that's in no translation group), and we'd
-		// wrongly report success. Roll the term back and fail - mirrors
-		// PostTranslationManager::do_create_translation()'s link-failure path.
+		// A failed link would leave an orphan term reported as created: roll it back and fail.
 		if ( ! $this->link_terms( $source_id, $new_term_id, $target_slug, $source ) ) {
 			wp_delete_term( $new_term_id, $taxonomy );
 			return false;
@@ -408,9 +343,16 @@ final class TermTranslationManager {
 
 		$inserted = true;
 
-		// Record the display slug so translated URLs resolve correctly.
-		// The DB slug is "base-lang" (e.g. uncategorized-de) but the URL
-		// should use the base slug (e.g. uncategorized).
+		// Read the parent again once this term is linked: of two racing processes, one sees the other's link.
+		if ( $source_term->parent > 0 && ! isset( $args['parent'] ) ) {
+			$late_parent = $this->parent_translation( (int) $source_term->parent, $language_id, $target_slug, $taxonomy, false );
+
+			if ( $late_parent > 0 ) {
+				$this->set_parent( $new_term_id, $taxonomy, $late_parent );
+			}
+		}
+
+		// Record the display slug: the DB slug is "base-lang" (uncategorized-de), the URL uses the base.
 		$slug_manager = new \PerfLocale\Router\SlugManager( $this->cache );
 		$slug_manager->set_slug( 'term', $taxonomy, $new_term_id, $language_id, $base_slug );
 
@@ -438,7 +380,500 @@ final class TermTranslationManager {
 		 */
 		do_action( 'perflocale/translation/created', $new_term_id, 'term', $target_slug, $source_id );
 
+		// Last: a request killed during a long adoption still leaves a complete translation.
+		$this->adopt_child_translations( $new_term_id, $taxonomy, $language_id, $content_source );
+
 		return $new_term_id;
+	}
+
+	/**
+	 * The parent's translation, read uncached (another process may have linked it); 0 when none,
+	 * gone or in another taxonomy, since a link can outlive its term and wp_insert_term() refuses it.
+	 *
+	 * @param int    $parent_id   Source term's parent.
+	 * @param int    $language_id Target language id.
+	 * @param string $target_slug Target language slug.
+	 * @param string $taxonomy    Taxonomy slug.
+	 * @param bool   $cached_when_unanswered Use the cached lookup when the database gives no answer.
+	 * @return int Term id of the parent's translation, or 0.
+	 */
+	private function parent_translation( int $parent_id, int $language_id, string $target_slug, string $taxonomy, bool $cached_when_unanswered ): int {
+		$linked = $this->groups->find_translation_link_uncached( $parent_id, ObjectType::Term, $language_id );
+
+		if ( is_array( $linked ) ) {
+			$parent_translation = $linked['object_id'];
+		} elseif ( false === $linked && $cached_when_unanswered ) {
+			$parent_translation = (int) $this->get_translation_id( $parent_id, $target_slug );
+		} else {
+			$parent_translation = 0;
+		}
+
+		if ( $parent_translation <= 0 || ! get_term( $parent_translation, $taxonomy ) instanceof \WP_Term ) {
+			return 0;
+		}
+
+		return $parent_translation;
+	}
+
+	/**
+	 * Move the top-level translations of the source term's children under the new term.
+	 *
+	 * Follows the source hierarchy only, as ContentSync::sync_on_term_edit(); off with `sync_term_hierarchy`.
+	 *
+	 * @param int      $new_term_id    Translation just created and linked.
+	 * @param string   $taxonomy       Taxonomy slug.
+	 * @param int      $language_id    Its language id.
+	 * @param \WP_Term $content_source The term it was copied from.
+	 * @return void
+	 */
+	private function adopt_child_translations( int $new_term_id, string $taxonomy, int $language_id, \WP_Term $content_source ): void {
+		if ( ! is_taxonomy_hierarchical( $taxonomy ) ) {
+			return;
+		}
+
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( $plugin->has( 'settings' ) && ! (bool) $plugin->settings()->get( 'sync_term_hierarchy', true ) ) {
+			return;
+		}
+
+		$entered  = microtime( true );
+		$started  = is_numeric( $_SERVER['REQUEST_TIME_FLOAT'] ?? null ) ? (float) $_SERVER['REQUEST_TIME_FLOAT'] : $entered; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotValidated -- A number set by PHP, checked above.
+		$deadline = 'cli' === php_sapi_name() ? 0.0 : max( $started + self::ADOPT_SECONDS, $entered + self::ADOPT_MIN_SECONDS );
+		$parent   = (int) $content_source->term_id;
+		$page     = self::source_children( $parent, $taxonomy, 0 );
+
+		if ( [] === $page ) {
+			return;
+		}
+
+		$source_language = $this->detect_term_language( $parent );
+		$source_vars     = is_object( $source_language ) ? get_object_vars( $source_language ) : [];
+
+		if ( ! is_numeric( $source_vars['id'] ?? null ) ) {
+			return;
+		}
+
+		$languages = [ (int) $source_vars['id'], $language_id ];
+		$moved     = 0;
+		$checked   = 0;
+		$cut       = false;
+		$blog      = get_current_blog_id();
+		$answered  = false;
+		$serve     = function ( mixed $pre ) use ( $taxonomy, $blog, &$answered ): mixed {
+			if ( get_current_blog_id() !== $blog || ! isset( $this->hierarchy[ $blog ][ $taxonomy ] ) ) {
+				return $pre;
+			}
+
+			$answered = true;
+
+			return $this->hierarchy[ $blog ][ $taxonomy ];
+		};
+		$watch     = function ( mixed $term_id, mixed $tt_id = 0, mixed $tax = '' ) use ( $taxonomy, $blog ): void {
+			if ( $tax === $taxonomy && get_current_blog_id() === $blog && ! ( is_numeric( $term_id ) && (int) $term_id === $this->moving ) ) {
+				unset( $this->hierarchy[ $blog ][ $taxonomy ] );
+			}
+		};
+		$gone      = function ( mixed $term_id, mixed $tax = '' ) use ( $taxonomy, $blog ): void {
+			if ( $tax === $taxonomy && get_current_blog_id() === $blog ) {
+				unset( $this->hierarchy[ $blog ][ $taxonomy ] );
+			}
+		};
+		$placed    = function ( mixed $parent_id, mixed $term_id = 0, mixed $tax = '' ) use ( $taxonomy, $blog, $new_term_id ): mixed {
+			if ( $tax === $taxonomy && get_current_blog_id() === $blog && is_numeric( $term_id ) && (int) $term_id === $this->moving && ! ( is_numeric( $parent_id ) && (int) $parent_id === $new_term_id ) ) {
+				unset( $this->hierarchy[ $blog ][ $taxonomy ] );
+			}
+
+			return $parent_id;
+		};
+
+		// Core reads this copy of the hierarchy while terms move (this blog only). Another term's edit, a create or a
+		// delete drops it, and so does a parent filter that puts the moving term elsewhere.
+		add_filter( "pre_option_{$taxonomy}_children", $serve );
+		add_action( 'edit_term', $watch, 10, 3 );
+		add_action( 'create_term', $watch, 10, 3 );
+		add_action( 'pre_delete_term', $gone, 10, 2 );
+		add_filter( 'wp_update_term_parent', $placed, PHP_INT_MAX, 3 );
+
+		try {
+			// One lookup per page, each made only when there is time to move what it finds.
+			while ( [] !== $page ) {
+				$waiting = self::top_level_translations( array_values( $page ), $languages, $taxonomy, $parent, $new_term_id );
+
+				if ( false === $waiting ) {
+					return;
+				}
+
+				foreach ( $page as $child_id ) {
+					$translation_id = $waiting[ $child_id ] ?? 0;
+
+					if ( $translation_id > 0 && $translation_id !== $new_term_id ) {
+						if ( self::out_of_time( $deadline, $moved ) ) {
+							$cut = true;
+							break 2;
+						}
+
+						$moved += $this->adopt_child( $child_id, $translation_id, $taxonomy, $new_term_id, $languages, $parent ) ? 1 : 0;
+					}
+
+					++$checked;
+				}
+
+				if ( count( $page ) < self::ADOPT_PAGE ) {
+					break;
+				}
+
+				if ( self::out_of_time( $deadline, $moved ) ) {
+					$cut = true;
+					break;
+				}
+
+				$page = self::source_children( $parent, $taxonomy, (int) array_key_last( $page ) );
+			}
+		} finally {
+			remove_filter( "pre_option_{$taxonomy}_children", $serve );
+			remove_action( 'edit_term', $watch, 10 );
+			remove_action( 'create_term', $watch, 10 );
+			remove_action( 'pre_delete_term', $gone, 10 );
+			remove_filter( 'wp_update_term_parent', $placed, PHP_INT_MAX );
+			unset( $this->hierarchy[ $blog ][ $taxonomy ] );
+			$this->moving = 0;
+
+			// A served answer left the stored hierarchy deleted: rebuild it once, unless the caller suspended invalidation.
+			if ( $answered && empty( $GLOBALS['_wp_suspend_cache_invalidation'] ) ) {
+				clean_taxonomy_cache( $taxonomy );
+			}
+		}
+
+		$total = $cut ? self::count_children( $parent, $taxonomy ) : 0;
+
+		// The rest stay at the top level: nothing resumes a cut-off adoption, the log says what moves them.
+		if ( $total > $checked ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic: the work left is not reported anywhere else.
+			error_log( sprintf( '[perflocale] create_translation: %d of %d source child terms were not checked for a translation to move under term %d in taxonomy %s (request time limit); their translations stay at the top level until set by hand, or until each source child term in the default language is saved while Sync Fields is not empty', $total - $checked, $total, $new_term_id, $taxonomy ) );
+		}
+	}
+
+	/**
+	 * Move one waiting translation if it, its source child and their link are still as the lookup found them.
+	 *
+	 * @param int        $child_id       Source child.
+	 * @param int        $translation_id Its top-level translation.
+	 * @param string     $taxonomy       Taxonomy slug.
+	 * @param int        $new_term_id    New parent.
+	 * @param array<int> $languages      Source language id, then the translation's language id.
+	 * @param int        $parent_id      Source term the child must still be under.
+	 * @return bool Whether it was moved.
+	 */
+	private function adopt_child( int $child_id, int $translation_id, string $taxonomy, int $new_term_id, array $languages, int $parent_id ): bool {
+		$child = get_term( $child_id, $taxonomy );
+
+		if ( ! $child instanceof \WP_Term ) {
+			return false;
+		}
+
+		/** This filter is documented in src/Translation/ContentSync.php */
+		if ( ! (bool) apply_filters( 'perflocale/sync/term_parent', true, $child, $translation_id, $taxonomy, $new_term_id ) ) {
+			return false;
+		}
+
+		// Read again just before the move: another request may have moved or unlinked either term meanwhile.
+		// No row lock on purpose: see docs-ai/11-code-rationale.md, "TermTranslationManager: child adoption".
+		$current = self::top_level_translations( [ $child_id ], $languages, $taxonomy, $parent_id, $new_term_id );
+
+		if ( ! is_array( $current ) || ( $current[ $child_id ] ?? 0 ) !== $translation_id ) {
+			return false;
+		}
+
+		// Served before the write: edited_term listeners read the hierarchy with this move in it.
+		$blog   = get_current_blog_id();
+		$served = isset( $this->hierarchy[ $blog ][ $taxonomy ] );
+
+		if ( $served ) {
+			$this->hierarchy[ $blog ][ $taxonomy ][ $new_term_id ][] = $translation_id;
+		}
+
+		// Not batched: wp_update_term() cleans the caches before edited_term, so listeners read the new parent.
+		if ( $this->set_parent( $translation_id, $taxonomy, $new_term_id ) ) {
+			// Core just rebuilt and stored the hierarchy: serve that copy from the next move on.
+			if ( ! $served ) {
+				$this->take_hierarchy( $taxonomy );
+			}
+
+			return true;
+		}
+
+		if ( $served ) {
+			$this->drop_last_child( $taxonomy, $new_term_id );
+		}
+
+		return false;
+	}
+
+	/**
+	 * Copy the hierarchy core just stored; adoption serves it to core for the remaining moves.
+	 *
+	 * @param string $taxonomy Taxonomy slug.
+	 * @return void
+	 */
+	private function take_hierarchy( string $taxonomy ): void {
+		// Suspended invalidation: core did not rebuild, so the stored hierarchy can be old.
+		if ( ! empty( $GLOBALS['_wp_suspend_cache_invalidation'] ) ) {
+			return;
+		}
+
+		$stored = get_option( "{$taxonomy}_children" );
+
+		if ( ! is_array( $stored ) ) {
+			return;
+		}
+
+		$copy = [];
+
+		foreach ( $stored as $parent => $children ) {
+			if ( is_int( $parent ) && is_array( $children ) ) {
+				$copy[ $parent ] = array_map( static fn( mixed $id ): int => is_numeric( $id ) ? (int) $id : 0, array_values( $children ) );
+			}
+		}
+
+		$this->hierarchy[ get_current_blog_id() ][ $taxonomy ] = $copy;
+	}
+
+	/**
+	 * Take back the child appended for a move that was not made.
+	 *
+	 * @param string $taxonomy  Taxonomy slug.
+	 * @param int    $parent_id Parent it was appended under.
+	 * @return void
+	 */
+	private function drop_last_child( string $taxonomy, int $parent_id ): void {
+		$blog = get_current_blog_id();
+
+		if ( ! isset( $this->hierarchy[ $blog ][ $taxonomy ][ $parent_id ] ) ) {
+			return;
+		}
+
+		array_pop( $this->hierarchy[ $blog ][ $taxonomy ][ $parent_id ] );
+
+		if ( [] === $this->hierarchy[ $blog ][ $taxonomy ][ $parent_id ] ) {
+			unset( $this->hierarchy[ $blog ][ $taxonomy ][ $parent_id ] );
+		}
+	}
+
+	/**
+	 * Whether a web request's adoption stops: past the deadline once the minimum moves are made, or 2 s after it.
+	 *
+	 * @param float $deadline 0 for no limit.
+	 * @param int   $moved    Moves made.
+	 * @return bool
+	 */
+	private static function out_of_time( float $deadline, int $moved ): bool {
+		if ( $deadline <= 0.0 ) {
+			return false;
+		}
+
+		$now = microtime( true );
+
+		return $now >= $deadline && ( $moved >= self::ADOPT_MIN_MOVES || $now >= $deadline + self::ADOPT_MIN_SECONDS );
+	}
+
+	/**
+	 * One page of a term's direct children, read from the table: the stored hierarchy can come from a
+	 * language-filtered query.
+	 *
+	 * @param int    $parent_id Term.
+	 * @param string $taxonomy  Taxonomy.
+	 * @param int    $after     Last term_taxonomy_id of the previous page; 0 for the first.
+	 * @return array<int, int> term_taxonomy_id => term id, in that order; empty also when the query gave no answer.
+	 */
+	private static function source_children( int $parent_id, string $taxonomy, int $after ): array {
+		global $wpdb;
+		/** @var \wpdb $wpdb */
+
+		// Keyset on term_taxonomy_id, the order of KEY taxonomy, so no page sorts the whole taxonomy.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- A read no term query filter may change.
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT term_taxonomy_id, term_id FROM %i WHERE taxonomy = %s AND parent = %d AND term_taxonomy_id > %d ORDER BY term_taxonomy_id LIMIT %d', $wpdb->term_taxonomy, $taxonomy, $parent_id, $after, self::ADOPT_PAGE ) );
+
+		if ( '' !== $wpdb->last_error || ! is_array( $rows ) ) {
+			return [];
+		}
+
+		$page = [];
+
+		foreach ( $rows as $row ) {
+			$fields = get_object_vars( $row );
+
+			if ( is_numeric( $fields['term_taxonomy_id'] ?? null ) && is_numeric( $fields['term_id'] ?? null ) && (int) $fields['term_id'] > 0 ) {
+				$page[ (int) $fields['term_taxonomy_id'] ] = (int) $fields['term_id'];
+			}
+		}
+
+		return $page;
+	}
+
+	/**
+	 * Number of a term's direct children; for the cut-off log only.
+	 *
+	 * @param int    $parent_id Term.
+	 * @param string $taxonomy  Taxonomy.
+	 * @return int
+	 */
+	private static function count_children( int $parent_id, string $taxonomy ): int {
+		global $wpdb;
+		/** @var \wpdb $wpdb */
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- As source_children().
+		$count = $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE taxonomy = %s AND parent = %d', $wpdb->term_taxonomy, $taxonomy, $parent_id ) );
+
+		return is_numeric( $count ) ? (int) $count : 0;
+	}
+
+	/**
+	 * Of the given children of a term, linked in one language, their top-level translations in another
+	 * language, while $new_term_id is still the parent's translation there; one indexed query per 500 terms.
+	 *
+	 * @param array<int> $term_ids    Terms.
+	 * @param array<int> $languages   Language the terms are linked in, then the translations' language.
+	 * @param string     $taxonomy    Taxonomy.
+	 * @param int        $parent_id   Parent the terms must still have.
+	 * @param int        $new_term_id Parent's translation the terms move under.
+	 * @return array<int, int>|false Term id => translation id; false when a query gave no answer.
+	 */
+	private static function top_level_translations( array $term_ids, array $languages, string $taxonomy, int $parent_id, int $new_term_id ): array|false {
+		global $wpdb;
+		/** @var \wpdb $wpdb */
+
+		$term_ids    = array_values( array_unique( array_filter( array_map( 'intval', $term_ids ), static fn( int $id ): bool => $id > 0 ) ) );
+		$found       = [];
+		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
+		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
+
+		foreach ( array_chunk( $term_ids, 500 ) as $chunk ) {
+			$in = implode( ', ', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- A read that must bypass every cache. Identifiers are bound with %i, the id list with one %d each.
+			$sql = $wpdb->prepare(
+				"SELECT s.object_id AS term_id, t.object_id AS translation_id FROM %i s
+				INNER JOIN %i stt ON stt.term_id = s.object_id AND stt.taxonomy = %s AND stt.parent = %d
+				INNER JOIN %i g ON g.id = s.group_id AND g.type = %s
+				INNER JOIN %i t ON t.group_id = s.group_id AND t.language_id = %d
+				INNER JOIN %i tt ON tt.term_id = t.object_id AND tt.taxonomy = %s AND tt.parent = 0
+				INNER JOIN %i pl ON pl.object_id = %d AND pl.language_id = %d
+				INNER JOIN %i pg ON pg.id = pl.group_id AND pg.type = %s
+				INNER JOIN %i dl ON dl.group_id = pl.group_id AND dl.language_id = %d AND dl.object_id = %d
+				WHERE s.object_id IN ( {$in} ) AND s.language_id = %d AND t.object_id <> s.object_id",
+				array_merge(
+					[ $links_table, $wpdb->term_taxonomy, $taxonomy, $parent_id, $groups_table, ObjectType::Term->value, $links_table, (int) ( $languages[1] ?? 0 ), $wpdb->term_taxonomy, $taxonomy ],
+					[ $links_table, $parent_id, (int) ( $languages[0] ?? 0 ), $groups_table, ObjectType::Term->value, $links_table, (int) ( $languages[1] ?? 0 ), $new_term_id ],
+					$chunk,
+					[ (int) ( $languages[0] ?? 0 ) ]
+				)
+			);
+
+			if ( ! is_string( $sql ) || '' === $sql ) {
+				return false;
+			}
+
+			$rows = $wpdb->query( $sql );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+			if ( ! is_int( $rows ) ) {
+				return false;
+			}
+
+			foreach ( is_array( $wpdb->last_result ) ? $wpdb->last_result : [] as $row ) {
+				$fields = get_object_vars( $row );
+				$term   = $fields['term_id'] ?? null;
+				$trans  = $fields['translation_id'] ?? null;
+
+				if ( is_numeric( $term ) && is_numeric( $trans ) && (int) $term > 0 && (int) $trans > 0 ) {
+					$found[ (int) $term ] = (int) $trans;
+				}
+			}
+		}
+
+		return $found;
+	}
+
+	/**
+	 * Set a term's parent.
+	 *
+	 * @param int    $term_id   Term to move.
+	 * @param string $taxonomy  Taxonomy slug.
+	 * @param int    $parent_id New parent.
+	 * @return bool Whether it was set.
+	 */
+	private function set_parent( int $term_id, string $taxonomy, int $parent_id ): bool {
+		// wp_update_term() writes back every field it reads: read the stored term, not this request's copy.
+		wp_cache_delete( $term_id, 'terms' );
+		$term = get_term( $term_id, $taxonomy );
+
+		if ( $term instanceof \WP_Term && $parent_id === (int) $term->parent ) {
+			return true;
+		}
+
+		// A term another request placed meanwhile keeps its parent.
+		if ( ! $term instanceof \WP_Term || 0 !== (int) $term->parent ) {
+			return false;
+		}
+
+		// Core's loop check walks cached ancestors, which another request may have moved: walk stored ones first.
+		if ( self::in_chain( $term_id, $parent_id, $taxonomy ) ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on a move no caller reports.
+			error_log( sprintf( '[perflocale] create_translation: did not set parent %d of term %d in taxonomy %s (hierarchy loop)', $parent_id, $term_id, $taxonomy ) );
+
+			return false;
+		}
+
+		$this->moving = $term_id;
+
+		try {
+			$result = wp_update_term( $term_id, $taxonomy, [ 'parent' => $parent_id ] );
+		} finally {
+			$this->moving = 0;
+		}
+
+		if ( is_wp_error( $result ) ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on a failure no caller reports.
+			error_log( sprintf( '[perflocale] create_translation: could not set parent %d of term %d in taxonomy %s (%s)', $parent_id, $term_id, $taxonomy, (string) $result->get_error_code() ) );
+
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether $term_id is $start or one of its stored ancestors, or the chain loops.
+	 *
+	 * Reads past this request's term cache, so core's own loop check then sees the same fresh copies.
+	 *
+	 * @param int    $term_id  Term.
+	 * @param int    $start    First term of the chain.
+	 * @param string $taxonomy Taxonomy slug.
+	 * @return bool
+	 */
+	private static function in_chain( int $term_id, int $start, string $taxonomy ): bool {
+		$seen = [];
+		$id   = $start;
+
+		while ( $id > 0 ) {
+			if ( $id === $term_id || isset( $seen[ $id ] ) ) {
+				return true;
+			}
+
+			$seen[ $id ] = true;
+			wp_cache_delete( $id, 'terms' );
+			$ancestor = get_term( $id, $taxonomy );
+
+			if ( ! $ancestor instanceof \WP_Term ) {
+				return false;
+			}
+
+			$id = (int) $ancestor->parent;
+		}
+
+		return false;
 	}
 
 	/**
@@ -471,25 +906,14 @@ final class TermTranslationManager {
 			return $result !== false;
 		}
 
-		// No group exists yet - same create-first-group race
-		// PostTranslationManager has. Two concurrent term saves can both
-		// observe `$group === null`, both call `create_group()`, both
-		// succeed (translation_groups has no UNIQUE on (type, object_id)),
-		// leaving the source term in two groups. Serialise with the
-		// token-guarded Lock primitive - keyed by source_id only (term IDs
-		// are globally unique across taxonomies in wp_terms).
+		// No group yet: two saves could both create one (no UNIQUE on (type, object_id)), leaving the term in
+		// two groups. Serialise per source_id (term ids are unique across taxonomies).
 		$lock_result = \PerfLocale\Concurrency\Lock::with(
 			'link_term_first_group_' . $source_id,
 			30,
 			function () use ( $source_id, $target_id, $target_lang, $source ): bool {
-				// Re-read inside the lock - another worker may have
-				// committed the group between the top-of-method
-				// find_for_object() and us acquiring the lock. The
-				// top-of-method call memoized its null in the request-local
-				// $find_cache; without dropping that entry the re-read
-				// returns the same stale null and never observes a group a
-				// concurrent PHP process just committed - defeating the guard
-				// and creating a second group for this term.
+				// Re-read inside the lock after dropping the null memoized above: otherwise the re-read never sees
+				// a group another process committed meanwhile.
 				$this->groups->invalidate_find_cache( $source_id, ObjectType::Term );
 				$double_check = $this->groups->find_for_object( $source_id, ObjectType::Term );
 				if ( $double_check ) {
@@ -503,8 +927,7 @@ final class TermTranslationManager {
 					return $result !== false;
 				}
 
-				// True first translation - create the group with the source
-				// row, then link the target.
+				// First translation: create the group with the source row, then link the target.
 				$source_lang = $this->languages->get_default();
 
 				if ( ! $source_lang ) {
@@ -538,10 +961,7 @@ final class TermTranslationManager {
 			return $lock_result;
 		}
 
-		// Lost the lock race - sibling worker is creating the first
-		// group right now. Re-read once more: if it landed, link the
-		// target through the existing-group branch. Drop the memoized null
-		// first so the re-read reflects the sibling's committed group.
+		// Lost the lock race: another process is creating the first group. Drop the memoized null, re-read once.
 		$this->groups->invalidate_find_cache( $source_id, ObjectType::Term );
 		$retry_group = $this->groups->find_for_object( $source_id, ObjectType::Term );
 		if ( ! $retry_group ) {
@@ -593,14 +1013,7 @@ final class TermTranslationManager {
 	/**
 	 * The term create_translation() would copy from, for a caller to authorize.
 	 *
-	 * Mirrors create_translation()'s decisions: 0 when nothing would be copied
-	 * (the source term is missing, the target language is unknown, or a
-	 * translation is already linked and would simply be returned), otherwise
-	 * the resolved content source - the default-language member of the group,
-	 * or `$source_id` itself.
-	 *
-	 * Side-effect free, with no user policy: callers acting for a user apply
-	 * their own check to the returned id.
+	 * Mirrors create_translation(): 0 when nothing would be copied. No user policy: callers check the id.
 	 *
 	 * @param int    $source_id   Term ID the caller was given.
 	 * @param string $taxonomy    Taxonomy slug.
@@ -660,9 +1073,7 @@ final class TermTranslationManager {
 	/**
 	 * Resolve the translation-group id a term belongs to, or null if unlinked.
 	 *
-	 * Used by bulk operations that need to check "is this source term already
-	 * translated to language X" via a pre-built group_id → lang → term_id map,
-	 * without issuing an N+1 query per iteration.
+	 * Lets bulk operations use a pre-built group_id => language => term_id map instead of N+1 queries.
 	 *
 	 * @param int $term_id Term ID.
 	 * @return int|null Group ID or null.
@@ -746,9 +1157,7 @@ final class TermTranslationManager {
 					[ '%d', '%d' ]
 				);
 			} else {
-				// SQLite: the same write with the write time the column's
-				// ON UPDATE CURRENT_TIMESTAMP gives on MySQL, the assignment
-				// Schema::touch_write_time() returns for language_id written out.
+				// SQLite: the same write plus the updated_at that ON UPDATE CURRENT_TIMESTAMP gives on MySQL.
 				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$updated = $wpdb->query(
 					$wpdb->prepare(
@@ -763,20 +1172,8 @@ final class TermTranslationManager {
 				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			}
 
-			// Same return-value gauntlet as PostTranslationManager::set_post_language.
-			// $wpdb->update can return:
-			// false  → DB error (UNIQUE collision from a concurrent writer
-			// grabbing the same (group_id, language_id) slot in
-			// our TOCTOU window).
-			// 0      → either (a) row was deleted between the conflict-
-			// check SELECT and this UPDATE, OR (b) the row's
-			// language_id was already this value (idempotent
-			// no-op - MySQL reports affected_rows as CHANGED,
-			// not matched).
-			// >0     → row updated successfully.
-			// Previously the call ignored the return value and unconditionally
-			// returned true, surfacing silent "language change confirmed" in
-			// the admin UI even when nothing landed.
+			// false: a DB error (a concurrent writer took the slot). 0: the row was deleted meanwhile, or already had
+			// this language (MySQL counts changed rows, not matched), so read it back.
 			if ( $updated === false ) {
 				return false;
 			}
@@ -817,9 +1214,7 @@ final class TermTranslationManager {
 	/**
 	 * Force-insert a term bypassing WordPress name uniqueness checks.
 	 *
-	 * WordPress prevents two terms with the same name in a taxonomy.
-	 * For multilingual sites, each language needs its own term with the
-	 * same visible name but a language-suffixed slug.
+	 * Each language needs its own term with the same name, which WordPress refuses within one taxonomy.
 	 *
 	 * @param string $name Term name.
 	 * @param string $taxonomy Taxonomy slug.
@@ -830,12 +1225,7 @@ final class TermTranslationManager {
 	/**
 	 * Backfill slug translations for all existing term translation groups.
 	 *
-	 * For each translation group, determines the base slug (from the
-	 * default-language term, stripping language suffixes) and records it
-	 * as the display slug for every term in the group. Terms linked by an
-	 * importer keep their own slug and are skipped.
-	 *
-	 * Safe to call multiple times - set_slug() uses INSERT ... ON DUPLICATE KEY UPDATE.
+	 * Records each group's default-language base slug for every member. Idempotent: set_slug() upserts.
 	 *
 	 * @return int Number of slug translations created.
 	 */
@@ -907,16 +1297,9 @@ final class TermTranslationManager {
 				continue;
 			}
 
-			// Set slug translation for every term in the group. Look up
-			// each term's taxonomy (the slug-translations subtype) at the
-			// callsite - different members of the same translation group
-			// always share the taxonomy in practice, but resolving per
-			// member keeps us correct if that invariant ever changes.
+			// Each member's own taxonomy is its slug-translation subtype.
 			foreach ( $members as $m ) {
-				// A term linked by an importer keeps its own slug as its URL
-				// (each language had its own under the source plugin), so it
-				// gets no slug translation: writing the default member's slug
-				// would move its archive to another address.
+				// An importer-linked term keeps its own slug as its URL: the default member's slug would move its archive.
 				if ( in_array( (string) $m->source, self::IMPORTED_SOURCES, true ) ) {
 					continue;
 				}
@@ -928,10 +1311,7 @@ final class TermTranslationManager {
 					continue;
 				}
 
-				// Count writes that actually landed. set_slug() returns false on a
-				// genuine failure (and reports it via perflocale/slug/write_failed);
-				// counting those would tell the operator N slugs were backfilled
-				// when fewer were.
+				// Count only writes that landed: set_slug() returns false on a failure (perflocale/slug/write_failed).
 				if ( $slug_manager->set_slug( 'term', $tax, (int) $m->term_id, (int) $m->language_id, $base_slug ) ) {
 					++$count;
 				}
@@ -944,9 +1324,7 @@ final class TermTranslationManager {
 	/**
 	 * Force-insert a term bypassing WordPress name uniqueness checks.
 	 *
-	 * WordPress prevents two terms with the same name in a taxonomy.
-	 * For multilingual sites, each language needs its own term with the
-	 * same visible name but a language-suffixed slug.
+	 * Each language needs its own term with the same name, which WordPress refuses within one taxonomy.
 	 *
 	 * @param string               $name Term name.
 	 * @param string               $taxonomy Taxonomy slug.
@@ -957,35 +1335,16 @@ final class TermTranslationManager {
 	private function force_insert_term( string $name, string $taxonomy, string $slug, array $args ): int|false {
 		global $wpdb;
 
-		// Dedupe the slug before inserting. This fallback runs only when the
-		// explicit slug create_translation() supplies is already taken in this
-		// taxonomy: wp_insert_term() answered 'term_exists', or it answered
-		// 'db_insert_error' after suffixing that taken slug past the column
-		// width. Inserting the same slug verbatim would leave two wp_terms rows
-		// sharing it (wp_terms has no unique slug index), and
-		// get_term_by('slug') / URL resolution would then deterministically
-		// resolve to the pre-existing term, leaving this new translation's
-		// archive unreachable. Walk to the first free "-N" suffix, mirroring
-		// wp_unique_term_slug()'s intent.
-		//
-		// Both halves of that walk are load-bearing. get_term_by( 'slug', ... )
-		// hands the needle to WP_Term_Query, which sanitize_title()s it - so a
-		// $base already at SLUG_MAX_LENGTH makes every "$base-N" candidate come
-		// back as $base itself, the same pre-existing term matches forever and
-		// the loop never terminates: a 100% CPU spin holding
-		// create_translation()'s lock until max_execution_time, which the CLI
-		// SAPI leaves unlimited. Reserving room for the suffix keeps each
-		// candidate distinct; the bound keeps the walk finite regardless.
+		// Walk to the first free "-N" slug (wp_terms has no unique slug index). Keep both halves: the reserved room
+		// (get_term_by() sanitizes "$base-N" back to $base at the cap, an endless spin) and MAX_SLUG_SUFFIX:
+		// see docs-ai/11-code-rationale.md, "TermTranslationManager: forced insert slug walk".
 		$base      = $this->reserve_slug_room( sanitize_title( $slug ), strlen( (string) self::MAX_SLUG_SUFFIX ) + 1 );
 		$candidate = $base;
 		$suffix    = 2;
 
 		while ( $candidate !== '' && get_term_by( 'slug', $candidate, $taxonomy ) ) {
 			if ( $suffix > self::MAX_SLUG_SUFFIX ) {
-				// Every suffix in range is taken. Fail cleanly rather than walk
-				// on: do_create_translation() turns this false into its own
-				// false, which the REST and admin callers report to the user.
-				// The bulk paths only count it as "skipped", hence the log.
+				// Every suffix is taken: fail. REST and admin callers report it; bulk paths only count it, hence the log.
 				if ( function_exists( 'error_log' ) ) {
 					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on an otherwise silent slug-exhaustion failure.
 					error_log(

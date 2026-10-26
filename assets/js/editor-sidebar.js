@@ -26,6 +26,166 @@
 	var config = perflocaleEditor || {};
 	var i18n = config.i18n || {};
 
+	// ---------------------------------------------------------------
+	// JavaScript hooks (wp.hooks). Language, PostRef and EditorContext
+	// are described in block-toolbar.js.
+	// ---------------------------------------------------------------
+
+	var hookWarned = {};
+
+	// The rows of the last accepted Translations response, unfiltered.
+	var lastRows = [];
+
+	// With SCRIPT_DEBUG: one console warning per hook and page load.
+	function hookWarn( name, why ) {
+		if ( config.debug && ! hookWarned[ name ] && window.console ) {
+			hookWarned[ name ] = true;
+			window.console.warn( 'PerfLocale: ' + name + ': ' + why );
+		}
+	}
+
+	// wp.hooks.applyFilters on a copy of `value` (plain data), in a
+	// try/catch: a callback that throws, or a result `accept` refuses, gives
+	// the unfiltered value, whatever the callback changed in its copy.
+	function applyFilters( name, value, context, accept ) {
+		var out;
+
+		try {
+			out = wp.hooks.applyFilters( name, JSON.parse( JSON.stringify( value ) ), context );
+		} catch ( e ) {
+			hookWarn( name, 'a callback threw; the unfiltered value is used.' );
+			return value;
+		}
+
+		if ( accept( out ) ) {
+			return out;
+		}
+
+		hookWarn( name, 'a callback returned a value the hook does not accept; the unfiltered value is used.' );
+		return value;
+	}
+
+	// wp.hooks.doAction in a try/catch: a callback that throws does not stop the panel.
+	function doAction( name, context ) {
+		try {
+			wp.hooks.doAction( name, context );
+		} catch ( e ) {
+			hookWarn( name, 'a callback threw.' );
+		}
+	}
+
+	// The Language object of a Translations row.
+	function rowLanguage( row ) {
+		return {
+			slug:       String( row.slug ),
+			locale:     String( row.locale || '' ),
+			name:       String( row.name || '' ),
+			nativeName: String( row.native_name || row.name || '' ),
+			isDefault:  !! row.is_default
+		};
+	}
+
+	function findRow( rows, test ) {
+		for ( var i = 0; i < rows.length; i++ ) {
+			if ( rows[ i ] && test( rows[ i ] ) ) {
+				return rows[ i ];
+			}
+		}
+
+		return null;
+	}
+
+	function rowLanguageBySlug( rows, slug ) {
+		var row = findRow( rows, function ( r ) { return r.slug === slug; } );
+
+		return row ? rowLanguage( row ) : null;
+	}
+
+	/**
+	 * The editor context plus `extra`. The rows are permission-scoped: a
+	 * sibling the user may not view has no id, so it is never sourcePost.
+	 *
+	 * @returns {EditorContext}
+	 */
+	function editorContext( rows, extra ) {
+		var current = findRow( rows, function ( r ) { return r.is_current; } );
+		var source  = findRow( rows, function ( r ) { return r.is_default && ! r.is_current && r.post_id; } );
+
+		return Object.assign( {
+			version:    1,
+			post:       {
+				id:       Number( config.postId ) || 0,
+				type:     String( config.postType || '' ),
+				language: current ? rowLanguage( current ) : null
+			},
+			sourcePost: ( current && ! current.is_default && source )
+				? { id: Number( source.post_id ), language: rowLanguage( source ) }
+				: null
+		}, extra );
+	}
+
+	// A row of the perflocale.editorSidebar.rows filter.
+	function hookRow( row ) {
+		return {
+			language:       rowLanguage( row ),
+			isCurrent:      !! row.is_current,
+			hasTranslation: !! row.has_translation,
+			translation:    row.post_id
+				? { id: Number( row.post_id ), status: String( row.post_status || '' ), editUrl: row.edit_url || null }
+				: null
+		};
+	}
+
+	// The server rows to show, in the order the filter returned: each row
+	// matched by language.slug at most once, unknown or malformed entries
+	// dropped, the current-language row kept at its own position.
+	function filterRows( rows ) {
+		/**
+		 * @hook perflocale.editorSidebar.rows
+		 * @kind filter
+		 * @since 1.0.7.4
+		 * @cardinality per-response
+		 * @fires Once per accepted list response of the Translations panel, before it is stored; the result is kept, not applied again on render.
+		 * @param {Array<{language: Language, isCurrent: boolean, hasTranslation: boolean, translation: ?{id: number, status: string, editUrl: ?string}}>} rows One row per language; translation is null when there is none or the user may not view it.
+		 * @returns {Array<Object>} Rows of the input (matched by language.slug, each at most once): hide or reorder only. Unknown or malformed entries are dropped and the current-language row is always kept; anything but an array leaves the rows unfiltered.
+		 * @context {EditorContext} context
+		 * @example wp.hooks.addFilter( 'perflocale.editorSidebar.rows', 'acme/hide-fr', function ( rows ) {
+		 *     return rows.filter( function ( row ) { return row.language.slug !== 'fr'; } );
+		 * } );
+		 */
+		var out = applyFilters( 'perflocale.editorSidebar.rows', rows.map( hookRow ), editorContext( rows, {} ), Array.isArray );
+		var at = {};
+		var used = {};
+		var result = [];
+		var dropped = false;
+
+		rows.forEach( function ( row, i ) { at[ row.slug ] = i; } );
+
+		out.forEach( function ( r ) {
+			var slug = r && r.language && typeof r.language.slug === 'string' ? r.language.slug : null;
+
+			if ( slug === null || ! Object.prototype.hasOwnProperty.call( at, slug ) || used[ slug ] ) {
+				dropped = true;
+				return;
+			}
+
+			used[ slug ] = true;
+			result.push( rows[ at[ slug ] ] );
+		} );
+
+		if ( dropped ) {
+			hookWarn( 'perflocale.editorSidebar.rows', 'unknown, repeated or malformed rows were dropped.' );
+		}
+
+		rows.forEach( function ( row, i ) {
+			if ( row.is_current && ! used[ row.slug ] ) {
+				result.splice( Math.min( i, result.length ), 0, row );
+			}
+		} );
+
+		return result;
+	}
+
 	// Why machine translation was not saved, by the Create action for this
 	// translation or by auto-translate on publish for this post: the server
 	// hands the text over once, when the editor opens the post. Shown as
@@ -89,7 +249,8 @@
 					return;
 				}
 				if ( response && response.languages ) {
-					setLanguages( response.languages );
+					lastRows = response.languages;
+					setLanguages( filterRows( response.languages ) );
 					setIsUnassigned( !! response.is_unassigned );
 				}
 				setIsLoading( false );
@@ -109,6 +270,23 @@
 				data: { slug: langSlug }
 			} ).then( function() {
 				setBusySlug( null );
+
+				/**
+				 * @hook perflocale.translation.languageAssigned
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality transition
+				 * @fires After Set as <language> succeeded (offered only on a post with no language).
+				 * @context {EditorContext} context
+				 * @property {?Language} context.language The language the post now has.
+				 * @example wp.hooks.addAction( 'perflocale.translation.languageAssigned', 'acme/log', function ( ctx ) {
+				 *     console.log( ctx.post.id, ctx.language && ctx.language.slug );
+				 * } );
+				 */
+				doAction( 'perflocale.translation.languageAssigned', editorContext( lastRows, {
+					language: rowLanguageBySlug( lastRows, langSlug )
+				} ) );
+
 				fetchTranslations();
 			} ).catch( function() {
 				setBusySlug( null );
@@ -155,11 +333,37 @@
 				return;
 			}
 
+			var targetLanguage = rowLanguageBySlug( lastRows, langSlug );
+
+			/**
+			 * @hook perflocale.translation.beforeCreate
+			 * @kind filter
+			 * @since 1.0.7.4
+			 * @cardinality transition
+			 * @fires + Create clicked in the Translations panel, after the unsaved-post check, before the spinner and the request.
+			 * @param {{copyContent: boolean}} value { copyContent: true }: the new translation starts as a copy of the original.
+			 * @returns {false|{copyContent: boolean}} false cancels: no spinner, no request, no notice. { copyContent: false } creates an empty translation. Anything else is ignored.
+			 * @context {EditorContext} context
+			 * @property {?Language} context.targetLanguage The language of the translation to create.
+			 * @example wp.hooks.addFilter( 'perflocale.translation.beforeCreate', 'acme/empty-de', function ( options, ctx ) {
+			 *     return ctx.targetLanguage && ctx.targetLanguage.slug === 'de' ? { copyContent: false } : options;
+			 * } );
+			 */
+			var create = applyFilters( 'perflocale.translation.beforeCreate', { copyContent: true }, editorContext( lastRows, {
+				targetLanguage: targetLanguage
+			} ), function ( v ) {
+				return v === false || ( !! v && typeof v === 'object' && typeof v.copyContent === 'boolean' );
+			} );
+
+			if ( create === false ) {
+				return;
+			}
+
 			setBusySlug( langSlug );
 			apiFetch( {
 				path: 'perflocale/v1/translations/post/' + config.postId,
 				method: 'POST',
-				data: { target_lang: langSlug, copy_content: true }
+				data: { target_lang: langSlug, copy_content: create.copyContent }
 			} ).then( function( response ) {
 				setBusySlug( null );
 				if ( response && response.edit_url ) {
@@ -180,6 +384,27 @@
 						}
 					);
 				}
+
+				/**
+				 * @hook perflocale.translation.created
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality transition
+				 * @fires After + Create succeeded.
+				 * @context {EditorContext} context
+				 * @property {?Language} context.targetLanguage The new translation's language.
+				 * @property {{id: number}} context.translation The new translation post.
+				 * @property {?string} context.editUrl Its edit link, or null.
+				 * @example wp.hooks.addAction( 'perflocale.translation.created', 'acme/log', function ( ctx ) {
+				 *     console.log( 'created', ctx.translation.id );
+				 * } );
+				 */
+				doAction( 'perflocale.translation.created', editorContext( lastRows, {
+					targetLanguage: targetLanguage,
+					translation:    { id: Number( response && response.post_id ) || 0 },
+					editUrl:        ( response && response.edit_url ) || null
+				} ) );
+
 				fetchTranslations();
 			} ).catch( function( err ) {
 				setBusySlug( null );
@@ -191,6 +416,29 @@
 					( err && err.message ) || __( 'Failed to create translation.', 'perflocale' ),
 					{ type: 'snackbar', isDismissible: true }
 				);
+
+				/**
+				 * @hook perflocale.translation.createFailed
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality transition
+				 * @fires After + Create failed.
+				 * @context {EditorContext} context
+				 * @property {?Language} context.targetLanguage The language that was not created.
+				 * @property {{code: string, message: string, status: ?number}} context.error code ('' if none), the message the notice shows, HTTP status (null without a response).
+				 * @example wp.hooks.addAction( 'perflocale.translation.createFailed', 'acme/log', function ( ctx ) {
+				 *     console.warn( ctx.error.code, ctx.error.status );
+				 * } );
+				 */
+				doAction( 'perflocale.translation.createFailed', editorContext( lastRows, {
+					targetLanguage: targetLanguage,
+					error:          {
+						code:    ( err && typeof err.code === 'string' ) ? err.code : '',
+						message: ( err && err.message ) || __( 'Failed to create translation.', 'perflocale' ),
+						status:  ( err && err.data && typeof err.data.status === 'number' ) ? err.data.status : null
+					}
+				} ) );
+
 				// Re-sync: the translation may already exist (created in
 				// another tab) or the source state changed under us.
 				fetchTranslations();

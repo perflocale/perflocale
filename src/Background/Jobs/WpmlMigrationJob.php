@@ -1,6 +1,6 @@
 <?php
 /**
- * Tier-2 wrapper for {@see \PerfLocale\Migration\WpmlImporter}.
+ * Background job for the WPML importer.
  *
  * @package PerfLocale
  */
@@ -19,24 +19,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Runs the WPML migration in the background.
- *
- * The underlying importer already chunks per-table and tolerates
- * being run multiple times (idempotent - re-running picks up where it
- * left off via existing translation-group lookups). The job layer adds:
- *
- *   - Crash recovery: the importer's heartbeat reports progress after each
- *     batch, which keeps the job's locks and status fresh; a killed worker's
- *     lock expires within {@see get_lock_ttl()} and the job is then marked
- *     failed ({@see \PerfLocale\Background\JobState::worker_gone()}).
- *   - Visibility: status, the stage and its items done / in total, and the
- *     overall progress under *PerfLocale → Jobs*
- *     ({@see MigrationRunner::job_reporter()}).
- *   - Retry: failed runs auto-retry up to 5 attempts.
- *
- * Args shape: none (the importer reads from `wp_icl_translations` and
- * `wp_icl_strings` in the current blog). Multisite: dispatch on the
- * blog that has WPML data; the worker runs in the same blog context.
+ * Runs the WPML migration in the background. The importer is idempotent (a re-run resumes through existing groups);
+ * the job adds heartbeat crash recovery, status under PerfLocale > Jobs and up to 5 attempts. No args: it reads the
+ * current blog's `icl_*` tables, so dispatch on the blog with WPML data.
  */
 final class WpmlMigrationJob extends AbstractJob {
 
@@ -48,8 +33,7 @@ final class WpmlMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Mirrors the existing handler at AdminController::handle_migrate_wpml
-	 * which gates on `manage_options`.
+	 * `manage_options`, as the admin's migrate_wpml action.
 	 */
 	public function get_required_capability(): string {
 		return 'manage_options';
@@ -63,10 +47,8 @@ final class WpmlMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * The importer reports progress after every batch (at most every 30
-	 * seconds), and each report refreshes the lock, so the lock only has to
-	 * outlive the longest gap between two batches: the same lifetime as the
-	 * import lock's heartbeat.
+	 * The import lock's heartbeat TTL: each report (at most 30 s apart) refreshes the lock, so it only outlives the
+	 * longest gap between batches.
 	 */
 	public function get_lock_ttl(): int {
 		return MigrationLock::HEARTBEAT_TTL;
@@ -75,10 +57,8 @@ final class WpmlMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * The rows the import reads: WPML's `icl_translations` plus its string
-	 * translations (`icl_string_translations`). A site with few posts and a
-	 * big string table still runs in the background. Returns 0 when WPML
-	 * data isn't present (the importer would no-op anyway).
+	 * `icl_translations` plus `icl_string_translations` rows, so a big string table alone still runs in the background;
+	 * 0 without WPML data.
 	 */
 	protected function args_size( array $args ): int {
 		global $wpdb;
@@ -103,22 +83,14 @@ final class WpmlMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Runs inside the shared import lock ({@see MigrationRunner}). When
-	 * another import holds it, the exception is left to the worker, which
-	 * retries the job later; the admin's inline run shows its message. A
-	 * refused import is returned as a failed run with its reason. Each
-	 * import heartbeat goes to {@see MigrationRunner::job_reporter()}.
+	 * In the shared import lock (MigrationRunner): a held lock's exception reaches the worker (retry) or the inline
+	 * run. A refused import returns a failed run; heartbeats go to MigrationRunner::job_reporter().
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$progress( 0, 1 );
 
-		// WPML string translations are stored at the trust level of the user
-		// who asked for the import, the current user on both paths, as in
-		// DataImportJob: Dispatcher::execute_inline() runs inside their
-		// request, and WorkerRegistry::run_on_current_blog() calls
-		// wp_set_current_user() with the job's `created_by` before execute().
-		// WP-CLI calls MigrationRunner::import() without the flag and keeps
-		// WPML's bytes.
+		// Strings are stored at the requesting user's trust level, the current user on both paths (inline: their
+		// request; worker: WorkerRunner switches to `created_by`). WP-CLI passes no flag (WPML's bytes kept).
 		$sanitize_strings = ! current_user_can( 'unfiltered_html' );
 
 		$result = MigrationRunner::import( 'wpml', Plugin::get_instance()->get( 'cache' ), null, MigrationRunner::job_reporter( $progress ), $sanitize_strings );

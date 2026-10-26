@@ -19,9 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * REST API endpoint for triggering machine translation.
- *
- * POST /perflocale/v1/machine-translate
+ * REST routes for machine translation: one post, one object (post or term), and the cost estimate.
  */
 final class MachineTranslateController extends RestController {
 
@@ -38,13 +36,7 @@ final class MachineTranslateController extends RestController {
 				'methods'             => \WP_REST_Server::CREATABLE,
 				'callback'            => [ $this, 'translate' ],
 				'permission_callback' => [ $this, 'translate_post_permissions_check' ],
-				// Documentation + defense-in-depth schema. Each sanitize_callback
-				// mirrors EXACTLY what translate() already applies (absint /
-				// sanitize_key), so behaviour is unchanged for every accepted
-				// request; the handler keeps its own sanitisation as well.
-				// Params are intentionally NOT marked required: the per-post
-				// permission gate already rejects a missing/invalid post_id,
-				// and preserving that path keeps the existing error response.
+				// Sanitizers mirror translate(). Not required: the handler answers a missing param with its own 400.
 				'args'                => [
 					'post_id'     => [
 						'type'              => 'integer',
@@ -65,10 +57,7 @@ final class MachineTranslateController extends RestController {
 			]
 		);
 
-		// Pre-dispatch cost estimate: read-only aggregate (no provider spend,
-		// no writes). POST because the payload carries ID arrays / a filter
-		// object that don't fit query strings. Powers the confirm dialogs and
-		// lets clients avoid enqueueing a job the budget gate would veto.
+		// Read-only cost estimate (no provider call, no write); POST because the ID arrays do not fit a query string.
 		register_rest_route(
 			$this->namespace,
 			'/machine-translate/estimate',
@@ -85,9 +74,7 @@ final class MachineTranslateController extends RestController {
 						'sanitize_callback' => 'sanitize_key',
 						'validate_callback' => 'rest_validate_request_arg',
 					],
-					// Array params intentionally undeclared beyond docs - the
-					// handler applies its own (array)+intval normalization, and
-					// a strict type would reject scalars the cast accepts.
+					// Array params have no type: type=array would reject a scalar the handler's (array) cast accepts.
 					'post_ids'        => [
 						'description' => __( 'Source post IDs (kind=posts).', 'perflocale' ),
 					],
@@ -110,12 +97,8 @@ final class MachineTranslateController extends RestController {
 			]
 		);
 
-		// Scope-orchestration endpoint: translate ONE object (post or term)
-		// including registered meta - the Content scope of a front-end
-		// "Translate page" flow. Skip-existing by default: an existing
-		// translation returns status=exists and the client must explicitly
-		// re-call with overwrite=true (translate_post OVERWRITES - the caller
-		// owns that decision, never this endpoint silently).
+		// One post or term with its meta (front-end Content scope). An existing translation answers status=exists
+		// unless the caller sends overwrite=true: overwriting is never this route's own decision.
 		register_rest_route(
 			$this->namespace,
 			'/machine-translate/object',
@@ -171,7 +154,7 @@ final class MachineTranslateController extends RestController {
 		$id   = absint( $request->get_param( 'object_id' ) );
 
 		if ( $id <= 0 ) {
-			return true; // handler returns the descriptive 400.
+			return true; // The handler returns the descriptive 400.
 		}
 
 		if ( $type === 'post' && ! current_user_can( 'edit_post', $id ) ) {
@@ -227,9 +210,7 @@ final class MachineTranslateController extends RestController {
 		$cache    = $plugin->get( 'cache' );
 		$service  = new TranslationService( $settings, $cache );
 
-		// Validate the target language BEFORE any provider spend: the post
-		// pipeline would otherwise burn a provider call and then fail inside
-		// create_translation with a misleading error.
+		// Validated before any provider spend: the post path would otherwise pay for a call and fail later.
 		$lang_repo   = $plugin->get( 'lang_repo' );
 		$target_row  = $lang_repo->find_by_slug( $target_lang );
 		$default_row = $lang_repo->get_default();
@@ -245,13 +226,8 @@ final class MachineTranslateController extends RestController {
 		if ( $type === 'post' ) {
 			$ptm = new \PerfLocale\Translation\PostTranslationManager( $cache, $settings );
 
-			// A front-end editor calls this from ANY language's page, so the
-			// queried object may be a translation SIBLING. translate_post()
-			// always treats its input as default-language text - feeding it a
-			// sibling would send e.g. German text labeled as English (wrong-
-			// direction garbage). Resolve to the default-language sibling; a
-			// post with no default-language row translates as-is (unlinked
-			// posts are their own source).
+			// The page may be a sibling, and translate_post() reads its input as default-language text: use the
+			// default-language sibling. A post without one is its own source.
 			if ( $default_row ) {
 				$default_sibling = $ptm->get_translation_id( $id, $default_row->slug );
 
@@ -267,23 +243,15 @@ final class MachineTranslateController extends RestController {
 			$existing = $ptm->get_translation_id( $id, $target_lang );
 
 			if ( $existing && ! $overwrite ) {
-				return $this->success(
-					[
-						'status'         => 'exists',
-						'translation_id' => (int) $existing,
-					]
-				);
+				return $this->success( self::exists_response( (int) $existing ) );
 			}
 
-			// Overwrite guard: translate_post() rewrites the existing
-			// translation in place; edit_post on the source is not authority
-			// to overwrite a translation post the caller can't edit.
+			// Overwriting rewrites the translation in place: it needs edit_post on the translation, not only the source.
 			if ( $existing && ! current_user_can( 'edit_post', (int) $existing ) ) {
 				return $this->error( 'rest_forbidden', __( 'You cannot overwrite this translation.', 'perflocale' ), 403 );
 			}
 
-			// The post whose text is sent: a password-protected one is sent
-			// unless the perflocale/mt/send_password_protected filter refuses it.
+			// A password-protected post is sent unless the perflocale/mt/send_password_protected filter refuses it.
 			$source = get_post( $id );
 
 			if ( $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, 'rest' ) ) {
@@ -291,8 +259,7 @@ final class MachineTranslateController extends RestController {
 			}
 
 			try {
-				// fast_fail: this is an interactive UI call - better a quick
-				// retryable error than a minutes-long retry loop.
+				// Fast fail: an interactive call gets a quick retryable error, not a long retry loop.
 				$result = $service->translate_post( $id, $target_lang, $provider_id, true, true );
 			} catch ( \Throwable $e ) {
 				return $this->error( 'mt_failed', $e->getMessage(), 500 );
@@ -303,20 +270,20 @@ final class MachineTranslateController extends RestController {
 					'status'         => 'translated',
 					'translation_id' => (int) ( $result['post_id'] ?? 0 ),
 					'meta'           => $result['meta'] ?? null,
+					'warnings'       => $result['warnings'] ?? [],
+					'kept'           => $result['kept'] ?? [],
 				],
 				201
 			);
 		}
 
-		// term
+		// Term.
 		$term = get_term( $id );
 		if ( ! $term instanceof \WP_Term ) {
 			return $this->error( 'not_found', __( 'Term not found.', 'perflocale' ), 404 );
 		}
 
-		// Only UI-visible taxonomies: without this, nav_menu terms were
-		// translatable and a machine-translated MENU clone appeared under
-		// Appearance → Menus.
+		// UI-visible taxonomies only: a nav_menu term would clone a whole menu.
 		$taxonomy = get_taxonomy( $term->taxonomy );
 		if ( ! $taxonomy || ! $taxonomy->show_ui ) {
 			return $this->error( 'invalid_taxonomy', __( 'This taxonomy cannot be translated here.', 'perflocale' ), 400 );
@@ -324,12 +291,7 @@ final class MachineTranslateController extends RestController {
 
 		$ttm = new \PerfLocale\Translation\TermTranslationManager( $cache );
 
-		// Same sibling-resolution as the post path: a front-end editor calls
-		// from any language's term archive, so the queried term may be a
-		// translation sibling. Resolve to the default-language term before
-		// reading name/description, or a non-default term would be sent to
-		// the provider labeled as the source language (wrong-direction
-		// garbage).
+		// As for posts: send the default-language term's text, never a sibling's labeled as the source language.
 		if ( $default_row ) {
 			$default_sibling = $ttm->get_translation_id( $id, $default_row->slug );
 
@@ -340,8 +302,7 @@ final class MachineTranslateController extends RestController {
 					return $this->error( 'rest_forbidden', __( 'You cannot translate this term.', 'perflocale' ), 403 );
 				}
 
-				// Re-fetch the resolved source term (name/description/taxonomy)
-				// and re-run the taxonomy gate on it.
+				// Re-read the resolved source term and re-run the taxonomy gate on it.
 				$term = get_term( $id );
 				if ( ! $term instanceof \WP_Term ) {
 					return $this->error( 'not_found', __( 'Term not found.', 'perflocale' ), 404 );
@@ -357,26 +318,16 @@ final class MachineTranslateController extends RestController {
 		$sibling = $ttm->get_translation_id( $id, $target_lang );
 
 		if ( $sibling && ! $overwrite ) {
-			return $this->success(
-				[
-					'status'         => 'exists',
-					'translation_id' => (int) $sibling,
-				]
-			);
+			return $this->success( self::term_exists_response( (int) $sibling ) );
 		}
 
-		// Overwrite guard: wp_update_term below rewrites the sibling's
-		// name/description; edit_term on the source is not authority to
-		// overwrite a translation term the caller can't edit.
+		// Overwriting rewrites the sibling: it needs edit_term on the sibling, not only the source.
 		if ( $sibling && ! current_user_can( 'edit_term', (int) $sibling ) ) {
 			return $this->error( 'rest_forbidden', __( 'You cannot overwrite this translation.', 'perflocale' ), 403 );
 		}
 
-		// Translate BEFORE creating the sibling (the post path's deliberate
-		// ordering). Terms have no draft state - a sibling created first
-		// would go live with source-language text, and on provider failure
-		// it would persist; the default overwrite=false retry would then
-		// report 'exists' without ever translating it.
+		// Translate before creating the sibling: a term has no draft, so a failed call would leave a live
+		// untranslated sibling that a retry reports as 'exists'.
 		try {
 			$default     = $plugin->get( 'lang_repo' )->get_default();
 			$source_lang = $default ? $default->slug : 'en';
@@ -398,12 +349,7 @@ final class MachineTranslateController extends RestController {
 			// the checks above: apply them to it before writing.
 			if ( ! $inserted ) {
 				if ( ! $overwrite ) {
-					return $this->success(
-						[
-							'status'         => 'exists',
-							'translation_id' => $sibling,
-						]
-					);
+					return $this->success( self::term_exists_response( (int) $sibling ) );
 				}
 
 				if ( ! current_user_can( 'edit_term', $sibling ) ) {
@@ -421,8 +367,7 @@ final class MachineTranslateController extends RestController {
 		}
 
 		if ( $update !== [] ) {
-			// Never touches the DB slug: the '-{lang}' suffixed slug + the
-			// separate display-slug (SlugManager) stay as created.
+			// The slug is not touched: the '-{lang}' slug and the display slug (SlugManager) stay as created.
 			$updated = wp_update_term( $sibling, $term->taxonomy, $update );
 			if ( is_wp_error( $updated ) ) {
 				return $this->error( 'term_update_failed', $updated->get_error_message(), 500 );
@@ -439,6 +384,32 @@ final class MachineTranslateController extends RestController {
 	}
 
 	/**
+	 * The skip-existing response for a post: the translation is named only to a user who may see it.
+	 *
+	 * @param int $existing Linked translation.
+	 * @return array{status: string, translation_id: int|null}
+	 */
+	private static function exists_response( int $existing ): array {
+		return [
+			'status'         => 'exists',
+			'translation_id' => \PerfLocale\Helper::user_can_view_object( $existing ) ? $existing : null,
+		];
+	}
+
+	/**
+	 * The skip-existing response for a term: the translation is named only to a user who may edit it.
+	 *
+	 * @param int $sibling Linked translation term.
+	 * @return array{status: string, translation_id: int|null}
+	 */
+	private static function term_exists_response( int $sibling ): array {
+		return [
+			'status'         => 'exists',
+			'translation_id' => current_user_can( 'edit_term', $sibling ) ? $sibling : null,
+		];
+	}
+
+	/**
 	 * POST /machine-translate/estimate - pre-dispatch character/cost estimate.
 	 *
 	 * @param \WP_REST_Request $request Request.
@@ -451,8 +422,7 @@ final class MachineTranslateController extends RestController {
 
 		$target_lang_ids = array_map( 'intval', (array) $request->get_param( 'target_lang_ids' ) );
 
-		// Slug convenience: clients that only know language slugs (the visual
-		// editor) may pass target_langs instead of numeric IDs.
+		// Clients that know only slugs (the visual editor) may pass target_langs.
 		foreach ( (array) $request->get_param( 'target_langs' ) as $slug ) {
 			$lang = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' )->find_by_slug( sanitize_key( (string) $slug ) );
 			if ( $lang ) {
@@ -463,13 +433,9 @@ final class MachineTranslateController extends RestController {
 		if ( $kind === 'posts' ) {
 			$post_ids = array_map( 'intval', (array) $request->get_param( 'post_ids' ) );
 
-			// The estimate exposes CHAR_LENGTH aggregates of the named posts, so
-			// require read access to every named source (mirrors the job's own
-			// per-row edit checks without being as strict - this is read-only).
-			foreach ( $post_ids as $pid ) {
-				if ( $pid > 0 && ! current_user_can( 'read_post', $pid ) ) {
-					return $this->error( 'rest_forbidden', __( 'You cannot access one of the requested posts.', 'perflocale' ), 403 );
-				}
+			// The estimate reveals the posts' text lengths: read access to every named post is required.
+			if ( ! $this->can_read_posts( $post_ids ) ) {
+				return $this->error( 'rest_forbidden', __( 'You cannot access one of the requested posts.', 'perflocale' ), 403 );
 			}
 
 			return $this->success(
@@ -479,9 +445,7 @@ final class MachineTranslateController extends RestController {
 
 		$string_ids = array_map( 'intval', (array) $request->get_param( 'string_ids' ) );
 
-		// The strings one dispatch of these IDs translates: the job's own
-		// selection, cut at its per-dispatch cap. `capped` counts the IDs
-		// beyond it, as the job result does.
+		// The job's own selection, cut at its per-dispatch cap; `capped` counts the IDs beyond it.
 		$selected = ( new \PerfLocale\Background\Jobs\BulkStringTranslateJob() )->resolve_ids_for_estimate(
 			[
 				'mode'       => 'ids',
@@ -496,11 +460,7 @@ final class MachineTranslateController extends RestController {
 	}
 
 	/**
-	 * Per-post permission gate. Runs the MT cap check first, then verifies
-	 * the caller can edit the specific `post_id` they're trying to
-	 * translate. Hoists the in-handler check at translate() line 54 up
-	 * to the routing layer so the request is rejected before the handler
-	 * runs.
+	 * Permission gate for /machine-translate: the MT cap, then edit_post on `post_id`.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return bool|\WP_Error
@@ -513,9 +473,7 @@ final class MachineTranslateController extends RestController {
 
 		$post_id = absint( $request->get_param( 'post_id' ) );
 		if ( $post_id <= 0 ) {
-			// Handler will return 400 invalid_params for missing IDs; keep
-			// the cap-only response here so the routing layer doesn't pre-empt
-			// the more descriptive validation error.
+			// The handler returns the more descriptive 400 for a missing ID.
 			return true;
 		}
 
@@ -545,13 +503,12 @@ final class MachineTranslateController extends RestController {
 			return $this->error( 'invalid_params', __( 'post_id and target_lang are required.', 'perflocale' ) );
 		}
 
-		// Verify user can edit this specific post (not just any post).
+		// Edit rights on this post, not any post.
 		if ( ! current_user_can( 'edit_post', $post_id ) ) {
 			return $this->error( 'rest_forbidden', __( 'You cannot translate this post.', 'perflocale' ), 403 );
 		}
 
-		// A password-protected post is sent unless the
-		// perflocale/mt/send_password_protected filter refuses it.
+		// A password-protected post is sent unless the perflocale/mt/send_password_protected filter refuses it.
 		$source = get_post( $post_id );
 
 		if ( $source instanceof \WP_Post && ! TranslationService::may_send_post( $source, 'rest' ) ) {
@@ -560,11 +517,7 @@ final class MachineTranslateController extends RestController {
 
 		$plugin = \PerfLocale\Plugin::get_instance();
 
-		// Overwrite guard: translate_post() rewrites an EXISTING target-language
-		// translation in place, so edit_post on the source is not authority to
-		// overwrite a translation post the caller can't edit - mirrors
-		// PUT /translations/{type}/{id}/{lang}, which requires edit_post on the
-		// translation before writing to it.
+		// Overwriting rewrites the translation in place: it needs edit_post on the translation, not only the source.
 		$existing = ( new \PerfLocale\Translation\PostTranslationManager( $plugin->get( 'cache' ), $plugin->get( 'settings' ) ) )
 			->get_translation_id( $post_id, $target_lang );
 
@@ -572,22 +525,15 @@ final class MachineTranslateController extends RestController {
 			return $this->error( 'rest_forbidden', __( 'You cannot overwrite this translation.', 'perflocale' ), 403 );
 		}
 
-		// No live translation: translate_post() creates one. Its translated
-		// title, body and excerpt come from $post_id, but the post shell, slug,
-		// meta and terms are copied from the group's default-language post,
-		// which can be a different one, and the new post takes that post's
-		// type. Checked before the rate limiter, so a refused request spends no
-		// quota and no provider call.
+		// A new translation copies shell, meta and terms from the default-language post, which may be another post.
+		// Checked before the rate limiter, so a refused request spends no quota.
 		$denied = $this->creation_denial( 'post', $post_id, $target_lang );
 
 		if ( $denied instanceof \WP_Error ) {
 			return $denied;
 		}
 
-		// Budget guard - cap per-user MT requests per hour. A runaway UI
-		// script or accidental loop across thousands of posts can exhaust
-		// provider quota fast; the rate limit protects the site owner's
-		// bill.
+		// Per-user hourly cap protects the provider bill from runaway scripts.
 		$limited = $this->enforce_rate_limit( get_current_user_id() );
 
 		if ( $limited instanceof \WP_Error ) {
@@ -608,8 +554,7 @@ final class MachineTranslateController extends RestController {
 
 			return $this->success( $result );
 		} catch ( \PerfLocale\MachineTranslation\SameLanguageException $e ) {
-			// A request error, not a server failure: the post is already in
-			// the target language.
+			// A request error: the post is already in the target language.
 			return $this->error( 'same_language', $e->getMessage(), 400 );
 		} catch ( \Throwable $e ) {
 			return $this->error( 'translation_failed', $e->getMessage(), 500 );
@@ -619,19 +564,8 @@ final class MachineTranslateController extends RestController {
 	/**
 	 * Refuse a request whose new translation the user may not create.
 	 *
-	 * Creating a translation copies from the group's default-language member,
-	 * which is not necessarily the object the request named. A post needs read
-	 * and edit authority ({@see \PerfLocale\Helper::user_can_copy_translation_source()}),
-	 * a term edit_term. A post also needs the create capability of that
-	 * member's type, the type the new post gets
-	 * ({@see \PerfLocale\Helper::user_can_create_like()}), a term the create
-	 * rule of that member's taxonomy
-	 * ({@see \PerfLocale\Helper::user_can_create_term_like()}). When a translation
-	 * already exists nothing is created, so nothing is checked here. translate()
-	 * then reads only the requested post, which its own edit_post gate covers.
-	 * translate_object() pivots to the default-language member and reads that;
-	 * its edit_post / edit_term check on the pivoted id, after the rate limiter,
-	 * is what covers the default there.
+	 * A new translation copies from the default-language member, maybe not the named object: the user needs edit
+	 * rights on it and the create rule of its type or taxonomy. An existing translation is not checked here.
 	 *
 	 * @param string $type        'post' or 'term'.
 	 * @param int    $id          Object ID the request named.
@@ -667,25 +601,13 @@ final class MachineTranslateController extends RestController {
 	}
 
 	/**
-	 * Sliding-window rate limit for per-user MT requests.
-	 *
-	 * Protects the site owner from runaway scripts or mis-clicks that
-	 * would otherwise drain provider quota. Returns a WP_Error with
-	 * HTTP 429 when the user has exceeded the window budget, or true
-	 * (implicitly, no return) when the request may proceed.
-	 *
-	 * State is stored in a single transient per user. A window is 1
-	 * hour; when the window expires, the count resets on the next call.
+	 * Per-user hourly MT rate limit (HTTP 429 past the budget).
 	 *
 	 * @param int $user_id Current user ID.
 	 * @return \WP_Error|null WP_Error on denial, null when allowed.
 	 */
 	private function enforce_rate_limit( int $user_id ): ?\WP_Error {
-		// Delegates to MtRateLimiter, the one hourly limiter shared with
-		// BlockTranslateController, the translate-post Ability and the admin
-		// create action. Keeping a thin wrapper here preserves this class's
-		// gate ordering and error codes exactly while leaving exactly one
-		// implementation to change.
+		// MtRateLimiter is the one limiter shared with block translation, the Ability and the admin action.
 		return MtRateLimiter::admit( $user_id );
 	}
 }

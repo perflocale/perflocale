@@ -1,6 +1,6 @@
 <?php
 /**
- * Tier-2 wrapper for {@see \PerfLocale\Admin\DataExporter}.
+ * Background job for DataExporter.
  *
  * @package PerfLocale
  */
@@ -17,22 +17,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Streams a full-site export to a file in the uploads directory.
- *
- * Sync `download()` path still works as-is - small admins clicking
- * "Download export" get an inline streaming response, no Jobs UI
- * involved. This job covers the OTHER pattern: kick off a background
- * export to disk + grab it from *PerfLocale → Jobs* when finished.
- *
- * Args shape:
- *   - 'sections' : string[]  Section keys to include (e.g. ['settings',
- *                            'translations']). Empty = full export.
- *   - 'addon_groups' : string[]  Add-on group parts to include
- *                            (DataExporter::addon_groups() keys). Absent =
- *                            every group when the sections include Add-on data.
- *   - 'path'     : string    Optional override; default = uploads dir
- *                            with timestamp filename. Validated to live
- *                            inside `wp_upload_dir()['basedir']`.
+ * Writes a full-site export to a file in uploads for download from PerfLocale > Jobs (the inline download streams).
+ * Args: `sections` (section keys; empty = all), `addon_groups` (DataExporter::addon_groups() keys; absent = all when
+ * Add-on data is chosen), `path` (optional, confined to the uploads tree; default: a random name in the exports dir).
  */
 final class DataExportJob extends AbstractJob {
 
@@ -49,17 +36,14 @@ final class DataExportJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * The export streams; size is bounded by translation count. The
-	 * threshold is conservative - small sites complete in under a
-	 * second and shouldn't be forced async.
+	 * The export streams and small sites finish in under a second, so only a large one goes async.
 	 */
 	public function get_default_threshold(): int {
 		return 5000;
 	}
 
 	/**
-	 * Exports stream tens of thousands of rows in one call; a 30-min cap
-	 * isn't enough for biggest sites. 2-hour TTL covers worst case.
+	 * Two hours: one call streams tens of thousands of rows, past the 30-minute default on the largest sites.
 	 */
 	public function get_lock_ttl(): int {
 		return 2 * HOUR_IN_SECONDS;
@@ -68,19 +52,13 @@ final class DataExportJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Estimate by counting translation_links rows - the dominant cost
-	 * driver in an export.
+	 * The rows of the tables the chosen sections export: a settings-only export counts 0.
 	 */
 	protected function args_size( array $args ): int {
-		global $wpdb;
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-		$count = (int) $wpdb->get_var(
-			$wpdb->prepare(
-				'SELECT COUNT(*) FROM %i',
-				$wpdb->prefix . 'perflocale_translation_links'
-			)
-		);
-		return $count;
+		$sections = isset( $args['sections'] ) && is_array( $args['sections'] ) ? \PerfLocale\Admin\Typed::strs( $args['sections'] ) : [];
+		$groups   = isset( $args['addon_groups'] ) && is_array( $args['addon_groups'] ) ? \PerfLocale\Admin\Typed::strs( $args['addon_groups'] ) : null;
+
+		return ( new DataExporter() )->row_count( $sections, $groups );
 	}
 
 	/**
@@ -115,41 +93,18 @@ final class DataExportJob extends AbstractJob {
 		$progress( 1, 1 );
 
 		/**
-		 * Fires after `DataExportJob` has successfully written the export
-		 * file to disk, before the job result is returned to the worker
-		 * and stored on the JobState row.
-		 *
-		 * Useful for offsite-backup integrations: copy the file to S3 /
-		 * Dropbox / a remote shell, push a webhook to your monitoring
-		 * pipeline, append an audit-log entry, etc.
-		 *
-		 * The file is still readable at $path when this action fires; it
-		 * will be served (and deleted) later by the download endpoint when
-		 * the operator clicks Download on PerfLocale → Jobs.
+		 * Fires after the job wrote the export file, before the result is stored: for offsite backups, webhooks or
+		 * audit logs. The file stays at $path until the Jobs screen's download serves and deletes it.
 		 *
 		 * @hook  perflocale/export/written
 		 * @since 1.0.0
 		 *
-		 * @param string             $path     Absolute path to the written
-		 *                                     export file (inside uploads/).
+		 * @param string             $path     Absolute path to the written export file (inside uploads/).
 		 * @param int                $bytes    Size of the written file.
-		 * @param array<int,string>  $sections The section keys that were
-		 *                                     exported - a subset of
-		 *                                     {@see DataExporter::sections()}
-		 *                                     (settings, roles, languages,
-		 *                                     translations, strings). Empty
-		 *                                     when the dispatch asked for a
-		 *                                     full export.
+		 * @param array<int,string>  $sections Exported section keys (DataExporter::sections()); empty: a full export.
 		 */
-		// A listener that throws must not cost us the record of the file we
-		// just wrote. Before this, an exception from a third-party
-		// backup/audit integration propagated out of execute(), the job was
-		// marked FAILED, and the result - including `path` - was never stored:
-		// a complete export left on disk with nothing owning it, invisible to
-		// the Jobs screen and to the download endpoint, removed only by the
-		// 7-day age sweep. The export itself had already succeeded, so the
-		// honest outcome is to keep the result and surface the listener's
-		// failure alongside it.
+		// A throwing listener must not lose the record of the written file (an orphan export only the 7-day sweep
+		// removes): the result is kept and the listener's failure is reported beside it.
 		$hook_error = '';
 
 		try {
@@ -166,13 +121,8 @@ final class DataExportJob extends AbstractJob {
 			'bytes' => (int) $bytes,
 		];
 
-		// Record the file's IDENTITY, not just its name, so the cleanup in
-		// JobState::delete_owned_artifact() can refuse to unlink a different
-		// file that has since appeared at the same pathname. A path is a label
-		// that anything can be moved to; an inode is the file itself.
-		//
-		// lstat(), not stat(): a symlink must report as the link, so a symlink
-		// swapped in later cannot match what was recorded here.
+		// Record the file's identity, not only its name, so JobState::delete_owned_artifact() refuses to unlink another
+		// file that later appears at this path. lstat(), not stat(): a symlink swapped in later cannot match.
 		$identity = @lstat( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- A vanished file is an expected race, not an error worth surfacing.
 
 		if ( is_array( $identity ) && isset( $identity['ino'], $identity['dev'] ) ) {
@@ -182,8 +132,7 @@ final class DataExportJob extends AbstractJob {
 		}
 
 		if ( $hook_error !== '' ) {
-			// Truncated and kept out of `path`/`bytes` so existing consumers
-			// of the result shape are unaffected.
+			// Truncated and apart from `path`/`bytes`, so consumers of the result shape are unaffected.
 			$result['hook_error'] = mb_substr( $hook_error, 0, 500 );
 		}
 
@@ -191,7 +140,7 @@ final class DataExportJob extends AbstractJob {
 	}
 
 	/**
-	 * Compose a default export path inside the uploads dir.
+	 * A default export path inside the uploads exports dir.
 	 *
 	 * @return string
 	 */
@@ -204,21 +153,9 @@ final class DataExportJob extends AbstractJob {
 
 		\PerfLocale\Helper::harden_directory( $dir );
 
-		// A 32-character CSPRN, doing two jobs.
-		//
-		// 1. Collision avoidance: two operators kicking off an export in
-		// the same wall-clock second must land on distinct files, or the
-		// second write corrupts the first's output. The per-job lock only
-		// covers same-job-id concurrency; distinct dispatches from
-		// different operators are otherwise unprotected at the filesystem
-		// layer.
-		// 2. ACCESS CONTROL. This file lands in wp-content/uploads, which is
-		// web-served, and not every server honours the `.htaccess`
-		// Helper::harden_directory() drops beside it, so the filename is the
-		// secret (see harden_directory()). 32 is what WP core
-		// uses for the privacy exports it stores in this same public tree
-		// (wp_privacy_generate_personal_data_export_file()). Do not shorten
-		// it; nothing parses this filename, so length costs nothing.
+		// 32 random characters: two exports in one second never share a file, and the name is the secret (uploads is
+		// web-served and not every server honours harden_directory()'s .htaccess), as for WP core's privacy exports.
+		// Do not shorten it.
 		$suffix = function_exists( 'wp_generate_password' )
 			? wp_generate_password( 32, false, false )
 			: bin2hex( random_bytes( 16 ) );
@@ -227,9 +164,7 @@ final class DataExportJob extends AbstractJob {
 	}
 
 	/**
-	 * Same upload-path guard as {@see DataImportJob} but accepts paths
-	 * that don't exist yet (writing creates them). Use `dirname()` for
-	 * the realpath check so we validate the parent dir.
+	 * DataImportJob's upload-path guard, but a path to write may not exist yet: realpath runs on its dirname().
 	 *
 	 * @param string $file
 	 * @param bool   $for_write Set true to allow not-yet-existing paths.
@@ -249,8 +184,7 @@ final class DataExportJob extends AbstractJob {
 			return false;
 		}
 
-		// Accept any path inside the uploads tree, not just
-		// `uploads/perflocale/`; the realpath check below confines it.
+		// Any path inside the uploads tree, not only `uploads/perflocale/`; the realpath check below confines it.
 		$uploads = realpath( (string) $upload['basedir'] );
 
 		if ( $uploads === false ) {

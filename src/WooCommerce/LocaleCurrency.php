@@ -14,48 +14,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Best-guess ISO 4217 currency code from a language's WordPress locale.
+ * Best-guess ISO 4217 currency from a language's locale: the first value of a new Exchange Rates row.
  *
- * Used by the WooCommerce settings tab to populate the per-language
- * Exchange Rates matrix when the user adds a new language: instead of
- * defaulting every row to the store's base currency (which on a
- * European store is usually EUR, so a freshly-added Polish row would
- * be set to EUR rather than PLN), the matrix uses this inference for
- * the initial value. The user can still override per row.
- *
- * Inference path:
- *   1. WordPress locales are `xx_YY` where YY is the ISO 3166-1 alpha-2
- *      country code. Look it up in the country → currency map below.
- *   2. If the locale carries no region (bare `pl`, `fr`, `de`, …),
- *      fall through to a small language → primary-country map for
- *      common languages.
- *   3. If neither match, return empty string - the caller's existing
- *      fallback (WC base currency) takes over.
- *
- * @internal Implementation detail of the WC settings UI. Not part of
- *           the @api surface - content of the map may shift as the
- *           ISO currency assignments do (e.g. Bulgaria adopted EUR on
- *           2026-01-01; Croatia 2023; Latvia 2014; Estonia 2011). Only
- *           the SUGGESTION for a language with no saved currency moves:
- *           a merchant's stored wc_currencies row always wins, so a
- *           store still trading in BGN is never rewritten.
+ * @internal WC settings UI only, not @api: the map follows ISO 4217, and a stored wc_currencies row always wins.
  */
 final class LocaleCurrency {
 
 	/**
-	 * ISO 3166-1 alpha-2 country code → ISO 4217 alpha-3 currency code.
-	 *
-	 * Coverage prioritises:
-	 *   • All 21 EUR-using EU member states + non-EU EUR users
-	 *     (Andorra, Monaco, San Marino, Vatican, Montenegro, Kosovo)
-	 *   • All G20 economies
-	 *   • Top 50 countries by population
-	 *   • All countries where WP commonly ships a locale
-	 *
-	 * Source: ISO 4217 official assignments as of 2026. Entries that
-	 * shifted historically (HR/EE/LV/LT to EUR) reflect the current
-	 * state, not the historical one - what matters here is the
-	 * currency a fresh WC row should suggest TODAY.
+	 * ISO 3166-1 alpha-2 country code to the ISO 4217 currency it uses today.
 	 *
 	 * @var array<string, string>
 	 */
@@ -211,16 +177,7 @@ final class LocaleCurrency {
 	];
 
 	/**
-	 * Fallback for bare locales (no region) - e.g. `pl`, `de`, `fr`.
-	 * Maps each common bare language code to its conventional primary
-	 * country, which is then looked up in COUNTRY_TO_CURRENCY.
-	 *
-	 * Order of preference for ambiguous ones:
-	 *   • `en` → US (most WP installs anchor on en_US for the bare slug)
-	 *   • `pt` → BR (more WP users than pt_PT)
-	 *   • `es` → ES (canonical Spanish - Latin America is regionalised)
-	 *   • `zh` → CN (most users; Taiwan + Hong Kong have their own locales)
-	 *   • `ar` → SA (canonical reference Arabic)
+	 * Primary country of a bare language code (`pl`, `de`), for locales without a region.
 	 *
 	 * @var array<string, string>
 	 */
@@ -297,24 +254,15 @@ final class LocaleCurrency {
 	];
 
 	/**
-	 * Best-guess ISO 4217 currency code for a language record.
+	 * Best-guess ISO 4217 currency for a language: the locale's region, then its bare language, else ''.
 	 *
-	 * Inference order:
-	 *   1. Region in the locale (`pl_PL` → PL → PLN, `en_GB` → GB → GBP).
-	 *   2. Bare language code (`pl` → PL → PLN, `de` → DE → EUR).
-	 *   3. Empty string if nothing matches - caller falls back to its
-	 *      own default (the WooCommerce base currency).
-	 *
-	 * @param object $language Language record with at minimum `->locale`
-	 *                         and `->slug` properties.
+	 * @param object $language Language record with `->locale` and `->slug`.
 	 * @return string ISO 4217 alpha-3 code, or `''` if no inference.
 	 */
 	public static function guess_currency( object $language ): string {
 		$locale = (string) ( $language->locale ?? '' );
 
-		// 1. Region from locale: `pl_PL`, `en-GB`, `pt_BR`, etc.
-		// Accept both `_` and `-` separators - WP normalises to `_` but
-		// some imported data carries hyphens.
+		// 1. Region from the locale; imported data may use `-` instead of `_`.
 		if ( $locale !== '' ) {
 			$parts = preg_split( '/[_-]/', $locale, 2 );
 			if ( is_array( $parts ) && isset( $parts[1] ) ) {
@@ -324,20 +272,18 @@ final class LocaleCurrency {
 				}
 			}
 
-			// Locale with no region (`pl`, `de`) - fall through to step 2
-			// using the locale's language part.
+			// No region (`pl`): step 2 uses the locale's language part.
 			$lang_code = strtolower( $parts[0] ?? '' );
 		} else {
 			$lang_code = '';
 		}
 
-		// 2. Bare language slug - try the language → country fallback.
+		// 2. Language to primary country; the slug when the locale gave no language.
 		if ( $lang_code === '' ) {
 			$lang_code = strtolower( (string) ( $language->slug ?? '' ) );
 		}
 
-		// Slug may be region-qualified too (`pt-br`, `en-gb`) - peel the
-		// suffix off so we look up the base language.
+		// A slug may carry a region (`pt-br`): keep the base language.
 		$lang_code = preg_split( '/[_-]/', $lang_code )[0] ?? '';
 
 		if ( $lang_code !== '' && isset( self::LANGUAGE_TO_COUNTRY[ $lang_code ] ) ) {

@@ -17,14 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Scans PHP files for translatable string function calls.
- *
- * Optimized for large codebases:
- * - Batched DB inserts (configurable, default 500)
- * - Skips files over size limit to prevent memory exhaustion
- * - Precompiled exclusion patterns for fast path filtering
- * - Binary search for line number resolution
- * - Supports all WordPress i18n functions including _n(), _nx(), _n_noop(), _nx_noop()
+ * Scans PHP files for WordPress i18n calls, with batched inserts and a file size cap.
  */
 final class StringScanner {
 
@@ -36,17 +29,13 @@ final class StringScanner {
 	/**
 	 * Regex patterns for translation function calls.
 	 *
-	 * Each pattern uses /s modifier for multiline support and captures
-	 * both single-quoted and double-quoted string arguments. Atomic groups
-	 * `(?>...)` prevent catastrophic backtracking on malformed files with
-	 * long runs of backslashes or unclosed quotes.
+	 * Atomic groups `(?>...)` stop catastrophic backtracking on malformed files (long backslash runs, open quotes).
 	 */
 	private const PATTERNS = [
-		// Matches the simple i18n functions: __, _e, esc_html__, esc_attr__, esc_html_e, esc_attr_e.
-		// Also matches single-argument calls - domain defaults to 'default'.
+		// The simple i18n functions; a single-argument call has the domain 'default'.
 		'simple'         => '/\b(?:__|_e|esc_html__|esc_attr__|esc_html_e|esc_attr_e)\s*\(\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*(?:,\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*)?\)/s',
 
-		// Matches the context-aware i18n functions: _x, _ex, esc_html_x, esc_attr_x.
+		// The context-aware i18n functions.
 		'context'        => '/\b(?:_x|_ex|esc_html_x|esc_attr_x)\s*\(\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*,\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*,\s*(?:\'((?>\\\\.|[^\'\\\\])*)\'|"((?>\\\\.|[^"\\\\])*)")\s*\)/s',
 
 		// _n() - singular + plural.
@@ -79,8 +68,7 @@ final class StringScanner {
 	private bool $last_scan_complete = true;
 
 	/**
-	 * Batches of the most recent scan() whose stored strings could not be
-	 * re-marked as seen.
+	 * Batches of the most recent scan() whose stored strings could not be re-marked as seen.
 	 *
 	 * @var int
 	 */
@@ -97,8 +85,6 @@ final class StringScanner {
 
 	/**
 	 * Scan a directory for translatable strings.
-	 *
-	 * Processes files in batches to stay within memory limits.
 	 *
 	 * @param string $directory Directory to scan.
 	 * @param string $domain Optional domain filter (only scan this domain).
@@ -123,28 +109,13 @@ final class StringScanner {
 		$inserted        = 0;
 		$batch           = [];
 
-		// ⚠️ Exclusions are relative to the REQUESTED ROOT, never the absolute
-		// path. The regex is a segment match like `/(?:vendor|tests|test|build)/`,
-		// and matching it against the full realpath means an installation that
-		// merely LIVES below a directory of that name - `/var/www/test/`,
-		// `/srv/build/`, a checkout under `dist/` - has every one of its files
-		// excluded and scans silently return "found 0": a readable file yields
-		// a string through scan_file() while scan() on its own directory finds
-		// nothing.
-		//
-		// Anchoring to the scan root keeps every intentional exclusion working -
-		// a `vendor/` or `tests/` directory INSIDE the tree being scanned is still
-		// skipped - while removing a rule nobody meant: that the name of a parent
-		// directory you did not ask to scan can disable scanning entirely.
+		// Exclusions match the path below the scan root, never the realpath: a site living under
+		// `/var/www/test/` would otherwise have every file excluded.
 		$scan_root = realpath( $directory );
 		$scan_root = false === $scan_root ? '' : rtrim( $scan_root, '/' );
 
 		/**
-		 * Maximum size of a single PHP file the scanner will read.
-		 * Default 2 MB. Files bigger than this are skipped to keep peak
-		 * memory bounded. Sites with unusual codebases (huge generated
-		 * translation files, bundled vendor JS) can raise this if they
-		 * want those scanned. Floor-clamped to 64 KB.
+		 * Maximum size of a single PHP file the scanner reads; bigger files are skipped. At least 64 KB.
 		 *
 		 * @hook perflocale/strings/scanner/max_file_bytes
 		 * @param int $bytes Default 2097152 (2 MB).
@@ -153,14 +124,9 @@ final class StringScanner {
 		$max_file_size = max( 64 * 1024, $max_file_size );
 
 		/**
-		 * Strings buffered in PHP memory before flushing to the DB via
-		 * bulk_insert. Default 500. Larger batches = fewer INSERTs but
-		 * bigger PHP memory peaks. Clamped to 50–5000.
+		 * Strings buffered before each bulk insert. Clamped to 50-5000.
 		 *
-		 * Note: the 'batch_size' argument to scan() takes precedence over
-		 * this filter - when the caller explicitly passes a batch size,
-		 * that's respected. The filter only affects callers using the
-		 * default (e.g. StringScanJob).
+		 * Receives, and overrides, the batch size the caller passed to scan().
 		 *
 		 * @hook perflocale/strings/scanner/batch_size
 		 * @param int $size Default whatever the caller passed (500).
@@ -186,14 +152,8 @@ final class StringScanner {
 				$filepath = $file->getRealPath();
 
 				if ( $filepath === false ) {
-					// A dangling symlink has no code behind it. Any other path
-					// that does not resolve sits in a directory PHP can list
-					// but not enter, so the strings in it were not read -
-					// unless the file is excluded anyway. With no realpath to
-					// test, the exclusion list is matched against the path
-					// below the requested directory instead. The two differ
-					// only under a symlinked folder, where this path carries
-					// the link's name and the realpath its target's.
+					// A dangling symlink is skipped; any other unresolved path is in a directory PHP can list but not
+					// enter, so the scan is incomplete unless the path below the directory is excluded.
 					$pathname = (string) $file->getPathname();
 
 					if ( ! is_link( $pathname ) ) {
@@ -208,8 +168,7 @@ final class StringScanner {
 					continue;
 				}
 
-				// Skip excluded paths (single regex check instead of loop),
-				// measured from the scan root - see $scan_root above.
+				// Skip excluded paths, measured from the scan root.
 				if ( '' !== $exclusion_regex ) {
 					$relative = $filepath;
 
@@ -217,8 +176,7 @@ final class StringScanner {
 						$relative = substr( $filepath, strlen( $scan_root ) );
 					}
 
-					// Leading slash so the segment regex can match the first
-					// directory below the root as well as a nested one.
+					// Leading slash, so the segment regex also matches the first directory below the root.
 					if ( preg_match( $exclusion_regex, '/' . ltrim( $relative, '/' ) ) ) {
 						continue;
 					}
@@ -248,11 +206,9 @@ final class StringScanner {
 				}
 			}
 		} catch ( \UnexpectedValueException $e ) {
-			// A directory that cannot be opened ends the walk of the WHOLE
-			// target, not only that directory.
+			// A directory that cannot be opened (or a symlink loop) ends the walk of the whole target.
 			$this->last_scan_complete = false;
 
-			// Directory permission errors - log and continue.
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				error_log( 'PerfLocale scanner: ' . $e->getMessage() ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			}
@@ -273,17 +229,9 @@ final class StringScanner {
 	}
 
 	/**
-	 * Whether the most recent scan() read every directory and PHP file it
-	 * walked.
+	 * Whether the most recent scan() read every directory and PHP file it walked.
 	 *
-	 * False when the target itself, a directory below it, or a PHP file in it
-	 * could not be read: the strings in the unread part were not re-marked as
-	 * seen, so the run is no liveness signal for them. Size-capped files,
-	 * files matched by the exclusion list and dangling symlinks do not count;
-	 * they are skipped the same way on every scan. A directory that cannot be
-	 * opened counts even inside an excluded folder such as vendor/ or
-	 * node_modules/: exclusions are matched per file, and the walk of the
-	 * whole target stops at that directory.
+	 * If not, unread strings were not re-marked as seen. Size-capped, excluded and dangling files count as read.
 	 *
 	 * @return bool
 	 */
@@ -292,10 +240,7 @@ final class StringScanner {
 	}
 
 	/**
-	 * Number of batches in the most recent scan() whose already-stored
-	 * strings could not be re-marked as seen because a database query failed.
-	 * Those rows kept their old last_seen_at, so the run is no liveness signal
-	 * for them either.
+	 * Batches of the most recent scan() whose stored strings kept their last_seen_at (a query failed).
 	 *
 	 * @return int
 	 */
@@ -496,16 +441,9 @@ final class StringScanner {
 	}
 
 	/**
-	 * Decode a captured i18n literal to its runtime value, choosing the
-	 * decoder by which quote alternative actually participated.
+	 * Decode a captured i18n literal to its runtime value, by the quote style that matched.
 	 *
-	 * The regexes capture a single-quoted body in one group and a
-	 * double-quoted body in the next; exactly one participates per argument
-	 * (offset !== -1 under PREG_OFFSET_CAPTURE). A blanket stripslashes()
-	 * mis-decodes both styles - it strips the backslash off escape sequences
-	 * a single-quoted literal keeps verbatim, and turns a double-quoted "\n"
-	 * into "n" instead of a newline - so the stored "original" no longer
-	 * hashes the same as the text gettext receives at runtime.
+	 * Not stripslashes(): it mis-decodes both styles, and the original must hash as gettext's runtime input.
 	 *
 	 * @param array<int, array{0: string, 1: int}> $match  One PREG_SET_ORDER match.
 	 * @param int                                   $single Capture index of the single-quoted body.
@@ -525,8 +463,7 @@ final class StringScanner {
 	}
 
 	/**
-	 * Decode a single-quoted PHP string body. PHP single quotes escape only
-	 * \\ and \'; every other backslash sequence is literal.
+	 * Decode a single-quoted PHP string body: only \\ and \' are escapes.
 	 *
 	 * @param string $body Raw bytes between the quotes.
 	 * @return string
@@ -536,8 +473,7 @@ final class StringScanner {
 	}
 
 	/**
-	 * Decode a double-quoted PHP string body, matching PHP's own escape
-	 * processing so the stored original equals the runtime gettext input.
+	 * Decode a double-quoted PHP string body as PHP does, so the original equals gettext's runtime input.
 	 *
 	 * @param string $body Raw bytes between the quotes.
 	 * @return string
@@ -584,16 +520,8 @@ final class StringScanner {
 	/**
 	 * Encode a Unicode codepoint as UTF-8 without mbstring.
 	 *
-	 * Replaces `mb_chr()`, which WordPress only polyfills from 7.1 and which
-	 * is absent entirely on a PHP build without the mbstring extension - this
-	 * plugin supports WordPress 6.4+, so depending on it would break string
-	 * scanning on older or minimal hosts. The plugin already avoids `mb_chr()`
-	 * the same way in {@see \PerfLocale\Helper::country_code_to_emoji()}.
-	 *
-	 * Implements the standard UTF-8 encoding directly. Values outside the
-	 * Unicode range and the UTF-16 surrogate block (which are not encodable and
-	 * would produce invalid UTF-8) yield the replacement character, mirroring
-	 * what `mb_chr()` does for invalid input.
+	 * Not mb_chr(): WordPress polyfills it only from 7.1 and it is missing without mbstring.
+	 * Invalid codepoints (out of range, surrogates) give U+FFFD, as mb_chr() does.
 	 *
 	 * @param int $codepoint Unicode codepoint.
 	 * @return string UTF-8 encoded character.
@@ -667,6 +595,42 @@ final class StringScanner {
 	}
 
 	/**
+	 * PHP files below the directory up to $limit, for a dispatch estimate; excluded directories are not entered.
+	 *
+	 * An unreadable directory answers $limit (size unknown).
+	 *
+	 * @param string $directory Directory.
+	 * @param int    $limit     Stop counting at this number.
+	 * @return int
+	 */
+	public function count_php_files( string $directory, int $limit ): int {
+		if ( $limit <= 0 || ! is_dir( $directory ) ) {
+			return 0;
+		}
+
+		$regex = $this->get_exclusion_regex();
+		$base  = strlen( rtrim( $directory, '/\\' ) );
+		$count = 0;
+
+		try {
+			$tree = new \RecursiveCallbackFilterIterator(
+				new \RecursiveDirectoryIterator( $directory, \RecursiveDirectoryIterator::SKIP_DOTS | \RecursiveDirectoryIterator::FOLLOW_SYMLINKS ),
+				static fn( \SplFileInfo $file, string $path, \RecursiveDirectoryIterator $it ): bool => '' === $regex || ! $it->hasChildren() || ! preg_match( $regex, '/' . trim( substr( $path, $base ), '/\\' ) . '/' )
+			);
+
+			foreach ( new \RecursiveIteratorIterator( $tree ) as $file ) {
+				if ( $file instanceof \SplFileInfo && strtolower( $file->getExtension() ) === 'php' && ++$count >= $limit ) {
+					break;
+				}
+			}
+		} catch ( \UnexpectedValueException $e ) {
+			return $limit;
+		}
+
+		return $count;
+	}
+
+	/**
 	 * Build a single regex from excluded paths (compiled once, reused per scan).
 	 *
 	 * @return string Regex pattern or empty string if no exclusions.
@@ -702,11 +666,7 @@ final class StringScanner {
 			return '';
 		}
 
-		// Build a single non-capturing alternation over every excluded path
-		// prefix so callers run one match per candidate. Each prefix is
-		// anchored to a path-segment boundary (slash on both sides) so
-		// 'cache/' excludes /cache/ but not e.g. /litespeed-cache/;
-		// multi-segment prefixes like 'foo/bar/' keep working.
+		// One alternation, each prefix anchored to slashes on both sides: 'cache/' must not match /litespeed-cache/.
 		$parts = array_map( static fn( string $path ): string => preg_quote( trim( $path, '/' ), '/' ), $excluded );
 		$parts = array_filter( $parts, static fn( string $part ): bool => $part !== '' );
 

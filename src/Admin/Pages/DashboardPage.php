@@ -20,12 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Renders the PerfLocale dashboard with translation completeness overview.
- *
- * Visual language mirrors the Settings page: native form-table rows for
- * label/value content and widefat tables for the per-language progress
- * breakdown, under the shared PluginNav strip. Maintenance/shortcut/
- * resource panels sit in a right-hand rail on wide screens.
+ * Renders the PerfLocale dashboard with the translation progress overview.
  */
 final class DashboardPage {
 
@@ -58,9 +53,7 @@ final class DashboardPage {
 		$post_types = $this->settings->get_translatable_post_types();
 		$default    = $lang_repo->get_default();
 
-		// Compute totals.
-		// Count only source (default-language) published posts - not all published
-		// posts - so that translations don't inflate the denominator.
+		// Totals count only published default-language posts, so translations do not inflate the denominator.
 		$total_source     = 0;
 		$total_translated = 0;
 		$default_id       = $default ? (int) $default->id : 0;
@@ -68,7 +61,7 @@ final class DashboardPage {
 		$non_default_langs = array_filter( $languages, fn( $l ) => $default && $l->slug !== $default->slug );
 		$target_count      = count( $non_default_langs );
 
-		// Per-post-type source counts (cached for reuse in per-type tables below).
+		// Source counts per post type, reused by the per-type tables.
 		$source_counts = [];
 
 		foreach ( $post_types as $pt ) {
@@ -160,8 +153,7 @@ final class DashboardPage {
 	}
 
 	/**
-	 * Overview - languages, content counts, and overall progress as
-	 * native form-table rows (the Settings page's label/value layout).
+	 * Renders the overview rows: languages, content counts and overall progress.
 	 *
 	 * @param array<int, object> $languages          Active languages.
 	 * @param object|null        $default_lang       Default language.
@@ -194,8 +186,7 @@ final class DashboardPage {
 								$is_default = ( $default_lang && $language->slug === $default_lang->slug );
 								$edit_url   = admin_url( 'admin.php?page=perflocale-languages&action=edit&language_id=' . (int) $language->id );
 
-								// Prefer the full locale (de-DE) over the bare
-								// slug; a slug-only language still shows its slug.
+								// Full locale (de-DE) when set, else the slug.
 								$code = Helper::format_locale_as_bcp47( (string) ( $language->locale ?: $language->slug ) );
 								?>
 								<a href="<?php echo esc_url( $edit_url ); ?>" class="perflocale-dash-langs__row">
@@ -280,8 +271,7 @@ final class DashboardPage {
 	}
 
 	/**
-	 * Translation Progress - one native table per post type with a
-	 * per-language completion row.
+	 * Renders one progress table per post type, with a row per language.
 	 *
 	 * @param array<int, string>                                 $post_types        Translatable post types.
 	 * @param array<int, object>                                 $non_default_langs Target languages.
@@ -308,10 +298,7 @@ final class DashboardPage {
 		<h2 class="perflocale-dash-section-title"><?php echo esc_html__( 'Translation Progress', 'perflocale' ); ?></h2>
 		<?php
 
-		// Two different reasons land here and they need different advice. The
-		// message used to say "no published content" in both cases - so a site
-		// with plenty of posts but only one language was told to go and publish
-		// something, which would not have helped and was not true.
+		// One language and no content are separate cases that need different advice.
 		if ( $non_default_langs === [] ) {
 			?>
 			<p class="perflocale-dash-empty">
@@ -410,8 +397,7 @@ final class DashboardPage {
 	}
 
 	/**
-	 * Right-hand rail - maintenance actions, shortcuts, and resources as
-	 * compact panels.
+	 * Renders the right-hand rail: maintenance actions, shortcuts and resources.
 	 *
 	 * @return void
 	 */
@@ -473,11 +459,8 @@ final class DashboardPage {
 					<span class="dashicons dashicons-external perflocale-dash-links__external" aria-hidden="true"></span>
 				</a>
 				<?php
-				// A quiet, opt-in ask that sits as a peer of the other resource
-				// rows - deliberately not a notice, a widget or a dismissible
-				// nag, so it needs no stored state and never interrupts a task.
-				// Administrators only: Translators reach this screen too but
-				// generally did not install the plugin.
+				// A plain link, not a notice, so it needs no stored state; administrators only,
+				// since Translators reach this screen too.
 				if ( current_user_can( 'manage_options' ) ) :
 					?>
 				<a href="https://wordpress.org/support/plugin/perflocale/reviews/" target="_blank" rel="noopener">

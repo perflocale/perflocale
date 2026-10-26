@@ -1,6 +1,6 @@
 <?php
 /**
- * Tier-2 wrapper for {@see \PerfLocale\Strings\StringScanner}.
+ * Background job for StringScanner.
  *
  * @package PerfLocale
  */
@@ -12,6 +12,7 @@ namespace PerfLocale\Background\Jobs;
 use PerfLocale\Background\AbstractJob;
 use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Plugin;
+use PerfLocale\Settings;
 use PerfLocale\Strings\StringScanner;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -19,33 +20,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Runs the gettext string scanner.
- *
- * StringScanner walks `*.php` and `*.twig` files looking for `__()`,
- * `_e()`, `esc_html__()`, and friends. On a large WordPress directory
- * (thousands of files) this is the slowest sync call in the plugin
- * outside of MT - perfect candidate for backgrounding.
- *
- * Two operating modes:
- *
- *   1. Single-directory: `args['directory'] = '/absolute/path'`
- *      Scans one directory tree. Useful for "rescan one plugin / theme"
- *      flows and the REST endpoint.
- *
- *   2. Scan-everything: `args['mode'] = 'all'`
- *      Iterates: parent theme → child theme (if different) → every
- *      active plugin (skipping perflocale itself) → mu-plugins.
- *      Mirrors the AdminController `process_string_scan` handler so
- *      the admin Scan button can route through Dispatcher.
- *
- * Args shape:
- *   - 'mode'       : string   'directory' (default) | 'all'
- *   - 'directory'  : string   Required when mode='directory'. Must
- *                              resolve inside WP_CONTENT_DIR.
- *   - 'domain'     : string   Optional text-domain filter; empty = all.
- *   - 'batch_size' : int      StringScanner batch (default 500).
+ * Runs the gettext string scanner (`*.php` and `*.twig`), the slowest call outside machine translation on a large
+ * install. Args: `mode` ('directory', default, or 'all': themes, active plugins, mu-plugins), `directory` (required
+ * for 'directory', inside a code root), `domain` (empty = all), `batch_size` (default 500).
  */
 final class StringScanJob extends AbstractJob {
+
+	/**
+	 * Scanner used for the dispatch estimate's file count.
+	 *
+	 * @var StringScanner|null
+	 */
+	private ?StringScanner $counter = null;
 
 	/** {@inheritDoc} */
 	public function get_type(): string {
@@ -55,7 +41,7 @@ final class StringScanJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Mirrors StringsController's REST permission.
+	 * As StringsController's REST permission.
 	 */
 	public function get_required_capability(): string {
 		return 'perflocale_translate';
@@ -63,18 +49,27 @@ final class StringScanJob extends AbstractJob {
 
 	/** {@inheritDoc} */
 	public function get_default_threshold(): int {
-		// 1000 strikes a balance: small themes + a handful of plugins
-		// (200–600 files × 2) stay sync so the operator gets immediate
-		// feedback in the admin; bigger installs (15+ heavy plugins, all
-		// of WooCommerce) fall through to async to dodge PHP-FPM
-		// timeouts. The user-facing override (Settings → Performance →
-		// Background processing thresholds) tunes from here.
+		// Small themes and a few plugins (200-600 files x 2) stay inline for immediate feedback; bigger installs go
+		// async to avoid PHP-FPM timeouts. Settings > Performance > Background processing thresholds tunes it.
 		return 1000;
 	}
 
 	/**
-	 * Scanning all of wp-content (themes + plugins + mu-plugins) on a
-	 * heavy install can take 10-30 minutes; bump to 2h for safety.
+	 * {@inheritDoc}
+	 *
+	 * "Scan all" always runs in the background, whatever the estimate or the setting: one request cannot scan a
+	 * large install, and a killed request leaves no record.
+	 *
+	 * @param array<string, mixed> $args     Dispatch args.
+	 * @param Settings             $settings Plugin settings.
+	 * @return bool
+	 */
+	public function should_run_async( array $args, Settings $settings ): bool {
+		return 'all' === ( $args['mode'] ?? null ) || parent::should_run_async( $args, $settings );
+	}
+
+	/**
+	 * Two hours: scanning all of wp-content on a heavy install can take 10-30 minutes.
 	 */
 	public function get_lock_ttl(): int {
 		return 2 * HOUR_IN_SECONDS;
@@ -83,24 +78,32 @@ final class StringScanJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Threshold check estimates the actual scan size in both modes -
-	 * count of top-level PHP files (× 2 fudge factor for nested dirs)
-	 * across the target(s). Returning a real number (rather than the
-	 * old `PHP_INT_MAX` shortcut for mode='all') is what makes the
-	 * per-type threshold override actually take effect on the
-	 * "Scan all" button.
-	 *
-	 *   - mode='directory': count top-level PHP files in that dir.
-	 *   - mode='all'      : sum top-level PHP files across theme,
-	 *                       child theme (if different), every active
-	 *                       plugin (minus PerfLocale itself), and the
-	 *                       mu-plugins directory.
+	 * Twice the PHP files the scan walks (nested ones included, excluded directories not), counted only up to the
+	 * threshold: that directory for mode='directory', scan_all()'s targets for mode='all'.
 	 */
 	protected function args_size( array $args ): int {
+		return $this->scan_size( $args, (int) ceil( $this->effective_threshold( $args ) / 2 ) );
+	}
+
+	/**
+	 * {@inheritDoc}
+	 */
+	public function estimated_size( array $args, int $count_to = 0 ): int {
+		return $this->scan_size( $args, (int) max( ceil( $this->effective_threshold( $args ) / 2 ), ceil( $count_to / 2 ) ) );
+	}
+
+	/**
+	 * The size of args_size(), counting at most $budget files.
+	 *
+	 * @param array<string, mixed> $args   Dispatch args.
+	 * @param int                  $budget Files at which the count stops.
+	 * @return int
+	 */
+	private function scan_size( array $args, int $budget ): int {
 		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'directory';
 
 		if ( $mode === 'all' ) {
-			return $this->estimate_all_targets_size();
+			return $this->estimate_all_targets_size( $budget );
 		}
 
 		$dir = isset( $args['directory'] ) ? (string) $args['directory'] : '';
@@ -109,71 +112,70 @@ final class StringScanJob extends AbstractJob {
 			return 0;
 		}
 
-		return $this->count_top_level_php( $dir ) * 2;
+		return 2 * $this->count_php( $dir, $budget );
 	}
 
 	/**
-	 * Estimate the file-count cost of a mode='all' scan. Same shape as
-	 * the target list `scan_all()` actually walks, so the threshold
-	 * comparison is meaningful.
+	 * The mode='all' estimate over the target list scan_all() walks.
 	 *
+	 * @param int $budget Files at which the count stops.
 	 * @return int
 	 */
-	private function estimate_all_targets_size(): int {
+	private function estimate_all_targets_size( int $budget ): int {
+		$parent_theme = get_template_directory();
+		$child_theme  = get_stylesheet_directory();
+		$dirs         = [ $parent_theme ];
+
+		if ( $child_theme !== $parent_theme ) {
+			$dirs[] = $child_theme;
+		}
+
+		$dirs = array_merge( $dirs, $this->plugin_target_dirs() );
+
+		if ( defined( 'WPMU_PLUGIN_DIR' ) ) {
+			$dirs[] = WPMU_PLUGIN_DIR;
+		}
+
 		$total = 0;
 
-		$parent_theme = get_template_directory();
+		foreach ( $dirs as $dir ) {
+			if ( $total >= $budget ) {
+				break;
+			}
 
-		if ( is_dir( $parent_theme ) ) {
-			$total += $this->count_top_level_php( $parent_theme );
+			if ( is_dir( $dir ) ) {
+				$total += $this->count_php( $dir, $budget - $total );
+			}
 		}
 
-		$child_theme = get_stylesheet_directory();
-
-		if ( $child_theme !== $parent_theme && is_dir( $child_theme ) ) {
-			$total += $this->count_top_level_php( $child_theme );
-		}
-
-		foreach ( $this->plugin_target_dirs() as $plugin_dir ) {
-			$total += $this->count_top_level_php( $plugin_dir );
-		}
-
-		if ( defined( 'WPMU_PLUGIN_DIR' ) && is_dir( WPMU_PLUGIN_DIR ) ) {
-			$total += $this->count_top_level_php( WPMU_PLUGIN_DIR );
-		}
-
-		// × 2 fudge factor matches the directory-mode estimate so
-		// thresholds are comparable across both call sites.
-		return $total * 2;
+		return 2 * $total;
 	}
 
 	/**
-	 * Count top-level PHP files in a directory. Fast (single glob).
+	 * PHP files the scanner would walk in one directory, up to $limit.
 	 *
-	 * @param string $dir
+	 * @param string $dir   Directory.
+	 * @param int    $limit Stop counting here.
 	 * @return int
 	 */
-	private function count_top_level_php( string $dir ): int {
-		$files = glob( rtrim( $dir, '/' ) . '/*.php' );
+	private function count_php( string $dir, int $limit ): int {
+		if ( null === $this->counter ) {
+			$cache = Plugin::get_instance()->get( 'cache' );
 
-		return is_array( $files ) ? count( $files ) : 0;
+			if ( ! $cache instanceof \PerfLocale\Cache\CacheManager ) {
+				return $limit;
+			}
+
+			$this->counter = new StringScanner( $cache );
+		}
+
+		return $this->counter->count_php_files( $dir, $limit );
 	}
 
 	/**
-	 * Plugin directories this scan must cover: site-active PLUS network-active.
-	 *
-	 * `active_plugins` alone misses every NETWORK-activated plugin on
-	 * multisite - those live in the network-wide `active_sitewide_plugins`
-	 * site-option, keyed by plugin file with the activation timestamp as the
-	 * value. Their strings were therefore never scanned and never translatable,
-	 * and, worse, scan_all() still armed `perflocale_strings_last_full_scan`
-	 * afterwards. That marker is the ONLY liveness signal
-	 * StringRepository::gc_stale_strings() has, so strings the scan never
-	 * reached could age past the 90-day retention and be deleted together with
-	 * their translations.
-	 *
-	 * Shared with {@see estimate_all_targets_size()} so the dispatch-threshold
-	 * estimate measures exactly the set the run walks.
+	 * Plugin directories this scan must cover: site-active plus network-active (`active_sitewide_plugins`). A missed
+	 * plugin would still arm the full-scan marker, and the 90-day GC would delete its strings and translations.
+	 * Shared with estimate_all_targets_size(), so the estimate measures the set the run walks.
 	 *
 	 * @return list<string> Absolute plugin directories, deduped.
 	 */
@@ -191,19 +193,15 @@ final class StringScanJob extends AbstractJob {
 		$dirs = [];
 
 		foreach ( $plugin_files as $plugin_file ) {
-			// Skip our own plugin so its strings stay out of the catalogue.
+			// Skip PerfLocale itself so its strings stay out of the catalogue.
 			if ( str_starts_with( (string) $plugin_file, 'perflocale/' ) ) {
 				continue;
 			}
 
 			$relative = dirname( (string) $plugin_file );
 
-			// A SINGLE-FILE plugin (`hello.php`) has a dirname of '.', which
-			// resolves to the plugins ROOT - and the scanner recurses, so that
-			// one entry would walk every plugin on the site on every scan.
-			// There is no directory of its own to scan, so skip it rather than
-			// turn one file into a full-tree crawl. Same reasoning for an
-			// empty or absolute-root dirname from a malformed entry.
+			// A single-file plugin's dirname is '.', the plugins root, and the recursive scan would walk every plugin:
+			// skip it (it has no directory of its own), as an empty or root dirname from a malformed entry.
 			if ( $relative === '.' || $relative === '' || $relative === DIRECTORY_SEPARATOR ) {
 				continue;
 			}
@@ -215,8 +213,7 @@ final class StringScanJob extends AbstractJob {
 			}
 		}
 
-		// Dedupe - a plugin can be both site- and network-active, and symlinks
-		// can resolve identically.
+		// A plugin can be both site- and network-active, and symlinks can resolve the same.
 		return array_values( array_unique( $dirs ) );
 	}
 
@@ -254,8 +251,7 @@ final class StringScanJob extends AbstractJob {
 	}
 
 	/**
-	 * Iterate: parent theme → child theme (if different) → active plugins
-	 * → mu-plugins. Same set the AdminController sync handler covered.
+	 * Scans parent theme, child theme (if different), active plugins, then mu-plugins.
 	 *
 	 * @param string   $domain     Domain filter (empty = all).
 	 * @param int      $batch_size StringScanner batch size.
@@ -267,8 +263,7 @@ final class StringScanJob extends AbstractJob {
 		$cache   = $plugin->get( 'cache' );
 		$scanner = new StringScanner( $cache );
 
-		// Build target list. Parent theme → child theme → plugins so
-		// child-theme overrides win when both define the same string.
+		// Parent theme, then child theme, then plugins, so child-theme overrides win when both define a string.
 		$targets = [];
 
 		$parent_theme = get_template_directory();
@@ -287,8 +282,7 @@ final class StringScanJob extends AbstractJob {
 			$targets[] = WPMU_PLUGIN_DIR;
 		}
 
-		// Dedupe - defensive in case the active_plugins list contains dupes
-		// or symlinks resolve identically.
+		// Duplicates in active_plugins or symlinks that resolve the same.
 		$targets = array_values( array_unique( $targets ) );
 
 		$total          = count( $targets );
@@ -303,8 +297,7 @@ final class StringScanJob extends AbstractJob {
 
 		foreach ( $targets as $dir ) {
 			if ( ! self::is_safe_content_path( $dir ) ) {
-				// Record the skip - see the GC marker below. Silently skipping
-				// made the scan claim full coverage it did not have.
+				// Record the skip: a skipped target denies full coverage (the GC marker below).
 				$skipped[] = $dir;
 				++$processed;
 				$progress( $processed, $total );
@@ -316,9 +309,8 @@ final class StringScanJob extends AbstractJob {
 			$total_inserted += (int) ( $r['inserted'] ?? 0 );
 			$total_unmarked += $scanner->last_scan_unmarked_batches();
 
-			// Part of the target could not be read. Its unseen strings kept
-			// their old last_seen_at, so it counts against full coverage the
-			// same way a path-guard skip does.
+			// Part of the target could not be read: its unseen strings kept their old last_seen_at, so it denies full
+			// coverage as a path-guard skip does.
 			if ( ! $scanner->last_scan_complete() ) {
 				$skipped[] = $dir;
 			}
@@ -327,24 +319,12 @@ final class StringScanJob extends AbstractJob {
 			$progress( $processed, $total );
 		}
 
-		// Lets addons register non-gettext strings as part of the scan.
+		// Add-ons register non-gettext strings as part of the scan.
 		do_action( 'perflocale/strings/after_scan' );
 
-		// Record that a full scan just completed. gc_stale_strings() gates its
-		// delete pass on this marker: without a recent full scan, last_seen_at
-		// carries no liveness signal, so the GC must not delete strings that
-		// were simply never scanned (e.g. imported via PO/migration on a site
-		// the operator never scans). Unix epoch = timezone-free comparison.
-		//
-		// Only arm it when coverage was ACTUALLY complete. A target rejected
-		// by the path guard (symlinked plugin dir, relocated wp-content), or
-		// one the scanner could not read in full, never re-marked its strings'
-		// last_seen_at, so arming the marker would let the 90-day GC delete
-		// strings - and their translations - that are still very much in use.
-		// The same holds when a database error kept a batch of already-stored
-		// strings from being re-marked as seen. Leaving the marker untouched
-		// means this run neither arms nor extends the GC window; a marker from
-		// an earlier complete scan still applies until it ages out.
+		// Arm the full-scan marker gc_stale_strings() depends on only when every target was scanned in full and every
+		// batch re-marked as seen; otherwise the 90-day GC could delete strings and translations still in use. An
+		// earlier marker still applies. Why: docs-ai/11-code-rationale.md, "StringScanJob: coverage and the GC marker".
 		if ( $total_unmarked > 0 ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a partial scan.
 			error_log(
@@ -358,15 +338,9 @@ final class StringScanJob extends AbstractJob {
 		if ( $skipped === [] && $total_unmarked === 0 && $domain === '' ) {
 			update_option( 'perflocale_strings_last_full_scan', time(), false );
 		} elseif ( $skipped === [] && $domain !== '' ) {
-			// Every target was readable, but the run was filtered to ONE text
-			// domain, so it only re-stamped last_seen_at for that domain's rows;
-			// every other domain's strings look untouched to the GC. Arming the
-			// GLOBAL marker would let gc_stale_strings() delete them, and their
-			// translations, once they aged past the retention window. No shipped
-			// surface dispatches mode='all' with a domain - AdminController::
-			// process_string_scan passes ['mode' => 'all'] and nothing else - so
-			// this guard is here to make sure adding one later cannot silently
-			// turn the GC into a data-loss path.
+			// A run filtered to one text domain re-stamped only that domain's rows, so arming the global marker would
+			// let the GC delete every other domain's strings. No shipped surface sends mode='all' with a domain; this
+			// guard keeps it safe.
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operator-facing diagnostic for a filtered scan.
 			error_log(
 				sprintf(
@@ -387,21 +361,13 @@ final class StringScanJob extends AbstractJob {
 			);
 		}
 
-		// Compute the DB total so callers get the post-scan row count
-		// directly instead of going via a transient.
+		// The database total, so callers get the post-scan row count without a transient.
 		$string_repo = new StringRepository( $cache );
 		$db_total    = $string_repo->count();
 
-		// `targets` is what was actually SCANNED in full, not what was
-		// selected. A target the path guard rejected, or one only partly
-		// read, did not re-mark all of its strings, so counting it here would
-		// make the stored result claim coverage the run did not have - the
-		// same shape as the GC marker above, which is conditioned on
-		// $skipped. `skipped_targets` (and a bounded sample of the paths) is
-		// the operator's only in-UI signal: the error_log line is unreachable
-		// on most managed hosts, and the Jobs → Details panel renders this
-		// array. `unmarked_batches` counts the batches a database error kept
-		// from being re-marked as seen.
+		// `targets` counts what was scanned in full, as the GC marker does. `skipped_targets` and a bounded path sample
+		// are the operator's only signal on PerfLocale > Jobs (error_log is out of reach on managed hosts);
+		// `unmarked_batches` counts batches a database error kept from being re-marked as seen.
 		$result = [
 			'found'            => $total_found,
 			'inserted'         => $total_inserted,
@@ -414,12 +380,9 @@ final class StringScanJob extends AbstractJob {
 		];
 
 		if ( $skipped !== [] ) {
-			// Same prefix substitution WorkerRegistry::redact_paths() applies
-			// before a job error is stored: this array is persisted on the job
-			// row and rendered by the Jobs page and the REST detail endpoint,
-			// and the host's directory layout is not the operator's business.
-			// A target under neither root (a relocated theme root) is left
-			// whole - naming the unreadable directory IS the message.
+			// WorkerRunner::redact_paths()'s prefix substitution: the array is stored and shown, and the host's
+			// directory layout is not the operator's business. A target under neither root stays whole: naming it is
+			// the message.
 			$result['skipped_paths'] = array_map(
 				static function ( string $path ): string {
 					return str_replace(
@@ -442,15 +405,9 @@ final class StringScanJob extends AbstractJob {
 	}
 
 	/**
-	 * Roots a scan target may live under: wp-content plus every location
-	 * WordPress itself reports for plugins, must-use plugins and themes.
-	 *
-	 * WP_PLUGIN_DIR / WPMU_PLUGIN_DIR / the theme roots are normally inside
-	 * WP_CONTENT_DIR, but all four are relocatable, so they are listed
-	 * explicitly rather than assumed. Only absolute values are used:
-	 * get_theme_roots() returns a RELATIVE fragment ('/themes') on the
-	 * common single-root install, so the registered-roots global and
-	 * get_theme_root() are read instead.
+	 * Roots a scan target may live under: wp-content plus the plugin, must-use plugin and theme roots WordPress
+	 * reports, all relocatable. Absolute values only: get_theme_roots() returns a relative '/themes' on a single-root
+	 * install.
 	 *
 	 * @return array<int, string> Absolute directory paths (no trailing slash).
 	 */
@@ -507,23 +464,9 @@ final class StringScanJob extends AbstractJob {
 	}
 
 	/**
-	 * Guard against scans of arbitrary filesystem locations. Only allow
-	 * paths at or below a WordPress code root (see allowed_scan_roots()).
-	 *
-	 * A target counts as safe when EITHER its literal path or its resolved
-	 * realpath() sits under a root. The literal form matters: plugin and
-	 * theme directories are frequently symlinks pointing outside wp-content
-	 * (Composer/Bedrock layouts, shared plugin mounts, local development),
-	 * and resolving those first made the guard reject them. The consequence
-	 * was silent: the target was skipped without a notice, its strings were
-	 * never re-seen, yet the run still recorded a completed full scan - so
-	 * gc_stale_strings() treated last_seen_at as authoritative and deleted
-	 * those strings AND their translations after the retention window.
-	 * WordPress core follows symlinked plugin directories in exactly the
-	 * same way (see wp_register_plugin_realpath()).
-	 *
-	 * Relative traversal is rejected outright so the literal comparison
-	 * cannot be walked back out of a root.
+	 * Only paths at or below a code root (allowed_scan_roots()): the literal path or its realpath(), so a symlinked
+	 * plugin or theme dir (Bedrock, shared mounts) passes, as wp_register_plugin_realpath() follows them. Relative
+	 * traversal is rejected. Why: docs-ai/11-code-rationale.md, "StringScanJob: coverage and the GC marker".
 	 *
 	 * @param string $dir Candidate directory to scan.
 	 * @return bool

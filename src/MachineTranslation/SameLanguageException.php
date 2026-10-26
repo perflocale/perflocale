@@ -14,9 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The target language equals the source post's language, so there is nothing
- * to translate. {@see TranslationService::translate_post()} throws it before
- * any provider call; callers that answer over HTTP can map it to a 400.
+ * The target language is the source post's language: thrown before any provider call (HTTP callers map it to a 400).
  */
 final class SameLanguageException extends \RuntimeException {
 }

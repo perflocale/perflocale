@@ -18,6 +18,108 @@
 
 	var cfg = window.perflocaleTrMt || {};
 
+	// ---- JavaScript hooks (wp.hooks); Language is described in block-toolbar.js
+	var hookWarned = {};
+
+	// wp.hooks.doAction in a try/catch: a callback that throws does not stop
+	// the screen. With SCRIPT_DEBUG it is reported once per hook in the console.
+	function doAction( name, context ) {
+		var hooks = window.wp && window.wp.hooks;
+
+		try {
+			if ( hooks && typeof hooks.doAction === 'function' ) {
+				hooks.doAction( name, context );
+			}
+		} catch ( e ) {
+			if ( cfg.debug && ! hookWarned[ name ] && window.console ) {
+				hookWarned[ name ] = true;
+				window.console.warn( 'PerfLocale: ' + name + ': a callback threw.' );
+			}
+		}
+	}
+
+	// The Language objects of the targets `test` keeps.
+	function targetLanguages( test ) {
+		return ( cfg.targets || [] ).filter( test ).map( function ( t ) {
+			return {
+				slug:       String( t.slug ),
+				locale:     String( t.locale || '' ),
+				name:       String( t.name || '' ),
+				nativeName: String( t.nativeName || t.name || '' ),
+				isDefault:  !! t.isDefault
+			};
+		} );
+	}
+
+	// Fired right before a confirmed bulk machine translation form is submitted.
+	function bulkSubmitted( scope, postCount, postTypes, langIds, includeMeta, estimate ) {
+		/**
+		 * @hook perflocale.translations.bulkSubmitted
+		 * @kind action
+		 * @since 1.0.7.4
+		 * @cardinality transition
+		 * @fires Translations screen: bulk machine translation confirmed (the list bulk action or the whole-site panel's Start), just before the form is submitted. The page navigates right after: synchronous work only. The result: perflocale.translations.bulkFinished on the next page, or perflocale.jobs.statusChanged (types bulk_translate, site_translate) when queued.
+		 * @context {Object} context
+		 * @property {number} context.version 1.
+		 * @property {string} context.scope 'selected' (the list bulk action) or 'site' (the whole-site panel).
+		 * @property {?number} context.postCount The selected posts; null for 'site'.
+		 * @property {string[]} context.postTypes The chosen post types for 'site'; [] for 'selected'.
+		 * @property {Language[]} context.targetLanguages The target languages.
+		 * @property {boolean} context.includeMeta SEO and custom fields are included.
+		 * @property {?{items: number, chars: number, skippedExisting: number}} context.estimate The estimate the user saw, or null without one.
+		 * @example wp.hooks.addAction( 'perflocale.translations.bulkSubmitted', 'acme/log', function ( ctx ) {
+		 *     navigator.sendBeacon( '/acme/mt', JSON.stringify( { scope: ctx.scope, posts: ctx.postCount } ) );
+		 * } );
+		 */
+		doAction( 'perflocale.translations.bulkSubmitted', {
+			version:         1,
+			scope:           scope,
+			postCount:       postCount,
+			postTypes:       postTypes,
+			targetLanguages: targetLanguages( function ( t ) { return langIds.indexOf( parseInt( t.id, 10 ) ) !== -1; } ),
+			includeMeta:     !! includeMeta,
+			estimate:        estimate
+		} );
+	}
+
+	function estimateOf( est ) {
+		return { items: Number( est.items ) || 0, chars: Number( est.chars ) || 0, skippedExisting: Number( est.skipped_existing ) || 0 };
+	}
+
+	// The result notice of a run that finished inside the request: once, on
+	// the load that shows it (core removes `message` from the address).
+	function initBulkFinished() {
+		var r = cfg.bulkFinished;
+
+		if ( ! r ) { return; }
+
+		/**
+		 * @hook perflocale.translations.bulkFinished
+		 * @kind action
+		 * @since 1.0.7.4
+		 * @cardinality transition
+		 * @fires Translations screen: once, on the load that shows the result notice of a bulk machine translation run inside the request (not again on reload).
+		 * @context {Object} context
+		 * @property {number} context.version 1.
+		 * @property {Language[]} context.targetLanguages The target languages.
+		 * @property {number} context.posts The selected posts.
+		 * @property {number} context.translated Translations created.
+		 * @property {number} context.skipped Skipped because a translation existed.
+		 * @property {number} context.failed Failed.
+		 * @example wp.hooks.addAction( 'perflocale.translations.bulkFinished', 'acme/log', function ( ctx ) {
+		 *     console.log( ctx.translated + ' created for ' + ctx.posts + ' posts' );
+		 * } );
+		 */
+		doAction( 'perflocale.translations.bulkFinished', {
+			version:         1,
+			targetLanguages: targetLanguages( function ( t ) { return r.target === 'all' || t.slug === r.target; } ),
+			posts:           Number( r.posts ) || 0,
+			translated:      Number( r.translated ) || 0,
+			skipped:         Number( r.skipped ) || 0,
+			failed:          Number( r.failed ) || 0
+		} );
+	}
+
 	function restPost( url, body ) {
 		return window.fetch( url, {
 			method: 'POST',
@@ -33,6 +135,11 @@
 				return json && json.data !== undefined ? json.data : json;
 			} );
 		} );
+	}
+
+	// The estimate's sentence on page builder layouts it leaves out, after sep.
+	function withBuilderNote( text, est, sep ) {
+		return est && est.builder_note ? text + sep + String( est.builder_note ) : text;
 	}
 
 	function fmt( n ) {
@@ -106,14 +213,17 @@
 					unbusy();
 					return;
 				}
-				proceed = window.confirm(
+				proceed = window.confirm( withBuilderNote(
 					( cfg.i18n.confirmEstimate || '%1$s / %2$s / %3$s' )
 						.replace( '%1$s', fmt( est.items ) )
 						.replace( '%2$s', fmt( est.chars ) )
-						.replace( '%3$s', fmt( est.skipped_existing ) )
-				);
+						.replace( '%3$s', fmt( est.skipped_existing ) ),
+					est,
+					'\n\n'
+				) );
 				if ( proceed ) {
 					confirmed = true;
+					bulkSubmitted( 'selected', ids.length, [], langIds, includeMeta, estimateOf( est ) );
 					form.submit();
 					return; // keep disabled - the page is navigating.
 				}
@@ -122,6 +232,7 @@
 				// Estimate unavailable: degrade to a plain confirm.
 				if ( window.confirm( cfg.i18n.confirmPlain || 'Machine-translate the selected items?' ) ) {
 					confirmed = true;
+					bulkSubmitted( 'selected', ids.length, [], langIds, includeMeta, null );
 					form.submit();
 					return;
 				}
@@ -154,12 +265,26 @@
 		// estimated (the server re-estimates on start, but the user acts
 		// on what they read).
 		var estToken = 0;
+		var lastEstimate = null;
 
 		panel.addEventListener( 'change', function () {
 			estToken++;
+			lastEstimate = null;
 			startBtn.disabled = true;
 			result.textContent = '';
 		} );
+
+		var siteForm = startBtn && startBtn.form;
+
+		if ( siteForm ) {
+			siteForm.addEventListener( 'submit', function ( ev ) {
+				if ( ev.defaultPrevented || ( ev.submitter && ev.submitter !== startBtn ) ) {
+					return;
+				}
+				var sel = selection();
+				bulkSubmitted( 'site', null, sel.types, sel.langIds, sel.includeMeta, lastEstimate );
+			} );
+		}
 
 		estBtn.addEventListener( 'click', function () {
 			var sel = selection();
@@ -171,13 +296,33 @@
 			estBtn.disabled = true;
 			result.textContent = cfg.i18n.estimating || '…';
 
-			restPost( cfg.bulkUrl, {
-				site_wide: true,
-				estimate_only: true,
-				post_types: sel.types,
-				target_lang_ids: sel.langIds,
-				include_meta: sel.includeMeta
-			} ).then( function ( est ) {
+			// The server reads a bounded window per request; follow next_after_id with the running totals.
+			function step( afterId, totals ) {
+				return restPost( cfg.bulkUrl, {
+					site_wide: true,
+					estimate_only: true,
+					post_types: sel.types,
+					target_lang_ids: sel.langIds,
+					include_meta: sel.includeMeta,
+					after_id: afterId,
+					totals: totals
+				} ).then( function ( est ) {
+					var next = Number( est.next_after_id ) || 0;
+					if ( ! next || token !== estToken ) {
+						return est;
+					}
+					result.textContent = ( cfg.i18n.estimatingProgress || '%s' ).replace( '%s', fmt( Number( est.checked ) || 0 ) );
+					return step( next, {
+						chars: est.chars,
+						items: est.items,
+						skipped_existing: est.skipped_existing,
+						builder_layouts: est.builder_layouts,
+						checked: est.checked
+					} );
+				} );
+			}
+
+			step( 0, {} ).then( function ( est ) {
 				estBtn.disabled = false;
 				if ( token !== estToken ) {
 					return; // Selection changed mid-flight - estimate is stale.
@@ -187,10 +332,15 @@
 					startBtn.disabled = true;
 					return;
 				}
-				result.textContent = ( cfg.i18n.estimateResult || '%1$s / %2$s / %3$s' )
-					.replace( '%1$s', fmt( est.items ) )
-					.replace( '%2$s', fmt( est.chars ) )
-					.replace( '%3$s', fmt( est.skipped_existing ) );
+				result.textContent = withBuilderNote(
+					( cfg.i18n.estimateResult || '%1$s / %2$s / %3$s' )
+						.replace( '%1$s', fmt( est.items ) )
+						.replace( '%2$s', fmt( est.chars ) )
+						.replace( '%3$s', fmt( est.skipped_existing ) ),
+					est,
+					' '
+				);
+				lastEstimate = estimateOf( est );
 				startBtn.disabled = false;
 			} ).catch( function ( err ) {
 				estBtn.disabled = false;
@@ -203,9 +353,10 @@
 	}
 
 	if ( document.readyState === 'loading' ) {
-		document.addEventListener( 'DOMContentLoaded', function () { initBulkConfirm(); initSitePanel(); } );
+		document.addEventListener( 'DOMContentLoaded', function () { initBulkConfirm(); initSitePanel(); initBulkFinished(); } );
 	} else {
 		initBulkConfirm();
 		initSitePanel();
+		initBulkFinished();
 	}
 } )();

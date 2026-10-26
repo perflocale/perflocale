@@ -46,8 +46,7 @@ final class LanguagesPage {
 	 * @return void
 	 */
 	public function render(): void {
-		// Form processing is handled by AdminController::process_language_forms()
-		// on admin_init (before output), so we only render here.
+		// AdminController::process_language_forms() handles the forms on admin_init, before output.
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$action = isset( $_GET['action'] ) ? sanitize_text_field( wp_unslash( $_GET['action'] ) ) : 'list';
@@ -61,11 +60,9 @@ final class LanguagesPage {
 	}
 
 	/**
-	 * Render the delete-preview screen: exactly what the cascade will
-	 * remove, BEFORE anything is touched. The destructive step moved to
-	 * action=confirm-delete (AdminController), so landing here - even
-	 * from an old bookmark of the previous action=delete URL - never
-	 * deletes anything.
+	 * Renders the delete preview: what the cascade would remove.
+	 *
+	 * Read-only: the delete is action=confirm-delete in AdminController, so this URL never deletes.
 	 *
 	 * @param object|null $language Language row, or null when not found.
 	 * @return void
@@ -175,15 +172,9 @@ final class LanguagesPage {
 	}
 
 	/**
-	 * Explain what stops a delete, and what the delete would unlink anyway.
+	 * Explains what stops a delete, and what the delete would unlink anyway.
 	 *
-	 * Posts block the delete (LanguageRepository::delete_blockers()). A post type
-	 * links to its list filtered to this language when that list opens and
-	 * filters (blocker_list_url()), so the operator can move the posts to the
-	 * Trash; any other type is named with its count as plain text. Deactivating
-	 * is offered as the alternative: an inactive language keeps its links.
-	 * Terms, media, and block theme templates and template parts are listed as
-	 * information only.
+	 * Posts block it (delete_blockers()); terms, media and block templates are information only.
 	 *
 	 * @param object                                                                              $language Language row.
 	 * @param array{posts: array<string, int>, attachments: int, terms: int, templates: int}|null $blockers delete_blockers() result.
@@ -259,10 +250,8 @@ final class LanguagesPage {
 	/**
 	 * The post list a blocking post type links to, filtered to the language.
 	 *
-	 * '' when that list would not open or not filter: core's edit.php refuses a
-	 * type that is not registered or has no admin screen (show_ui false), and
-	 * PostListColumns applies the perflocale_lang filter to translatable types
-	 * only, so any other type would open an unfiltered list of every language.
+	 * '' when edit.php refuses the type (unregistered or show_ui false) or PostListColumns
+	 * would not filter it (not translatable), which would list every language.
 	 *
 	 * @param string             $type         Post type.
 	 * @param string             $lang_slug    Language slug.
@@ -288,32 +277,8 @@ final class LanguagesPage {
 	/**
 	 * Warning shown where a language's URLs are about to stop being routed.
 	 *
-	 * Deleting a language drops its prefix from the rewrite rules AND from the
-	 * slug-redirect map (there is no successor language to remap onto);
-	 * deactivating it drops the rewrite rules alone.
-	 *
-	 * WHAT THAT COSTS DEPENDS ON THE URL MODE, and the wording must follow it.
-	 * Only subdirectory mode routes a language by a PATH prefix, so only there
-	 * does a retired URL become a 404 that core's redirect_guess_404_permalink()
-	 * may answer with a fuzzy match on an unrelated post - a guess that is not
-	 * even stable between requests, because core's query has no ORDER BY.
-	 * Subdomain, per-domain and query modes carry the language in the host or a
-	 * query argument: detect_from_subdomain() / detect_from_domain() /
-	 * detect_from_query_param() simply return null and LanguageRouter's fallback
-	 * forces the default language, so those URLs still answer 200 - in the
-	 * default language. Telling that operator to expect core's guess would
-	 * describe a failure their site cannot have, and send them off writing
-	 * redirects they do not need.
-	 *
-	 * TENSE FOLLOWS THE ROW, NOT THE SCREEN. The Active checkbox renders this
-	 * for a language that is still active, where the loss is what unticking the
-	 * box would cause; on an already-inactive language it is a present fact, on
-	 * the delete screen too.
-	 *
-	 * This only TELLS the operator. Routing is deliberately left alone: a
-	 * stored map of retired prefixes would hijack a later legitimate page at
-	 * the same path, and forcing a 410 or a home redirect would replace a guess
-	 * that is often right with a dead end.
+	 * The wording follows the URL mode and the row's state, and routing is left alone on purpose:
+	 * see docs-ai/11-code-rationale.md, "LanguagesPage: routing loss warning".
 	 *
 	 * @param object $language  Language row being deleted or deactivated.
 	 * @param bool   $permanent True on the delete screen, false for the active toggle.
@@ -325,21 +290,8 @@ final class LanguagesPage {
 		$prefix       = '';
 
 		if ( $is_path_mode ) {
-			// The language segment sits under the site's own home path, which is
-			// not always '/'. A single-site install in a subfolder
-			// (example.com/blog/) and a subdirectory multisite child
-			// (example.com/sub/) both carry one, so this language's real URLs are
-			// /blog/de/ or /sub/de/, never /de/ - and an operator told to look for
-			// the wrong path would find nothing to redirect, which is the whole
-			// point of this notice.
-			//
-			// home_url() is the right source because it is exactly what the router
-			// strips before reading the language segment
-			// (LanguageRouter::detect_slug_from_request_uri()), and it covers both
-			// shapes; current_blog->path knows only about the network one. Asking
-			// for '/' guarantees a path component even on a root install, and
-			// PerfLocale's own home_url filter returns early in wp-admin, so the
-			// value never comes back language-prefixed here.
+			// The segment sits under home_url()'s path (subfolder install or multisite child), which is
+			// what the router strips; PerfLocale's home_url filter skips wp-admin, so it is unprefixed.
 			$home_path = (string) ( wp_parse_url( home_url( '/' ), PHP_URL_PATH ) ?? '/' );
 
 			if ( '' === $home_path ) {
@@ -452,12 +404,8 @@ final class LanguagesPage {
 							</button>
 							<?php
 							/*
-							 * Touch has no equivalent of the drag handle above: HTML5
-							 * drag-and-drop never fires on a touchscreen, and the handle
-							 * is `opacity: 0` until row hover -- which a phone also does
-							 * not have. So on small screens the handle is swapped for
-							 * these two buttons, which drive the same move-one-slot-and-
-							 * save path the handle's arrow keys already used.
+							 * Touch has no HTML5 drag-and-drop and no hover to reveal the handle, so small
+							 * screens get these buttons, which use the arrow keys' move-and-save path.
 							 */
 							?>
 							<div class="perflocale-lang-item__move">
@@ -511,10 +459,7 @@ final class LanguagesPage {
 								</div>
 								<div class="perflocale-lang-item__meta">
 									<?php
-									// bdi + lang: an RTL native name ("العربية")
-									// printed bare inside this LTR admin line
-									// garbles the adjacent "·"/code punctuation;
-									// bdi isolates its directionality and lang
+									// bdi keeps an RTL native name from garbling the LTR punctuation; lang
 									// lets screen readers switch pronunciation.
 									?>
 									<bdi lang="<?php echo esc_attr( str_replace( '_', '-', (string) $language->locale ) ); ?>"><?php echo esc_html( $language->native_name ); ?></bdi>
@@ -558,13 +503,8 @@ final class LanguagesPage {
 										</a>
 									<?php else : ?>
 										<?php
-										// An inactive language cannot be promoted:
-										// get_default() reads the active-only
-										// bootstrap, so LanguageRepository::
-										// set_default() refuses it outright. Offer
-										// the action as visibly unavailable rather
-										// than hiding it - the operator can see the
-										// button exists and what unlocks it.
+										// Shown disabled, not hidden: set_default() refuses an inactive
+										// language, because get_default() reads the active-only bootstrap.
 										?>
 										<button type="button" class="button button-small" disabled
 											title="<?php echo esc_attr__( 'Activate this language before making it the default.', 'perflocale' ); ?>">
@@ -600,16 +540,10 @@ final class LanguagesPage {
 	}
 
 	/**
-	 * The language packs that can be installed for the active languages on
-	 * this page, by locale, read through the same LanguagePacks::report() and
-	 * LanguagePacks::findings() as Site Health's language-pack test (without
-	 * the theme and plugin names, which the hint does not show): a WordPress
-	 * pack that is not installed (state `missing`: WordPress.org is not known
-	 * to lack it), and the WordPress, theme and plugin packs core's last
-	 * update checks offered. Packs WordPress.org does not offer (`not_offered`
-	 * theme and plugin packs, a WordPress pack `not_available`) stay on Site
-	 * Health only. Only locales with an installable pack are returned, and
-	 * nothing is read for a user who cannot manage languages.
+	 * The installable language packs of this page's active languages, by locale.
+	 *
+	 * Read like Site Health's test: a missing WordPress pack and the packs core's update checks
+	 * offered; packs WordPress.org does not offer stay on Site Health only.
 	 *
 	 * @param array<int, object> $languages Language rows of this page.
 	 * @return array
@@ -653,11 +587,9 @@ final class LanguagesPage {
 	}
 
 	/**
-	 * The language-pack hint in an active language's row: the packs that can
-	 * be installed for its locale (see language_packs()), stated as Site
-	 * Health's language-pack test states them, by kind. Users who can install
-	 * languages also get the way to install them. Empty when there is no such
-	 * pack, so the hint goes once the packs are installed.
+	 * The language-pack hint of an active language's row, empty when no pack is installable.
+	 *
+	 * Users who can install languages also get the way to install them.
 	 *
 	 * @param object $language Language row.
 	 * @param array  $packs    Result of language_packs().
@@ -750,11 +682,8 @@ final class LanguagesPage {
 		$option = $screen ? $screen->get_option( 'per_page', 'option' ) : '';
 		$val    = $option ? (int) get_user_meta( $user, $option, true ) : 0;
 
-		// ⚠️ Clamp on READ. The save-time ceiling cannot touch values stored
-		// BEFORE it existed: measured with max_input_vars=64 (ceiling 25), a
-		// stored 777 still drove posts_per_page=777 and rendered every row.
-		// The protection has to sit where the value is USED. The stored
-		// preference is deliberately not rewritten - only the effective value.
+		// Clamped on read too: a stored value may exceed the save-time ceiling. The stored
+		// preference is not rewritten.
 		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
 	}
 
@@ -821,26 +750,14 @@ final class LanguagesPage {
 			$predefined = require PERFLOCALE_DIR . 'data/languages.php';
 
 			/**
-			 * Filter the bundled list of predefined languages shown in the
-			 * "Add Language" quick-select. Use this to add custom languages
-			 * (e.g. constructed languages, internal locale variants) or to
-			 * replace / prune the bundled set entirely.
+			 * Filters the predefined languages of the "Add Language" quick-select.
 			 *
-			 * Each entry is an associative array with the following keys:
-			 *   - `slug`           string, max 10 chars, must be unique
-			 *   - `locale`         string, max 20 chars, must be unique
-			 *   - `name`           string, English display name
-			 *   - `native_name`    string, native-script display name
-			 *   - `flag`           string, ISO 3166-1 alpha-2 country code
-			 *   - `text_direction` string, 'ltr' or 'rtl'
-			 *   - `date_format`    string, PHP date() format
-			 *   - `time_format`    string, PHP date() format
+			 * Entry keys (strings): slug (max 10, unique), locale (max 20, unique), name, native_name,
+			 * flag (ISO 3166-1 alpha-2), text_direction ('ltr' or 'rtl'), date_format, time_format.
 			 *
 			 * @hook perflocale/predefined_languages
 			 *
-			 * @param array<int, array<string, string>> $predefined Bundled
-			 *   languages as loaded from `data/languages.php` (194 entries
-			 *   in 1.0.0).
+			 * @param array<int, array<string, string>> $predefined Bundled languages from `data/languages.php`.
 			 */
 			$predefined = (array) apply_filters( 'perflocale/predefined_languages', $predefined );
 		}
@@ -865,12 +782,8 @@ final class LanguagesPage {
 			<div class="perflocale-lang-form-wrap">
 				<?php if ( ! $is_edit && ! empty( $predefined ) ) : ?>
 					<?php
-					// Sort: popular languages first (curated by real-world
-					// usage frequency on WP installs), then alphabetical
-					// by english name. Slugs in `$popular_slugs` keep
-					// their declared order. The combobox JS reads each
-					// row's `data-popular="1"` marker to render a section
-					// divider between the two groups.
+					// Popular languages first in their declared order, then the rest by English name;
+					// the combobox draws its group divider from `data-popular="1"`.
 					$popular_slugs = [
 						'en',
 						'en-gb',
@@ -916,11 +829,8 @@ final class LanguagesPage {
 						$flag_emoji = '';
 
 						if ( $flag !== '' && strlen( $flag ) === 2 && Helper::is_ascii_alpha( $flag ) ) {
-							// Regional-indicator codepoints U+1F1E6–U+1F1FF are a
-							// contiguous 4-byte UTF-8 block (leading bytes F0 9F 87);
-							// 'A' (0x41) maps to U+1F1E6, so 'us' becomes 🇺🇸. Encoded
-							// directly to avoid depending on mb_chr(), which has no
-							// WP core polyfill and would fatal on a no-mbstring host.
+							// Regional indicators from raw UTF-8 bytes ('A' is U+1F1E6): mb_chr() has no
+							// core polyfill and fatals on a host without mbstring.
 							$flag_emoji = "\xF0\x9F\x87" . chr( 0xA6 + ord( strtoupper( $flag[0] ) ) - 0x41 )
 								. "\xF0\x9F\x87" . chr( 0xA6 + ord( strtoupper( $flag[1] ) ) - 0x41 );
 						}
@@ -1097,22 +1007,12 @@ final class LanguagesPage {
 					<?php endif; ?>
 
 					<?php
-					// Pre-flight rename nudge - extended in v… to cover ALL
-					// active bare-language slugs whose locale exposes a
-					// region-qualified upgrade target, not just the default.
-					// A non-default `ar` next to `ar-MA` benefits from the
-					// rename nudge identically to a default `en` next to
-					// `en-GB`, so we render one checkbox per candidate and
-					// show whichever one matches the slug the user is
-					// typing into the form (prefix match: `ar-ma` → `ar`).
+					// Rename nudge: one checkbox per active bare-language slug with a region-qualified
+					// target; JS shows the one whose slug prefixes the typed slug (`ar-ma` shows `ar`).
 					$rename_candidates = [];
 
 					if ( ! $is_edit ) {
-						// Use the form-side detector: render checkboxes for
-						// every active bare language whose locale exposes a
-						// rename target. No "existing region-qualified
-						// sibling" requirement - at form-render time the
-						// user is precisely about to ADD that sibling.
+						// The form detector needs no region-qualified sibling yet: the user is about to add it.
 						$rename_candidates = Helper::bare_language_rename_candidates_for_form(
 							$this->repo->get_active()
 						);
@@ -1180,8 +1080,7 @@ final class LanguagesPage {
 			return;
 		}
 
-		// Error-class messages (red, sticky) - duplicate-key collisions
-		// caught by the AdminController before the wpdb->insert fires.
+		// Duplicate slug or locale, caught by AdminController before the insert.
 		if ( $message === 'duplicate_slug' || $message === 'duplicate_locale' ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$dup     = isset( $_GET['dup'] ) ? sanitize_text_field( wp_unslash( $_GET['dup'] ) ) : '';
@@ -1206,9 +1105,7 @@ final class LanguagesPage {
 			return;
 		}
 
-		// A slug the routing layer cannot express. update() refuses it before
-		// writing the row, so the whole form was discarded - say so, and name
-		// the value, rather than re-rendering the screen with nothing saved.
+		// A slug routing cannot express: update() refused it before writing, so nothing was saved.
 		if ( $message === 'invalid_slug' ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$bad = isset( $_GET['dup'] ) ? sanitize_text_field( wp_unslash( $_GET['dup'] ) ) : '';
@@ -1248,10 +1145,8 @@ final class LanguagesPage {
 			return;
 		}
 
-		// A delete that did not happen: LanguageRepository::delete() rolls its
-		// cascade back and returns false, and the default language / a stale
-		// delete URL for an already-removed id never reach it at all. All three
-		// leave the site unchanged, so say so instead of reporting success.
+		// A delete that did not happen: delete() rolled back, or it was the default language or a
+		// removed id. The site is unchanged.
 		if ( $message === 'delete_failed' ) {
 			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__(
 				'The language was not deleted and nothing on the site was changed. The default language cannot be removed, and the language may already be gone - reload this list, and check the error log if it is still here.',
@@ -1260,9 +1155,7 @@ final class LanguagesPage {
 			return;
 		}
 
-		// A refused "Set as Default": LanguageRepository::set_default() rejects
-		// a missing or inactive target, and the controller now honours that
-		// return value instead of reporting success over a no-op.
+		// A refused "Set as Default": LanguageRepository::set_default() rejects a missing or inactive target.
 		if ( $message === 'default_change_failed' ) {
 			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__(
 				'The default language was not changed. Only an active language can be the default - activate it first, then set it as default.',
@@ -1288,13 +1181,9 @@ final class LanguagesPage {
 	}
 
 	/**
-	 * Surface an inline notice when the site default uses a bare-language
-	 * slug (`en`) AND another active language is region-qualified (`en-gb`).
+	 * Shows a notice when a bare-language slug (`en`) sits next to a region-qualified one (`en-gb`).
 	 *
-	 * Pure UX nudge: the renderer is correct per BCP 47, but the visual
-	 * mismatch confuses users who expect symmetry. The notice points at
-	 * the suggested rename and links to the Add Language form (where the
-	 * pre-flight checkbox can also kick off the rename in one click).
+	 * A UX nudge only: the output is valid BCP 47; the Add Language form offers the rename.
 	 *
 	 * @param array<int, object> $languages All active languages.
 	 * @return void

@@ -14,25 +14,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Replaces every shortcode tag of an HTML text with an opaque placeholder
- * before the text goes to a provider, and puts the tags back afterwards, byte
- * for byte. A shortcode's attributes are settings (ids, keys, form names,
- * sizes) far more often than visible text, and a translated attribute breaks
- * the shortcode, so attribute values are not sent.
+ * Swaps every registered shortcode tag for an opaque placeholder before the provider call and restores it byte for byte.
  *
- * The tags are found with core's own grammar, get_shortcode_regex() over the
- * registered shortcodes: what WordPress itself parses as a shortcode. A
- * bracket that is no registered shortcode renders as text and stays text, and
- * so does an escaped `[[tag]]`. What an enclosing shortcode wraps stays text
- * and is translated; the opening and closing tags are held back. A shortcode
- * that keeps visible text in its attributes is sent as it is when it is on the
- * text-carrying list: core's `caption` (its older form keeps the caption in a
- * `caption` attribute), and what the `perflocale/mt/text_shortcodes` filter
- * adds.
- *
- * A placeholder is an HTML comment with a per-call nonce and an index, the
- * form the block-delimiter placeholders use. A placeholder the answer lost,
- * repeated or invented means the answer is damaged: restore() refuses it.
+ * An HTML comment, or an empty `<pfl-s>` element for a provider that returns comments as text. Attributes are settings
+ * far more often than text, and a translated one breaks the shortcode; enclosed content is translated. Details:
+ * docs-ai/11-code-rationale.md, "ShortcodeMask: what is held back".
  */
 final class ShortcodeMask {
 
@@ -47,6 +33,13 @@ final class ShortcodeMask {
 	 * @var string
 	 */
 	private string $nonce;
+
+	/**
+	 * Whether placeholders are `<pfl-s>` elements instead of comments.
+	 *
+	 * @var bool
+	 */
+	private bool $elements = false;
 
 	/**
 	 * The text with its shortcode tags replaced.
@@ -72,23 +65,26 @@ final class ShortcodeMask {
 	/**
 	 * Mask the shortcode tags of a text.
 	 *
-	 * @param string $text Text as it is sent.
+	 * @param string $text     Text as it is sent.
+	 * @param bool   $elements Placeholders as empty `<pfl-s>` elements ({@see AbstractProvider::placeholders_as_elements()}).
 	 * @return self|null Null when the text holds no shortcode tag to hold back.
 	 */
-	public static function mask( string $text ): ?self {
+	public static function mask( string $text, bool $elements = false ): ?self {
 		if ( ! str_contains( $text, '[' ) || ! function_exists( 'get_shortcode_regex' ) ) {
 			return null;
 		}
 
-		$names = array_diff( array_keys( (array) ( $GLOBALS['shortcode_tags'] ?? [] ) ), self::text_shortcodes() );
+		// Such a provider changes a tag sent as text (name, attributes, closer): every tag is held back.
+		$names = array_diff( array_keys( (array) ( $GLOBALS['shortcode_tags'] ?? [] ) ), $elements ? [] : self::text_shortcodes() );
 		$names = array_values( array_filter( array_map( 'strval', $names ), static fn( string $n ): bool => '' !== $n ) );
 
 		if ( [] === $names ) {
 			return null;
 		}
 
-		$mask         = new self();
-		$mask->masked = $mask->replace( $text, '/' . get_shortcode_regex( $names ) . '/s', 0 );
+		$mask           = new self();
+		$mask->elements = $elements;
+		$mask->masked   = $mask->replace( $text, '/' . get_shortcode_regex( $names ) . '/s', 0 );
 
 		return [] === $mask->tags ? null : $mask;
 	}
@@ -111,13 +107,15 @@ final class ShortcodeMask {
 	 * @throws NotSavedException When a placeholder is missing, repeated or unknown.
 	 */
 	public function restore( string $translated ): string {
-		$map = [];
+		$translated = PlaceholderCheck::respaced( $translated );
+		$map        = [];
 
 		foreach ( $this->tags as $i => $tag ) {
 			$map[ $this->placeholder( $i ) ] = $tag;
 		}
 
-		$damaged = PlaceholderCheck::damaged( $translated, array_keys( $map ), '/<!--\s*pfl-s-' . $this->nonce . '-\d+\s*-->|pfl-s-' . $this->nonce . '-\d+/' );
+		// Either form and any pfl-s tag or bare nonce token counts, so a marker moved between forms is damage.
+		$damaged = PlaceholderCheck::damaged( $translated, array_keys( $map ), '/<!--\s*pfl-s-' . $this->nonce . '-\d+\s*-->|<pfl-s\b[^>]*+>(?:\s*+<\/pfl-s>)?|<\/pfl-s>|(?:pfl-s-)?' . $this->nonce . '-\d+/' );
 
 		if ( $damaged > 0 ) {
 			throw new NotSavedException(
@@ -142,9 +140,10 @@ final class ShortcodeMask {
 	 */
 	private static function text_shortcodes(): array {
 		/**
-		 * Filter the shortcodes whose tags go to machine translation with
-		 * their attributes, because the attributes hold visible text. Every
-		 * other registered shortcode's tags are held back and restored.
+		 * Filter the shortcodes whose tags go to machine translation with their attributes (they hold visible text).
+		 *
+		 * Every other registered shortcode's tags are held back and restored. Not read for a provider that returns HTML
+		 * comments as text (LibreTranslate): it changes tags sent as text, so every tag is held back.
 		 *
 		 * @hook perflocale/mt/text_shortcodes
 		 * @param string[] $tags Shortcode names. Default: [ 'caption' ].
@@ -181,8 +180,7 @@ final class ShortcodeMask {
 				$open   = '[' . $name . (string) ( $m[3] ?? '' ) . ( '/' === ( $m[4] ?? '' ) ? '/' : '' ) . ']';
 				$result = $this->hold( $open );
 
-				// The match without the bracket core captured after it: a
-				// closing tag followed by a literal `]` still ends the match.
+				// The match without the bracket core captured after it: a closing tag followed by a literal `]` still ends it.
 				$tag = substr( $m[0], 0, strlen( $m[0] ) - strlen( (string) ( $m[6] ?? '' ) ) );
 
 				// Enclosing only when the match is opener, content and closer: an attribute may end in the closer text.
@@ -226,6 +224,8 @@ final class ShortcodeMask {
 	 * @return string
 	 */
 	private function placeholder( int $index ): string {
-		return '<!-- pfl-s-' . $this->nonce . '-' . $index . ' -->';
+		return $this->elements
+			? '<pfl-s data-i="' . $this->nonce . '-' . $index . '"></pfl-s>'
+			: '<!-- pfl-s-' . $this->nonce . '-' . $index . ' -->';
 	}
 }

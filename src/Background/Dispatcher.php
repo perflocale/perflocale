@@ -17,29 +17,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Single entry point that sync callers use instead of running heavy work
- * inline. Decides between inline execution and enqueueing for async.
+ * Single entry point for heavy work: runs a job inline or enqueues it for a background worker.
  *
- * Returns a structured result so the caller knows what happened:
- *   - `['mode' => 'sync',   'result' => [...]]`     ran inline; here's the output
- *   - `['mode' => 'sync',   'error'  => '...']`     ran inline but threw
- *   - `['mode' => 'async',  'job_id' => '...']`     enqueued; track via Jobs page
- *   - `['mode' => 'denied', 'error'  => '...']`     user lacks the required cap
- *
- * Worker hook registration lives in {@see WorkerRegistry::register_hooks()};
- * each job type's `perflocale_job_run_<type>` action invokes the worker with
- * `(string $job_id, array $args)` and handles cap re-validation, locking,
- * retries, and state transitions.
+ * Result `mode` and its keys:
+ *   - 'sync':   `result`, or `error` when execute() threw.
+ *   - 'async':  `job_id`; `duplicate`, `status` and `updated_at` when an identical job was joined; or `replaced`.
+ *   - 'denied': `error` (missing capability or a should_dispatch veto).
+ *   - 'error':  `error` (args too large or too deep, no job id, or the runner failed).
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class Dispatcher {
 
 	/**
-	 * Compose the worker hook name from a job type slug.
-	 *
-	 * Used by both Dispatcher (enqueue side) and WorkerRegistry (listener
-	 * side) so they always agree on the hook name.
+	 * Compose the worker hook name from a job type slug (shared with WorkerRegistry).
 	 *
 	 * @param string $type Job type slug.
 	 * @return string Hook name, e.g. 'perflocale_job_run_data_import'.
@@ -56,9 +47,7 @@ final class Dispatcher {
 	 * @return array{mode: string, job_id?: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string, result?: array<string,mixed>, error?: string}
 	 */
 	public static function dispatch( AbstractJob $job, array $args ): array {
-		// Capability check on the dispatch side. The worker hook re-runs
-		// this check with stored `created_by`, but failing here lets us
-		// surface a clean error to the caller without ever enqueueing.
+		// The worker re-checks as the stored `created_by`; failing here returns a clean error without enqueueing.
 		if ( ! current_user_can( $job->get_required_capability() ) ) {
 			return [
 				'mode'  => 'denied',
@@ -69,17 +58,8 @@ final class Dispatcher {
 		/**
 		 * Veto a job dispatch before it runs.
 		 *
-		 * Returning `false` from this filter blocks the dispatch entirely:
-		 * the job never runs (sync or async) and the caller gets back
-		 * `[ 'mode' => 'denied', 'error' => ... ]`. Returning `true` (the
-		 * default) lets the dispatch proceed.
-		 *
-		 * Useful for ops policies that the capability system can't express
-		 * cleanly: deploy freezes ("no jobs after 5pm UTC"), per-tenant
-		 * quotas, A/B rollout gates, monitoring-driven kill switches.
-		 *
-		 * Distinct from `perflocale/jobs/threshold/<type>` which only
-		 * decides sync-vs-async - `should_dispatch` is the kill switch.
+		 * False vetoes it (mode 'denied'); a string vetoes it with that message. Distinct from
+		 * `perflocale/jobs/threshold/<type>`, which only picks sync or async.
 		 *
 		 * @hook  perflocale/jobs/should_dispatch
 		 * @since 1.0.0
@@ -113,29 +93,17 @@ final class Dispatcher {
 	/**
 	 * Force-enqueue a job for async execution, bypassing the sync/async decision.
 	 *
-	 * Useful for retries from the Jobs admin page (the user explicitly asked
-	 * to re-run it asynchronously) and for callers that know their workload
-	 * is too big to run sync regardless of settings.
+	 * An identical job still queued or running on this blog is returned instead (`duplicate`), unless its worker is gone
+	 * ({@see JobState::fail_if_worker_gone()}): then that job is marked failed and the result names it in `replaced`.
 	 *
 	 * @param AbstractJob          $job  Job descriptor.
 	 * @param array<string, mixed> $args Worker args.
-	 * An identical job still queued or running on this blog is returned
-	 * instead (`duplicate`, with its `status` and `updated_at`), unless its
-	 * worker is gone ({@see JobState::fail_if_worker_gone()}): then that job
-	 * is marked failed and the new one's result names it in `replaced`.
-	 *
 	 * @return array{mode: string, job_id: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string}|array{mode: string, error: string}
 	 */
 	/**
-	 * Maximum serialised size of `$args` accepted by an async dispatch.
+	 * Maximum JSON size of `$args` for an async dispatch, so the job row does not become a data sink.
 	 *
-	 * Anything larger would bloat the `args` column of the JobState
-	 * row. 100 KB comfortably covers every realistic job (an import job's
-	 * args are paths + IDs, not the payload itself) while keeping the queue
-	 * from becoming a data sink.
-	 *
-	 * Filterable via `perflocale/jobs/max_args_bytes` for ops who genuinely
-	 * need bigger payloads (e.g. a custom job that ships inline data).
+	 * Filterable via `perflocale/jobs/max_args_bytes`.
 	 */
 	public const MAX_ARGS_BYTES = 102400;
 
@@ -147,9 +115,7 @@ final class Dispatcher {
 			];
 		}
 
-		// Reject oversized args before they reach JobState::create - the
-		// args array is persisted in the `args` LONGTEXT column of the
-		// per-job row, which must not grow by megabytes per call.
+		// The args are stored in the job row, which must not grow by megabytes per call.
 		$encoded = wp_json_encode( $args );
 		$limit   = (int) apply_filters( 'perflocale/jobs/max_args_bytes', self::MAX_ARGS_BYTES );
 
@@ -164,12 +130,7 @@ final class Dispatcher {
 			];
 		}
 
-		// Reject deeply-nested arrays before serialisation. A 100 KB JSON
-		// payload of 1000-level-nested arrays still fits the size cap but
-		// can trip PHP's `xdebug.max_nesting_level` and slows the write
-		// (JSON-encoding walks the full tree, and so does every later
-		// decode on the worker side). Cap at a depth that covers any
-		// legitimate job args shape.
+		// Deep nesting fits the size cap but can trip xdebug.max_nesting_level and slows every encode and decode.
 		$max_depth = (int) apply_filters( 'perflocale/jobs/max_args_depth', 20 );
 		if ( self::array_depth( $args ) > max( 4, $max_depth ) ) {
 			return [
@@ -182,23 +143,12 @@ final class Dispatcher {
 			];
 		}
 
-		// Idempotent admission. Two identical dispatches - a double-clicked
-		// admin button, a retried REST call, the same `--async` command run
-		// twice - used to create two independent jobs for one logical
-		// operation. The default per-type concurrency of 1 serialises them, so
-		// on a stock install the second mostly re-walks work the first already
-		// did; but an operator who raises
-		// `perflocale/jobs/max_concurrent/{type}` to overlap same-type work
-		// gets both running at once, and then the provider is called twice for
-		// every string and paid for twice, with an unlinked draft left behind.
-		//
-		// Scoped to the exact operation (type + identical args + this blog),
-		// never a global lock: different work of the same type still runs in
-		// parallel exactly as before.
+		// Idempotent admission: an identical dispatch (double click, retried REST call) joins the in-flight job; with a
+		// raised max_concurrent both would run and pay the provider twice. Scoped to type + args + blog, never global.
 		/**
 		 * Filter whether an identical in-flight job blocks a new dispatch.
 		 *
-		 * Return false to allow duplicate admission (the pre-1.0.2 behaviour).
+		 * Return false to admit identical jobs side by side.
 		 *
 		 * @hook perflocale/jobs/deduplicate_admission
 		 * @param bool        $enabled Default true.
@@ -207,9 +157,7 @@ final class Dispatcher {
 		 */
 		$dedupe = (bool) apply_filters( 'perflocale/jobs/deduplicate_admission', true, $job->get_type(), $args );
 
-		// Check-then-insert under a short admission lock, so two identical
-		// dispatches in the same second (a double click, two administrators)
-		// cannot both miss each other's row.
+		// Check-then-insert under a short lock, so two identical dispatches in the same second cannot miss each other.
 		$admission = $dedupe ? self::acquire_admission( $job->get_type(), $args ) : '';
 		$replaced  = '';
 
@@ -217,8 +165,7 @@ final class Dispatcher {
 			if ( $dedupe ) {
 				$in_flight = JobState::find_active_duplicate( $job->get_type(), $args );
 
-				// A twin whose worker was killed is failed, not joined: joining it
-				// would report "queued" for work nothing will ever run.
+				// A twin whose worker was killed is failed, not joined: nothing would ever run it.
 				if ( $in_flight !== null && JobState::fail_if_worker_gone( $in_flight ) ) {
 					$replaced  = $in_flight;
 					$in_flight = null;
@@ -245,13 +192,7 @@ final class Dispatcher {
 			$runner = JobRunnerFactory::pick();
 			$hook   = self::worker_hook( $job->get_type() );
 
-			// JobState::create uses an atomic INSERT IGNORE against the jobs
-			// table's UNIQUE uuid key and returns
-			// false on the astronomically rare UUID collision. Retry up to
-			// three times with fresh UUIDs before giving up - collisions
-			// indicate either a broken entropy source or someone re-creating
-			// the same job_id manually, both of which should surface as a
-			// hard error rather than silently re-using an unrelated row.
+			// INSERT IGNORE on the UNIQUE uuid fails on a collision: three fresh UUIDs, then a hard error, never a reused row.
 			$job_id  = '';
 			$created = false;
 			for ( $attempt = 0; $attempt < 3; $attempt++ ) {
@@ -281,20 +222,11 @@ final class Dispatcher {
 			];
 		}
 
-		// Embed the dispatching blog id in worker args so the worker can
-		// `switch_to_blog()` before reading the per-blog JobState row. On
-		// single-site installs this is a no-op (blog_id 0 → sentinel not
-		// added). The worker strips the sentinel before invoking the job.
+		// The worker switches to this blog before reading its job row; single site adds no sentinel.
 		$blog_id     = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
 		$worker_args = WorkerRegistry::with_blog_sentinel( $args, $blog_id );
 
-		// If the runner blows up before scheduling the worker event (AS
-		// table corrupted, wp_cron option write failed, etc.), the
-		// JobState row would survive with no worker event waiting - a
-		// stuck queued row visible on the Jobs page until the GC's 6-hour
-		// stuck-sweep marks it failed. That's a slow path; clean up at
-		// the dispatch site instead so the failure is visible immediately
-		// to the caller.
+		// A runner failure would leave a queued row with no worker event until the stuck sweep: delete it and report now.
 		try {
 			$runner->enqueue( $hook, $worker_args, $job_id );
 		} catch ( \Throwable $e ) {
@@ -309,10 +241,7 @@ final class Dispatcher {
 			];
 		}
 
-		// DISABLE_WP_CRON + the WP-Cron runner + no external cron = dispatched
-		// jobs sit in `queued` until the watchdog flags them stuck ~6h later.
-		// We can't probe for an external cron, so flag the combination on the
-		// job log so the operator sees it instead of a "queued forever" mystery.
+		// With DISABLE_WP_CRON the WP-Cron runner needs an external cron, which cannot be probed: say so in the job log.
 		if ( $runner->get_engine_name() === 'wp_cron'
 			&& defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON
 		) {
@@ -359,10 +288,8 @@ final class Dispatcher {
 	/**
 	 * Take the short lock that makes admission of one operation atomic.
 	 *
-	 * Keyed by type, args and blog, so only identical dispatches wait on
-	 * each other. Waits up to five seconds for a holder to finish; a holder
-	 * that died frees it after 30 seconds. Without the lock the dispatch
-	 * goes ahead unserialised.
+	 * Keyed by type, args and blog. Waits up to five seconds; a dead holder's lock expires after 30 seconds; without
+	 * the lock the dispatch goes ahead unserialised.
 	 *
 	 * @param string       $type Job type slug.
 	 * @param array<mixed> $args Worker args.
@@ -383,18 +310,14 @@ final class Dispatcher {
 	}
 
 	/**
-	 * Run the job inline and capture the result. The progress callback is
-	 * a no-op in sync mode - sync callers expect a single result, not a
-	 * progress stream.
+	 * Run the job inline and capture the result; sync mode reports no progress.
 	 *
-	 * @param AbstractJob          $job
-	 * @param array<string, mixed> $args
+	 * @param AbstractJob          $job  Job descriptor.
+	 * @param array<string, mixed> $args Worker args.
 	 * @return array{mode: string, result?: array<string,mixed>, error?: string}
 	 */
 	private static function execute_inline( AbstractJob $job, array $args ): array {
-		// Sync callers don't care about progress; pass a no-op closure.
-		// `function () {}` rather than an arrow fn because the latter must
-		// have an expression body, which collides with the void contract.
+		// A closure, not an arrow fn: an arrow fn's expression body clashes with the void return type.
 		$noop = static function ( int $processed, int $total ): void {};
 
 		try {
@@ -412,18 +335,9 @@ final class Dispatcher {
 	}
 
 	/**
-	 * Resolve the Settings service or return null if it's not registered
-	 * yet (very early bootstrap).
+	 * Depth of the deepest nested array in `$value`, capped so the probe itself cannot exhaust the stack.
 	 *
-	 * @return Settings|null
-	 */
-	/**
-	 * Bounded recursion to measure the deepest nested-array path in
-	 * `$args`. Caps at 64 to keep the probe itself from blowing PHP's
-	 * stack - `array_depth(...) > $cap` short-circuits as soon as we
-	 * exceed the threshold the caller cares about.
-	 *
-	 * @param mixed $value
+	 * @param mixed $value  Value to measure.
 	 * @param int   $cap    Hard recursion ceiling.
 	 * @return int Depth of the deepest nested array (1 for a flat array).
 	 */
@@ -443,6 +357,11 @@ final class Dispatcher {
 		return $max;
 	}
 
+	/**
+	 * Resolve the Settings service, or null when it is not registered yet (early bootstrap).
+	 *
+	 * @return Settings|null
+	 */
 	private static function settings(): ?Settings {
 		try {
 			$plugin = Plugin::get_instance();

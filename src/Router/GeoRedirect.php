@@ -18,12 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Redirects first-time visitors to their country's language version
- * based on IP geolocation.
- *
- * Supports multiple GeoIP providers (free and paid), caches lookups
- * per IP in transients, and provides filter hooks for custom providers
- * and country-to-language mapping.
+ * Redirects first-time visitors to their country's language, using a GeoIP provider a site registers by filter.
  */
 final class GeoRedirect {
 
@@ -43,11 +38,7 @@ final class GeoRedirect {
 	private readonly ?CacheManager $cache;
 
 	/**
-	 * Per-request memo of the country → language slug map. Built lazily
-	 * by `get_country_map()` on first call; subsequent calls within the
-	 * same request return the cached array. Per-INSTANCE (not static) so
-	 * tests that mutate the saved option between calls see fresh data
-	 * after instantiating a new GeoRedirect.
+	 * Memo of get_country_map(); per instance, so a new instance reads the saved option again.
 	 *
 	 * @var array<string, string>|null
 	 */
@@ -59,8 +50,7 @@ final class GeoRedirect {
 	private const CB_THRESHOLD = 3;
 
 	/**
-	 * Rolling window (seconds) over which failures accumulate before
-	 * tripping the breaker.
+	 * Rolling window (seconds) over which failures trip the breaker.
 	 */
 	private const CB_WINDOW = 300; // 5 minutes.
 
@@ -72,11 +62,7 @@ final class GeoRedirect {
 	/**
 	 * Cloudflare's published edge IP ranges (https://www.cloudflare.com/ips/).
 	 *
-	 * CF-Connecting-IP is only trustworthy when the immediate peer really is
-	 * Cloudflare: a generic reverse proxy forwards a client-sent header of that
-	 * name verbatim, so REMOTE_ADDR is checked against this list first. A
-	 * stale list fails SAFE - CF-Connecting-IP is simply ignored and
-	 * detection falls back to X-Forwarded-For / REMOTE_ADDR.
+	 * A stale list fails safe: CF-Connecting-IP is ignored and X-Forwarded-For / REMOTE_ADDR are used.
 	 *
 	 * @var array<int, string>
 	 */
@@ -106,7 +92,7 @@ final class GeoRedirect {
 	];
 
 	/**
-	 * Built-in GeoIP provider definitions.
+	 * Built-in GeoIP provider definitions: none ship, sites add theirs through perflocale/geo/providers.
 	 *
 	 * @var array<string, array{name: string, needs_key: bool, key_setting: string}>
 	 */
@@ -117,32 +103,19 @@ final class GeoRedirect {
 	 *
 	 * @param Settings          $settings Plugin settings.
 	 * @param LanguageRouter    $router Language router.
-	 * @param CacheManager|null $cache Optional cache manager for circuit-
-	 *                                 breaker state; falls back to the
-	 *                                 plugin container when null.
+	 * @param CacheManager|null $cache Optional cache manager for the lookup cache; the container's when null.
 	 */
 	public function __construct( Settings $settings, LanguageRouter $router, ?CacheManager $cache = null ) {
 		$this->settings = $settings;
 		$this->router   = $router;
 		$this->cache    = $cache;
 
-		// Preserve the geo-specific breaker thresholds (3 fails, 15min
-		// cooldown - more conservative than the shared default of 5/5min
-		// because a single missed country lookup costs the visitor a
-		// wrong-language landing). Registered once per request via the
-		// static flag; subsequent GeoRedirect constructions are no-ops.
+		// Geo breaker thresholds (CB_*) for built-in providers only; filtered providers get the shared defaults.
 		self::register_geo_breaker_filters();
 	}
 
 	/**
-	 * Hook per-key breaker threshold/cooldown filters so geo_* breakers
-	 * keep the original GeoRedirect-specific tuning even after the
-	 * migration to the shared {@see PerfLocale\Concurrency\Breaker}
-	 * primitive.
-	 *
-	 * Idempotent - a process-wide static flag guards against re-adding
-	 * the filters when multiple GeoRedirect instances are constructed
-	 * in the same request.
+	 * Give each built-in provider's breaker the CB_* thresholds, once per request.
 	 *
 	 * @return void
 	 */
@@ -162,11 +135,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Lazily resolve a CacheManager instance.
-	 *
-	 * Prefers the one injected at construction time; falls back to the
-	 * plugin container so existing callers that don't pass a cache
-	 * instance still get the circuit-breaker behaviour.
+	 * The injected CacheManager, else the plugin container's (null before it is ready).
 	 *
 	 * @return CacheManager|null
 	 */
@@ -199,10 +168,7 @@ final class GeoRedirect {
 			return;
 		}
 
-		// Priority comes from `redirect_priority_order` so the admin's chosen
-		// first method runs first when both this and the browser-language
-		// redirect are enabled. Default order is ['geo','browser'] which
-		// resolves to priority 9 here (matching the previous hard-coded value).
+		// Priority 9 plus the position of 'geo' in `redirect_priority_order`: the admin's first method runs first.
 		$order    = $this->settings->get_redirect_priority_order();
 		$idx      = array_search( 'geo', $order, true );
 		$priority = $idx !== false ? 9 + (int) $idx : 10;
@@ -224,51 +190,31 @@ final class GeoRedirect {
 			return;
 		}
 
-		// Body-preserving methods only - a 302 would drop the POST payload
-		// and silently turn form submissions from anonymous first-time
-		// visitors into orphaned GETs on the language-prefixed URL.
+		// GET and HEAD only: a 302 would drop a form's POST body.
 		$method = strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) : 'GET' );
 
 		if ( $method !== 'GET' && $method !== 'HEAD' ) {
 			return;
 		}
 
-		// Feeds, robots.txt, favicon and trackbacks reach template_redirect
-		// before core handles them; a per-visitor geo 302 must not hijack them
-		// (a cookieless feed poller from a mapped country would flip a
-		// subscribed feed's language on every poll). URL-derived, so it stays
-		// ABOVE nocache_headers() to keep those responses cacheable.
+		// No 302 for feeds and the like (a cookieless poller would flip a feed's language).
+		// URL-derived checks stay above nocache_headers(), so these responses stay cacheable.
 		if ( is_feed() || is_trackback() || is_robots() || is_favicon() ) {
 			return;
 		}
 
-		// No automatic redirect when the language cookie can never be
-		// written: nothing would stop it from redirecting the visitor again
-		// on every default-language page. Config-derived, so it stays above
-		// nocache_headers() and the geo lookup below.
+		// Without a language cookie the redirect would repeat on every page. Config-derived: above nocache_headers().
 		if ( $this->router->language_cookie_never_written() ) {
 			return;
 		}
 
-		// Pages the admin excluded from language routing must not be
-		// geo-redirected either (single-language campaign landing pages).
-		// URL-derived - stays above nocache_headers() so excluded pages
-		// keep full-page cacheability, and above the geo lookup so no IP
-		// is ever sent to the provider for an excluded page.
+		// Excluded paths: no redirect, still cacheable, and no IP is sent to the provider.
 		if ( $this->router->is_excluded_request_path() ) {
 			return;
 		}
 
-		// From here on, whether this response is a 302 or a 200 depends on
-		// the INDIVIDUAL visitor (cookie, consent, bot UA, their country).
-		// If a full-page cache stores any of those 200s under the entry URL
-		// (a bot, a cookied visitor, or a same-country visitor primes it),
-		// PHP never runs for later visitors and the geo redirect is
-		// silently dead. This must fire BEFORE the visitor-specific
-		// declines below - only URL-derived conditions above it. Enabling
-		// geo redirect therefore trades cacheability of default-language
-		// entry pages for a redirect that actually fires; operators who
-		// need both should deploy the edge worker (assets/js/edge-helper.js).
+		// From here the 302-or-200 answer depends on the visitor, so a cached 200 would end the redirect for everyone:
+		// no-cache before every visitor-specific decline below. The edge worker (assets/js/edge-helper.js) keeps both.
 		if ( $this->router->is_default_language() && ! headers_sent() ) {
 			nocache_headers();
 		}
@@ -279,10 +225,7 @@ final class GeoRedirect {
 		}
 
 		/**
-		 * Consent gate - shared with the browser-language redirect.
-		 * Consent plugins return false while the visitor hasn’t accepted
-		 * non-strictly-necessary processing, suppressing the IP lookup
-		 * entirely (no request to the GeoIP provider is made).
+		 * Consent gate, shared with the browser-language redirect: false skips the IP lookup entirely.
 		 *
 		 * @hook perflocale/privacy/consent_given
 		 * @param bool $granted Default true.
@@ -302,8 +245,7 @@ final class GeoRedirect {
 			return;
 		}
 
-		// Skip bots / crawlers. Single source of truth for the detection
-		// pattern lives in LanguageRouter::is_bot_ua().
+		// Skip bots: LanguageRouter::is_bot_ua() is the one detection pattern.
 		$ua = sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ?? '' ) );
 
 		if ( \PerfLocale\Router\LanguageRouter::is_bot_ua( $ua ) ) {
@@ -311,13 +253,7 @@ final class GeoRedirect {
 		}
 
 		/**
-		 * Final short-circuit before the IP lookup is performed.
-		 *
-		 * Integrators commonly want to skip GeoIP redirects for authenticated
-		 * users (they already picked a language), for specific URL patterns
-		 * (/api/*, /webhook/*), or for returning visitors that were brought
-		 * back by a campaign link. Returning false here stops the redirect
-		 * and, crucially, avoids the outbound IP-lookup request.
+		 * Final short-circuit before the IP lookup: false stops the redirect and the outbound lookup.
 		 *
 		 * @hook perflocale/geo/should_redirect
 		 *
@@ -386,9 +322,7 @@ final class GeoRedirect {
 		/** @var UrlConverter $converter */
 		$converter = $plugin->get( 'url_converter' );
 
-		// Current URL via the shared builder: REQUEST_URI already contains the
-		// home path, so a plain home_url( add_query_arg( [] ) ) doubles a
-		// subfolder install's prefix. See LanguageRouter::current_request_url().
+		// The shared builder: REQUEST_URI holds the home path, so home_url() around it doubles a subfolder prefix.
 		$current_url  = \PerfLocale\Router\LanguageRouter::current_request_url();
 		$redirect_url = $converter->convert( $current_url, $language_slug );
 
@@ -396,12 +330,8 @@ final class GeoRedirect {
 			return;
 		}
 
-		// A singular landing that would answer 404 or send the visitor back to
-		// the default language gets no redirect. This returns before the
-		// target-language cookie is written and before perflocale/geo/redirected
-		// fires. The default-language cookie LanguageRouter::detect_language()
-		// sets on this request still marks the visitor as returning, so later
-		// pages do not redirect them either.
+		// No redirect to a landing that would 404 or bounce back; the default-language cookie
+		// detect_language() set on this request still marks the visitor as returning.
 		if ( ! $this->router->first_visit_landing_serves( $language_slug ) ) {
 			return;
 		}
@@ -415,17 +345,10 @@ final class GeoRedirect {
 		// Append a sentinel so even cookie-blocked browsers don't redirect twice.
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
-		// This 302 is a per-visitor language decision (geo/cookie-driven) on a
-		// shared URL - mark it uncacheable so an edge/server cache that stores
-		// 3xx (Varnish, nginx fastcgi_cache) can't pin one visitor's redirect
-		// onto everyone. Plugin page caches already skip it via the Set-Cookie
-		// above; this covers caches that ignore Set-Cookie on redirects.
-		// In domain/subdomain url-mode the target lives on a different host;
-		// whitelist it for this single redirect so wp_safe_redirect() doesn't
-		// reject the cross-host URL and fall back to /wp-admin/. No-op in
-		// subdirectory mode (same host is already allowed).
+		// Domain mode: allow the target host, or wp_safe_redirect() falls back to /wp-admin/.
 		$this->allow_redirect_host( $redirect_url );
 
+		// A cache that stores 3xx (Varnish, nginx) would otherwise pin one visitor's 302 on everyone.
 		nocache_headers();
 		wp_safe_redirect( $redirect_url, 302 );
 		exit;
@@ -457,33 +380,19 @@ final class GeoRedirect {
 	/**
 	 * Look up the country code for an IP address.
 	 *
-	 * Checks transient cache first, then calls the configured provider.
-	 * Custom providers can bypass built-in ones via the
-	 * perflocale/geo/lookup_country filter.
+	 * The cache first, then perflocale/geo/lookup_country, then the configured provider.
 	 *
 	 * @param string $ip Visitor IP address.
 	 * @return string Two-letter country code (uppercase) or empty string.
 	 */
 	private function lookup_country( string $ip ): string {
-		// Cache-key derivation is privacy-load-bearing: a bare md5(ip) is
-		// reversible over the 4-billion-address IPv4 space, so persisting it
-		// (options table / Redis, 24h) stores personal data. Anonymize the
-		// host bits first (core's /24 / v6-prefix zeroing - country lookups
-		// are stable at that granularity) and HMAC with a site salt so the
-		// stored key can't be dictionary-reversed offline. Bonus: one entry
-		// now serves the whole /24, cutting provider lookups.
+		// Privacy: key on a salted HMAC of the anonymized /24 (or v6 prefix), never the IP; a hashed IP is reversible.
 		$anon      = function_exists( 'wp_privacy_anonymize_ip' ) ? wp_privacy_anonymize_ip( $ip ) : $ip;
 		$cache_key = 'ip_' . hash_hmac( 'sha256', (string) $anon, wp_salt( 'auth' ) );
 		$cache     = $this->cache();
 
-		// 3-layer cache lookup via CacheManager. If the cache container
-		// isn't available (very rare - only on early-boot edge paths) we
-		// fall through and query the provider uncached.
 		if ( $cache instanceof CacheManager ) {
-			// Read-only: only POSITIVE results are ever written (see set() below),
-			// so any non-empty hit is a real country code - no sentinel needed.
-			// get_cached() (not get()) means a MISS writes nothing, so unseen
-			// IPs never add negative-result rows.
+			// get_cached(), not get(): a miss writes nothing, so unseen IPs add no rows.
 			$cached = $cache->get_cached( $cache_key, 'perflocale_geo_lookup' );
 
 			if ( is_string( $cached ) && $cached !== '' ) {
@@ -506,24 +415,11 @@ final class GeoRedirect {
 
 		$country_code = strtoupper( sanitize_key( $country_code ) );
 
-		// Cache the result. Two-tier TTL:
-		// - Successful lookup (non-empty country): full configured window.
-		// - Empty result (provider 429 / 5xx / network hiccup / bad IP):
-		// short window so transient provider failures recover quickly
-		// instead of locking visitors out for the full cache duration.
-		// 0 = caching disabled - every request queries the provider.
+		// 0 hours: no cache, every request asks the provider.
 		$cache_hours = (int) $this->settings->get( 'geo_cache_hours', 24 );
 
 		if ( $cache_hours > 0 && $country_code !== '' && $cache instanceof CacheManager ) {
-			// Only cache POSITIVE results. Empty-result writes are skipped:
-			// on no-external-object-cache sites every wp_options write costs
-			// 2 rows (transient value + transient timeout), and the cache
-			// key is derived from $ip, so negative-result rows would grow
-			// with the number of distinct client IPs until the daily GC
-			// sweep reaps them. Inline-fail recovery still works because L1
-			// (in-request static) prevents repeated provider calls within a
-			// single request; subsequent requests just re-call the provider
-			// (cheap when the breaker is OPEN, sub-µs short-circuit there).
+			// Positive results only: negative rows per client network would fill wp_options; the breaker keeps retries cheap.
 			$ttl = $cache_hours * HOUR_IN_SECONDS;
 			$cache->set( $cache_key, $country_code, $ttl, 'perflocale_geo_lookup' );
 		}
@@ -534,11 +430,7 @@ final class GeoRedirect {
 	/**
 	 * Call the configured GeoIP provider API.
 	 *
-	 * A per-provider circuit breaker sits in front of the actual fetch: if
-	 * the provider has recently returned empty/errored {@see self::CB_THRESHOLD}
-	 * times within {@see self::CB_WINDOW}, subsequent requests short-circuit
-	 * for {@see self::CB_COOLDOWN} instead of paying the 5-second HTTP
-	 * timeout on every new visitor.
+	 * A per-provider circuit breaker skips a failing provider instead of paying its timeout for every visitor.
 	 *
 	 * @param string $ip IP address.
 	 * @return string Two-letter country code or empty string.
@@ -586,13 +478,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Check whether the circuit breaker for this provider is currently open
-	 * (i.e., we should skip the HTTP call).
-	 *
-	 * Delegates to the shared {@see PerfLocale\Concurrency\Breaker} so the
-	 * Site Health "circuit breakers" card lists every open breaker in one
-	 * place (MT, webhooks, FX sync, geo, scoring). Same transient-backed
-	 * storage so cache eviction behaviour matches.
+	 * Whether this provider's breaker is open (skip the call); the shared Breaker, so Site Health lists it.
 	 *
 	 * @param string $provider_id Provider ID.
 	 * @return bool
@@ -612,8 +498,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Record a failed provider call and trip the breaker when the threshold
-	 * is reached inside the rolling window.
+	 * Record a failed provider call; the breaker trips at its threshold within the window.
 	 *
 	 * @param string $provider_id Provider ID.
 	 * @return void
@@ -625,7 +510,7 @@ final class GeoRedirect {
 	/**
 	 * Fetch from a custom provider registered via filter.
 	 *
-	 * Custom providers should add a 'fetch_callback' key to their definition.
+	 * The definition's `fetch_callback` receives the IP and the settings.
 	 *
 	 * @param string               $provider_id Provider ID.
 	 * @param array<string, mixed> $provider Provider definition.
@@ -650,8 +535,7 @@ final class GeoRedirect {
 	/**
 	 * Map a country code to a language slug.
 	 *
-	 * Uses the geo_country_map setting, with auto-population from
-	 * active language flag fields as fallback.
+	 * From get_country_map(), through the perflocale/geo/country_map filter.
 	 *
 	 * @param string $country_code Two-letter uppercase country code.
 	 * @return string Language slug or empty string.
@@ -666,23 +550,9 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Build the country-to-language mapping.
+	 * Build the country-to-language mapping: saved geo_country_map codes, then the locale region of uncovered languages.
 	 *
-	 * Two layers, in order:
-	 *   1. Saved `geo_country_map` setting - explicit per-language ISO
-	 *      country codes. Filtered server-side: the default language is
-	 *      dropped (an explicit default mapping over-redirects), and
-	 *      non-ISO entries are dropped (defends against legacy emoji
-	 *      saves from before this hardening pass).
-	 *   2. Locale-derived fallback - for languages NOT covered by the
-	 *      saved map AND whose `locale` carries an ISO country part
-	 *      (`en_US` → `US`, `de_DE` → `DE`). The default language is
-	 *      excluded here too.
-	 *
-	 * Generic-locale languages (e.g. `ar` with no `_XX` suffix) are
-	 * intentionally not auto-derived - the admin must configure them
-	 * explicitly because there's no single right answer (Arabic spans
-	 * SA/EG/AE/JO/MA/DZ/etc.).
+	 * Both skip the default language (mapping it over-redirects); a locale without a region (`ar`) is never derived.
 	 *
 	 * @return array<string, string> ISO country code (uppercase) => language slug.
 	 */
@@ -705,15 +575,12 @@ final class GeoRedirect {
 
 		$saved_map = (array) $this->settings->get( 'geo_country_map', [] );
 		$map       = [];
-		$covered   = []; // slugs that already have at least one mapped code → skip auto-derive for these.
+		$covered   = []; // Slugs with a saved code are not derived.
 
 		foreach ( $saved_map as $lang_slug => $codes_string ) {
 			$lang_slug = (string) $lang_slug;
 
-			// Defense in depth: even if a stale option still has a
-			// default-language entry from before the save-time guard,
-			// silently drop it at read time so old data doesn't override
-			// the "stays on default" behaviour.
+			// A stored default-language entry is dropped at read time too.
 			if ( $default_slug !== '' && $lang_slug === $default_slug ) {
 				continue;
 			}
@@ -732,8 +599,7 @@ final class GeoRedirect {
 			}
 		}
 
-		// Auto-derive from `locale` for any active non-default language
-		// the saved map didn't cover.
+		// Derive from the locale for active non-default languages the saved map does not cover.
 		foreach ( $lang_repo->get_active() as $lang ) {
 			$slug = (string) ( $lang->slug ?? '' );
 
@@ -744,7 +610,7 @@ final class GeoRedirect {
 			$parts = explode( '_', (string) ( $lang->locale ?? '' ) );
 
 			if ( ! isset( $parts[1] ) || ! preg_match( '/^[A-Za-z]{2}$/', $parts[1] ) ) {
-				continue; // generic locale like `ar` - admin must configure explicitly.
+				continue; // No region (`ar`): only the admin can map it.
 			}
 
 			$code = strtoupper( substr( $parts[1], 0, 2 ) );
@@ -762,26 +628,13 @@ final class GeoRedirect {
 	/**
 	 * Get the visitor's real IP address.
 	 *
-	 * Supports proxies via X-Forwarded-For and CF-Connecting-IP headers.
+	 * REMOTE_ADDR unless proxy headers are trusted and the peer is a trusted proxy.
 	 *
 	 * @return string IP address or empty string.
 	 */
 	private function get_visitor_ip(): string {
-		// Proxy headers are CLIENT-CONTROLLED on a default WordPress install
-		// - X-Forwarded-For / CF-Connecting-IP / X-Real-IP arrive as the
-		// client sent them - so they are not trusted by default.
-		//
-		// Site operators who run behind a real reverse proxy (Cloudflare,
-		// Nginx with proxy_set_header, AWS ALB) must opt in by setting
-		// `geo_trust_proxy_headers => true` AND providing a
-		// `geo_trusted_proxies` CIDR allow-list. The proxy header is only
-		// honoured when REMOTE_ADDR is inside the allow-list (i.e. the
-		// request actually came from the configured reverse proxy).
-		//
-		// Without opt-in we fall back to REMOTE_ADDR, which the web server
-		// sets from the TCP socket peer and cannot be spoofed at the
-		// application layer. Loses Cloudflare/ALB awareness for non-opted-
-		// in sites; trades closed-by-default for accuracy on those edges.
+		// Proxy headers are client-controlled: used only with geo_trust_proxy_headers and a peer in geo_trusted_proxies.
+		// Both settings stay out of the defaults and the UI on purpose (secure by default, opt in from code).
 		$remote_addr = sanitize_text_field( wp_unslash( (string) ( $_SERVER['REMOTE_ADDR'] ?? '' ) ) );
 
 		if ( ! (bool) $this->settings->get( 'geo_trust_proxy_headers', false ) ) {
@@ -792,11 +645,7 @@ final class GeoRedirect {
 			return $remote_addr;
 		}
 
-		// Cloudflare - CF-Connecting-IP is a single, chain-less value that only
-		// Cloudflare sets authoritatively (it strips any client-sent copy). A
-		// generic nginx/ALB forwards a client-sent header of the same name
-		// verbatim, so honour it ONLY when the immediate peer is a published
-		// Cloudflare edge address; otherwise it is client-controlled.
+		// CF-Connecting-IP only from a Cloudflare edge peer: other proxies forward a client-sent copy verbatim.
 		if ( ! empty( $_SERVER['HTTP_CF_CONNECTING_IP'] ) && $this->is_cloudflare_ip( $remote_addr ) ) {
 			$cf_ip = trim( sanitize_text_field( wp_unslash( (string) $_SERVER['HTTP_CF_CONNECTING_IP'] ) ) );
 
@@ -805,13 +654,8 @@ final class GeoRedirect {
 			}
 		}
 
-		// X-Forwarded-For - a well-behaved proxy APPENDS the address it saw, so
-		// the real client is the RIGHTMOST entry that is not itself one of our
-		// trusted proxies. Walking right-to-left and skipping trusted hops
-		// discards any addresses the client prepended (they sit to the left of
-		// what the first trusted proxy appended). Operators with multi-tier
-		// chains must list every internal hop's CIDR in geo_trusted_proxies,
-		// else resolution stops at the first unlisted (inner) proxy.
+		// X-Forwarded-For: the client is the rightmost hop that is not a trusted proxy (a client can only prepend).
+		// Multi-tier chains must list every internal hop in geo_trusted_proxies.
 		if ( ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
 			$hops = explode( ',', sanitize_text_field( wp_unslash( (string) $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) );
 
@@ -830,9 +674,7 @@ final class GeoRedirect {
 			}
 		}
 
-		// X-Real-IP - single value set by the trusted proxy itself (nginx
-		// proxy_set_header). Trust it only as a direct value from that proxy,
-		// validated, after the forgery-resistant X-Forwarded-For walk.
+		// X-Real-IP: one value the trusted proxy sets, used after the X-Forwarded-For walk.
 		if ( ! empty( $_SERVER['HTTP_X_REAL_IP'] ) ) {
 			$real_ip = trim( sanitize_text_field( wp_unslash( (string) $_SERVER['HTTP_X_REAL_IP'] ) ) );
 
@@ -845,9 +687,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Check whether REMOTE_ADDR is inside the configured trusted-proxy
-	 * CIDR allow-list. Supports both bare IPs (`203.0.113.10`) and CIDR
-	 * blocks (`10.0.0.0/8`, `192.168.0.0/16`, IPv6 `2001:db8::/32`).
+	 * Whether an address is in geo_trusted_proxies (bare IPs or IPv4/IPv6 CIDR blocks).
 	 *
 	 * @param string $remote_addr REMOTE_ADDR for the current request.
 	 * @return bool
@@ -894,10 +734,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Whether an IP falls inside Cloudflare's published edge ranges - used to
-	 * authenticate that a CF-Connecting-IP header genuinely came from
-	 * Cloudflare (REMOTE_ADDR is a CF edge) rather than a client forgery
-	 * forwarded by a generic proxy.
+	 * Whether an IP is in Cloudflare's published edge ranges, so its CF-Connecting-IP header is genuine.
 	 *
 	 * @param string $ip Candidate address (REMOTE_ADDR).
 	 * @return bool
@@ -929,8 +766,7 @@ final class GeoRedirect {
 	}
 
 	/**
-	 * Byte-wise prefix comparison for IPv4/IPv6 in their packed `inet_pton`
-	 * form. $a and $b must be the same length (both 4 or both 16 bytes).
+	 * Byte-wise prefix comparison of two packed `inet_pton` addresses of the same length.
 	 *
 	 * @param string $a Packed candidate address.
 	 * @param string $b Packed subnet address.
@@ -969,7 +805,6 @@ final class GeoRedirect {
 	 * @return array<string, object>
 	 */
 	private function get_slug_map(): array {
-		$cache     = \PerfLocale\Plugin::get_instance()->get( 'cache' );
 		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
 		return $lang_repo->get_slug_map();
 	}
@@ -977,11 +812,7 @@ final class GeoRedirect {
 	/**
 	 * Get the available provider definitions.
 	 *
-	 * No providers ship with the plugin - the list is whatever the site
-	 * registers through `perflocale/geo/providers`. The same filter is
-	 * applied on the lookup path, so the admin picker and the runtime
-	 * resolver always agree on which providers exist; without it a
-	 * site-registered provider could never be selected in Settings.
+	 * No providers ship: the same perflocale/geo/providers filter as the lookup path, so the Settings picker agrees.
 	 *
 	 * @return array<string, array<string, mixed>>
 	 */

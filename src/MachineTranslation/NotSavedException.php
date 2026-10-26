@@ -14,12 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * A save check refused the machine translation (the block structure guard, a
- * block or shortcode marker that came back damaged), so nothing was written.
- * Its message is a whole sentence that already says the translation was not
- * saved and why. Every caller that catches RuntimeException catches it as
- * before; a caller that shows the message can show it without saying "not
- * saved" again.
+ * A save check refused the machine translation, so nothing was written.
+ *
+ * The message already says "not saved" and why: show it as it is.
  */
 final class NotSavedException extends \RuntimeException {
 }

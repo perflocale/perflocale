@@ -115,13 +115,8 @@ final class AddonsPage {
 				'icon'        => 'dashicons-chart-area',
 				'requires'    => __( 'Slim SEO plugin', 'perflocale' ),
 				'plugin_file' => 'slim-seo/slim-seo.php',
-				// Must match AddonRegistry::bundled_manifest()['slimseo']['compat']
-				// and PerfLocaleSlimSeo::is_compatible() exactly. Slim SEO 4.x
-				// renamed SlimSEO\Plugin → SlimSEO\Core (verified against 4.9.11);
-				// the registry was updated and this page was not, so the addon
-				// booted while the page badged it "Not active" on every site
-				// running Slim SEO 4. A display check that disagrees with the boot
-				// check is the bug, not the class name - keep the three in sync.
+				// Must match AddonRegistry::bundled_manifest()['slimseo']['compat'] and
+				// PerfLocaleSlimSeo::is_compatible(): Slim SEO 4 names its class SlimSEO\Core.
 				'check'       => fn() => class_exists( 'SlimSEO\\Core' ) || class_exists( 'SlimSEO\\Plugin' ),
 			],
 			'woocommerce'         => [
@@ -208,17 +203,9 @@ final class AddonsPage {
 			],
 			'gravity-forms'       => [
 				'name'        => 'Gravity Forms',
-				// ⚠️ Deliberately worded differently from the Contact Form 7 and
-				// WPForms cards. Those two create a translation POST you edit in
-				// the host's own builder. Gravity Forms keeps its forms in its
-				// own gf_form* tables - a GF form id is not a post id - so there
-				// is no translation record and no screen to edit one. The addon
-				// applies translations at render (gform_pre_render /
-				// _pre_validation / _pre_submission_filter), but the translations
-				// themselves have to be supplied by the operator through the
-				// `perflocale/gravity_forms/form_translations` filter or
-				// save_translations(). The old copy promised the same experience
-				// as the other two form addons and there was nothing behind it.
+				// Worded unlike the CF7 and WPForms cards on purpose: GF forms are not posts, so there is
+				// no translation to edit; translations come from the
+				// `perflocale/gravity_forms/form_translations` filter or save_translations().
 				'description' => __( 'Apply translated labels, choices, and confirmations at render time. Supplied by filter or API - Gravity Forms keeps forms in its own tables, so there is no per-language form editor.', 'perflocale' ),
 				'category'    => 'forms',
 				'icon'        => 'dashicons-feedback',
@@ -284,15 +271,11 @@ final class AddonsPage {
 		$addons     = $this->get_addon_registry();
 		$categories = $this->get_categories();
 
-		// Auto-show addons registered via perflocale/addons/register that
-		// didn't add a card via the perflocale/addons/registry filter.
-		// Reads optional get_card_info() for category, icon, description, etc.
+		// Registered add-ons without a card from the registry filter get one from get_card_info().
 		$plugin   = \PerfLocale\Plugin::get_instance();
 		$registry = $plugin->has( 'addon_registry' ) ? $plugin->get( 'addon_registry' ) : null;
 
-		// Index of registered addon instances so the per-card section can
-		// pull get_settings_fields() / version requirement from the same
-		// source. Keyed by addon ID.
+		// Registered add-on instances by ID, for each card's settings fields.
 		$addon_instances = [];
 
 		if ( $registry !== null ) {
@@ -322,8 +305,7 @@ final class AddonsPage {
 		$version_mismatches = $registry !== null ? $registry->get_version_mismatches() : [];
 		$disabled_ids       = \PerfLocale\Addon\AddonRegistry::get_disabled();
 		$quarantined_ids    = $registry !== null ? $registry->get_quarantined_ids() : [];
-		// Addons whose own is_compatible() returned false. method_exists keeps this
-		// safe if an older registry is somehow in play.
+		// Addons whose own is_compatible() returned false; method_exists guards an older registry.
 		$incompatible_ids   = ( $registry !== null && method_exists( $registry, 'get_incompatible_ids' ) )
 			? $registry->get_incompatible_ids()
 			: [];
@@ -343,40 +325,22 @@ final class AddonsPage {
 			$status_filter = 'all';
 		}
 
-		// IDs that the Addons page treats as built-in features (cards
-		// exist but they aren't registry-registered addons - their
-		// on/off state is the underlying Settings flag, not the
-		// disabled-addons option).
+		// Built-in feature cards: their on/off state is a Settings flag, not the disabled-addons option.
 		$builtin_feature_ids = [ 'machine-translation' ];
 
-		// Precompute status for each addon. Status is one of:
-		// 'active'        - addon is doing work right now
-		// 'disabled'      - operator turned it off (registry or feature flag)
-		// 'installed'     - host plugin/theme detected but addon not booted
-		// (typically blocked by addon's own compat check)
-		// 'not_installed' - host plugin/theme absent on disk
-		//
-		// Order of checks matters: 'disabled' wins over 'active' so a
-		// disabled WC addon doesn't show up under the Active tab just
-		// because WooCommerce is loaded.
+		// Status per addon: active, disabled (operator off), blocked (host present, registry did not
+		// boot it), installed (host on disk, not booted) or not_installed. Disabled wins over a loaded
+		// host; only a filter-booted addon reads active despite the list.
 		$addon_statuses  = [];
 		$active_count    = 0;
 		$disabled_count  = 0;
 		$installed_count = 0;
 
 		foreach ( $addons as $addon_id => $addon ) {
-			// Check disabled FIRST, before active. A disabled addon
-			// shouldn't read as "active" just because its host plugin
-			// is loaded - the user's intent (clicked Disable) overrides
-			// the auto-detection.
+			// The operator's Disable beats host detection.
 			$is_disabled = in_array( $addon_id, $disabled_ids, true );
 
-			// Built-in features have their own toggle (the Settings flag
-			// the toggle handler writes to). When the flag is off, the
-			// check() callback already returns false. So we don't need
-			// a second source of truth - but we DO want the card to read
-			// "Disabled" instead of "Not installed" for these because
-			// they're always installed (they're part of the plugin).
+			// Built-in features are always installed: an off flag reads Disabled, not Not installed.
 			$is_builtin = in_array( $addon_id, $builtin_feature_ids, true );
 
 			// A `perflocale/addon/enabled` callback can boot an addon the list
@@ -397,14 +361,8 @@ final class AddonsPage {
 			$check     = $addon['check'] ?? null;
 			$is_active = is_callable( $check ) ? (bool) $check() : false;
 
-			// An addon the registry refused to boot must never badge "Active".
-			// `check()` answers "is the host plugin present?", which stays true
-			// while the addon is quarantined after repeated boot failures, or
-			// skipped because it needs a newer PerfLocale, or because its own
-			// is_compatible() said no, or because a site filter turned it off for
-			// this request. The card said Active, the quarantine banner on the
-			// same screen said otherwise, and the operator had no way to tell
-			// which was true. Counted as installed-not-active, which is what it is.
+			// `check()` only finds the host plugin: a quarantined, version-gated, incompatible or
+			// filtered-off addon never badges Active and counts as installed.
 			if (
 				in_array( $addon_id, (array) $quarantined_ids, true )
 				|| isset( $version_mismatches[ $addon_id ] )
@@ -422,9 +380,7 @@ final class AddonsPage {
 				continue;
 			}
 
-			// Built-in features whose flag is off → 'disabled'
-			// (semantically: turned off by the operator), NOT
-			// 'not_installed' which would imply the plugin is missing.
+			// Built-in feature with its flag off.
 			if ( $is_builtin ) {
 				$addon_statuses[ $addon_id ] = 'disabled';
 				++$disabled_count;
@@ -633,12 +589,7 @@ final class AddonsPage {
 				</a>
 
 				<?php
-				// "Inactive" tab - everything that's not currently
-				// booted, regardless of why (operator-disabled, host
-				// plugin not installed, or host detected but addon
-				// didn't pass compat). The per-card badge still shows
-				// the specific reason so operators can see what's going
-				// on at a glance.
+				// "Inactive" tab - everything not booted, whatever the reason; each card's badge names it.
 				$inactive_count = count( $addons ) - $active_count;
 				$inactive_url   = add_query_arg(
 					[
@@ -655,14 +606,8 @@ final class AddonsPage {
 			</div>
 			</div>
 				<?php
-				// Scroll indicator. Drawn by us rather than left to the native
-				// scrollbar: iOS and Android render scrollbars as transient
-				// overlays and iOS ignores ::-webkit-scrollbar entirely, so a
-				// native bar cannot be made to stay visible on the devices that
-				// actually need the hint. aria-hidden because it is decorative -
-				// the strip is already reachable by keyboard through the tabs
-				// themselves. It stays hidden until JS measures an overflow, so
-				// with JS off nothing misleading is drawn.
+				// Own scroll indicator: mobile scrollbars are transient overlays and iOS ignores
+				// ::-webkit-scrollbar. Decorative, and hidden until JS measures an overflow.
 				?>
 				<div class="perflocale-addons-tabs-bar" aria-hidden="true"><span></span></div>
 			</div>
@@ -673,13 +618,7 @@ final class AddonsPage {
 				foreach ( $addons as $addon_id => $addon ) :
 					$addon_status = $addon_statuses[ $addon_id ] ?? 'not_installed';
 
-					// Status filter: Active matches only running addons;
-					// Inactive matches everything that's NOT active
-					// regardless of why (disabled by operator, host
-					// plugin not installed, or addon failed its own
-					// compat check). The per-card badge below still
-					// shows the specific reason. Anything else falls
-					// through to the per-category filter.
+					// Active and Inactive filter by status; otherwise the category filter applies.
 					if ( $status_filter === 'active' ) {
 						if ( $addon_status !== 'active' ) {
 							continue;
@@ -695,11 +634,7 @@ final class AddonsPage {
 						}
 					}
 
-					// Card-render flags derived from the precomputed status.
-					// $addon_status was already resolved in the precompute
-					// loop above with 'disabled' winning over 'active', so
-					// a disabled addon's WC plugin being loaded doesn't
-					// make this card read as "Active" any more.
+					// Card flags from the precomputed status, where disabled wins over a loaded host.
 					$is_active    = ( $addon_status === 'active' );
 					$is_disabled  = ( $addon_status === 'disabled' );
 					$is_installed = ( $addon_status === 'installed' );
@@ -708,10 +643,7 @@ final class AddonsPage {
 					$is_switched_off = $is_disabled || in_array( $addon_id, $disabled_ids, true );
 
 					if ( $addon_status === 'blocked' ) {
-						// Installed, host plugin present, but the registry did not
-						// boot it - quarantined, version-gated, self-declared
-						// incompatible, or turned off by a site filter. "Not
-						// running" rather than "Active".
+						// Host present, but the registry did not boot it.
 						$status_class = 'perflocale-addon-card__status--inactive';
 						$status_label = __( 'Not running', 'perflocale' );
 					} elseif ( $is_disabled ) {
@@ -728,8 +660,7 @@ final class AddonsPage {
 						$status_label = __( 'Not installed', 'perflocale' );
 					}
 
-					// Look up the registered addon instance - gives us the
-					// canonical settings fields + version requirement.
+					// Registered instance, for the settings fields.
 					$addon_instance  = $addon_instances[ $addon_id ] ?? null;
 					$settings_fields = [];
 
@@ -741,9 +672,7 @@ final class AddonsPage {
 						}
 					}
 
-					// Drop non-editable types (e.g. 'hidden') from the inline
-					// form - they're addon-managed and the generic save path
-					// preserves them automatically.
+					// Non-editable fields (e.g. 'hidden') are add-on managed; the save path keeps them.
 					$editable_fields = [];
 					foreach ( $settings_fields as $field_key => $field_def ) {
 						if ( is_string( $field_key ) && is_array( $field_def ) && \PerfLocale\Addon\AddonSettings::is_user_editable_field( $field_def ) ) {
@@ -754,12 +683,7 @@ final class AddonsPage {
 					$current_values = ! empty( $editable_fields ) ? \PerfLocale\Addon\AddonSettings::get_addon( $addon_id ) : [];
 					?>
 					<?php
-					// Surface the most recent boot / migration / uninstall
-					// error inline so operators don't need to SSH + tail
-					// error_log to find out why an addon is quarantined or
-					// in an unexpected state. AddonMigrationErrors reads a
-					// single autoload=no option; per-card loop is fine
-					// since a typical install has fewer than ~30 cards.
+					// Last boot, migration or uninstall error, shown on the card.
 					$last_error     = \PerfLocale\Addon\AddonMigrationErrors::last_for_addon( $addon_id );
 					$is_quarantined = in_array( $addon_id, $quarantined_ids, true );
 					?>
@@ -776,9 +700,7 @@ final class AddonsPage {
 							<p><?php echo esc_html( $addon['description'] ); ?></p>
 							<?php
 							if ( $last_error !== null ) :
-								// Truncate stack-trace-like messages so the card
-								// stays readable; full text is in
-								// `wp perflocale addon errors <id>`.
+								// Truncated; `wp perflocale addon errors <id>` prints the full text.
 								$msg     = (string) ( $last_error['message'] ?? '' );
 								$display = mb_strlen( $msg ) > 200 ? mb_substr( $msg, 0, 200 ) . '…' : $msg;
 								$stage   = (string) ( $last_error['stage'] ?? '' );
@@ -815,11 +737,8 @@ final class AddonsPage {
 							<?php endif; ?>
 						</div>
 						<?php
-						// Built-in features (Machine Translation) have no registry
-						// instance, but they DO have a toggle: AdminController's
-						// BUILTIN_FEATURE_TOGGLES maps the card to its Settings flag.
-						// Gating this form on $addon_instance alone meant the MT card
-						// rendered "Enable here" with no Enable button on it.
+						// Built-in features have no registry instance but still toggle:
+						// AdminController's BUILTIN_FEATURE_TOGGLES maps the card to its Settings flag.
 						$perflocale_card_toggleable = ( $addon_instance !== null || in_array( $addon_id, $builtin_feature_ids, true ) );
 						?>
 						<?php if ( $perflocale_card_toggleable && current_user_can( 'perflocale_manage_addons' ) ) : ?>
@@ -847,12 +766,8 @@ final class AddonsPage {
 
 						<div class="perflocale-addon-card__footer">
 							<?php
-							// Manage URL: first preference is an explicitly-declared
-							// settings_tab (e.g. machine-translation, woocommerce
-							// - the built-in tabs that ship with the plugin). Second preference is the auto-generated
-							// per-addon subtab - any registered addon with user-
-							// editable get_settings_fields() gets one for free
-							// (see SettingsPage::get_addon_subtabs).
+							// Manage URL: the declared settings_tab, else the per-addon subtab that every add-on
+							// with editable settings fields gets (SettingsPage::get_addon_subtabs).
 							$settings_tab = sanitize_key( $addon['settings_tab'] ?? '' );
 
 							if ( $settings_tab === '' && ! empty( $editable_fields ) ) {
@@ -876,11 +791,7 @@ final class AddonsPage {
 								</a>
 								<span class="perflocale-addon-card__auto" style="color: var(--perflocale-gray-text);">
 									<?php
-									// Reuse the status already resolved above. Hard-coding
-									// "Not installed" made a built-in feature that is merely
-									// switched off - Machine Translation on a default install -
-									// read "Disabled" in its header and "Not installed" in its
-									// footer at the same time.
+									// The resolved status, so a switched-off built-in feature matches its header.
 									echo esc_html( $status_label );
 									?>
 								</span>

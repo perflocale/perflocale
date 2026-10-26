@@ -14,12 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Persistent log of per-addon migration + custom-uninstall errors.
+ * Persistent log of per-addon boot, migration and uninstall errors, in one non-autoloaded option.
  *
- * Records are stored in the `perflocale_addon_migration_errors` option
- * (autoload=false) keyed by `{addon_id}:{stage}:{version}` so the same
- * error doesn't accumulate duplicate entries on every retry. Shows one
- * admin notice per unique record until cleared.
+ * Keyed by `{addon_id}:{stage}:{detail}`, so a retry replaces its record; the admin notice lists the latest five.
  */
 final class AddonMigrationErrors {
 
@@ -30,9 +27,8 @@ final class AddonMigrationErrors {
 	 * Record an error.
 	 *
 	 * @param string     $addon_id Addon identifier.
-	 * @param string     $stage Short stage label: 'migrate', 'custom_uninstall',
-	 *     'custom_uninstall_skipped', 'purge'.
-	 * @param string|int $detail Version number for migrate stage, or message string.
+	 * @param string     $stage Stage label, e.g. 'boot', 'schema', 'migrate', 'purge_validation', 'custom_uninstall'.
+	 * @param string|int $detail The version for 'migrate' and 'schema', else a short label.
 	 * @param string     $message Human-readable error message.
 	 * @return void
 	 */
@@ -50,7 +46,7 @@ final class AddonMigrationErrors {
 					'recorded' => gmdate( 'c' ),
 				];
 
-				// Keep the log bounded - newest 200 entries.
+				// Bounded to the last 200 entries.
 				if ( count( $records ) > 200 ) {
 					$records = array_slice( $records, -200, null, true );
 				}
@@ -62,11 +58,9 @@ final class AddonMigrationErrors {
 	}
 
 	/**
-	 * Serialize a read-modify-write on the error option under the concurrency
-	 * lock so two simultaneous record()/clear() calls (multi-addon activation,
-	 * overlapping scheduled migrations) can't lose each other's writes. Falls
-	 * back to an unlocked run if the lock is unavailable/contended - this is a
-	 * best-effort error log, never durable system state.
+	 * Run a read-modify-write of the option under a lock, so concurrent record()/clear() calls keep each other's writes.
+	 *
+	 * Runs unlocked when the lock is held or missing: this is a best-effort log, not system state.
 	 *
 	 * @param callable $mutate Returns the mutate result (any value, incl. null).
 	 * @return mixed
@@ -79,22 +73,14 @@ final class AddonMigrationErrors {
 				'addon_migration_errors',
 				5,
 				static function () use ( $run ): array {
-					// The lock leaves this request's caches as they are. The
-					// option is not autoloaded, so get_option() keeps the row
-					// it read under the option's own key: a read of that copy
-					// would miss a record another request wrote or cleared
-					// since, and the write would replace that change. The copy
-					// is dropped, so the read goes to the database.
+					// Read the committed row, not this request's cached copy, or the write drops another request's change.
 					wp_cache_delete( self::OPTION, 'options' );
 
-					// When `notoptions` lists the option, the callback's read
-					// would return that absence even after another request
-					// has created the row; dropping `notoptions` then sends
-					// the read to the database. Otherwise nothing is dropped.
+					// A `notoptions` entry from before another request created the row would hide it; unlist it.
 					$notoptions = wp_cache_get( 'notoptions', 'options' );
 
 					if ( is_array( $notoptions ) && isset( $notoptions[ self::OPTION ] ) ) {
-						wp_cache_delete( 'notoptions', 'options' );
+						\PerfLocale\Database\NotOptions::unlist( [ self::OPTION ] );
 					}
 
 					return $run();
@@ -144,10 +130,7 @@ final class AddonMigrationErrors {
 	/**
 	 * Clear one addon's records for a single stage.
 	 *
-	 * Narrower than {@see clear()} on purpose. A successful boot proves the
-	 * `boot` records are stale; it says nothing about a failed migration or a
-	 * failed custom uninstall, which are separate facts the operator still
-	 * needs to see.
+	 * A successful boot clears only `boot`: a failed migration or uninstall is a separate fact the operator still needs.
 	 *
 	 * @param string $addon_id Addon identifier.
 	 * @param string $stage    Stage label to drop, e.g. 'boot'.
@@ -184,21 +167,11 @@ final class AddonMigrationErrors {
 	}
 
 	/**
-	 * Return the most recent error record for one addon, or null if it has
-	 * no recorded errors. Used by the Addons admin page to surface boot /
-	 * migration failures inline on the card so operators don't have to dig
-	 * through error_log to find out why an addon is quarantined.
+	 * The addon's last record in stored order, or null; a re-recorded key keeps its first position.
 	 *
-	 * Records are stored in insertion order - newer overwrites the same
-	 * key - so "most recent" = highest-positioned record matching the
-	 * addon id.
+	 * Keys inside a record are not checked: callers null-coalesce each one.
 	 *
-	 * The returned shape is best-effort - records are validated as arrays
-	 * but individual keys are not asserted, since the persisted option
-	 * could have been written by an older plugin version with a different
-	 * schema. Callers should null-coalesce each key they read.
-	 *
-	 * @param string $addon_id
+	 * @param string $addon_id Addon identifier.
 	 * @return array<string, mixed>|null
 	 */
 	public static function last_for_addon( string $addon_id ): ?array {

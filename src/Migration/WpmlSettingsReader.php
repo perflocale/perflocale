@@ -16,17 +16,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Reads WPML's own settings for the current blog without loading WPML.
  *
- * Only plain scalar keys of `icl_sitepress_settings` are read, and the
- * locale tables are read with plain SELECTs. Nothing here writes, and
- * nothing calls WPML code. The content count is the only scan of
- * `icl_translations`; it runs when an import or a preflight asks for it,
- * never while a page renders.
+ * Read-only plain SELECTs, no WPML code. The content count scans `icl_translations`,
+ * so it runs only for an import or a preflight, never while a page renders.
  */
 final class WpmlSettingsReader {
 
 	/**
-	 * WPML language codes whose locale is not a prefix of the code, used when
-	 * neither `icl_locale_map` nor `icl_languages` names a locale for them.
+	 * WPML codes whose locale is not a prefix of the code, used when neither WPML table names one.
 	 *
 	 * @var array<string, string>
 	 */
@@ -129,9 +125,7 @@ final class WpmlSettingsReader {
 	/**
 	 * WPML's locale for each language code it knows.
 	 *
-	 * `icl_locale_map` first, then `icl_languages.default_locale` for codes the
-	 * map lacks, then a short list of codes whose locale is not a prefix of the
-	 * code.
+	 * `icl_locale_map` first, then `icl_languages.default_locale`, then KNOWN_LOCALES.
 	 *
 	 * @return array<string, string> WPML code => locale.
 	 */
@@ -182,9 +176,8 @@ final class WpmlSettingsReader {
 	/**
 	 * Post and term rows per WPML language code, without the element types the import skips.
 	 *
-	 * Rows whose element_id is NULL are left out. Rows pointing at a post or
-	 * term deleted since are counted: telling them apart needs a join over the
-	 * whole posts table, and counting them errs toward refusing.
+	 * Rows of deleted posts or terms are counted: excluding them needs a join over the whole
+	 * posts table, and counting them errs toward refusing.
 	 *
 	 * @param string[] $skipped_types Element types the import skips.
 	 * @return array<string, int> WPML code => rows.

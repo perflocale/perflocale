@@ -19,63 +19,30 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Manages slug translation preloading and lookups.
  *
- * The key optimization: on the_posts hook, batch-load the slug
- * translations for the fetched posts (all but the core infrastructure
- * types in UNBATCHED_POST_TYPES) in ONE query. This eliminates per-post
- * DB queries when rendering permalinks on archive pages.
+ * Batches the slug rows of each the_posts result into one query, so permalinks build without per-post reads.
  */
 final class SlugManager {
 
 	/**
-	 * In-memory slug cache, blog-id prefixed for multisite isolation.
+	 * In-memory slug memo: [blog_id][object_type][object_id][language_id] = slug, or null for no row.
 	 *
-	 * Structure: [blog_id][object_type][object_id][language_id] = slug
-	 *
-	 * Blog-id prefix is mandatory on multisite: SlugManager is registered
-	 * as an eager DI singleton, so the same instance serves every blog the
-	 * request touches. Without the prefix, `switch_to_blog( 2 )` followed
-	 * by `get_slug( 'post', 5, 7 )` would happily return blog 1's cached
-	 * slug for post 5 - slug rows live in `wp_<id>_perflocale_slug_translations`
-	 * and the object IDs are NOT globally unique across subsites.
-	 *
-	 * On single-site WP, `get_current_blog_id()` returns 1 so the prefix is
-	 * constant; this costs one extra hash-table lookup per access and saves
-	 * silent cross-blog bleed on multisite.
-	 *
-	 * Capped per (blog_id, object_type) at SLUGS_CAP entries - long-running
-	 * CLI (sitemap rebuild, bulk slug regeneration) walks every post/term
-	 * and would otherwise grow this map unboundedly through the long-lived
-	 * DI singleton.
+	 * Keyed by blog id: one instance serves every blog after switch_to_blog(), and object ids repeat
+	 * across subsites. Capped per (blog, type) at SLUGS_CAP for long CLI walks.
 	 *
 	 * @var array<int, array<string, array<int, array<int, string|null>>>>
 	 */
 	private array $slugs = [];
 
 	/**
-	 * Soft cap on $slugs entries per (blog_id, object_type). When count
-	 * exceeds this the oldest 25% are evicted FIFO. Each entry is a leaf
-	 * array of (~5) language→slug pairs ≈ 200B; cap = 5000 → ≈ 1MB per
-	 * (blog, type) pair.
+	 * Soft cap on $slugs entries per (blog_id, object_type); the oldest 25% are evicted FIFO.
 	 */
 	private const SLUGS_CAP = 5000;
 
 	/**
-	 * Core block-theme infrastructure post types left out of the slug batch.
+	 * Core block-theme infrastructure post types left out of the slug batch (no null sentinel either).
 	 *
-	 * Core's own lookups fetch these posts through WP_Query (the theme.json
-	 * resolver for global styles, template-part rendering, block template
-	 * lookups), and nothing on those paths builds a permalink for them, so a
-	 * batch for their IDs fills memo entries no one reads. They get no null
-	 * sentinel either: a caller that does build a URL for one falls through
-	 * get_slug() to the repository and receives the same slug the batch would
-	 * have found. The zero-state branch still seeds them, because with no slug
-	 * rows at all null is also the repository's answer.
-	 *
-	 * An explicit list on purpose. A non-viewable test would also catch
-	 * wp_navigation and wp_block, whose REST responses carry a `link` built
-	 * through the permalink filters, and the never-scoped query list is
-	 * extended per site (Oxygen adds its public ct_template); either would
-	 * drop the batch from types whose slugs are read.
+	 * An explicit list on purpose: a viewable or never-scoped test would also drop wp_navigation, wp_block
+	 * or ct_template, whose REST `link` reads slugs. See docs-ai/11-code-rationale.md, "SlugManager: unbatched post types".
 	 *
 	 * @var array<string, true>
 	 */
@@ -86,29 +53,32 @@ final class SlugManager {
 	];
 
 	/**
-	 * Per-request gate snapshot for preload_slugs(): translate_slugs
-	 * setting, current language ID, and the full active-language ID list.
+	 * Per-request gate snapshot for preload_slugs(): translate_slugs, current language id, active language ids.
 	 *
-	 * Lifted out of preload_slugs() as a function-level `static` so it
-	 * can be invalidated by reset_static_caches() when settings or
-	 * languages mutate mid-request. Without that, programmatic language
-	 * adds/deletes would leave the gate frozen at first-read state and
-	 * subsequent slug priming would skip the new language (or attempt to
-	 * prime a deleted one).
+	 * Static so reset_static_caches() can drop it when languages change mid-request.
 	 *
 	 * @var array{enabled:bool,language_id:int,all_lang_ids:array<int,int>}|null
 	 */
 	private static ?array $gate_memo = null;
 
 	/**
-	 * Clear the per-request gate snapshot. Hooked to language CRUD events
-	 * (and switch_blog on multisite) so subsequent preload_slugs() calls
-	 * within the same request rebuild from fresh state.
+	 * Clear the per-request gate snapshot (language CRUD hooks, and switch_blog on multisite).
 	 *
 	 * @return void
 	 */
 	public static function reset_static_caches(): void {
 		self::$gate_memo = null;
+	}
+
+	/**
+	 * Drop this blog's slug memo and the slug gate memos after a cache flush.
+	 *
+	 * @return void
+	 */
+	public function forget_slugs(): void {
+		unset( $this->slugs[ (int) get_current_blog_id() ] );
+		self::$gate_memo = null;
+		SlugTranslationRepository::reset_static_caches();
 	}
 
 	/**
@@ -128,13 +98,8 @@ final class SlugManager {
 	/**
 	 * Runs a queued term slug prime before a term slug is read.
 	 *
-	 * UrlConverter's get_terms / get_the_terms callback queues term IDs
-	 * instead of querying their slugs at once, because most term reads never
-	 * build a link. Called from get_slug() for object type 'term' on an
-	 * in-memory miss, with the term ID being read, so when that term is
-	 * queued its batch lands in L1 before the repository read. Anchored here
-	 * rather than at UrlConverter's own call sites so every caller of the
-	 * shared slug_manager service, including addons, is covered.
+	 * Called from get_slug() on a term miss, not at UrlConverter's call sites, so every caller of the
+	 * slug_manager service (addons too) is covered. See docs-ai/11-code-rationale.md, "SlugManager: queued term slug prime".
 	 *
 	 * @var (\Closure(int): void)|null
 	 */
@@ -168,9 +133,11 @@ final class SlugManager {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Preload slug translations for posts returned by WP_Query.
-		// Runs after WP fetches posts, before template rendering.
-		// Controlled by the cache_preload_slugs setting (default: true).
+		// The memos would otherwise outlive a flush in a long (WP-CLI) process.
+		add_action( 'perflocale/cache/flush_all', [ $this, 'forget_slugs' ] );
+		add_action( 'perflocale/cache/flush_slugs', [ $this, 'forget_slugs' ] );
+
+		// Preload slug translations for WP_Query results (setting cache_preload_slugs, default on).
 		$plugin = \PerfLocale\Plugin::get_instance();
 
 		if ( $plugin->has( 'settings' ) && ! (bool) $plugin->get( 'settings' )->get( 'cache_preload_slugs', true ) ) {
@@ -181,9 +148,7 @@ final class SlugManager {
 
 		$reset_static = [ self::class, 'reset_static_caches' ];
 
-		// Invalidate the gate memo when languages change mid-request so
-		// the next preload_slugs() call rebuilds the active-language list
-		// from fresh state instead of using a frozen snapshot.
+		// Invalidate the gate memo when languages change mid-request.
 		add_action( 'perflocale/language/added', $reset_static );
 		add_action( 'perflocale/language/updated', $reset_static );
 		add_action( 'perflocale/language/slug_renamed', $reset_static );
@@ -197,17 +162,7 @@ final class SlugManager {
 	/**
 	 * Preload slug translations for all posts in a WP_Query result.
 	 *
-	 * This is the key performance optimization. Instead of querying
-	 * slug translations one-by-one when rendering permalinks, we
-	 * batch-load them in a single query here.
-	 *
-	 * Members that are not WP_Post instances are ignored: WP_Query::get_posts()
-	 * runs the_posts BEFORE its array_map( 'get_post' ) normalisation
-	 * (wp-includes/class-wp-query.php), so a sparse result from an earlier
-	 * filter or a hard-delete race can hand this callback a null member.
-	 *
-	 * Posts of the core infrastructure types in UNBATCHED_POST_TYPES are left
-	 * out of the batch; every other post type, viewable or not, is batched.
+	 * Skips non-WP_Post members: the_posts runs before WP_Query's array_map( 'get_post' ), so one can be null.
 	 *
 	 * @param array<int, mixed> $posts Posts returned by WP_Query; non-WP_Post members are skipped.
 	 * @param \WP_Query         $query The WP_Query instance.
@@ -218,16 +173,8 @@ final class SlugManager {
 			return $posts;
 		}
 
-		// Per-request cache of the runtime gate - translate_slugs off OR
-		// current language zero means the preload query is pure waste.
-		// Cached so every WP_Query on the request (sidebars, related,
-		// widgets) doesn't re-resolve the same settings + router values.
-		// Also carries the full active-language list so we can prime slugs
-		// across every language in one batched query - hreflang + language
-		// switcher + alternate-language permalinks all call get_slug with
-		// the target language ID, not the visitor's, and without multi-lang
-		// priming those calls each trigger an L3 transient read (~200µs × N
-		// posts × N other languages on every archive page).
+		// Gate memo shared by every WP_Query of the request. It holds every active language because
+		// hreflang and the switcher read other languages' slugs, which one batched query primes.
 		if ( self::$gate_memo === null ) {
 			$plugin = \PerfLocale\Plugin::get_instance();
 
@@ -262,12 +209,7 @@ final class SlugManager {
 			return $posts;
 		}
 
-		// Zero-state short-circuit: if no rows have ever been written to
-		// the slug_translations table, the batch query below is guaranteed
-		// to return zero rows. Seed null sentinels for each (pid, lang)
-		// pair instead so subsequent `get_slug()` calls hit the in-memory
-		// cache without falling through to the repository. The
-		// has_any_slugs check is sub-µs on warm cache.
+		// No slug rows at all: seed null sentinels instead of running a query that returns nothing.
 		$blog_id = (int) get_current_blog_id();
 
 		if ( ! $this->get_repo()->has_any_slugs() ) {
@@ -307,10 +249,7 @@ final class SlugManager {
 			return $posts;
 		}
 
-		// Fast path: if every (post, current_language) pair is already cached,
-		// the batch is a no-op. Second and later WP_Query executions (sidebars,
-		// related loops, wp_list_pages) hit this when the same posts were
-		// primed by the first query.
+		// Every (post, current language) pair already primed by an earlier query: nothing to do.
 		$any_missing = false;
 
 		foreach ( $post_ids as $pid ) {
@@ -325,12 +264,7 @@ final class SlugManager {
 			return $posts;
 		}
 
-		// Batch-load slugs for EVERY active language in one query. Without
-		// this, get_slug(post, other_lang_id) calls from the hreflang tags +
-		// language switcher each triggered per-post L3 transient reads
-		// (~200µs × N × M on archive pages). Single multi-language batch
-		// returns all rows, then we seed the cache with null sentinels for
-		// every (post, lang) pair we probed so subsequent gets hit L1.
+		// One query for every active language (see the gate memo above).
 		if ( $all_lang_ids === [] ) {
 			$all_lang_ids = [ $language_id ];
 		}
@@ -343,9 +277,7 @@ final class SlugManager {
 	/**
 	 * Batch-load slug translations for a set of posts across many languages.
 	 *
-	 * Single scoped SQL query populates the L1 cache for every
-	 * (post_id, language_id) pair, using null sentinels for combinations
-	 * without a stored row so subsequent lookups short-circuit.
+	 * Pairs without a row get a null sentinel so later lookups skip the repository.
 	 *
 	 * @param array<int, int> $post_ids Post IDs to prime.
 	 * @param array<int, int> $lang_ids Language IDs to prime across.
@@ -404,9 +336,7 @@ final class SlugManager {
 	/**
 	 * Whether ANY slug translation exists (table-wide, cached verdict).
 	 *
-	 * Public passthrough so batch primes outside this class (UrlConverter's
-	 * term-slug prime) can share the same cheap gate the post-side preload
-	 * uses instead of constructing their own repository.
+	 * Shared with UrlConverter's term slug prime, so that prime needs no repository of its own.
 	 *
 	 * @return bool
 	 */
@@ -417,9 +347,7 @@ final class SlugManager {
 	/**
 	 * Get the translated slug for an object.
 	 *
-	 * Checks the in-memory cache first, then falls back to the repository.
-	 * For terms, a miss first runs any queued term slug prime covering the
-	 * term (see $term_slug_prime_flusher).
+	 * For terms, a miss first runs any queued term slug prime (see $term_slug_prime_flusher).
 	 *
 	 * @param string $object_type Object type.
 	 * @param int    $object_id Object ID.
@@ -429,11 +357,7 @@ final class SlugManager {
 	public function get_slug( string $object_type, int $object_id, int $language_id ): ?string {
 		$blog_id = (int) get_current_blog_id();
 
-		// Check in-memory cache first (populated by preload_slugs). We use
-		// array_key_exists here so the preloaded null-sentinel for posts
-		// confirmed-without-a-translation short-circuits too - without this
-		// we'd fall through to the repository for every untranslated post
-		// on every permalink build.
+		// Use array_key_exists() so a null sentinel (no translation) also short-circuits.
 		if ( isset( $this->slugs[ $blog_id ][ $object_type ][ $object_id ] )
 			&& array_key_exists( $language_id, $this->slugs[ $blog_id ][ $object_type ][ $object_id ] ) ) {
 			return $this->slugs[ $blog_id ][ $object_type ][ $object_id ][ $language_id ];
@@ -446,9 +370,7 @@ final class SlugManager {
 		// Fallback to repository (which uses the 3-layer cache).
 		$slug = $this->get_repo()->get_slug( $object_type, $object_id, $language_id );
 
-		// FIFO eviction at SLUGS_CAP per (blog, object_type) - see property
-		// docblock for rationale. Counted at the object_id level since
-		// each object_id holds a small map of language→slug pairs.
+		// FIFO eviction at SLUGS_CAP object ids per (blog, object_type).
 		if ( isset( $this->slugs[ $blog_id ][ $object_type ] ) && count( $this->slugs[ $blog_id ][ $object_type ] ) >= self::SLUGS_CAP ) {
 			$evict                                   = (int) ( self::SLUGS_CAP / 4 );
 			$this->slugs[ $blog_id ][ $object_type ] = array_slice( $this->slugs[ $blog_id ][ $object_type ], $evict, null, true );
@@ -476,11 +398,7 @@ final class SlugManager {
 
 		if ( $result ) {
 			$blog_id = (int) get_current_blog_id();
-			// Invalidate (don't seed) the memo: the repository runs the slug
-			// through find_unique_slug(), so a collision auto-suffix can make
-			// the stored value differ from $slug. Seeding with the requested
-			// slug would hand a stale value back from get_slug() later in this
-			// same request; dropping the entry forces a fresh canonical read.
+				// Drop, do not seed: find_unique_slug() may store a suffixed slug that differs from $slug.
 			unset( $this->slugs[ $blog_id ][ $object_type ][ $object_id ][ $language_id ] );
 		}
 

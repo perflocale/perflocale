@@ -13,9 +13,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Language Switcher Bricks element.
- *
- * Renders the PerfLocale language switcher as a native Bricks
- * Builder element with all configuration options exposed.
  */
 class PerfLocale_Bricks_Language_Switcher extends \Bricks\Element {
 
@@ -225,11 +222,8 @@ class PerfLocale_Bricks_Language_Switcher extends \Bricks\Element {
 
 		$html = $block->render( $render_args );
 
-		// Bricks' render_attributes() is third-party output that also carries
-		// builder-authored custom attributes, so escape it here rather than
-		// trusting the theme. wp_kses_post() keeps the id / class / style /
-		// data-* attributes Bricks needs for element styling and builder
-		// selection, and drops event handlers.
+		// render_attributes() carries builder-authored custom attributes: kses keeps id/class/style/data-*
+		// for Bricks styling and selection, and drops event handlers.
 		echo wp_kses_post( '<div ' . (string) $this->render_attributes( '_root' ) . '>' );
 		echo \PerfLocale\Frontend\LanguageSwitcherBlock::kses_switcher( $html ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
 		echo '</div>';

@@ -1,6 +1,6 @@
 <?php
 /**
- * Background jobs admin page.
+ * Jobs admin page.
  *
  * @package PerfLocale
  */
@@ -19,15 +19,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Renders *PerfLocale → Jobs*. Lists active + recent jobs from
- * {@see JobState::list_active()} with status, progress, and action
- * buttons (cancel / retry / delete). The page polls the JobsController
- * REST endpoint every 5 seconds while any row is in `running` state so
- * the operator sees live progress without a manual refresh.
- *
- * All mutations go through the REST endpoints (not direct POST to this
- * page) so the permission story is the same for browser users and CLI
- * users (`curl -u admin /wp-json/perflocale/v1/jobs`).
+ * Renders PerfLocale > Jobs: active and recent jobs with status, progress and actions, polled from the Jobs REST
+ * routes every 5 s while a row runs. Every change goes through those routes, so browser and CLI users share one
+ * permission model.
  */
 final class JobsPage {
 
@@ -47,10 +41,9 @@ final class JobsPage {
 	private const COUNT_RESULT_TYPES = [ 'template_refs_backfill', 'template_refs_fanout', 'sqlite_group_repair' ];
 
 	/**
-	 * Job types whose result carries the first error of the items that failed
-	 * (`first_error`); a finished or canceled row shows it.
+	 * Job types whose result carries the first failed item's error (`first_error`), shown on a finished or canceled row.
 	 */
-	private const FIRST_ERROR_RESULT_TYPES = [ 'bulk_translate', 'site_translate', 'bulk_string_translate', 'string_scan' ];
+	private const FIRST_ERROR_RESULT_TYPES = [ 'bulk_translate', 'site_translate', 'bulk_string_translate', 'string_scan', 'auto_translate' ];
 
 	/**
 	 * Characters of the first error a row shows; the job's details hold all of it.
@@ -58,12 +51,7 @@ final class JobsPage {
 	private const FIRST_ERROR_SHOWN = 140;
 
 	/**
-	 * Enqueue stylesheet + auto-refresh script on the Jobs admin page only.
-	 *
-	 * Wired from {@see AdminController} on `admin_enqueue_scripts`. The
-	 * `$hook` arg is WordPress's per-page hook suffix; we gate on the
-	 * canonical `perflocale_page_perflocale-jobs` suffix so the asset
-	 * payload doesn't load on every wp-admin screen.
+	 * Enqueue the page's stylesheet and refresh script, on the `perflocale_page_perflocale-jobs` screen only.
 	 *
 	 * @param string $hook
 	 * @return void
@@ -80,10 +68,11 @@ final class JobsPage {
 			PERFLOCALE_VERSION
 		);
 
+		// wp-hooks: the poller fires perflocale.jobs.statusChanged.
 		wp_enqueue_script(
 			'perflocale-jobs',
 			PERFLOCALE_URL . 'assets/js/jobs.js',
-			[],
+			[ 'wp-hooks' ],
 			PERFLOCALE_VERSION,
 			true
 		);
@@ -96,6 +85,8 @@ final class JobsPage {
 				'nonce'       => wp_create_nonce( 'wp_rest' ),
 				'ago'         => __( 'ago', 'perflocale' ),
 				'isMultisite' => is_multisite(),
+				// SCRIPT_DEBUG: a hook callback that throws is reported once per hook in the console.
+				'debug'       => defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG,
 				'i18n'        => [
 					'pollPaused'    => __( 'Live updates paused after repeated errors - reload the page to resume.', 'perflocale' ),
 					'id'            => __( 'ID', 'perflocale' ),
@@ -132,27 +123,21 @@ final class JobsPage {
 	 * @return void
 	 */
 	public function render(): void {
-		// list_active_summary() omits args, result and log. The kept-rows
-		// warning reads the results it needs in one batch below; a row's
-		// Details toggle fetches GET /jobs/{id}, which reads the full row
-		// through JobState::get().
+		// Summary rows have no args, result or log: the kept-rows warning reads results in one batch below, and a row's
+		// Details fetches GET /jobs/{id}.
 		$jobs = JobState::list_active_summary();
 
-		// Only a supervisor sees every user's jobs; everyone else sees the
-		// jobs they dispatched, as in the REST list (JobsController).
-		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
-			$current_uid = get_current_user_id();
-			$jobs        = array_filter(
-				$jobs,
-				static fn( array $row ): bool => (int) ( $row['created_by'] ?? 0 ) === $current_uid
-			);
-		}
+		$current_uid = (int) get_current_user_id();
+		$jobs        = self::shown_rows( $jobs, $current_uid );
+		$status_only = self::status_only_rows( $jobs, $current_uid );
 
-		// The kept-rows warning and the count lines need the result of each
-		// displayed row that shows one: one batched read for all of them, none
-		// when no row does.
+		// One batched result read for the displayed rows that show one; none when no row does.
 		$kept_ids = [];
 		foreach ( $jobs as $kept_id => $summary ) {
+			if ( isset( $status_only[ (string) $kept_id ] ) ) {
+				continue;
+			}
+
 			if ( self::shows_kept( $summary['status'] ?? '', $summary['type'] ?? '' ) || self::shows_first_error( $summary['status'] ?? '', $summary['type'] ?? '' ) ) {
 				$kept_ids[] = (string) $kept_id;
 			}
@@ -163,18 +148,13 @@ final class JobsPage {
 		$as_url = '';
 
 		if ( $engine === 'action_scheduler' && function_exists( 'admin_url' ) ) {
-			// Action Scheduler's Tools → Scheduled Actions screen has no
-			// `group` URL filter - passing one is silently ignored. Use the
-			// `s` (search) param instead, which AS exposes as a real form
-			// field and matches against hook + group + args. "perflocale"
-			// matches our group name AND our hook prefix, so it narrows the
-			// list to plugin-owned actions either way.
+			// Action Scheduler's screen ignores a `group` URL filter: its `s` search matches hook, group and args, and
+			// "perflocale" is both the group and the hook prefix.
 			$as_url = admin_url( 'tools.php?page=action-scheduler&s=perflocale' );
 		}
 
-		// Surface the "scan queued" confirmation set by AdminController's
-		// async-dispatch path. The transient is consumed on first read so
-		// a manual page-refresh doesn't replay it.
+		// The "scan queued" notice from AdminController's async dispatch; consumed on first read, so a refresh does not
+		// replay it.
 		$scan_queued_notice = get_transient( 'perflocale_scan_queued_notice_' . get_current_user_id() );
 		if ( is_string( $scan_queued_notice ) && $scan_queued_notice !== '' ) {
 			delete_transient( 'perflocale_scan_queued_notice_' . get_current_user_id() );
@@ -182,9 +162,7 @@ final class JobsPage {
 			$scan_queued_notice = '';
 		}
 
-		// A queued job's confirmation (Export & Import, migrations, bulk
-		// machine translation): the redirect carries a fixed code, and only
-		// a known code shows its message.
+		// A queued job's confirmation: the redirect carries a fixed code, and only a known code shows a message.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$queued_code    = isset( $_GET['perflocale_notice'] ) && is_string( $_GET['perflocale_notice'] ) ? sanitize_key( wp_unslash( $_GET['perflocale_notice'] ) ) : '';
 		$queued_message = '' !== $queued_code ? self::queued_message( $queued_code ) : '';
@@ -252,7 +230,7 @@ final class JobsPage {
 					</thead>
 					<tbody>
 						<?php foreach ( $jobs as $job_id => $row ) : ?>
-							<?php $this->render_row( (string) $job_id, $row, $results[ (string) $job_id ] ?? [] ); ?>
+							<?php $this->render_row( (string) $job_id, $row, $results[ (string) $job_id ] ?? [], isset( $status_only[ (string) $job_id ] ) ); ?>
 						<?php endforeach; ?>
 					</tbody>
 				</table>
@@ -275,32 +253,18 @@ final class JobsPage {
 		</div>
 
 		<?php
-		// Styles + auto-refresh JS for this page are enqueued by
-		// JobsPage::enqueue_assets() on `admin_enqueue_scripts`. See the
-		// top of this class for the registration.
+		// The page's styles and refresh script come from enqueue_assets() on `admin_enqueue_scripts`.
 	}
 
 	/**
-	 * Render the read-only "Scheduled tasks" observability panel.
-	 *
-	 * Lists the recurring schedulers that live outside the Jobs queue
-	 * (exchange-rate sync, lock cleanup, jobs GC) so the operator can see
-	 * all of the plugin's background work in one place - next run, engine,
-	 * status - without needing to dig into Tools → Scheduled Actions or
-	 * wp_options['cron'].
+	 * Render the read-only "Scheduled tasks" panel: the recurring work outside the Jobs queue (rate sync, lock cleanup,
+	 * jobs GC) with next run, engine and status.
 	 *
 	 * @return void
 	 */
 	private function render_scheduled_tasks_panel(): void {
-		// Each task carries its expected interval so we can detect drift:
-		// `interval_seconds` is how long between runs the engine is
-		// supposed to fire. When `next_run` is more than 1.5x that into
-		// the past, we flag the task as overdue. This is the canonical
-		// symptom of WP-Cron drift on low-traffic sites (cron only fires
-		// on traffic; daily events can run weekly).
-		// jobs_gc and jobs_watchdog are scheduled per blog with a [blog_id]
-		// args tuple. Action Scheduler matches args exactly, so the next_run
-		// probe passes the same args or it would miss the schedule.
+		// Each task has its interval: a next run over 1.5 x that in the past is overdue (WP-Cron drift on quiet sites).
+		// The per-blog tasks pass their [blog_id] args, which Action Scheduler matches exactly.
 		$blog_arg = function_exists( 'get_current_blog_id' ) ? [ (int) get_current_blog_id() ] : [ 0 ];
 
 		$tasks = [
@@ -338,26 +302,14 @@ final class JobsPage {
 		$overdue_seen = false;
 
 		foreach ( $tasks as $task ) {
-			// A recurring Action Scheduler task that is running right now has
-			// no next timestamp: its next instance is created only after the
-			// run completes (cited in BackgroundEvents::as_next_raw()).
-			// `untimed` comes from the same probe as `next`, so telling
-			// "running" apart from "not scheduled" adds no query.
-			// `untimed` also covers a pending ASYNC action. These four hooks
-			// are only ever scheduled through enqueue_recurring()
-			// (Bootstrap::ensure_recurring_schedules(),
-			// ExchangeRateSync::ensure_scheduled()), never enqueued async, so
-			// here it means running. Enqueueing one of them async would make
-			// the "Running" label wrong for that row.
+			// A running recurring Action Scheduler task has no next timestamp; `untimed` from the same probe marks it running.
+			// These hooks are only ever scheduled through enqueue_recurring(), never async, so `untimed` means running here.
 			$detail   = BackgroundEvents::next_run_detail( $task['hook'], (array) ( $task['args'] ?? [] ) );
 			$next     = $detail['next'];
 			$overdue  = false;
 			$drift_by = 0;
 
-			// "Overdue" = scheduled time is in the past by more than half
-			// the interval. For a daily event that means >12h past due.
-			// Daily events are normally still upcoming (next_run is in
-			// the future), so this only fires if WP-Cron skipped a tick.
+			// Overdue: the scheduled time passed by more than half the interval (WP-Cron skipped a tick).
 			if ( $next !== null
 				&& $next < time()
 				&& ( time() - $next ) > (int) ( $task['interval_seconds'] / 2 ) ) {
@@ -378,11 +330,7 @@ final class JobsPage {
 			];
 		}
 
-		// WP-Cron drift detection - only show the warning when the
-		// engine is actually WP-Cron. Action Scheduler doesn't drift the
-		// same way (it persists and catches up via WP-Heartbeat-fired
-		// runner), so the banner would be a false alarm on AS-backed
-		// sites.
+		// Drift warning on WP-Cron only: Action Scheduler persists and catches up, so it would be a false alarm there.
 		$current_engine = JobRunnerFactory::pick()->get_engine_name();
 		?>
 		<h2 style="margin-top:2em;"><?php esc_html_e( 'Scheduled tasks', 'perflocale' ); ?></h2>
@@ -391,14 +339,8 @@ final class JobsPage {
 		</p>
 
 		<?php
-		// DISABLE_WP_CRON detection. When the host (or `wp-config.php`)
-		// defines `DISABLE_WP_CRON` and we're scheduling onto WP-Cron,
-		// the events sit in `wp_options['cron']` forever until something
-		// fires `wp-cron.php` externally (server cron, uptime monitor,
-		// SaaS pinger). Action Scheduler isn't affected - it runs on
-		// its own claim loop. So only show this banner when:
-		// 1. The constant is truthy.
-		// 2. The plugin is on the wp_cron engine right now.
+		// DISABLE_WP_CRON on the WP-Cron engine: events wait until something calls wp-cron.php externally (Action
+		// Scheduler runs its own loop), so warn only in that case.
 		$disable_wp_cron_active = defined( 'DISABLE_WP_CRON' ) && constant( 'DISABLE_WP_CRON' );
 		?>
 
@@ -512,8 +454,7 @@ final class JobsPage {
 									<br>
 									<small style="color:#646970;">
 										<?php
-										// Display duration in ms for sub-second
-										// runs, seconds otherwise.
+										// Milliseconds below one second, else seconds.
 										if ( $duration_ms < 1000 ) {
 											printf(
 												/* translators: %d: number of milliseconds */
@@ -607,9 +548,8 @@ final class JobsPage {
 	}
 
 	/**
-	 * The lines under a finished row's status that come from its result: a
-	 * Polylang job's policy line and left-out items, and the first error.
-	 * Prints nothing when there is none of them.
+	 * The lines from a finished row's result under its status: a Polylang job's policy line and left-out items, and the
+	 * first error. Prints nothing without any.
 	 *
 	 * @param string        $policy_line Language conflict policy line, or ''.
 	 * @param array<string> $attention   Lines of items left out.
@@ -622,9 +562,7 @@ final class JobsPage {
 	}
 
 	/**
-	 * A Polylang job's policy line and the items its run left out, when there are any.
-	 *
-	 * Prints nothing otherwise, so every other row's cell stays byte for byte as it was.
+	 * A Polylang job's policy line and left-out items; nothing otherwise, so other rows stay byte for byte the same.
 	 *
 	 * @param string        $policy_line Language conflict policy line, or ''.
 	 * @param array<string> $attention   Lines of items left out.
@@ -641,8 +579,7 @@ final class JobsPage {
 	}
 
 	/**
-	 * The message for a queued-job code a redirect to this screen carries,
-	 * or '' for any other code.
+	 * The message of a queued-job code a redirect carries; '' for any other code.
 	 *
 	 * @param string $code The perflocale_notice code.
 	 * @return string
@@ -665,9 +602,8 @@ final class JobsPage {
 	}
 
 	/**
-	 * Whether a row shows its result's first error: a finished or canceled
-	 * job of a type in FIRST_ERROR_RESULT_TYPES. A failed row shows its own
-	 * error instead.
+	 * Whether a row shows its result's first error: a finished or canceled job of a FIRST_ERROR_RESULT_TYPES type (a
+	 * failed row shows its own error).
 	 *
 	 * @param mixed $status Job status.
 	 * @param mixed $type   Job type slug.
@@ -678,9 +614,7 @@ final class JobsPage {
 	}
 
 	/**
-	 * The result's first error under the status, shortened; the title and the
-	 * job's details hold the whole text. Prints nothing when there is none,
-	 * so every other row's cell stays byte for byte as it was.
+	 * The first error under the status, shortened (title and details hold all of it); nothing when there is none.
 	 *
 	 * @param string $first_error The result's first error, or ''.
 	 * @return void
@@ -698,8 +632,7 @@ final class JobsPage {
 	}
 
 	/**
-	 * Whether a row shows how many created translations kept the source
-	 * language: a finished job of a type in KEPT_RESULT_TYPES.
+	 * Whether a row shows how many created translations kept the source language (finished, KEPT_RESULT_TYPES).
 	 *
 	 * @param mixed $status Job status.
 	 * @param mixed $type   Job type slug.
@@ -710,14 +643,77 @@ final class JobsPage {
 	}
 
 	/**
+	 * The rows the REST list shows (JobAccess, asked once per type and owner kind).
+	 *
+	 * @param array<int|string, array<string, mixed>> $jobs        Active-index summary rows.
+	 * @param int                                     $current_uid Viewer.
+	 * @return array<int|string, array<string, mixed>>
+	 */
+	private static function shown_rows( array $jobs, int $current_uid ): array {
+		$allowed = [ [], [] ];
+
+		return array_filter(
+			$jobs,
+			static function ( array $row ) use ( $current_uid, &$allowed ): bool {
+				$type = is_string( $row['type'] ?? null ) ? $row['type'] : '';
+				$mine = $current_uid > 0 && (int) ( $row['created_by'] ?? 0 ) === $current_uid ? 1 : 0;
+
+				$allowed[ $mine ][ $type ] ??= $mine ? \PerfLocale\Background\JobAccess::may_handle_own( $type ) : \PerfLocale\Background\JobAccess::may_handle_others( $type );
+
+				return $allowed[ $mine ][ $type ];
+			}
+		);
+	}
+
+	/**
+	 * Ids of another user's translation runs whose posts the viewer may not edit (JobAccess): they show their status only.
+	 *
+	 * @param array<int|string, array<string, mixed>> $jobs        Rows shown.
+	 * @param int                                     $current_uid Viewer.
+	 * @return array<string, true>
+	 */
+	private static function status_only_rows( array $jobs, int $current_uid ): array {
+		$ids = [];
+
+		foreach ( $jobs as $id => $row ) {
+			$owner = is_numeric( $row['created_by'] ?? null ) ? (int) $row['created_by'] : 0;
+
+			if ( in_array( $row['type'] ?? '', \PerfLocale\Background\JobAccess::CONTENT_TYPES, true ) && ( $current_uid <= 0 || $owner !== $current_uid ) ) {
+				$ids[] = (string) $id;
+			}
+		}
+
+		$args = [] === $ids ? [] : JobState::args( $ids );
+		$out  = [];
+
+		foreach ( $ids as $id ) {
+			$state = [
+				'type' => $jobs[ $id ]['type'],
+				'args' => $args[ $id ] ?? null,
+			];
+
+			if ( ! \PerfLocale\Background\JobAccess::may_edit_content( $state ) ) {
+				$out[ $id ] = true;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
 	 * Render a single job row.
 	 *
 	 * @param string                   $job_id
-	 * @param array<string, mixed>     $row    Active-index summary row.
-	 * @param array<int|string, mixed> $result The job's decoded result when the row shows the kept count, else [].
+	 * @param array<string, mixed>     $row         Active-index summary row.
+	 * @param array<int|string, mixed> $result      The job's decoded result when the row shows the kept count, else [].
+	 * @param bool                     $status_only Whether the viewer may not open the job: no texts, no actions.
 	 * @return void
 	 */
-	private function render_row( string $job_id, array $row, array $result = [] ): void {
+	private function render_row( string $job_id, array $row, array $result = [], bool $status_only = false ): void {
+		if ( $status_only ) {
+			$row['error'] = '';
+		}
+
 		$status     = (string) ( $row['status'] ?? 'unknown' );
 		$type       = (string) ( $row['type'] ?? '' );
 		$progress   = (int) ( $row['progress'] ?? 0 );
@@ -736,8 +732,7 @@ final class JobsPage {
 		];
 		$status_label  = $status_labels[ $status ] ?? $status;
 
-		// The summary row carries the error. A failed row shows it inline so
-		// the operator can triage without the REST endpoint or WP-CLI.
+		// A failed row shows the summary's error inline, for triage without REST or WP-CLI.
 		$error_full  = '';
 		$error_short = '';
 		if ( $status === 'failed' ) {
@@ -750,8 +745,7 @@ final class JobsPage {
 			}
 		}
 
-		// A finished machine-translation job reports the rows whose content
-		// stayed in the source language; only those job types read the result.
+		// Finished machine-translation jobs report rows kept in the source language; only those types read the result.
 		$kept          = 0;
 		$first_warning = '';
 		if ( self::shows_kept( $status, $type ) ) {
@@ -768,9 +762,7 @@ final class JobsPage {
 			? \PerfLocale\Migration\MigrationRunner::skipped_lines( self::ATTENTION_RESULT_TYPES[ $type ], array_filter( $result, 'is_string', ARRAY_FILTER_USE_KEY ) )
 			: [];
 
-		// A Polylang job under a language conflict policy other than the
-		// default says so: a finished one with the policy it ran under, a
-		// queued or running one with the policy it will read.
+		// A Polylang job under a non-default conflict policy says so: the policy it ran under, or the one it will read.
 		$policy_line = '';
 
 		if ( 'polylang_migration' === $type ) {
@@ -867,7 +859,11 @@ final class JobsPage {
 				?>
 			</td>
 			<td>
-				<?php $this->render_actions( $job_id, $status, $type ); ?>
+				<?php
+				if ( ! $status_only ) {
+					$this->render_actions( $job_id, $status, $type );
+				}
+				?>
 			</td>
 		</tr>
 		<tr class="perflocale-jobs-detail-row" data-perflocale-job-detail="<?php echo esc_attr( $job_id ); ?>" hidden>
@@ -918,7 +914,7 @@ final class JobsPage {
 	}
 
 	/**
-	 * Render the action buttons for one row, gated by status.
+	 * Render a row's action buttons by status.
 	 *
 	 * @param string $job_id
 	 * @param string $status
@@ -926,8 +922,7 @@ final class JobsPage {
 	 * @return void
 	 */
 	private function render_actions( string $job_id, string $status, string $type ): void {
-		// Build once; escape AT the echo point below so static analysers
-		// see the escape call inline.
+		// Escaped at the echo below, inline for the static analysers.
 		$rest_url_base = rest_url( 'perflocale/v1/jobs/' . $job_id );
 		$nonce         = wp_create_nonce( 'wp_rest' );
 
@@ -947,9 +942,7 @@ final class JobsPage {
 			<?php
 		}
 
-		// Single-use download anchor for async data_export results. The actual
-		// streaming + auth happens in AdminController::process_export_download
-		// on admin_init; this is just a nonce'd link to that endpoint.
+		// A finished data_export's one-use download link; AdminController::process_export_download() streams and checks it.
 		if ( $status === 'complete' && $type === 'data_export' ) {
 			$download_url = wp_nonce_url(
 				admin_url( 'admin.php?page=perflocale-jobs&perflocale_export_download=' . rawurlencode( $job_id ) ),
@@ -967,7 +960,6 @@ final class JobsPage {
 		}
 		?>
 		<?php
-		// Click handler for these buttons lives in assets/js/jobs.js,
-		// enqueued by JobsPage::enqueue_assets().
+		// The buttons' click handler is in assets/js/jobs.js (enqueue_assets()).
 	}
 }

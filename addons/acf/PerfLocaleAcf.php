@@ -12,13 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Advanced Custom Fields integration for PerfLocale.
- *
- * Detects ALL ACF field types and registers translatable fields for content
- * sync across translations. Handles repeaters, flexible content, groups,
- * and nested structures recursively.
- *
- * Compatible with ACF 5.x, 6.x, and ACF Pro.
+ * Advanced Custom Fields integration: field sync, machine translation and reference fields.
  */
 final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
@@ -38,8 +32,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	];
 
 	/**
-	 * Translated posts or terms loaded per statement by
-	 * prime_reference_targets() and prime_term_targets().
+	 * Translated posts or terms loaded per statement when priming reference targets.
 	 *
 	 * @var int
 	 */
@@ -84,52 +77,36 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function boot( \PerfLocale\Plugin $plugin ): void {
-		// Register translatable meta keys (used by content sync across translations).
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_acf_meta_keys' ], 10, 2 );
 
-		// Expand repeater / flexible-content sub-field keys to every row of the
-		// source post at sync time (the static list above only knows row 0).
+		// The post-type key list knows only row 0: expand rows per source post at sync time.
 		add_filter( 'perflocale/sync_fields/for_post', [ $this, 'expand_repeating_rows' ], 10, 2 );
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 4 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 4 );
 
-		// Translate reference fields on the frontend to point to translated posts.
+		// Front-end reference fields point to translated posts and terms.
 		add_filter( 'acf/format_value/type=relationship', [ $this, 'translate_relationship' ], 20, 3 );
 		add_filter( 'acf/format_value/type=post_object', [ $this, 'translate_post_object' ], 20, 3 );
 
-		// Translate taxonomy fields on the frontend to point to translated terms.
 		add_filter( 'acf/format_value/type=taxonomy', [ $this, 'translate_taxonomy' ], 20, 3 );
 
-		// Keep ACF's in-request value store coherent: machine translation writes
-		// field meta behind ACF's back, and an imposed language changes what the
-		// reference formatters above return.
+		// ACF memoises values per request: MT writes meta behind its back and an imposed language changes formatted references.
 		add_action( 'perflocale/mt/meta_translated', [ $this, 'forget_post_values' ], 10, 1 );
 		add_action( 'perflocale/language/overridden', [ $this, 'forget_formatted_values' ], 10, 0 );
 
-		// A text field a person empties stays empty: recorded in the post's
-		// seed-cleared marker, which machine translation and the seed honour.
-		// Last, so the value judged is the one ACF stores.
+		// Last priority, so the value judged is the one ACF stores.
 		add_filter( 'acf/update_value', [ $this, 'record_clear_on_update' ], PHP_INT_MAX, 3 );
 
-		// A front-end ACF form passed its nonce check: the post it saves is
-		// being edited by a person. The edit screen is marked by ContentSync.
+		// Front-end ACF form after its nonce check; the edit screen is marked by ContentSync.
 		add_filter( 'acf/pre_save_post', [ $this, 'open_form_edit' ], PHP_INT_MAX, 1 );
 
-		// The value of a password field is not copied into a new translation.
 		add_filter( 'perflocale/translation/excluded_meta_keys', [ $this, 'exclude_password_fields' ], 10, 2 );
 	}
 
 	/**
-	 * `perflocale/translation/excluded_meta_keys`: the values of the source's
-	 * ACF password fields stay out of a new translation.
+	 * `perflocale/translation/excluded_meta_keys`: keep the source's ACF password field values out of a new translation.
 	 *
-	 * A password field is a password by its type, whatever its name, so the
-	 * credential-name patterns of the meta copy do not catch it. ACF stores
-	 * next to each value row `{name}` a reference row `_{name}` holding the
-	 * field key, at any depth (group, repeater, flexible content and clone
-	 * values each have their own), so the source's references give each
-	 * value's field type. Runs only when a translation is created, where the
-	 * source's meta is already in the cache.
+	 * A password is known by its field type, not its name: each value row `{name}` has a `_{name}` row holding the field key.
 	 *
 	 * @param array<int, string> $excluded  Meta keys that are not copied.
 	 * @param int                $source_id Post the translation is copied from.
@@ -189,11 +166,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * `acf/update_value`: record in the post's seed-cleared marker that a
-	 * text field which held a value is saved empty while a person edits the
-	 * post, and forget it once the field holds a value again. Repeater, flexible-content and group
-	 * sub-fields arrive with their full meta key as the name. Any other save
-	 * returns after the field-type check or one read of the primed meta cache.
+	 * `acf/update_value`: record a text field a person empties in the post's seed-cleared marker.
+	 *
+	 * The marker is forgotten once the field holds a value again; nested sub-fields arrive with their full meta key as the name.
 	 *
 	 * @param mixed $value   Value about to be saved, returned unchanged.
 	 * @param mixed $post_id ACF post ID (123, "post_123", "term_5", "option").
@@ -254,13 +229,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Drop every entry ACF's value store holds for one post.
 	 *
-	 * ACF memoises loaded, formatted and escaped values per request under
-	 * "{post_id}:{field name}[:formatted|:escaped]" (the id as an int or as
-	 * "post_{id}"). A write outside update_field() leaves those entries stale,
-	 * and a parent field (group, repeater, flexible content, clone) caches its
-	 * children's values too, so evicting the written leaf keys alone is not
-	 * enough: the whole post's entries go. Other posts, options, terms and
-	 * users keep theirs.
+	 * Keys are "{id}:{name}[:formatted|:escaped]" or "post_{id}:...". A parent field caches its
+	 * children's values too, so evicting only the written leaf keys would leave stale values.
 	 *
 	 * @param mixed $post_id Post whose values changed.
 	 * @return void
@@ -286,10 +256,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Drop ACF's formatted and escaped values when the current language
-	 * changes mid-request, so reference fields re-resolve their siblings for
-	 * the imposed language. Raw loaded values do not depend on the language
-	 * and stay.
+	 * Drop ACF's formatted and escaped values when the language changes mid-request.
+	 *
+	 * Raw loaded values do not depend on the language and stay.
 	 *
 	 * @return void
 	 */
@@ -328,19 +297,12 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function get_settings_fields(): array {
-		// No user-configurable settings - ACF field auto-detection runs
-		// unconditionally on every translatable post type, which is the
-		// expected behaviour for an integration addon.
-		// Empty return means the auto-generated settings subtab won't
-		// surface this addon - there's nothing to configure.
+		// No settings: field detection runs on every translatable post type.
 		return [];
 	}
 
 	/**
-	 * Detect all translatable ACF fields for a post type.
-	 *
-	 * Recursively walks field groups to find text-type fields inside
-	 * repeaters, flexible content layouts, and groups.
+	 * Detect all translatable ACF fields for a post type, nested ones included.
 	 *
 	 * @param array<int, string> $keys Existing translatable meta keys.
 	 * @param string             $post_type Post type being queried.
@@ -371,14 +333,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Expand repeater / flexible-content sub-field keys to every row of the
-	 * source post.
+	 * Expand repeater and flexible-content sub-field keys to every row of the source post.
 	 *
-	 * collect_translatable_fields() can only register row 0 - the meta-key set
-	 * is post-type-scoped and can't know a given post's row count. ContentSync
-	 * copies keys verbatim, so without this rows 1+ of every repeater/flexible
-	 * field would be dropped from translations. The source post id is known
-	 * here, so read its real row structure and add the remaining rows' keys.
+	 * The post-type key set knows only row 0 and ContentSync copies keys verbatim, so rows 1+ need their own keys.
 	 *
 	 * @param array<int, string> $fields    Meta keys queued for sync.
 	 * @param int                $source_id Source post being synced from.
@@ -389,17 +346,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 			return $fields;
 		}
 
-		// Worklist expansion. A nested template like slides_0_buttons_0_label
-		// carries a "_0_" per repeater level; the old single-pass code found
-		// only the FIRST occurrence (expanding outer rows while pinning every
-		// inner row to 0) and never re-scanned the keys it generated - so
-		// inner rows 1..N and outer×inner combinations were silently dropped,
-		// leaving translations with untranslated or structurally-missing rows.
-		// Here each queue item carries a search OFFSET so the NEXT level's
-		// "_0_" is expanded in turn; generated keys re-enter the queue until no
-		// unexpanded "_0_" remains. The (key|offset) dedup makes row-0 (whose
-		// concretised key equals the template) still advance to the inner level
-		// instead of colliding with the original.
+		// Worklist: an item carries a search offset so each nesting level's "_0_" is expanded in turn.
+		// The (key|offset) dedup lets row 0, whose key equals the template, still advance to the inner level.
 		$out   = [];
 		$seen  = [];
 		$queue = [];
@@ -428,10 +376,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 			$suffix    = substr( $key, $pos + 3 ); // Sub-key after this "_0_".
 			$container = get_post_meta( $source_id, $prefix, true );
 
-			// Repeaters store the row count as an int; flexible content stores
-			// an array of layout names (one per row). Row 0 always exists as
-			// the source template; rows 1..N-1 exist when the container reports
-			// them (int count / array length).
+			// A repeater stores a row count, flexible content an array of layout names; row 0 is the template.
 			$count = is_array( $container ) ? count( $container ) : (int) $container;
 
 			for ( $i = 0; $i < max( 1, $count ); $i++ ) {
@@ -440,22 +385,18 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 				$is_leaf   = strpos( $candidate, '_0_', $next_off ) === false;
 
 				if ( $is_leaf ) {
-					// Concrete leaf: keep row 0 (template) always; a
-					// flexible-content row only has this sub-key when its
-					// layout contains the field, so gate real rows on existence.
+					// A flexible-content row has this sub-key only when its layout contains the field.
 					if ( $i === 0 || metadata_exists( 'post', $source_id, $candidate ) ) {
 						$out[ $candidate ] = true;
 					}
 				} else {
-					// Intermediate level: the row exists (i < count), recurse
-					// to expand the next "_0_" past the part just concretised.
+					// Intermediate level: expand the next "_0_" past the part just concretised.
 					$queue[] = array( $candidate, $next_off );
 				}
 			}
 		}
 
-		// Preserve the original contract: every input template key is returned
-		// even when a nested-leaf existence check would otherwise drop it.
+		// Every input template key is returned, even one a leaf existence check skipped.
 		foreach ( $fields as $key ) {
 			if ( is_string( $key ) ) {
 				$out[ $key ] = true;
@@ -466,20 +407,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Machine-translatable ACF meta keys: LEAF text fields only.
+	 * Machine-translatable ACF meta keys: leaf text, textarea and wysiwyg fields only.
 	 *
-	 * Deliberately narrower than add_acf_meta_keys(): url/email/link/oembed
-	 * values must not be machine-translated, and container keys (repeater
-	 * counts, flexible-content layout arrays, group parents) are structural.
-	 * For a concrete post the keys come from concrete_mt_map(), which types
-	 * every flexible-content row by that row's own layout. Type-level queries
-	 * (post id 0, the cost estimate) return row-0 templates. Gated by the
-	 * mt_meta_custom_fields setting (opt-in - cost scales with structure).
-	 *
-	 * With a translation ID, a repeater or flexible-content row is listed only
-	 * while the translation's row at the same index still has the source row's
-	 * structure (see aligned_rows_only()), so a reordered or re-laid-out
-	 * target row never receives another row's text.
+	 * Narrower than add_acf_meta_keys(): url/email/link/oembed values are never machine translated, container keys are structural.
 	 *
 	 * @param array<int, string> $keys           Meta keys.
 	 * @param string             $post_type      Post type.
@@ -520,26 +450,19 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * The concrete MT map of the source post resolved last:
-	 * [ "{blog}:{post}", [ meta key => 'text' | 'html' ] ]. One entry keeps a
-	 * bulk job memory-flat; the blog id keeps it multisite-safe.
+	 * The concrete MT map of the source post resolved last: [ "{blog}:{post}", [ meta key => 'text' | 'html' ] ].
+	 *
+	 * One entry only, so a bulk job stays memory-flat.
 	 *
 	 * @var array{0: string, 1: array<string, string>}|null
 	 */
 	private ?array $concrete_mt_memo = null;
 
 	/**
-	 * Machine-translatable ACF leaves of ONE source post, with their format.
+	 * Machine-translatable ACF leaves of one source post, with their format.
 	 *
-	 * Walks the field schema together with the post's own container meta,
-	 * as ACF's load_value() does: a repeater contributes its stored row count
-	 * and a flexible-content field contributes each row's stored layout name,
-	 * whose sub-fields alone are walked for that row. ACF stores a layout
-	 * sub-field as {field}_{row}_{name} with no layout in the key, so a name
-	 * reused across layouts can only be typed from the row's layout. Container
-	 * keys are never returned, and a key classified twice with different
-	 * results is dropped. Reads come from the post's meta cache. Runs only
-	 * inside machine translation (perflocale/mt/* filters).
+	 * A layout sub-field key has no layout in it, so each flexible row is typed from its stored layout.
+	 * See docs-ai/11-code-rationale.md, "PerfLocaleAcf: concrete MT map".
 	 *
 	 * @param string $post_type Source post type.
 	 * @param int    $source_id Source post ID.
@@ -554,10 +477,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 		// stored row writes at least one key, so a corrupt count cannot spin.
 		$budget = count( (array) get_post_meta( $source_id ) );
 
-		// The groups ACF shows on THIS post's edit screen: location rules that
-		// depend on the post itself (post, page, template, parent, status,
-		// format, terms) resolve against it, and a rule that excludes it (a
-		// default-template group on a custom-template page) keeps its fields out.
+		// The groups ACF shows on this post's edit screen: post-dependent location rules resolve against it.
 		foreach ( acf_get_field_groups(
 			[
 				'post_id'   => $source_id,
@@ -583,25 +503,10 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Drop every key whose row no longer lines up with the translation.
+	 * Drop every key whose row does not line up with the translation.
 	 *
-	 * ACF rows have no stable identity: row N of the translation is only the
-	 * same logical row as row N of the source while its structure matches. A
-	 * flexible-content row matches when the translation stores the same
-	 * layout at that index. A repeater row matches when the index is below
-	 * the translation's row count and none of the row's leaves, including
-	 * the leaves of rows nested in it, holds on the translation, instead of
-	 * the source row's value, the value that leaf has at the same path in
-	 * ANOTHER source row (the mark of a reorder). A leaf that is
-	 * empty, still equal to the source or changed to anything else (a
-	 * translation, a localised link) is no evidence either way. Every
-	 * enclosing row of a key must match. A reorder whose moved leaves are
-	 * all empty or all changed is not detectable this way. A nested leaf
-	 * counts for its outer row even when its own row moved, so when a value
-	 * repeats at mirrored inner positions of two outer rows, a reorder
-	 * inside one of them also fails that whole outer row: its aligned leaves
-	 * are skipped too, and nothing is written into another row. Reads come
-	 * from both posts' meta caches.
+	 * ACF rows have no stable identity, so a reordered target row must not receive another row's text.
+	 * See docs-ai/11-code-rationale.md, "PerfLocaleAcf: row alignment".
 	 *
 	 * @param array<string, string>                                               $map       key => 'text' | 'html'.
 	 * @param array<string, array<int, array{0: string, 1: int, 2: string|null}>> $chains    key => enclosing rows [container key, index, layout|null], outermost first; every classified key, not only those in $map.
@@ -819,9 +724,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 				continue;
 			}
 
-			// Clone fields: cloned text/textarea/wysiwyg subfields are copied
-			// to translations, so they are MT-collectable too, under the same
-			// prefix as the copy walker (clone_child_prefix()).
+			// Cloned leaves are copied to translations, so they are collected under the copy walker's prefix.
 			if ( $field['type'] === 'clone' && ! empty( $field['sub_fields'] ) ) {
 				$clone_prefix = self::clone_child_prefix( $field, $meta_key, $prefix );
 				$keys         = array_merge( $keys, $this->collect_mt_fields( $field['sub_fields'], $clone_prefix, $leaf_types ) );
@@ -832,15 +735,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Declare the MT destination format for an ACF meta key: 'text' for
-	 * text / textarea fields (plain-text destinations that must not carry
-	 * entity-escaped output), leaving wysiwyg (and every non-ACF key) on the
-	 * inherited 'html' default. Only ever UPGRADES a key to text - never the
-	 * reverse - so a wysiwyg field can never be mis-sent as plain text.
+	 * Declare the MT destination format of an ACF meta key: 'text' for text and textarea fields.
 	 *
-	 * A key of the source post that concrete_mt_map() resolved is typed by its
-	 * own row, so a name that is text in one flexible layout and wysiwyg in
-	 * another is routed per row; other keys use the post type's template set.
+	 * Only ever turns a key into text, never back, so a wysiwyg field is never sent as plain text.
 	 *
 	 * @param string $format    Inherited format ('html' by default).
 	 * @param string $key       Meta key (repeater rows carry numeric indices).
@@ -869,18 +766,14 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 			return $format;
 		}
 
-		// Normalise repeater / flexible-content row indices to the row-0
-		// template form collect_mt_fields() emits (slides_3_title →
-		// slides_0_title) so every row of a text field resolves.
+		// Normalise row indices to the row-0 template form (slides_3_title → slides_0_title).
 		$template = (string) preg_replace( '/_\d+_/', '_0_', $key );
 
 		return ( isset( $set[ $key ] ) || isset( $set[ $template ] ) ) ? 'text' : $format;
 	}
 
 	/**
-	 * The set of ACF text/textarea (NOT wysiwyg) meta-key templates for a post
-	 * type, built once per request. Blog-keyed for multisite; bounded so a
-	 * request touching many post types stays memory-flat.
+	 * ACF text and textarea (not wysiwyg) meta-key templates of a post type, memoised per blog.
 	 *
 	 * @param string $post_type Source post type.
 	 * @return array<string, bool> template meta key => true.
@@ -918,12 +811,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Meta-key prefix of a Clone field's children, derived the way ACF Pro
-	 * stores them (acf_field_clone::prepare_field_for_db()): the clone's own
-	 * path minus its `_name`. When ACF loads a clone it already writes the
-	 * "Prefix Field Names" setting into every child's `name` (and, for a
-	 * seamless clone, into `_name`), so the setting must not be applied a
-	 * second time here, and `display` / `prefix_name` are never read.
+	 * Meta-key prefix of a Clone field's children: the clone's own path minus its `_name`, as ACF Pro stores them.
+	 *
+	 * ACF already writes "Prefix Field Names" into each loaded child's name, so that setting is not applied again here.
 	 *
 	 * @param array<string, mixed> $field    Loaded ACF clone field.
 	 * @param string               $meta_key The clone's own meta path ($prefix . name).
@@ -942,10 +832,6 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Recursively collect translatable field meta keys.
-	 *
-	 * Walks through field definitions and builds the meta key patterns
-	 * for all text-type fields, including those nested inside repeaters,
-	 * flexible content layouts, and groups.
 	 *
 	 * @param array<int, array<string, mixed>> $fields ACF field definitions.
 	 * @param string                           $prefix Meta key prefix for nested fields.
@@ -1020,16 +906,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Translate ACF relationship field values on the frontend.
 	 *
-	 * Replaces related post IDs with their translated counterparts
-	 * for the current language.
-	 *
 	 * @param mixed               $value Field value (array of post IDs or WP_Post objects).
-	 * @param mixed               $post_id ACF post id. NOT always an int: acf_get_valid_post_id()
-	 *                                     returns 'options', "term_{$id}", "user_{$id}", "block_…"
-	 *                                     and null. Typing this `int` made PHP throw at argument
-	 *                                     binding - before this method's own early returns could
-	 *                                     run - turning a taxonomy archive or an options page into
-	 *                                     an HTTP 500. Unused in the body; kept for the signature.
+	 * @param mixed               $post_id ACF post id, unused; mixed because ACF passes 'options', "term_{$id}" or null (an int type fatals).
 	 * @param array<string,mixed> $field Field configuration.
 	 * @return mixed
 	 */
@@ -1060,12 +938,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 
 			$translation = $manager->get_translation_id( $related_id, $lang_slug );
 
-			// Only swap in a translation the visitor is allowed to see. A
-			// translation still in draft/pending/private would otherwise be
-			// rendered on a public page in place of the published source -
-			// leaking unfinished content to anonymous visitors and linking to
-			// a URL they cannot open. Falling back to the source keeps the
-			// field populated with something public.
+			// Only a translation the visitor may see: a draft or private one would leak unfinished content.
 			if ( $translation && ! $this->is_publicly_viewable_translation( (int) $translation ) ) {
 				$translation = null;
 			}
@@ -1074,9 +947,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 				if ( is_object( $related_post ) ) {
 					$translated_post = get_post( $translation );
 
-					// Null-guard: get_post returns null when the ID no longer
-					// exists (translator deleted the translated post, etc).
-					// Fall back to the original so callers don't dereference null.
+					// The translated post may be deleted: fall back to the original.
 					$translated[] = $translated_post instanceof \WP_Post ? $translated_post : $related_post;
 				} else {
 					$translated[] = $translation;
@@ -1109,15 +980,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Load what translate_relationship() reads for a list of references in
-	 * batches: the links of every referenced post in one prime, then the
-	 * current-language posts in chunks of TARGET_PRIME_CHUNK. The mapping
-	 * loop then finds them in the cache instead of paying one link lookup
-	 * (above the eager-map cap) and one post query per item. It only fills
-	 * caches: the per-item visibility check, the fallback to the source and
-	 * the order of the list are the loop's, unchanged. Terms and meta are not
-	 * read by the loop, so they are not loaded. A list with fewer than two
-	 * distinct posts is left to the loop.
+	 * Prime in batches the links and translated posts translate_relationship() reads.
+	 *
+	 * Cache fill only: visibility, fallback and order stay with the mapping loop.
 	 *
 	 * @param array<int|string, mixed> $value     Relationship field value.
 	 * @param string                   $lang_slug Current language slug.
@@ -1161,20 +1026,12 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * @param mixed               $value Field value: a post ID or WP_Post object, or a
 	 *                                   list of them when "Select multiple" is on.
-	 * @param mixed               $post_id ACF post id. NOT always an int: acf_get_valid_post_id()
-	 *                                     returns 'options', "term_{$id}", "user_{$id}", "block_…"
-	 *                                     and null. Typing this `int` made PHP throw at argument
-	 *                                     binding - before this method's own early returns could
-	 *                                     run - turning a taxonomy archive or an options page into
-	 *                                     an HTTP 500. Unused in the body; kept for the signature.
+	 * @param mixed               $post_id ACF post id, unused; mixed because ACF passes 'options', "term_{$id}" or null (an int type fatals).
 	 * @param array<string,mixed> $field Field configuration.
 	 * @return mixed
 	 */
 	public function translate_post_object( mixed $value, mixed $post_id, array $field ): mixed {
-		// A "Select multiple" Post Object reaches this filter as int[] or
-		// WP_Post[] (ACF's own format_value collapses to one value only when
-		// `multiple` is off). Map a list per item, exactly like a Relationship
-		// field: an (int) cast of an array is 1, a real post ID.
+		// A "Select multiple" Post Object arrives as a list: map it per item (an (int) cast of an array is 1, a real post ID).
 		if ( is_array( $value ) ) {
 			return $this->translate_relationship( $value, $post_id, $field );
 		}
@@ -1215,15 +1072,8 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Translate ACF taxonomy field values on the frontend.
 	 *
-	 * Replaces term IDs with their translated counterparts.
-	 *
 	 * @param mixed               $value Field value (array of term IDs or WP_Term objects).
-	 * @param mixed               $post_id ACF post id. NOT always an int: acf_get_valid_post_id()
-	 *                                     returns 'options', "term_{$id}", "user_{$id}", "block_…"
-	 *                                     and null. Typing this `int` made PHP throw at argument
-	 *                                     binding - before this method's own early returns could
-	 *                                     run - turning a taxonomy archive or an options page into
-	 *                                     an HTTP 500. Unused in the body; kept for the signature.
+	 * @param mixed               $post_id ACF post id, unused; mixed because ACF passes 'options', "term_{$id}" or null (an int type fatals).
 	 * @param array<string,mixed> $field Field configuration.
 	 * @return mixed
 	 */
@@ -1286,15 +1136,9 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Load what translate_taxonomy() reads for a list of terms in batches:
-	 * the links of every listed term in one prime, then the current-language
-	 * terms in chunks of TARGET_PRIME_CHUNK, without term meta. The mapping
-	 * loop then finds them in the cache instead of paying one link lookup
-	 * (above the eager-map cap) and one term query per item. It only fills
-	 * caches: the per-item get_term() check, the fallback to the source and
-	 * the order of the list are the loop's, unchanged. Only term objects,
-	 * integers and numeric strings are read here; a list with fewer than two
-	 * distinct terms is left to the loop.
+	 * Prime in batches the links and translated terms translate_taxonomy() reads.
+	 *
+	 * Cache fill only: the get_term() check, fallback and order stay with the mapping loop.
 	 *
 	 * @param array<int|string, mixed> $value     Taxonomy field value.
 	 * @param string                   $lang_slug Current language slug.
@@ -1348,10 +1192,7 @@ final class PerfLocaleAcf implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Whether a translated post may be shown to the current visitor.
 	 *
-	 * Reference fields resolve on the front end, where swapping in a draft,
-	 * pending or private translation would publish unfinished content and
-	 * point at a URL the visitor cannot open. Uses core's own visibility
-	 * rule (WP 5.7+) with a status fallback for older cores.
+	 * Core's visibility rule (WP 5.7+) with a status fallback for older cores.
 	 *
 	 * @param int $post_id Translated post ID.
 	 * @return bool

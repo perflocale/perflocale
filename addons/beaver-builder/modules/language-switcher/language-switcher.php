@@ -13,9 +13,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Language Switcher Beaver Builder module.
- *
- * Renders the PerfLocale language switcher as a drag-and-drop
- * Beaver Builder module with all configuration options.
  */
 class PerfLocale_BB_Language_Switcher extends \FLBuilderModule {
 

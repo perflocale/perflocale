@@ -1,6 +1,6 @@
 <?php
 /**
- * Tier-2 wrapper for {@see \PerfLocale\Migration\PolylangImporter}.
+ * Background job for the Polylang importer.
  *
  * @package PerfLocale
  */
@@ -19,13 +19,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Runs the Polylang migration in the background.
- *
- * Polylang stores translation groups as serialised PHP arrays in the
- * `description` field of `post_translations` / `term_translations`
- * taxonomy terms. The importer walks those and rebuilds groups in
- * PerfLocale's tables. It does NOT touch Polylang's data, so re-runs
- * are safe.
+ * Runs the Polylang migration in the background. It reads Polylang's translation terms and never writes them, so a
+ * re-run is safe.
  */
 final class PolylangMigrationJob extends AbstractJob {
 
@@ -47,12 +42,8 @@ final class PolylangMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * The importer reports progress after every batch, and a report at
-	 * least every 30 seconds refreshes the lock, so the lock only has to
-	 * outlive the longest gap between two batches: the same lifetime as the
-	 * import lock's heartbeat. A killed worker's job is then found within
-	 * minutes ({@see \PerfLocale\Background\JobState::worker_gone()}) and a
-	 * new import can start.
+	 * The import lock's heartbeat TTL: a report at least every 30 s refreshes the lock, so it only outlives the longest
+	 * gap between batches and a killed worker is found within minutes (JobState::worker_gone()).
 	 */
 	public function get_lock_ttl(): int {
 		return MigrationLock::HEARTBEAT_TTL;
@@ -61,14 +52,12 @@ final class PolylangMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Polylang's translation taxonomy lives in `wp_term_taxonomy`. Count
-	 * `post_translations` rows as a proxy for migration cost.
+	 * Polylang's translation terms in `wp_term_taxonomy` as the migration's cost.
 	 */
 	protected function args_size( array $args ): int {
 		global $wpdb;
-		// Count BOTH translation taxonomies: import() processes post_translations
-		// AND term_translations, so a term-heavy site was under-counted and could
-		// wrongly run inline (risking a PHP-FPM timeout) instead of async.
+		// Both taxonomies: import() walks post and term groups; counting one would send a term-heavy site to an
+		// inline run (a PHP-FPM timeout risk).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		return (int) $wpdb->get_var(
 			$wpdb->prepare(
@@ -82,11 +71,8 @@ final class PolylangMigrationJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Runs inside the shared import lock ({@see MigrationRunner}). When
-	 * another import holds it, the exception is left to the worker, which
-	 * retries the job later; the admin's inline run shows its message. A
-	 * refused import is returned as a failed run with its reason. Each
-	 * import heartbeat goes to {@see MigrationRunner::job_reporter()}.
+	 * In the shared import lock (MigrationRunner): a held lock's exception reaches the worker (retry) or the inline
+	 * run. A refused import returns a failed run; heartbeats go to MigrationRunner::job_reporter().
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$progress( 0, 1 );

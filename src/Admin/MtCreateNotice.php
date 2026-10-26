@@ -14,27 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * When the Create action was set to machine-translate a new translation and
- * the machine translation was refused or failed, the translation is created
- * as an untranslated copy of the original, as before, and the screen the
- * user lands on says why.
+ * Tells the user on the post's screen why machine translation was not saved (Create, or publish).
  *
- * The reason travels as a short-lived record for that user and that post (a
- * transient, ten minutes), read once on the screen that shows it and
- * deleted. Not as text or a code in the redirect URL: the reason is the
- * provider's or the save guard's own message, which a code cannot carry,
- * and a link someone else crafts cannot put a notice on anyone's screen.
- *
- * Shown by the block editor (its notices, from the editor script's data),
- * the classic editor (an admin notice) and, when the new post has no edit
- * screen, the Translations screen the action falls back to.
- *
- * Auto-translate on publish runs later, in a background job with no user,
- * and records its refusal or failures on the published post for the user
- * who published it (the publishing request notes who that was), or for the
- * post's author when nobody did: a scheduled publish, WP-CLI. The record
- * waits up to seven days for that user's next load of the post's edit
- * screen. A later run that saves every translation removes it.
+ * A per-user, per-post transient read once, never a URL parameter: a crafted link must not show a notice.
+ * See docs-ai/11-code-rationale.md, "MtCreateNotice: notice records".
  */
 final class MtCreateNotice {
 
@@ -49,18 +32,19 @@ final class MtCreateNotice {
 	private const PUBLISH_TTL = 7 * DAY_IN_SECONDS;
 
 	/**
-	 * How long the publishing user is kept for the background job.
-	 */
-	private const PUBLISHER_TTL = DAY_IN_SECONDS;
-
-	/**
 	 * Longest reason kept, in characters.
 	 */
 	private const MAX_REASON = 500;
 
 	/**
-	 * Notices already taken in this request, by post id ('' when none), so
-	 * the editor script's data and the admin notice read one record once.
+	 * Prefix of the user meta `perflocale_mt_notice_<blog>_<post>` => expiry of a waiting record.
+	 *
+	 * AdminController::mt_create_notice_waiting() reads the same key.
+	 */
+	public const WAITING_META_PREFIX = 'perflocale_mt_notice_';
+
+	/**
+	 * Notices taken in this request by post id, so script data and admin notice share one read.
 	 *
 	 * @var array<int, string>
 	 */
@@ -78,7 +62,44 @@ final class MtCreateNotice {
 	}
 
 	/**
-	 * Transient name of the user who published a post, for its auto-translate job.
+	 * User meta key that says a record for a post on this site is waiting.
+	 *
+	 * @param int $post_id Post.
+	 * @return string
+	 */
+	private static function waiting_key( int $post_id ): string {
+		return self::WAITING_META_PREFIX . get_current_blog_id() . '_' . $post_id;
+	}
+
+	/**
+	 * Note that a record waits for a user, deleting the user's expired entries first.
+	 *
+	 * @param int $user_id User.
+	 * @param int $post_id Post.
+	 * @param int $ttl     Seconds the record lives.
+	 * @return void
+	 */
+	private static function mark_waiting( int $user_id, int $post_id, int $ttl ): void {
+		$all = get_user_meta( $user_id );
+		$now = time();
+
+		foreach ( is_array( $all ) ? $all : [] as $meta_key => $values ) {
+			if (
+				is_string( $meta_key )
+				&& 1 === preg_match( '/^' . preg_quote( self::WAITING_META_PREFIX, '/' ) . '([0-9]+)_([0-9]+)$/', $meta_key, $m )
+				&& is_array( $values )
+				&& is_numeric( $values[0] ?? null )
+				&& (int) $values[0] < $now
+			) {
+				delete_user_meta( $user_id, self::WAITING_META_PREFIX . $m[1] . '_' . $m[2] );
+			}
+		}
+
+		update_user_meta( $user_id, self::waiting_key( $post_id ), $now + $ttl );
+	}
+
+	/**
+	 * Transient name of the user who published a post (written by 1.0.7.3 and earlier for their queued event).
 	 *
 	 * @param int $post_id Published post.
 	 * @return string
@@ -88,28 +109,13 @@ final class MtCreateNotice {
 	}
 
 	/**
-	 * Note the current user as the one who published a post, for the
-	 * auto-translate job that runs later without a user. Nothing without a
-	 * current user (a scheduled publish, WP-CLI).
+	 * The user who published a post; the note is deleted unless $keep.
 	 *
-	 * @param int $post_id Published post.
-	 * @return void
-	 */
-	public static function remember_publisher( int $post_id ): void {
-		$user_id = get_current_user_id();
-
-		if ( $user_id > 0 && $post_id > 0 ) {
-			set_transient( self::publisher_key( $post_id ), $user_id, self::PUBLISHER_TTL );
-		}
-	}
-
-	/**
-	 * The user who published a post, once: the note is deleted.
-	 *
-	 * @param int $post_id Published post.
+	 * @param int  $post_id Published post.
+	 * @param bool $keep    Leave the note (a run that may still be retried).
 	 * @return int The user's id, or 0 when none was noted.
 	 */
-	public static function take_publisher( int $post_id ): int {
+	public static function take_publisher( int $post_id, bool $keep = false ): int {
 		if ( $post_id <= 0 ) {
 			return 0;
 		}
@@ -121,20 +127,17 @@ final class MtCreateNotice {
 			return 0;
 		}
 
-		delete_transient( $key );
+		if ( ! $keep ) {
+			delete_transient( $key );
+		}
 
 		return is_numeric( $stored ) ? max( 0, (int) $stored ) : 0;
 	}
 
 	/**
-	 * Record what auto-translate on publish could not save, for a user, on
-	 * the published post; replaces the post's earlier publish record. No
-	 * failures removes it.
+	 * Record what auto-translate on publish could not save; replaces the publish record, and none removes it.
 	 *
-	 * Each failure is one language not saved: `reason` the refusal or
-	 * failure message, `own` when it already says it was not saved (a save
-	 * guard's refusal), `language` the language's name, '' when the refusal
-	 * covers every language.
+	 * Failure keys: `reason`, `own` (it says "not saved" itself), `language` ('' = all), `warning` (saved, with gaps).
 	 *
 	 * @param int                              $user_id  The user to show it to.
 	 * @param int                              $post_id  Published post.
@@ -157,6 +160,7 @@ final class MtCreateNotice {
 				$items[] = [
 					'reason'   => $reason,
 					'own'      => true === ( $failure['own'] ?? false ),
+					'warning'  => true === ( $failure['warning'] ?? false ),
 					'language' => is_string( $language ) ? self::plain( $language ) : '',
 				];
 			}
@@ -175,8 +179,10 @@ final class MtCreateNotice {
 
 			if ( [] === $record ) {
 				delete_transient( $key );
+				delete_user_meta( $user_id, self::waiting_key( $post_id ) );
 			} else {
 				set_transient( $key, $record, self::TTL );
+				self::mark_waiting( $user_id, $post_id, self::TTL );
 			}
 
 			return;
@@ -185,6 +191,7 @@ final class MtCreateNotice {
 		$record['publish'] = $items;
 
 		set_transient( $key, $record, self::PUBLISH_TTL );
+		self::mark_waiting( $user_id, $post_id, self::PUBLISH_TTL );
 	}
 
 	/**
@@ -192,9 +199,7 @@ final class MtCreateNotice {
 	 *
 	 * @param int    $post_id    Created translation.
 	 * @param string $reason     The refusal or failure message.
-	 * @param bool   $says_not_saved The reason already says the translation was
-	 *                           not saved (a save guard's refusal), so the
-	 *                           notice does not say it again.
+	 * @param bool   $says_not_saved The reason already says it was not saved, so the notice does not repeat it.
 	 * @return void
 	 */
 	public static function remember( int $post_id, string $reason, bool $says_not_saved = false ): void {
@@ -213,10 +218,56 @@ final class MtCreateNotice {
 			],
 			self::TTL
 		);
+		self::mark_waiting( $user_id, $post_id, self::TTL );
 	}
 
 	/**
-	 * The current user's notice for a post, once: the record is deleted.
+	 * A remember_publish() item for a translation saved with a builder warning, or none.
+	 *
+	 * @param array<string, mixed> $result   translate_post() result.
+	 * @param object               $language The target language.
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function publish_warnings( array $result, object $language ): array {
+		$warning = $result['builder_warning'] ?? '';
+		$vars    = get_object_vars( $language );
+		$name    = $vars['name'] ?? '';
+		$slug    = $vars['slug'] ?? '';
+
+		return is_string( $warning ) && '' !== $warning
+			? [
+				[
+					'reason'   => $warning,
+					'warning'  => true,
+					'language' => is_string( $name ) && '' !== $name ? $name : ( is_string( $slug ) ? $slug : '' ),
+				],
+			]
+			: [];
+	}
+
+	/**
+	 * Record a warning of the machine translation that created the post; shown as it is.
+	 *
+	 * @param int    $post_id Created translation.
+	 * @param string $warning What the translation left out.
+	 * @return void
+	 */
+	public static function remember_warning( int $post_id, string $warning ): void {
+		self::remember( $post_id, $warning );
+
+		$key    = self::key( get_current_user_id(), $post_id );
+		$record = get_transient( $key );
+
+		if ( is_array( $record ) ) {
+			$record['warning'] = true;
+			set_transient( $key, $record, self::TTL );
+		}
+	}
+
+	/**
+	 * The current user's notice for a post, once (record and waiting entry are deleted).
+	 *
+	 * Without a waiting entry the record is not read.
 	 *
 	 * @param int $post_id Post.
 	 * @return string The notice text, or ''.
@@ -229,7 +280,7 @@ final class MtCreateNotice {
 		$user_id = get_current_user_id();
 		$notice  = '';
 
-		if ( $user_id > 0 && $post_id > 0 ) {
+		if ( $user_id > 0 && $post_id > 0 && AdminController::mt_create_notice_waiting( $post_id ) ) {
 			$key    = self::key( $user_id, $post_id );
 			$stored = get_transient( $key );
 
@@ -237,12 +288,14 @@ final class MtCreateNotice {
 				delete_transient( $key );
 			}
 
+			delete_user_meta( $user_id, self::waiting_key( $post_id ) );
+
 			$record = is_array( $stored ) ? $stored : [];
 			$reason = $record['reason'] ?? '';
 			$parts  = [];
 
 			if ( is_string( $reason ) && '' !== $reason ) {
-				$parts[] = self::message( $reason, true === ( $record['own'] ?? false ) );
+				$parts[] = true === ( $record['warning'] ?? false ) ? $reason : self::message( $reason, true === ( $record['own'] ?? false ) );
 			}
 
 			if ( isset( $record['publish'] ) && is_array( $record['publish'] ) ) {
@@ -283,8 +336,7 @@ final class MtCreateNotice {
 	}
 
 	/**
-	 * The notice lines of a publish record: one per reason, naming the
-	 * languages it left unchanged, in the order recorded.
+	 * The lines of a publish record: one per reason, with the languages it left unchanged.
 	 *
 	 * @param array<mixed> $items The record's items.
 	 * @return array<int, string>
@@ -298,12 +350,14 @@ final class MtCreateNotice {
 			}
 
 			$own   = true === ( $item['own'] ?? false );
-			$group = ( $own ? 'own:' : 'other:' ) . $item['reason'];
+			$warn  = true === ( $item['warning'] ?? false );
+			$group = ( $warn ? 'warning:' : ( $own ? 'own:' : 'other:' ) ) . $item['reason'];
 
 			if ( ! isset( $groups[ $group ] ) ) {
 				$groups[ $group ] = [
 					'reason'    => $item['reason'],
 					'own'       => $own,
+					'warning'   => $warn,
 					'languages' => [],
 				];
 			}
@@ -318,7 +372,13 @@ final class MtCreateNotice {
 		$lines = [];
 
 		foreach ( $groups as $group ) {
-			$lines[] = self::publish_message( $group['reason'], $group['own'], $group['languages'] );
+			$lines[] = $group['warning']
+				? $group['reason'] . ( [] === $group['languages'] ? '' : ' ' . sprintf(
+					/* translators: %s: a language name, or a list of language names. */
+					_n( 'Affected translation: %s.', 'Affected translations: %s.', count( $group['languages'] ), 'perflocale' ),
+					wp_sprintf( '%l', $group['languages'] )
+				) )
+				: self::publish_message( $group['reason'], $group['own'], $group['languages'] );
 		}
 
 		return $lines;
@@ -329,8 +389,7 @@ final class MtCreateNotice {
 	 *
 	 * @param string             $reason         Reason.
 	 * @param bool               $says_not_saved The reason already says the translation was not saved.
-	 * @param array<int, string> $languages      Names of the languages it left unchanged; none when
-	 *                                           the reason covers every language.
+	 * @param array<int, string> $languages      Languages it left unchanged; none when it covers every language.
 	 * @return string
 	 */
 	public static function publish_message( string $reason, bool $says_not_saved, array $languages ): string {
@@ -356,27 +415,35 @@ final class MtCreateNotice {
 	}
 
 	/**
-	 * The admin notice on the classic editor and on the Translations screen.
-	 * The block editor shows the notice from its script's data instead.
+	 * The admin notice on the classic editor and the Translations screen (the block editor uses script data).
 	 *
 	 * @return void
 	 */
 	public static function render_admin_notice(): void {
-		$post_id = 0;
-		$page    = isset( $_GET['page'] ) && is_string( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only: the record is the current user's and is checked against edit_post.
+		$post_id        = 0;
+		$on_post_screen = false;
+		$page           = isset( $_GET['page'] ) && is_string( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only: the record is the current user's and is checked against edit_post.
 
 		if ( 'post.php' === ( $GLOBALS['pagenow'] ?? '' ) && isset( $_GET['post'] ) && is_numeric( $_GET['post'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only, as above.
-			$post_id = absint( $_GET['post'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only, as above.
-			$post    = get_post( $post_id );
-
-			if ( ! $post instanceof \WP_Post || ( function_exists( 'use_block_editor_for_post' ) && use_block_editor_for_post( $post ) ) ) {
-				return;
-			}
+			$post_id        = absint( $_GET['post'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only, as above.
+			$on_post_screen = true;
 		} elseif ( 'perflocale-translations' === $page && isset( $_GET['perflocale_created'] ) && is_numeric( $_GET['perflocale_created'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only, as above.
 			$post_id = absint( $_GET['perflocale_created'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only, as above.
 		}
 
-		if ( $post_id <= 0 || ! current_user_can( 'edit_post', $post_id ) ) {
+		if ( ! AdminController::mt_create_notice_waiting( $post_id ) ) {
+			return;
+		}
+
+		if ( $on_post_screen ) {
+			$post = get_post( $post_id );
+
+			if ( ! $post instanceof \WP_Post || ( function_exists( 'use_block_editor_for_post' ) && use_block_editor_for_post( $post ) ) ) {
+				return;
+			}
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
 			return;
 		}
 
@@ -399,7 +466,7 @@ final class MtCreateNotice {
 	 * @return string
 	 */
 	public static function editor_message( int $post_id ): string {
-		if ( $post_id <= 0 || ! current_user_can( 'edit_post', $post_id ) ) {
+		if ( ! AdminController::mt_create_notice_waiting( $post_id ) || ! current_user_can( 'edit_post', $post_id ) ) {
 			return '';
 		}
 
@@ -407,8 +474,7 @@ final class MtCreateNotice {
 	}
 
 	/**
-	 * A message as plain text: no tags, entities decoded, credentials masked,
-	 * one line, capped.
+	 * A message as plain text: no tags, entities decoded, credentials masked, one line, capped.
 	 *
 	 * @param string $text Message.
 	 * @return string

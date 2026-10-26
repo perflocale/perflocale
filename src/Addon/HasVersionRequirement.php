@@ -14,14 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Implement this on an addon class that uses an API surface introduced in
- * a specific PerfLocale release. The registry calls
- * {@see get_min_perflocale_version()} during boot and skips the addon
- * (surfacing an admin notice instead of fataling) when the host plugin is
- * older than the required version.
+ * Opt-in capability: on an older PerfLocale the registry skips the addon with an admin notice instead of a fatal.
  *
- * The check uses PHP's {@see version_compare()} with the `<` operator, so
- * the string should be a SemVer-ish triple ("1.4.0", "2.0.0-beta1", etc.).
+ * Compared with version_compare( PERFLOCALE_VERSION, $min, '<' ): return a dot version such as "1.4.0".
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */

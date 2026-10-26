@@ -12,14 +12,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Slim SEO integration for PerfLocale.
+ * Slim SEO integration: canonical guard, all-language sitemaps and schema.
  *
- * Ensures schema language properties are correct and unlocks Slim
- * SEO's own sitemap queries so every language's content is listed
- * (Slim SEO replaces WP core sitemaps with its /sitemap.xml tree
- * built from plain WP_Query/get_terms calls). Slim SEO delegates
- * hreflang to multilingual plugins, which PerfLocale's core
- * handles natively.
+ * No hreflang suppression: Slim SEO leaves hreflang to multilingual plugins.
  */
 final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 
@@ -60,10 +55,8 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function is_compatible(): bool {
-		// Slim-SEO 4.x renamed its main class from SlimSEO\Plugin to
-		// SlimSEO\Core. Accept either so the addon stays compatible with
-		// both the older and the current naming. The SLIM_SEO_VER constant
-		// is the version gate.
+		// Either main class name: Slim SEO 4.x has SlimSEO\Core, older builds SlimSEO\Plugin.
+		// SLIM_SEO_VER is the version gate.
 		if ( ! class_exists( 'SlimSEO\\Core' ) && ! class_exists( 'SlimSEO\\Plugin' ) ) {
 			return false;
 		}
@@ -82,35 +75,17 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so Slim SEO's own og:locale already reflects the current language.
 
-		// Missing-translation canonical guard. PerfLocale registers it on
-		// core's `get_canonical_url`, but Slim SEO removes core's
-		// rel_canonical and emits its own, so that filter never fires and the
-		// guard is inert whenever this plugin is active. Re-register it on
-		// Slim SEO's own canonical filter; HreflangTags decides whether the
-		// value is PerfLocale's to correct, so the per-post
-		// `slim_seo[canonical]` override (already applied upstream) is left
-		// alone. Only the URL argument is needed; the queried-object id passed
-		// as the second arg is ignored.
+		// Slim SEO removes core's rel_canonical, so the missing-translation canonical guard
+		// rides Slim SEO's filter; HreflangTags leaves a `slim_seo[canonical]` override alone.
 		add_filter( 'slim_seo_canonical_url', [ $this, 'pin_fallback_canonical' ] );
 
-		// Slim SEO's /sitemap.xml tree replaces WP core sitemaps and builds
-		// its entries with plain WP_Query/get_terms calls - without this
-		// unlock PerfLocale's language filter stamps the default language
-		// onto those queries and every translated post/term vanishes from
-		// the sitemap.
+		// Slim SEO's sitemap (replaces core's) uses plain WP_Query/get_terms calls, which
+		// PerfLocale would limit to one language.
 		add_filter( 'slim_seo_sitemap_post_type_query_args', [ $this, 'include_all_languages' ] );
 		add_filter( 'slim_seo_taxonomy_query_args', [ $this, 'include_all_languages' ] );
 
-		// Set schema inLanguage to current language. Gated on the
-		// setting so no callback runs when enrichment is disabled.
-		//
-		// `slim_seo_schema_graph`, NOT `slim_seo_schema_entities`. Manager::output()
-		// fires the entities filter over `$this->entities` - Schema\Types\Base
-		// OBJECTS keyed by `$entity->context` - and only turns them into schema
-		// arrays two lines later (src/Schema/Manager.php:32 vs 37). A schema
-		// enricher hooked there is handed objects it cannot read and silently
-		// changes nothing; worse, anything it added to that array would reach
-		// `$entity->is_active()` on line 34 as a fatal.
+		// Schema enrichment, only when on. `slim_seo_schema_graph`, never `slim_seo_schema_entities`:
+		// that one holds entity objects, and an array added to it fatals on is_active().
 		if ( $plugin->has( 'settings' ) && $plugin->get( 'settings' )->seo_schema_enrichment_enabled() ) {
 			add_filter( 'slim_seo_schema_graph', [ $this, 'filter_schema_language' ] );
 		}
@@ -119,8 +94,7 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
-	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context - where Slim SEO's canonical filter never fires anyway.
+	 * Null in admin (non-AJAX): the service is front-end only.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
 	 */
@@ -168,23 +142,13 @@ final class PerfLocaleSlimSeo implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Enrich Slim SEO's schema graph with inLanguage + translation siblings.
+	 * Enrich Slim SEO's schema graph with inLanguage and translation siblings.
 	 *
-	 * Slim SEO builds the graph with `array_map()` over its context-keyed
-	 * entity map, and `array_map()` preserves those string keys - so what
-	 * arrives here is a MAP ('website' => [...], 'webpage' => [...]), not the
-	 * sequential list Yoast, AIOSEO and TSF pass. SchemaEnricher::enrich_graph()
-	 * recognises an `@graph` envelope, a list, or one entity; a keyed map falls
-	 * through to its single-entity branch, whose `@type` lookup misses and
-	 * returns the map untouched. Enrich each entity individually and keep the
-	 * keys, exactly as the Rank Math and SEOPress addons do for their own
-	 * keyed maps. Slim SEO re-indexes with array_values() straight after this
-	 * filter, so the keys are ours to preserve.
+	 * A map keyed by context ('website', 'webpage'), which enrich_graph() leaves untouched:
+	 * enrich entity by entity and keep the keys.
 	 *
 	 * @param array<string, array<string, mixed>>|mixed $graph Slim SEO schema map.
-	 * @return array<string, array<string, mixed>>|mixed Enriched map, or the
-	 *                                                   value unchanged when it
-	 *                                                   is not a graph array.
+	 * @return array<string, array<string, mixed>>|mixed Enriched map; anything else unchanged.
 	 */
 	public function filter_schema_language( $graph ) {
 		if ( ! is_array( $graph ) ) {

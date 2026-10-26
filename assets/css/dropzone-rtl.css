@@ -1,8 +1,7 @@
 /**
  * Drag-and-drop file uploader.
  *
- * Used by the PO import disclosure on the Strings page and the CSV import
- * disclosure on the Glossary page. Conditionally enqueued - only on those
+ * Used by the PO import on the Strings page and the data import on the Settings page; enqueued only on those
  * two screens.
  */
 

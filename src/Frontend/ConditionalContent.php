@@ -16,17 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Evaluates whether content should display based on the current language,
- * exposed consistently across three surfaces:
+ * Shows content only for chosen languages: the if-language block, `[perflocale_if]` and a PHP helper.
  *
- * - Gutenberg block - `perflocale/if-language` wrapping inner blocks
- * - Shortcode - `[perflocale_if langs="fr,de"]...[/perflocale_if]`
- * - PHP helper - `perflocale_if_language( [ 'fr', 'de' ] )`
- *
- * All three call {@see should_show()} so semantics can never drift.
- * Zero DB I/O: the current-language lookup is already cached once per
- * request by LanguageRouter - evaluating the predicate is a single
- * `in_array()` plus light attribute parsing.
+ * All three go through should_show() so their semantics stay identical.
  */
 final class ConditionalContent {
 
@@ -41,10 +33,7 @@ final class ConditionalContent {
 	public const SHORTCODE_TAG = 'perflocale_if';
 
 	/**
-	 * Register hooks for block + shortcode registration + editor assets.
-	 *
-	 * Called from Bootstrap. Idempotent - safe to call more than once
-	 * but Bootstrap only wires it in the container lifecycle.
+	 * Register hooks for the block, the shortcode and editor assets.
 	 *
 	 * @return void
 	 */
@@ -58,9 +47,7 @@ final class ConditionalContent {
 	/**
 	 * Register the editor stylesheet referenced from block.json.
 	 *
-	 * block.json's `editorStyle` field expects a registered handle when it
-	 * isn't prefixed with `file:`. Registering here (before register_block)
-	 * lets the block metadata resolve the handle at registration time.
+	 * Priority 9: block.json names this handle, so it must exist before the block registers.
 	 *
 	 * @return void
 	 */
@@ -84,17 +71,14 @@ final class ConditionalContent {
 		$languages = self::normalize_languages( $languages );
 
 		if ( $languages === [] ) {
-			// No languages specified. Non-inverted → block never shows;
-			// inverted → block always shows (because "none" excluded).
+			// No languages: never shown, or always shown when inverted.
 			return $invert;
 		}
 
 		$current = self::current_slug();
 
 		if ( $current === '' ) {
-			// Unknown current language - fail closed so conditional content
-			// doesn't accidentally leak in the wrong locale on edge cases
-			// (e.g. during language setup before any language is active).
+			// Unknown language: fail closed.
 			return false;
 		}
 
@@ -142,12 +126,7 @@ final class ConditionalContent {
 	}
 
 	/**
-	 * Attach the editor-script data for the block.
-	 *
-	 * The script itself is registered + enqueued by WP core via block.json's
-	 * `editorScript` field. We just need to localise the language list onto
-	 * that auto-generated handle so the editor can populate its multi-select
-	 * without a REST roundtrip per block instance.
+	 * Attach the language list to the block's editor script (registered from block.json).
 	 *
 	 * @return void
 	 */
@@ -175,9 +154,7 @@ final class ConditionalContent {
 	 * Server-side render callback for the block.
 	 *
 	 * @param array<string, mixed> $attributes Block attributes.
-	 * @param string               $content Inner (block) content - already
-	 *               rendered by the core parser
-	 *               before this callback fires.
+	 * @param string               $content Rendered inner block content.
 	 * @return string
 	 */
 	public function render_block( array $attributes, string $content ): string {
@@ -190,18 +167,14 @@ final class ConditionalContent {
 			return '';
 		}
 
-		// Escaped on the way out. $content is inner-block HTML that core has
-		// already rendered (and KSES-filtered at save for authors without
-		// unfiltered_html), but this callback's return value is echoed by
-		// WordPress, so it is filtered here too rather than trusted.
+		// The return value is echoed: escape it rather than trust the saved content.
 		return self::kses_content( $content );
 	}
 
 	/**
-	 * Shortcode callback: [perflocale_if langs="fr,de" not_langs="" ]...[/perflocale_if]
+	 * Shortcode callback for `[perflocale_if langs="fr,de"]` or `not_langs` (inverted).
 	 *
-	 * Accepts either `langs` (positive match) OR `not_langs` (inverted).
-	 * When both are supplied `not_langs` wins (inverts against its list).
+	 * When both are given, `not_langs` wins.
 	 *
 	 * @param array<string, string>|string $atts Shortcode attributes.
 	 * @param string|null                  $content Enclosed shortcode content.
@@ -225,12 +198,7 @@ final class ConditionalContent {
 			return '';
 		}
 
-		// Render nested shortcodes + blocks so authors can nest e.g.
-		// `[perflocale_if][perflocale_switcher][/perflocale_if]`. do_blocks()/
-		// do_shortcode() return trusted HTML by definition, and the inner
-		// $content came through the_content (KSES-filtered by core for users
-		// without unfiltered_html); escaping it would defeat the purpose and
-		// corrupt valid markup, like every container shortcode in WP.
+		// Nested blocks and shortcodes render first; the result is escaped below.
 		$out = (string) ( $content ?? '' );
 
 		if ( $out === '' ) {
@@ -244,19 +212,10 @@ final class ConditionalContent {
 	}
 
 	/**
-	 * Escape wrapped content on output.
+	 * Escape wrapped content on output with the post allowlist extended for core block output.
 	 *
-	 * Both callbacks return author-authored content that WordPress echoes
-	 * directly, so it is run through `wp_kses()` here instead of being
-	 * trusted. Plain `wp_kses_post()` is not usable: it strips `<iframe>`
-	 * (destroying every oEmbed), removes inline `<svg>` outright, and drops
-	 * `srcset`/`sizes` from responsive images - so the post allowlist is
-	 * extended with exactly the elements and attributes WordPress core's own
-	 * block renderers emit.
-	 *
-	 * Anything still missing can be restored per-site through the
-	 * `perflocale/conditional_content/allowed_html` filter rather than by
-	 * disabling escaping.
+	 * Not wp_kses_post(): it strips iframes (oEmbeds), inline SVG and srcset.
+	 * See docs-ai/11-code-rationale.md, "ConditionalContent: output allowlist".
 	 *
 	 * @param string $content Rendered inner content.
 	 * @return string Escaped content.
@@ -268,8 +227,7 @@ final class ConditionalContent {
 
 		$allowed = wp_kses_allowed_html( 'post' );
 
-		// Shared presentational/accessibility attributes core puts on block
-		// wrappers. data-* is allowed wholesale by wp_kses since WP 5.0.
+		// Attributes core puts on block wrappers; wp_kses() allows data-* on its own.
 		$common = [
 			'class'           => true,
 			'id'              => true,
@@ -359,7 +317,7 @@ final class ConditionalContent {
 		$allowed['polygon']  = $svg_common + [ 'points' => true ];
 
 		/**
-		 * Filter the allowlist used to escape conditional-content output.
+		 * Filter the allowlist that escapes conditional-content output.
 		 *
 		 * @hook perflocale/conditional_content/allowed_html
 		 *
@@ -368,10 +326,7 @@ final class ConditionalContent {
 		 */
 		$allowed = (array) apply_filters( 'perflocale/conditional_content/allowed_html', $allowed, $content );
 
-		// `xlink:href` is a URL attribute like `href`, but core does not list
-		// it in wp_kses_uri_attributes(), so wp_kses() would keep any protocol
-		// in it. Listed for this call, it keeps only the allowed protocols
-		// (a `#fragment` or an http(s) URL; not `javascript:`).
+		// Core does not list `xlink:href` as a URI attribute, so wp_kses() would keep `javascript:` in it.
 		$uri_attributes = [ self::class, 'with_xlink_href' ];
 		$listed_here    = false === has_filter( 'wp_kses_uri_attributes', $uri_attributes );
 
@@ -389,8 +344,7 @@ final class ConditionalContent {
 	}
 
 	/**
-	 * `wp_kses_uri_attributes` while {@see self::kses_content()} runs: adds
-	 * `xlink:href`, so wp_kses() checks its protocol as it checks `href`'s.
+	 * Adds `xlink:href` to `wp_kses_uri_attributes` while kses_content() runs.
 	 *
 	 * @internal
 	 *
@@ -445,10 +399,7 @@ final class ConditionalContent {
 	}
 
 	/**
-	 * Build the list of languages the block editor should offer.
-	 *
-	 * Each entry is `{ slug, label }` - labels favour the native name so
-	 * editors recognise their own language instantly in the UI.
+	 * Build the editor's language choices, labelled by native name first.
 	 *
 	 * @return array<int, array{slug: string, label: string}>
 	 */

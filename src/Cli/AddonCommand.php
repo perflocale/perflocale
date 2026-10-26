@@ -78,9 +78,7 @@ final class AddonCommand {
 		$format   = (string) ( $assoc_args['format'] ?? 'table' );
 		$show_all = ! empty( $assoc_args['all'] );
 
-		// A value that does not apply is "-" in the table view and an empty
-		// value in the machine formats (json, csv, yaml), so scripts need no
-		// placeholder.
+		// A value that does not apply: "-" in the table view, empty in the machine formats, so scripts need no placeholder.
 		$none = 'table' === $format ? '-' : '';
 
 		$rows        = [];
@@ -93,9 +91,7 @@ final class AddonCommand {
 			$rows[ $id ] = [
 				'id'            => $id,
 				'name'          => method_exists( $addon, 'get_name' ) ? $addon->get_name() : '',
-				// Bundled = ships inside the plugin's own addons/ directory.
-				// Operator's main signal for "is this one of yours or one of
-				// mine"; both kinds honour the disabled list.
+				// Bundled: ships in the plugin's own addons/ directory; both kinds honour the disabled list.
 				'bundled'       => $reg && method_exists( $reg, 'is_bundled' ) ? $this->bool_label( $reg->is_bundled( $id ) ) : $none,
 				'booted'        => $reg && method_exists( $reg, 'is_booted' ) ? $this->bool_label( $reg->is_booted( $id ) ) : $none,
 				'disabled'      => $this->bool_label( AddonRegistry::is_disabled( $id ) ),
@@ -134,13 +130,11 @@ final class AddonCommand {
 		$values         = array_values( $rows );
 		$default_fields = [ 'id', 'name', 'bundled', 'booted', 'disabled', 'compatible', 'has_schema', 'schema_target', 'schema_stored', 'has_uninstall', 'has_custom', 'manifest' ];
 
-		// Honour --fields=col1,col2 from CLI. format_items() doesn't read
-		// runtime args itself - the command has to plumb the value through.
+		// Honour --fields: format_items() does not read it itself.
 		$fields = $default_fields;
 		if ( ! empty( $assoc_args['fields'] ) ) {
 			$requested = array_filter( array_map( 'trim', explode( ',', (string) $assoc_args['fields'] ) ) );
-			// Defensive: drop any user-supplied column that we don't expose,
-			// so a typo doesn't fatal format_items with an undefined-index.
+			// Drop unknown columns, so a typo does not fatal format_items().
 			$fields = array_values( array_intersect( $requested, $default_fields ) );
 			if ( empty( $fields ) ) {
 				$fields = $default_fields;
@@ -148,9 +142,7 @@ final class AddonCommand {
 		}
 
 		if ( 'ids' === $format ) {
-			// format_items() can't render 'ids' from associative rows - it
-			// stringifies each row ("Array to string conversion"). Emit the
-			// addon id column directly so `--format=ids` stays scriptable.
+			// format_items() cannot render 'ids' from associative rows: print the id column.
 			\WP_CLI::line( implode( ' ', wp_list_pluck( $values, 'id' ) ) );
 			return;
 		}
@@ -227,9 +219,7 @@ final class AddonCommand {
 		}
 		if ( 'yaml' === $format ) {
 			foreach ( $info as $k => $v ) {
-				// wp_json_encode for scalars produces YAML-safe scalar
-				// forms (true / false / 123 / "string") - same role
-				// var_export played, minus the plugin-check warning.
+				// wp_json_encode() gives YAML-safe scalars; not var_export(), which Plugin Check flags.
 				\WP_CLI::log( $k . ': ' . ( is_array( $v ) ? '[' . implode( ',', $v ) . ']' : (string) wp_json_encode( $v ) ) );
 			}
 			return;
@@ -454,7 +444,7 @@ final class AddonCommand {
 	 * ## OPTIONS
 	 *
 	 * <id>
-	 * : Addon ID. Must match /^[a-z0-9_]{2,16}$/.
+	 * : Addon ID. Must match /^[a-z0-9_-]{2,16}$/.
 	 *
 	 * ## EXAMPLES
 	 *
@@ -489,7 +479,7 @@ final class AddonCommand {
 	 * ## OPTIONS
 	 *
 	 * <id>
-	 * : Addon ID. Must match /^[a-z0-9_]{2,16}$/.
+	 * : Addon ID. Must match /^[a-z0-9_-]{2,16}$/.
 	 *
 	 * ## EXAMPLES
 	 *

@@ -1,6 +1,6 @@
 <?php
 /**
- * Action Scheduler-backed implementation of the job runner.
+ * Action Scheduler job runner.
  *
  * @package PerfLocale
  */
@@ -14,24 +14,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Used when Action Scheduler is loaded (any WooCommerce-active site, the
- * standalone AS plugin, or any other plugin that bundles AS).
- *
- * Inherits AS's native features:
- *   - Persistent claim / lock model - two cron processes can't pick up
- *     the same action.
- *   - Built-in retry with exponential backoff on uncaught exceptions.
- *   - Admin UI at *Tools → Scheduled Actions* showing every action
- *     PerfLocale ever enqueued, grouped under `'perflocale'`.
- *
- * The factory only instantiates this when {@see JobRunnerFactory::action_scheduler_available()}
- * returns true, so we can assume `as_*` functions exist throughout.
+ * Runner used when Action Scheduler is loaded (WooCommerce, the AS plugin or another bundling): AS claims each
+ * action once and retries on uncaught exceptions. Created only when
+ * JobRunnerFactory::action_scheduler_available() is true, so the as_* functions exist.
  */
 final class ActionSchedulerRunner implements JobRunnerInterface {
 
 	/**
-	 * AS group name. Surfaces in *Tools → Scheduled Actions* so PerfLocale's
-	 * background work is filterable from WC's actions.
+	 * AS group of PerfLocale's actions (filterable in Tools > Scheduled Actions).
 	 */
 	public const GROUP = 'perflocale';
 
@@ -41,15 +31,8 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 	 * @throws \RuntimeException When Action Scheduler refuses the enqueue.
 	 */
 	public function enqueue( string $hook, array $args, string $job_id ): string {
-		// as_enqueue_async_action() documents 0 as "there was an error scheduling
-		// the action" - AS not initialised, or a `pre_as_enqueue_async_action`
-		// short-circuit that returned a non-int. Ignoring it returned the
-		// PerfLocale job id regardless, so Dispatcher::enqueue() reported
-		// mode:queued for a job with no action behind it and the row sat in
-		// `queued` until the 6-hour stuck sweep force-failed it. Throw instead,
-		// so Dispatcher's existing catch deletes the orphaned JobState row and
-		// reports mode:error - the contract WpCronRunner already honours through
-		// schedule_or_throw().
+		// 0 means AS did not schedule it: throw, so Dispatcher::enqueue() deletes the row and reports mode:error instead of
+		// leaving a queued job with no action behind it (WpCronRunner does the same).
 		$action_id = as_enqueue_async_action( $hook, [ $job_id, $args ], self::GROUP );
 
 		if ( (int) $action_id <= 0 ) {
@@ -67,9 +50,7 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 	 * @throws \RuntimeException When Action Scheduler refuses the scheduled action.
 	 */
 	public function schedule( int $timestamp, string $hook, array $args, string $job_id ): string {
-		// Same zero-means-failure contract as enqueue(). This is the delayed
-		// retry / resume / busy-reschedule path, so swallowing the failure lost
-		// the job silently: the row stayed `queued` with no action behind it.
+		// Same as enqueue(): the retry, resume and busy-reschedule path must not lose the job silently.
 		$action_id = as_schedule_single_action( max( time(), $timestamp ), $hook, [ $job_id, $args ], self::GROUP );
 
 		if ( (int) $action_id <= 0 ) {
@@ -84,10 +65,7 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * AS matches scheduled actions by exact (hook, args, group). We try
-	 * both arg shapes: with the multisite blog-id sentinel and without
-	 * (single-site form). Also use `as_unschedule_all_actions` to clear
-	 * duplicates from retry / pause-reschedule paths.
+	 * AS matches (hook, args, group) exactly: every args shape is unscheduled, then any action left for the job id.
 	 */
 	public function cancel( string $job_id ): bool {
 		$state = JobState::get( $job_id );
@@ -100,20 +78,15 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 		$base_args = (array) ( $state['args'] ?? [] );
 		$cancelled = false;
 
-		// Try the non-sentinel shape first (single-site form).
+		// Single-site shape first.
 		foreach ( $this->candidate_arg_shapes( $job_id, $base_args, $state ) as $args ) {
-			// `as_unschedule_all_actions` removes EVERY matching action,
-			// not just the next-scheduled one. Idempotent: returns void.
+			// Removes every matching action, not only the next one.
 			as_unschedule_all_actions( $hook, $args, self::GROUP );
 			$cancelled = true;
 		}
 
-		// Belt-and-braces: the busy-count enumeration can't predict every arg
-		// shape (combined type-busy + lock-busy counters, or a type-busy count
-		// past the enumeration ceiling). Scan pending actions for this
-		// hook+group whose first arg is this job_id (enqueue() always stores
-		// args as [job_id, …]) and clear each, so a "successful" cancel never
-		// leaves a live action behind.
+		// The enumeration cannot predict every arg shape: also clear each pending action of this hook and group whose
+		// first arg is this job id, so a cancel leaves no live action.
 		foreach ( $this->pending_args_for_job( $hook, $job_id ) as $action_args ) {
 			as_unschedule_all_actions( $hook, $action_args, self::GROUP );
 			$cancelled = true;
@@ -123,8 +96,33 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 	}
 
 	/**
-	 * Collect the distinct arg arrays of pending actions under $hook+group
-	 * whose first argument is $job_id, regardless of the trailing arg shape.
+	 * Cancel the job's pending actions under $hook from one scan (every arg shape), without the shape enumeration.
+	 *
+	 * @param string $hook   Worker hook.
+	 * @param string $job_id Job UUID.
+	 * @return void
+	 */
+	public function cancel_pending( string $hook, string $job_id ): void {
+		if ( ! function_exists( 'as_get_scheduled_actions' ) || ! function_exists( 'as_unschedule_all_actions' ) ) {
+			$this->cancel( $job_id );
+			return;
+		}
+
+		$seen = [];
+
+		foreach ( $this->pending_args_for_job( $hook, $job_id ) as $action_args ) {
+			$key = serialize( $action_args ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize -- A set key; one unschedule per arg shape.
+
+			if ( ! isset( $seen[ $key ] ) ) {
+				$seen[ $key ] = true;
+				as_unschedule_all_actions( $hook, $action_args, self::GROUP );
+			}
+		}
+	}
+
+	/**
+	 * The distinct args of pending actions under $hook and the group whose first argument is $job_id.
+	 * The store is searched for the id first, so only this job's actions are read.
 	 *
 	 * @param string $hook   Worker hook.
 	 * @param string $job_id Job UUID (always args[0] per enqueue()).
@@ -140,6 +138,7 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 				'hook'     => $hook,
 				'group'    => self::GROUP,
 				'status'   => 'pending',
+				'search'   => $job_id,
 				'per_page' => -1,
 			],
 			'OBJECT'
@@ -181,14 +180,12 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 			}
 		}
 
-		// Catch arg shapes the enumeration can't predict (see cancel()).
+		// Arg shapes the enumeration cannot predict (see cancel()).
 		return $this->pending_args_for_job( $hook, $job_id ) !== [];
 	}
 
 	/**
-	 * Yield each candidate (hook, args) shape this job could have been
-	 * scheduled under: non-sentinel single-site form, multisite blog-id
-	 * sentinel, and type-busy reschedule sentinel (and combinations).
+	 * Each args shape the job could be scheduled under: single-site, blog-id sentinel, busy-count sentinels.
 	 *
 	 * @param string               $job_id
 	 * @param array<string, mixed> $base_args
@@ -206,10 +203,7 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 			yield [ $job_id, $with_blog ];
 		}
 
-		// Type-busy retries add `__perflocale_type_busy_count` to args.
-		// Enumerate 1..10 which covers any realistic cascade given the
-		// exponential cap (the busy-count delay saturates well before 10
-		// attempts).
+		// Type-busy retries add `__perflocale_type_busy_count`; 1..10 covers any chain (its delay saturates sooner).
 		for ( $n = 1; $n <= 10; $n++ ) {
 			$with_busy                                 = $base_args;
 			$with_busy['__perflocale_type_busy_count'] = $n;
@@ -222,10 +216,7 @@ final class ActionSchedulerRunner implements JobRunnerInterface {
 			}
 		}
 
-		// Per-job-lock-busy retries add `__perflocale_lock_busy_count` to
-		// args (introduced when WorkerRegistry stopped silently returning
-		// on JobLock::acquire failure). Same enumeration up to the
-		// lock_busy_max_retries cap (20).
+		// Lock-busy retries add `__perflocale_lock_busy_count`; 1..20 matches the lock_busy_max_retries cap.
 		for ( $n = 1; $n <= 20; $n++ ) {
 			$with_lock_busy                                 = $base_args;
 			$with_lock_busy['__perflocale_lock_busy_count'] = $n;

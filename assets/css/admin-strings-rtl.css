@@ -193,11 +193,7 @@
 	position: relative;
 }
 
-/* Per-cell overlay icons sitting in the top-right of an input wrap. The
-   needs-update warning sits at right:32px (just to the left of the
-   expand-editor button); the AI quality score pill sits to the left of
-   needs-update when both are visible - the `right:52px` modifier on the
-   element wins over the default `right:32px`. */
+/* Needs-update warning: an overlay icon in the top corner of an input wrap, beside the expand-editor button. */
 .perflocale-str-needs-update {
 	position: absolute;
 	top: 2px;

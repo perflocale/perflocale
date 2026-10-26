@@ -1,6 +1,6 @@
 <?php
 /**
- * Base class for Tier-2 background jobs.
+ * Base class for background jobs.
  *
  * @package PerfLocale
  */
@@ -17,72 +17,42 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Every "conditionally async" operation (DataImport, migration importers,
- * bulk MT, etc.) extends this. Tier-1 ops (webhook delivery, exchange-rate
- * sync, etc.) bypass it entirely - they enqueue directly via the runner.
+ * Base of every job that may run inline or in the background (imports, migrations, bulk translation).
  *
- * The base class defines:
- *   - Type slug (used to dispatch the worker hook).
- *   - Required capability for dispatching this job.
- *   - Default threshold for "Auto" background-processing mode.
- *   - The actual work (`execute()`), which MUST be re-entrant + resumable.
- *   - Decision logic for sync vs async via {@see should_run_async()}.
- *
- * Workers are STATELESS aside from the per-job JobState row (read inside
- * the worker hook). Anything cached on the instance lives only for the duration
- * of one execute() call - re-creation between dispatch and execution is
- * normal.
+ * A job defines its type, required capability, Auto-mode threshold and a re-entrant execute(); its only state
+ * between runs is its JobState row, as the instance is re-created between dispatch and execution.
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 abstract class AbstractJob {
 
 	/**
-	 * Short slug, e.g. 'data_import'. Used to compose the worker hook
-	 * name (`perflocale_job_run_<type>`) so each job type has its own
-	 * isolated callback.
-	 *
-	 * MUST be `[a-z0-9_]{1,40}` - used as part of a hook name and an option
-	 * prefix, both of which are sensitive to weird characters.
+	 * Type slug, `[a-z0-9_]{1,40}`: part of the worker hook `perflocale_job_run_<type>` and of option names.
 	 *
 	 * @return string
 	 */
 	abstract public function get_type(): string;
 
 	/**
-	 * Capability the dispatching user must have. Re-checked inside the
-	 * worker hook against the stored `created_by` user, so a revoked cap
-	 * between dispatch and execution is caught.
+	 * Capability the dispatcher needs; the worker checks it again for the stored `created_by` user.
 	 *
 	 * @return string
 	 */
 	abstract public function get_required_capability(): string;
 
 	/**
-	 * Default item-count threshold for "Auto" mode. If the job's
-	 * {@see args_size()} returns >= this value, the dispatcher will
-	 * route to async; otherwise it runs inline.
+	 * Auto mode runs the job in the background when args_size() reaches this.
 	 *
 	 * @return int
 	 */
 	abstract public function get_default_threshold(): int;
 
 	/**
-	 * The actual work. Called either inline (sync path) or by the worker
-	 * hook (async path). The implementation MUST be:
-	 *   - Re-entrant: same args → same outcome on a re-run after a crash.
-	 *   - Resumable: read its own progress from JobState if it wants
-	 *     incremental work; otherwise idempotent re-processing is fine.
-	 *   - Bounded in memory: process in chunks; don't load everything
-	 *     into a single in-memory array on large workloads.
+	 * Do the work, inline or from the worker hook: re-entrant (a re-run after a crash gives the same outcome), resumable
+	 * or idempotent, and chunked so memory stays bounded.
 	 *
-	 * The progress callback signature is
-	 * `function(int $processed, int $total, array $detail = []): void`.
-	 * `$detail` is optional and may carry `stage` (a key logged once per
-	 * stage), `label` (the stage's display name) and `percent` (the overall
-	 * percent, used in place of processed / total). Workers should call it
-	 * periodically - every 1 second or every 50 items, whichever first.
-	 * Callers may pass a no-op for the sync path.
+	 * $progress is `function(int $processed, int $total, array $detail = []): void`; $detail may carry `stage`,
+	 * `label` and `percent`. Call it about every second or every 50 items; the sync path may pass a no-op.
 	 *
 	 * @param array<string, mixed> $args     Worker args.
 	 * @param callable             $progress `function(int, int, array): void`. Use
@@ -97,12 +67,8 @@ abstract class AbstractJob {
 	abstract public function execute( array $args, callable $progress ): array;
 
 	/**
-	 * Decide whether THIS dispatch should run async (true) or inline (false).
-	 *
-	 * Logic:
-	 *   - `Never`  → always inline.
-	 *   - `Always` → always async.
-	 *   - `Auto`   → async if {@see args_size()} >= {@see effective_threshold()}.
+	 * Whether this dispatch runs in the background: Never = inline, Always = background, Auto = args_size() reaches
+	 * effective_threshold().
 	 *
 	 * @param array<string, mixed> $args     Worker args.
 	 * @param Settings             $settings Plugin settings.
@@ -124,11 +90,7 @@ abstract class AbstractJob {
 	}
 
 	/**
-	 * How many "items" are in this args set. Default is 0 (always sync in
-	 * Auto mode) - override per-job to return the actual item count, byte
-	 * size, post count, whatever's the cost dimension.
-	 *
-	 * Compared against the threshold value to drive the Auto-mode decision.
+	 * Size of this args set in the job's cost unit (items, bytes, posts) for the Auto threshold; 0 by default.
 	 *
 	 * @param array<string, mixed> $args
 	 * @return int
@@ -139,17 +101,20 @@ abstract class AbstractJob {
 	}
 
 	/**
-	 * How long the per-job lock should live without a progress refresh.
-	 * Default is {@see JobLock::DEFAULT_TTL}. Jobs that issue a single
-	 * monolithic call (DB migrations, big CSV imports) should override to
-	 * a value comfortably larger than their worst-case duration so the
-	 * lock isn't reclaimed mid-flight by a second worker.
+	 * This dispatch's size in the job's own unit ({@see args_size()}), for the web-request guard.
 	 *
-	 * Progress ticks also refresh the lock - workers that emit periodic
-	 * progress can rely on the default. Workers that block for minutes
-	 * without a tick (slow HTTP, single-shot importer) need to bump this
-	 * to cover the worst-case run time, OR call {@see JobLock::refresh()}
-	 * themselves inside their loops.
+	 * @since 1.0.7.4
+	 * @param array<string, mixed> $args     Dispatch args.
+	 * @param int                  $count_to A count that stops early counts at least this far.
+	 * @return int
+	 */
+	public function estimated_size( array $args, int $count_to = 0 ): int {
+		return $this->args_size( $args );
+	}
+
+	/**
+	 * Seconds the job lock lives without a progress tick (JobLock::DEFAULT_TTL by default). A job that blocks for
+	 * minutes without a tick overrides this to its worst case, or calls JobLock::refresh() itself.
 	 *
 	 * @return int Seconds.
 	 */
@@ -160,14 +125,9 @@ abstract class AbstractJob {
 	/**
 	 * Whether the worker may run this job in slices.
 	 *
-	 * When this returns true, {@see WorkerRegistry} passes execute() its args
-	 * with `__perflocale_slice` set to `[ 'resume' => <the result stored on
-	 * the row, or []> ]`. execute() may then stop early and return its result
-	 * so far with `__perflocale_continue => true`: the worker stores that
-	 * result on the row, releases the locks and schedules the same job again,
-	 * which resumes from it. The row stays `running`, and the completion hook
-	 * fires once, after the last slice. A run that does not come from the
-	 * worker (inline dispatch, a job calling another job) never gets the key.
+	 * Then the worker passes `__perflocale_slice` = `[ 'resume' => <stored result or []> ]`; execute() may return early
+	 * with `__perflocale_continue => true` and the same job is scheduled again from that result. The row stays
+	 * `running` and the completion hook fires once; an inline or nested run never gets the key.
 	 *
 	 * @return bool
 	 */
@@ -176,12 +136,42 @@ abstract class AbstractJob {
 	}
 
 	/**
-	 * Resolve the effective threshold for this job + this args set.
+	 * Whether a killed worker's job resumes from its last checkpoint instead of failing.
 	 *
-	 * Reads from `background_thresholds` setting (admin override per type),
-	 * falling back to {@see get_default_threshold()}, finally exposed via
-	 * the `perflocale/jobs/threshold/<type>` filter for per-args dynamic
-	 * thresholds.
+	 * Only for a continuation job reporting a per-unit `checkpoint` whose units are safe to redo: it gets a short lock,
+	 * a dead-man event, and Retry resumes from the checkpoint.
+	 *
+	 * @since 1.0.7.4
+	 * @return bool
+	 */
+	public function resumes_after_kill(): bool {
+		return false;
+	}
+
+	/**
+	 * Whether a run that ends starts the oldest queued job of its type at once instead of after the busy backoff
+	 * (only while the type runs one job at a time).
+	 *
+	 * @since 1.0.7.4
+	 * @return bool
+	 */
+	public function starts_next_when_done(): bool {
+		return false;
+	}
+
+	/**
+	 * Whether a row with no user (created_by 0) runs as no user instead of failing; needs a capability every user has
+	 * (`exist`).
+	 *
+	 * @since 1.0.7.4
+	 * @return bool
+	 */
+	public function runs_without_user(): bool {
+		return false;
+	}
+
+	/**
+	 * The threshold: the `background_thresholds` setting for this type, else get_default_threshold(), then the filter.
 	 *
 	 * @param array<string, mixed> $args
 	 * @return int
@@ -198,8 +188,7 @@ abstract class AbstractJob {
 		$base = isset( $thresholds[ $type ] ) ? (int) $thresholds[ $type ] : $this->get_default_threshold();
 
 		/**
-		 * Filter the threshold for a specific job type. Receives the args
-		 * for the current dispatch so the threshold can vary with payload.
+		 * Filter the Auto-mode threshold of a job type for this dispatch.
 		 *
 		 * @hook perflocale/jobs/threshold/<type>
 		 * @param int                  $base Threshold from settings (or default).

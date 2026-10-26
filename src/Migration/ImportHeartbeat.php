@@ -14,18 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Lets an importer keep the {@see MigrationLock} while it works and report
- * how far it is.
+ * Lets an importer keep the MigrationLock while it works and report its progress.
  *
- * The importer calls beat() after each batch, with the stage it is in and
- * the stage's items done and in total. The callable set through
- * set_heartbeat() refreshes the lock at most once per 30 seconds, so a call
- * per item costs a time() read. A background job's reporter receives the
- * progress detail ({@see MigrationRunner::import()}); a stage total is
- * counted only when such a reporter is attached.
- *
- * The using class lists its stages, in the order it runs them, in a
- * `PROGRESS_STAGES` constant (list of stage keys).
+ * Calling beat() after each batch is cheap: the lock is written at most once per 30 seconds.
+ * The using class lists its stages, in run order, in a `PROGRESS_STAGES` constant.
  */
 trait ImportHeartbeat {
 
@@ -44,13 +36,10 @@ trait ImportHeartbeat {
 	private bool $has_reporter = false;
 
 	/**
-	 * Set the callable run after each batch (the import lock's heartbeat).
-	 *
-	 * It receives the progress detail as its only argument, or nothing when
-	 * the call only keeps the lock.
+	 * Set the callable run after each batch: the progress detail, or no argument to only keep the lock.
 	 *
 	 * @param callable $heartbeat    Heartbeat.
-	 * @param bool     $has_reporter Whether the heartbeat passes the progress detail on to a reporter (a background job's progress), so a stage total is worth a count query.
+	 * @param bool     $has_reporter Whether a reporter receives the progress, so a stage total is worth a count query.
 	 * @return void
 	 */
 	public function set_heartbeat( callable $heartbeat, bool $has_reporter = false ): void {
@@ -80,8 +69,7 @@ trait ImportHeartbeat {
 	}
 
 	/**
-	 * Whether a reporter receives the progress, so a stage total is worth a
-	 * count query.
+	 * Whether a reporter receives the progress, so a stage total is worth a count query.
 	 *
 	 * @return bool
 	 */
@@ -90,12 +78,9 @@ trait ImportHeartbeat {
 	}
 
 	/**
-	 * The progress detail of a stage: its key, items done and in total, and
-	 * the import's overall percent.
+	 * The progress detail of a stage, with the import's overall percent.
 	 *
-	 * Every stage is an equal share of the percent; within a stage the share
-	 * fills as `done / total`. A stage whose total is not known yet counts
-	 * as just started.
+	 * Each stage is an equal share, filled as `done / total`; an unknown total counts as just started.
 	 *
 	 * @param string $stage Stage key.
 	 * @param int    $done  Items done.

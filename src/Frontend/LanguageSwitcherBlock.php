@@ -14,25 +14,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Registers the perflocale/language-switcher Gutenberg block.
- *
- * Uses server-side rendering so the block output matches the frontend
- * exactly, including current language detection and URL generation.
+ * Registers and server-renders the perflocale/language-switcher block.
  */
 final class LanguageSwitcherBlock {
 
 	/**
-	 * Per-request memo of the `switcher_auto_insert` setting (null until
-	 * first read). Cleared on switch_blog - the setting is per-blog.
+	 * Memo of the per-blog `switcher_auto_insert` setting; null until read, reset on switch_blog.
 	 *
 	 * @var bool|null
 	 */
 	private ?bool $auto_insert_enabled = null;
 
 	/**
-	 * Per-request memo: "anchor|position" => whether it is the auto-insert
-	 * target. Bounds at the number of distinct pairs in the templates
-	 * being rendered (dozens), versus thousands of filter invocations.
+	 * Memo: "anchor|position" => whether it is the auto-insert target.
 	 *
 	 * @var array<string, bool>
 	 */
@@ -54,11 +48,7 @@ final class LanguageSwitcherBlock {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// `register_block_type_args` is intentionally NOT wired here - that
-		// filter fires for EVERY block type registered after init (100-250
-		// invocations on a typical site), and our callback short-circuits on
-		// 99% of them. register_block() attaches+detaches the filter only
-		// around our own register_block_type() call so the cost is paid once.
+		// `register_block_type_args` is attached only around our own registration in register_block().
 		add_action( 'init', [ $this, 'register_frontend_style' ], 9 );
 		add_action( 'init', [ $this, 'register_block' ] );
 		add_filter( 'hooked_block_types', [ $this, 'filter_hooked_block_types' ], 10, 4 );
@@ -70,17 +60,9 @@ final class LanguageSwitcherBlock {
 	}
 
 	/**
-	 * Customise the attributes of the language-switcher block when WP's
-	 * Block Hooks engine auto-inserts it.
+	 * Give the auto-inserted switcher compact defaults for a header.
 	 *
-	 * Site Title anchors are almost always inside an FSE header, where the
-	 * full inline list (the global default) is too tall and the user really
-	 * wants the compact `dropdown` mode. We override only the display + flag
-	 * size by default; the user can supply any override via the
-	 * `perflocale/switcher/auto_insert_attrs` filter.
-	 *
-	 * @param array|null $parsed_hooked_block The parsed-block array WP will insert.
-	 *                                        Null means "don't insert"; we never return null.
+	 * @param array|null $parsed_hooked_block The parsed-block array WP will insert; null means no insert.
 	 * @param string     $hooked_block_type   Always 'perflocale/language-switcher' (route gate).
 	 * @param string     $relative_position   Position relative to anchor ('before'/'after'/...).
 	 * @param array|null $parsed_anchor_block The anchor block array (or null in some contexts).
@@ -103,13 +85,7 @@ final class LanguageSwitcherBlock {
 		/**
 		 * Filter the default attributes applied to the auto-inserted switcher.
 		 *
-		 * Use this to force a specific display mode, font size, layout, etc.
-		 * for the auto-inserted block - typically you want compact + dropdown
-		 * inside an FSE header, but a site with a wide hero header might want
-		 * the full inline list instead.
-		 *
-		 * Returning an empty array disables the per-context defaults so the
-		 * block uses the global Settings → Language Switcher values verbatim.
+		 * Returning an empty array keeps the global switcher settings.
 		 *
 		 * @hook perflocale/switcher/auto_insert_attrs
 		 *
@@ -134,28 +110,16 @@ final class LanguageSwitcherBlock {
 			? $parsed_hooked_block['attrs']
 			: [];
 
-		// Merge: filter-returned attrs win over existing on key conflict, so
-		// the operator's per-context overrides take effect. Existing keys
-		// the filter doesn't touch are preserved.
+		// Filtered attrs win on conflict.
 		$parsed_hooked_block['attrs'] = array_merge( $existing, $attrs );
 
 		return $parsed_hooked_block;
 	}
 
 	/**
-	 * Strip our auto-inserted hook when the user has opted out, or rewire the
-	 * anchor when a theme declares its own preferred insertion point.
+	 * Runtime gate for the block.json hook: drop it when auto-insert is off, or move it to a filtered anchor.
 	 *
-	 * The block.json `blockHooks` declaration always registers the switcher
-	 * against `core/site-title:after`. This filter is the runtime gate that
-	 * the `switcher_auto_insert` setting (and the per-theme override filter)
-	 * uses to decide whether to actually inject for any given anchor.
-	 *
-	 * `$anchor_block_type` is nullable: WordPress core's `insert_hooked_blocks()`
-	 * walks template trees recursively and passes null when the outer iterator
-	 * has no anchor context (top-of-template injection for first_child /
-	 * last_child positions). Strict-typing it would 500 the entire FSE
-	 * rendering pipeline.
+	 * Core passes a null anchor for context-less positions; a non-nullable type would fatal.
 	 *
 	 * @param string[]    $hooked_block_types Block types the engine will hook.
 	 * @param string      $relative_position  'before'|'after'|'first_child'|'last_child'.
@@ -164,18 +128,12 @@ final class LanguageSwitcherBlock {
 	 * @return string[]
 	 */
 	public function filter_hooked_block_types( array $hooked_block_types, string $relative_position, ?string $anchor_block_type, $context ): array {
-		// Null anchor = context-less iteration. Our injection is targeted at
-		// a specific anchor block; without one, just pass through unchanged.
+		// No anchor: nothing to target.
 		if ( $anchor_block_type === null ) {
 			return $hooked_block_types;
 		}
 
-		// This filter fires for EVERY (block, position) pair the template
-		// engine walks - thousands of invocations on block-heavy screens
-		// (4,000+ on a wp-admin pages list). The enabled flag is request-
-		// constant and the anchor-override decision is constant per
-		// (anchor, position) pair, so both are memoised; per-call work
-		// after the first sighting of a pair is two array lookups.
+		// Runs for every (block, position) pair the engine walks: both decisions are memoized.
 		if ( $this->auto_insert_enabled === null ) {
 			$plugin = \PerfLocale\Plugin::get_instance();
 
@@ -199,10 +157,7 @@ final class LanguageSwitcherBlock {
 			$target_position = 'after';
 
 			/**
-			 * Allow themes / addons to redirect the auto-insertion to a different
-			 * anchor block. Return `[ block_type, position ]` (e.g.
-			 * `[ 'core/navigation', 'last_child' ]`) to retarget; return false to
-			 * keep the default `core/site-title:after`.
+			 * Filter the auto-insert anchor: `[ block_type, position ]` retargets, false keeps core/site-title:after.
 			 *
 			 * @hook perflocale/switcher/auto_insert_anchor
 			 *
@@ -306,18 +261,11 @@ final class LanguageSwitcherBlock {
 	 * @return void
 	 */
 	public function register_block(): void {
-		// Scope the register_block_type_args filter to just our own
-		// registration: attach immediately before, detach immediately after.
-		// WP's block-registry calls our filter only during the call below,
-		// so any other block-type registration in the request - WooCommerce,
-		// FSE patterns, third-party plugins - runs without paying the
-		// callback's cost (~150-400 µs/request total).
+		// Scoped to our own registration so other block registrations skip the callback.
 		add_filter( 'register_block_type_args', [ $this, 'apply_setting_defaults' ], 10, 2 );
 
-		// Only the call that adds the metadata filter removes it, in finally:
-		// a PerfLocale block registered inside another one's registration
-		// leaves the outer call's filter in place, and a throwing callback
-		// leaves no filter behind.
+		// Only the call that adds the metadata filter removes it, in finally: a nested
+		// registration keeps the outer filter, and a throwing callback leaves none behind.
 		$strip = ! \PerfLocale\Helper::shows_registration_labels()
 			&& false === has_filter( 'block_type_metadata', [ \PerfLocale\Helper::class, 'block_metadata_without_textdomain' ] );
 
@@ -381,11 +329,7 @@ final class LanguageSwitcherBlock {
 			return '';
 		}
 
-		// The built-in arrow is a hardcoded, input-free SVG; return it as-is so
-		// its case-sensitive `viewBox` survives - wp_kses (via kses_fragment)
-		// lowercases attribute names, and browsers ignore a lowercased
-		// `viewbox` on <svg>, leaving the chevron unable to scale with the
-		// trigger font size. Only third-party-FILTERED markup is sanitised.
+		// The built-in SVG is returned as-is: kses lowercases `viewBox`, which browsers then ignore.
 		return $filtered === $html ? $filtered : self::kses_fragment( $filtered );
 	}
 
@@ -433,11 +377,7 @@ final class LanguageSwitcherBlock {
 			return '';
 		}
 
-		// Sanitisation is unconditional by design. Every call site echoes this
-		// return value directly, so an opt-out filter here would make the
-		// escaping guarantee those call sites rely on conditional. Sites that
-		// need extra tags or attributes widen the allowlist through
-		// `perflocale/switcher/kses_allowed_html` instead of turning escaping off.
+		// Never add an opt-out: every call site echoes this unescaped. Widen the allowlist filter instead.
 		static $memo = [];
 		$key         = sha1( $html );
 
@@ -514,8 +454,7 @@ final class LanguageSwitcherBlock {
 		];
 
 		/**
-		 * Filter the wp_kses allowlist used to sanitize switcher HTML.
-		 * Map shape: `[ 'tag' => [ 'attr' => true, ... ], ... ]`.
+		 * Filter the wp_kses allowlist that sanitizes switcher HTML.
 		 *
 		 * @param array<string, array<string, bool>> $allowed Current allowlist.
 		 * @param string                             $html    The HTML being sanitized.
@@ -550,11 +489,52 @@ final class LanguageSwitcherBlock {
 	}
 
 	/**
-	 * Block render_callback entry point. Wraps {@see render()} in the same
-	 * SVG-aware {@see kses_switcher()} allowlist that LanguageSwitcherWidget
-	 * and CustomizerIntegration apply when they echo the switcher, so the
-	 * block-into-the_content path is sanitized at the same boundary. The
-	 * memo inside kses_switcher() makes the second pass effectively free.
+	 * The `data-pl-*` language attributes of one dropdown option or of the trigger.
+	 *
+	 * @param object $lang    Language object.
+	 * @param bool   $missing This page has no translation in this language.
+	 * @return array<string, string> Attribute name => value, in output order.
+	 */
+	private static function language_data_attrs( object $lang, bool $missing ): array {
+		$str    = static fn( $v ): string => is_scalar( $v ) ? (string) $v : '';
+		$name   = $str( $lang->name ?? '' );
+		$native = $str( $lang->native_name ?? '' );
+		$attrs  = [
+			'data-pl-slug'   => $str( $lang->slug ?? '' ),
+			'data-pl-locale' => $str( $lang->locale ?? '' ),
+			'data-pl-name'   => $name,
+			'data-pl-native' => '' !== $native ? $native : $name,
+		];
+
+		if ( ! empty( $lang->is_default ) ) {
+			$attrs['data-pl-default'] = '1';
+		}
+
+		if ( $missing ) {
+			$attrs['data-pl-missing'] = '1';
+		}
+
+		return $attrs;
+	}
+
+	/**
+	 * The data attributes as an HTML attribute string with a leading space.
+	 *
+	 * @param array<string, string> $attrs Attribute name => value.
+	 * @return string
+	 */
+	private static function data_attr_string( array $attrs ): string {
+		$out = '';
+
+		foreach ( $attrs as $name => $value ) {
+			$out .= ' ' . $name . '="' . esc_attr( $value ) . '"';
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Block render_callback: render() through kses_switcher(), as the other switcher sinks do.
 	 *
 	 * @param array<string, mixed> $attributes Block attributes.
 	 * @param string               $content    Inner content (unused).
@@ -588,10 +568,7 @@ final class LanguageSwitcherBlock {
 		static $urls         = null;
 		static $memo_blog    = null;
 
-		// These are function-statics (reset_memos() can't reach them), so key
-		// them by blog id: a request that renders the switcher for blog A and
-		// then, after switch_to_blog(), for blog B must not reuse A's languages/
-		// URLs. No-op on single-site (blog id is constant).
+		// Function statics are out of reset_memos()' reach: key them by blog id for switch_to_blog().
 		$current_blog = function_exists( 'get_current_blog_id' ) ? get_current_blog_id() : 0;
 
 		if ( $languages === null || $memo_blog !== $current_blog ) {
@@ -612,10 +589,7 @@ final class LanguageSwitcherBlock {
 			/**
 			 * Filter the languages shown in the switcher.
 			 *
-			 * Applied inside the populate block (and the filtered result is
-			 * memoised) so a second switcher on the same page doesn't re-run
-			 * the filter on already-filtered data - non-idempotent callbacks
-			 * would otherwise compound across renders.
+			 * Runs once per memo fill, so a non-idempotent callback does not compound across switchers.
 			 *
 			 * @hook perflocale/switcher/languages
 			 *
@@ -716,12 +690,7 @@ final class LanguageSwitcherBlock {
 		$html  = '<nav ' . self::build_wrapper_attrs( $classes, $wrapper_style, $block ) . '>';
 		$html .= '<ul>';
 
-		/*
-		 * Counted rather than pre-computed on purpose. render_dropdown() below
-		 * pre-counts because it has to build a trigger before the loop; here the
-		 * loop is the only thing that knows, and a second copy of the skip rules
-		 * would be free to drift away from the ones actually applied.
-		 */
+		// Counted in the loop: a second copy of the skip rules could drift.
 		$items = 0;
 
 		foreach ( $languages as $lang ) {
@@ -750,10 +719,7 @@ final class LanguageSwitcherBlock {
 
 			$label = $this->format_name( $lang, $name_format );
 
-			// An untranslated language shown as a non-link placeholder is NOT
-			// the current language: it must not wear the --current style, and it
-			// carries aria-disabled so assistive tech announces it as an inert
-			// option - mirroring the dropdown and nav-menu placeholder paths.
+			// A non-link placeholder is not current: --disabled style and aria-disabled, as in the dropdown.
 			$is_placeholder = ( ! $has_translation && $untranslated_link === 'no_link' );
 
 			if ( $is_current ) {
@@ -826,16 +792,7 @@ final class LanguageSwitcherBlock {
 			++$items;
 		}
 
-		/*
-		 * Every language was skipped -- an untranslated page with the current
-		 * language hidden and untranslated languages hidden skips all of them.
-		 * Return nothing rather than an empty `<nav><ul></ul></nav>`: that string
-		 * is non-empty, so a consumer testing the rendered HTML for emptiness
-		 * (the floating switcher's fixed-position panel, the widget's
-		 * before_widget/after_widget, a builder addon's own wrapper) would still
-		 * draw its chrome around nothing. The dropdown branch has always done
-		 * this; the inline and simple branches did not.
-		 */
+		// All skipped: return '' so callers that test for emptiness draw no empty box.
 		if ( $items === 0 ) {
 			return '';
 		}
@@ -856,11 +813,6 @@ final class LanguageSwitcherBlock {
 	 * @return string
 	 */
 	private function render_dropdown( array $languages, string $current_slug, array $urls, array $attributes, $block = null ): string {
-		// Bind the Settings singleton once. Common renders (no per-block
-		// arrowStyle / untranslatedLink override) hit BOTH fallback paths
-		// below and previously walked the
-		// Plugin::get_instance()->get('settings')->get(...) chain twice
-		// per dropdown render. One bind, two reuses.
 		$plugin_settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 
 		$name_format    = $attributes['nameFormat'] ?? 'native';
@@ -903,10 +855,7 @@ final class LanguageSwitcherBlock {
 			return '';
 		}
 
-		// Pre-count the options the loop below would actually render (same
-		// skip rules). On an untranslated page with hideCurrent + untranslated
-		// languages hidden, that count is ZERO - rendering a trigger whose
-		// panel opens empty is a dead control, so suppress the whole block.
+		// Same skip rules as the loop below: no options means no dead trigger.
 		$renderable = 0;
 
 		foreach ( $languages as $lang ) {
@@ -945,7 +894,7 @@ final class LanguageSwitcherBlock {
 
 		$html .= '<div class="perflocale-dd__anchor">';
 
-		$html .= '<button type="button" id="' . esc_attr( $trigger_id ) . '" class="perflocale-dd__trigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="' . esc_attr( $dropdown_id ) . '" aria-label="' . esc_attr( $trigger_label ) . '"' . self::language_attr_string( $current_lang ) . '>';
+		$html .= '<button type="button" id="' . esc_attr( $trigger_id ) . '" class="perflocale-dd__trigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="' . esc_attr( $dropdown_id ) . '" aria-label="' . esc_attr( $trigger_label ) . '"' . self::language_attr_string( $current_lang ) . self::data_attr_string( self::language_data_attrs( $current_lang, false ) ) . '>';
 
 		if ( $show_flags ) {
 			$html .= '<span class="perflocale-dd__flag">' . esc_html( \PerfLocale\Helper::get_flag_emoji( $current_lang ) ) . '</span>';
@@ -996,6 +945,7 @@ final class LanguageSwitcherBlock {
 			}
 
 			$option_class = 'perflocale-dd__option' . ( $is_active ? ' perflocale-dd__option--active' : '' );
+			$data_attrs   = self::language_data_attrs( $lang, ! $has_translation && ! $is_active );
 
 			if ( $url !== '' ) {
 				$base_attrs = [
@@ -1014,6 +964,8 @@ final class LanguageSwitcherBlock {
 					$base_attrs['aria-selected'] = 'true';
 				}
 
+				$base_attrs += $data_attrs;
+
 				$link_attrs = LanguageSwitcher::render_link_attrs(
 					$base_attrs,
 					$lang,
@@ -1023,7 +975,7 @@ final class LanguageSwitcherBlock {
 
 				$html .= '<a ' . $link_attrs . '>';
 			} else {
-				$html .= '<span class="' . esc_attr( $option_class ) . ' perflocale-dd__option--disabled" role="option" aria-disabled="true" tabindex="-1"' . ( $is_active ? ' aria-selected="true"' : '' ) . self::language_attr_string( $lang ) . '>';
+				$html .= '<span class="' . esc_attr( $option_class ) . ' perflocale-dd__option--disabled" role="option" aria-disabled="true" tabindex="-1"' . ( $is_active ? ' aria-selected="true"' : '' ) . self::language_attr_string( $lang ) . self::data_attr_string( $data_attrs ) . '>';
 			}
 
 			$inner = '';

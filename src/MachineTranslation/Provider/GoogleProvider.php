@@ -44,11 +44,7 @@ final class GoogleProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Get the API key from settings.
-	 *
-	 * Resolved transparently as env var → PHP constant → database via
-	 * Settings::get() (see Settings::CONSTANT_MAP for the env/constant
-	 * name binding: PERFLOCALE_GOOGLE_API_KEY ↔ mt_google_api_key).
+	 * The API key: env var or constant PERFLOCALE_GOOGLE_API_KEY first, then the database (Settings::get()).
 	 *
 	 * @return string
 	 */
@@ -59,10 +55,7 @@ final class GoogleProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch(). Google's own docs recommend
-	 *   format=text for plain text: format=html returns entity-escaped
-	 *   output (&#39;, &amp;).
+	 * @param string $format Destination format hint ('html'|'text'); 'text' sends format=text, as html returns entities (&#39;).
 	 *
 	 * @throws \RuntimeException When Google Translate returns an unexpected response or all retries fail.
 	 */
@@ -73,12 +66,8 @@ final class GoogleProvider extends AbstractProvider {
 			self::API_URL,
 			[
 				'method'  => 'POST',
-				// The key travels as a header, never in the JSON body: Google
-				// reads its system parameters only from the query string or a
-				// header, so a body `key` arrives as an unauthenticated call
-				// and every request fails 403 "unregistered callers". A header
-				// is preferred over ?key= because query strings land in proxy
-				// and access logs.
+				// The key is a header: in the body Google ignores it (403 "unregistered callers"), and ?key= lands in
+				// proxy and access logs.
 				'headers' => [
 					'Content-Type'   => 'application/json',
 					'X-goog-api-key' => $this->get_api_key(),
@@ -86,8 +75,7 @@ final class GoogleProvider extends AbstractProvider {
 				'body'    => wp_json_encode(
 					[
 						'q'      => $text,
-						// Google Translate v2 accepts both base ('en') and variant
-						// ('zh-CN') forms. Normalize underscore-locale input.
+						// Source as a base code; the target keeps its variant ('zh-cn') in dash form.
 						'source' => $this->base_language_code( $source_lang ),
 						'target' => $this->normalize_language_code( $target_lang ),
 						'format' => 'text' === $format ? 'text' : 'html',
@@ -117,13 +105,9 @@ final class GoogleProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Google Translate v2 accepts `q` as either a single string or an
-	 * array - a single HTTP round-trip handles the whole batch. Billing
-	 * is per-character regardless, so batching is pure latency + cost-
-	 * overhead reduction (no per-call TCP/TLS handshake on each string).
+	 * One request for the whole batch (`q` as an array).
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch().
+	 * @param string $format Destination format hint ('html'|'text'), as in translate().
 	 *
 	 * @throws \RuntimeException When Google Translate batch returns an unexpected response or all retries fail.
 	 */
@@ -176,13 +160,8 @@ final class GoogleProvider extends AbstractProvider {
 			);
 		}
 
-		// Cardinality contract: one translation per text sent, in order. The
-		// batch is then mapped BY INDEX onto the caller's strings, so a short
-		// or over-long reply does not degrade gracefully - it silently shifts
-		// every later translation onto the wrong source. Core's
-		// TranslationService already refuses a mismatched batch, but this
-		// provider is a public class a third party can call directly, and the
-		// check that protects them costs one integer comparison per batch.
+		// One translation per text, in order: mapped by index, a count mismatch shifts every later translation.
+		// Checked here too because a third party may call this public class directly.
 		if ( count( $data['data']['translations'] ) !== count( $filtered ) ) {
 			throw new \RuntimeException(
 				esc_html(
@@ -200,16 +179,12 @@ final class GoogleProvider extends AbstractProvider {
 
 		foreach ( $data['data']['translations'] as $i => $translation ) {
 			$text = (string) ( $translation['translatedText'] ?? '' );
-			// Pass the original source text (by index) to the result filter,
-			// matching translate()'s signature + the documented hook contract.
-			// Google returns translations in request order, so $values[$i] is
-			// the corresponding source string.
+			// The result filter receives the original source text, as in translate(); answers are in request order.
 			$original  = (string) ( $values[ $i ] ?? '' );
 			$results[] = (string) apply_filters( 'perflocale/machine_translation/result', $text, $original, 'google' );
 		}
 
-		// Track usage once for the whole batch - matches per-char billing
-		// but avoids N update_option() calls inside a tight loop.
+		// Usage is tracked once per batch: one option write, not one per text.
 		$total_chars = 0;
 		foreach ( $filtered as $text ) {
 			$total_chars += mb_strlen( (string) $text );

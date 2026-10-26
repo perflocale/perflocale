@@ -1,15 +1,8 @@
 <?php
 /**
- * CLDR plural rules: how many grammatical plural forms a language has, and
- * which form a given count selects.
+ * CLDR plural rules: how many plural forms a language has, and which form a count selects.
  *
- * PerfLocale stores a plural string's forms across three places - form 0 in
- * the `singular`-context row, form 1 in the `plural`-context row, and forms
- * 2..N in that plural row's JSON `extra_forms` column - so the SERVING layer
- * needs, for a given (locale, number), the CLDR form INDEX. This class owns
- * that mapping: a shipped locale → gettext plural expression table (the same
- * data translate.wordpress.org uses) plus evaluation through WordPress's own
- * bundled {@see \Plural_Forms} compiler, memoized per locale.
+ * Form 0 is the `singular` row, form 1 the `plural` row, forms 2..N its `extra_forms` JSON.
  *
  * @package PerfLocale\Strings
  */
@@ -26,10 +19,8 @@ final class PluralRules {
 	/**
 	 * gettext Plural-Forms expressions keyed by base language code.
 	 *
-	 * Value: [ nplurals, "plural=(...)" expression body ]. Sourced from the
-	 * CLDR/gettext canonical set (translate.wordpress.org uses the same).
-	 * A locale like `pt_BR` falls back to its base `pt`; unknown languages
-	 * fall back to the English 2-form rule (safe: form 0 for n==1, else 1).
+	 * Value: [ nplurals, expression ], the set translate.wordpress.org uses. `pt_BR` falls back to `pt`,
+	 * an unknown language to the English 2-form rule.
 	 *
 	 * @var array<string, array{0:int,1:string}>
 	 */
@@ -70,12 +61,9 @@ final class PluralRules {
 		// 2 forms, n > 1 (French/Brazilian variety).
 		'fr'  => array( 2, '(n > 1)' ),
 		'pt_br' => array( 2, '(n > 1)' ),
-		// Turkish + Persian are 2-form in BOTH CLDR (one/other) and every WP
-		// language-pack header ("nplurals=2; plural=(n > 1);") - classifying
-		// them 1-form silently discarded the plural msgstr WP-ecosystem POs
-		// ship. (n > 1) matches the header translators author under, so the
-		// n=0 text lands in the bucket they intended; for fa it is also the
-		// exact CLDR rule (one = i=0 or n=1).
+		// Turkish and Persian are 2-form in CLDR and every WP language pack header: 1-form would drop
+		// the plural msgstr their POs ship. (n > 1) matches the header translators write under, and for fa
+		// it is also the exact CLDR rule (one = i=0 or n=1).
 		'tr'  => array( 2, '(n > 1)' ),
 		'fa'  => array( 2, '(n > 1)' ),
 
@@ -130,8 +118,7 @@ final class PluralRules {
 	/**
 	 * Resolve a locale/slug to its [ nplurals, expression ] rule.
 	 *
-	 * Accepts a WP locale (`pt_BR`), a language slug (`pt-br`, `pl`), or a
-	 * bare code. Tries the exact normalized key, then the base language.
+	 * Accepts a WP locale (`pt_BR`), a slug (`pt-br`) or a bare code: exact normalized key, then the base.
 	 *
 	 * @param string $locale Locale, slug, or language code.
 	 * @return array{0:int,1:string}
@@ -177,10 +164,7 @@ final class PluralRules {
 	/**
 	 * The CLDR plural FORM INDEX (0-based) a count selects in a locale.
 	 *
-	 * Delegates the arithmetic to WordPress's bundled {@see \Plural_Forms},
-	 * the same evaluator core uses for MO/PO plurals - so the result is
-	 * identical to what a native gettext consumer would pick. Compiled once
-	 * per expression and clamped to [0, nplurals-1] defensively.
+	 * Uses core's Plural_Forms, so the pick matches what gettext would choose; clamped to [0, nplurals-1].
 	 *
 	 * @param string $locale Locale, slug, or language code.
 	 * @param int    $number The count.
@@ -194,8 +178,7 @@ final class PluralRules {
 		}
 
 		if ( ! class_exists( '\\Plural_Forms' ) ) {
-			// Bundled with WP since 4.9; require the pomo file directly if
-			// it hasn't autoloaded yet (it uses require_once-style loading).
+			// Core's pomo file is not autoloaded: require it.
 			$pomo = ABSPATH . WPINC . '/pomo/plural-forms.php';
 
 			if ( is_readable( $pomo ) ) {

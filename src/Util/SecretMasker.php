@@ -14,16 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Single implementation of the credential-redaction rule, shared by every
- * surface that persists or renders third-party error text.
+ * The one credential-redaction rule for stored or shown third-party error text.
  *
- * The rule matches the SAFE shape rather than the unsafe one: a 24+ character
- * run of `[A-Za-z0-9_-]` survives only when it looks like a lowercase
- * snake_case identifier (letter-initial, `word_word_word`, each segment at
- * most 16 characters) - which is what this plugin's hook, filter and
- * capability names look like. Everything else is redacted, so hex digests,
- * UUIDs, `sk-…` keys and all-letter base62 tokens fail closed even when they
- * contain no digit.
+ * It allowlists the safe shape: a 24+ character `[A-Za-z0-9_-]` run survives only as lowercase snake_case
+ * (segments of at most 16), like the plugin's hook names; hex, UUIDs, `sk-` keys and all-letter tokens fail closed.
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */

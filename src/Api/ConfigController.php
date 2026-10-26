@@ -18,50 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * `GET /wp-json/perflocale/v1/config` - publishes the minimum set of
- * routing + language info an edge worker (Cloudflare Worker, Vercel
- * Edge, Netlify Edge) needs to pre-route a visitor before the request
- * ever hits PHP.
+ * `GET /perflocale/v1/config`: the routing and language data an edge worker needs to pre-route a visitor.
  *
- * ## Public by default
- *
- * The endpoint is public - all the data it returns is already visible
- * in the rendered HTML (hreflang tags, language switcher, URL prefixes)
- * - but it's gated behind the `edge_integration_enabled` setting so
- * sites that don't use an edge runtime don't expose an extra surface.
- *
- * **The response NEVER contains:** API keys, machine-translation provider
- * tokens, user data, internal post/term IDs, or any data not already
- * observable from the public site. That non-sensitive invariant is what
- * justifies the public default. If extended via the
- * {@see perflocale/api/config} filter, callers MUST preserve this invariant.
- *
- * ## Restricting access
- *
- * Site owners who still want to gate the endpoint (e.g. private staging,
- * IP allowlist, Application-Password auth) hook the
- * {@see perflocale/edge_worker/config_permission_callback} filter:
- *
- *     // Restrict to logged-in admins (works with Application Passwords).
- *     add_filter( 'perflocale/edge_worker/config_permission_callback', function () {
- *         return current_user_can( 'manage_options' );
- *     } );
- *
- *     // OR: IP allowlist for known edge-worker origins.
- *     add_filter( 'perflocale/edge_worker/config_permission_callback', function () {
- *         return in_array( $_SERVER['REMOTE_ADDR'] ?? '', [ '203.0.113.10' ], true );
- *     } );
- *
- * The default permission_callback returns `true` (public read).
- *
- * ## Caching
- *
- * Response is aggressively cacheable: hosts can hold it on their own
- * edge for an hour while we respect a 5-minute browser cache, plus a
- * 1-day stale-while-revalidate window. ETag + If-None-Match → 304
- * revalidation is implemented so edges can refresh cheaply. A restricted
- * endpoint (permission filter hooked), and any response to a logged-in
- * caller, is sent `Cache-Control: private, no-store` instead.
+ * Public read: the payload holds only data the rendered site already shows (never keys, user data or internal IDs),
+ * and a `perflocale/api/config` filter must keep it that way. Restrict with the config_permission_callback filter.
  */
 final class ConfigController extends RestController {
 
@@ -83,17 +43,12 @@ final class ConfigController extends RestController {
 	private const CACHE_KEY = 'edge_config_v1';
 
 	/**
-	 * Payload cache TTL (seconds). Invalidated eagerly on language or
-	 * settings changes, so this is a ceiling not a staleness budget.
+	 * Payload cache TTL (seconds): a ceiling, as language and settings changes invalidate it.
 	 */
 	private const CACHE_TTL = 900; // 15 minutes.
 
 	/**
-	 * Register REST routes.
-	 *
-	 * Only called when `edge_integration_enabled` is on - Bootstrap
-	 * gates the container so `register_hooks()` / `register_routes()`
-	 * never runs on sites that haven't opted in.
+	 * Register REST routes; Bootstrap calls it only while `edge_integration_enabled` is on.
 	 *
 	 * @return void
 	 */
@@ -110,33 +65,16 @@ final class ConfigController extends RestController {
 	}
 
 	/**
-	 * Permission gate for the public config endpoint.
-	 *
-	 * Default: public read. The payload contains only non-sensitive routing
-	 * + language metadata (slugs, locales, URL mode, default language) that
-	 * is already observable from the rendered HTML, hreflang tags, and
-	 * public language switcher - there is nothing to gate by default.
-	 *
-	 * Site owners who want to restrict it (private staging, IP allowlist,
-	 * Application-Password auth, mTLS proxy, etc.) filter this callback:
-	 *
-	 *     add_filter( 'perflocale/edge_worker/config_permission_callback',
-	 *         fn () => current_user_can( 'manage_options' ) );
-	 *
-	 * Returning `false` or a `WP_Error` produces the standard WP-REST 401/
-	 * 403 response. Returning `true` (the default) keeps the endpoint open.
+	 * Permission gate for the config endpoint: public read unless the filter below restricts it.
 	 *
 	 * @param \WP_REST_Request $request The REST request.
 	 * @return bool|\WP_Error
 	 */
 	public function permission_check( \WP_REST_Request $request ) {
 		/**
-		 * Filter the permission_callback for the edge-worker config endpoint.
+		 * Filter the permission of the edge-worker config endpoint (default true, public read).
 		 *
-		 * Default is `true` (public read). The endpoint exposes only data
-		 * that is already observable from the rendered site - see the class
-		 * docblock for the non-sensitive invariant. Return `false`, a
-		 * `WP_Error`, or the result of `current_user_can()` to restrict.
+		 * Return false, a WP_Error or a current_user_can() result to restrict it.
 		 *
 		 * @hook perflocale/edge_worker/config_permission_callback
 		 * @param bool|\WP_Error   $allowed Default true.
@@ -148,11 +86,7 @@ final class ConfigController extends RestController {
 			$request
 		);
 
-		// Type-safety contract: filter must return bool or WP_Error. A
-		// non-conformant return is a definite developer mistake - silently
-		// coercing to true would defeat the gate; coercing to false would
-		// 403 every edge worker. Surface the bug + fall back to the safe
-		// default (preserve the documented public-read behavior).
+		// A return that is not bool or WP_Error is a developer bug: report it and keep the documented public default.
 		if ( ! is_bool( $allowed ) && ! ( $allowed instanceof \WP_Error ) ) {
 			_doing_it_wrong(
 				'apply_filters( "perflocale/edge_worker/config_permission_callback", ... )',
@@ -181,7 +115,7 @@ final class ConfigController extends RestController {
 		$payload = $this->build_payload();
 		$etag    = '"' . md5( (string) wp_json_encode( $payload ) ) . '"';
 
-		// Respect If-None-Match - lets edges revalidate with a cheap 304.
+		// If-None-Match lets edges revalidate with a 304.
 		$if_none_match = $request->get_header( 'if_none_match' );
 
 		if ( is_string( $if_none_match ) && trim( $if_none_match ) === $etag ) {
@@ -202,10 +136,7 @@ final class ConfigController extends RestController {
 	/**
 	 * Cache-Control value for a config response.
 	 *
-	 * Shared caches may store the response only while the route is public:
-	 * when the permission filter is hooked, or the caller is logged in (a
-	 * route restricted by other means answers only them), a stored copy could
-	 * be served to a client the gate would refuse.
+	 * Private when the permission filter is hooked or the caller is logged in: a shared copy could reach a refused client.
 	 *
 	 * @return string
 	 */
@@ -306,16 +237,9 @@ final class ConfigController extends RestController {
 		];
 
 		/**
-		 * Filter the edge-config payload before it is cached and returned
-		 * to edge runtimes. Use it to expose custom fields (feature flags,
-		 * per-language A/B variants, fallback chains) that your Cloudflare
-		 * Worker / Vercel Edge / Netlify Edge handler needs without making
-		 * a separate origin request.
+		 * Filter the public edge-config payload before it is cached and returned.
 		 *
-		 * The result is stored in the 3-layer cache and contributes to the
-		 * ETag - keep additions deterministic (no timestamps, no request-
-		 * specific data) or call `ConfigController::invalidate()` whenever
-		 * the added data changes.
+		 * The result is cached and feeds the ETag: keep additions deterministic, or call ConfigController::invalidate().
 		 *
 		 * @hook perflocale/api/config
 		 *
@@ -325,8 +249,7 @@ final class ConfigController extends RestController {
 	}
 
 	/**
-	 * Invalidate the cached payload - hook target for language/settings
-	 * mutation events.
+	 * Invalidate the cached payload on language or settings changes.
 	 *
 	 * @return void
 	 */

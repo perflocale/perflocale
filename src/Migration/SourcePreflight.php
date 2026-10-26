@@ -16,18 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Compares the source plugin's languages with PerfLocale's before an import.
+ * Compares the source plugin's languages with PerfLocale's before an import (read-only).
  *
- * Read-only. The first import from a source is refused (`blocking`) when
- * the source's default language is not PerfLocale's default language, or
- * when the source has content in a language PerfLocale does not have:
- * importing then would move every page to another address, or leave that
- * content without a language in the default-language listings. Once an
- * import from the source has run on the blog, the same findings are only
- * warnings, so a catch-up import is never refused.
- *
- * Reads only the source's settings option and its language rows; runs when
- * an import or a dry run starts, never on a page view.
+ * The first import is `blocking` on a default mismatch (every page would change address) or content in a
+ * missing language; after one import ran, these are warnings so a catch-up import is never refused.
  */
 final class SourcePreflight {
 
@@ -121,9 +113,8 @@ final class SourcePreflight {
 		$found    = is_array( $settings );
 		$default  = $found && is_string( $settings['default-language'] ?? null ) ? (string) $settings['default-language'] : '';
 		$targets  = $found && is_array( $settings['translation-languages'] ?? null ) ? $settings['translation-languages'] : [];
-		// A language TranslatePress had not published is imported only into a
-		// switched-off PerfLocale language, or skipped with a notice, by the
-		// importer; it is never a missing language here.
+		// The importer maps an unpublished TranslatePress language to an inactive language or skips it,
+		// so it is never a missing language here.
 		$published = $found && is_array( $settings['publish-languages'] ?? null ) ? array_map( 'strval', $settings['publish-languages'] ) : null;
 		$active    = $languages->get_active();
 		$map       = [];
@@ -318,8 +309,7 @@ final class SourcePreflight {
 			return '';
 		}
 
-		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false blocks object injection, as in PolylangImporter.
-		$meta = @unserialize( $description, [ 'allowed_classes' => false ] );
+		$meta = PolylangImporter::decode_description( $description );
 
 		return is_array( $meta ) && is_string( $meta['locale'] ?? null ) ? sanitize_text_field( $meta['locale'] ) : '';
 	}

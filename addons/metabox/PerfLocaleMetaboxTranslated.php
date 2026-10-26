@@ -2,9 +2,7 @@
 /**
  * PerfLocale MetaBox addon: the work done on a translated request.
  *
- * Loaded only by PerfLocaleMetabox once the request's language is known to
- * be another than the default one, or when a reference field is read in
- * such a language. A default-language request never loads this file.
+ * Loaded by PerfLocaleMetabox only when a translated request renders a Meta Box block or reads a reference field.
  *
  * @package PerfLocale
  */
@@ -16,19 +14,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Translated-request serving for the MetaBox addon: one render cache entry
- * per language for Meta Box blocks, the translation printed through Meta
- * Box's the_value() path for `post` and `taxonomy_advanced` fields, and the
- * shape-keeping reference walk behind `rwmb_get_value`.
+ * Translated-request serving for the MetaBox addon.
+ *
+ * Per-language block render cache, translated `post` / `taxonomy_advanced` output and the `rwmb_get_value` reference walk.
  */
 final class PerfLocaleMetaboxTranslated {
 
 	/**
 	 * Key added to a Meta Box block's `data` attribute on a translated request.
 	 *
-	 * MB Blocks caches a block's HTML under a key built from the block's
-	 * `data` attribute only, so without this key two languages rendering the
-	 * same `data` share one cache entry.
+	 * MB Blocks keys its HTML cache on `data` alone, so without it two languages share one entry.
 	 *
 	 * @var string
 	 */
@@ -47,8 +42,7 @@ final class PerfLocaleMetaboxTranslated {
 	/**
 	 * Levels of nested arrays the reference walk enters.
 	 *
-	 * Meta Box nests a value one array per clone, multiple and group level, a
-	 * few levels deep; an array nested deeper is returned unchanged.
+	 * Meta Box nests one array per clone, multiple and group level; deeper arrays come back unchanged.
 	 *
 	 * @var int
 	 */
@@ -83,24 +77,14 @@ final class PerfLocaleMetaboxTranslated {
 	private \Closure $repo;
 
 	/**
-	 * Whether the translated-page hooks are attached.
-	 *
-	 * @var bool
-	 */
-	private bool $language_hooks_attached = false;
-
-	/**
-	 * The references whose translations and target objects this request
-	 * already read in a batch: "blog|post|lang" or "blog|term|lang" => ( ID => true ).
+	 * References this request already batch-read: "blog|post|lang" or "blog|term|lang" => ( ID => true ).
 	 *
 	 * @var array<string, array<int, true>>
 	 */
 	private array $primed = [];
 
 	/**
-	 * While a value's references are collected ({@see self::prime_references()}):
-	 * the IDs translate_post_ids() and translate_term_ids() would map, which
-	 * they record here instead of mapping. Null otherwise.
+	 * While prime_references() collects: the IDs the translate_*_ids() methods record instead of mapping.
 	 *
 	 * @var array{post: array<int, int>, term: array<int, int>}|null
 	 */
@@ -141,18 +125,6 @@ final class PerfLocaleMetaboxTranslated {
 		self::$current = new self( $addon, $manager, $repo );
 
 		return self::$current;
-	}
-
-	/**
-	 * Serve a translated request: attach the translated-page hooks, and
-	 * follow the rendering windows that impose or restore a language.
-	 *
-	 * @return void
-	 */
-	public function serve(): void {
-		add_action( 'perflocale/language/overridden', [ $this, 'attach_language_hooks' ], 20 );
-		add_action( 'perflocale/language/restored', [ $this, 'attach_language_hooks' ], 20 );
-		$this->attach_language_hooks();
 	}
 
 	/**
@@ -197,46 +169,9 @@ final class PerfLocaleMetaboxTranslated {
 	}
 
 	/**
-	 * Attach the translated-page hooks for the current language.
+	 * `rwmb_raw_meta`: batch-read the links and targets of a reference or group field's IDs.
 	 *
-	 * Runs once the request's language is known to be a translated one, and
-	 * again when a rendering window imposes or restores a language: a window
-	 * in the default language detaches them until the window closes.
-	 *
-	 * @return void
-	 */
-	public function attach_language_hooks(): void {
-		if ( $this->language_hooks_attached ) {
-			remove_filter( 'render_block_data', [ $this, 'add_block_render_language' ], 10 );
-			remove_filter( '_rwmb_post_format_single_value', [ $this, 'translate_post_format_value' ], 10 );
-			remove_filter( 'rwmb_field_class', [ $this, 'term_display_field_class' ], 10 );
-			remove_filter( 'rwmb_raw_meta', [ $this, 'prime_raw_meta' ], 10 );
-			$this->language_hooks_attached = false;
-		}
-
-		if ( $this->translated_slug() === '' ) {
-			return;
-		}
-
-		add_filter( 'render_block_data', [ $this, 'add_block_render_language' ], 10, 1 );
-		add_filter( '_rwmb_post_format_single_value', [ $this, 'translate_post_format_value' ], 10, 2 );
-		add_filter( 'rwmb_field_class', [ $this, 'term_display_field_class' ], 10, 2 );
-		add_filter( 'rwmb_raw_meta', [ $this, 'prime_raw_meta' ], 10, 2 );
-		$this->language_hooks_attached = true;
-	}
-
-	/**
-	 * `rwmb_raw_meta`: Meta Box read the stored value of a field. For a
-	 * `post`, `taxonomy_advanced` or `group` field, the translations of all its
-	 * references, and the posts or terms they point to, are read now in one
-	 * batch, before Meta Box prints or returns them one by one.
-	 *
-	 * Every read of a field passes here first: rwmb_the_value(), the
-	 * [rwmb_meta] shortcode, MB Blocks, a group (its whole value, nested
-	 * sub-fields included) and rwmb_get_value. The per-reference lookups that
-	 * follow ({@see self::translate_post_format_value()}, the term display
-	 * class, `rwmb_get_value`) then find the links and objects in the
-	 * request's caches. The value comes back unchanged.
+	 * Every Meta Box field read passes here first, so the per-reference lookups after it hit the cache.
 	 *
 	 * @param mixed $value The stored value.
 	 * @param mixed $field Field settings.
@@ -257,13 +192,9 @@ final class PerfLocaleMetaboxTranslated {
 	}
 
 	/**
-	 * Read in one batch the translations of a field value's references and
-	 * the posts and terms they point to: the IDs the mapping walk would look
-	 * up are collected first (each once), then their links are read with
-	 * {@see \PerfLocale\Database\Repository\TranslationGroupRepository::prime_translations()}
-	 * (the same cache fill one lookup makes, for all of them at once) and the
-	 * language's siblings with _prime_post_caches() or _prime_term_caches().
-	 * IDs this request already read are skipped. Nothing is mapped here.
+	 * Batch-read a field value's reference links and the language's sibling posts or terms.
+	 *
+	 * Collects the IDs the mapping walk would look up, then primes each ID once per request; maps nothing.
 	 *
 	 * @param mixed               $value     Field value.
 	 * @param array<string,mixed> $field     Field configuration.
@@ -380,17 +311,10 @@ final class PerfLocaleMetaboxTranslated {
 	}
 
 	/**
-	 * `rwmb_field_class`: on a translated request a `taxonomy_advanced` field
-	 * prints through PerfLocaleMetaboxTermField, which maps each printed term
-	 * to the current language's sibling.
+	 * `rwmb_field_class`: on a translated request, print `taxonomy_advanced` through PerfLocaleMetaboxTermField.
 	 *
-	 * The functions rwmb_the_value() and mb_the_block_field(), the [rwmb_meta]
-	 * shortcode, MB Group and the page-builder integrations print a
-	 * `taxonomy_advanced` field through format_single_value(), which gets a
-	 * term object read from the stored IDs without `rwmb_get_value`, and Meta
-	 * Box offers no filter on that term. The subclass changes only that
-	 * method, so reads, saves and every other method stay Meta Box's own. A
-	 * class another plugin put in place is left as it is.
+	 * Meta Box prints it via format_single_value() with no filter on the term; the subclass changes only
+	 * that method. Another plugin's class is left as it is.
 	 *
 	 * @param mixed $class_name Field class name.
 	 * @param mixed $type       Field type.
@@ -439,12 +363,8 @@ final class PerfLocaleMetaboxTranslated {
 	 * `_rwmb_post_format_single_value`: the post a `post` field prints through
 	 * Meta Box's the_value() path is the current language's sibling.
 	 *
-	 * The functions rwmb_the_value() and mb_the_block_field(), the [rwmb_meta]
-	 * shortcode and the page-builder integrations print a `post` field through
-	 * RWMB_Post_Field::format_single_value(), which reads the stored ID without
-	 * `rwmb_get_value`. This filter (the seam Meta Box's own WPML integration
-	 * uses) gets each printed ID once, before its title and link are read. A
-	 * sibling the visitor may not see is skipped, as on `rwmb_get_value`.
+	 * The print path reads the stored ID without `rwmb_get_value`; this is the seam Meta Box's own WPML
+	 * integration uses. A sibling the visitor may not see is skipped.
 	 *
 	 * @param mixed $value The stored post ID.
 	 * @param mixed $field Field settings.
@@ -461,16 +381,9 @@ final class PerfLocaleMetaboxTranslated {
 	}
 
 	/**
-	 * `render_block_data`: give a Meta Box block's `data` attribute the
-	 * current language, so MB Blocks' render cache keeps one entry per
-	 * language.
+	 * `render_block_data`: add the current language to a Meta Box block's `data`, one cache entry per language.
 	 *
-	 * MB Blocks keys its cached HTML on `data` alone, while the HTML differs
-	 * per language (references mapped to the translated post or term,
-	 * translated template strings, language-prefixed links). The added key is
-	 * not a field ID, so Meta Box reads no value for it. A block without a
-	 * stored `data` attribute gets its registered default plus the key, which
-	 * is what it would have rendered with.
+	 * The key is not a field ID, so Meta Box reads no value for it; a block without `data` gets its registered default.
 	 *
 	 * @param mixed $parsed_block The parsed block.
 	 * @return mixed
@@ -560,17 +473,9 @@ final class PerfLocaleMetaboxTranslated {
 	}
 
 	/**
-	 * Resolve a post's current-language sibling, but only when the visitor is
-	 * allowed to see it.
+	 * Resolve a post's current-language sibling, only when the visitor may see it.
 	 *
-	 * `rwmb_get_value` is filtered on the FRONT END, so a reference field whose
-	 * sibling is still a draft/pending/private translation would otherwise put
-	 * that unpublished post's title on a public page and link to a URL an
-	 * anonymous visitor cannot open. PerfLocale creates translations as drafts,
-	 * so that is the normal state of a half-finished translation, not an edge
-	 * case. Returning null keeps the published source in place - the same rule
-	 * the ACF addon applies to its relationship / post-object fields and the
-	 * WooCommerce addon to cross-sell and upsell IDs.
+	 * Translations start as drafts; null keeps the published source instead of a draft's title and URL.
 	 *
 	 * @param int    $post_id   Source post ID.
 	 * @param string $lang_slug Target language slug.
@@ -601,8 +506,7 @@ final class PerfLocaleMetaboxTranslated {
 	/**
 	 * Translate post IDs to their current-language equivalents.
 	 *
-	 * Keeps the value's shape: see {@see self::map_reference_tree()}. A sibling
-	 * the visitor may not see is skipped - see {@see self::public_translation_id()}.
+	 * Keeps the value's shape; a sibling the visitor may not see is skipped.
 	 *
 	 * @param mixed  $value Post ID(s) in various formats.
 	 * @param string $lang_slug Target language slug.
@@ -634,7 +538,7 @@ final class PerfLocaleMetaboxTranslated {
 	/**
 	 * Translate term IDs to their current-language equivalents.
 	 *
-	 * Keeps the value's shape: see {@see self::map_reference_tree()}.
+	 * Keeps the value's shape.
 	 *
 	 * @param mixed  $value Term ID(s) in various formats.
 	 * @param string $lang_slug Target language slug.
@@ -693,18 +597,9 @@ final class PerfLocaleMetaboxTranslated {
 	/**
 	 * Map every reference in a stored or formatted value, keeping its shape.
 	 *
-	 * Meta Box nests a cloneable multiple field one array per clone
-	 * (`[[11, 12], [13]]`), and a group nests its sub-fields' values the same
-	 * way, so the walk recurses into every array and keeps its keys and order.
-	 * The leaves:
-	 * - an object carrying the ID property maps to the sibling's object;
-	 * - an int, or a string of digits, maps to the sibling's ID;
-	 * - a comma-separated string of IDs maps each ID (non-positive ones dropped);
-	 * - a non-positive ID, an ID without a sibling, an object without the ID
-	 *   property and any other value come back as they are.
-	 * An array or object is never read as an ID. The walk enters at most
-	 * {@see self::MAX_REFERENCE_DEPTH} levels of arrays; an array below that
-	 * comes back as it is, neither walked nor truncated.
+	 * Recurses into arrays (clones and groups nest: `[[11, 12], [13]]`) up to MAX_REFERENCE_DEPTH. Leaves that map:
+	 * an object with the ID property, an int or digit string, a comma-separated ID list (non-positive IDs dropped);
+	 * anything else comes back as it is.
 	 *
 	 * @param mixed                     $value      The value.
 	 * @param callable(int): (int|null) $sibling    The sibling ID of an ID, or null to keep it.
@@ -767,9 +662,6 @@ final class PerfLocaleMetaboxTranslated {
 
 	/**
 	 * Translate reference fields inside a group value.
-	 *
-	 * Walks the deserialized group value and translates post/term IDs
-	 * for sub-fields that are reference types.
 	 *
 	 * @param array<string, mixed>|array<int, array<string, mixed>> $value Group value (single or cloneable array of groups).
 	 * @param array<string, mixed>                                  $field Group field config.

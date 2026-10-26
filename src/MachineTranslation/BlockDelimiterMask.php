@@ -16,26 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Replaces every block delimiter of a post's content (starts with their
- * attribute JSON, ends, self-closing blocks) with an opaque placeholder before
- * the content goes to the provider, and puts the original delimiters back
- * afterwards, byte for byte.
+ * Swaps every block delimiter for an opaque placeholder before the provider call and restores it byte for byte.
  *
- * A placeholder is an HTML comment holding a per-call nonce and an index and
- * no text to translate, the form the "Do not translate" placeholders of
- * BlockSkipFilter already rely on with every bundled provider; wp_kses() keeps
- * comments. A placeholder the answer lost, repeats or invents means the answer
- * is damaged: restore() refuses it with the reason, and translate_post() fails
- * the item without writing anything.
- *
- * Text a block keeps only in its comment attributes (the BlockAttributeSource
- * rules the block editor's Translate button uses) is sent as separate
- * segments; restore() writes each sanitized translation back into the
- * attribute JSON with core's serializer.
- *
- * keep_delimiters() puts trusted delimiter bytes back after sanitize_mt_html():
- * wp_kses() re-serializes block attributes and turns a bare `&` in an
- * attribute value into `&amp;`.
+ * An HTML comment, or an empty `<pfl-b>` element for a provider that returns comments as text: see
+ * docs-ai/11-code-rationale.md, "BlockDelimiterMask: placeholder form and attribute segments".
  */
 final class BlockDelimiterMask {
 
@@ -45,6 +29,13 @@ final class BlockDelimiterMask {
 	 * @var string
 	 */
 	private string $nonce;
+
+	/**
+	 * Whether placeholders are `<pfl-b>` elements instead of comments.
+	 *
+	 * @var bool
+	 */
+	private bool $elements = false;
 
 	/**
 	 * The content with its delimiters replaced.
@@ -91,11 +82,11 @@ final class BlockDelimiterMask {
 	/**
 	 * Mask the block delimiters of a content.
 	 *
-	 * @param string $content Content as it is sent.
-	 * @return self|null Null when the content has no block delimiter (or they
-	 *                   cannot be read): it is sent as it is.
+	 * @param string $content  Content as it is sent.
+	 * @param bool   $elements Placeholders as empty `<pfl-b>` elements ({@see AbstractProvider::placeholders_as_elements()}).
+	 * @return self|null Null when the content has no readable block delimiter: it is sent as it is.
 	 */
-	public static function mask( string $content ): ?self {
+	public static function mask( string $content, bool $elements = false ): ?self {
 		if ( ! str_contains( $content, '<!-- wp:' ) && ! str_contains( $content, '<!-- /wp:' ) ) {
 			return null;
 		}
@@ -106,8 +97,9 @@ final class BlockDelimiterMask {
 			return null;
 		}
 
-		$mask   = new self();
-		$offset = 0;
+		$mask           = new self();
+		$mask->elements = $elements;
+		$offset         = 0;
 
 		foreach ( $tokens as $i => $t ) {
 			$text = substr( $content, $t['start'], $t['end'] - $t['start'] );
@@ -175,13 +167,15 @@ final class BlockDelimiterMask {
 	 * @throws NotSavedException When a placeholder is missing, repeated or unknown.
 	 */
 	public function restore( string $translated, array $segments ): string {
-		$sent = [];
+		$translated = PlaceholderCheck::respaced( $translated );
+		$sent       = [];
 
 		foreach ( array_keys( $this->delimiters ) as $i ) {
 			$sent[] = $this->placeholder( $i );
 		}
 
-		$damaged = PlaceholderCheck::damaged( $translated, $sent, '/<!--\s*pfl-b-' . $this->nonce . '-\d+\s*-->|pfl-b-' . $this->nonce . '-\d+/' );
+		// Either form and any pfl-b tag or bare nonce token counts, so a marker moved between forms is damage.
+		$damaged = PlaceholderCheck::damaged( $translated, $sent, '/<!--\s*pfl-b-' . $this->nonce . '-\d+\s*-->|<pfl-b\b[^>]*+>(?:\s*+<\/pfl-b>)?|<\/pfl-b>|(?:pfl-b-)?' . $this->nonce . '-\d+/' );
 
 		if ( $damaged > 0 ) {
 			throw new NotSavedException(
@@ -254,12 +248,9 @@ final class BlockDelimiterMask {
 	}
 
 	/**
-	 * Put trusted delimiter bytes back after sanitizing.
+	 * Put trusted delimiter bytes back after sanitizing (wp_kses() turns a bare `&` in an attribute into `&amp;`).
 	 *
-	 * When the sanitized content has the same delimiters (kind and name, in
-	 * order) as the content before sanitizing, each delimiter whose text
-	 * before sanitizing is trusted is written back as it was. Any other
-	 * delimiter keeps its sanitized text.
+	 * Only when kind and name of every delimiter match in order; any other delimiter keeps its sanitized text.
 	 *
 	 * @param string              $sanitized Content after sanitize_mt_html().
 	 * @param string              $before    The same content before it.
@@ -299,6 +290,8 @@ final class BlockDelimiterMask {
 	 * @return string
 	 */
 	private function placeholder( int $index ): string {
-		return '<!-- pfl-b-' . $this->nonce . '-' . $index . ' -->';
+		return $this->elements
+			? '<pfl-b data-i="' . $this->nonce . '-' . $index . '"></pfl-b>'
+			: '<!-- pfl-b-' . $this->nonce . '-' . $index . ' -->';
 	}
 }

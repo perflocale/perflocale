@@ -1,0 +1,61 @@
+/* PerfLocale - "Stock across languages" block of the WooCommerce add-on settings. */
+
+.perflocale-wc-stock__actions {
+	margin: 8px 0;
+}
+
+.perflocale-wc-stock__progress {
+	display: block;
+	width: 100%;
+	max-width: 420px;
+	margin: 8px 0;
+}
+
+.perflocale-wc-stock__progress[hidden],
+.perflocale-wc-stock__confirm[hidden] {
+	display: none;
+}
+
+.perflocale-wc-stock__table-wrap {
+	max-width: 100%;
+	overflow-x: auto;
+	margin: 8px 0;
+}
+
+.perflocale-wc-stock__table {
+	width: auto;
+	min-width: 320px;
+}
+
+.perflocale-wc-stock__table th,
+.perflocale-wc-stock__table td {
+	text-align: right;
+	white-space: nowrap;
+}
+
+.perflocale-wc-stock__reference {
+	font-weight: 600;
+}
+
+.perflocale-wc-stock__differs {
+	font-weight: 600;
+	color: #8a1f1f;
+}
+
+.perflocale-wc-stock__confirm {
+	max-width: 640px;
+	margin: 8px 0;
+	padding: 8px 12px;
+	border-right: 4px solid #dba617;
+	background: #fcf9e8;
+}
+
+.perflocale-wc-stock__confirm:focus {
+	outline: 2px solid #2271b1;
+	outline-offset: 2px;
+}
+
+.perflocale-wc-stock__left-list {
+	margin: 4px 18px 0 0;
+	list-style: disc;
+}

@@ -14,12 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Raised by {@see MigrationLock::run()} when the `migration_import` lock is
- * held, and by its heartbeat when a running import lost the lock. The
- * message is translated and safe to show to the operator.
+ * Raised when the import lock is held or a running import lost it; the message is translated and safe to show.
  *
- * In a background job the exception is left uncaught, so the worker retries
- * the job later; the admin's inline path and WP-CLI show the message.
+ * A background job leaves it uncaught on purpose, so the worker retries the job later.
  */
 final class MigrationLockedException extends \RuntimeException {
 }

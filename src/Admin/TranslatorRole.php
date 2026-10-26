@@ -15,22 +15,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Comprehensive permissions system for PerfLocale.
+ * The Translator role and the PerfLocale capabilities of each role.
  *
- * Capabilities:
- * perflocale_translate - Create and edit translations (Translator, Editor, Admin; WooCommerce's Shop Manager)
- * perflocale_manage_translations - Manage translations and translation settings (Editor, Admin)
- * perflocale_approve_translations - Approve/reject pending translations in review (Editor, Admin)
- * perflocale_manage_languages - Add/edit/delete languages (Admin only)
- * perflocale_manage_addons - Install/activate/deactivate addons (Admin only)
- * perflocale_use_mt - Use machine translation (Translator, Editor, Admin)
- * perflocale_import_export - Import/export translations (Admin only)
- *
- * `perflocale_approve_translations` gates the review-workflow approve/reject
- * action of review workflows. It is granted
- * to Editors + Admins but NOT the base Translator role, so translators submit
- * and supervisors approve; it can also be granted on its own to a dedicated
- * reviewer role without the broader perflocale_manage_translations.
+ * `perflocale_approve_translations` is never a Translator capability: translators submit, reviewers approve.
  */
 final class TranslatorRole {
 
@@ -53,14 +40,9 @@ final class TranslatorRole {
 	];
 
 	/**
-	 * Capabilities this plugin granted in EARLIER versions and no longer uses.
+	 * Retired capabilities, still stripped on deactivation and uninstall.
 	 *
-	 * `remove_roles()` strips caps by iterating {@see self::CAPABILITIES}, so a
-	 * capability dropped from that list becomes unremovable: it stays on every
-	 * role that was ever granted it, surviving deactivation AND a full
-	 * uninstall. Retiring a capability therefore means MOVING it here, not
-	 * deleting the line. Same reasoning as the legacy cron-hook names swept by
-	 * raw string in Deactivator::cron_hooks().
+	 * Retire a capability by moving it here, never by deleting it: remove_roles() strips only listed ones.
 	 *
 	 * @var array<int, string>
 	 */
@@ -70,9 +52,7 @@ final class TranslatorRole {
 	];
 
 	/**
-	 * Core capabilities granted to the Translator role: open, edit and save
-	 * posts and pages written by others, and upload media. No publish or
-	 * delete capability.
+	 * Core capabilities of the Translator role: edit others' posts and pages, upload media; no publish or delete.
 	 */
 	private const TRANSLATOR_BASE_CAPS = [
 		'read'                 => true,
@@ -94,9 +74,9 @@ final class TranslatorRole {
 	];
 
 	/**
-	 * The Translator role's capabilities at capability version 4: the set
-	 * every install had before the ledger existed. An absent ledger reads as
-	 * this map. Fixed: it does not follow later changes to the defaults.
+	 * The Translator capabilities an absent ledger reads as (capability version 4).
+	 *
+	 * Never edit it with the defaults: it is what every site without a ledger holds.
 	 */
 	private const TRANSLATOR_CAPS_V4 = [
 		'read'                 => true,
@@ -112,26 +92,16 @@ final class TranslatorRole {
 	];
 
 	/**
-	 * Non-autoloaded option holding the Translator role's capability ledger:
-	 * `granted`, the capability map install_caps() last applied; `removed`,
-	 * the granted defaults the role had no entry for when remove_roles()
-	 * deleted it; and `denied`, the granted defaults it held as an explicit
-	 * deny (`false`) at that point.
+	 * Option holding the Translator capability ledger (`granted`, `removed`, `denied`); not autoloaded.
 	 *
-	 * The ledger only narrows the role: `removed` subtracts from the
-	 * defaults, `denied` turns a default grant into a deny, and a `granted`
-	 * entry that is not a default is taken off. Nothing in it adds a
-	 * capability outside the filtered defaults or lifts an explicit deny.
-	 *
-	 * Read on rebuilds and deactivation only, never on the admin_init
-	 * short-circuit. Kept on a preserve-mode uninstall, deleted on a full one.
+	 * It only narrows the role: docs-ai/11-code-rationale.md, "TranslatorRole: capability ledger".
 	 */
 	private const TRANSLATOR_LEDGER_OPTION = 'perflocale_translator_caps';
 
 	/**
-	 * Capabilities granted once to WooCommerce's Shop Manager role, so shop
-	 * managers can create product translations. No machine translation
-	 * (`perflocale_use_mt` spends the site's MT budget).
+	 * Capabilities granted once to WooCommerce's Shop Manager role.
+	 *
+	 * No `perflocale_use_mt`: it spends the site's MT budget.
 	 */
 	private const SHOP_MANAGER_CAPS = [
 		'perflocale_translate' => true,
@@ -143,20 +113,14 @@ final class TranslatorRole {
 	private const SHOP_MANAGER_ROLE = 'shop_manager';
 
 	/**
-	 * Autoloaded per-site option recording the Shop Manager grant: `granted`,
-	 * the capabilities install_shop_manager_caps() added to the role, and,
-	 * between a deactivation and the next grant pass, `removed`, the recorded
-	 * capabilities the role no longer held when remove_roles() took the
-	 * others off. While the option exists the grant is never repeated.
+	 * Option recording the Shop Manager grant (`granted`, and `removed` after a deactivation).
 	 *
-	 * Autoloaded because install_shop_manager_caps() reads it on every
-	 * admin_init of a WooCommerce site. Kept on a preserve-mode uninstall,
-	 * deleted on a full one.
+	 * Autoloaded: read on every admin_init of a WooCommerce site. While it exists the grant is never repeated.
 	 */
 	private const SHOP_MANAGER_OPTION = 'perflocale_shop_manager_caps';
 
 	/**
-	 * Capabilities granted to Editors (in addition to Translator caps).
+	 * PerfLocale capabilities granted to Editors.
 	 */
 	private const EDITOR_CAPS = [
 		'perflocale_translate'            => true,
@@ -166,7 +130,7 @@ final class TranslatorRole {
 	];
 
 	/**
-	 * Capabilities granted to Administrators (all caps).
+	 * PerfLocale capabilities granted to Administrators (all of them).
 	 */
 	private const ADMIN_CAPS = [
 		'perflocale_translate'            => true,
@@ -186,92 +150,21 @@ final class TranslatorRole {
 	public function register_hooks(): void {
 		add_action( 'admin_init', [ $this, 'ensure_roles_exist' ] );
 
-		// The user-deletion hooks (delete_user, wpmu_delete_user,
-		// remove_user_from_blog) are wired in Bootstrap for every request
-		// context, because account plugins delete users from a front-end
-		// POST where this service is never booted. Hooking them here too
-		// would run each anonymisation twice in admin.
+		// The user-deletion hooks live in Bootstrap (front-end deletes skip this class): adding them here runs them twice.
 	}
 
 	/**
-	 * Anonymise background-job attribution on the site a user is removed
-	 * from. Delegates to {@see \PerfLocale\Bootstrap::anonymize_jobs_on_blog()},
-	 * which the `remove_user_from_blog` action calls directly.
+	 * Capability version: install_caps() reruns (idempotently) while `perflocale_caps_version` is lower.
 	 *
-	 * @param int $user_id User being removed from the blog.
-	 * @param int $blog_id Blog the user is being removed from.
-	 * @return void
-	 */
-	public function on_user_removed_from_blog( int $user_id, int $blog_id ): void {
-		\PerfLocale\Bootstrap::anonymize_jobs_on_blog( $user_id, $blog_id );
-	}
-
-	/**
-	 * Anonymise background-job attribution when a user is deleted.
-	 *
-	 * Mirrors the GDPR erasure flow on user delete: zeroes `created_by`
-	 * on the user's active jobs so job rows never point at a
-	 * since-deleted user.
-	 *
-	 * @param int $user_id Deleted user ID.
-	 * @return void
-	 */
-	public function on_user_deleted( int $user_id ): void {
-		\PerfLocale\Background\JobState::anonymize_for_user( $user_id );
-	}
-
-	/**
-	 * Current capability-schema version. Compared against the stored
-	 * `perflocale_caps_version` option; install_caps() runs whenever
-	 * the stored value is lower.
-	 *
-	 * Unlike PERFLOCALE_DB_VERSION, this is NOT a migration system -
-	 * there are no per-version cap migration methods. The install
-	 * routine is idempotent (the Translator role gets only the delta
-	 * between its filtered defaults and the ledger of what was last
-	 * granted; add_cap is a no-op when the cap already exists), so a
-	 * single "trigger" flag is enough.
-	 *
-	 * Bump this whenever CAPABILITIES, TRANSLATOR_BASE_CAPS,
-	 * TRANSLATOR_CAPS, EDITOR_CAPS, or ADMIN_CAPS change (never
-	 * TRANSLATOR_CAPS_V4). The next admin request on every existing install
-	 * will see `db_version < CAPS_VERSION` and re-run the install, picking
-	 * up the new cap set. Capabilities a site owner removed from or added to
-	 * the Translator role stay as the owner left them.
-	 *
-	 * v2: added `perflocale_manage_addons` consumption on the AdminController
-	 *     handlers + AddonsPage UI gates. Existing administrators need this
-	 *     cap re-applied or the per-card Save/Enable/Disable buttons stop
-	 *     working silently.
-	 * v3: added `perflocale_approve_translations` (Editor + Admin), the
-	 *     approve/reject capability of review workflows, so a dedicated
-	 *     reviewer role can be given approve rights without the broader
-	 *     `perflocale_manage_translations` cap.
+	 * Bump it when CAPABILITIES, TRANSLATOR_BASE_CAPS, TRANSLATOR_CAPS, EDITOR_CAPS or ADMIN_CAPS change.
 	 */
 	public const CAPS_VERSION = 4;
 
 	/**
 	 * Create the Translator role and add capabilities to existing roles.
 	 *
-	 * Idempotent: short-circuits when the stored caps version is already
-	 * current. Callable in two contexts:
-	 *
-	 *   - Activation: Activator::activate() calls this so a fresh install
-	 *     has the caps in place before any request is served. Required -
-	 *     without it, the very first /wp-admin redirect after activation
-	 *     hits a stale `WP_User->$allcaps` cache and 403s.
-	 *   - admin_init: covers plugin upgrades (new caps in a later
-	 *     version) and self-heals if a role-managing plugin wipes them.
-	 *
-	 * The Translator role is created when it is missing and otherwise
-	 * changed only by the delta described in {@see sync_translator_role()},
-	 * so capabilities a site owner removed from it, denied on it or added to
-	 * it survive a rebuild, and default grants the owner removed or denied
-	 * survive a deactivate/activate cycle.
-	 *
-	 * Multisite: caller is responsible for `switch_to_blog()` when running
-	 * across sites - see Activator::activate_for_network() and the
-	 * Bootstrap `wp_initialize_site` handler.
+	 * Activation calls it too: without that the first wp-admin redirect 403s on a stale allcaps cache.
+	 * Runs on the current site only; network callers switch blogs.
 	 *
 	 * @return void
 	 */
@@ -287,9 +180,7 @@ final class TranslatorRole {
 		/**
 		 * Filter the capabilities granted to the Editor role on plugin activation.
 		 *
-		 * Return an empty array to prevent the Editor role from receiving any
-		 * PerfLocale capabilities. Return a subset to grant only specific ones.
-		 * The Administrator role is not affected by this filter.
+		 * Return [] or a subset to grant fewer; Administrators are not affected.
 		 *
 		 * @hook perflocale/roles/editor_caps
 		 *
@@ -315,32 +206,14 @@ final class TranslatorRole {
 			}
 		}
 
-		// Autoloaded: the install_caps() guard reads this on every admin_init,
-		// so a non-autoloaded row costs one options SELECT per admin request
-		// on sites without a persistent object cache.
+		// Autoloaded: the guard above reads it on every admin_init.
 		update_option( 'perflocale_caps_version', self::CAPS_VERSION, true );
 	}
 
 	/**
-	 * Create the Translator role, or apply the plugin's own capability
-	 * changes to the existing one.
+	 * Create the Translator role, or apply only the plugin's own capability changes to it.
 	 *
-	 * Role missing (first install, or deleted by remove_roles() on
-	 * deactivation): created with the filtered defaults minus the ledger's
-	 * `removed` list, the grants the site owner had taken off before the role
-	 * was deleted, and with each default grant on the ledger's `denied` list
-	 * as an explicit deny, as the owner had set it.
-	 *
-	 * Role present: only the delta between the filtered defaults and the
-	 * ledger's `granted` map is applied. A default that is new, or whose
-	 * grant changed, is added; a `granted` entry that is no longer a default
-	 * (retired by the plugin, or dropped by the filter) is removed while the
-	 * role still grants it, and an explicit deny is left in place. Every
-	 * other capability on the role, removed or added by the site owner, is
-	 * left alone.
-	 *
-	 * The ledger then records the defaults as granted and empty `removed`
-	 * and `denied` lists.
+	 * Owner edits to the role survive: docs-ai/11-code-rationale.md, "TranslatorRole: capability ledger".
 	 *
 	 * @return void
 	 */
@@ -352,18 +225,14 @@ final class TranslatorRole {
 		if ( null === $role ) {
 			$caps = $defaults;
 
-			// Only a default grant can be subtracted: dropping an explicit
-			// `false` would lift a denial for users who also hold another role.
+			// Only a default grant is subtracted: dropping a `false` lifts a deny for users with another role.
 			foreach ( $ledger['removed'] as $cap ) {
 				if ( true === ( $caps[ $cap ] ?? null ) ) {
 					unset( $caps[ $cap ] );
 				}
 			}
 
-			// A denied default comes back as an explicit `false`, not as an
-			// absence: for a user who also holds another role that grants
-			// it, only the `false` keeps the capability denied. Only a
-			// default grant is turned into a deny.
+			// An explicit `false`, not an absence: only that denies it to a user whose other role grants it.
 			foreach ( $ledger['denied'] as $cap ) {
 				if ( true === ( $defaults[ $cap ] ?? null ) ) {
 					$caps[ $cap ] = false;
@@ -406,21 +275,11 @@ final class TranslatorRole {
 		/**
 		 * Filter the capabilities of the Translator role.
 		 *
-		 * Keys are capability names, values grant (true) or deny (false). A
-		 * capability added here is granted on the next rebuild, and one taken
-		 * out here is removed from the role on the next rebuild. Capabilities
-		 * a site owner removed from or added to the role by hand are kept.
-		 *
-		 * A rebuild runs when `perflocale_caps_version` is behind the plugin's
-		 * capability version: after a plugin update that changes capabilities,
-		 * after activation, or after that option is deleted.
+		 * Changes apply on the next rebuild (activation, or a capability version update); owner edits are kept.
 		 *
 		 * @hook perflocale/roles/translator_caps
 		 *
-		 * @param array<string, bool> $caps Map of capability => grant. Default: read, the edit
-		 *                                  capabilities for posts and pages (own, others' and
-		 *                                  published), upload_files, perflocale_translate and
-		 *                                  perflocale_use_mt.
+		 * @param array<string, bool> $caps Map of capability => grant. Default: TRANSLATOR_BASE_CAPS plus translate and use_mt.
 		 */
 		$caps = apply_filters( 'perflocale/roles/translator_caps', array_merge( self::TRANSLATOR_BASE_CAPS, self::TRANSLATOR_CAPS ) );
 
@@ -430,11 +289,7 @@ final class TranslatorRole {
 	/**
 	 * Read the Translator role's capability ledger.
 	 *
-	 * An absent or unreadable `granted` map reads as TRANSLATOR_CAPS_V4, the
-	 * capability set every install had before the ledger existed, so the
-	 * first rebuild on an existing site changes only what differs from it
-	 * (a changed default, or the filter). An absent or unreadable `removed`
-	 * or `denied` list reads as empty.
+	 * An unreadable `granted` map reads as TRANSLATOR_CAPS_V4, and an unreadable list as empty.
 	 *
 	 * @return array{granted: array<string, bool>, removed: array<int, string>, denied: array<int, string>}
 	 */
@@ -454,9 +309,7 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * Normalise a stored list of capability names: `sanitize_key()` values,
-	 * without duplicates. A value that is not a string, or that sanitises to
-	 * '', is dropped; anything other than an array reads as an empty list.
+	 * Normalise a stored list of capability names: unique `sanitize_key()` strings, others dropped.
 	 *
 	 * @param mixed $caps Candidate list of capability names.
 	 * @return array<int, string>
@@ -480,9 +333,7 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * Normalise a capability map from a filter or a stored option:
-	 * `sanitize_key()` keys, boolean values. Entries without a string key,
-	 * or whose key sanitises to '', are dropped.
+	 * Normalise a capability map: `sanitize_key()` string keys, boolean values, others dropped.
 	 *
 	 * @param mixed $caps Candidate map of capability => grant.
 	 * @return array<string, bool>
@@ -506,9 +357,7 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * Hook callback for admin_init. Thin wrapper around install_caps() that
-	 * keeps the existing public API intact for any callers that already
-	 * relied on the instance method.
+	 * Admin_init: install the role and capabilities, and the Shop Manager grant.
 	 *
 	 * @return void
 	 */
@@ -518,27 +367,9 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * Grant WooCommerce's Shop Manager role `perflocale_translate`, once per
-	 * site, so shop managers (who already edit every product) can create
-	 * product translations.
+	 * Grant WooCommerce's Shop Manager role `perflocale_translate`, once per site.
 	 *
-	 * Runs on admin_init and on activation. Does nothing unless WooCommerce is
-	 * loaded, its PerfLocale add-on is not disabled and the `shop_manager`
-	 * role exists, so a site that installs WooCommerce later gets the grant on
-	 * its next admin request.
-	 *
-	 * The first pass adds the filtered capabilities the role has no entry for
-	 * and records them in the SHOP_MANAGER_OPTION option; every later pass
-	 * returns at that record, so a capability the site owner removes is never
-	 * granted again. A pass after a deactivation restores the recorded
-	 * capabilities remove_roles() took off, except the ones the owner had
-	 * already removed. A capability the role already has an entry for, a
-	 * grant or an explicit deny, is never changed by either pass; one the
-	 * role held before the first pass is not recorded, so a deactivation
-	 * leaves it alone.
-	 *
-	 * After the first pass the cost is a class check and two autoloaded
-	 * option reads; without WooCommerce, a class check.
+	 * Once only, so an owner's removal sticks: docs-ai/11-code-rationale.md, "TranslatorRole: Shop Manager grant".
 	 *
 	 * @return void
 	 */
@@ -554,11 +385,9 @@ final class TranslatorRole {
 		}
 
 		/**
-		 * Filter the PerfLocale capabilities granted once to WooCommerce's Shop
-		 * Manager role.
+		 * Filter the PerfLocale capabilities granted once to WooCommerce's Shop Manager role.
 		 *
-		 * Return an empty array to grant nothing. The grant runs once per site;
-		 * to run it again, delete the `perflocale_shop_manager_caps` option.
+		 * Return [] to grant nothing; delete the `perflocale_shop_manager_caps` option to grant again.
 		 *
 		 * @hook perflocale/roles/shop_manager_caps
 		 *
@@ -575,8 +404,7 @@ final class TranslatorRole {
 		if ( false === $stored ) {
 			$added = [];
 
-			// An entry the role already has is the owner's: an explicit deny
-			// set before this pass stays a deny.
+			// An entry the role already has is the owner's: a deny stays a deny.
 			foreach ( $caps as $cap => $grant ) {
 				if ( ! array_key_exists( $cap, $role->capabilities ) ) {
 					$role->add_cap( $cap, $grant );
@@ -593,11 +421,8 @@ final class TranslatorRole {
 			return;
 		}
 
-		// The first pass after a deactivation: put back what remove_roles()
-		// took off. Only a capability the filter still grants, with the same
-		// value, is restored, so a stored record can never widen the role;
-		// and only where the role has no entry for it, so a deny the owner
-		// set while the plugin was inactive stays a deny.
+		// After a deactivation: restore only what the filter still grants with the same value (never widens the
+		// role), and only where the role has no entry (an owner's deny stays).
 		$granted = isset( $stored['granted'] ) && is_array( $stored['granted'] ) ? self::normalise_caps( $stored['granted'] ) : [];
 		$removed = is_array( $stored['removed'] ) ? array_filter( $stored['removed'], 'is_string' ) : [];
 
@@ -611,13 +436,9 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * Take the recorded Shop Manager grant off the role on deactivation, and
-	 * record which of those capabilities the role no longer held (removed by
-	 * the site owner) so the next grant pass leaves them out.
+	 * On deactivation, take the recorded Shop Manager grant off and note what the owner had already removed.
 	 *
-	 * Does nothing when nothing is recorded, when the record already carries
-	 * a `removed` list (a second deactivation before any grant pass), or when
-	 * the role is gone.
+	 * A record that already has `removed` (a second deactivation) is left as it is.
 	 *
 	 * @return void
 	 */
@@ -658,17 +479,7 @@ final class TranslatorRole {
 	/**
 	 * Remove all custom roles and capabilities on plugin deactivation.
 	 *
-	 * Before the Translator role is deleted, the default grants it no longer
-	 * holds are stored in the ledger: in `denied` when the role holds the
-	 * capability as an explicit deny, in `removed` when it has no entry for
-	 * it. The role install_caps() creates on the next activation denies the
-	 * first and leaves out the second, as the owner had them. A default the
-	 * ledger has not recorded as granted yet (added by the filter since the
-	 * last rebuild) is listed in neither. When the role is already gone, the
-	 * ledger is left as it is.
-	 *
-	 * The Shop Manager grant is taken off the same way (see
-	 * strip_shop_manager_caps()).
+	 * First records the owner's removed and denied defaults in the ledger, so reactivation restores them.
 	 *
 	 * @return void
 	 */
@@ -708,8 +519,7 @@ final class TranslatorRole {
 		/**
 		 * Filter which WordPress roles have PerfLocale capabilities removed on plugin deactivation.
 		 *
-		 * Remove a role slug from this array to preserve its PerfLocale capabilities
-		 * after deactivation - useful when re-activating frequently during development.
+		 * Remove a role slug from this array to keep its PerfLocale capabilities after deactivation.
 		 *
 		 * @hook perflocale/roles/cap_roles
 		 *
@@ -728,19 +538,13 @@ final class TranslatorRole {
 				$role->remove_cap( $cap );
 			}
 
-			// Retired capabilities too - otherwise a site that installed an
-			// older build keeps them on the role forever.
+			// Retired capabilities too, or they stay on the role forever.
 			foreach ( self::LEGACY_CAPABILITIES as $cap ) {
 				$role->remove_cap( $cap );
 			}
 		}
 
-		// Sweep user_meta for orphan `perflocale_*` capability entries left
-		// behind by direct add_cap() grants or by removing a role users were
-		// assigned to. Without this, the next deactivate/reactivate cycle
-		// inherits stale entries that bypass the canonical role+cap install
-		// path. Shared with SiteCleanup::strip_role_and_caps so the two
-		// codepaths can't drift.
+		// Orphan user-level PerfLocale capabilities; one sweep shared with SiteCleanup so the two cannot drift.
 		if ( class_exists( \PerfLocale\Database\SiteCleanup::class ) ) {
 			\PerfLocale\Database\SiteCleanup::sweep_orphan_user_caps();
 		}

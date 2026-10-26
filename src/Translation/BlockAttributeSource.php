@@ -14,25 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Resolves the value of each text attribute of a parsed block from the place
- * the block type stores it.
+ * Reads each text attribute of a parsed block from where its block type stores it.
  *
- * Core paragraph, heading, list-item, image, button and most other text blocks
- * keep their text in the saved HTML, not in the block comment: the block type's
- * attribute schema names a `source` (`rich-text`, `html`, `attribute`) and a CSS
- * `selector`. The editor reads each attribute from that element; this class
- * does the same on the server, so a caller gets the paragraph's inner HTML, the
- * image's `alt` and its `<figcaption>` as separate values instead of the whole
- * `<figure>…</figure>` markup.
- *
- * The attribute chain and the text-attribute rules mirror `textAttrChain()` and
- * `findTextAttrsInSchema()` in assets/js/block-toolbar.js, so the server and the
- * editor pick the same attributes for the same block.
- *
- * Used by the block-editor REST route only (never on a front-end request). No
- * dependency on ext-dom or on WP_HTML_Processor internals: one regex pass over
- * the block's own `innerHTML` (inner blocks are already cut out of it by the
- * block parser).
+ * Mirrors `textAttrChain()` and `findTextAttrsInSchema()` in assets/js/block-toolbar.js,
+ * so the server and the editor pick the same attributes. Block-editor REST route only.
  */
 final class BlockAttributeSource {
 
@@ -55,18 +40,15 @@ final class BlockAttributeSource {
 	/**
 	 * Attribute names that are user-visible text although their schema source
 	 * is an HTML attribute. Same list as `TRANSLATABLE_ATTR_NAMES` in
-	 * block-toolbar.js; every other `source: attribute` value (URLs, targets,
-	 * ids) is left alone.
+	 * block-toolbar.js.
 	 */
 	private const TEXT_ATTRIBUTE_NAMES = '/^(alt|title|placeholder|ariaLabel|aria-label|description|summary|tooltip)$/i';
 
 	/**
 	 * Per-block attribute chains. Same map as `per_block` in `textAttrChain()`.
 	 *
-	 * A quote keeps its text in inner paragraph blocks; its own text attribute
-	 * is `citation`. Its `value` attribute is never read or written: the
-	 * editor turns a non-empty `value` into paragraphs and replaces the
-	 * quote's inner blocks with them.
+	 * A quote's `value` is never read or written: the editor turns a non-empty
+	 * `value` into paragraphs that replace the quote's inner blocks.
 	 *
 	 * @var array<string, string[]>
 	 */
@@ -125,15 +107,12 @@ final class BlockAttributeSource {
 	/**
 	 * Read the text attributes of a parsed block.
 	 *
-	 * Sourced attributes (`rich-text`, `html`, `children`) are read from the
-	 * inner HTML of the first element matching the schema selector; `attribute`
-	 * sources from that element's decoded HTML attribute; comment attributes
-	 * from the block comment. A selector this reader cannot evaluate is
-	 * reported in `skipped`, never replaced by the block's whole HTML.
+	 * Sourced attributes come from the first element matching the schema selector,
+	 * comment attributes from the block comment. A selector this reader cannot
+	 * evaluate is reported in `skipped`, never replaced by the block's whole HTML.
 	 *
 	 * @param array<mixed> $block Parsed block (parse_blocks() shape).
-	 * @param array<mixed> $names Attribute names to read; empty = the block type's chain.
-	 *                            Anything that is not a valid attribute name is ignored.
+	 * @param array<mixed> $names Attribute names to read (invalid ones ignored); empty = the block type's chain.
 	 * @return array{values: array<string, string>, formats: array<string, string>, skipped: string[]}
 	 */
 	public static function read( array $block, array $names = [] ): array {
@@ -240,17 +219,19 @@ final class BlockAttributeSource {
 	/**
 	 * Text attributes of a block that live only in its block comment.
 	 *
-	 * The names of the block type's chain whose schema gives no `source` (so
-	 * the value is stored in the comment's attribute JSON, never in the saved
-	 * HTML) and whose value is a string with at least one letter. Used when a
-	 * whole post goes to machine translation with its block comments held
-	 * back: these values would otherwise not be translated.
+	 * Chain names with no schema `source` whose value has a letter. Whole-post
+	 * machine translation holds block comments back, so these would otherwise
+	 * stay untranslated. None for a "Do not translate" block: its text is not sent.
 	 *
 	 * @param string       $block_name Block name, e.g. `acme/card`.
 	 * @param array<mixed> $attrs      The block's decoded comment attributes.
 	 * @return string[]
 	 */
 	public static function comment_text_names( string $block_name, array $attrs ): array {
+		if ( ! empty( $attrs[ BlockSkipFilter::SKIP_ATTRIBUTE ] ) ) {
+			return [];
+		}
+
 		$schema = self::schema( $block_name );
 		$names  = [];
 

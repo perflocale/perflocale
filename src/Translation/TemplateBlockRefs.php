@@ -20,95 +20,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Points the Navigation blocks and synced patterns of a translated template or
- * template part at that language's translation of their menu or pattern, in
- * the stored template.
+ * Points the menu and pattern refs of stored translated templates at that language's translations.
  *
- * WHY THE STORED TEMPLATE AND NOT ONLY THE RENDER
- *
- * A translated part, such as "Header (de)", starts as a copy of the original,
- * so its Navigation block holds the original menu's id
- * (`<!-- wp:navigation {"ref":7} /-->`) and a synced pattern the original
- * pattern's (`<!-- wp:block {"ref":12} /-->`). On the front end
- * {@see \PerfLocale\Frontend\BlockRefTranslator} swaps those ids while the page
- * renders. The Site Editor loads the stored template, so a user who opens
- * "Header (de)" and edits the menu's labels or the pattern's text edits the
- * original, and every language that shows it.
- *
- * THE RULES (a "container" is a wp_template or wp_template_part translation; a
- * "reference" is the `ref` of a core/navigation or core/block block in it)
- *
- *   - A reference is rewritten only while it still names the source-language
- *     menu or pattern: one linked in the default language that the original
- *     container (its default-language member) names too, and whose translation
- *     in the container's language exists and can be opened in the editor
- *     (a menu published or draft, the two states core's Navigation block
- *     edits; a pattern published, draft or pending).
- *   - A reference the user changed is never touched: once the container names
- *     another menu or pattern than its original does, no rewrite reaches it.
- *     So is one the user switched back to the source: each write records,
- *     per block occurrence, what these rules put there (REWRITTEN_META), and
- *     an occurrence that names the source where its record says the rules
- *     wrote the translation is left as it is; the other occurrences of the
- *     container are still rewritten.
- *   - When a container translation is created or linked, its references to
- *     such menus and patterns are rewritten. When a menu or pattern
- *     translation is created, linked, or comes back from the trash, the
- *     references to its source in the containers of its language are
- *     rewritten.
- *   - When a menu or pattern translation is deleted or trashed, the references
- *     to it in the containers of its language go back to its source, so no
- *     container is left naming something that is gone. The occurrences that
- *     went back are recorded (FALLBACK_META); a restore points exactly those
- *     at the translation again, while they still name the source.
- *
- * Only the default-language container is a template's original; it is never
- * rewritten. A rewrite changes nothing a visitor sees: BlockRefTranslator
- * renders that language's menu or pattern when it is usable, from either
- * reference, and the source otherwise. So the write needs no cache flush.
- *
- * WHEN IT RUNS
- *
- * A create runs the rules at once (`perflocale/translation/created`), so the
- * request that made the translation answers with the containers already
- * pointing at it. Any other link of a post (an import, a language change, a
- * reset template linked back) is noted by
- * {@see \PerfLocale\Database\Repository\TranslationGroupRepository::link_object()}
- * and {@see PostTranslationManager::set_post_language()}, where the object is
- * known to be a post: one array entry. The noted posts are processed once, at
- * the end of the REST request or at shutdown (or early, after QUEUE_LIMIT
- * posts), with their post types read from the post cache or one query per
- * QUEUE_LIMIT posts. Links of terms and strings never reach this class. A
- * menu or pattern that changes language also has the references to it in the
- * containers of the language it left pointed back (at that language's own
- * member of the group, or the original). A JSON restore, which writes link
- * rows directly, runs the rules once at its end for the posts it linked
- * ({@see self::after_restore()}).
- *
- * HOW MUCH RUNS AT ONCE
- *
- * A container's own create or link rewrites that container. A menu or
- * pattern event (a translation created, linked, trashed, deleted, restored
- * or moved to another language) reaches every container of a language that
- * names it: the request that made the change rewrites the first SYNC_LIMIT
- * of them (in id order), so a site with a few templates and parts per
- * language sees them all pointing at the right menu or pattern when the
- * request answers. The rest goes to a background job
- * ({@see \PerfLocale\Background\Jobs\TemplateRefsFanoutJob}) that goes on
- * from the last container read, in keyset pages, and first checks that the
- * change still stands (a translation restored again is not pointed back).
- * Without a job (no user who may run it, as in WP-CLI without --user) the
- * request rewrites the rest itself, page by page.
- *
- * THE WRITE
- *
- * Only the number after `"ref":` in the block comment changes; every other
- * byte stays as stored. The row is updated with a compare-and-set on the
- * content the rewrite was computed from (re-read and retried when another
- * writer got there first), and its cache cleaned: wp_update_post() would run
- * the content through kses for a user without `unfiltered_html` and add a
- * revision for a change the user did not make. When a user is logged in, a
- * container that user cannot edit is skipped.
+ * The Site Editor edits the stored template, so a render-time swap alone would let
+ * "Header (de)" edit the original menu. A reference the user changed or switched back
+ * is never rewritten: see docs-ai/11-code-rationale.md, "TemplateBlockRefs: the rules".
  */
 final class TemplateBlockRefs {
 
@@ -148,28 +64,16 @@ final class TemplateBlockRefs {
 	private const QUEUE_LIMIT = 500;
 
 	/**
-	 * Post meta of a removed menu or pattern translation: its source and the
-	 * block occurrences its removal pointed back at that source,
-	 * `[ 'source' => id, 'containers' => [ container id => [ occurrence, ... ] ] ]`,
-	 * so that its restore points exactly those again, while they still name
-	 * the source ({@see self::on_removed()}, {@see self::on_restored()}). An
-	 * occurrence is the position of the block among the container's blocks of
-	 * that name that hold a `ref` ({@see self::occurrences()}). Every
-	 * container and occurrence the removal wrote is kept: the containers of
-	 * the language that named the translation bound the list.
+	 * Post meta of a removed menu or pattern translation: its source, the block
+	 * occurrences its removal pointed back per container, and `blocks`, which finds
+	 * them again after they moved. Its restore points exactly those again.
 	 */
 	public const FALLBACK_META = '_perflocale_ref_fallback';
 
 	/**
-	 * Post meta of a container translation: for each block occurrence these
-	 * rules wrote, block name => ( occurrence => [ the group's source-language
-	 * member, the id written ] ). An occurrence that names the source while
-	 * its record says the rules wrote another id there was switched back by
-	 * its user, and no rule rewrites it ({@see self::switched_back()}); nor
-	 * an occurrence without an entry that names a source another occurrence
-	 * was switched back to. An entry is matched to the content first
-	 * ({@see self::matched()}): blocks added or removed before it move it.
-	 * At most RECORD_LIMIT entries per block.
+	 * Post meta of a container translation: block name => ( occurrence => [ source
+	 * member, id written ] ) for each occurrence these rules wrote. An occurrence
+	 * naming the source where its entry says another id was written was switched back.
 	 */
 	public const REWRITTEN_META = '_perflocale_ref_rewritten';
 
@@ -190,14 +94,9 @@ final class TemplateBlockRefs {
 	private const PAGE = 50;
 
 	/**
-	 * The kinds of fan-out (a menu or pattern event, applied to the
-	 * containers of one language): `forward` points the references to a
-	 * source at its translation (only where the container's original names the
-	 * source too, and not an occurrence its user switched back); `back` points
-	 * the references to a removed translation at its source and records them
-	 * in FALLBACK_META; `left` points the references to a menu or pattern that
-	 * left the language at the language's own member or the source; `restore`
-	 * points the occurrences FALLBACK_META recorded at the translation again.
+	 * Kinds of fan-out over one language's containers: `forward` (source to its
+	 * translation), `back` (removed translation to its source, recorded), `left`
+	 * (to the language's own member or the source), `restore` (the recorded ones again).
 	 *
 	 * @var array<int, string>
 	 */
@@ -256,6 +155,22 @@ final class TemplateBlockRefs {
 	private static bool $flush_attached = false;
 
 	/**
+	 * Post types a save hook passed for posts about to be linked, by blog: post
+	 * id => post type. An entry goes when the post's cache is cleaned, since its
+	 * type may have changed.
+	 *
+	 * @var array<int, array<int, string>>
+	 */
+	private static array $known_types = [];
+
+	/**
+	 * Whether forget_known_type() is attached to `clean_post_cache`.
+	 *
+	 * @var bool
+	 */
+	private static bool $forget_attached = false;
+
+	/**
 	 * A translation was created: `perflocale/translation/created`.
 	 *
 	 * @param mixed $new_id      New translation's id.
@@ -284,6 +199,76 @@ final class TemplateBlockRefs {
 
 		// The create linked the post just before this ran: that note is done.
 		unset( self::$queue[ get_current_blog_id() ][ $post->ID ] );
+	}
+
+	/**
+	 * The type of a post that is about to be linked, from the post object a
+	 * save hook passed ({@see \PerfLocale\Bootstrap::auto_assign_default_language()}),
+	 * so the end-of-request rules do not read the post again to learn it.
+	 *
+	 * @param int    $post_id   Post id.
+	 * @param string $post_type Its type.
+	 * @return void
+	 */
+	public static function note_known_type( int $post_id, string $post_type ): void {
+		if ( $post_id <= 0 || '' === $post_type ) {
+			return;
+		}
+
+		$blog = get_current_blog_id();
+
+		if ( count( self::$known_types[ $blog ] ?? [] ) >= self::QUEUE_LIMIT ) {
+			self::$known_types[ $blog ] = [];
+		}
+
+		self::$known_types[ $blog ][ $post_id ] = $post_type;
+
+		if ( ! self::$forget_attached ) {
+			self::$forget_attached = true;
+			add_action( 'clean_post_cache', [ self::class, 'forget_known_type' ], 10, 1 );
+		}
+	}
+
+	/**
+	 * `clean_post_cache`: a post's cached row was dropped, so the type noted
+	 * for it may be stale; relevant_types() reads it again.
+	 *
+	 * @param mixed $post_id Post id.
+	 * @return void
+	 */
+	public static function forget_known_type( $post_id ): void {
+		if ( is_numeric( $post_id ) ) {
+			unset( self::$known_types[ get_current_blog_id() ][ (int) $post_id ] );
+		}
+	}
+
+	/**
+	 * A non-user write (machine translation, XLIFF import) replaced a template
+	 * translation's content: its rewrite record does not describe it, so it goes
+	 * and the forward rules run on the new content, as for a new translation.
+	 *
+	 * @param int $post_id Post id.
+	 * @return void
+	 */
+	public static function content_replaced( int $post_id ): void {
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof WP_Post || ! in_array( $post->post_type, self::CONTAINERS, true ) ) {
+			return;
+		}
+
+		if ( ! self::$system && is_user_logged_in() && ! current_user_can( 'edit_post', $post_id ) ) {
+			return;
+		}
+
+		delete_post_meta( $post_id, self::REWRITTEN_META );
+
+		$context = self::context();
+		$slug    = null === $context ? false : array_search( $post_id, $context['manager']->get_translations( $post_id ), true );
+
+		if ( is_string( $slug ) ) {
+			self::localise_container( $post, $slug );
+		}
 	}
 
 	/**
@@ -319,8 +304,7 @@ final class TemplateBlockRefs {
 	 * A post changed its language inside its translation group
 	 * ({@see PostTranslationManager::set_post_language()}).
 	 *
-	 * Noted like a link (the new language's containers follow at the end of
-	 * the request); a menu or pattern also has the references to it in the
+	 * Noted like a link; a menu or pattern also has the references to it in the
 	 * containers of the language it left pointed back.
 	 *
 	 * @param int $post_id          Post id.
@@ -336,19 +320,16 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * After a JSON restore ({@see \PerfLocale\Admin\DataImporter::import()})
-	 * wrote link rows directly: run the rules once for the posts it linked.
-	 *
-	 * The restored posts that are linked menus, patterns, templates or parts
-	 * are found with one query per QUEUE_LIMIT restored ids, among those ids
-	 * only.
+	 * Of some restored post ids, the linked menus, patterns, templates and parts:
+	 * one query per QUEUE_LIMIT ids. A paged restore merges the pages and calls
+	 * process_restored() once.
 	 *
 	 * @param array<int, int> $post_ids Post ids the restore linked.
-	 * @return void
+	 * @return array<int, string> Post id => post type.
 	 */
-	public static function after_restore( array $post_ids ): void {
+	public static function restored_types( array $post_ids ): array {
 		if ( [] === $post_ids ) {
-			return;
+			return [];
 		}
 
 		$wanted = array_merge( array_keys( self::TARGETS ), self::CONTAINERS );
@@ -379,6 +360,18 @@ final class TemplateBlockRefs {
 			}
 		}
 
+		return $types;
+	}
+
+	/**
+	 * Run the rules once for restored posts of known type
+	 * ({@see self::restored_types()}). A failure leaves the references as
+	 * they were, which the Site Editor notice shows.
+	 *
+	 * @param array<int, string> $types Post id => post type.
+	 * @return void
+	 */
+	public static function process_restored( array $types ): void {
 		if ( [] === $types ) {
 			return;
 		}
@@ -386,8 +379,7 @@ final class TemplateBlockRefs {
 		try {
 			self::process_types( $types );
 		} catch ( \Throwable $e ) {
-			// The restore itself is written; a failure here leaves the
-			// references as they were, which the Site Editor notice shows.
+			// The restore itself is written.
 			unset( $e );
 		}
 	}
@@ -414,8 +406,11 @@ final class TemplateBlockRefs {
 	public static function flush(): void {
 		$queues      = self::$queue;
 		$lefts       = self::$left;
+		$known       = self::$known_types;
 		self::$queue = [];
 		self::$left  = [];
+
+		self::$known_types = [];
 
 		foreach ( array_unique( array_merge( array_keys( $queues ), array_keys( $lefts ) ) ) as $blog ) {
 			$ids  = array_keys( $queues[ $blog ] ?? [] );
@@ -433,7 +428,7 @@ final class TemplateBlockRefs {
 
 			try {
 				self::process_left( $left );
-				self::process_links( $ids );
+				self::process_links( $ids, $known[ $blog ] ?? [] );
 			} catch ( \Throwable $e ) {
 				// The links themselves are written; a failure here leaves the
 				// references as they were, which the Site Editor notice shows.
@@ -447,12 +442,9 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * The container translations the upgrade backfill reads, after one id:
-	 * templates and template parts linked in a language other than the
-	 * default, not trashed, whose content holds a `ref`, in id order (keyset
-	 * paging). Null when they could not be read (the services or the default
-	 * language missing, a database error): "could not read" is never "nothing
-	 * to read".
+	 * The container translations the upgrade backfill reads after one id, in id
+	 * order: non-default, not trashed, content holding a `ref`. Null when they
+	 * could not be read: "could not read" is never "nothing to read".
 	 *
 	 * @param int $after Last id read, 0 to start.
 	 * @param int $limit Rows to read.
@@ -501,32 +493,17 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * One page of the upgrade backfill: the rules a container translation's
-	 * create runs ({@see self::localise_container()}), run for container
-	 * translations written before those rules existed. Each container's
-	 * references to a source-language menu or pattern that its original
-	 * names too are pointed at that menu's or pattern's translation in the
-	 * container's language, when it exists and the editor opens it; a
-	 * reference the user changed is kept; every write is a compare-and-set.
-	 * The rules apply to every container, whoever the current user is: a
-	 * rewrite only points a reference at the same group's member in the
-	 * container's own language, which is what the page already renders.
+	 * One page of the upgrade backfill: localise_container() for existing container translations.
 	 *
-	 * The page's containers, their groups, their originals and the menus and
-	 * patterns they name (with their groups and translations) are read in one
-	 * batch per kind before the first container, and each container's
-	 * compare-and-set starts from the content read there.
+	 * Runs for every container whoever the current user is: a rewrite only points a
+	 * reference at the same group's member in the container's language, which the
+	 * page already renders.
 	 *
 	 * @param int        $after Last container id read, 0 to start.
 	 * @param int        $limit Containers per page.
-	 * @param float|null $until A microtime( true ) deadline, checked after each container: the page stops at
-	 *                          the first container that ends past it (next is that container). Null: none.
+	 * @param float|null $until A microtime( true ) deadline, checked after each container; null: none.
 	 * @return array{next: int, read: int, updated: int, references: int, error: bool, failed: int, cause: string} next
-	 *         is 0 after the last page; error is true when the page could not be read (next is $after)
-	 *         or a container's write failed (failed is its id, cause 'database' when the database did
-	 *         not accept a read or the change, 'conflict' when every compare-and-set attempt lost to a
-	 *         concurrent edit; next the last container before it, and read and updated count the
-	 *         containers before it).
+	 *         is 0 after the last page; on a failed write, failed is its id and cause 'database' or 'conflict'.
 	 */
 	public static function backfill_page( int $after, int $limit, ?float $until = null ): array {
 		$rows    = self::backfill_rows( $after, max( 1, $limit ) );
@@ -547,9 +524,7 @@ final class TemplateBlockRefs {
 			];
 		}
 
-		// The rules read each container's record of what they wrote, its
-		// group and original, and the menus and patterns it names: one batch
-		// read per kind for the page instead of reads per container.
+		// One batch read per kind for the page instead of reads per container.
 		self::prime_page( array_keys( $rows ), $context );
 
 		$read    = 0;
@@ -619,9 +594,7 @@ final class TemplateBlockRefs {
 
 	/**
 	 * Read what the rules read for a page of containers, one batch per kind:
-	 * the container posts and their meta, their groups, their originals, and
-	 * the menus and patterns they name with those posts' groups and their
-	 * translations' posts.
+	 * posts, meta, groups, originals, and the menus and patterns they name.
 	 *
 	 * @param array<int, int>                                                                        $ids     Container ids.
 	 * @param array{manager: PostTranslationManager, languages: LanguageRepository, default: string} $context Services.
@@ -682,11 +655,12 @@ final class TemplateBlockRefs {
 	/**
 	 * Run the rules for the groups of some linked posts.
 	 *
-	 * @param array<int, int> $ids Linked post ids.
+	 * @param array<int, int>    $ids   Linked post ids.
+	 * @param array<int, string> $known Post id => type a save hook passed ({@see self::note_known_type()}).
 	 * @return void
 	 */
-	private static function process_links( array $ids ): void {
-		$types = self::relevant_types( $ids );
+	private static function process_links( array $ids, array $known = [] ): void {
+		$types = self::relevant_types( $ids, $known );
 
 		if ( [] !== $types ) {
 			self::process_types( $types );
@@ -731,10 +705,8 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * Point the references to menus and patterns that left a language back:
-	 * in the containers of that language, at that language's own member of
-	 * the group when it has one the editor opens, otherwise at the group's
-	 * default-language member.
+	 * Point the references to menus and patterns that left a language back, in
+	 * that language's containers ({@see self::left_target()}).
 	 *
 	 * @param array<int, int> $left Post id => the language id it left.
 	 * @return void
@@ -795,18 +767,28 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * Post type of each id that is a referenced or container type. Posts in
-	 * the cache are read there; the rest in one query per QUEUE_LIMIT ids.
+	 * Post type of each id that is a referenced or container type. A type a
+	 * save hook passed is used as it is; posts in the cache are read there;
+	 * the rest in one query per QUEUE_LIMIT ids.
 	 *
-	 * @param array<int, int> $ids Post ids.
+	 * @param array<int, int>    $ids   Post ids.
+	 * @param array<int, string> $known Post id => type a save hook passed.
 	 * @return array<int, string> Post id => post type.
 	 */
-	private static function relevant_types( array $ids ): array {
+	private static function relevant_types( array $ids, array $known = [] ): array {
 		$wanted  = array_merge( array_keys( self::TARGETS ), self::CONTAINERS );
 		$types   = [];
 		$missing = [];
 
 		foreach ( $ids as $id ) {
+			if ( isset( $known[ $id ] ) ) {
+				if ( in_array( $known[ $id ], $wanted, true ) ) {
+					$types[ $id ] = $known[ $id ];
+				}
+
+				continue;
+			}
+
 			$cached = wp_cache_get( $id, 'posts' );
 
 			if ( is_object( $cached ) && isset( $cached->post_type ) && is_string( $cached->post_type ) ) {
@@ -877,25 +859,30 @@ final class TemplateBlockRefs {
 
 	/**
 	 * Remember which occurrences a removal pointed back, those a user chose
-	 * included: a restore points exactly those at the translation again.
-	 * Merged into the translation's FALLBACK_META while it records the same
-	 * source; nothing is written for a translation that is gone.
+	 * included, merged into FALLBACK_META while it records the same source.
 	 *
-	 * @param int                         $translation The removed menu or pattern translation.
-	 * @param int                         $source      The source the occurrences point at now.
-	 * @param array<int, array<int, int>> $written     Container id => the occurrences pointed back.
+	 * @param int                                                       $translation The removed menu or pattern translation.
+	 * @param int                                                       $source      The source the occurrences point at now.
+	 * @param array<int, array<int, int>>                               $written     Container id => the occurrences pointed back.
+	 * @param array<int, array{sum: string, fp: array<int, string>}> $identity    Container id => its block identity as written.
 	 * @return void
 	 */
-	private static function record_fallback( int $translation, int $source, array $written ): void {
+	private static function record_fallback( int $translation, int $source, array $written, array $identity = [] ): void {
 		if ( [] === $written || ! get_post( $translation ) instanceof WP_Post ) {
 			return;
 		}
 
 		$recorded = self::fallback_record( $translation );
-		$merged   = $recorded['source'] === $source ? $recorded['containers'] : [];
+		$same     = $recorded['source'] === $source;
+		$merged   = $same ? $recorded['containers'] : [];
+		$blocks   = $same ? $recorded['blocks'] : [];
 
 		foreach ( $written as $container => $at ) {
 			$merged[ $container ] = array_values( array_unique( array_merge( $merged[ $container ] ?? [], $at ) ) );
+
+			if ( isset( $identity[ $container ] ) ) {
+				$blocks[ $container ] = $identity[ $container ];
+			}
 		}
 
 		update_post_meta(
@@ -904,6 +891,7 @@ final class TemplateBlockRefs {
 			[
 				'source'     => $source,
 				'containers' => $merged,
+				'blocks'     => $blocks,
 			]
 		);
 	}
@@ -913,13 +901,14 @@ final class TemplateBlockRefs {
 	 * none) and container id => the occurrences pointed back.
 	 *
 	 * @param int $post_id Menu or pattern translation.
-	 * @return array{source: int, containers: array<int, array<int, int>>}
+	 * @return array{source: int, containers: array<int, array<int, int>>, blocks: array<int, array{sum: string, fp: array<int, string>}>}
 	 */
 	private static function fallback_record( int $post_id ): array {
 		$stored = get_post_meta( $post_id, self::FALLBACK_META, true );
 		$out    = [
 			'source'     => 0,
 			'containers' => [],
+			'blocks'     => [],
 		];
 
 		if ( ! is_array( $stored ) ) {
@@ -934,17 +923,31 @@ final class TemplateBlockRefs {
 			}
 		}
 
+		foreach ( is_array( $stored['blocks'] ?? null ) ? $stored['blocks'] : [] as $container => $identity ) {
+			if ( ! is_int( $container ) || ! is_array( $identity ) || ! is_string( $identity['sum'] ?? null ) || ! is_array( $identity['fp'] ?? null ) ) {
+				continue;
+			}
+
+			$fp = [];
+
+			foreach ( $identity['fp'] as $occurrence => $value ) {
+				if ( is_int( $occurrence ) && is_string( $value ) ) {
+					$fp[ $occurrence ] = $value;
+				}
+			}
+
+			$out['blocks'][ $container ] = [
+				'sum' => $identity['sum'],
+				'fp'  => $fp,
+			];
+		}
+
 		return $out;
 	}
 
 	/**
-	 * A post came back from the trash (`untrashed_post`): the containers of
-	 * its language whose original names its source point at it again, and so
-	 * do the occurrences its removal pointed back (a reference a user chose
-	 * among them), while they still name the source and their container is
-	 * still a container of its language. The record is taken container by
-	 * container as they are written; it is gone once every recorded container
-	 * was done.
+	 * A post came back from the trash (`untrashed_post`): forward rules, then the
+	 * occurrences its removal pointed back, while they still name the source.
 	 *
 	 * @param mixed $post_id Post id.
 	 * @return void
@@ -1052,12 +1055,9 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * Apply a menu or pattern event to the containers of one language: the
-	 * first SYNC_LIMIT now, the rest in a TemplateRefsFanoutJob that goes on
-	 * after the last one read. A page that could not be read, or a container
-	 * whose write failed, goes to the job too (from that container), so it
-	 * is tried again. Without a job (no user who may run it, or the queue
-	 * refused it), this request goes on with the rest itself.
+	 * Apply a menu or pattern event to the containers of one language: the first
+	 * SYNC_LIMIT now, the rest (and any failed page) in a TemplateRefsFanoutJob, or
+	 * in this request when no job can be queued.
 	 *
 	 * @param string $kind        One of KINDS.
 	 * @param int    $language_id Language of the containers.
@@ -1152,22 +1152,16 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * One page of a queued fan-out ({@see \PerfLocale\Background\Jobs\TemplateRefsFanoutJob}),
-	 * after a check that the event still stands: a forward or restore target
-	 * that is still that source's translation in the language and opens in
-	 * the editor, a removed translation still in the trash or gone, a menu or
-	 * pattern still out of the language it left (its references then point
-	 * where they would now). An event that no longer stands is done: nothing
-	 * is written, and the containers not reached keep naming what they name.
-	 * Without a default language that check cannot be made: the page is an
-	 * error with cause 'language' (a removal's way back needs none).
+	 * One page of a queued fan-out, after a check that its event still stands
+	 * (self::standing_task()); an event that does not is done with nothing written.
+	 * Without a default language the page is an error with cause 'language'.
 	 *
 	 * @param array{kind: string, language: int, type: string, from: int, to: int} $task  The fan-out.
 	 * @param int                                                                  $after Last container done, 0 to start.
 	 * @param int                                                                  $limit Containers per page.
 	 * @param float|null                                                           $until A microtime( true ) deadline, checked after each container. Null: none.
 	 * @return array{next: int, read: int, updated: int, references: int, error: bool, failed: int, cause: string, stands: bool}
-	 *         As {@see self::fan_out_page()}; stands is false when the event no longer stands (next is 0).
+	 *         As {@see self::fan_out_page()}; stands is false when the event does not stand (next is 0).
 	 */
 	public static function fan_out_job_page( array $task, int $after, int $limit, ?float $until = null ): array {
 		if ( 'back' !== $task['kind'] && null === self::context() ) {
@@ -1202,8 +1196,9 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * A queued fan-out as it applies now, or null when its event no longer
-	 * stands ({@see self::fan_out_job_page()}).
+	 * A queued fan-out as it applies now, or null when its event does not stand:
+	 * the target is not that source's openable translation, the removed one is back,
+	 * or the menu or pattern returned to the language it left.
 	 *
 	 * @param array{kind: string, language: int, type: string, from: int, to: int} $task The fan-out.
 	 * @return array{kind: string, language: int, type: string, from: int, to: int}|null
@@ -1246,25 +1241,17 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * One page of a fan-out: the containers after one id, in id order, read
-	 * in one batch per kind (the posts, their meta, and for a forward
-	 * rewrite their groups and originals), then each rewritten with a
-	 * compare-and-set that starts from the content read. A `restore` takes
-	 * the first containers of the translation's FALLBACK_META instead (the
-	 * record is the queue: each container done leaves it, and the record is
-	 * deleted once empty; $after is not used), only those still a container
-	 * of the language.
+	 * One page of a fan-out: the containers after one id, in id order, each rewritten by compare-and-set.
+	 *
+	 * A `restore` reads the translation's FALLBACK_META instead, which is its queue:
+	 * each container done leaves it, and $after is not used.
 	 *
 	 * @param array{kind: string, language: int, type: string, from: int, to: int} $task  The fan-out.
 	 * @param int                                                                  $after Last container done, 0 to start.
 	 * @param int                                                                  $limit Containers per page.
 	 * @param float|null                                                           $until A microtime( true ) deadline, checked after each container. Null: none.
 	 * @return array{next: int, read: int, updated: int, references: int, error: bool, failed: int, cause: string}
-	 *         next is 0 after the last page, otherwise the last container done; error is true when the
-	 *         page could not be read (failed 0, next $after, cause 'database' when a read failed,
-	 *         'language' when a forward rewrite finds no default language) or a container's write failed
-	 *         (failed is its id, cause 'database' or 'conflict' as in {@see self::backfill_page()}; next the
-	 *         last container done before it).
+	 *         next is 0 after the last page; cause 'database', 'conflict' or 'language' on an error.
 	 */
 	private static function fan_out_page( array $task, int $after, int $limit, ?float $until = null ): array {
 		$out = [
@@ -1306,9 +1293,8 @@ final class TemplateBlockRefs {
 			return $out;
 		}
 
-		// A recorded container is replayed only while it is still a container
-		// of the language (never an original, never one that moved to another
-		// language): the others leave the record unwritten.
+		// A recorded container is replayed only while it is still a container of
+		// the language (never an original, never one that moved language).
 		$live = null === $record ? null : self::containers_page( $task['language'], $from, 0, max( 1, count( $ids ) ), $ids );
 
 		if ( null !== $record && null === $live ) {
@@ -1322,11 +1308,12 @@ final class TemplateBlockRefs {
 
 		self::prime_containers( $ids, $forward ? $context : null );
 
-		$before  = self::$rewritten;
-		$last    = $after;
-		$done    = [];
-		$written = [];
-		$stopped = false;
+		$before   = self::$rewritten;
+		$last     = $after;
+		$done     = [];
+		$written  = [];
+		$identity = [];
+		$stopped  = false;
 
 		foreach ( $ids as $id ) {
 			$post    = get_post( $id );
@@ -1334,7 +1321,7 @@ final class TemplateBlockRefs {
 			$allow   = null;
 
 			if ( null !== $record ) {
-				$at    = array_flip( $record['containers'][ $id ] ?? [] );
+				$at    = self::restore_allowed( $record, $id, (string) $content, $block );
 				$allow = static fn( string $name, int $occurrence ): bool => isset( $at[ $occurrence ] );
 			} elseif ( $forward ) {
 				$allow = self::not_switched_back( $id, (string) $content );
@@ -1345,7 +1332,8 @@ final class TemplateBlockRefs {
 				|| ( $forward && ! in_array( $from, self::block_refs( self::original_content( $id, $context ), $block ), true ) );
 
 			$changed = [];
-			$result  = $skip ? false : self::write_container( $id, [ $block => [ $from => $to ] ], $allow, $changed, $content );
+			$stored  = '';
+			$result  = $skip ? false : self::write_container( $id, [ $block => [ $from => $to ] ], $allow, $changed, $content, $stored );
 
 			if ( null === $result ) {
 				$out['failed'] = $id;
@@ -1356,6 +1344,10 @@ final class TemplateBlockRefs {
 			if ( true === $result ) {
 				++$out['updated'];
 				$written[ $id ] = $changed[ $block ] ?? [];
+
+				if ( 'back' === $task['kind'] ) {
+					$identity[ $id ] = self::block_identity( $stored, $block, $written[ $id ] );
+				}
 			}
 
 			++$out['read'];
@@ -1371,7 +1363,7 @@ final class TemplateBlockRefs {
 		$out['references'] = self::$rewritten - $before;
 
 		if ( 'back' === $task['kind'] ) {
-			self::record_fallback( $from, $to, $written );
+			self::record_fallback( $from, $to, $written, $identity );
 		}
 
 		if ( null !== $record ) {
@@ -1390,9 +1382,8 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * Drop the containers a restore did from a translation's FALLBACK_META,
-	 * read again first (a removal may have added to it meanwhile); the meta is
-	 * deleted once no container is left.
+	 * Drop the containers a restore did from a translation's FALLBACK_META, read
+	 * again first since a removal may have added to it; deleted once empty.
 	 *
 	 * @param int             $translation The restored menu or pattern translation.
 	 * @param array<int, int> $done        Containers done.
@@ -1418,6 +1409,7 @@ final class TemplateBlockRefs {
 				[
 					'source'     => $recorded['source'],
 					'containers' => $recorded['containers'],
+					'blocks'     => $recorded['blocks'],
 				]
 			);
 		}
@@ -1426,9 +1418,8 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * Read what a page of a fan-out reads, one batch per kind: the container
-	 * posts and their meta (the record of what the rules wrote), and for a
-	 * forward rewrite their groups and their originals.
+	 * Read what a page of a fan-out reads, one batch per kind: posts and meta,
+	 * and for a forward rewrite their groups and originals.
 	 *
 	 * @param array<int, int>                                                                             $ids     Container ids.
 	 * @param array{manager: PostTranslationManager, languages: LanguageRepository, default: string}|null $context Services, for a forward rewrite; null otherwise.
@@ -1489,10 +1480,8 @@ final class TemplateBlockRefs {
 			return [];
 		}
 
-		// The two LIKEs narrow the rows read to content holding a `ref` and
-		// the id's digits, in any form the block parser reads (`"ref":7`,
-		// `"ref": 7`, `"ref":"7"`); the rewrite matches the number exactly,
-		// so `"ref":7` never rewrites `"ref":70`.
+		// The LIKEs only narrow the rows (any `"ref"` form the parser reads); the
+		// rewrite matches the number exactly, so `"ref":7` never rewrites `"ref":70`.
 		$args = [ $wpdb->posts, $wpdb->prefix . 'perflocale_translation_links', $language_id, $after, self::CONTAINERS[0], self::CONTAINERS[1], '%' . $wpdb->esc_like( '"ref"' ) . '%', '%' . $wpdb->esc_like( (string) $ref ) . '%' ];
 
 		if ( null === $among ) {
@@ -1514,25 +1503,19 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * Store a container's content with its references mapped, compare-and-set
-	 * on the content the rewrite was computed from.
+	 * Store a container's content with its references mapped, compare-and-set on
+	 * the content the rewrite was computed from. Not wp_update_post(): it would run
+	 * kses for a user without `unfiltered_html` and add a revision the user did not make.
 	 *
 	 * @param int                                     $id      Container id.
 	 * @param array<string, array<int, int>>          $maps    Block name => ( post id => post id ).
-	 * @param (callable(string, int, int): bool)|null $allow   Whether an occurrence (block name,
-	 *                                                         occurrence, the id it names) may be
-	 *                                                         rewritten; null: every one.
+	 * @param (callable(string, int, int): bool)|null $allow   Whether an occurrence (block name, occurrence, id) may be rewritten; null: all.
 	 * @param array<string, array<int, int>>          $changed Set to block name => the occurrences the write changed.
-	 * @param string|null                             $known   The container's content as the caller just read it:
-	 *                                                         the first compare-and-set starts from it, and the row
-	 *                                                         is read again only after a lost comparison. Null: read
-	 *                                                         it first.
-	 * @return bool|null True when the row was written, false when there was
-	 *                   nothing to write, null when a read or the write failed
-	 *                   or every compare-and-set attempt lost to another writer
-	 *                   (self::$write_failure says which).
+	 * @param string|null                             $known   Content the caller just read, the first comparison's base; null: read it.
+	 * @param string                                  $stored  Set to the content written.
+	 * @return bool|null Written, false when nothing to write, null on a failure (self::$write_failure says which).
 	 */
-	private static function write_container( int $id, array $maps, ?callable $allow = null, array &$changed = [], ?string $known = null ): ?bool {
+	private static function write_container( int $id, array $maps, ?callable $allow = null, array &$changed = [], ?string $known = null, string &$stored = '' ): ?bool {
 		$changed             = [];
 		self::$write_failure = '';
 
@@ -1583,6 +1566,7 @@ final class TemplateBlockRefs {
 			$rows = $wpdb->query( $sql );
 
 			if ( 1 === $rows ) {
+				$stored           = $rewritten;
 				self::$rewritten += self::changed_refs( $current, $rewritten );
 				// The record first, while the post and its meta are still cached.
 				$changed = self::record_rewrite( $id, $current, $rewritten );
@@ -1602,11 +1586,9 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * The forward rewrites' filter for one container: an occurrence its user
-	 * switched back to the source is not rewritten ({@see self::switched_back()}),
-	 * nor an occurrence without an entry that names a source another
-	 * occurrence was switched back to (a block its user added). The record is
-	 * matched to the content first ({@see self::matched()}).
+	 * The forward rewrites' filter for one container: skips an occurrence its user
+	 * switched back, and one without an entry naming a source another occurrence
+	 * was switched back to (a block its user added).
 	 *
 	 * @param int    $container Container id.
 	 * @param string $content   Its content, as the rewrite reads it.
@@ -1633,12 +1615,9 @@ final class TemplateBlockRefs {
 	}
 
 	/**
-	 * The entries of one block name matched to the content: an entry whose
-	 * occurrence names neither of its ids moves to the first occurrence
-	 * without an entry that names one of them (blocks added or removed
-	 * before it moved it), and is dropped when there is none. An entry on
-	 * an occurrence naming the id it wrote moves to an occurrence without an
-	 * entry that names its source, when there is one.
+	 * The entries of one block name matched to the content, since blocks added or
+	 * removed before an occurrence shift its position: see
+	 * docs-ai/11-code-rationale.md, "TemplateBlockRefs: rewrite and fallback records".
 	 *
 	 * @param array<int, array{0: int, 1: int}> $entries Occurrence => [ source, written ].
 	 * @param array<int, int>                   $names   Occurrence => the id it names.
@@ -1667,10 +1646,8 @@ final class TemplateBlockRefs {
 			}
 		}
 
-		// An entry on an occurrence naming the id it wrote, while an
-		// occurrence without an entry names its source: the editor may have
-		// switched that block back and added one naming the written id. The
-		// entry moves to the source occurrence, so that one is not rewritten.
+		// The user may have switched a block back and added one naming the written
+		// id: the entry moves to the occurrence naming the source.
 		foreach ( $kept as $occurrence => $entry ) {
 			if ( $entry[0] === $entry[1] || ( $names[ $occurrence ] ?? 0 ) !== $entry[1] ) {
 				continue;
@@ -1733,8 +1710,8 @@ final class TemplateBlockRefs {
 
 	/**
 	 * Note what a write put in each occurrence it changed: [ the group's
-	 * source-language member, the id written ]. An entry whose occurrence
-	 * names neither any more is dropped.
+	 * source-language member, the id written ]. An entry whose occurrence names
+	 * neither is dropped.
 	 *
 	 * @param int    $id     Container id.
 	 * @param string $before The content the write replaced.
@@ -1821,6 +1798,125 @@ final class TemplateBlockRefs {
 	}
 
 	/**
+	 * What finds a container's pointed-back blocks again: the md5 of its content
+	 * with reference numbers masked, and per occurrence the md5 of the block's
+	 * attributes, '' when another block of that name has the same.
+	 *
+	 * @param string          $content     Container content as written.
+	 * @param string          $block       Block name without namespace.
+	 * @param array<int, int> $occurrences Occurrences pointed back.
+	 * @return array{sum: string, fp: array<int, string>}
+	 */
+	private static function block_identity( string $content, string $block, array $occurrences ): array {
+		$fps    = self::fingerprints( $content, $block );
+		$counts = array_count_values( $fps );
+		$out    = [];
+
+		foreach ( $occurrences as $occurrence ) {
+			$fp                 = $fps[ $occurrence ] ?? '';
+			$out[ $occurrence ] = '' !== $fp && 1 === $counts[ $fp ] ? $fp : '';
+		}
+
+		return [
+			'sum' => self::masked_sum( $content ),
+			'fp'  => $out,
+		];
+	}
+
+	/**
+	 * The occurrences a restore may point at the translation again: the recorded
+	 * ones while the content is as the removal left it (reference numbers aside),
+	 * else each recorded block that exactly one block matches by attributes.
+	 *
+	 * @param array{source?: int, containers: array<int, array<int, int>>, blocks?: array<int, array{sum: string, fp: array<int, string>}>} $record The translation's FALLBACK_META, read.
+	 * @param int                                                                                                               $container Container id.
+	 * @param string                                                                                                            $content   Its content now.
+	 * @param string                                                                                                            $block     Block name without namespace.
+	 * @return array<int, true>
+	 */
+	private static function restore_allowed( array $record, int $container, string $content, string $block ): array {
+		$at       = $record['containers'][ $container ] ?? [];
+		$identity = $record['blocks'][ $container ] ?? null;
+
+		// A record without an identity: by position, only while exactly the recorded blocks name the source.
+		if ( null === $identity ) {
+			$naming = array_keys( self::occurrences( $content, $block ), $record['source'] ?? 0, true );
+			$want   = array_values( array_unique( $at ) );
+			sort( $want );
+
+			return $want === $naming ? array_fill_keys( $want, true ) : [];
+		}
+
+		if ( $identity['sum'] === self::masked_sum( $content ) ) {
+			return array_fill_keys( $at, true );
+		}
+
+		$now     = self::fingerprints( $content, $block );
+		$allowed = [];
+
+		foreach ( $at as $occurrence ) {
+			$fp    = $identity['fp'][ $occurrence ] ?? '';
+			$found = '' === $fp ? [] : array_keys( $now, $fp, true );
+
+			if ( 1 === count( $found ) ) {
+				$allowed[ $found[0] ] = true;
+			}
+		}
+
+		return $allowed;
+	}
+
+	/**
+	 * Block markup's md5 with the `ref` number of every menu and pattern block masked.
+	 *
+	 * @param string $content Block markup.
+	 * @return string
+	 */
+	private static function masked_sum( string $content ): string {
+		$masked = preg_replace_callback(
+			self::DELIMITER,
+			static function ( array $token ): string {
+				foreach ( self::TARGETS as $block ) {
+					if ( self::token_ref( $token, $block ) > 0 ) {
+						return (string) preg_replace( '/("ref"\s*:\s*)"?[0-9]+"?/', '${1}0', $token[0] );
+					}
+				}
+
+				return $token[0];
+			},
+			$content
+		);
+
+		return md5( is_string( $masked ) ? $masked : $content );
+	}
+
+	/**
+	 * Per occurrence of one block name, the md5 of its attributes (a pointed-back
+	 * block names the source both when recorded and when restored).
+	 *
+	 * @param string $content Block markup.
+	 * @param string $block   Block name without namespace.
+	 * @return array<int, string>
+	 */
+	private static function fingerprints( string $content, string $block ): array {
+		$out = [];
+
+		if ( ! str_contains( $content, '"ref"' ) || ! preg_match_all( self::DELIMITER, $content, $matches, PREG_SET_ORDER ) ) {
+			return $out;
+		}
+
+		foreach ( $matches as $token ) {
+			if ( self::token_ref( $token, $block ) <= 0 ) {
+				continue;
+			}
+
+			$out[] = md5( (string) wp_json_encode( json_decode( (string) ( $token['attrs'] ?? '' ), true ) ) );
+		}
+
+		return $out;
+	}
+
+	/**
 	 * The ids named by the `ref` of the core blocks of one name in some block
 	 * markup.
 	 *
@@ -1876,16 +1972,12 @@ final class TemplateBlockRefs {
 	 * Block markup with the `ref` of each core block that names a key of its
 	 * map replaced by the value. Every other byte is kept.
 	 *
-	 * A block whose attributes hold "ref" more than once (nested in another
-	 * attribute) is left as it is: the top-level one cannot be told apart
-	 * without re-encoding the attributes.
+	 * A block holding "ref" more than once is left as it is: the top-level one
+	 * cannot be told apart without re-encoding the attributes.
 	 *
 	 * @param string                                  $content Block markup.
 	 * @param array<string, array<int, int>>          $maps    Block name => ( post id => post id ).
-	 * @param (callable(string, int, int): bool)|null $allow   Whether an occurrence (block name,
-	 *                                                         occurrence as {@see self::occurrences()}
-	 *                                                         counts it, the id it names) may be
-	 *                                                         rewritten; null: every one.
+	 * @param (callable(string, int, int): bool)|null $allow   Whether an occurrence (block name, occurrence, id) may be rewritten; null: all.
 	 * @return string
 	 */
 	public static function rewrite_refs( string $content, array $maps, ?callable $allow = null ): string {

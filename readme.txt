@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.7.3.1
+Stable tag: 1.0.7.4
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -207,6 +207,14 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
+= 1.0.7.4 =
+* Security hardening.
+* Background jobs: bulk machine translation continues where a stopped worker left off, bulk string translation runs in short slices, and work one web request cannot finish is refused with the WP-CLI command that runs it.
+* Machine translation: "Do not translate" blocks keep their markup on every save path (WordPress 6.7+); a cut-off title, excerpt or classic content is not saved; page builder layouts that machine translation does not send are reported.
+* Developers: a PHP API for add-ons (`perflocale()->addon()`) and JavaScript hooks for the language switcher, the block editor and the Jobs, Strings and Translations screens.
+* Export & Import and repairs: a Replace import that loses its database connection changes nothing, Merge imports keep their working data in a database table when the database allows it, and `wp perflocale health-check` lists links a string import replaced and gives each string a translation group of its own.
+* Visitor pages load less PHP code and admin screens load fewer script files.
+
 = 1.0.7.3.1 =
 * Page builders: the builder link of an unpublished translation (for example "Edit with Oxygen") opens the translation, not the original page, so saving no longer changes the original. A builder link that cannot open the translation stops with a message instead.
 
@@ -257,6 +265,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.7.4 =
+Security hardening. Background jobs that continue after a stopped worker, protected blocks that keep their markup, and less code on visitor pages.
 
 = 1.0.7.3.1 =
 Opening an unpublished translation in a page builder opens the translation, not the original page.

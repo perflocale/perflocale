@@ -17,15 +17,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The part of InventorySync that runs when a product is written: the product
- * editor, Quick/Bulk Edit, the Variations panel and its bulk actions, the REST
- * API, the CSV importer, any other WooCommerce save (CRUD updates), the flows
- * that sync their own save, and the end-of-request rollup of sibling variable
- * parents. InventorySync builds it the first time one of these runs, so a
- * request that writes no product (a cart, a checkout, a Store API read)
- * neither builds nor loads it. It works through the InventorySync instance it
- * belongs to (locks, matches, lookup refreshes, the stock deltas and the
- * write depth).
+ * The product-write half of InventorySync: editor, Quick/Bulk Edit, Variations panel, REST, CSV import and CRUD saves.
+ *
+ * Built on first use, so a request that writes no product (cart, checkout, Store API read) never loads it.
  *
  * @internal Internal to PerfLocale; not a public API.
  */
@@ -34,8 +28,7 @@ final class InventoryFieldSync {
 	/**
 	 * Physical product fields that must be identical across all language variants.
 	 *
-	 * These represent product facts, not translatable content. The list is
-	 * filterable via `perflocale/woocommerce/synced_product_fields`.
+	 * Filterable via `perflocale/woocommerce/synced_product_fields`.
 	 */
 	private const SHARED_FIELDS = [
 		// Stock management.
@@ -49,11 +42,7 @@ final class InventoryFieldSync {
 		'_sale_price',
 		'_sale_price_dates_from',
 		'_sale_price_dates_to',
-		// Identity. The GTIN/UPC/EAN (WC 9.1+) identifies the same physical
-		// product in every language - the WC addon already exempts shared
-		// values from WC's uniqueness validation for translation siblings,
-		// so without syncing it here a GTIN edited AFTER translation
-		// creation would silently diverge (harmless meta on WC < 9.1).
+		// Identity. The GTIN (WC 9.1+) names the same physical product in every language.
 		'_sku',
 		'_global_unique_id',
 		// Physical dimensions (shipped in all languages the same way).
@@ -64,10 +53,7 @@ final class InventoryFieldSync {
 		// Product nature.
 		'_virtual',
 		'_downloadable',
-		// NB: total_sales is intentionally NOT synced. Copying the source
-		// product's counter onto siblings clobbers each variant's own sales
-		// (it overwrites, it does not aggregate), losing data and skewing
-		// best-seller reports. Each language variant keeps its own count.
+		// Not total_sales: a copy would overwrite each variant's own count, not add to it.
 	];
 
 	/**
@@ -77,11 +63,9 @@ final class InventoryFieldSync {
 	private const PRICE_KEYS = [ '_price', '_regular_price', '_sale_price', '_sale_price_dates_from', '_sale_price_dates_to' ];
 
 	/**
-	 * WooCommerce props a save can change => the shared meta keys a change of
-	 * that prop mirrors (see note_crud_update()).
+	 * WooCommerce props a save can change => the shared meta keys their change mirrors.
 	 *
-	 * `stock_quantity` is absent on purpose: quantity is mirrored by the stock
-	 * hooks, relatively for orders, and never by this path.
+	 * No `stock_quantity` on purpose: the stock hooks mirror quantity (relatively for orders), never this path.
 	 */
 	private const CRUD_PROP_KEYS = [
 		'regular_price'     => self::PRICE_KEYS,
@@ -102,11 +86,7 @@ final class InventoryFieldSync {
 	];
 
 	/**
-	 * Actions that run a save with a sync of its own: the product editor, the
-	 * products-list Quick/Bulk Edit (WooCommerce fires this one around every
-	 * admin save_post), the Variations panel and its bulk actions, and the
-	 * creation of a translation. A save recorded while one of them runs waits
-	 * for it to end (see sync_after_crud_update()).
+	 * Actions that run a save with a sync of its own; a save recorded inside one waits for it to end.
 	 */
 	private const OWN_SYNC_FLOWS = [
 		'woocommerce_process_product_meta'         => true,
@@ -119,10 +99,7 @@ final class InventoryFieldSync {
 	/**
 	 * Variation fields treated as shared product facts across languages.
 	 *
-	 * Unlike the variable PARENT (where price keys are child-derived
-	 * aggregates WC owns and this class must not copy), a variation's
-	 * `_price` is a real single value - safe and necessary to mirror.
-	 * total_sales is per-variant by design (see SHARED_FIELDS note).
+	 * A variation's `_price` is a real value, unlike a variable parent's child-derived aggregate, so it is mirrored.
 	 */
 	private const VARIATION_FIELDS = [
 		'_stock',
@@ -162,9 +139,7 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Shared meta keys a WooCommerce save changed, waiting for that save (or
-	 * the flow around it, when `waiting` is set) to finish, keyed blog id =>
-	 * product / variation id.
+	 * Shared keys a WooCommerce save changed, waiting for it (or its flow, when `waiting`) to end; blog id => product id.
 	 *
 	 * @var array<int, array<int, array{keys: array<int, string>, variation: bool, parent: int, waiting?: bool}>>
 	 */
@@ -178,18 +153,16 @@ final class InventoryFieldSync {
 	private bool $flush_hooked = false;
 
 	/**
-	 * Product objects that a REST or CSV-importer flow is about to save and
-	 * will sync itself right after. The CRUD trigger leaves that one save to
-	 * the flow. Weak, so an object the flow never saves cannot leave a claim
-	 * behind once it is gone.
+	 * Products a REST or CSV-importer flow will save and then sync itself; the CRUD trigger leaves that save to it.
+	 *
+	 * Weak, so an object the flow never saves leaves no claim behind.
 	 *
 	 * @var \WeakMap<\WC_Product, true>
 	 */
 	private \WeakMap $flow_claims;
 
 	/**
-	 * Sibling variable parents waiting for their end-of-request rollup, keyed
-	 * blog id => parent id => true.
+	 * Sibling variable parents waiting for their end-of-request rollup; blog id => parent id => true.
 	 *
 	 * @var array<int, array<int, true>>
 	 */
@@ -203,21 +176,16 @@ final class InventoryFieldSync {
 	private bool $rollups_hooked = false;
 
 	/**
-	 * Variations whose stock status a products-list Quick Edit or Bulk Edit
-	 * just changed, keyed blog id => parent id => variation id => true.
+	 * Variations whose stock status a products-list Quick/Bulk Edit just changed; blog id => parent id => variation id.
 	 *
-	 * WooCommerce applies "In stock?" to a variable product that does not
-	 * manage stock by saving each child variation, then fires the quick/bulk
-	 * edit action for the parent only. The parent handler reads this list so
-	 * the matching variations in the other languages follow.
+	 * WooCommerce saves each child, then fires the edit action for the parent only, whose handler reads this list.
 	 *
 	 * @var array<int, array<int, array<int, true>>>
 	 */
 	private array $quick_edit_children = [];
 
 	/**
-	 * Sync every variation touched by a Variations-tab bulk action, rolling
-	 * the sibling parents up once at the end.
+	 * Sync every variation a Variations-tab bulk action touched, then roll the sibling parents up once.
 	 *
 	 * @param string            $bulk_action Bulk action slug (unused - field diffing is value-based).
 	 * @param array<mixed>      $data        Bulk action payload (unused).
@@ -240,13 +208,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Record the shared keys a WooCommerce save of a product or variation
-	 * changed, for sync_after_crud_update().
+	 * Record the shared keys a WooCommerce save changed, for sync_after_crud_update().
 	 *
-	 * Runs inside the data store's save, for every product and variation save
-	 * on the site, each order line's stock save included. Everything up to the
-	 * first check that needs the object is array work, so a save that changed
-	 * no shared field (a sale, a rating, a rollup) costs no I/O.
+	 * Runs in every product and variation save, order stock saves included, so a save without a shared field does no I/O.
 	 *
 	 * @param mixed $product       Product or variation being saved.
 	 * @param mixed $updated_props Props whose stored value the save changed.
@@ -265,10 +229,7 @@ final class InventoryFieldSync {
 
 		$product_id = (int) $product->get_id();
 
-		// WooCommerce's own relative stock statement for this product has been
-		// captured and not replayed yet: this is the save inside
-		// wc_update_product_stock() (an order, a refund, an order-screen stock
-		// adjustment). The stock hooks own that save.
+		// A captured, unreplayed relative stock statement: the save inside wc_update_product_stock(), owned by the stock hooks.
 		if ( $product_id <= 0 || $this->sync->has_stock_op( $product_id ) ) {
 			return;
 		}
@@ -279,11 +240,8 @@ final class InventoryFieldSync {
 			return;
 		}
 
-		// Derived state never pushes. A variable or grouped product's prices
-		// and stock status come from its children; a stock-managed product's
-		// status comes from its own quantity. get_manage_stock() is
-		// WooCommerce's own test (WC_Product::validate_props) and reads
-		// 'parent' for a variation whose parent manages the stock.
+		// Derived state never pushes: variable/grouped prices and status come from children, a managed status from its quantity.
+		// get_manage_stock() is WooCommerce's own test and reads 'parent' for a variation whose parent manages the stock.
 		$derived_type = $product->is_type( [ 'variable', 'grouped' ] );
 		$keys         = [];
 
@@ -316,18 +274,10 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Copy the shared keys a finished WooCommerce save changed to the
-	 * translation siblings (see note_crud_update()).
+	 * Copy the shared keys a finished WooCommerce save changed to the translation siblings.
 	 *
-	 * WooCommerce fires the two hooks this runs on once the save is complete
-	 * and the product's caches are cleared. A save with nothing recorded,
-	 * every order-path save among them, returns on the first check.
-	 *
-	 * Inside a flow with its own sync (OWN_SYNC_FLOWS) the record waits for
-	 * the flow to end. The flow's full-field sync of the object it edited
-	 * drops that object's record (see forget_record()), so nothing is copied
-	 * twice; what is left, such as another product a listener on the flow's
-	 * hooks saved meanwhile, is copied by flush_crud_updates().
+	 * Inside an OWN_SYNC_FLOWS flow the record waits: the flow's full sync drops its own object's record, so nothing
+	 * is copied twice, and flush_crud_updates() copies the rest.
 	 *
 	 * @param int|string $product_id Saved product or variation ID.
 	 * @return void
@@ -408,10 +358,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Drop what a create recorded. WooCommerce reports every prop of a new
-	 * product or variation as changed, and a create never starts this sync:
-	 * the new object is the copy (a translation clone, a duplicate, an added
-	 * variation), not the record the other languages should follow.
+	 * Drop what a create recorded: WooCommerce reports every prop of a new object as changed.
+	 *
+	 * The new object is a copy (translation clone, duplicate, added variation), not the record to follow.
 	 *
 	 * @param int|string $product_id Created product or variation ID.
 	 * @return void
@@ -455,12 +404,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Copy what the saves recorded inside a flow left for it (see
-	 * sync_after_crud_update()), once the flow's own handlers have run.
+	 * Copy the records left waiting inside a flow, once the flow's own handlers have run.
 	 *
-	 * Hooked last on each flow's closing action, and to `shutdown` for a flow
-	 * that never got there. Inside a flow that another flow is running, the
-	 * outer one flushes when it ends.
+	 * Hooked last on each flow's closing action and to `shutdown`; a nested flow leaves the flush to the outer one.
 	 *
 	 * @return void
 	 */
@@ -503,9 +449,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * End of a translation's creation: drop what the new copy and its
-	 * variations recorded, since the copy is built from the product it
-	 * translates and must push nothing back to it, then flush the rest.
+	 * End of a translation's creation: drop what the copy and its variations recorded, then flush the rest.
+	 *
+	 * The copy is built from the product it translates and must push nothing back to it.
 	 *
 	 * @param int|string $new_id      ID of the translation just created.
 	 * @param mixed      $object_type 'post' or 'term'.
@@ -527,8 +473,7 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Mark the object a REST or CSV-importer flow is about to save. The CRUD
-	 * trigger leaves that save to the flow, which syncs it right after.
+	 * Mark the object a REST or CSV-importer flow is about to save; the flow syncs it right after.
 	 *
 	 * @param mixed $product Object the flow will save.
 	 * @return mixed The same object, untouched.
@@ -544,9 +489,7 @@ final class InventoryFieldSync {
 	/**
 	 * Roll each queued sibling parent up once.
 	 *
-	 * Hooked to `shutdown` when the first parent is queued, the way
-	 * WooCommerce defers the edited parent's own rollup. Public so it can run
-	 * on demand; the queue is emptied first, so a second run does nothing.
+	 * Hooked to `shutdown`, as WooCommerce defers the edited parent's rollup; the queue empties first, so a rerun is a no-op.
 	 *
 	 * @return void
 	 */
@@ -572,12 +515,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Queue sibling parents for one rollup each at the end of the request, so
-	 * a loop of variation saves rolls each parent up once rather than once per
-	 * variation.
+	 * Queue sibling parents for one rollup each at the end of the request, not one per variation save.
 	 *
-	 * Rolled up at once instead while switched to another blog (the queue must
-	 * not outlive the switch) or once the request is already shutting down.
+	 * Rolled up at once while switched to another blog (the queue must not outlive the switch) or during shutdown.
 	 *
 	 * @param array<int, int> $parent_ids Sibling parent IDs.
 	 * @return void
@@ -643,9 +583,7 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Whether a copy leaves one sibling's `_stock_status` alone: the sibling
-	 * manages its own stock, so its status comes from its own quantity
-	 * (refresh_derived_stock_status()), never from the source.
+	 * Whether a copy leaves a sibling's `_stock_status` alone: a stock-managed sibling derives it from its own quantity.
 	 *
 	 * @param bool   $derive     Whether the copy re-derives stock status.
 	 * @param string $field      Meta key about to be copied.
@@ -660,10 +598,7 @@ final class InventoryFieldSync {
 	 * Copy shared physical fields to all language variants of a product.
 	 *
 	 * @param int                     $product_id Post ID of the saved product.
-	 * @param array<int, string>|null $only_keys  Copy only these of the synced
-	 *                                            fields (a save through code
-	 *                                            passes the keys it changed).
-	 *                                            Null copies every one.
+	 * @param array<int, string>|null $only_keys  Copy only these synced fields (a code save passes its changed keys); null: all.
 	 * @return void
 	 */
 	public function sync_product_fields( int $product_id, ?array $only_keys = null ): void {
@@ -676,9 +611,7 @@ final class InventoryFieldSync {
 			return;
 		}
 
-		// Atomically acquire a cross-request lock. add_option() is backed by
-		// an INSERT against the UNIQUE option_name key, so two concurrent
-		// requests cannot both enter this method - the loser bails.
+		// Cross-request lock: one INSERT on the UNIQUE option_name wins, the other request returns.
 		if ( ! Lock::acquire( $this->sync->lock_name( $product_id ), InventorySync::LOCK_TTL_OUTER ) ) {
 			return;
 		}
@@ -694,12 +627,8 @@ final class InventoryFieldSync {
 				$base_fields = array_diff( $base_fields, $price_keys );
 			}
 
-			// For a variable parent these price keys are child-derived aggregates
-			// WC owns: it stores one _price row per unique child price (min..max)
-			// and empties parent _regular_price/_sale_price. Copying them with
-			// update_post_meta() would collapse the sibling's multi-row _price
-			// index to a single value and corrupt its min/max price lookup, so
-			// leave WC to rebuild them from the sibling's own variations.
+			// Not on a variable parent: WC keeps one _price row per child price there, and update_post_meta() would
+			// collapse that min/max index. WC rebuilds them from the sibling's own variations.
 			$product = wc_get_product( $product_id );
 
 			if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) ) {
@@ -717,14 +646,8 @@ final class InventoryFieldSync {
 				return;
 			}
 
-			// A sibling that manages its own stock never takes the source's
-			// `_stock_status`: it re-derives its status from its OWN quantity
-			// instead. A partial copy re-derives it after every copied
-			// stock-management or backorders setting, or status change. A full
-			// copy re-derives it only where it wrote the quantity, the
-			// stock-management setting or the backorders setting, or where the
-			// sibling's status differs from the source's, so an in-sync
-			// sibling costs no query.
+			// A stock-managed sibling never takes the source's `_stock_status`: it re-derives it from its own quantity.
+			// A full copy re-derives only where a stock field differs, so an in-sync sibling costs no query.
 			$derive = [] !== array_intersect( $fields, [ '_manage_stock', '_backorders', '_stock_status' ] );
 
 			$repo         = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
@@ -747,11 +670,7 @@ final class InventoryFieldSync {
 					continue;
 				}
 
-				// Lock the sibling too so save_post hooks fired as a
-				// side-effect of update_post_meta/wc_delete_product_transients
-				// don't bounce back into this method. If the lock is already
-				// held (another request racing on the same sibling) skip it -
-				// the other request will finish the sync there.
+				// The sibling lock stops hooks fired by these writes from re-entering; a held one means another request syncs it.
 				if ( ! Lock::acquire( $this->sync->lock_name( $sibling_id ), InventorySync::LOCK_TTL_INNER ) ) {
 					continue;
 				}
@@ -759,19 +678,9 @@ final class InventoryFieldSync {
 				try {
 					$changed = false;
 
-					// Whether the sibling manages its own stock and still does
-					// after this copy, read before this copy can change the
-					// setting. Its quantity then belongs to the stock hooks alone
-					// (sync_on_stock_change(): orders as a relative change,
-					// explicit stock changes absolutely), so no copy writes its
-					// `_stock`. An absolute copy of the source's quantity would
-					// overwrite an order's decrement that is committed on the
-					// sibling and not yet relayed to the source, and that sale
-					// would be lost. A sibling that does not manage its stock
-					// takes the source's quantity: no order moves it, and this
-					// copy may be about to make it managed. So does a sibling
-					// this copy stops managing: once it does not manage its
-					// stock, no sale depends on its quantity.
+					// A sibling that manages its stock, before and after this copy, owns `_stock`: only the stock hooks write it.
+					// An absolute copy would overwrite an order's decrement not yet relayed to the source, losing that sale.
+					// See docs-ai/11-code-rationale.md, "InventoryFieldSync: owned stock quantity".
 					$owned = 'yes' === get_post_meta( $sibling_id, '_manage_stock', true )
 						&& ( ! array_key_exists( '_manage_stock', $values ) || 'yes' === $values['_manage_stock'] );
 
@@ -784,13 +693,7 @@ final class InventoryFieldSync {
 							continue;
 						}
 
-						// update_post_meta() returns false BOTH on failure AND
-						// when the new value equals the stored one - and an
-						// already-in-sync sibling is the COMMON case, not an
-						// error. Skip the write (and the log) when the value
-						// already matches, so WP_DEBUG logs carry only genuine
-						// failures instead of dozens of false "failed" lines
-						// per product save.
+						// Skip equal values: update_post_meta() returns false for them too, so the log keeps real failures only.
 						if ( (string) get_post_meta( $sibling_id, $field, true ) === (string) $value ) {
 							continue;
 						}
@@ -828,16 +731,8 @@ final class InventoryFieldSync {
 						continue;
 					}
 
-					// Rebuild the sibling's wc_product_meta_lookup row from the
-					// meta just written. update_post_meta() bypasses WC's CRUD
-					// change-tracking, so the lookup (which backs catalog
-					// price-sort / stock-filter / SKU search) would otherwise go
-					// stale. Re-entrancy is safe: the sibling lock is held. Only
-					// a copy that wrote `_stock` lets the refresh re-set the
-					// quantity, and a full copy that wrote the stock-management
-					// setting has it set the stock columns from the committed
-					// meta (see refresh_product_lookup()). A partial copy that
-					// leaves the sibling stock-managed refreshes them below.
+					// Raw meta writes bypass WC's change tracking: rebuild the lookup row under the held sibling lock.
+					// Only a `_stock` write re-sets the quantity; a full copy that wrote `_manage_stock` sets the stock columns too.
 					$this->sync->refresh_product_lookup( $sibling_id, $stock_written, null === $only_keys && $manage_written );
 
 					// The copied setting can have made the sibling stock-managed;
@@ -893,19 +788,13 @@ final class InventoryFieldSync {
 	 * @return void
 	 */
 	public function sync_on_quick_or_bulk_edit( \WC_Product $product ): void {
-		// Bulk Edit changes stock through wc_update_product_stock( ..., true ),
-		// which still fires the set_stock action, so sync_on_stock_change()
-		// has normally consumed the delta already. Taking it again makes sure
-		// nothing captured during this save outlives it.
+		// Bulk Edit's stock change fires set_stock, which normally consumed the delta; taking it again lets none outlive this save.
 		$this->sync->take_stock_delta( $product->get_id() );
 
 		$this->sync_product_fields( $product->get_id() );
 
-		// Variations whose stock status this edit changed (see
-		// note_quick_edit_child). The parent copy above carries only the
-		// parent's derived status, so sync each recorded variation, then
-		// roll every touched sibling parent up once so its status is derived
-		// from its own children again.
+		// The parent copy carries only its derived status: sync each variation this edit changed, then roll the sibling
+		// parents up once so their status comes from their own children again.
 		$blog       = get_current_blog_id();
 		$product_id = $product->get_id();
 		$children   = $this->quick_edit_children[ $blog ][ $product_id ] ?? [];
@@ -936,12 +825,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Record a variation whose stock status a Quick Edit or Bulk Edit of its
-	 * parent just changed, for sync_on_quick_or_bulk_edit().
+	 * Record a variation whose stock status a Quick/Bulk Edit of its parent changed, for sync_on_quick_or_bulk_edit().
 	 *
-	 * Only a variation that does not manage its own stock is recorded: its
-	 * status is the value the operator chose. A stock-managed variation's
-	 * status follows its own quantity, which the stock hooks already sync.
+	 * Only one that does not manage stock: a managed variation's status follows its quantity, which the stock hooks sync.
 	 *
 	 * @param int|string $variation_id Variation ID.
 	 * @param mixed      $status       New stock status (unused; the sync reads the saved meta).
@@ -951,9 +837,7 @@ final class InventoryFieldSync {
 	public function note_quick_edit_child( $variation_id, $status = '', $variation = null ): void {
 		unset( $status );
 
-		// The wrapper action WooCommerce fires around both edits
-		// (WC_Admin_Post_Types::bulk_and_quick_edit_hook). Every other
-		// variation save, including the order path, returns here.
+		// WooCommerce's wrapper action around both edits; every other variation save, orders included, returns here.
 		if ( ! doing_action( 'woocommerce_product_bulk_and_quick_edit' ) ) {
 			return;
 		}
@@ -976,13 +860,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Trigger sync for a product or variation row written by the WooCommerce
-	 * CSV importer.
+	 * Trigger sync for a product or variation row written by the WooCommerce CSV importer.
 	 *
-	 * Cheap when the row has no translations (one cached group lookup +
-	 * short-circuit), but a mass import of a fully-translated catalog runs a
-	 * sibling sync per row - the filter lets operators skip it and rely on a
-	 * post-import resync instead.
+	 * A translated catalog syncs siblings per row; perflocale/woocommerce/sync_on_import can skip that for a later resync.
 	 *
 	 * @param \WC_Product          $product Imported product object.
 	 * @param array<string, mixed> $data    Raw row data (unused).
@@ -1011,29 +891,14 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Copy an edited variation's shared fields to the attribute-matched
-	 * variation on every sibling-language parent, then rebuild each touched
-	 * sibling parent's derived aggregates.
+	 * Copy an edited variation's shared fields to the matching variation of each sibling parent, then roll those up.
 	 *
-	 * Sibling variations are located exactly like the order-driven stock
-	 * path: anchor on the (group-linked) PARENT, match children by exact
-	 * normalised attribute set, and skip (never guess) when a translator
-	 * has diverged a sibling's attributes. Same lock discipline: outer lock
-	 * on the source variation, inner lock per sibling write, so hooks fired
-	 * as side-effects of the writes bail instead of looping - and a
-	 * concurrent save of the sibling itself skips rather than fights.
-	 *
-	 * The SOURCE parent's aggregates are deliberately left alone: WC's own
-	 * save flow (admin variations panel and REST alike) runs
-	 * WC_Product_Variable::sync() for the product being edited.
+	 * Matched as in the order stock path: exact attribute set under the linked parent, a diverged sibling skipped, never guessed.
+	 * The source parent is left alone: WC's own save runs WC_Product_Variable::sync() for it.
 	 *
 	 * @param int                     $variation_id   Saved variation ID.
-	 * @param bool                    $rollup_parents Roll touched sibling parents up inline.
-	 *                                                The bulk-edit handler passes false and
-	 *                                                amortises the rollup across the whole run.
-	 * @param array<int, string>|null $only_keys      Copy only these of the synced fields
-	 *                                                (a save through code passes the keys
-	 *                                                it changed). Null copies every one.
+	 * @param bool                    $rollup_parents Roll touched sibling parents up inline (bulk edit passes false, rolls up once).
+	 * @param array<int, string>|null $only_keys      Copy only these synced fields (a code save passes its changed keys); null: all.
 	 * @return array<int, true> Touched sibling parent IDs (keys).
 	 */
 	public function sync_variation_fields( int $variation_id, bool $rollup_parents = true, ?array $only_keys = null ): array {
@@ -1071,8 +936,7 @@ final class InventoryFieldSync {
 		try {
 			$fields = self::VARIATION_FIELDS;
 
-			// Mirror the parent-product flow: price mirroring is opt-out via
-			// the same wc_sync_prices setting (per-language pricing setups).
+			// The same wc_sync_prices opt-out as the product flow.
 			if ( ! $this->prices_synced() ) {
 				$fields = array_diff( $fields, self::PRICE_KEYS );
 			}
@@ -1114,12 +978,7 @@ final class InventoryFieldSync {
 
 				$sib_variation_id = $this->sync->match_sibling_variation( $sib_parent_id, $src_attrs );
 
-				// A variation-level opt-out must block INCOMING writes too, not
-				// only outgoing ones - the source-side gate reads the same flag,
-				// so checking just the parent here would leave the key
-				// protecting a variation in one direction only. Placed after
-				// the match so the cheaper parent-level skip short-circuits
-				// first and this meta read only happens on real candidates.
+				// A variation opt-out blocks incoming writes too; read after the match, so only real candidates pay for it.
 				if ( $sib_variation_id <= 0 || $sib_variation_id === $variation_id || $this->sync->is_sync_opted_out( $sib_variation_id ) ) {
 					continue;
 				}
@@ -1131,11 +990,8 @@ final class InventoryFieldSync {
 				try {
 					$changed = false;
 
-					// See sync_product_fields(): the quantity of a sibling
-					// variation that manages its own stock, and still does
-					// after this copy, belongs to the stock hooks, and no copy
-					// writes it. A parent-managed variation stores 'no' here
-					// and takes the source's value.
+					// See sync_product_fields(): a sibling that manages its stock owns `_stock`.
+					// A parent-managed variation stores 'no' here and takes the source's value.
 					$owned = 'yes' === get_post_meta( $sib_variation_id, '_manage_stock', true )
 						&& ( ! array_key_exists( '_manage_stock', $values ) || 'yes' === $values['_manage_stock'] );
 
@@ -1148,9 +1004,7 @@ final class InventoryFieldSync {
 							continue;
 						}
 
-						// Change-only writes: update_post_meta returns false for
-						// an unchanged value too, so only a real change is a
-						// candidate failure (mirrors every other sync flow here).
+						// Skip equal values: update_post_meta() returns false for them too.
 						if ( (string) get_post_meta( $sib_variation_id, $field, true ) === (string) $value ) {
 							continue;
 						}
@@ -1187,13 +1041,7 @@ final class InventoryFieldSync {
 						continue;
 					}
 
-					// Rebuild the sibling variation's wc_product_meta_lookup row
-					// (price sort / stock filter / SKU search) - the raw meta
-					// writes bypass WC's change tracking. Re-entrancy safe: the
-					// sibling lock is held. Only a copy that wrote `_stock` lets
-					// the refresh re-set the quantity, and a full copy that
-					// wrote the stock-management setting has it set the stock
-					// columns from the committed meta.
+					// Raw meta writes bypass WC's change tracking: rebuild the lookup row as in sync_product_fields().
 					$this->sync->refresh_product_lookup( $sib_variation_id, $stock_written, null === $only_keys && $manage_written );
 
 					if ( $derive && null !== $only_keys && 'yes' === (string) get_post_meta( $sib_variation_id, '_manage_stock', true ) ) {
@@ -1224,18 +1072,9 @@ final class InventoryFieldSync {
 	}
 
 	/**
-	 * Rebuild the derived aggregates of sibling variable parents whose
-	 * children were just synced.
+	 * Rebuild the derived aggregates of sibling variable parents whose children were just synced.
 	 *
-	 * A variation price/stock write changes the PARENT's derived state
-	 * (multi-row _price index, min/max lookup columns, parent stock status,
-	 * price-range transients). WC rebuilds all of it from the children in
-	 * WC_Product_Variable::sync(); without this the sibling shop archive
-	 * keeps the stale price range until the sibling's next manual save.
-	 * Locked so any hook fired from inside the rollup that lands back in
-	 * this class bails immediately; skipped (not queued) under contention -
-	 * the next sibling save rebuilds the same derived state from the same
-	 * children.
+	 * Locked so a hook fired inside the rollup bails; skipped under contention, as the next save rebuilds the same state.
 	 *
 	 * @param array<int, int> $parent_ids Sibling parent IDs to roll up.
 	 * @return void

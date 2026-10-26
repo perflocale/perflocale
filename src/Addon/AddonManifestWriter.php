@@ -14,15 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Writes + reads the per-addon uninstall manifest.
+ * Writes and reads the per-addon uninstall manifest, one non-autoloaded option per addon.
  *
- * Manifest is the source of truth for uninstall - even when the addon's
- * class file is gone from disk, the manifest still drives the declarative
- * purge. This is what makes third-party addon cleanup reliable.
- *
- * One option per addon (`perflocale_addon_manifest_{addon_id}`, autoload=false).
- * Checksumed against the live targets - re-written only when the shape
- * actually changes. That keeps the option_id churn low.
+ * The manifest drives the purge even after the addon's files are gone; it is rewritten only when its checksum changes.
  */
 final class AddonManifestWriter {
 
@@ -30,13 +24,9 @@ final class AddonManifestWriter {
 	public const OPTION_PREFIX = 'perflocale_addon_manifest_';
 
 	/**
-	 * Refresh the manifest for an addon if the live targets differ from
-	 * what's stored. No-op when targets are unchanged.
+	 * Rewrite an addon's manifest when its live targets changed.
 	 *
-	 * Handles 3 cases:
-	 * • Addon implements HasUninstallTargets: capture current targets + flags.
-	 * • Addon implements only HasCustomUninstall: capture the flag, no targets.
-	 * • Addon implements neither: no-op (no manifest written).
+	 * HasUninstallTargets stores the targets, HasCustomUninstall the flag; an addon with neither gets no manifest.
 	 *
 	 * @param AddonInterface $addon The addon.
 	 * @return bool True if a write occurred, false if unchanged or skipped.
@@ -59,12 +49,7 @@ final class AddonManifestWriter {
 		$raw_targets = $has_targets ? $addon->get_uninstall_targets() : [];
 		$normalized  = self::normalize( $raw_targets );
 
-		// Developer-mode nudge: notice each soft-prefix entry that doesn't
-		// carry the per-addon sub-namespace. The trust model is intentional
-		// (per-addon namespacing is not enforced, only the plugin-wide
-		// `perflocale_` prefix is), but helping addon authors catch
-		// accidental cross-addon collisions during development beats
-		// debugging "why did my data disappear?" after the fact.
+		// WP_DEBUG nudge for entries without the per-addon sub-namespace, which is a convention, not enforced.
 		self::warn_unscoped_soft_prefixes( $addon_id, $normalized );
 
 		$manifest = [
@@ -127,9 +112,7 @@ final class AddonManifestWriter {
 	}
 
 	/**
-	 * Return all addon-ids currently with a manifest on this site.
-	 *
-	 * Uses a LIKE scan on the options table (indexed by option_name).
+	 * Ids of every addon with a manifest on this site (a prefix LIKE on the option_name index).
 	 *
 	 * @return array<int, string>
 	 */
@@ -167,38 +150,23 @@ final class AddonManifestWriter {
 	}
 
 	/**
-	 * Developer-mode DX nudge: emit a `_doing_it_wrong` notice for each
-	 * soft-prefix manifest entry that doesn't carry the per-addon
-	 * sub-namespace (`perflocale_{addon_id}_` for transients/cron-hooks,
-	 * additionally `_perflocale_{addon_id}_` for meta keys).
+	 * Under WP_DEBUG, a `_doing_it_wrong` for each soft-prefix entry outside the per-addon sub-namespace.
 	 *
-	 * Soft-prefix isolation is NOT enforced - the trust model matches
-	 * WordPress's own (a sibling plugin can wipe your transients on its
-	 * uninstall too). This helper only surfaces accidental sub-namespace
-	 * omissions to addon authors during development; production users
-	 * never see it (core gates `_doing_it_wrong` on `WP_DEBUG`).
-	 *
-	 * Suppress on a per-addon basis via the
-	 * `perflocale/addon/manifest/check_soft_prefix_namespacing` filter
-	 * - useful for addons that intentionally coordinate state across the
-	 * addon namespace.
+	 * That is `perflocale_{addon_id}_` (or `_perflocale_{addon_id}_` for meta). Only `perflocale_` is enforced, so a
+	 * sibling addon's broader prefix could wipe such an entry on its uninstall.
 	 *
 	 * @param string               $addon_id   Addon identifier.
 	 * @param array<string, mixed> $normalized Already-normalised manifest shape from self::normalize().
 	 * @return void
 	 */
 	private static function warn_unscoped_soft_prefixes( string $addon_id, array $normalized ): void {
-		// Cheap early exit before building any messages or running filters
-		// in production. `_doing_it_wrong` itself also gates on WP_DEBUG.
+		// Before any message or filter runs.
 		if ( ! defined( 'WP_DEBUG' ) || ! WP_DEBUG ) {
 			return;
 		}
 
 		/**
-		 * Filter to suppress the soft-prefix DX nudge for addons that
-		 * intentionally claim a broader namespace (e.g. a coordinator
-		 * addon cleaning up after a family of sibling addons it manages).
-		 * Return false to skip the check entirely for this addon.
+		 * Filters whether the soft-prefix nudge runs; false for an addon that claims a broader namespace on purpose.
 		 *
 		 * @hook perflocale/addon/manifest/check_soft_prefix_namespacing
 		 * @param bool   $check    Default true.
@@ -253,11 +221,9 @@ final class AddonManifestWriter {
 	}
 
 	/**
-	 * Normalize raw uninstall targets into the manifest shape, filtering out
-	 * obviously invalid entries (non-string, empty, wrong type).
+	 * Normalize raw uninstall targets into the manifest shape, dropping non-string and empty entries.
 	 *
-	 * Prefix validation (the security-sensitive part) happens later in
-	 * AddonUninstaller; this step just coerces shape.
+	 * The namespace check that guards core data is AddonUninstaller's; this only coerces shape.
 	 *
 	 * @param array<string, mixed> $raw Targets as returned by get_uninstall_targets().
 	 * @return array<string, array<int|string, mixed>>
@@ -276,11 +242,7 @@ final class AddonManifestWriter {
 			return array_values( array_unique( $out ) );
 		};
 
-		// Table short names are inserted verbatim into DROP TABLE IF EXISTS
-		// statements wrapped in backticks. An addon returning a crafted value
-		// containing backticks or semicolons could break out and execute
-		// arbitrary SQL. Enforce the same strict pattern AddonSchemaManager
-		// uses for apply_schema() - reject anything that doesn't match.
+		// Short names become part of a table identifier: only SHORT_NAME_PATTERN passes.
 		$tables = array_values(
 			array_filter(
 				$str_list( $raw['tables'] ?? [] ),
@@ -292,9 +254,7 @@ final class AddonManifestWriter {
 		if ( isset( $raw['meta'] ) && is_array( $raw['meta'] ) ) {
 			foreach ( [ 'post', 'user', 'term', 'comment' ] as $type ) {
 				$keys = $raw['meta'][ $type ] ?? [];
-				// Meta keys are bound parameters to DELETE ... WHERE meta_key IN (%s,…),
-				// so no SQL-injection vector - but enforce the soft prefix as a data-
-				// integrity guard.
+				// Bound values; the prefix keeps other plugins' meta out.
 				$meta_by_type[ $type ] = array_values(
 					array_filter(
 						$str_list( $keys ),
@@ -312,10 +272,7 @@ final class AddonManifestWriter {
 			];
 		}
 
-		// Transient prefixes are escape_like-wrapped in delete_transients() -
-		// safe from SQL injection. Enforce the perflocale_ namespace as a
-		// data-integrity guard so an addon can't expire unrelated plugins'
-		// transients.
+		// esc_like()'d values; the prefix keeps other plugins' transients out.
 		$transients = array_values(
 			array_filter(
 				$str_list( $raw['transients'] ?? [] ),

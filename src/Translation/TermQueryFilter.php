@@ -21,11 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Filters term queries to return only terms in the current language.
- *
- * Uses the terms_clauses filter to join translation_links and filter
- * by language, similar to PostQueryFilter. In admin post editors,
- * filters by the edited post's language so taxonomy pickers only show
- * terms matching the post's language.
+ * In post editors it uses the edited post's language, so taxonomy pickers match the post.
  */
 final class TermQueryFilter {
 
@@ -40,25 +36,15 @@ final class TermQueryFilter {
 	private readonly Settings $settings;
 
 	/**
-	 * Per-request post_id → language_id memo, behind reset_static_caches() so
-	 * a `switch_to_blog()` mid-request wipes it (same post_id can map to a
-	 * different language_id on a different blog).
+	 * Per-request "blog_id:post_id" to language_id memo; cleared on switch_blog.
 	 *
 	 * @var array<string, int>
 	 */
 	private static array $post_lang_id_cache = [];
 
 	/**
-	 * Per-request cache of the language SQL fragments, keyed by language_id.
-	 *
-	 * The join + where fragments are a pure function of the blog's table names
-	 * (Schema::table) and the language_id, so they can be built once per
-	 * language and spliced in on every subsequent terms_clauses cache-miss -
-	 * mirroring PostQueryFilter::$query_clauses_cache. MUST be reset on
-	 * switch_blog: the fragments embed the blog-specific table prefix, and
-	 * language_id is a per-blog auto-increment, so a stale entry would splice
-	 * another blog's table names / wrong-language clause. reset_static_caches()
-	 * (hooked to switch_blog in Bootstrap) clears it below.
+	 * Per-request language SQL fragments, keyed by language_id.
+	 * Must be reset on switch_blog: fragments embed the blog's table prefix and per-blog language ids.
 	 *
 	 * @var array<int, array{join: string, where: string}>
 	 */
@@ -112,11 +98,7 @@ final class TermQueryFilter {
 
 	/**
 	 * Filter REST API term queries by the edited post's language.
-	 *
-	 * The block editor sends term requests with a `perflocale_post`
-	 * parameter added by the editor sidebar JS middleware. This method
-	 * detects the post's language and injects it into the query args
-	 * so the terms_clauses filter can apply language filtering.
+	 * The `perflocale_post` param is added by the editor sidebar JS middleware.
 	 *
 	 * @param array<string, mixed> $args Term query arguments.
 	 * @param \WP_REST_Request     $request REST request.
@@ -152,28 +134,23 @@ final class TermQueryFilter {
 			return $clauses;
 		}
 
-		// Skip when fetching terms for specific objects (e.g. get_the_terms(),
-		// wp_get_object_terms()). That query asks "what terms does this post
-		// have?" - it must return all assigned terms regardless of language.
-		// Language filtering only applies when listing terms for pickers.
+		// Terms of specific objects (get_the_terms()) must return every assigned term, any language.
 		if ( ! empty( $args['object_ids'] ) ) {
 			return $clauses;
 		}
 
-		// Skip when fetching specific terms by ID (e.g. term_exists() called
-		// during wp_set_object_terms() to validate term IDs). Filtering these
-		// by language causes valid terms from other languages to fail validation
-		// and be silently dropped from post assignments.
+		// Terms by ID: wp_set_object_terms() validates IDs this way, and filtering silently drops assignments.
 		if ( ! empty( $args['include'] ) ) {
 			return $clauses;
 		}
 
-		// Skip slug resolution queries. When WordPress resolves a taxonomy
-		// archive (e.g. /tag/tag1-fr/), WP_Tax_Query calls get_terms() with
-		// a specific 'slug' argument to find the term. Filtering this by
-		// language causes 404s when the slug is from a different language's
-		// term. Language filtering for posts is handled by PostQueryFilter.
+		// Slug lookups resolve taxonomy archives: filtering them 404s another language's term slug.
 		if ( ! empty( $args['slug'] ) ) {
+			return $clauses;
+		}
+
+		// Core's _get_term_hierarchy() build: stored once for every language.
+		if ( 'all' === ( $args['get'] ?? '' ) && 'id=>parent' === ( $args['fields'] ?? '' ) && false === ( $args['update_term_meta_cache'] ?? true ) && empty( $args['perflocale_language_id'] ) ) {
 			return $clauses;
 		}
 
@@ -196,27 +173,20 @@ final class TermQueryFilter {
 	}
 
 	/**
-	 * Resolve the language ID for term filtering based on context.
-	 *
-	 * Priority:
-	 * 1. Explicit perflocale_language_id arg (from REST API or programmatic).
-	 * 2. Admin post editor context (classic editor).
-	 * 3. Frontend: current language from URL.
+	 * Resolve the language ID: explicit arg, then admin post editor, then the URL language.
 	 *
 	 * @param array<string, mixed> $args Term query arguments.
 	 * @return int Language ID or 0.
 	 */
 	private function resolve_language_id( array $args ): int {
-		// 1. Explicit language ID (from REST API filter or programmatic use).
+		// 1. Explicit language ID.
 		if ( ! empty( $args['perflocale_language_id'] ) ) {
 			return (int) $args['perflocale_language_id'];
 		}
 
 		// 2. Admin context: filter by the edited post's language.
 		if ( is_admin() ) {
-			// 2a. Classic-editor tag autocomplete (admin-ajax.php?action=ajax-tag-search).
-			// The AJAX call carries no post ID of its own, so we read the
-			// referring post.php/post-new.php URL from HTTP_REFERER.
+			// 2a. Classic-editor tag autocomplete carries no post ID: read it from the referer.
 			if ( wp_doing_ajax() ) {
 				return $this->get_ajax_edit_language_id();
 			}
@@ -229,16 +199,8 @@ final class TermQueryFilter {
 	}
 
 	/**
-	 * Detect the edited post's language during a tag-search AJAX request.
-	 *
-	 * WordPress' classic-editor tag autocomplete posts to
-	 * admin-ajax.php?action=ajax-tag-search and does not include a post ID.
-	 * We parse HTTP_REFERER to find the post.php/post-new.php URL the tag
-	 * box lives on, then reuse the same detection as non-AJAX admin
-	 * (post=<id>, perflocale_lang=<slug>, or the default language).
-	 *
-	 * Returns 0 for any other AJAX action so we don't accidentally filter
-	 * unrelated AJAX callers (e.g. wp_ajax_inline-save term pickers).
+	 * Detect the edited post's language during a tag-search AJAX request, from HTTP_REFERER.
+	 * Returns 0 for any other AJAX action, so unrelated callers stay unfiltered.
 	 *
 	 * @return int Language ID or 0.
 	 */
@@ -246,8 +208,7 @@ final class TermQueryFilter {
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only language detection.
 		$action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( (string) $_REQUEST['action'] ) ) : '';
 
-		// Only handle the tag-search endpoint. Other AJAX actions stay
-		// unfiltered to avoid surprising third-party callers.
+		// Only the tag-search endpoint.
 		if ( $action !== 'ajax-tag-search' ) {
 			return 0;
 		}
@@ -264,14 +225,8 @@ final class TermQueryFilter {
 	}
 
 	/**
-	 * Detect the language ID for admin post editor context.
-	 *
-	 * Returns 0 when no context can be inferred, which disables term
-	 * filtering. Uses $_SERVER + $_GET signals instead of the $pagenow
-	 * global because $pagenow has proven unreliable at the point this
-	 * runs on some Local-for-Linux setups (empty string despite being
-	 * on post.php - WP's vars.php derives it from PHP_SELF which can
-	 * be rewritten by the container's front controller).
+	 * Detect the language ID for admin post editor context, or 0 (no filtering).
+	 * Reads REQUEST_URI first: $pagenow comes from PHP_SELF, which some front controllers rewrite.
 	 *
 	 * @return int Language ID or 0.
 	 */
@@ -286,7 +241,7 @@ final class TermQueryFilter {
 			|| strpos( $uri, '/wp-admin/post-new.php' ) !== false
 		);
 
-		// Fall back to $pagenow on environments where it IS set correctly.
+		// Fall back to $pagenow.
 		if ( ! $on_post_edit ) {
 			global $pagenow;
 			$on_post_edit = in_array( (string) $pagenow, [ 'post.php', 'post-new.php' ], true );
@@ -301,9 +256,7 @@ final class TermQueryFilter {
 
 	/**
 	 * Extract an edited-post language ID from a post.php / post-new.php URI.
-	 *
-	 * Works for both the current request URI and referring URLs (for AJAX).
-	 * Priority: ?post=<id> → ?perflocale_lang=<slug> → default language.
+	 * Priority: ?post=<id>, then ?perflocale_lang=<slug>, then the default language.
 	 *
 	 * @param string $uri Absolute or relative URL pointing at post.php / post-new.php.
 	 * @return int Language ID or 0.
@@ -356,10 +309,7 @@ final class TermQueryFilter {
 	 * @return int Language ID or 0.
 	 */
 	private function detect_post_language_id( int $post_id ): int {
-		// Key by blog_id:post_id so multisite switch_to_blog() doesn't serve
-		// blog A's cached value to blog B (same post_id can map to a different
-		// language on a different subsite). The class-static is cleared on
-		// switch_blog via reset_static_caches() - defence in depth.
+		// Keyed by blog too: the same post_id can map to another language on another subsite.
 		$key = get_current_blog_id() . ':' . $post_id;
 
 		if ( isset( self::$post_lang_id_cache[ $key ] ) ) {
@@ -391,44 +341,24 @@ final class TermQueryFilter {
 	 * @return array<string, string> Modified clauses.
 	 */
 	private function apply_language_clauses( array $clauses, int $language_id ): array {
-		// The join + where fragments are a pure function of the blog's table
-		// names and $language_id, so build them once per language and reuse on
-		// every subsequent terms_clauses cache-miss (mirrors
-		// PostQueryFilter::$query_clauses_cache). Reset on switch_blog via
-		// reset_static_caches() so a stale entry never splices another blog's
-		// table prefix or a different blog's language_id semantics.
+		// Built once per language; reset on switch_blog (see $clause_cache).
 		if ( ! isset( self::$clause_cache[ $language_id ] ) ) {
 			global $wpdb;
 
 			$links_table  = Schema::table( 'translation_links' );
 			$groups_table = Schema::table( 'translation_groups' );
 
-			// LEFT JOIN approach: terms match if linked to this language OR have
-			// no term-type link at all (unmanaged content). Avoids the expensive
-			// NOT IN subquery that requires scanning all rows in translation_links.
-			//
-			// A second LEFT JOIN onto translation_groups with `type = 'term'`
-			// replaces the prior `group_id IN (…huge list…)` filter. That list
-			// grew O(n) in SQL text with the number of term-type groups; the join
-			// version hits the translation_groups primary key and is constant-sized.
+			// LEFT JOIN: a term matches when linked to this language or has no term link (unmanaged).
+			// Table names are Schema::table() values: the fragment is returned to core, so it cannot be prepared.
 			$alias = 'pl_term_lang';
 
-			// translation_links is polymorphic - object_id is a post OR a term id.
-			// A post whose id equals a term's term_id would otherwise match this
-			// term on `object_id = t.term_id`, producing a spurious extra row that
-			// double-counts the term (and, via `_g.id IS NULL`, leaks it across
-			// languages). Nest the type='term' filter into an INNER JOIN INSIDE the
-			// LEFT JOIN so only term-typed links reach the result - a colliding
-			// post-link never participates. Mirrors PostQueryFilter::modify_query_clauses.
+			// object_id is a post OR term id: the nested INNER JOIN on type 'term' keeps a colliding post link out.
 			$join = " LEFT JOIN ( {$links_table} AS {$alias}"
 				. " INNER JOIN {$groups_table} AS {$alias}_g"
 				. " ON {$alias}_g.id = {$alias}.group_id AND {$alias}_g.type = 'term' )"
 				. " ON {$alias}.object_id = t.term_id";
 
-			// Match semantics: {$alias}_g.id IS NOT NULL means "a term-typed
-			// translation link exists" (the nested INNER JOIN already excluded any
-			// colliding post-link, so IS NULL means genuinely no term link); the
-			// fallback branch admits unmanaged terms only.
+			// `_g.id IS NULL` means no term link at all, so the fallback admits unmanaged terms only.
 			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $alias is a hardcoded string constant, not user input.
 			$where = $wpdb->prepare(
 				" AND ( ( {$alias}.language_id = %d AND {$alias}_g.id IS NOT NULL ) OR {$alias}_g.id IS NULL )",
@@ -438,9 +368,7 @@ final class TermQueryFilter {
 
 			self::$clause_cache[ $language_id ] = [
 				'join'  => $join,
-				// prepare() returns string on success; is_string() narrows the
-				// type cleanly and falls back to '' on the (never-hit-here)
-				// null/false error path rather than splicing a bad fragment.
+				// Never splice a failed prepare() result.
 				'where' => is_string( $where ) ? $where : '',
 			];
 		}

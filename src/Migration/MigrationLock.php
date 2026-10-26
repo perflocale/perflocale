@@ -16,30 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Lets only one import run at a time on a blog.
+ * Lets only one import (any source, CLI, inline or job) run at a time on a blog.
  *
- * Two imports running together split translation sets over several groups
- * and leave empty groups behind, whether they come from WP-CLI, the admin
- * button (inline) or a background job, and whichever source they read. Every
- * import path therefore runs inside {@see run()}, which holds the
- * `migration_import` type lock of {@see JobLock} (one option row, not
- * autoloaded, released in `finally` and again at shutdown).
- *
- * An import that reports progress (every importer calls the heartbeat
- * after each batch) holds the lock for {@see HEARTBEAT_TTL} seconds past its
- * last batch, so a run killed without a shutdown (SIGKILL, out of memory)
- * frees it within minutes. A caller without a heartbeat holds it for
- * {@see DEFAULT_TTL} seconds, the same bound as the background job's own
- * lock.
- *
- * A heartbeat that finds the lock gone, or held by another process (one
- * that took it over after this import went {@see HEARTBEAT_TTL} seconds
- * without a heartbeat), stops the import: it throws a
- * {@see MigrationLockedException} with {@see lost_message()}, and so does
- * every later heartbeat of that run.
- *
- * The lock lives in the blog's options table, so imports on two blogs of a
- * network run side by side.
+ * Two imports at once split translation sets over several groups; the lock is per blog (options table).
+ * Lifetimes, heartbeat and loss: docs-ai/11-code-rationale.md, "MigrationLock: lifetime and lost lock".
  */
 final class MigrationLock {
 
@@ -80,13 +60,8 @@ final class MigrationLock {
 	/**
 	 * Run an import while holding the lock.
 	 *
-	 * `$import` receives a heartbeat callable; call it after each batch to
-	 * keep the lock (it writes at most once per 30 seconds). It throws a
-	 * MigrationLockedException when the lock was lost, so the import writes
-	 * nothing more. Pass `$heartbeat = true` only when `$import` calls it.
-	 *
-	 * Callers must not exit inside `$import` (WP_CLI::error(), wp_die()):
-	 * exit skips `finally`. The shutdown release covers a fatal error.
+	 * `$import` gets a heartbeat to call after each batch; it throws once the lock is lost.
+	 * Never exit inside `$import` (WP_CLI::error(), wp_die()): exit skips `finally`.
 	 *
 	 * @template T
 	 * @param callable(callable():void):T $import    The import.
@@ -117,8 +92,7 @@ final class MigrationLock {
 				return;
 			}
 
-			// JobLock keeps answering false for a lock this process lost, and
-			// $last stays put, so every later heartbeat of the run throws too.
+			// $last stays put on a lost lock, so every later heartbeat of the run throws too.
 			if ( ! JobLock::refresh_type( self::TYPE, self::HEARTBEAT_TTL ) ) {
 				throw new MigrationLockedException( esc_html( self::lost_message() ) );
 			}
@@ -172,8 +146,7 @@ final class MigrationLock {
 	}
 
 	/**
-	 * The message of an import stopped by a heartbeat that found the lock
-	 * lost.
+	 * The message of an import stopped because its lock was lost.
 	 *
 	 * @return string
 	 */
@@ -184,9 +157,7 @@ final class MigrationLock {
 	/**
 	 * Release the lock of an import that did not reach its `finally`.
 	 *
-	 * Registered as a shutdown function; a no-op when nothing is held.
-	 * JobLock releases only the value this process stamped, so a lock another
-	 * process took over is never removed.
+	 * Shutdown function. JobLock releases only the value this process stamped, never a taken-over lock.
 	 *
 	 * @return void
 	 */

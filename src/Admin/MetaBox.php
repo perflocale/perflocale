@@ -18,18 +18,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds a translation meta box to the classic post editor.
- *
- * Shows all language versions and their status, with links to
- * create or edit translations.
+ * Adds the translation meta box to the classic post editor.
  */
 final class MetaBox {
 
 	/**
-	 * Query argument of the edit screen's redirect after a save whose Sync
-	 * Fields did not reach some translations, and of the post list's after
-	 * such a Bulk Edit; see add_sync_skipped_arg() and
-	 * add_bulk_sync_skipped_arg().
+	 * Redirect query argument: how many translations a save or Bulk Edit's Sync Fields did not reach.
 	 */
 	public const SYNC_SKIPPED_ARG = 'perflocale_sync_skipped';
 
@@ -63,51 +57,21 @@ final class MetaBox {
 		add_filter( 'redirect_post_location', [ $this, 'add_sync_skipped_arg' ], 10, 2 );
 		add_filter( 'wp_redirect', [ $this, 'add_bulk_sync_skipped_arg' ], 10, 1 );
 		add_filter( 'removable_query_args', [ $this, 'remove_sync_skipped_arg' ] );
-		// NOTE: the `_perflocale_meta_copy_errors` save_post cleanup is
-		// registered in Bootstrap at always-loaded scope (NOT here),
-		// because MetaBox itself is admin-only (registered behind
-		// `is_admin() && ! wp_doing_ajax()`) and the meta needs to clear
-		// on REST API saves (block editor) and WP-CLI saves too - neither
-		// of which loads MetaBox. See Bootstrap::register_post_meta_cleanup_hooks().
+		// The `_perflocale_meta_copy_errors` cleanup is a save_post hook in Bootstrap: REST and CLI saves skip MetaBox.
 
-		// Filter the category/tag checklist on post.php + post-new.php so
-		// translators only see terms matching the post's current language -
-		// prevents accidentally assigning an English term to a Bulgarian post.
+		// The term checklist shows only terms in the post's language.
 		add_filter( 'wp_terms_checklist_args', [ $this, 'filter_terms_checklist_by_language' ], 10, 2 );
 	}
 
 	/**
-	 * Restrict the taxonomy checklist on post edit screens to terms in the
-	 * same language as the post being edited.
+	 * Restrict the post editor's term checklist to the post's language (two or more languages, opt-out filter).
 	 *
-	 * Core's `wp_terms_checklist()` calls `get_terms()` with the args we
-	 * return here. We can add a lightweight flag that PostQueryFilter +
-	 * TermQueryFilter recognize as "treat this as a language-scoped query"
-	 * (same mechanism the public frontend uses, reused here in admin).
-	 *
-	 * The filter is gated by:
-	 *   - only firing inside post.php / post-new.php for translatable post types
-	 *   - only active when there are 2+ active languages
-	 *   - the `perflocale/admin/filter_terms_checklist` filter (opt-out escape hatch for
-	 *     operators who want the full flat list).
-	 *
-	 * @param mixed $args    Checklist args. Core documents this as `array|string`
-	 *                       (it is whatever the caller handed
-	 *                       `wp_terms_checklist()`, BEFORE core's own
-	 *                       `wp_parse_args()`), and `wp_parse_args()` also
-	 *                       accepts an object - so anything can arrive.
+	 * @param mixed $args    Checklist args as the caller passed them: an array, a query string or an object.
 	 * @param int   $post_id Post ID the checklist is for.
-	 * @return mixed The args, language-scoped when they were an array,
-	 *               otherwise returned exactly as received.
+	 * @return mixed The args, language-scoped when they were an array, otherwise unchanged.
 	 */
 	public function filter_terms_checklist_by_language( $args, int $post_id ) {
-		// `wp_terms_checklist( $post_id, 'taxonomy=category' )` is a documented,
-		// supported call - core's own filter docblock says `array|string $args`
-		// and its `wp_parse_args()` takes a query string or an object too. An
-		// `array` type declaration turned any such caller into a TypeError at
-		// argument binding, before this method's own guards could run. Hand a
-		// non-array shape straight back UNCHANGED: coercing it to an array here
-		// would silently discard the caller's arguments instead.
+		// A query string or object is valid input (no array type hint): return it unchanged, not coerced.
 		if ( ! is_array( $args ) ) {
 			return $args;
 		}
@@ -127,8 +91,7 @@ final class MetaBox {
 		/**
 		 * Filter whether to scope the taxonomy checklist to the post's language.
 		 *
-		 * Return false to restore core WordPress behaviour (show all terms
-		 * regardless of language).
+		 * Return false to show all terms, as core does.
 		 *
 		 * @hook perflocale/admin/filter_terms_checklist
 		 * @param bool $enabled Default true when 2+ languages active.
@@ -151,8 +114,7 @@ final class MetaBox {
 		$post_lang = $manager->detect_post_language( $post_id );
 
 		if ( ! $post_lang ) {
-			// Post has no language yet (fresh "Add new") - fall back to
-			// default language so the checklist doesn't span all languages.
+			// A new post has no language yet: use the default language.
 			$default = $lang_repo->get_default();
 			if ( ! $default ) {
 				return $args;
@@ -160,20 +122,14 @@ final class MetaBox {
 			$post_lang = $default;
 		}
 
-		// The checklist's get_terms() call is routed through TermQueryFilter,
-		// which reads the `perflocale_language_id` arg as the highest-priority
-		// language signal. Passing it explicitly covers both post.php (where
-		// TermQueryFilter would detect the language from the post anyway) AND
-		// post-new.php for a fresh "Add New" with no post context yet.
+		// TermQueryFilter reads this arg first; explicit so post-new.php, without a post context, is scoped too.
 		$args['perflocale_language_id'] = (int) $post_lang->id;
 
 		return $args;
 	}
 
 	/**
-	 * Enqueue the metabox stylesheet (assets/css/metabox.css) on the classic
-	 * post editor of a translatable post type. The block editor uses its own
-	 * sidebar panel and gets nothing here.
+	 * Enqueue the metabox stylesheet on the classic editor of a translatable post type.
 	 *
 	 * @param string $hook Current admin page hook.
 	 * @return void
@@ -248,17 +204,8 @@ final class MetaBox {
 
 		$post_lang = $manager->detect_post_language( $post->ID );
 
-		// ⭐ The language list is SHARED. Every other place this panel appears -
-		// the block-editor sidebar, the Site Editor sidebar, and a host plugin's
-		// own editor screen via TranslationsPanel::mount() - renders the same
-		// rows from the same code, so a change to a row is a change everywhere
-		// instead of a change in one of four near-identical copies.
-		//
-		// What stays HERE is everything below: the language <select> and the two
-		// opt-out checkboxes are form inputs, and they only mean something on a
-		// screen whose submit reaches save_meta_box() on save_post. Rendering
-		// them on a host's own editor would show controls that silently discard
-		// whatever the operator changed.
+		// The shared language list. The inputs below stay here: only save_meta_box() handles them, see
+		// docs-ai/11-code-rationale.md, "TranslationsPanel: host editors".
 		$plugin->get( 'translations_panel' )->render( $post->ID, [ 'context' => 'metabox' ] );
 
 		echo '<div class="perflocale-mb-footer">';
@@ -285,9 +232,7 @@ final class MetaBox {
 		echo '</select>';
 		echo '</div>';
 
-		// Per-post sync opt-out. Products are skipped: the WooCommerce
-		// Advanced-tab checkbox owns the same meta key there, and rendering
-		// both would double the control on one screen.
+		// Not on products: the WooCommerce Advanced-tab checkbox owns the same meta key there.
 		if ( ! in_array( $post->post_type, [ 'product', 'product_variation' ], true ) ) {
 			$optout = get_post_meta( $post->ID, \PerfLocale\Translation\SyncMeta::SYNC_OPTOUT_META, true ) === 'yes';
 
@@ -296,16 +241,12 @@ final class MetaBox {
 			echo '<input type="checkbox" name="perflocale_sync_optout" value="yes"' . checked( $optout, true, false ) . ' style="margin-top:2px;">';
 			echo '<span>' . esc_html__( 'Independent across languages - do not sync this post\'s shared fields (featured image, configured sync fields) with its translations, in either direction.', 'perflocale' ) . '</span>';
 			echo '</label>';
-			// Marker so programmatic saves that never render this box cannot
-			// clear the flag (an unchecked checkbox is indistinguishable from
-			// an absent one without it).
+			// Marker: an unchecked box sends nothing, so only a submit with this marker may clear the flag.
 			echo '<input type="hidden" name="perflocale_sync_optout_present" value="1">';
 			echo '</div>';
 		}
 
-		// Per-post SEO opt-out - drops this translation from hreflang tags
-		// and sitemap alternate links. Rendered for products too (unlike the
-		// sync opt-out above, no other UI owns this flag).
+		// SEO opt-out (hreflang and sitemap alternates), on products too: no other UI owns this flag.
 		$seo_excluded = get_post_meta( $post->ID, \PerfLocale\Helper::SEO_EXCLUDE_META, true ) === 'yes';
 
 		echo '<div class="perflocale-mb-footer">';
@@ -325,10 +266,7 @@ final class MetaBox {
 	 * @return void
 	 */
 	public function save_meta_box( int $post_id, ?\WP_Post $post = null ): void {
-		// WordPress re-reads the row after the write and hands the hook
-		// whatever it got, which is null when the post was deleted in the
-		// interim; some plugins also fire save_post with one argument. A
-		// non-nullable hint turned either into an uncaught TypeError.
+		// Nullable: core passes null for a post deleted after the write, and some plugins pass one argument.
 		if ( ! $post instanceof \WP_Post ) {
 			return;
 		}
@@ -341,9 +279,7 @@ final class MetaBox {
 			return;
 		}
 
-		// The form belongs to the post being edited. Another post saved in the
-		// same request (a translation the sync writes, a stub created on
-		// publish) keeps its own values.
+		// The form is for its own post (post_ID), not a sibling or stub saved in the same request.
 		$form_post = isset( $_POST['post_ID'] ) && is_scalar( $_POST['post_ID'] ) ? absint( $_POST['post_ID'] ) : 0;
 
 		if ( $form_post !== $post_id ) {
@@ -358,8 +294,7 @@ final class MetaBox {
 			return;
 		}
 
-		// Sync opt-out checkbox - only when the box that renders it actually
-		// submitted (marker present), so REST/CLI saves never clear the flag.
+		// Only when the box submitted (marker present), so REST and CLI saves never clear the flag.
 		if ( isset( $_POST['perflocale_sync_optout_present'] ) ) {
 			if ( isset( $_POST['perflocale_sync_optout'] ) ) {
 				update_post_meta( $post_id, \PerfLocale\Translation\SyncMeta::SYNC_OPTOUT_META, 'yes' );
@@ -368,9 +303,7 @@ final class MetaBox {
 			}
 		}
 
-		// SEO-exclude checkbox - same marker guard. Stale hreflang transients
-		// are cleared by CacheInvalidator::on_save_post (post + siblings) on
-		// this same save request, so no extra invalidation is needed here.
+		// Same marker guard; CacheInvalidator::on_save_post clears the hreflang caches on this save.
 		if ( isset( $_POST['perflocale_seo_exclude_present'] ) ) {
 			if ( isset( $_POST['perflocale_seo_exclude'] ) ) {
 				update_post_meta( $post_id, \PerfLocale\Helper::SEO_EXCLUDE_META, 'yes' );
@@ -385,10 +318,7 @@ final class MetaBox {
 			$manager = new PostTranslationManager( $this->cache, \PerfLocale\Plugin::get_instance()->get( 'settings' ) );
 
 			if ( ! $manager->set_post_language( $post_id, $language ) ) {
-				// Surface the failure to the user who just clicked Update -
-				// without this, the editor silently shows the OLD language
-				// on next load and the user assumes their choice stuck.
-				// Same one-shot transient pattern as maybe_show_language_save_error.
+				// Shown once by maybe_show_language_save_error(); otherwise the editor silently shows the old language.
 				$user_id = get_current_user_id();
 
 				if ( $user_id > 0 ) {
@@ -411,9 +341,7 @@ final class MetaBox {
 	/**
 	 * One-shot error notice when a post or term language save failed.
 	 *
-	 * Written by save_meta_box() here and TermMetaBox::save_term_language()
-	 * - both funnel through the same per-user transient so this single
-	 * renderer covers post AND term screens (admin_notices fires on both).
+	 * TermMetaBox::save_term_language() writes the same per-user transient, so this covers term screens too.
 	 *
 	 * @return void
 	 */
@@ -439,10 +367,7 @@ final class MetaBox {
 	}
 
 	/**
-	 * Edit-screen save: the redirect back to the editor carries the number
-	 * of translations the save's Sync Fields did not reach because the
-	 * saver may not edit them, counting those where a value would have
-	 * changed (ContentSync::skipped_siblings()).
+	 * Add the skipped-translations count (ContentSync::skipped_siblings()) to the edit-screen save redirect.
 	 *
 	 * @param string|mixed $location Redirect URL.
 	 * @param int|mixed    $post_id  Saved post.
@@ -459,13 +384,9 @@ final class MetaBox {
 	}
 
 	/**
-	 * Bulk Edit on a post list: the redirect back to the list carries the
-	 * number of translations the edited posts' Sync Fields did not reach
-	 * because the user may not edit them, counting those where a value would
-	 * have changed (ContentSync::bulk_skipped()). After any bulk action the
-	 * argument is first removed from the redirect, which core builds from
-	 * the list's own address, so an earlier count is not shown again. Every
-	 * other redirect is left alone.
+	 * Add the skipped-translations count (ContentSync::bulk_skipped()) to the Bulk Edit redirect.
+	 *
+	 * Core builds that redirect from the list's address, so an earlier count is removed first.
 	 *
 	 * @param string|mixed $location Redirect URL.
 	 * @return string|mixed
@@ -497,10 +418,9 @@ final class MetaBox {
 	}
 
 	/**
-	 * Warning after an edit-screen save, or a Bulk Edit on a post list,
-	 * whose Sync Fields did not reach some translations because the user may
-	 * not edit them. Display only: the count comes from the redirect of that
-	 * save.
+	 * Warning that a save or Bulk Edit did not copy Sync Fields to translations the user may not edit.
+	 *
+	 * Display only: the count comes from that save's redirect.
 	 *
 	 * @return void
 	 */
@@ -528,16 +448,9 @@ final class MetaBox {
 	}
 
 	/**
-	 * Surface copy_* failures from `create_translation()` to the
-	 * translator who just opened the freshly-created translation post.
+	 * Warn which steps of create_translation() failed to copy (`_perflocale_meta_copy_errors`).
 	 *
-	 * `PostTranslationManager::create_translation()` stores per-step
-	 * failures in the `_perflocale_meta_copy_errors` post meta when
-	 * any of copy_post_meta / copy_featured_image / copy_taxonomy_terms
-	 * throw. Without surfacing them, the translator sees a translation
-	 * with missing featured image / ACF fields / categories and no
-	 * explanation. We render a one-shot warning and delete the meta so
-	 * the notice only shows once.
+	 * Read-only: Bootstrap's save_post hook clears the meta on the next real save.
 	 *
 	 * @return void
 	 */
@@ -547,17 +460,12 @@ final class MetaBox {
 			return;
 		}
 
-		$post_id = isset( $_GET['post'] ) ? absint( wp_unslash( $_GET['post'] ) ) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- this method is purely read-only since the state-change (delete_post_meta) was moved to clear_meta_copy_errors_on_save on the save_post hook (which WP-core has already nonce-verified). The capability check below is belt-and-braces defensive depth, not the primary security boundary.
+		$post_id = isset( $_GET['post'] ) ? absint( wp_unslash( $_GET['post'] ) ) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only: Bootstrap's save_post callback clears the warning meta behind core's save nonce; the capability check below is defence in depth.
 		if ( $post_id <= 0 ) {
 			return;
 		}
 
-		// Defensive capability check on the post_id parsed from $_GET. WP's
-		// admin_notices hook fires after the post.php pre-screen capability
-		// gate (an unauthorized user gets the "Sorry, you are not allowed to
-		// edit this item." page before we run), so reaching this code path
-		// already implies the user can edit $post_id. Repeating the check
-		// here makes the intent explicit.
+		// Defence in depth: post.php already refused a user who may not edit this post.
 		if ( ! current_user_can( 'edit_post', $post_id ) ) {
 			return;
 		}
@@ -567,10 +475,7 @@ final class MetaBox {
 			return;
 		}
 
-		// State change moved to clear_meta_copy_errors_on_save (save_post
-		// hook). The notice persists across views until the user takes a
-		// real save action - better educational UX and removes the
-		// "GET-driven state change" pattern entirely from this callback.
+		// No state change on this GET: the notice stays until the next real save.
 
 		$step_label_map = [
 			'post_meta'      => __( 'post meta + custom fields', 'perflocale' ),
@@ -584,8 +489,7 @@ final class MetaBox {
 			$step_labels[ $step ] = $step_label_map[ $step ] ?? $step;
 		}
 
-		// Escape late: the dynamic value is escaped with esc_html() at the
-		// point of output, inside the wp_kses_post()-allowed notice markup.
+		// Escaped late, at the output.
 		printf(
 			'<div class="notice notice-warning is-dismissible"><p>%s</p></div>',
 			esc_html(

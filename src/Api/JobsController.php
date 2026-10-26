@@ -1,6 +1,6 @@
 <?php
 /**
- * REST endpoints for the background-jobs system.
+ * REST endpoints of background jobs.
  *
  * @package PerfLocale
  */
@@ -9,6 +9,7 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Api;
 
+use PerfLocale\Background\JobAccess;
 use PerfLocale\Background\JobRunnerFactory;
 use PerfLocale\Background\JobState;
 use PerfLocale\Background\OneTimeDispatch;
@@ -18,21 +19,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Endpoints (namespace `perflocale/v1`):
- *
- *   GET    /jobs                List active jobs (active index + per-job status).
- *   GET    /jobs/{id}           Full detail for one job.
- *   POST   /jobs/{id}/cancel    Mark canceled + unschedule any pending action.
- *   POST   /jobs/{id}/retry     Reset to queued and re-enqueue with same args.
- *   DELETE /jobs/{id}           Hard-delete job state (only for completed/failed/canceled).
- *
- * All routes require the dispatching user's cap OR the supervisor cap.
- * Defaults to `perflocale_translate` (the broadest read perm); cancel /
- * retry / delete additionally require the dispatching user to be the
- * current user OR the current user to have `perflocale_manage_translations`.
- * A retry also requires the capability of the job's type and, when someone
- * other than the dispatcher retries, every right the dispatcher holds: the
- * worker runs the job as the dispatcher.
+ * `perflocale/v1`: GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel, POST /jobs/{id}/retry, DELETE /jobs/{id}
+ * (finished jobs only). Every route needs `perflocale_translate`; one job follows JobAccess::may_handle(). A retry
+ * by another user also needs the job's capability and makes them its owner, so the worker runs with their rights.
  */
 final class JobsController extends RestController {
 
@@ -44,16 +33,9 @@ final class JobsController extends RestController {
 	protected $rest_base = 'jobs';
 
 	/**
-	 * JobState rows keyed by BLOG ID + job id, so a permission_callback and
-	 * its handler share one read. WP_REST_Server reuses this controller
-	 * instance for every dispatch in the process, so each per-job permission
-	 * check reads the row afresh (one read per dispatch) and every handler
-	 * that changes the row drops its entry.
-	 *
-	 * The blog id is part of the key because the jobs table is per-blog while
-	 * this memo is not, and a controller instance can outlive a
-	 * switch_to_blog() in a CLI or worker context rather than a normal REST
-	 * dispatch.
+	 * JobState rows by blog id + job id, so a permission_callback and its handler share one read. The server reuses
+	 * this instance per dispatch, so each permission check reads afresh and each handler that changes the row drops it;
+	 * the blog id is in the key because the instance can outlive a switch_to_blog().
 	 *
 	 * @var array<string, array<string, mixed>|null>
 	 */
@@ -70,8 +52,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Memoised JobState::get(). Returns the row this dispatch's
-	 * permission_callback already read; on a miss reads through.
+	 * JobState::get() through the memo: the row this dispatch's permission_callback read, else a fresh read.
 	 *
 	 * @param string $id Job UUID.
 	 * @return array<string, mixed>|null
@@ -87,7 +68,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Reads the row from JobState and stores it for this dispatch's handler.
+	 * Read the row from JobState and keep it for this dispatch's handler.
 	 *
 	 * @param string $id Job UUID.
 	 * @return array<string, mixed>|null
@@ -100,7 +81,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Drops the stored row after a handler changed it.
+	 * Drop the kept row after a handler changed it.
 	 *
 	 * @param string $id Job UUID.
 	 * @return void
@@ -110,10 +91,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * The job id the route's URL names, '' when it names none.
-	 *
-	 * The URL segment only: get_param() prefers a body or query `id`, which
-	 * would name a different job than the route.
+	 * The job id in the route's URL ('' for none); not get_param(), which prefers a body or query `id`.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return string
@@ -178,28 +156,24 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * GET /jobs - list active jobs (newest first).
-	 *
-	 * Returns the bounded active-index - never the full per-job payload,
-	 * which would be expensive to serialize on every poll. Clients fetch
-	 * `/jobs/{id}` for the row they want to expand.
+	 * GET /jobs: the active jobs, newest first, as summaries; `/jobs/{id}` gives one job's detail.
 	 *
 	 * @return \WP_REST_Response
 	 */
 	public function list_jobs(): \WP_REST_Response {
 		$jobs        = [];
-		$is_super    = current_user_can( 'perflocale_manage_translations' );
 		$current_uid = (int) get_current_user_id();
+		$allowed     = [ [], [] ];
 
-		// list_active_summary() omits args/result/log - this endpoint only
-		// reads a few small fields per row, so pulling the LONGTEXT columns
-		// every 5 s on the polling client is pure wasted bytes-on-wire.
+		// Summary rows: no args, result or log columns on a client polling every 5 s.
 		foreach ( JobState::list_active_summary() as $job_id => $row ) {
-			// Non-supervisors only see jobs they dispatched. `created_by` is
-			// already hydrated on every $row by list_active() (it runs SELECT *
-			// through the same hydrate() that JobState::get() uses), so the
-			// previous per-row JobState::get() re-fetch was a pure N+1.
-			if ( ! $is_super && (int) ( $row['created_by'] ?? 0 ) !== $current_uid ) {
+			// JobAccess per type and owner kind, asked once each; status fields only, so no content check.
+			$type = is_string( $row['type'] ?? null ) ? $row['type'] : '';
+			$mine = $current_uid > 0 && (int) ( $row['created_by'] ?? 0 ) === $current_uid ? 1 : 0;
+
+			$allowed[ $mine ][ $type ] ??= $mine ? JobAccess::may_handle_own( $type ) : JobAccess::may_handle_others( $type );
+
+			if ( ! $allowed[ $mine ][ $type ] ) {
 				continue;
 			}
 
@@ -224,7 +198,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * GET /jobs/{id} - full detail for one job.
+	 * GET /jobs/{id}: one job's detail.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
@@ -234,9 +208,7 @@ final class JobsController extends RestController {
 
 		$state = $this->get_job_state( $id );
 
-		// Return 404 (not 403) when the user lacks access. 403 would leak
-		// whether the ID exists at all; 404 keeps non-existent and
-		// not-yours indistinguishable from the caller's perspective.
+		// 404, not 403: whether another user's job exists stays hidden.
 		if ( ! $state || ! $this->user_can_read( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
@@ -245,7 +217,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * POST /jobs/{id}/cancel - mark canceled + unschedule.
+	 * POST /jobs/{id}/cancel: mark canceled and unschedule.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
@@ -254,15 +226,12 @@ final class JobsController extends RestController {
 		$id    = $this->url_id( $request );
 		$state = $this->get_job_state( $id );
 
-		// 404 covers both "row missing" and "not yours" so the existence
-		// of jobs you don't own isn't observable via the cancel endpoint.
+		// 404 for missing and not yours alike.
 		if ( ! $state || ! $this->user_can_mutate( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		// 409 on terminal status - distinct from 404 so the API client can
-		// distinguish "already done, nothing to cancel" from "no such job".
-		// Safe to disclose because the caller already proved ownership above.
+		// 409 for a finished job, distinct from 404; safe after the access check.
 		if ( ! in_array( (string) $state['status'], [ 'queued', 'running' ], true ) ) {
 			return new \WP_Error(
 				'rest_invalid_state',
@@ -271,10 +240,8 @@ final class JobsController extends RestController {
 			);
 		}
 
-		// Record the cancel BEFORE removing the worker event or the locks. If
-		// the write does not land, nothing else is touched: the job keeps its
-		// event and its worker keeps its lock. An event that fires after the
-		// write finds a canceled row and stands down.
+		// The cancel is recorded before the event and locks go: if the write fails nothing else changes, and an event
+		// firing after it finds a canceled row.
 		$canceled = JobState::cancel( $id );
 		$this->forget_job_state( $id );
 
@@ -282,7 +249,7 @@ final class JobsController extends RestController {
 			$latest = JobState::get( $id );
 			$status = $latest ? (string) $latest['status'] : '';
 
-			// A concurrent cancel already landed: finish the cleanup below.
+			// A concurrent cancel landed: finish the cleanup.
 			if ( 'canceled' !== $status ) {
 				if ( JobState::is_terminal( $status ) ) {
 					return new \WP_Error(
@@ -305,15 +272,8 @@ final class JobsController extends RestController {
 
 		JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $id );
 
-		// Release the locks held by the (now-canceled) worker. The per-JOB
-		// lock is keyed by this job id, so it is dropped unconditionally even
-		// though the acquiring request was a different one. The per-TYPE lock
-		// is shared by every job of the type: a blind delete here could free a
-		// lock another worker is legitimately holding and let two same-type
-		// workers run at once, so it is only released when this request owns
-		// it. Otherwise it clears when the canceled worker notices the
-		// cancellation in its `finally`, or when its TTL
-		// (JobLock::DEFAULT_TTL, 30 min) lapses. Both calls are idempotent.
+		// The job lock names this job only, so it is dropped although another request holds it. The type lock is shared:
+		// released only when this request owns it, else by the worker's finally or its TTL.
 		\PerfLocale\Background\JobLock::release( $id );
 		\PerfLocale\Background\JobLock::release_type( (string) $state['type'] );
 
@@ -322,7 +282,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * POST /jobs/{id}/retry - reset to queued and re-enqueue.
+	 * POST /jobs/{id}/retry: reset to queued and enqueue again.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
@@ -331,12 +291,12 @@ final class JobsController extends RestController {
 		$id    = $this->url_id( $request );
 		$state = $this->get_job_state( $id );
 
-		// 404 covers "row missing" + "not yours" identically.
+		// 404 for missing and not yours alike.
 		if ( ! $state || ! $this->user_can_mutate( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		// Only retry-able from a terminal status.
+		// Only failed or canceled jobs.
 		if ( ! in_array( (string) $state['status'], [ 'failed', 'canceled' ], true ) ) {
 			return new \WP_Error(
 				'rest_invalid_state',
@@ -345,64 +305,47 @@ final class JobsController extends RestController {
 			);
 		}
 
-		// Pre-flight cap re-check: the dispatcher's capability may have
-		// been revoked since the original dispatch. The worker performs
-		// the same check and marks failed if it fails, but doing it here
-		// gives the operator immediate REST-level feedback instead of a
-		// "queued → failed" round trip via the runner. The retrying user
-		// must hold the same capability on this site.
-		$type       = (string) $state['type'];
-		$created_by = (int) ( $state['created_by'] ?? 0 );
-		$factory    = \PerfLocale\Background\WorkerRegistry::factory_for_type( $type );
+		// The retrying user needs the job's capability; another user's retry makes them the owner, so the worker runs it
+		// with their rights (it runs as `created_by`).
+		$type    = (string) $state['type'];
+		$current = (int) get_current_user_id();
+		$owner   = (int) ( $state['created_by'] ?? 0 ) === $current ? -1 : $current;
+		$factory = \PerfLocale\Background\WorkerRegistry::factory_for_type( $type );
+
+		// A type whose worker is not registered here (stock jobs) is checked against JobAccess's capability for it.
+		$required_cap = JobAccess::type_capability( $type );
+
 		if ( is_callable( $factory ) ) {
 			try {
 				$probe_job = $factory();
 				if ( $probe_job instanceof \PerfLocale\Background\AbstractJob ) {
 					$required_cap = $probe_job->get_required_capability();
-
-					if ( $created_by > 0 && ! user_can( $created_by, $required_cap ) ) {
-						return new \WP_Error(
-							'rest_forbidden',
-							__( 'Original dispatcher no longer holds the capability for this job.', 'perflocale' ),
-							[ 'status' => 403 ]
-						);
-					}
-
-					if ( ! current_user_can( $required_cap ) ) {
-						return new \WP_Error(
-							'rest_forbidden',
-							__( 'You do not have permission to run this job.', 'perflocale' ),
-							[ 'status' => 403 ]
-						);
-					}
 				}
 			} catch ( \Throwable $e ) {
-				// Factory blew up; let the worker handle it and mark failed.
-				// Falls through to the rights check and the enqueue below.
+				// The factory failed; the worker marks the job failed.
 				unset( $e );
+				$required_cap = '';
 			}
 		}
 
-		// The worker runs the job as its dispatcher, so a retry by another
-		// user must not hand the job rights that user does not hold.
-		if ( ! $this->holds_dispatcher_rights( $created_by ) ) {
+		if ( '' !== $required_cap && ! current_user_can( $required_cap ) ) {
 			return new \WP_Error(
 				'rest_forbidden',
-				__( 'This job runs with the permissions of the user who started it, and that user has permissions you do not have. Start the job again yourself instead.', 'perflocale' ),
+				__( 'You do not have permission to run this job.', 'perflocale' ),
 				[ 'status' => 403 ]
 			);
 		}
 
-		// Re-inject the blog-id sentinel so the worker can switch_to_blog
-		// before reading the per-blog JobState row. Without this, retries
-		// of jobs dispatched from a non-main multisite site would orphan.
+		// The blog-id sentinel, so the worker reads the right blog's row.
 		$blog_id     = (int) ( $state['blog_id'] ?? 0 );
 		$worker_args = \PerfLocale\Background\WorkerRegistry::with_blog_sentinel(
 			(array) ( $state['args'] ?? [] ),
 			$blog_id
 		);
 
-		$reset = JobState::reset_for_retry( $id, true );
+		// Only the row version checked above is reset: a racing retry gets the 409 below.
+		$version = $state['version'] ?? null;
+		$reset   = is_int( $version ) && JobState::reset_for_retry( $id, true, -1, $owner, $version );
 		$this->forget_job_state( $id );
 
 		if ( ! $reset ) {
@@ -413,11 +356,16 @@ final class JobsController extends RestController {
 			);
 		}
 
-		// Record which engine actually re-queued the job (mirrors
-		// WorkerRegistry::schedule_recording_engine): if the operator switched
-		// runner engines since the original enqueue, later cancel /
-		// is_scheduled probes would otherwise target the WRONG store and
-		// silently misfire.
+		if ( $owner > 0 ) {
+			JobState::append_log(
+				$id,
+				/* translators: %d: user ID. */
+				sprintf( __( 'Retried by user %d; the job now runs with that user\'s permissions.', 'perflocale' ), $owner )
+			);
+		}
+
+		// Store the engine that queued it (as WorkerRunner::schedule_recording_engine()), so cancel and is_scheduled
+		// probe the right store.
 		$runner = JobRunnerFactory::pick();
 		try {
 			$runner->enqueue(
@@ -426,10 +374,7 @@ final class JobsController extends RestController {
 				$id
 			);
 		} catch ( \Throwable $e ) {
-			// The row is `queued` with no worker event behind it. Put it back
-			// to `failed` (retryable at once) rather than leave it for the
-			// watchdog. Never delete it (it is the operator's history) and
-			// never re-enqueue here.
+			// Queued with no event behind it: back to failed (retryable at once), never deleted, never enqueued here.
 			$message = sprintf(
 				/* translators: %s is the runner's error message. */
 				__( 'Failed to enqueue background job: %s', 'perflocale' ),
@@ -446,11 +391,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * DELETE /jobs/{id} - hard-delete the job state row + active-index entry.
-	 *
-	 * Only allowed on jobs that have already finished (complete/failed/
-	 * canceled). Running / queued jobs must be canceled first, so the
-	 * runner has a chance to unschedule cleanly.
+	 * DELETE /jobs/{id}: delete the row of a finished job (complete, failed, canceled); cancel a live one first.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return \WP_REST_Response|\WP_Error
@@ -459,21 +400,21 @@ final class JobsController extends RestController {
 		$id    = $this->url_id( $request );
 		$state = $this->get_job_state( $id );
 
-		// 404 covers "row missing" + "not yours" identically (security).
+		// 404 for missing and not yours alike.
 		if ( ! $state || ! $this->user_can_mutate( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		if ( ! in_array( (string) $state['status'], [ 'complete', 'failed', 'canceled' ], true ) ) {
+		$deleted = JobState::delete_finished( $id );
+		$this->forget_job_state( $id );
+
+		if ( ! $deleted ) {
 			return new \WP_Error(
 				'rest_invalid_state',
 				__( 'Cancel the job before deleting it.', 'perflocale' ),
 				[ 'status' => 409 ]
 			);
 		}
-
-		JobState::delete( $id );
-		$this->forget_job_state( $id );
 
 		return rest_ensure_response(
 			[
@@ -484,7 +425,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Read permission - any user who can translate may see the queue.
+	 * Read permission: any user who can translate sees the queue.
 	 *
 	 * @return bool|\WP_Error
 	 */
@@ -496,7 +437,7 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Coarse mutate permission - finer per-job check happens in {@see user_can_mutate()}.
+	 * Coarse mutate permission; the per-job check is user_can_mutate().
 	 *
 	 * @return bool|\WP_Error
 	 */
@@ -508,14 +449,8 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Per-job READ permission. Routes the cap check + per-job ownership
-	 * / supervisor check at the permission_callback layer so the request
-	 * is rejected before reaching the handler.
-	 *
-	 * Returns 404 (not 403) when the user lacks per-job access, so the
-	 * existence of a job ID owned by another translator isn't observable.
-	 * The handler keeps its own check too - defense in depth, and so any
-	 * internal caller still gets the gate.
+	 * Per-job read permission at the permission_callback, 404 when denied so another user's job id is not observable.
+	 * The handler checks again.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return bool|\WP_Error
@@ -528,8 +463,7 @@ final class JobsController extends RestController {
 
 		$id = $this->url_id( $request );
 		if ( $id === '' ) {
-			// Should never happen - the route regex enforces 8-64 chars -
-			// but defensively reject malformed paths at the gate.
+			// The route regex already enforces 8-64 characters.
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
@@ -542,11 +476,8 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Per-job MUTATE permission (cancel / retry / delete). Same shape as
-	 * {@see read_job_permissions_check()} but routes through user_can_mutate
-	 * - currently identical to user_can_read, but kept as a separate hook
-	 * so future tightening (e.g. supervisor-only delete) only changes one
-	 * predicate.
+	 * Per-job mutate permission (cancel, retry, delete), as read_job_permissions_check() through user_can_mutate(),
+	 * a separate predicate so a stricter rule changes one place.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return bool|\WP_Error
@@ -571,29 +502,17 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Per-job mutate permission. The current user must either be the
-	 * dispatching user, or hold `perflocale_manage_translations`
-	 * (supervisor cap).
+	 * Per-job mutate permission (cancel, retry, delete): JobAccess::may_handle().
 	 *
 	 * @param array<string, mixed> $state Job state row.
 	 * @return bool
 	 */
 	private function user_can_mutate( array $state ): bool {
-		$created_by = (int) ( $state['created_by'] ?? 0 );
-		$current    = (int) get_current_user_id();
-
-		if ( $created_by > 0 && $current === $created_by ) {
-			return true;
-		}
-
-		return current_user_can( 'perflocale_manage_translations' );
+		return JobAccess::may_handle( $state );
 	}
 
 	/**
-	 * Per-job read permission. Same scoping as {@see user_can_mutate()}:
-	 * the dispatcher always sees their own row; everyone else needs the
-	 * supervisor cap. Prevents one translator from observing another's
-	 * job IDs, types, error messages, or log buffers.
+	 * Per-job read permission: JobAccess::may_handle(), as {@see user_can_mutate()}.
 	 *
 	 * @param array<string, mixed> $state Job state row.
 	 * @return bool
@@ -603,89 +522,48 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * Whether the current user holds every right of a job's dispatcher on
-	 * this site.
+	 * Per request: whether a job type's worker runs without a user.
 	 *
-	 * The worker runs a job as its dispatcher (`created_by`). A user who
-	 * retries someone else's job may do so only when that identity gives the
-	 * job nothing the retrying user lacks: on a network, super admin rights
-	 * need a super admin; everywhere, each capability the dispatcher holds
-	 * must be held by the retrying user. Role names are not compared (an
-	 * administrator does not hold the `editor` role capability), and a
-	 * capability the dispatcher holds in the role but not in effect (a site
-	 * administrator's `unfiltered_html` on a network) is skipped. A job with
-	 * no dispatcher, or one whose dispatcher no longer exists, runs as nobody:
-	 * the worker refuses it.
+	 * @var array<string, bool>
+	 */
+	private static array $without_user = [];
+
+	/**
+	 * Whether this request's worker of $type runs without a user: its created_by 0 rows are system jobs.
 	 *
-	 * @param int $created_by The job's dispatcher.
+	 * @param string $type Job type.
 	 * @return bool
 	 */
-	private function holds_dispatcher_rights( int $created_by ): bool {
-		$current = (int) get_current_user_id();
-
-		if ( $created_by <= 0 || $created_by === $current ) {
-			return true;
+	private static function runs_without_user( string $type ): bool {
+		if ( ! isset( self::$without_user[ $type ] ) ) {
+			$factory                     = \PerfLocale\Background\WorkerRegistry::factory_for_type( $type );
+			$job                         = is_callable( $factory ) ? $factory() : null;
+			self::$without_user[ $type ] = $job instanceof \PerfLocale\Background\AbstractJob && $job->runs_without_user();
 		}
 
-		$dispatcher = get_userdata( $created_by );
-
-		if ( ! $dispatcher instanceof \WP_User ) {
-			return true;
-		}
-
-		if ( is_multisite() && is_super_admin( $created_by ) && ! is_super_admin( $current ) ) {
-			return false;
-		}
-
-		$roles = wp_roles();
-
-		foreach ( (array) $dispatcher->allcaps as $cap => $granted ) {
-			$cap = (string) $cap;
-
-			if ( ! $granted || is_numeric( $cap ) || $roles->is_role( $cap ) || current_user_can( $cap ) ) {
-				continue;
-			}
-
-			if ( $dispatcher->has_cap( $cap ) ) {
-				return false;
-			}
-		}
-
-		return true;
+		return self::$without_user[ $type ];
 	}
 
 	/**
-	 * Strip / coerce per-job state into a JSON-safe response shape.
-	 *
-	 * Specifically:
-	 *   - Don't echo raw `args` to non-supervisors (could leak post IDs,
-	 *     file paths). Show a redacted summary.
-	 *   - Coerce all numeric fields to int.
-	 *   - Pass the log ring buffer through as-is - already capped by JobState.
+	 * The job row as a JSON-safe response: numbers as ints, args only for those who may see them, the log as stored.
 	 *
 	 * @param array<string, mixed> $state
 	 * @return array<string, mixed>
 	 */
 	private function sanitize_state_for_response( array $state ): array {
-		// Args carry potentially-sensitive content (file paths, IDs).
-		// Show them to the supervisor cap (so the admin can debug any
-		// job) AND to the original dispatching user (so they can see
-		// what their own job is doing). Every other translator sees a
-		// sentinel - they know args exist but not their contents.
+		// Args can name files and ids: shown to the dispatcher and to a supervisor with the type's capability (JobAccess).
 		$created_by = (int) ( $state['created_by'] ?? 0 );
 		$current    = (int) get_current_user_id();
 		$show_args  = ( $created_by > 0 && $current === $created_by )
-			|| current_user_can( 'perflocale_manage_translations' );
+			|| JobAccess::may_handle_others( is_string( $state['type'] ?? null ) ? $state['type'] : '' );
 
-		// Label for the dispatcher cell in the Jobs admin UI. `created_by`
-		// may be 0 (GDPR anonymisation zeroed it), may point to a user
-		// that no longer exists (admin deleted them without remap), or
-		// may be a regular live user - in which case surface their
-		// display_name (or user_login as fallback) so the UI shows
-		// something human instead of a bare numeric ID.
+		// Dispatcher label: created_by 0 (a system job, or anonymized), a deleted user, or a user's display name.
 		$created_by_label = null;
 		if ( $created_by === 0 ) {
-			$created_by_label = __( '(anonymized)', 'perflocale' );
+			$created_by_label = self::runs_without_user( is_string( $state['type'] ?? null ) ? $state['type'] : '' )
+				/* translators: Shown as who started a background job that runs without a user (e.g. auto-translate on publish). */
+				? __( 'System', 'perflocale' )
+				: __( '(anonymized)', 'perflocale' );
 		} else {
 			$user = get_userdata( $created_by );
 			if ( false === $user ) {
@@ -696,16 +574,15 @@ final class JobsController extends RestController {
 			}
 		}
 
-		// `result` can name a file: for a data_export job it is
-		// `[ 'path' => …, 'bytes' => … ]`. The cap that got the caller this
-		// far is not the one that may download that file
-		// (`perflocale_import_export`), so `path` is gated on the DOWNLOAD
-		// capability, not on $show_args. Keyed on the field name rather than
-		// the job type so an addon job that returns a path is covered too.
-		// Everything else in `result` (`bytes`, counts) stays visible, so the
-		// Jobs UI still shows that the job finished and how large the output
-		// was.
+		// A `path` in the result (data_export) needs the download capability (`perflocale_import_export`), whatever the job
+		// type; the other result fields stay visible.
 		$result = (array) ( $state['result'] ?? [] );
+		unset( $result[ JobState::REQUEUES_KEY ] );
+
+		// A bulk translation's `cut`: the pair its next slice redoes, internal.
+		if ( 'bulk_translate' === ( $state['type'] ?? null ) ) {
+			unset( $result['cut'] );
+		}
 
 		if ( isset( $result['path'] ) && ! current_user_can( 'perflocale_import_export' ) ) {
 			unset( $result['path'] );
@@ -729,8 +606,7 @@ final class JobsController extends RestController {
 			'created_by'       => (int) ( $state['created_by'] ?? 0 ),
 			'created_by_label' => $created_by_label,
 			'blog_id'          => (int) ( $state['blog_id'] ?? 0 ),
-			// Only supervisors / dispatcher see raw args; everyone else gets
-			// a sentinel so the UI knows args exist without leaking values.
+			// Others get a sentinel: args exist, values hidden.
 			'args'             => $show_args ? (array) ( $state['args'] ?? [] ) : null,
 			'args_redacted'    => $show_args ? null : __( '(redacted - supervisors only)', 'perflocale' ),
 		];

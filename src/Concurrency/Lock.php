@@ -16,41 +16,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Atomic, TTL-bounded cross-request lock backed by a raw INSERT IGNORE.
+ * Atomic, TTL-bounded cross-request lock: an `INSERT IGNORE` of a wp_options row holding `<expiry>|<token>`.
  *
- * Uses `INSERT IGNORE INTO wp_options` so the UNIQUE KEY on `option_name`
- * enforces mutual exclusion at the InnoDB row level. A `$wpdb->rows_affected`
- * of 1 means we acquired the lock; 0 means another process already holds it.
- * Unlike WordPress core's `add_option()` (which uses `ON DUPLICATE KEY UPDATE`
- * and could let two concurrent callers both appear to "succeed"), this is a
- * genuine race-free acquire.
- *
- * TTL is encoded in the stored value so a crashed request doesn't permanently
- * wedge the lock - subsequent callers attempt a takeover after the stored
- * expiry has passed.
- *
- * ## Release-token guard
- *
- * Stored value format is `"<expiry>|<token>"` where `<token>` is a per-acquire
- * random hex string. The token is also stashed in {@see $owned} for the
- * acquiring request. {@see release()} does a conditional DELETE that ONLY
- * removes the row when the stored value still matches the acquirer's
- * stamped value - so a holder that ran past its TTL (whose lock was
- * already taken over by another worker) can't accidentally delete the new
- * owner's row.
- *
- * The takeover path in {@see acquire()} uses a true compare-and-swap UPDATE
- * for the same reason: two contenders racing on an expired lock would both
- * succeed with the old DELETE-then-INSERT pattern; only one wins the CAS
- * UPDATE.
- *
- * Intended for fine-grained locks around per-object sync work (inventory
- * sync, content sync, etc.) where transient-based "best effort" guards
- * have a TOCTOU race between get_transient() and set_transient().
- *
- * Acquiring a lock does not refresh the request's options negative cache
- * (`notoptions`), so a critical section that re-reads an option this
- * request may already have read as absent must drop `notoptions` itself.
+ * Not add_option(): its ON DUPLICATE KEY UPDATE can let two callers both succeed. Release and expired takeover are
+ * compare-and-set on the stored value, so a holder past its TTL never deletes its successor's row. Acquiring does not
+ * refresh `notoptions`; see docs-ai/11-code-rationale.md, "Lock: row protocol and option caches".
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
@@ -67,40 +37,21 @@ final class Lock {
 	public const CLEANUP_HOOK = 'perflocale_lock_cleanup';
 
 	/**
-	 * Stored-value separator between expiry timestamp and per-acquire token.
-	 * Fixed literal - never derived from input, so format injection is
-	 * impossible. Tokens are pure hex (see {@see generate_token()}) so they
-	 * never contain this character either.
+	 * Separator between the expiry and the per-acquire token; no token ever contains it.
 	 */
 	private const DELIMITER = '|';
 
 	/**
-	 * Per-request map of lock keys → exact stored value at acquire time.
+	 * Locks this request holds: "blog:option name" => the exact stored value (the CAS value for release()).
 	 *
-	 * Used as the CAS comparison value in {@see release()}. Also doubles as
-	 * a reentry guard - if a hook handler re-enters its own critical section,
-	 * the second {@see acquire()} call short-circuits to false.
-	 *
-	 * Keys are namespaced with the current blog ID on multisite - without
-	 * that, `switch_to_blog( 2 )` followed by `acquire( 'X' )` would see
-	 * `$owned[ 'perflocale_lock_X' ]` from blog 1's earlier acquire and
-	 * short-circuit, even though the lock row lives in a DIFFERENT
-	 * wp_<id>_options table and is genuinely free on blog 2. The blog-id
-	 * prefix in {@see owned_key()} makes the per-request memo isolated
-	 * per blog the same way the underlying options table is.
-	 *
-	 * Cleared on request end (PHP static state).
+	 * A second acquire() of a held lock returns false. Keyed by blog: each blog has its own options table.
 	 *
 	 * @var array<string, string>
 	 */
 	private static array $owned = [];
 
 	/**
-	 * Build the per-blog static key for the {@see $owned} map. On
-	 * single-site WP, get_current_blog_id() returns 1 (the only blog),
-	 * so the prefix is constant and adds no semantic complexity. On
-	 * multisite, switch_to_blog() updates get_current_blog_id() so the
-	 * prefix follows the active context automatically.
+	 * Per-blog key for the {@see $owned} map.
 	 *
 	 * @param string $key Lock option name (already DB-prefixed).
 	 * @return string
@@ -112,22 +63,8 @@ final class Lock {
 	/**
 	 * Seconds until a held lock self-expires, or 0 when it is not held.
 	 *
-	 * ⭐ WHY A CALLER NEEDS THIS. `release()` deliberately only works in the
-	 * process that acquired the lock - it returns early unless `self::$owned`
-	 * has the token - so that one worker cannot steal another's lock. The
-	 * consequence is that a request which FATALS mid-run leaves its lock
-	 * standing until the TTL expires, and the next click gets "another run is
-	 * already in progress" with no hint that the previous one died or how long
-	 * the wait is.
-	 *
-	 * Reported after a real incident: a bulk handler hit PHP's memory limit,
-	 * and every retry for the next two minutes looked like contention with a
-	 * healthy run that was not there. Telling the operator the remaining
-	 * seconds turns a mystery into a wait.
-	 *
-	 * Reads the row directly rather than through `get_option()`: the lock is
-	 * written with `INSERT IGNORE` and is deliberately not autoloaded, so the
-	 * options cache may not have it.
+	 * Only the acquiring process can release(), so a run that fatals holds its lock until the TTL:
+	 * callers show this wait. Reads the row itself; the options cache may not have it.
 	 *
 	 * @param string $name Lock name (unprefixed, as passed to acquire()).
 	 * @return int Seconds remaining, 0 when free or already expired.
@@ -155,9 +92,7 @@ final class Lock {
 	 * Attempt to atomically acquire a named lock.
 	 *
 	 * @param string $name Lock name (will be prefixed to avoid collisions).
-	 * @param int    $ttl Time-to-live in seconds. The lock self-expires
-	 *    after this so a crashed request doesn't block
-	 *    future acquisitions indefinitely.
+	 * @param int    $ttl Seconds until the lock self-expires (frees it after a crash).
 	 * @return bool True if the lock was acquired.
 	 */
 	public static function acquire( string $name, int $ttl = 15 ): bool {
@@ -166,11 +101,7 @@ final class Lock {
 		$key       = self::PREFIX . $name;
 		$owned_key = self::owned_key( $key );
 
-		// Fast path: we already own this lock this request. Recursion-safe -
-		// a re-entrant caller (via hooks) gets the same answer without a DB
-		// round-trip. TTL-aware: if our stored expiry has passed (or another
-		// process's reap_expired dropped it mid-request), drop the stale entry
-		// and fall through to the normal acquire path.
+		// Held by this request: refuse re-entry without a query, unless our expiry has passed.
 		if ( isset( self::$owned[ $owned_key ] ) ) {
 			$owned_expiry = self::parse_expiry( (string) self::$owned[ $owned_key ] );
 			if ( $owned_expiry > 0 && $owned_expiry <= time() ) {
@@ -183,10 +114,7 @@ final class Lock {
 		$expires = time() + max( 1, $ttl );
 		$value   = self::format_value( $expires, self::generate_token() );
 
-		// INSERT IGNORE is atomic at the DB layer - the UNIQUE constraint
-		// check is serialised by InnoDB, so two concurrent callers cannot
-		// both get rows_affected=1. phpcs suppressions: option_name is a
-		// safe constant + controlled input; caller inputs are prepared.
+		// The unique option_name key lets exactly one concurrent INSERT IGNORE affect a row.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$inserted = $wpdb->query(
 			$wpdb->prepare(
@@ -203,9 +131,7 @@ final class Lock {
 			return true;
 		}
 
-		// Row already exists - read the stored expiry directly (bypassing
-		// the object cache which could be stale after another process'
-		// release ran). If it's still live, refuse without further work.
+		// Row exists: read its expiry past the object cache, which another process's release leaves stale.
 		$stored = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
@@ -213,9 +139,7 @@ final class Lock {
 			)
 		);
 
-		// Concurrent release between the INSERT and the SELECT can leave
-		// us with $stored === null (the row vanished). Retry the INSERT
-		// path once - if we still lose, the lock is contended and we bail.
+		// Released between the INSERT and the SELECT: retry the INSERT once.
 		if ( $stored === null ) {
 			$inserted = $wpdb->query(
 				$wpdb->prepare(
@@ -238,16 +162,11 @@ final class Lock {
 		$stored_expiry = self::parse_expiry( (string) $stored );
 
 		if ( $stored_expiry <= 0 || $stored_expiry >= time() ) {
-			// Lock is still live (or unparseable, which we treat as live to
-			// avoid clobbering an unexpected row). Acquire fails.
+			// Live, or unparseable (treated as live: never take over an unexpected row).
 			return false;
 		}
 
-		// Lock has expired - attempt a true CAS takeover. The UPDATE only
-		// matches when the stored value is STILL the same expired one we
-		// just observed; if another contender beat us between SELECT and
-		// UPDATE, their newer value won't match and we cleanly fail to
-		// acquire. Closes the race the older DELETE+INSERT path had.
+		// Expired: CAS takeover, matching only the expired value read above, so one contender wins.
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
@@ -268,11 +187,7 @@ final class Lock {
 	}
 
 	/**
-	 * Release a previously-acquired lock.
-	 *
-	 * Safe to call even if the lock wasn't owned by this request - the
-	 * stored value won't match our (empty) owned token, so the conditional
-	 * DELETE affects zero rows.
+	 * Release a lock this request acquired; a no-op for any other lock.
 	 *
 	 * @param string $name Lock name.
 	 * @return void
@@ -289,10 +204,7 @@ final class Lock {
 			return;
 		}
 
-		// Conditional DELETE that ONLY removes the row when the stored
-		// value still matches what we stamped at acquire time. If another
-		// worker took over after our TTL expired, the row's value is now
-		// different and the DELETE affects zero rows - exactly what we want.
+		// Deletes only our stamped value: a lock taken over after our TTL is left alone.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$wpdb->query(
 			$wpdb->prepare(
@@ -305,15 +217,13 @@ final class Lock {
 	}
 
 	/**
-	 * Push the expiry of a lock this request holds to now + $ttl, so a long
-	 * run keeps a short TTL and a crashed one still frees the lock soon. A
-	 * compare-and-swap on the stored value: a lock another request took over
-	 * is not touched.
+	 * Move a held lock's expiry to $ttl seconds from the current time (CAS: a lock taken over is not touched).
+	 *
+	 * Lets a long run keep a short TTL, so a crashed one still frees the lock soon.
 	 *
 	 * @param string $name Lock name.
-	 * @param int    $ttl  Seconds from now.
-	 * @return bool False when this request does not hold the lock, or no
-	 *              longer does.
+	 * @param int    $ttl  Seconds from the current time.
+	 * @return bool False when this request does not hold the lock.
 	 */
 	public static function extend( string $name, int $ttl ): bool {
 		$wpdb = $GLOBALS['wpdb'] ?? null;
@@ -347,31 +257,18 @@ final class Lock {
 	}
 
 	/**
-	 * Run a callable under a lock. Acquire, execute, release in try/finally.
+	 * Run a callable under a lock, released in a finally block.
 	 *
 	 * @param string   $name Lock name.
 	 * @param int      $ttl TTL in seconds.
 	 * @param callable $callback Callback to run when the lock is held.
-	 * Return value is forwarded to the caller.
-	 * @return mixed Callback return value, or null when the lock could not
-	 * be acquired. (Callers that return null on success can't distinguish
-	 * - wrap the callback to return a sentinel if you need to.)
+	 * @return mixed Callback return value, or null when the lock was busy (return a non-null sentinel to tell them apart).
 	 */
 	public static function with( string $name, int $ttl, callable $callback ): mixed {
-		// Reentry detector (process-local). Recursing into Lock::with() with
-		// the same name is a developer mistake: the inner acquire() will
-		// either fail (returning null and skipping critical work) or - on a
-		// non-row-locking backend - silently double-release at the outer
-		// finally. Either way the outer caller's invariants are broken.
-		// Same-process guard only: cross-request collisions are handled by
-		// acquire()'s row-lock semantics.
+		// Same-request re-entry with the same name is a caller bug: the inner acquire() fails and returns null.
 		static $held = [];
 
-		// Blog-namespace the re-entry key exactly as $owned is (see owned_key):
-		// the same lock NAME on two blogs are independent rows in different
-		// wp_<id>_options tables, so nesting them across a switch_to_blog() is
-		// legitimate - not re-entry - and must not trip the guard or let the
-		// inner finally clear the outer blog's entry early.
+		// Keyed by blog like $owned: the same name on another blog is another row, so nesting it is legitimate.
 		$held_key = self::owned_key( $name );
 
 		if ( isset( $held[ $held_key ] ) ) {
@@ -403,31 +300,16 @@ final class Lock {
 	}
 
 	/**
-	 * Reap expired lock rows from wp_options.
-	 *
-	 * Locks are released explicitly via release() at the end of their
-	 * critical section, but a crashed request (fatal error, OOM, timeout)
-	 * can leak the row. This reaper walks every `perflocale_lock_*` row
-	 * and deletes those whose stored expiry timestamp is in the past -
-	 * safe because an active lock's value is always `time() + ttl`, so
-	 * any in-flight lock has expiry > now.
-	 *
-	 * Scheduled daily from Bootstrap; manually-callable for tests.
+	 * Delete expired and malformed lock rows that crashed requests left (daily cron).
 	 *
 	 * @return int Number of rows deleted.
 	 */
 	public static function reap_expired(): int {
-		// In-flight safety: if uninstall is mid-flight (or the plugin
-		// directory was force-deleted), bail out. We don't touch any
-		// plugin-owned tables here, but checking once at entry future-
-		// proofs against handlers that grow custom-table queries later.
 		if ( \PerfLocale\Plugin::is_uninstalling() ) {
 			return 0;
 		}
 
-		// Capture start time for the recurring-handler tracing/profiling
-		// record. `BackgroundEvents::record_run()` writes it at the end
-		// so the Jobs admin page can show "ran 2 hours ago - took N ms".
+		// For the Jobs page's last-run record.
 		$started_at = time();
 
 		global $wpdb;
@@ -435,17 +317,8 @@ final class Lock {
 		$now    = time();
 		$prefix = self::PREFIX;
 
-		// Self-healing: delete every lock row that is NOT a currently-live
-		// lock. A live lock is our exact shape (`<expiry>|<token>`) whose
-		// expiry is still in the future. Everything else - expired locks,
-		// and any malformed / leftover row that doesn't match our shape -
-		// is swept, so a corrupt value can never permanently block a lock
-		// name. (`acquire()` stays conservative and refuses to TAKE OVER an
-		// unparseable row; the reaper is the one that cleans them up.)
-		// `\\\\` in this double-quoted PHP string → MySQL `\\` → REGEXP `\`.
-		// The expiry is cut before the first `|` with INSTR() and SUBSTR(),
-		// which the SQLite Database Integration runs too (SUBSTRING_INDEX()
-		// is MySQL-only).
+		// Keeps only live `<expiry>|<token>` rows: acquire() never takes over a malformed row, so this clears it.
+		// `\\\\` here is MySQL `\\`, REGEXP `\`; INSTR()/SUBSTR(), not SUBSTRING_INDEX(), for the SQLite integration.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$deleted = (int) $wpdb->query(
 			$wpdb->prepare(
@@ -461,17 +334,9 @@ final class Lock {
 		);
 
 		if ( $deleted > 0 ) {
-			// One blanket cache wipe - cheaper than invalidating each row
-			// individually, and expired locks are cold-path data anyway.
 			wp_cache_delete( 'alloptions', 'options' );
 
-			// Sweep our own static $owned cache of any entries whose stored
-			// expiry has passed. Without this, a long-running request that
-			// holds an expired lock AND runs the daily reap in the same PHP
-			// process keeps thinking it owns the lock - even though we
-			// just deleted its DB row. Same-process coherence only; we
-			// can't see another process's $owned cache, so a remote
-			// reap-while-we-hold remains a documented TTL-lock limitation.
+			// Forget the expired locks just deleted (other processes find out by CAS).
 			$now_check = time();
 			foreach ( self::$owned as $ok => $val ) {
 				$exp = self::parse_expiry( (string) $val );
@@ -481,7 +346,6 @@ final class Lock {
 			}
 		}
 
-		// Record completion time + duration for the observability panel.
 		\PerfLocale\Background\BackgroundEvents::record_run( self::CLEANUP_HOOK, $started_at );
 
 		return $deleted;
@@ -499,27 +363,21 @@ final class Lock {
 	}
 
 	/**
-	 * Generate a per-acquire random token. 16 hex chars from 8 random bytes
-	 * - collision-resistant for the lock's lifetime (we only need uniqueness
-	 * within the TTL window for one option_name, not global uniqueness).
+	 * Generate a per-acquire token, unique within one lock's TTL.
 	 *
-	 * @return string Lowercase hex; never contains {@see DELIMITER}.
+	 * @return string 16 hex characters (uniqid() text without an entropy source); never contains {@see DELIMITER}.
 	 */
 	private static function generate_token(): string {
 		try {
 			return bin2hex( random_bytes( 8 ) );
 		} catch ( \Throwable $e ) {
-			// random_bytes throws if the OS has no entropy source. Fall
-			// back to a microtime + uniqid pair - weaker but still unique
-			// enough for the per-request lifetime of one lock row.
+			// No OS entropy source: weaker, still unique enough for one lock row.
 			return uniqid( '', true ) . dechex( (int) ( microtime( true ) * 1e6 ) );
 		}
 	}
 
 	/**
-	 * Parse the integer expiry timestamp out of either storage format.
-	 * Returns 0 for unparseable values so the caller treats them as
-	 * unknown / still-live (refuse to take over).
+	 * Expiry timestamp of a stored `<expiry>|<token>` value; 0 when unparseable (callers treat it as live).
 	 *
 	 * @param string $stored Raw option_value.
 	 * @return int Unix timestamp, or 0 if unparseable.
@@ -533,11 +391,7 @@ final class Lock {
 
 		$prefix = substr( $stored, 0, $delim_pos );
 
-		// is_ascii_digits() rejects negative numbers, decimals, and the empty
-		// string - so an empty or garbage prefix returns 0 (treated as
-		// unknown / refuse takeover). Defensive against a corrupted row.
-		// It replaces ctype_digit() with the same contract; ext-ctype is
-		// absent on some builds and WordPress polyfills none of it.
+		// Not ctype_digit(): ext-ctype is missing on some builds and WordPress polyfills none of it.
 		if ( $prefix === '' || ! Helper::is_ascii_digits( $prefix ) ) {
 			return 0;
 		}
@@ -546,28 +400,10 @@ final class Lock {
 	}
 
 	/**
-	 * Drop the per-key options cache entry of a lock row written with raw
-	 * SQL, so a later read of that key goes to the database.
+	 * Drop the per-key options cache entry of a lock row written with raw SQL.
 	 *
-	 * Lock rows are written, read and deleted here only with raw SQL, never
-	 * through the options API, so WordPress's shared `notoptions` negative
-	 * cache is left as it is: dropping that whole blob would send the next
-	 * read of every absent option to the database, in this request and,
-	 * with a persistent object cache, in every other one. `alloptions` is
-	 * left as it is too: lock rows use autoload 'no', so they are never in it.
-	 *
-	 * What this leaves:
-	 * - A lock name that `notoptions` lists stays listed while the lock is
-	 *   held. Through the options API a held lock can then read as absent
-	 *   (`get_option()`), and `add_option()`, which skips its existence
-	 *   check for a listed name, can replace a live lock row; the holder's
-	 *   token-checked release() then leaves that row to reap_expired().
-	 *   seconds_remaining() reads the row itself.
-	 * - Acquiring a lock does not refresh this request's `notoptions`. A
-	 *   critical section that re-reads an option this request already saw
-	 *   absent, and that is not in `alloptions`, gets that absence back even
-	 *   when another request has added the row since, unless it drops
-	 *   `notoptions` itself.
+	 * Not `notoptions`: dropping it sends every absent-option read to the database, site-wide under a persistent
+	 * cache. Not `alloptions`: lock rows are never autoloaded. See docs-ai/11-code-rationale.md, "Lock: row protocol and option caches".
 	 *
 	 * @param string $key Option name (prefixed).
 	 * @return void

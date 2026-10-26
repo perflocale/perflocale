@@ -18,21 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Wires PerfLocale into the built-in WordPress privacy tools so site admins
- * can honour data-subject access and erasure requests without writing any
- * glue code:
- *
- * - Tools &rarr; Export Personal Data includes the user’s PerfLocale
- *   user-meta preferences (per-page list lengths + hidden-language column
- *   choices) and the background jobs they dispatched.
- * - Tools &rarr; Erase Personal Data deletes the per-user meta entries and
- *   anonymises job ownership.
- * - Settings &rarr; Privacy &rarr; Policy Guide shows suggested privacy-policy text
- *   that adapts to which features (GeoIP, MT, browser-language detection) are
- *   actually enabled on this site.
- *
- * Nothing here stores or transmits additional data - it surfaces existing
- * records through WordPress’s native privacy surfaces.
+ * Personal data exporter and eraser (user-meta preferences, job ownership) and the suggested policy text.
  */
 final class PrivacyIntegration {
 
@@ -42,9 +28,7 @@ final class PrivacyIntegration {
 	private const SLUG = 'perflocale';
 
 	/**
-	 * Background-job rows per exporter page. WordPress asks for page N+1
-	 * while `done` is false, so this bounds one AJAX request, not the
-	 * export.
+	 * Background-job rows per exporter page: bounds one AJAX request, not the export.
 	 */
 	private const EXPORT_JOBS_PER_PAGE = 200;
 
@@ -106,17 +90,13 @@ final class PrivacyIntegration {
 	}
 
 	/**
-	 * Return the user's PerfLocale admin-UI preferences and the background
-	 * jobs they dispatched, in the shape WordPress expects. The preferences
-	 * are a fixed key set sent on page 1; the jobs are paged by
-	 * EXPORT_JOBS_PER_PAGE, and `done` stays false while a page comes back
-	 * full.
+	 * Export the user's admin-UI preferences (page 1) and the background jobs they dispatched (paged).
 	 *
 	 * @param string $email_address Subject's email.
 	 * @param int    $page          Pagination cursor, 1-based; supplied by WP.
-	 * @return array{data: array<int, array<string, mixed>>, done: bool}
+	 * @return array{data: array<int, array<string, mixed>>, done: bool}|\WP_Error Error when the jobs cannot be read, so the export stops instead of completing without them.
 	 */
-	public function export_personal_data( string $email_address, int $page = 1 ): array {
+	public function export_personal_data( string $email_address, int $page = 1 ) {
 		$user = get_user_by( 'email', $email_address );
 
 		if ( ! $user instanceof \WP_User ) {
@@ -126,19 +106,21 @@ final class PrivacyIntegration {
 			];
 		}
 
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
 		global $wpdb;
 
 		$data = [];
 		$page = max( 1, $page );
 
-		// The preferences are a fixed, small set - emit on page 1 only.
-		// WordPress merges items that share an item_id, so repeating them on
-		// later pages would duplicate their fields in the export.
+		// Page 1 only: WordPress merges items sharing an item_id, so repeats would duplicate the fields.
 		if ( 1 === $page ) {
 			$meta_fields = [];
 
-			// The admin-UI preferences keyed to the user's ID (hidden language
-			// columns, items per page): the registry's user-meta entries.
+			// The registry's user-meta entries (hidden language columns, items per page).
 			foreach ( DataRegistry::user_meta_keys() as $meta_key ) {
 				$value = get_user_meta( (int) $user->ID, $meta_key, true );
 
@@ -162,29 +144,31 @@ final class PrivacyIntegration {
 			}
 		}
 
-		// Background jobs this user dispatched - the eraser zeroes
-		// `created_by` on these rows, so the access request must surface
-		// them too. A chained job (a site-wide machine translation, for one)
-		// writes a row per chunk, so one user can own more rows than a page
-		// holds. WordPress passes only a page number, so pages are
-		// OFFSET-based, like core's comments exporter: each exported row
-		// deleted before the next request (the daily GC, a job deleted from
-		// the Jobs screen or WP-CLI) makes that page skip one later row, and
-		// running the export again includes it. An erasure zeroes every row
-		// in one statement, so it leaves nothing to skip.
+		// The jobs the eraser anonymises. OFFSET paging, as core's comments exporter: a row deleted between
+		// pages skips one later row; see docs-ai/11-code-rationale.md, "PrivacyIntegration: export and erasure".
 		$jobs_table = Schema::table( 'jobs' );
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $jobs_table is Schema::table('jobs'), bound as a %i identifier.
-		$job_rows = (array) $wpdb->get_results(
+		$found = $wpdb->query(
 			$wpdb->prepare(
 				'SELECT uuid, type, status, created_at FROM %i WHERE created_by = %d ORDER BY id ASC LIMIT %d OFFSET %d',
 				$jobs_table,
 				(int) $user->ID,
 				self::EXPORT_JOBS_PER_PAGE,
 				( $page - 1 ) * self::EXPORT_JOBS_PER_PAGE
-			)
+			) ?? ''
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		// query() is false on a database error and on a statement a `query` filter emptied (last_error stays as it was).
+		if ( false === $found ) {
+			return new \WP_Error(
+				'perflocale_export_jobs_failed',
+				__( 'PerfLocale could not read its background-job records. Run the export again.', 'perflocale' )
+			);
+		}
+
+		$job_rows = (array) $wpdb->last_result;
 
 		foreach ( $job_rows as $job ) {
 			$data[] = [
@@ -208,8 +192,7 @@ final class PrivacyIntegration {
 			];
 		}
 
-		// A short page is the last one; a full page may have more behind it
-		// (at worst, one empty page follows).
+		// A short page is the last one (a full last page costs one empty page).
 		return [
 			'data' => $data,
 			'done' => count( $job_rows ) < self::EXPORT_JOBS_PER_PAGE,
@@ -217,16 +200,7 @@ final class PrivacyIntegration {
 	}
 
 	/**
-	 * Erase the user's PerfLocale data: delete their admin-UI preference
-	 * user-meta outright (pure UI state, no shared-history concern) and
-	 * anonymise background jobs they dispatched (zeroing `created_by`
-	 * makes pending runs fail their cap re-validation, which is the right
-	 * behavior for an erased user).
-	 *
-	 * Returns integer counts (not bools) in the `items_removed` and
-	 * `items_retained` fields. WP's privacy controller accepts both forms
-	 * - counts are more accurate and the admin UI aggregates them across
-	 * pages.
+	 * Erase the user's PerfLocale data: delete the preference user-meta and anonymise their background jobs.
 	 *
 	 * @param string $email_address Subject's email.
 	 * @param int    $page          Pagination cursor (single-batch flow; ignored).
@@ -244,17 +218,13 @@ final class PrivacyIntegration {
 			];
 		}
 
-		// 1. Anonymise queued / running / recently-finished background jobs
-		// dispatched by this user. JobState options carry `created_by` -
-		// zeroing it makes pending runs fail their cap re-validation, which
-		// is the right behavior for an erased user. Null means the UPDATE
-		// failed and the rows still carry the user's ID.
+		// Zeroing `created_by` makes the user's pending runs fail their capability check, except a type that runs without a user.
+		// Null: the UPDATE failed and the rows still carry the user's ID.
 		$jobs_result     = \PerfLocale\Background\JobState::try_anonymize_for_user( (int) $user->ID );
 		$jobs_failed     = null === $jobs_result;
 		$jobs_anonymised = (int) $jobs_result;
 
-		// 2. Delete every PerfLocale user-meta entry - these are pure UI
-		// state, no shared-history concern. Runs even when step 1 failed.
+		// Runs even when the job update failed.
 		$meta_deleted = 0;
 
 		foreach ( DataRegistry::user_meta_keys() as $meta_key ) {
@@ -295,18 +265,8 @@ final class PrivacyIntegration {
 			);
 		}
 
-		// Returned as integer counts. Core only checks that both keys
-		// exist, and privacy-tools.js only whether each value is truthy.
-		// Removals: user-meta entries + job-row anonymisations (the
-		// stored value is gone after each). A failed job UPDATE is
-		// reported as one retained item (the row count is unknown). Core
-		// then shows the admin a one-time "not erased" warning beside the
-		// request, but once the last eraser is done it still marks the
-		// request completed and emails the data subject that the erasure
-		// is complete. `done` stays true: privacy-tools.js requests the
-		// next page at once, with no delay and no limit, so `done` = false
-		// would loop forever on a lasting failure (a missing table, a
-		// `query` filter that blocks the statement).
+		// A failed job UPDATE counts as one retained item. `done` stays true: privacy-tools.js requests the next
+		// page at once and without limit, so false would loop forever on a lasting failure.
 		return [
 			'items_removed'  => $meta_deleted + $jobs_anonymised,
 			'items_retained' => $jobs_failed ? 1 : 0,
@@ -318,14 +278,8 @@ final class PrivacyIntegration {
 	/**
 	 * Build the deduplicated pattern list of a user's personal identifiers.
 	 *
-	 * Splits patterns into "always-safe" (email + login, both unique by WP
-	 * design) and "uniqueness-gated" (display_name, full name, individual
-	 * first/last name - only included when no other user on the site shares
-	 * the value). Skips anything < 4 chars throughout.
-	 *
-	 * Public: an add-on reuses the exact same pattern set for
-	 * its own dynamic-string scrub, so the two erasure flows can never
-	 * disagree about what counts as the subject's identifier.
+	 * Email and login always; name fields only when no other user shares them; nothing under 4 characters.
+	 * Public so an add-on's scrub uses the same identifiers as this one.
 	 *
 	 * @param \WP_User $user
 	 * @param int      $user_id
@@ -334,7 +288,7 @@ final class PrivacyIntegration {
 	public static function collect_pii_patterns( \WP_User $user, int $user_id ): array {
 		$patterns = [];
 
-		// Always-safe: globally unique by WP design.
+		// Unique by WordPress design.
 		foreach ( [ (string) $user->user_email, (string) $user->user_login ] as $p ) {
 			$p = trim( $p );
 			if ( strlen( $p ) >= 4 ) {
@@ -342,9 +296,7 @@ final class PrivacyIntegration {
 			}
 		}
 
-		// Uniqueness-gated: name fields. Multiple translators on a site can
-		// share a first/last/display name; scrubbing those would corrupt
-		// notes about other users.
+		// Shared names are skipped: scrubbing them would corrupt notes about other users.
 		$display = trim( (string) $user->display_name );
 		if (
 			strlen( $display ) >= 4
@@ -447,9 +399,7 @@ final class PrivacyIntegration {
 	/**
 	 * Register suggested privacy-policy text on WP’s Privacy Guide page.
 	 *
-	 * Content is dynamic: GeoIP, MT, and browser-language sections only
-	 * appear when those features are actually switched on, so the suggested
-	 * text doesn’t overstate what the site is doing.
+	 * GeoIP, MT and browser-language sections appear only when those features are on.
 	 *
 	 * @return void
 	 */
@@ -462,10 +412,8 @@ final class PrivacyIntegration {
 	}
 
 	/**
-	 * Who receives machine-translation content, as escaped HTML for the policy
-	 * text: the selected provider's label, not its id. The WordPress AI Client
-	 * sends content to whichever AI provider is connected under Settings →
-	 * Connectors, so that is what the text names.
+	 * Who receives machine-translation content, as escaped HTML: the provider's label, or for the AI Client
+	 * the provider connected under Settings > Connectors.
 	 *
 	 * @param string $provider Selected provider id.
 	 * @return string
@@ -499,10 +447,7 @@ final class PrivacyIntegration {
 	}
 
 	/**
-	 * Build the HTML policy-text string the admin sees on Settings &rarr;
-	 * Privacy &rarr; Policy Guide. Split out of {@see add_privacy_policy_content()}
-	 * so the assembly can be inspected by tests + by callers that want to
-	 * surface the same text in a custom UI without re-registering it.
+	 * Build the policy-text HTML for the Privacy Policy Guide; public for tests and custom screens.
 	 *
 	 * @return string Concatenated HTML sections (already escaped per section).
 	 */

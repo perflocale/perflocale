@@ -17,26 +17,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Emits a `Cache-Tag` response header on every frontend HTML response,
- * giving CDNs (Cloudflare, Bunny, Fastly, etc.) per-resource tags they
- * can use for surgical purges - "flush everything tagged `lang:fr_FR`"
- * or "flush `post:42`" without nuking the whole cache.
+ * Emits a `Cache-Tag` header (`lang:fr_FR`, `post:42`, ...) on front-end HTML responses for CDN tag purges.
  *
- * Short-circuits at the earliest point when the feature is disabled,
- * so there's zero overhead for sites that don't use a CDN.
- *
- * Filters:
- * perflocale/cache_tags/enabled (bool) kill switch
- * perflocale/cache_tags/header_name (string) default `Cache-Tag`
- * perflocale/cache_tags/tags (array) modify tags
- * perflocale/cache_tags/max_header_length (int) default 8000 bytes
+ * The off check comes first, so a site without the setting pays one settings read.
  */
 final class CacheTagEmitter {
 
 	/**
-	 * Maximum number of tags emitted per response.
-	 * Keeps the header under typical server/CDN header-size limits even
-	 * when a page happens to collect many tags.
+	 * Maximum tags per response, to stay under server and CDN header-size limits.
 	 */
 	private const MAX_TAGS = 32;
 
@@ -66,15 +54,14 @@ final class CacheTagEmitter {
 	 * @return void
 	 */
 	public function emit(): void {
-		// Kill-switch - setting-backed + filter-backed.
+		// The setting, through the perflocale/cache_tags/enabled filter.
 		$plugin = Plugin::get_instance();
 
 		if ( ! $plugin->has( 'settings' ) || ! $plugin->get( 'settings' )->cdn_cache_tags_enabled() ) {
 			return;
 		}
 
-		// Scope: frontend HTML responses only. Skip admin, AJAX, cron,
-		// REST, XMLRPC, feeds, and already-sent headers.
+		// Front-end HTML responses only.
 		if ( is_admin() ) {
 			return;
 		}
@@ -95,9 +82,7 @@ final class CacheTagEmitter {
 			return;
 		}
 
-		// Excluded paths - match the language-routing exclusion list so
-		// health-check URLs, admin-ajax, or other special endpoints
-		// don't accidentally carry our tags.
+		// The router's excluded paths (health checks, special endpoints) carry no tags.
 		if ( $this->request_is_excluded() ) {
 			return;
 		}
@@ -129,13 +114,7 @@ final class CacheTagEmitter {
 		 */
 		$header_name = (string) apply_filters( 'perflocale/cache_tags/header_name', 'Cache-Tag' );
 
-		// Defensive: HTTP field names are tokens limited to a specific
-		// ASCII subset (RFC 7230 §3.2.6). Strip everything else from the
-		// filtered value before assembling the header string. PHP's
-		// header() already refuses CRLF-laced values (response-splitting
-		// vector), so this is hygiene rather than fix - it guarantees
-		// the emitted header is always wire-format-valid even when a
-		// filter callback returns something unexpected.
+		// A filter may return anything: keep only RFC 7230 token characters.
 		$header_name = (string) preg_replace( "/[^A-Za-z0-9!#$%&'*+\\-.^_`|~]/", '', $header_name );
 
 		if ( $header_name === '' ) {
@@ -163,8 +142,7 @@ final class CacheTagEmitter {
 	}
 
 	/**
-	 * Whether the current request URI matches an excluded path from the
-	 * settings list (same list the router uses to skip language routing).
+	 * Whether the request path matches an excluded path (the list the router skips).
 	 *
 	 * @return bool
 	 */
@@ -216,7 +194,7 @@ final class CacheTagEmitter {
 		$tags   = [ 'perflocale' ];
 		$plugin = Plugin::get_instance();
 
-		// Language tags - always useful.
+		// Language tags.
 		if ( $plugin->has( 'router' ) ) {
 			$lang = $plugin->get( 'router' )->get_current_language();
 
@@ -304,8 +282,7 @@ final class CacheTagEmitter {
 
 			$tag = (string) $tag;
 
-			// Strip anything that isn't ASCII-safe for HTTP headers.
-			// Allow: letters, digits, hyphen, underscore, colon, dot.
+			// Header-safe ASCII only.
 			$tag = preg_replace( '/[^A-Za-z0-9\-_:.]/', '', $tag ) ?? '';
 			$tag = substr( $tag, 0, self::MAX_TAG_LENGTH );
 

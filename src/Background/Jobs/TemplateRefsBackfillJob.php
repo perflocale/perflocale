@@ -19,36 +19,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Points the menu and synced-pattern references of the translated templates
- * and template parts a site already has at their language's translations,
- * once per blog after an update to a version with
- * {@see TemplateBlockRefs}: its rules run when a translation is created or
- * linked, so containers written before carry the source-language references
- * until such an event reaches them, and a container the translator could
- * not edit was skipped.
- *
- * Dispatched from wp-admin (admin_init, by a user who may edit the theme's
- * templates) and run by the job runner (WP-Cron or Action Scheduler), never
- * on a visitor's request; `wp perflocale template-refs-backfill` runs it
- * again inline. The work is TemplateBlockRefs::backfill_page(): keyset pages
- * of container translations, the same rules and compare-and-set write as a
- * create, in time slices that resume from the last container read.
- *
- * The blog's state is the option `perflocale_template_refs_backfill`, in
- * the forms of {@see OneTimeDispatch}: absent until the first dispatch,
- * `claim:<unix time>` while a request dispatches, `queued:<job id>:<unix
- * time>` while the job is queued or running, `done:<unix time>` once it
- * finished (or when the blog had nothing to read), `failed:<unix time>` or
- * `canceled:<unix time>` once its job failed or was canceled. A job that
- * could not read the containers, or could not write one, fails with that
- * reason on its Jobs row and is never recorded as done; once the job
- * runner's automatic retries are used up the state records the failure, and
- * the next dispatch waits until it failed at least an hour ago.
+ * Points the menu and synced-pattern references of a site's existing translated templates and parts at their
+ * language's translations, once per blog: TemplateBlockRefs runs on a create or link, so older containers keep source
+ * references. Queued from wp-admin (maybe_dispatch()); `wp perflocale template-refs-backfill` runs it inline.
  */
 final class TemplateRefsBackfillJob extends AbstractJob {
 
 	/**
-	 * The blog's backfill state.
+	 * The blog's backfill state (OneTimeDispatch forms): absent, `claim:`, `queued:<job id>:`, `done:` (also when
+	 * there was nothing to read), `failed:` or `canceled:` plus a unix time. A failed read or write is never done.
 	 */
 	public const OPTION = 'perflocale_template_refs_backfill';
 
@@ -58,8 +37,7 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 	private const CAPABILITY = 'edit_theme_options';
 
 	/**
-	 * Seconds a failed backfill waits before an admin page view dispatches it
-	 * again.
+	 * Seconds a failed backfill (retries used up) waits before an admin page view dispatches it again.
 	 */
 	private const RETRY_AFTER_FAILED = HOUR_IN_SECONDS;
 
@@ -81,8 +59,7 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Templates and template parts are edited by users who may edit the
-	 * theme's options.
+	 * `edit_theme_options`: who edits templates and template parts.
 	 */
 	public function get_required_capability(): string {
 		return self::CAPABILITY;
@@ -101,11 +78,8 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Result: `read` containers read, `updated` containers written,
-	 * `references` references pointed at a translation, `after` the last
-	 * container read (the resume point). No count is read up front: the
-	 * containers are found page by page, and a run that finds none records
-	 * done.
+	 * Result: `read`, `updated` and `references` counts, and `after` (the resume point). No count up front: containers
+	 * are found page by page, and a run that finds none records done.
 	 *
 	 * @param array<string, mixed> $args     Worker args (`__perflocale_slice` from the worker).
 	 * @param callable             $progress Progress reporter.
@@ -147,8 +121,7 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 			$result['references'] += $page['references'];
 			$result['after']       = $page['next'];
 
-			// Progress as the worker finds it: what was read, of that and one
-			// more page while there is one.
+			// Progress as found: read so far, of that plus one page while another page exists.
 			$progress( $result['read'], 0 === $page['next'] ? max( 1, $result['read'] ) : $result['read'] + self::PAGE );
 
 			if ( 0 === $page['next'] ) {
@@ -164,23 +137,16 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 	}
 
 	/**
-	 * `admin_init`: the first wp-admin request of a user who may run the
-	 * backfill dispatches it, once per blog, and dispatches it again when the
-	 * job it recorded was canceled or is gone, or failed at least an hour
-	 * ago. Decided from the autoloaded state option alone; a queued job's
-	 * row is read at most once per {@see OneTimeDispatch::CHECK_EVERY}
-	 * seconds. The request claims the state first, in one statement, and
-	 * reads no container: of simultaneous admin requests only the one that
-	 * wins the claim dispatches, and the job finds the containers page by
-	 * page. Nothing on any other request.
+	 * `admin_init`: dispatches the backfill once per blog for a user who may run it, and again when its job was
+	 * canceled, is gone or failed at least RETRY_AFTER_FAILED ago. Decided from the autoloaded state (a queued job's
+	 * row is read at most once per OneTimeDispatch::CHECK_EVERY); only the request that wins the claim dispatches.
 	 *
 	 * @return void
 	 */
 	public static function maybe_dispatch(): void {
 		$state = get_option( self::OPTION, '' );
 
-		// Done, the state of every admin request once the backfill ran, stops
-		// here without loading the dispatch class.
+		// Done (every admin request once the backfill ran) stops here without loading the dispatch class.
 		if ( wp_doing_ajax() || ! is_string( $state ) || str_starts_with( $state, 'done:' ) ) {
 			return;
 		}
@@ -196,8 +162,7 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 	}
 
 	/**
-	 * Queue the backfill job and record it as queued over the claim of the
-	 * request that won it ({@see OneTimeDispatch::publish()}).
+	 * Queue the backfill job and record it as queued over this request's claim (OneTimeDispatch::publish()).
 	 *
 	 * @param string $claim The claim this request holds.
 	 * @return void
@@ -205,8 +170,7 @@ final class TemplateRefsBackfillJob extends AbstractJob {
 	private static function dispatch( string $claim ): void {
 		$queued = Dispatcher::enqueue( new self(), [] );
 
-		// Not queued (a veto filter, a refused dispatch): no job id, and the
-		// next admin request tries again.
+		// Not queued (a veto filter, a refused dispatch): no job id, and the next admin request tries again.
 		OneTimeDispatch::publish( self::OPTION, $claim, isset( $queued['job_id'] ) && is_string( $queued['job_id'] ) ? $queued['job_id'] : '' );
 	}
 }

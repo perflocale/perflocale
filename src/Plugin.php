@@ -14,18 +14,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Singleton service container for the PerfLocale plugin.
- *
- * Services are registered as factories (callables) and only instantiated
- * on first access, ensuring minimal memory footprint.
+ * Singleton service container; services are factories built on first access.
  */
 final class Plugin {
 
 	/**
-	 * Stable service-ID constants for the most-used DI services. Addons
-	 * should prefer these over magic strings - the constants are part of
-	 * the @api surface and won't be renamed across minor versions, but the
-	 * string values may change in major versions if the service is split.
+	 * Stable service IDs for the most-used services.
 	 *
 	 * @api
 	 */
@@ -90,9 +84,7 @@ final class Plugin {
 	}
 
 	/**
-	 * Register a service factory.
-	 *
-	 * The factory is not called until the service is first requested via get().
+	 * Register a lazy service factory.
 	 *
 	 * @param string   $id Service identifier (typically the class name).
 	 * @param callable $factory Factory callable that returns the service instance.
@@ -141,12 +133,7 @@ final class Plugin {
 		return isset( $this->factories[ $id ] );
 	}
 
-	// ─────────────────────────────────────────────────────────────────
-	// Typed accessors - IDE-autocomplete + type-safe lookups for the
-	// most-used services. Addons can call these instead of `get( '…' )`
-	// to get the right return type without casting. Marked @api: stable
-	// across the 1.x line.
-	// ─────────────────────────────────────────────────────────────────
+	// Typed accessors for the most-used services (stable @api for add-ons).
 
 	/**
 	 * @api
@@ -215,8 +202,6 @@ final class Plugin {
 	/**
 	 * Boot all eager services and call register_hooks() on them.
 	 *
-	 * Called once during plugin initialization.
-	 *
 	 * @return void
 	 */
 	public function boot(): void {
@@ -242,18 +227,10 @@ final class Plugin {
 	}
 
 	/**
-	 * Whether the plugin is currently being uninstalled.
+	 * Whether the plugin is being uninstalled.
 	 *
-	 * Hooked handlers (recurring AS / WP-Cron callbacks) can call this
-	 * to bail out cleanly when an action fires after `uninstall.php` has
-	 * begun dropping tables/options out from under them. WordPress sets
-	 * `WP_UNINSTALL_PLUGIN` for the duration of the uninstall request,
-	 * so any code that runs in that request can detect the state.
-	 *
-	 * Also returns true if the plugin's main file is gone from disk -
-	 * a defensive belt-and-braces check for the (rare) case where the
-	 * plugin directory was deleted outside the normal uninstall flow
-	 * (e.g. force-delete via FTP, broken host file manager).
+	 * Also true when the main file is gone (plugin dir deleted outside uninstall), so late
+	 * Action Scheduler or WP-Cron callbacks bail out.
 	 *
 	 * @return bool
 	 */

@@ -14,11 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Read-only summary of what AddonUninstaller::purge() actually deleted.
- *
- * Returned by AddonUninstaller::purge(). Counts here are actual DB deletions
- * (not estimates). A non-empty $errors array means partial cleanup - the
- * purge continued past each soft failure and recorded it.
+ * What AddonUninstaller::purge() deleted, as actual counts; a non-empty $errors means some targets were left.
  */
 final class PurgeResult {
 

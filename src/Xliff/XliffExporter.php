@@ -14,9 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Exports WordPress post content as XLIFF 2.0 format.
- *
- * Creates translation units for title, content, and excerpt of each post.
+ * Exports post titles, content and excerpts as XLIFF 2.0.
  */
 final class XliffExporter {
 
@@ -38,23 +36,15 @@ final class XliffExporter {
 	 * @throws \RuntimeException If PHP was built without ext-xmlwriter.
 	 */
 	public function export( array $post_ids, string $source_lang, string $target_lang ): string {
-		// ext-xmlwriter is bundled by default but is a separate compile-time
-		// unit (Debian/RHEL ship it inside php-xml), so a stripped build can
-		// lack it. Without this guard `new \XMLWriter()` raises an Error that
-		// nothing upstream catches, turning a missing optional extension into
-		// a white screen. Throw the documented \RuntimeException instead so
-		// the REST layer answers with a readable 500 and CLI callers see a
-		// sentence rather than a stack trace. Deliberately NOT an
-		// XliffFormatException: that type means "the client sent bad XLIFF"
-		// and maps to 4xx, while a missing extension is a server fault.
+		// A build without ext-xmlwriter would throw an uncaught Error. Not XliffFormatException:
+		// that one maps to 4xx (bad client XLIFF), a missing extension is a server fault.
 		if ( ! class_exists( '\XMLWriter' ) ) {
 			throw new \RuntimeException(
 				esc_html__( 'XLIFF export needs the PHP xmlwriter extension, which is not installed on this server. Ask your host to enable the php-xml package.', 'perflocale' )
 			);
 		}
 
-		// Stream-build via XMLWriter into memory so very large exports don't
-		// hold the entire DOM tree + its duplicate serialization simultaneously.
+		// XMLWriter, not DOM: a large export never holds a tree beside its serialization.
 		$writer = new \XMLWriter();
 		$writer->openMemory();
 		$writer->setIndent( true );
@@ -66,15 +56,10 @@ final class XliffExporter {
 	}
 
 	/**
-	 * Shared XLIFF writer - serialises the xliff/file/unit tree via XMLWriter.
+	 * Writes the xliff/file/unit tree.
 	 *
-	 * Reading a post does not clear its caches: the export changes nothing,
-	 * and clean_post_cache() would invalidate shared caches (the post's
-	 * entries and the posts last_changed key other requests' queries use).
-	 * An export longer than one chunk releases each chunk's posts from the
-	 * runtime cache once they are written
-	 * (CacheManager::release_runtime_posts()), so the posts held shrink as
-	 * the document grows, and none are held when it is returned.
+	 * Never clean_post_cache() here: it would bump the shared posts last_changed key for a read.
+	 * An export longer than one chunk releases each written chunk from the runtime cache.
 	 *
 	 * @param \XMLWriter $writer Writer.
 	 * @param array<int> $post_ids Post IDs.
@@ -87,20 +72,16 @@ final class XliffExporter {
 		$writer->startElement( 'xliff' );
 		$writer->writeAttribute( 'xmlns', 'urn:oasis:names:tc:xliff:document:2.0' );
 		$writer->writeAttribute( 'version', '2.0' );
-		// XLIFF 2.0 §3.1 mandates BCP 47 language tags for srcLang / trgLang.
-		// Caller passes the raw `lang->slug` (lowercase, e.g. `en-gb`); CAT
-		// tools and validators expect the canonical mixed-case form.
+		// XLIFF 2.0 requires BCP 47 tags; the caller passes the lowercase slug (`en-gb`).
 		$writer->writeAttribute( 'srcLang', \PerfLocale\Helper::format_locale_as_bcp47( $source_lang ) );
 		$writer->writeAttribute( 'trgLang', \PerfLocale\Helper::format_locale_as_bcp47( $target_lang ) );
 
-		// Prime the post cache one chunk (100 posts) per query instead of one
-		// query per post inside the loop. `update_meta_cache`=false because we
-		// only read title/content/excerpt from the post row itself. Posts
-		// already cached cost nothing.
-		$post_ids = array_map( 'intval', $post_ids );
+		// Each post once: a repeated id would repeat its whole <file>.
+		$post_ids = array_values( array_unique( array_map( 'intval', $post_ids ) ) );
 		$release  = count( $post_ids ) > self::CHUNK;
 
 		foreach ( array_chunk( $post_ids, self::CHUNK ) as $chunk ) {
+			// One query per chunk; no meta cache, only post columns are read.
 			if ( function_exists( '_prime_post_caches' ) ) {
 				_prime_post_caches( $chunk, false, false );
 			}
@@ -168,48 +149,16 @@ final class XliffExporter {
 	}
 
 	/**
-	 * Write text into a CDATA section, safely handling the ']]>' terminator.
-	 *
-	 * A CDATA section cannot contain the literal sequence ']]>'; content that
-	 * does (code samples, shortcodes, escaped markup) would otherwise close the
-	 * section early and produce malformed XLIFF no importer can parse.
-	 * Splitting each occurrence across two sections (']]]]><![CDATA[>') keeps
-	 * the document well-formed while preserving the exact bytes.
+	 * Writes text as CDATA; each ']]>' is split across two sections so the bytes survive.
 	 *
 	 * @param \XMLWriter $writer Writer.
 	 * @param string     $text   Raw text to wrap in CDATA.
 	 * @return void
 	 */
 	private function write_cdata( \XMLWriter $writer, string $text ): void {
-		// XML 1.0 forbids C0 control characters (below 0x20 except tab/LF/CR)
-		// even inside CDATA. Post content can carry a stray \x0B etc.; passing
-		// it through writeRaw produced a document neither the importer nor any
-		// CAT tool could parse. Strip every char outside the legal XML range
-		// (wp_check_invalid_utf8 first so preg_replace can't null on bad UTF-8).
-		//
-		// The allowed set is XML 1.0's Char production verbatim:
-		// #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF].
-		// The last alternative was missing, so every supplementary-plane
-		// character - emoji, rare CJK, Deseret, Gothic, mathematical
-		// alphanumerics - was silently deleted from the export. The result
-		// stayed well-formed, which is exactly why a well-formedness check
-		// never caught it. U+FFFE / U+FFFF remain excluded, as XML requires.
-		//
-		// Not wp_check_invalid_utf8(): without $strip it returns '' for the WHOLE
-		// string when any byte is invalid, so one bad byte anywhere in a title or
-		// body exported that entire field as an empty CDATA - silently, in a
-		// still-well-formed document, and a partial re-import could then write
-		// the emptiness back. Its $strip branch is not usable either: on the
-		// declared 6.4 floor it returns iconv()'s false on PHP 8, and this file
-		// declares strict_types=1, so the preg_replace() below would throw a
-		// TypeError out of the REST handler.
-		//
-		// So drop only the offending bytes. One pass: the alternation captures a
-		// VALID sequence into group 1 and is replaced by itself, while any other
-		// single byte matches the trailing `.` with group 1 empty and is replaced
-		// by nothing. No /u modifier, which is the point - a /u pattern cannot run
-		// on invalid input at all. Every valid sequence survives, astral-plane
-		// characters included.
+		// Drop invalid UTF-8 bytes (no /u: it cannot run on invalid input), then chars outside XML 1.0 Char.
+		// Not wp_check_invalid_utf8(): it empties the whole field on one bad byte; its $strip mode can return false.
+		// See docs-ai/11-code-rationale.md, "XliffExporter: CDATA byte cleaning".
 		$text = (string) preg_replace(
 			'/([\x00-\x7F]'
 			. '|[\xC2-\xDF][\x80-\xBF]'

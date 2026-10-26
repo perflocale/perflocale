@@ -14,70 +14,25 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Lets WordPress load the catalogs the plugin ships in `languages/`, and
- * list them without reading the folder.
+ * Lets WordPress load and list the catalogs shipped in `languages/` without reading the folder.
  *
- * WordPress loads a text domain just in time, when the first string of the
- * domain is translated. It looks for `{domain}-{locale}.l10n.php` or `.mo` in
- * WP_LANG_DIR/plugins (the language packs of translate.wordpress.org), then
- * in WP_LANG_DIR/themes, then in the plugin's own folder when it knows that
- * folder, and passes the folder it found, or false, through the
- * `lang_dir_for_domain` filter (WordPress 6.6+). This class answers only a
- * false for its domain and one of its locales, with its own folder. So an
- * installed language pack is loaded instead of the bundled file, as a whole,
- * and a locale without a bundled file stays in English, unless FALLBACKS
- * names a bundled locale of the same language for it.
- *
- * For such a variant (nl_BE, de_CH, fr_CA, es_MX, ...) with no language pack
- * of its own, WordPress answers false, or the plugin's folder where it knows
- * that folder (6.8+, see below) and found no file of the variant there. The
- * class then answers its folder and, through `load_textdomain_mofile`,
- * hands WordPress the bundled catalog of the base locale in place of the
- * variant's file name. That second filter is hooked only when a variant was
- * answered, so a request in a bundled locale or in English runs no callback
- * of it. A language pack for the variant itself is found by WordPress in
- * WP_LANG_DIR/plugins first and is kept.
- *
- * WordPress 6.8+ already knows the folder of a plugin activated on the site
- * (its Domain Path header), so there `lang_dir_for_domain` receives that
- * folder and changes nothing. It is what loads the bundled file for a
- * network-activated plugin and on WordPress 6.6 and 6.7. Before 6.6 the
- * filter does not exist, and the strings stay in English.
- *
- * To look in a folder it knows, WordPress lists the folder's translation
- * files, with two glob() calls that run in every request without a
- * persistent object cache. That happens for the plugin's folder on
- * WordPress 6.8+ when the plugin is activated on the site, never for a
- * network activation and never before 6.8. The `pre_get_language_files_from_path`
- * filter (WordPress 6.5+) answers that listing for the plugin's folder with
- * the catalog file names built from LOCALES, in the spelling of the path
- * WordPress passes: the folder as the plugin reads it, or as WordPress
- * builds it from WP_PLUGIN_DIR and the plugin's basename (a symlinked
- * plugin, Windows paths). Any other folder, or a list another callback
- * already returned, is passed through unchanged.
- *
- * No filter reads anything: the folder of a listed locale is returned as it
- * is, the file names come from LOCALES and FALLBACKS, and WordPress opens a
- * file only when a string of the domain is translated in that locale.
+ * An installed language pack always wins: see docs-ai/11-code-rationale.md, "BundledTranslations: lookup order".
  *
  * @internal Not part of the public API.
  */
 final class BundledTranslations {
 
 	/**
-	 * Locales with a bundled catalog in `languages/`. English locales are
-	 * not listed: the source strings are their text.
+	 * Locales with a bundled catalog in `languages/` (English is the source text).
 	 *
 	 * @var list<string>
 	 */
 	public const LOCALES = [ 'ar', 'bg_BG', 'cs_CZ', 'de_DE', 'es_ES', 'fa_IR', 'fi', 'fr_FR', 'hi_IN', 'id_ID', 'it_IT', 'ja', 'ko_KR', 'nl_NL', 'pl_PL', 'pt_BR', 'pt_PT', 'ru_RU', 'sv_SE', 'tr_TR', 'uk', 'vi', 'zh_CN', 'zh_TW' ];
 
 	/**
-	 * Bundled locale used for a locale with no catalog and no language pack
-	 * of its own. A key that ends in `_` stands for every locale of that
-	 * language. Portuguese has no such key: pt_PT_ao90 and pt_AO read the
-	 * European Portuguese catalog (pt_PT), and no locale reads pt_BR's in
-	 * place of its own.
+	 * Bundled locale for a locale with no catalog or language pack; a key ending in `_` covers the language.
+	 *
+	 * No `pt_` key on purpose: no locale reads pt_BR's catalog in place of its own.
 	 *
 	 * @var array<string, string>
 	 */
@@ -123,16 +78,14 @@ final class BundledTranslations {
 	private array $locales;
 
 	/**
-	 * Base locale for a locale with no catalog in the folder, by locale or
-	 * by language prefix (a key that ends in `_`).
+	 * Base locale for a locale with no catalog in the folder, by locale or language prefix.
 	 *
 	 * @var array<string, string>
 	 */
 	private array $fallbacks;
 
 	/**
-	 * Catalog to load in place of a variant's file name, by the .mo path
-	 * WordPress builds from the folder this class answered.
+	 * Catalog to load in place of a variant's file name, by the .mo path WordPress builds.
 	 *
 	 * @var array<string, string>
 	 */
@@ -162,8 +115,7 @@ final class BundledTranslations {
 	}
 
 	/**
-	 * Register the plugin's own catalogs: the `perflocale` domain in
-	 * `languages/`, for the locales in LOCALES.
+	 * Register the plugin's own catalogs: the `perflocale` domain in `languages/`.
 	 *
 	 * @return void
 	 */
@@ -174,9 +126,7 @@ final class BundledTranslations {
 			return;
 		}
 
-		// The folder as WordPress spells it when it lists a plugin's Domain
-		// Path: WP_PLUGIN_DIR plus the plugin's basename, which follows a
-		// symlinked plugin folder (wp_register_plugin_realpath()).
+		// WordPress spells the Domain Path folder from WP_PLUGIN_DIR and the basename (symlinks differ).
 		$aliases = [];
 
 		$plugin_file = defined( 'PERFLOCALE_FILE' ) ? PERFLOCALE_FILE : '';
@@ -199,14 +149,9 @@ final class BundledTranslations {
 	}
 
 	/**
-	 * The catalog files of the folder, named from LOCALES under the path as
-	 * WordPress passed it, when WordPress lists the folder's translation
-	 * files (WordPress 6.5+; for a plugin activated on the site, WordPress
-	 * 6.8+ lists the Domain Path folder): without a persistent object cache
-	 * WordPress otherwise runs two glob() calls on the folder in every
-	 * request. The folder matches in any of its spellings (see the
-	 * constructor's aliases). Any other folder, or a non-null list from an
-	 * earlier callback: unchanged.
+	 * The folder's catalog file names from LOCALES, in place of WordPress's listing of it.
+	 *
+	 * Spares two glob() calls per request without a persistent object cache; other folders pass through.
 	 *
 	 * @param mixed $files Files a previous callback returned, or null.
 	 * @param mixed $path  Folder WordPress lists, with a trailing slash.
@@ -235,16 +180,9 @@ final class BundledTranslations {
 	}
 
 	/**
-	 * The catalog folder when WordPress found no folder for the domain and a
-	 * listed locale; otherwise the path unchanged, except for a variant.
+	 * The catalog folder when WordPress found none for a listed locale or a FALLBACKS variant.
 	 *
-	 * A variant is a locale with no catalog in the folder whose base locale
-	 * (FALLBACKS) has one. When WordPress found nothing for it, or found only
-	 * the catalog folder in one of its spellings (WordPress 6.8+ answers the
-	 * Domain Path folder for any locale it has no file for), the catalog
-	 * folder is returned and the base catalog is queued for
-	 * filter_mofile(). A folder WordPress found elsewhere (a language pack
-	 * of the variant) is kept.
+	 * A variant's base catalog is queued for filter_mofile(); a folder found elsewhere (a language pack) is kept.
 	 *
 	 * @param mixed $path   Folder WordPress found for the domain and locale, or false.
 	 * @param mixed $domain Text domain.
@@ -276,9 +214,7 @@ final class BundledTranslations {
 	}
 
 	/**
-	 * The base locale's catalog in place of the file name WordPress built
-	 * for a variant in the catalog folder (see filter_lang_dir()). WordPress
-	 * derives the .l10n.php name from this path. Any other file: unchanged.
+	 * The base locale's catalog in place of a queued variant's file name (also yields the .l10n.php name).
 	 *
 	 * @param mixed $mofile Path of the .mo file WordPress is about to load.
 	 * @param mixed $domain Text domain.

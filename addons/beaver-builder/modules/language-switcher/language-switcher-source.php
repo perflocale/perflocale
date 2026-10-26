@@ -1,18 +1,8 @@
 <?php
 /**
- * PerfLocale Language Switcher module for Beaver Builder, registered where
- * Beaver Builder shows none of its labels: language-switcher.php with the
- * source strings in place of their translations (same class, same form; the
- * slug is given, as Beaver Builder takes it from the file name otherwise), so
- * a page view makes no gettext call for it and loads no catalog.
+ * Copy of language-switcher.php with source strings instead of gettext calls, for requests where Beaver Builder shows no labels.
  *
- * PerfLocaleBeaverBuilder::register_module() registers language-switcher.php
- * instead where the labels show: a logged-in user's builder request (the
- * `fl_builder` query, which also serves the settings config script, or the
- * `fl_builder_data` AJAX POST), admin, REST and WP-CLI
- * (Helper::shows_registration_labels()). A change to one file is made in both;
- * the beaver-builder-module-labels suite (E1) proves they register the same
- * module.
+ * A change to one file is made in both. The slug is given: Beaver Builder otherwise takes it from the file name.
  *
  * @package PerfLocale
  */
@@ -25,9 +15,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Language Switcher Beaver Builder module.
- *
- * Renders the PerfLocale language switcher as a drag-and-drop
- * Beaver Builder module with all configuration options.
  */
 class PerfLocale_BB_Language_Switcher extends \FLBuilderModule {
 

@@ -1,6 +1,6 @@
 <?php
 /**
- * Gettext PO export + import for the strings + string_translations tables.
+ * Gettext PO export and import of the strings and string_translations tables.
  *
  * @package PerfLocale
  */
@@ -17,36 +17,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Translates between PerfLocale's `strings` + `string_translations` rows and
- * standard gettext PO files. One PO carries every string for ONE language at
- * a time - that's the format Poedit, Loco Translate, Crowdin, GlotPress and
- * every CAT tool natively understand.
- *
- * The plugin's `domain` field is preserved in the PO via an extracted
- * comment (`#. domain: my-plugin`) so a round-trip back through this
- * importer correctly re-associates strings with their source domain. WP-core
- * gettext doesn't model "all domains in one file" so we synthesize this
- * with a sentinel comment rather than abusing msgctxt.
- *
- * Line-ending caveat: PO is a Unix-line-ending format by convention. WP's
- * core PO writer drops carriage returns from msgid/msgstr; on import this
- * class normalizes the source-string lookup to match either form, so a
- * source row stored with \r\n still matches an import with \n. For lossless
- * \r preservation, use the JSON DataExporter / DataImporter instead.
+ * Converts between the string tables and PO files, one language per file. The text domain travels as a
+ * `#. domain:` comment and, when not default, in msgctxt; carriage returns become `\n` (lossless: JSON export).
+ * Docs: docs-ai/11-code-rationale.md, "PoSync: PO round trip".
  */
 final class PoSync {
 
 	/**
-	 * Comment prefix used to round-trip the `domain` column through PO files.
+	 * Comment prefix carrying the `domain` column through PO files.
 	 */
 	private const DOMAIN_PREFIX = 'domain: ';
 
 	/**
-	 * Separator that folds the text domain into msgctxt on export so entries
-	 * that share (context, msgid) across different domains keep distinct PO
-	 * keys. Text domains are slugs (never contain this char), so a single-split
-	 * on it cleanly recovers the domain; the domain comment stays authoritative
-	 * and gates the reverse so foreign PO contexts are never mis-parsed.
+	 * Separator of the text domain folded into msgctxt, so entries sharing (context, msgid) across domains stay
+	 * distinct; domains are slugs and never contain it.
 	 */
 	private const CTX_DOMAIN_SEP = '|';
 
@@ -56,13 +40,8 @@ final class PoSync {
 	private const HELD_BATCH = 250;
 
 	/**
-	 * Fold a non-default text domain into the PO entry's msgctxt.
-	 *
-	 * PO entries are keyed by (context, msgid) only - the domain is otherwise
-	 * carried in a comment, so two rows sharing (context, msgid) in DIFFERENT
-	 * domains would collapse onto one entry and lose a translation. Prefixing
-	 * the domain keeps them distinct. Default-domain strings keep their bare
-	 * context (or null) so the common case stays clean.
+	 * Fold a non-default text domain into msgctxt (PO keys entries by (context, msgid) only); the default domain keeps
+	 * its bare context or null.
 	 *
 	 * @param string $domain  Text domain.
 	 * @param string $context Gettext context.
@@ -77,9 +56,8 @@ final class PoSync {
 	}
 
 	/**
-	 * Reverse {@see compose_context}. Only strips the prefix when it EXACTLY
-	 * matches the domain recovered from the entry's comment, so a foreign PO
-	 * whose context legitimately contains the separator is left untouched.
+	 * Reverse compose_context(), only when the prefix is exactly the entry's comment domain, so a foreign context that
+	 * contains the separator is left alone.
 	 *
 	 * @param string $raw_context The msgctxt as read from the PO file.
 	 * @param string $domain      Domain from the entry's `domain:` comment.
@@ -110,8 +88,7 @@ final class PoSync {
 	public static function export_to_file( string $path, string $lang_slug, string $domain = '', array &$report = [] ) {
 		self::load_pomo();
 
-		// Assigned on EVERY exit path, including every failure below, so a
-		// caller can read it without checking the return value first.
+		// Set on every exit path, so a caller can read it without checking the return value.
 		$report = [
 			'emitted'        => 0,
 			'unhashable'     => 0,
@@ -138,8 +115,7 @@ final class PoSync {
 			$args[] = $domain;
 		}
 
-		// Header block via core's PO class so the output matches what every
-		// other gettext consumer produces.
+		// The header through core's PO class, as every gettext consumer writes it.
 		$po = new \PO();
 
 		$po->set_header( 'Project-Id-Version', 'PerfLocale ' . ( defined( 'PERFLOCALE_VERSION' ) ? PERFLOCALE_VERSION : '0.0' ) );
@@ -147,32 +123,44 @@ final class PoSync {
 		$po->set_header( 'MIME-Version', '1.0' );
 		$po->set_header( 'Content-Type', 'text/plain; charset=UTF-8' );
 		$po->set_header( 'Content-Transfer-Encoding', '8bit' );
-		// Per-language CLDR plural header so a translator's editor knows the
-		// language's form count. The flat export emits singular/plural as
-		// separate entries (universal 2-form interchange); the lossless
-		// full-fidelity backup of 3+ plural forms is the JSON DataExporter,
-		// which copies the extra_forms column verbatim.
+		// The language's CLDR plural header; singular and plural are exported as separate entries (the JSON export keeps
+		// 3+ forms).
 		$po->set_header( 'Plural-Forms', \PerfLocale\Strings\PluralRules::header( (string) $lang->locale ) );
 		$po->set_header( 'X-Generator', 'PerfLocale' );
 
-		// Serialise the entries in keyset-paginated batches instead of
-		// materialising the whole corpus as objects (all rows as stdClass +
-		// every Translation_Entry + core \PO's internal entries array) -
-		// the ~1KB-per-row object overhead peaked at 3-4x data size and
-		// OOM'd around 100k strings. Each 1000-row batch is discarded after
-		// serialising, so peak memory is O(final file size), not O(rows ×
-		// object overhead). WHERE s.id > cursor ORDER BY s.id rides the PK
-		// (no filesort per batch); entry order is by id instead of the old
-		// domain-grouped order, which no consumer depends on (each entry
-		// carries its own domain comment).
-		$out    = $po->export_headers();
+		// Keyset batches written as produced (memory: one batch), into a sibling temp renamed over $path on success.
+		$tmp = $path . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Streaming write; WP_Filesystem has no streaming API.
+		$fh = fopen( $tmp, 'xb' );
+
+		if ( ! $fh ) {
+			return false;
+		}
+
+		$bytes = 0;
+		$write = static function ( string $data ) use ( $fh, &$bytes ): bool {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming write.
+			$ok     = fwrite( $fh, $data ) === strlen( $data );
+			$bytes += strlen( $data );
+
+			return $ok;
+		};
+		$abort = static function () use ( $fh, $tmp ): bool {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Paired with the fopen above.
+			fclose( $fh );
+			wp_delete_file( $tmp );
+
+			return false;
+		};
+
+		if ( ! $write( $po->export_headers() ) ) {
+			return $abort();
+		}
+
 		$cursor = 0;
 
 		/**
-		 * Rows fetched per keyset batch during PO export. Trade-off knob:
-		 * higher = fewer queries, more peak wpdb result memory per batch;
-		 * lower = the reverse. Clamped to a sane floor/ceiling so a filter
-		 * bug can't turn the export into per-row queries or one giant fetch.
+		 * Filter the rows per keyset batch of the PO export (default 1000, clamped): more rows, fewer queries and more memory.
 		 *
 		 * @hook perflocale/strings/po_export_batch_size
 		 * @param int $batch_size Default 1000.
@@ -181,19 +169,12 @@ final class PoSync {
 		$batch_size = max( 100, min( 10000, $batch_size ) );
 
 		do {
-			// $cursor / $batch_size are internally-generated integers (the
-			// keyset cursor comes from a previous row's id; the batch size is
-			// clamped to 100..10000 above), hard int-cast into the query body.
-			// Every user-influenceable value - the language id and the domain -
-			// stays on a %d/%s placeholder bound through $args, so no
-			// request-derived value is ever interpolated into SQL.
+			// Cursor and batch size are internal integers cast into the query; the language id and domain stay placeholders.
 			$cursor_sql = (int) $cursor;
 			$limit_sql  = (int) $batch_size;
 
-			// Placeholder order: the two %i table names, then the %d language id
-			// and whatever %s the $where fragment added (both already in $args),
-			// then the keyset cursor and batch size. $where is a structural
-			// fragment built from literals above - it never carries a value.
+			// Placeholder order: the two %i tables, the %d language and any %s of $where (in $args), then cursor and batch size.
+			// $where is built from literals only.
 			$q_args = array_merge( [ $strings, $translations ], $args, [ $cursor_sql, $limit_sql ] );
 
 			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -210,26 +191,16 @@ final class PoSync {
 			);
 			// phpcs:enable
 
-			// A failed page is not the last page, but wpdb::get_results() returns
-			// [] for both, so the loop would end here and write a truncated file
-			// as a success. wpdb::query() clears last_error before every
-			// statement, so a non-empty value belongs to this SELECT. It is read
-			// before any other query runs, because the duplicate count below
-			// clears it, and before the write, so a file already at $path stays.
+			// A failed page and the last page both return []: without this a truncated file would be a success. Read before
+			// another query (the duplicate count) clears last_error.
 			if ( '' !== (string) $wpdb->last_error ) {
-				return false;
+				return $abort();
 			}
 
 			foreach ( $rows as $row ) {
 				$cursor = (int) $row->id;
 
-				// Carriage returns are normalised out first. Core's PO::poify
-				// escapes backslash, double quote and tab but NOT \r, so a raw
-				// 0x0D inside a quoted PO string is emitted verbatim and makes
-				// the ENTIRE exported file unparseable - a re-import returns
-				// zero entries, not one bad entry. Measured: one CR anywhere in
-				// one string costs the whole export. Windows line endings in a
-				// translation are the ordinary way to acquire one.
+				// Carriage returns out: core's PO::poify() does not escape \r, and one raw CR makes the whole file unparseable.
 				$entry = new \Translation_Entry(
 					[
 						'singular'           => self::normalise_newlines( (string) $row->original ),
@@ -242,31 +213,18 @@ final class PoSync {
 				$serialized = \PO::export_entry( $entry );
 
 				if ( ! is_string( $serialized ) || $serialized === '' ) {
-					continue; // Core returns false for an entry it can't serialise.
+					continue; // False for an entry core cannot serialise.
 				}
 
-				// Mirror core PO::export(): headers and entries joined by
-				// exactly one blank line.
-				$out .= "\n\n" . $serialized;
+				// One blank line between entries, as core's PO::export().
+				if ( ! $write( "\n\n" . $serialized ) ) {
+					return $abort();
+				}
 				++$report['emitted'];
 
 				/*
-				 * Round-trip integrity, checked per row and retaining nothing.
-				 *
-				 * The importer finds an existing string by hashing the msgid it
-				 * reads back. If a row's stored original_hash was not computed
-				 * from the text now in its `original` column, that probe misses
-				 * and the re-import creates a PHANTOM row instead of updating
-				 * this one -- so a translator's work lands somewhere the site
-				 * never reads. Observed on a real corpus: rows whose `original`
-				 * had been HTML-entity-encoded after the hash was taken, e.g.
-				 * `Review sites &amp; upgrade` hashed as `Review sites & upgrade`.
-				 * Serving is unaffected (the runtime hashes the live source
-				 * string, which still matches), which is exactly why this stays
-				 * invisible until someone re-imports.
-				 *
-				 * Hash the RAW original, not the newline-normalised copy above:
-				 * the stored hash was taken before normalisation.
+				 * A row whose stored original_hash is not the hash of its `original` would get a phantom twin on re-import (the
+				 * importer hashes the msgid it reads); counted per row, retaining nothing. The raw original is hashed.
 				 */
 				if ( StringRepository::compute_hash( (string) $row->domain, (string) $row->context, (string) $row->original ) !== (string) $row->original_hash ) {
 					++$report['unhashable'];
@@ -279,22 +237,11 @@ final class PoSync {
 		} while ( count( $rows ) === $batch_size );
 
 		/*
-		 * A PO file is keyed by (msgctxt, msgid), so two rows that compose to the
-		 * same pair collapse into one entry in every consumer and one of them
-		 * becomes unreachable through PO forever. Counted in SQL rather than with
-		 * a seen-set in PHP: this method is keyset-paginated precisely so the
-		 * corpus is never materialised (the comment above records an OOM around
-		 * 100k strings), and an O(corpus) array here would undo that. One
-		 * aggregate over the same WHERE the loop used, so the report always
-		 * describes exactly the set that was exported.
+		 * Rows composing to the same (msgctxt, msgid) collapse into one PO entry: counted in SQL over the loop's WHERE, as an
+		 * in-PHP set would materialise the corpus the keyset loop avoids.
 		 */
-		// ReplacementsWrongNumber is a FALSE POSITIVE here and must stay suppressed:
-		// the query carries six placeholders (%i, then %s for the context separator,
-		// then four %s for the nested REPLACE) and exactly six values are bound -
-		// but they arrive through `...array_merge( ... )`, and the sniff counts the
-		// spread as a single argument. It reports "found 1, expected 6" for correct
-		// code. Verified by binding: $args holds only the language id on this path,
-		// so array_slice( $args, 1 ) is empty and the count is 1 + 0 + 5 = 6.
+		// ReplacementsWrongNumber is a false positive here: six placeholders, six values, passed through a spread the
+		// sniff counts as one argument.
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 		$dupes = $wpdb->get_row(
 			$wpdb->prepare(
@@ -306,9 +253,7 @@ final class PoSync {
 						BINARY REPLACE( REPLACE( s.original, %s, %s ), %s, %s )
 					HAVING COUNT(*) > 1
 				) d",
-				// $args[0] is the language id, bound to the LEFT JOIN in the row
-				// query above; this aggregate has no such join, so only the optional
-				// domain filter that $where may carry is bound here.
+				// $args[0] is the row query's language id; this aggregate has no such join, so only the domain filter is bound.
 				...array_merge( [ $strings ], array_slice( $args, 1 ), [ self::CTX_DOMAIN_SEP, "\r\n", "\n", "\r", "\n" ] )
 			)
 		);
@@ -319,20 +264,26 @@ final class PoSync {
 			$report['dup_rows']   = (int) $dupes->rows_in_grps;
 		}
 
-		$wp_filesystem = \PerfLocale\Helper::filesystem();
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fflush -- Streaming write.
+		$ok = fflush( $fh );
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Paired with the fopen above.
+		$ok = fclose( $fh ) && $ok;
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- The mode put_contents() gave the file.
+		$ok = $ok && chmod( $tmp, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 );
 
-		if ( ! $wp_filesystem || ! $wp_filesystem->put_contents( $path, $out, FS_CHMOD_FILE ) ) {
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.rename_rename -- Atomic publish of the file written above.
+		if ( ! $ok || ! rename( $tmp, $path ) ) {
+			wp_delete_file( $tmp );
+
 			return false;
 		}
 
-		return strlen( $out );
+		return $bytes;
 	}
 
 	/**
-	 * Write a database error to the debug log (only when WP_DEBUG_LOG is on).
-	 *
-	 * The import result, which the admin notice and the REST answer show, carries
-	 * a short message instead: the server's text can name tables and row values.
+	 * Log a database error when WP_DEBUG_LOG is on; the import result (notice, REST) gets a short message, as the
+	 * server's text can name tables and values.
 	 *
 	 * @param string $where What the import was doing.
 	 * @param string $error The database error.
@@ -348,15 +299,8 @@ final class PoSync {
 	}
 
 	/**
-	 * Make a language's string translations visible on both serving paths.
-	 *
-	 * Drops the per-language gettext map so database mode rebuilds it, and
-	 * regenerates the `.l10n` bundles in files mode. Without it an import only
-	 * takes effect after an unrelated admin save or the caches' natural TTL.
-	 *
-	 * Also run after a rolled-back replace: that pass deleted and re-read rows
-	 * before aborting, so anything it cached describes a state the database has
-	 * since discarded.
+	 * Make a language's string translations visible on both serving paths: drop its gettext map (database mode),
+	 * regenerate its `.l10n` bundles (files mode). Also after a rolled-back replace, whose reads cached discarded state.
 	 *
 	 * @param object $lang Language row (needs `id`).
 	 * @return void
@@ -390,14 +334,8 @@ final class PoSync {
 	}
 
 	/**
-	 * True when `$bytes` is well-formed UTF-8.
-	 *
-	 * preg_match with the /u modifier and an empty pattern is the standard test
-	 * and needs no extension: PCRE refuses to run a /u pattern against a subject
-	 * that is not valid UTF-8, so a false return IS the answer.
-	 * mb_check_encoding() would be the obvious choice and is not usable here -
-	 * WordPress core does not polyfill it, so it would fatal on a host built
-	 * without ext-mbstring.
+	 * Whether `$bytes` is well-formed UTF-8: an empty /u pattern fails on invalid UTF-8. Not mb_check_encoding(), which
+	 * core does not polyfill (a fatal without ext-mbstring).
 	 *
 	 * @param string $bytes Candidate.
 	 */
@@ -406,36 +344,16 @@ final class PoSync {
 	}
 
 	/**
-	 * Import a PO file into the strings + string_translations tables.
-	 *
-	 * Each PO entry becomes (or matches) a row in `strings`; the row is linked
-	 * to the target language in `translation_links` (the join every serving
-	 * path drives through - see {@see self::link_string_translation()}), and
-	 * only then is the entry's msgstr upserted into `string_translations`. An
-	 * entry that cannot be linked is counted in `skipped` with a message in
-	 * `errors` naming the row, and writes NOTHING - a stored value with no link
-	 * is invisible to every reader and is never retried.
-	 *
-	 * The originating `domain` is read from the extracted comment that this
-	 * exporter emits; entries without that comment fall back to 'default'.
+	 * Import a PO file into the string tables: each entry finds or creates its `strings` row, links it to the language
+	 * in `translation_links` and only then upserts its msgstr; an entry that cannot be linked is skipped with an error
+	 * and writes nothing. Entries without a `domain:` comment use 'default'.
 	 *
 	 * @param string        $path      Input PO path.
 	 * @param string        $lang_slug Target language slug.
-	 * @param bool          $replace   When true, blow away every existing
-	 *                                 translation for this language before
-	 *                                 importing (sources are kept; only the
-	 *                                 per-language `string_translations` rows
-	 *                                 for $lang_slug are wiped).
-	 * @param callable|null $sanitize  Applied to every non-empty translated
-	 *                                 value (msgstr and each extra plural form)
-	 *                                 of an entry that is neither msgid-only
-	 *                                 nor fuzzy, before that entry writes
-	 *                                 anything; returns the string to store.
-	 *                                 Null stores the file's bytes as they are.
-	 *                                 The importer never decides this itself:
-	 *                                 the admin upload handler passes a
-	 *                                 sanitizer for users without
-	 *                                 `unfiltered_html`, and WP-CLI passes none.
+	 * @param bool          $replace   Delete this language's string translations first (sources and other languages kept).
+	 * @param callable|null $sanitize  Applied to every non-empty value of an importable entry before it writes; returns
+	 *                                 what to store. Null stores the file's bytes (WP-CLI); the admin upload passes one
+	 *                                 for users without `unfiltered_html`.
 	 * @return array{
 	 *     imported:int,
 	 *     skipped:int,
@@ -448,15 +366,8 @@ final class PoSync {
 	 *     total_entries:int,
 	 *     sanitized:int,
 	 *     sanitized_empty:int,
-	 * } The first three keys match the standard importer shape; the rest
-	 * break the count down so callers can render an accurate notice
-	 * instead of an "8 imported, 22001 skipped" lump that hides the fact
-	 * most of those 22001 are msgid-only entries (no translation to upsert).
-	 * `sanitized` counts entries in which $sanitize changed at least one value,
-	 * whether it removed markup or only reformatted it; `sanitized_empty`
-	 * counts the subset not imported at all because no row kept a
-	 * translation. An entry with a value $sanitize emptied always has a line
-	 * in `errors`, and a row left without a translation counts in `skipped`.
+	 * } The first three keys are the standard importer shape; the rest break it down for the notice. `sanitized`:
+	 * entries $sanitize changed; `sanitized_empty`: those left with no translation (always with an error line).
 	 *
 	 * @throws \Throwable Re-thrown after the replace-mode transaction is rolled
 	 *                     back, so an unexpected failure can never leave the
@@ -503,39 +414,16 @@ final class PoSync {
 		}
 
 		/*
-		 * import_from_file() returns TRUE for a file it could not read a single
-		 * usable entry out of, and in replace mode the code below then deletes
-		 * every string translation and every translated link for the target
-		 * language, commits, and imports nothing: total data loss from a file the
-		 * operator was told was fine.
-		 *
-		 * Four distinct triggers:
-		 *
-		 *  1. A file that parses to zero entries. A header-only PO - what Poedit
-		 *     writes before anything is translated - does this.
-		 *  2. A file that is not valid UTF-8. Core's PO::unpoify runs a /u regex,
-		 *     so a Latin-1 or Windows-1252 save loses the entries that contain a
-		 *     high byte while the method still reports success.
-		 *  3. A file whose entries all carry an EMPTY translation, which is what
-		 *     an ASCII msgid with a Latin-1 msgstr produces: one entry, nothing
-		 *     in it. Counting entries was not enough.
-		 *  4. A file whose only translations sit where the entry loop never
-		 *     writes from: on entries marked fuzzy, or in a plural form with no
-		 *     row of its own (msgstr[2+], or msgstr[1] under an empty
-		 *     msgid_plural).
-		 *
-		 * So: reject the payload outright unless it is valid UTF-8, and then
-		 * require at least one entry that would actually write something.
+		 * A replace import deletes the language before it writes, so a file that would write nothing is refused first:
+		 * not valid UTF-8, no entries, only empty, fuzzy or extra-plural translations. Docs: docs-ai/11-code-rationale.md,
+		 * "PoSync: what an import may write".
 		 */
 		if ( ! self::is_valid_utf8( (string) file_get_contents( $path ) ) ) {
 			$result['errors'][] = __( 'The PO file is not valid UTF-8. Re-save it as UTF-8 and try again - importing it as-is would discard the entries it cannot read.', 'perflocale' );
 			return $result;
 		}
 
-		// "Would write" is the entry loop's own test, in its order: a translation
-		// on row 0 or 1 (extra plural forms ride on row 1 and never write alone),
-		// then no fuzzy flag. Any looser test passes trigger 4 through to a
-		// replace that deletes and writes nothing.
+		// The entry loop's own test, in its order: a translation on row 0 or 1, then no fuzzy flag.
 		$has_entries = false;
 		$saw_fuzzy   = false;
 
@@ -564,10 +452,7 @@ final class PoSync {
 			break;
 		}
 
-		// A file that reaches the fuzzy message can also hold translations that
-		// sit only in extra plural forms (msgstr[2+], or msgstr[1] under an
-		// empty msgid_plural), which never write on their own, so the message
-		// names both kinds.
+		// Such a file can also hold translations only in extra plural forms, which never write alone: the message names both.
 		if ( ! $has_entries ) {
 			$result['errors'][] = $saw_fuzzy
 				? __( 'Nothing was imported: every translation in the PO file is either marked fuzzy (needs review) or an extra plural form that is not imported on its own, and fuzzy translations are never imported. Review the fuzzy translations in your translation tool, then import again.', 'perflocale' )
@@ -575,10 +460,7 @@ final class PoSync {
 			return $result;
 		}
 
-		// A file whose importable translations $sanitize empties entirely is the
-		// third trigger again: in replace mode it would wipe the language and
-		// import nothing. Such a file returns here, before anything is written,
-		// with the counters the entry loop would have reported for it.
+		// Importable values the sanitizer empties entirely: returned here before any write, with the loop's counters.
 		if ( $sanitize !== null ) {
 			$emptied_file = self::counts_if_sanitizer_empties_file( $po, $sanitize );
 
@@ -594,11 +476,8 @@ final class PoSync {
 		$strings_table = Schema::table( 'strings' );
 		$st_table      = Schema::table( 'string_translations' );
 
-		// Resolved ONCE, before anything is written. Every imported value needs
-		// a `translation_links` row to be servable at all and that write goes
-		// through the repository, whose constructor is typed - so an import
-		// that cannot build one has to say so up front rather than fatal on the
-		// first entry, or (worse) store thousands of rows nothing can serve.
+		// Resolved once before any write: every value needs a link through the repository, so a missing one is reported
+		// up front instead of storing rows nothing can serve.
 		$plugin        = \PerfLocale\Plugin::get_instance();
 		$cache_service = $plugin->has( 'cache' ) ? $plugin->get( 'cache' ) : null;
 
@@ -614,13 +493,8 @@ final class PoSync {
 		$tx_errors = Schema::query_error_count();
 
 		if ( $replace ) {
-			// Wrap the destructive DELETE + the re-insert loop below in ONE
-			// transaction so a mid-import fatal (timeout/OOM) rolls back to the
-			// pre-import state instead of leaving a language's translations
-			// deleted-but-only-partially-restored. InnoDB auto-rolls-back an
-			// open transaction when the connection tears down on a fatal.
-			// Checked against false only: the statement returns 0 on success.
-			// Without the transaction, the DELETEs below would commit on their own.
+			// The delete and the re-import in one transaction, so a fatal rolls back to the state before the import.
+			// Checked against false only: success returns 0.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
 			if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
 				$result['errors'][] = __( 'Replace import did not start: the database could not open a transaction, so nothing was changed.', 'perflocale' );
@@ -637,35 +511,15 @@ final class PoSync {
 				)
 			);
 
-			// Drop the 'translated' link markers the wiped rows carried too -
-			// leaving them orphans the exact way a stale link points at a
-			// now-deleted row (grid shows translated with an empty value).
-			// Scoped to type='string' groups: the links table is polymorphic
-			// and this language's POST/TERM links must survive a strings-only
-			// replace.
-			$groups_table_r = Schema::sanitize_table( Schema::table( 'translation_groups' ) );
-			$links_table_r  = Schema::sanitize_table( Schema::table( 'translation_links' ) );
-
-			// Runs only when the first DELETE succeeded.
-			$wiped = $wiped && false !== $wpdb->query(
-				$wpdb->prepare(
-					"DELETE l FROM %i l
-					 INNER JOIN %i g ON g.id = l.group_id AND g.type = 'string'
-					 WHERE l.language_id = %d",
-					$links_table_r,
-					$groups_table_r,
-					(int) $lang->id
-				)
-			);
+			// Also drop the wiped rows' 'translated' string links, only in string groups (post and term links stay); only
+			// after the first delete succeeded.
+			$wiped = $wiped && self::delete_string_links( (int) $lang->id );
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-			// Zero deleted rows is a valid wipe (a language with nothing stored
-			// yet); only false is a failure. Stop here rather than import on top:
-			// after a deadlock the server has already ended the transaction, and
-			// every later statement would commit on its own. Nothing was read
-			// inside the transaction, so there is no cache to flush.
+			// 0 deleted rows is a valid wipe; false stops here, since after a deadlock every later statement would commit
+			// alone. Nothing was read, so no cache to flush.
 			if ( ! $wiped ) {
-				// Read before the ROLLBACK, which clears it.
+				// Read before the ROLLBACK clears it.
 				self::log_db_error( 'removing the existing translations', (string) $wpdb->last_error );
 
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
@@ -677,30 +531,13 @@ final class PoSync {
 			}
 		}
 
-		// A replace has already DELETEd every translation for this language a
-		// few lines above, inside the open transaction. From here on, ANY exit
-		// that is not a clean COMMIT has to ROLLBACK explicitly: relying on the
-		// connection tearing down only covers a fatal, and a Throwable caught
-		// by an outer handler (REST, CLI, a job worker) would otherwise leave
-		// the transaction open for whatever runs next on that connection to
-		// commit - publishing the wipe without the re-import.
-		//
-		// What each string held in this language before its row is written:
-		// the rows below are counted inserted / updated / unchanged against it,
-		// the same way on every database (an upsert's affected-row count is
-		// 1, 2 or 0 on MySQL but 1 for all three on the SQLite integration).
-		// A replace import starts from an emptied language and keeps what it
-		// wrote. Any other import reads, before each batch of entries writes,
-		// what that batch's strings hold, and drops it after the batch.
+		// From here every exit that is not a clean COMMIT rolls back explicitly: an outer handler catching a Throwable
+		// would leave the wipe for the next statement to commit. $held is what each string held before its write, for the
+		// inserted / updated / unchanged counts (SQLite's upsert reports 1 for all three).
 		$held    = [];
 		$entries = array_values( (array) $po->entries );
 
-		// A replace import writes inside a transaction, where no statement may
-		// fail: on the SQLite Database Integration a failed statement ends the
-		// transaction (the wipe and every earlier write roll back) and the
-		// statements after it commit one by one. So in replace mode a failed
-		// write stops the import at once - the next statement is the ROLLBACK -
-		// instead of skipping the entry and going on.
+		// In a replace transaction no statement may fail (on SQLite one failure ends it): a failed write stops the import.
 		$abort_replace = static function () use ( &$result, $wpdb, $lang ): void {
 			if ( $wpdb instanceof \wpdb ) {
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
@@ -718,7 +555,7 @@ final class PoSync {
 
 		try {
 
-			// Iterate entries. PO::$entries is keyed by Translation_Entry::key().
+			// PO::$entries is keyed by Translation_Entry::key().
 			foreach ( $entries as $index => $entry ) {
 				if ( ! $replace && 0 === $index % self::HELD_BATCH ) {
 					$held = self::held_translations( $strings_table, $st_table, $lang, array_slice( $entries, $index, self::HELD_BATCH ) );
@@ -731,7 +568,7 @@ final class PoSync {
 				$singular = (string) ( $entry->singular ?? '' );
 
 				if ( $singular === '' ) {
-					continue; // Empty msgid is the PO header - skip.
+					continue; // The PO header.
 				}
 
 				++$result['total_entries'];
@@ -739,44 +576,26 @@ final class PoSync {
 				$raw_context = $entry->context !== null ? (string) $entry->context : '';
 				$domain      = self::extract_domain( (string) ( $entry->extracted_comments ?? '' ) );
 
-				// A single PO entry is normally one source row, but a standard
-				// gettext PLURAL entry (msgid + msgid_plural, msgstr[0..N] in one
-				// entry) carries two source forms. PerfLocale's own exporter emits
-				// singular/plural as two separate context-tagged entries, so its
-				// round-trip never enters the plural branch; but an externally
-				// authored PO (e.g. a translate.wordpress.org language pack) packs
-				// both forms into one entry. Split it into the two rows the scanner
-				// and loader expect so the plural form isn't dropped and the
-				// singular lands where _n() looks it up instead of context ''.
+				// A gettext plural entry (msgid + msgid_plural, as in a translate.wordpress.org pack) becomes the two rows the
+				// scanner and loader expect; PerfLocale's own export writes them as two entries.
 				$forms = self::entry_to_forms( $entry, $singular, $raw_context, $domain );
 
 				if ( ! self::forms_have_translation( $forms ) ) {
-					// No translation on any form; nothing to upsert. Dominant case
-					// for a fresh PO the translator hasn't filled in, or an export
-					// that carried every source string regardless of status. Track
-					// it separately so the UI can say "msgid-only" instead of
-					// lumping it under generic "skipped".
+					// No translation on any form (a fresh PO): counted apart, so the notice can say msgid-only.
 					++$result['no_translation'];
 					++$result['skipped'];
 					continue;
 				}
 
-				// gettext semantics: a fuzzy translation is msgmerge's guess
-				// copied from a DIFFERENT source string - explicitly marked
-				// unreliable. Every standard consumer (msgfmt, Poedit, Loco)
-				// excludes fuzzy by default; importing it as authoritative would
-				// display wrong text. PerfLocale's own exports never carry flags,
-				// so this only affects externally-edited PO files.
+				// Fuzzy is msgmerge's guess from another string; every standard consumer skips it.
 				if ( in_array( 'fuzzy', (array) $entry->flags, true ) ) {
 					++$result['fuzzy_skipped'];
 					++$result['skipped'];
 					continue;
 				}
 
-				// Sanitized only once the entry is known to be importable, so a
-				// msgid-only or fuzzy entry is counted exactly as it is for an
-				// import without a sanitizer. A value emptied here must not reach
-				// the per-form loop's silent `continue` unreported.
+				// Sanitized only once importable, so msgid-only and fuzzy entries count as without a sanitizer; an emptied value
+				// is reported.
 				if ( $sanitize !== null ) {
 					[ $clean_forms, $altered ] = self::sanitize_forms( $forms, $sanitize );
 
@@ -812,17 +631,10 @@ final class PoSync {
 					$msgstr   = $form['translation'];
 
 					if ( $msgstr === '' ) {
-						continue; // This form has no translation yet; skip it.
+						continue; // No translation for this form.
 					}
 
-					// Find or create the source string row. Primary lookup by the
-					// canonical sha256 original_hash - a UNIQUE indexed O(1) probe
-					// on the exact (domain, context, original) tuple; the plain
-					// (original, context, domain) SELECT scanned the TEXT column.
-					// group_id rides along: the serving layer's map query INNER
-					// JOINs translation_links, so the upsert below must mark the
-					// group translated for this language or the imported text is
-					// never served.
+					// Find the source row by its sha256 original_hash (unique, indexed); group_id comes along for the link below.
 					// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$lookup_errors   = Schema::query_error_count();
 					$string_row      = $wpdb->get_row(
@@ -835,26 +647,8 @@ final class PoSync {
 					$string_id       = $string_row ? (int) $string_row->id : 0;
 					$string_group_id = $string_row ? (int) $string_row->group_id : 0;
 
-					// Fallback: gettext PO format normalizes line endings to \n.
-					// WP-core's PO::unpoify reads back any \r in the source as \n,
-					// so a row stored with \r\n or lone \r won't byte-match the
-					// import's $singular without normalization.
-					//
-					// Two-step normalize on the stored side so the comparison
-					// matches gettext semantics exactly:
-					// \r\n → \n   (CRLF collapses to LF)
-					// lone \r → \n  (any remaining lone CR becomes LF)
-					//
-					// CHAR(13) / CHAR(10) avoid $wpdb->prepare's backslash
-					// escaping of the query body - '\r' / '\n' literals get
-					// double-escaped and stop matching.
-					//
-					// GATED on the msgid containing \n: a stored row that differs
-					// only by CR/CRLF normalizes to a form that HAS \n, so its PO
-					// msgid must too. Without the gate, this non-sargable
-					// REPLACE() scan (it computes REPLACE over every candidate
-					// TEXT row) ran once per NEW entry - quadratic on first-time
-					// imports of large external PO files.
+					// Line-ending fallback: PO reads \r back as \n, so a row stored with CRLF or CR is matched normalised (CHAR(13) and
+					// CHAR(10), as prepare() would escape '\r'). Only when the msgid has a newline: the scan is not sargable.
 					if ( $string_id === 0 && $singular !== '' && str_contains( $singular, "\n" ) ) {
 						$string_row      = $wpdb->get_row(
 							$wpdb->prepare(
@@ -873,36 +667,21 @@ final class PoSync {
 						$string_group_id = $string_row ? (int) $string_row->group_id : 0;
 					}
 
-					// A failed lookup ends a replace import before any write
-					// (the lookups run no hook, so a new failed query is theirs).
+					// A failed lookup ends a replace import before any write (lookups run no hook, so the failure is theirs).
 					if ( $replace && Schema::transaction_lost( $tx_errors, Schema::query_error_count() > $lookup_errors ) ) {
 						$abort_replace();
 						return $result;
 					}
 
-					// True only when THIS iteration minted the group it is about to
-					// link under, so it is known to be `type = 'string'` without
-					// re-reading it. Every other path - an existing row, or the
-					// row recovered after losing the UNIQUE-hash race - carries a
-					// group_id from the table that has to be verified.
+					// True only when this iteration created the group (then known to be a string group); any other group_id is verified.
 					$group_verified = false;
 
 					if ( $string_id === 0 ) {
-						// Create the source row exactly as the scanner does: a canonical
-							// sha256 original_hash + a dedicated type='string' group. The
-							// previous hand-rolled md5 hash with group_id 0 produced an
-							// orphan that never rendered in DB mode and collided into a
-							// DUPLICATE on the next scan (which keys by the sha256 hash).
+						// Create the source row as the scanner does: the sha256 original_hash and its own type='string' group.
 							$groups_table = Schema::table( 'translation_groups' );
 
-							// insert_id is read only after a CONFIRMED insert: on a
-							// failed one it can still hold a PRIOR row's id rather
-							// than 0, depending on the mysqli driver - the same
-							// reason BulkStringTranslateJob::mint_string_group()
-							// refuses to trust it. Trusting it here would file the
-							// new string under a group that belongs to something
-							// else, which is the exact shape upsert_link() then
-							// rewrites through the group_lang unique key.
+							// insert_id only after a confirmed insert: after a failed one it can hold an earlier row's id (as
+							// BulkStringTranslateJob::mint_string_group()).
 							$group_inserted = $wpdb->insert( $groups_table, [ 'type' => 'string' ], [ '%s' ] );
 							$group_id       = false !== $group_inserted ? (int) $wpdb->insert_id : 0;
 
@@ -927,8 +706,7 @@ final class PoSync {
 								$abort_replace();
 								return $result;
 							} else {
-								// Lost the UNIQUE-hash race: drop the orphan group and
-								// recover the existing row by its canonical hash.
+								// Lost the unique-hash race: drop the orphan group and use the existing row.
 								$wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
 								$string_row      = $wpdb->get_row(
 									$wpdb->prepare(
@@ -958,23 +736,8 @@ final class PoSync {
 						continue;
 					}
 
-					// The link is written BEFORE the value, and the string's group
-					// is healed first when it cannot legally own one. Same order
-					// and same contract as
-					// BulkStringTranslateJob::save_translation(): a value with no
-					// link is never served AND never retried (the skip-existing
-					// branches key off the value), whereas a link with no value
-					// serves nothing in the meantime and is simply re-written by
-					// the next import.
-					//
-					// `strings.group_id` is an unenforced FK and three shapes fail
-					// it - 0 (never grouped), an id whose group row is gone, and an
-					// id that collides with a live post/term group. The last is why
-					// this can never be the bare `> 0` test it used to be:
-					// upsert_link()'s ON DUPLICATE KEY UPDATE would match that post
-					// group's own row through the group_lang unique key and rewrite
-					// its object_id to a string id, pointing a real post
-					// translation at nothing.
+					// The link before the value, its group healed first (as BulkStringTranslateJob::save_translation()): a value
+					// without a link is never served or retried. group_id can be 0, gone, or a post or term group's.
 					$link_error = self::link_string_translation(
 						$group_repo,
 						$string_id,
@@ -984,10 +747,7 @@ final class PoSync {
 						$replace
 					);
 
-					// The link write runs perflocale/translation/linked listeners:
-					// a failed query of theirs can have ended the transaction as
-					// well (Schema::transaction_lost(): on SQLite any, on MySQL a
-					// deadlock).
+					// The link write runs perflocale/translation/linked listeners, whose failed query can also end the transaction.
 					if ( $replace && Schema::transaction_lost( $tx_errors, $link_error !== '' ) ) {
 						$abort_replace();
 						return $result;
@@ -999,58 +759,21 @@ final class PoSync {
 						continue;
 					}
 
-					// Upsert the translation.
-					//
-					// `updated_at` is deliberately NOT in the MySQL UPDATE clause:
-					// the schema declares `updated_at … ON UPDATE CURRENT_TIMESTAMP`,
-					// which moves it only when another column changes (on SQLite,
-					// Schema::touch_write_time() writes the same).
-					// Plural forms 2..N (Polish/Russian/Arabic) ride on this row as
-					// JSON extra_forms; NULL for every other row. ONLY a genuine
-					// msgid_plural entry is authoritative about those forms -
-					// entry_to_forms tags its plural row with the 'extra_forms' key
-					// (even as []), and NEVER sets it on a flat/singular entry. So a
-					// plural entry may write (form present) OR clear (empty ->
-					// NULL) the column; a flat entry must leave it untouched. That
-					// distinction is load-bearing: our own PO export flattens each
-					// plural row to a singular msgctxt="plural" entry, which on
-					// re-import hash-matches the existing plural row. If a flat
-					// entry were allowed to write extra_forms it would NULL every
-					// 3+ form language's stored forms on the export -> edit ->
-					// re-import round-trip (silent data loss).
+					// Upsert the value; updated_at moves by its ON UPDATE clause (SQLite: Schema::touch_write_time()). Only a genuine
+					// msgid_plural entry may write or clear extra_forms: a flat re-imported entry would erase stored forms.
 					$authoritative = array_key_exists( 'extra_forms', $form );
 					$extra_json    = ( $authoritative && is_array( $form['extra_forms'] ) && $form['extra_forms'] !== [] )
 						? wp_json_encode( array_map( 'strval', $form['extra_forms'] ) )
 						: null;
 
-					// IF(%d, VALUES(extra_forms), extra_forms): when authoritative,
-					// take the incoming value (possibly NULL to clear); otherwise
-					// keep whatever is already stored. NULLIF(%s, '') restores the
-					// SQL NULL that wpdb::prepare() flattens away - a null php
-					// value binds as '' under %s, which would store a junk
-					// empty-string on every non-plural row (and on authoritative
-					// clears) instead of the column's real "no extra forms" state.
-					// A genuine $extra_json is a non-empty JSON array literal, so
-					// the '' → NULL mapping can never hit a real value.
-					//
-					// updated_at is left to the column (DEFAULT / ON UPDATE
-					// CURRENT_TIMESTAMP), the database clock every other writer of
-					// string_translations uses; Site Health reads it back with
-					// UNIX_TIMESTAMP() in that clock.
-					// `string_translations` has exactly ONE unique key - PRIMARY
-					// (string_id, language_id) - so this upsert can only ever
-					// collide on the pair it is addressing. The polymorphic
-					// `translation_links` table, written above, carries two, which
-					// is why its write goes through link_string_translation()
-					// rather than a bare upsert.
+					// IF(%d, VALUES(extra_forms), extra_forms) takes the value only when authoritative; NULLIF(%s, '') restores the NULL
+					// prepare() flattens. One unique key (string_id, language_id), unlike translation_links.
 					$touch = \PerfLocale\Database\Schema::touch_write_time(
 						$authoritative
 							? [ [ 'extra_forms', 'VALUES(extra_forms)', 'text_null' ], [ 'translation', 'VALUES(translation)', 'text' ] ]
 							: [ [ 'translation', 'VALUES(translation)', 'text' ] ]
 					);
-					// A string the batch read did not cover: one created by this
-					// entry holds nothing yet; one found by the line-ending
-					// fallback or after losing the creation race is read here.
+					// A string the batch read did not cover (created here, or found by the fallback or after the race) is read now.
 					if ( ! $replace && ! array_key_exists( $string_id, $held ) ) {
 						$held[ $string_id ] = $group_verified ? null : self::held_translation( $st_table, $lang, $string_id );
 					}
@@ -1100,16 +823,8 @@ final class PoSync {
 							mb_substr( $singular, 0, 60 )
 						);
 
-						// In replace mode the old value for this string is already
-						// deleted, so a refused upsert is not a skip - it is the
-						// string's translation, gone. Committing the rest would
-						// hand back 19 of 20 replacements plus a link still marked
-						// "translated" pointing at nothing. Roll the whole import
-						// back and give the operator their pre-import data.
-						//
-						// Returned, not thrown, so every caller keeps the
-						// documented array contract and reports the failure the
-						// same way it reports a malformed file.
+						// In replace mode the old value is already deleted, so a refused upsert loses the translation: roll the whole
+						// import back. Returned, not thrown, to keep the array contract.
 						if ( $replace ) {
 							// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
 							$wpdb->query( 'ROLLBACK' );
@@ -1120,9 +835,7 @@ final class PoSync {
 							$result['updated']   = 0;
 							$result['unchanged'] = 0;
 
-							// Flush before returning. The aborted pass deleted
-							// and re-read rows, so caches populated during it
-							// describe a state the database has just discarded.
+							// The aborted pass deleted and re-read rows: its caches describe discarded state.
 							self::flush_language_caches( $lang );
 
 							return $result;
@@ -1139,14 +852,8 @@ final class PoSync {
 			throw $e;
 		}
 
-		// A refused COMMIT usually means the server has already discarded the
-		// transaction; the ROLLBACK covers one that is still open. Checked
-		// against false only: the statement returns 0 on success. The message
-		// does not claim nothing changed, because a connection lost during the
-		// COMMIT can hide one that landed; re-running a replace is safe.
-		// A failed query anywhere in the import that ended the transaction
-		// (Schema::transaction_lost()) has rolled the wipe back too: report it
-		// rather than COMMIT.
+		// A refused COMMIT usually means the server discarded the transaction; the ROLLBACK covers an open one (false only:
+		// success is 0). A failed query that ended the transaction rolled the wipe back too: reported, never committed.
 		if ( $replace && Schema::transaction_lost( $tx_errors ) ) {
 			$abort_replace();
 
@@ -1155,14 +862,13 @@ final class PoSync {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
 		if ( $replace && false === $wpdb->query( 'COMMIT' ) ) {
-			// Read before the ROLLBACK, which clears it.
+			// Read before the ROLLBACK clears it.
 			self::log_db_error( 'committing a replace import', (string) $wpdb->last_error );
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Transaction control statement; constant SQL, no value/identifier, caching N/A.
 			$wpdb->query( 'ROLLBACK' );
 
-			// First, so the admin notice, which shows three messages, cannot
-			// hide it behind per-entry ones.
+			// First, so the three-message admin notice cannot hide it behind per-entry ones.
 			array_unshift(
 				$result['errors'],
 				__( 'Replace import not confirmed: the database reported an error while saving it. Check this language\'s translations and run the import again.', 'perflocale' )
@@ -1172,28 +878,20 @@ final class PoSync {
 			$result['updated']   = 0;
 			$result['unchanged'] = 0;
 
-			// Same reason as the rolled-back upsert above: the aborted pass
-			// deleted and re-read rows.
+			// As after the rolled-back upsert: the aborted pass deleted and re-read rows.
 			self::flush_language_caches( $lang );
 
 			return $result;
 		}
 
-		// Make the import visible immediately on BOTH serving paths (same
-		// post-write flush the strings-admin save performs): drop the
-		// per-language gettext map so DB mode rebuilds it with the new rows,
-		// and regenerate this language's .l10n bundles in files mode.
-		// Without this, an import only takes effect after an unrelated
-		// admin save or the caches' natural TTL.
+		// Make the import visible on both serving paths at once, as a Strings save does (flush_language_caches()).
 		if ( $result['imported'] > 0 || $replace ) {
 			self::flush_language_caches( $lang );
 		}
 
 		/**
-		 * Fires after a PO import writes string translations. Lets addons
-		 * deriving state from the strings tables invalidate it (PO import
-		 * can touch any domain, including addon-owned ones, and --replace
-		 * mode bulk-deletes a language's translations).
+		 * Fires after a PO import writes string translations, so add-ons deriving state from the string tables can refresh
+		 * it (an import can touch any domain, and --replace deletes a language's translations).
 		 *
 		 * @hook perflocale/strings/changed
 		 *
@@ -1205,10 +903,7 @@ final class PoSync {
 	}
 
 	/**
-	 * True when at least one row of an entry carries a translation to store.
-	 *
-	 * Extra plural forms do not count: the per-form loop writes a row only for
-	 * a non-empty `translation`, and the extra forms ride on that row.
+	 * Whether a row of the entry carries a translation to store (extra plural forms ride on a row and do not count).
 	 *
 	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $forms Output of {@see self::entry_to_forms()}.
 	 */
@@ -1223,14 +918,8 @@ final class PoSync {
 	}
 
 	/**
-	 * The result counters for a file whose importable translations a sanitizer
-	 * empties entirely, or null when the import has something to write.
-	 *
-	 * "Importable" follows the entry loop's own order: msgid-only and fuzzy
-	 * entries are counted as the loop counts them and are never sanitized.
-	 * Null is also returned when no entry is importable even before
-	 * sanitizing, so such a file behaves exactly as it does without a
-	 * sanitizer. The scan stops at the first translation that survives.
+	 * The counters for a file whose importable translations the sanitizer empties entirely, else null (also when nothing
+	 * is importable before sanitizing). Importable follows the entry loop's order; stops at the first surviving value.
 	 *
 	 * @param \PO      $po       Parsed file.
 	 * @param callable $sanitize Import sanitizer.
@@ -1282,13 +971,9 @@ final class PoSync {
 	}
 
 	/**
-	 * Describe the rows and plural forms of a partly surviving entry that the
-	 * sanitizer emptied, so the import is never read as complete.
-	 *
-	 * A row whose translation was emptied is not written at all (the per-form
-	 * loop skips an empty translation), so in merge mode whatever is stored for
-	 * it stays; for msgstr[1] that includes the plural forms riding on the row.
-	 * An emptied msgstr[2..N] is stored as an empty form in its slot.
+	 * Describe the rows and plural forms of a partly surviving entry that the sanitizer emptied, so the import never
+	 * reads as complete: an emptied row is not written (merge mode keeps what is stored), an emptied msgstr[2..N] is
+	 * stored as an empty form.
 	 *
 	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $forms       Forms as read from the file.
 	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $clean_forms The same forms after the sanitizer.
@@ -1347,11 +1032,8 @@ final class PoSync {
 	}
 
 	/**
-	 * Run an import sanitizer over every translated value of one PO entry.
-	 *
-	 * Extra plural forms keep their positions: a form emptied here stays '' in
-	 * its slot, because the forms are indexed by CLDR category and dropping one
-	 * would move every later form into the wrong category.
+	 * Run the sanitizer over every value of one entry; an emptied extra form stays '' in its slot (forms are indexed by
+	 * CLDR category).
 	 *
 	 * @param array<int, array{original: string, context: string, translation: string, extra_forms?: array<int, string>}> $forms    Output of {@see self::entry_to_forms()}.
 	 * @param callable                                                                                                    $sanitize Maps a non-empty value to the string to store.
@@ -1387,11 +1069,7 @@ final class PoSync {
 	}
 
 	/**
-	 * Call an import sanitizer and normalise what it returns.
-	 *
-	 * Anything that is not a scalar counts as "nothing left", so a sanitizer
-	 * that fails by returning null or an array stores nothing rather than a
-	 * value it never produced.
+	 * Call the sanitizer; a non-scalar answer (null, an array) counts as nothing left.
 	 *
 	 * @param callable $sanitize Import sanitizer.
 	 * @param string   $value    Non-empty translated value.
@@ -1404,38 +1082,9 @@ final class PoSync {
 	}
 
 	/**
-	 * Make one imported translation SERVABLE: heal the string's group when it
-	 * cannot legally own a link, then write the `translation_links` row.
-	 *
-	 * `strings.group_id` is an unenforced foreign key and three shapes fail it
-	 * - 0 (never grouped), an id whose group row is gone, and an id that
-	 * collides with a live post/term group. A string link cannot legally hang
-	 * off any of them, so the group is healed onto a fresh `type = 'string'`
-	 * one ({@see self::mint_string_group()}) at the moment of the first write
-	 * for the row - the same deferral
-	 * {@see \PerfLocale\Admin\AdminController::process_string_translations()}
-	 * and {@see \PerfLocale\Background\Jobs\BulkStringTranslateJob::save_translation()}
-	 * make, because minting for every entry of a PO file would create a group
-	 * per untranslated msgid.
-	 *
-	 * `translation_links` carries TWO unique keys - `group_lang`
-	 * (group_id, language_id) AND `object_lang` (type, object_id, language_id)
-	 * - and an INSERT … ON DUPLICATE KEY UPDATE can collide on either. When a
-	 * heal has just moved this string onto a new group but an orphaned
-	 * `type = 'string'` link for the same (object_id, language_id) still points
-	 * at the OLD group, the INSERT collides on `object_lang` instead: the
-	 * update rewrites that stale row while leaving its group_id on the dead
-	 * group, so nothing links the string to the NEW group and upsert_link()
-	 * reports false. `upsert_link()` reaps that debris itself and retries once
-	 * before it gives up; the same reap is repeated here - type-scoped, because
-	 * object_id is polymorphic and a post/term id collides with a string id
-	 * freely - so this path behaves identically whichever layer is doing the
-	 * reaping, exactly as
-	 * {@see \PerfLocale\Background\Jobs\BulkStringTranslateJob::save_translation()}
-	 * does. A false that survives both is a real write failure.
-	 *
-	 * A group minted by this call is reclaimed when the link still cannot be
-	 * written, so a failure is a true no-op rather than a fresh orphan.
+	 * Make one imported translation servable: heal the string's group when it cannot own a link, then write the link,
+	 * reaping a stale link under another group once (translation_links has two unique keys). A group minted here is
+	 * reclaimed on failure. Docs: docs-ai/11-code-rationale.md, "PoSync: string links and their two keys".
 	 *
 	 * @param \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo  Group/link repository.
 	 * @param int                                                        $string_id   Row in the `strings` table being linked.
@@ -1477,9 +1126,7 @@ final class PoSync {
 			}
 		}
 
-		// For string groups object_id is the string id. upsert_link() is a
-		// single INSERT … ON DUPLICATE KEY UPDATE, so this string's
-		// sibling-language links survive untouched.
+		// object_id is the string id; one upsert, so the string's other language links stay.
 		$linked = $group_repo->upsert_link(
 			$group_id,
 			$string_id,
@@ -1498,20 +1145,16 @@ final class PoSync {
 		}
 
 		if ( $linked === false ) {
-			// Second line of defence behind upsert_link()'s own object_lang
-			// reap: drop the stale type-scoped slot and try once more. No row
-			// for this group exists at this point - that is what false means -
-			// so this can only remove debris that belongs to a dead group.
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Debris removal on a self-heal path; no cache to consult.
-			$wpdb->delete(
-				Schema::table( 'translation_links' ),
-				[
-					'type'        => \PerfLocale\Enum\ObjectType::String->value,
-					'object_id'   => $string_id,
-					'language_id' => $language_id,
-				],
-				[ '%s', '%d', '%d' ]
-			);
+			// Behind upsert_link()'s own reap: drop a stale link of this string in another group and try once more.
+			// Never this group's link: after a failed write it still serves the stored translation.
+			if ( $wpdb instanceof \wpdb ) {
+				$sql = $wpdb->prepare( 'DELETE FROM %i WHERE type = %s AND object_id = %d AND language_id = %d AND group_id != %d', Schema::table( 'translation_links' ), \PerfLocale\Enum\ObjectType::String->value, $string_id, $language_id, $group_id );
+
+				if ( is_string( $sql ) ) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Debris removal on a self-heal path (prepared above); no cache to consult.
+					$wpdb->query( $sql );
+				}
+			}
 
 			$linked = $group_repo->upsert_link(
 				$group_id,
@@ -1523,8 +1166,7 @@ final class PoSync {
 		}
 
 		if ( $linked === false ) {
-			// Leave nothing widowed: if this call minted the group moments ago,
-			// reclaim it by primary key and put the row back where it was.
+			// A group this call minted is reclaimed by primary key and the row put back.
 			if ( $minted_group_id > 0 ) {
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Rollback of a write this method just made.
 				$wpdb->delete(
@@ -1556,21 +1198,8 @@ final class PoSync {
 	}
 
 	/**
-	 * Mint a fresh string-type translation group and repoint one string at it.
-	 *
-	 * The same INSERT-then-UPDATE pair, in the same order and with the same
-	 * checks, that
-	 * {@see \PerfLocale\Background\Jobs\BulkStringTranslateJob::mint_string_group()},
-	 * {@see \PerfLocale\Admin\AdminController::process_string_translations()}
-	 * and {@see \PerfLocale\Strings\TranslationFileGenerator::repair_orphaned_translations()}
-	 * shape (2) run - the four self-heal paths must not drift.
-	 *
-	 * Both statements are checked. A failed INSERT leaves the string exactly
-	 * as it was. A failed UPDATE - or a zero-row one, meaning the `strings` row
-	 * went away between the lookup and now - would leave the string still
-	 * pointing at the unusable id while a usable group sat under a different
-	 * one, so the group is reclaimed rather than widowed. Either way the caller
-	 * gets 0 and reports the entry skipped.
+	 * Mint a string group and point one string at it, exactly as the other self-heal paths do (same statements, order
+	 * and checks). A failed INSERT changes nothing; a failed or zero-row UPDATE reclaims the group. Then 0.
 	 *
 	 * @param int  $string_id      Row in the `strings` table to repair.
 	 * @param bool $in_transaction True inside a replace import's transaction: a failed write is not
@@ -1595,9 +1224,7 @@ final class PoSync {
 			return 0;
 		}
 
-		// insert_id is only read after a confirmed INSERT: on a failed one it
-		// can still hold a PRIOR row's id rather than 0, depending on the
-		// mysqli driver.
+		// insert_id only after a confirmed INSERT: after a failed one it can hold an earlier row's id.
 		$group_id = (int) $wpdb->insert_id;
 
 		if ( $group_id <= 0 ) {
@@ -1614,9 +1241,7 @@ final class PoSync {
 		);
 
 		if ( ! is_int( $updated ) || $updated < 1 ) {
-			// Inside a transaction a FAILED update is followed by nothing: the
-			// caller's ROLLBACK removes the group (no statement may follow a
-			// failure there, see import_from_file()).
+			// In a transaction nothing follows a failed update: the caller's ROLLBACK removes the group.
 			if ( false === $updated && $in_transaction ) {
 				return 0;
 			}
@@ -1631,8 +1256,29 @@ final class PoSync {
 	}
 
 	/**
-	 * Lazy-load WP's bundled gettext classes. They don't autoload like the
-	 * rest of WP since `wp-includes/pomo/*.php` is plain require_once-style.
+	 * Delete one language's links of string groups (a replace import's wipe).
+	 *
+	 * @param int $language_id Language ID.
+	 * @return bool False when the DELETE failed.
+	 */
+	private static function delete_string_links( int $language_id ): bool {
+		global $wpdb;
+
+		// One table per DELETE: the SQLite integration's 2.2.x legacy driver mishandles a DELETE holding JOIN.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		return false !== $wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM %i WHERE language_id = %d AND group_id IN ( SELECT id FROM %i WHERE type = 'string' )",
+				Schema::sanitize_table( Schema::table( 'translation_links' ) ),
+				$language_id,
+				Schema::sanitize_table( Schema::table( 'translation_groups' ) )
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+	}
+
+	/**
+	 * Load WordPress's bundled gettext classes (wp-includes/pomo/ is not autoloaded).
 	 *
 	 * @return void
 	 */
@@ -1669,7 +1315,7 @@ final class PoSync {
 	}
 
 	/**
-	 * Pull the `domain: <name>` token out of an extracted-comments block.
+	 * The `domain: <name>` token of an entry's extracted comments.
 	 *
 	 * @param string $extracted PO `#.` comments for one entry.
 	 * @return string Domain string, or 'default' when absent.
@@ -1687,16 +1333,8 @@ final class PoSync {
 	}
 
 	/**
-	 * Expand a PO entry into the (original, context, translation) source rows
-	 * it maps to.
-	 *
-	 * A normal entry is a single row. A standard gettext PLURAL entry
-	 * (msgid + msgid_plural, msgstr[0..N] in one entry) expands to two rows,
-	 * one per source form, matching how the scanner stores _n()/_nx(): the
-	 * singular under context 'singular' (or the entry's own msgctxt) and the
-	 * plural under 'plural' (or "<msgctxt> (plural)"). Forms 0 and 1 fill the
-	 * two rows' translation columns; forms 2..N (Polish/Russian/Arabic) ride
-	 * on the plural row's 'extra_forms' key, which the CLDR runtime indexes.
+	 * The source rows a PO entry maps to: one, or for a gettext plural entry two, as the scanner stores _n()/_nx()
+	 * ('singular' / 'plural' or "<msgctxt> (plural)"); forms 2..N ride on the plural row's 'extra_forms'.
 	 *
 	 * @param \Translation_Entry $entry    Parsed PO entry.
 	 * @param string             $singular The entry's msgid (already stringified).
@@ -1719,9 +1357,7 @@ final class PoSync {
 
 		$base = self::decompose_context( $raw_ctx, $domain );
 
-		// Forms 2..N (msgstr[2], msgstr[3], … for Polish/Russian/Arabic)
-		// ride on the plural row as extra_forms; the DB and files runtimes
-		// pick the right one by the locale's CLDR form index.
+		// Forms 2..N ride on the plural row; both runtimes pick one by the locale's CLDR form index.
 		$extra = [];
 		foreach ( array_slice( (array) $entry->translations, 2 ) as $form ) {
 			$extra[] = (string) $form;
@@ -1743,11 +1379,8 @@ final class PoSync {
 	}
 
 	/**
-	 * What the strings of a batch of PO entries hold in a language, per string
-	 * id: a SHA-1 of the translation and of the plural extra forms (null when
-	 * there are none), or null for a string that holds no translation in the
-	 * language. One read by the entries' source hashes; a string that does not
-	 * exist yet is absent from the map.
+	 * What a batch's strings hold in a language, per string id: SHA-1s of the translation and of the extra forms (null
+	 * without), or null without a translation; one read by source hash, missing strings absent.
 	 *
 	 * @param string                   $strings_table The strings table.
 	 * @param string                   $st_table      The string_translations table.

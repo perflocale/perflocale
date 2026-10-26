@@ -20,18 +20,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * `POST /perflocale/v1/block-translate` - translate a single text / HTML
- * snippet with the configured MT provider.
+ * `POST /perflocale/v1/block-translate`: machine-translate text or HTML snippets for the block editor; writes nothing.
  *
- * Used by the Gutenberg block-toolbar "Translate with MT" action, but
- * otherwise generic: any caller can POST a text + source + target and
- * get a translation back without side effects on any post.
- *
- * Unlike {@see MachineTranslateController::translate} this does NOT touch
- * the translation-group tables or persist anything about a post. It is a
- * provider wrapper, but still a provider-bound spender: the monthly
- * character cap is enforced inside the service before the provider call,
- * and the same per-user hourly rate-limit cap applies for budget safety.
+ * It still spends provider quota: the monthly character cap and the shared per-user hourly rate limit apply.
  */
 final class BlockTranslateController extends RestController {
 
@@ -43,26 +34,17 @@ final class BlockTranslateController extends RestController {
 	protected $rest_base = 'block-translate';
 
 	/**
-	 * Maximum input length - protects MT budget + caps request body
-	 * size. Block content shouldn't realistically exceed this.
+	 * Maximum characters per text: protects the MT budget and bounds the request.
 	 */
 	private const MAX_INPUT_LENGTH = 50000;
 
 	/**
-	 * Maximum number of entries accepted in one batch. The per-entry and
-	 * aggregate-character caps alone let a request carry hundreds of
-	 * thousands of tiny strings, and each batch miss becomes one sequential
-	 * provider round-trip inside a single PHP worker. A full post's
-	 * translatable leaves stay well under this bound.
+	 * Maximum entries per batch: the character caps alone allow huge numbers of tiny strings, each a provider round-trip.
 	 */
 	private const MAX_BATCH_ENTRIES = 500;
 
 	/**
-	 * Maximum block-path depth accepted on /from-source. Real Gutenberg
-	 * trees rarely nest beyond 6-8 levels (group → columns → column → block);
-	 * a cap of 32 is well above any realistic post and well below anything
-	 * that would let a malicious client force pathological recursion in
-	 * walk_block_path().
+	 * Maximum block-path depth on /from-source: far above real nesting, and bounds walk_block_path() for hostile input.
 	 */
 	private const MAX_BLOCK_PATH_DEPTH = 32;
 
@@ -72,11 +54,8 @@ final class BlockTranslateController extends RestController {
 	 * @return void
 	 */
 	public function register_routes(): void {
-		// Sibling-aware "Fill in from source" endpoint. Resolves
-		// the corresponding block in the post's source-language sibling and
-		// translates it into the current sibling's language. Registered
-		// BEFORE the catch-all `/block-translate` so the more-specific
-		// suffix wins the route match.
+		// "Fill in from source": translates the same block of the source-language sibling.
+		// Registered before `/block-translate` so the more specific route matches first.
 		register_rest_route(
 			$this->namespace,
 			'/' . $this->rest_base . '/from-source',
@@ -85,31 +64,23 @@ final class BlockTranslateController extends RestController {
 				'callback'            => [ $this, 'translate_from_source' ],
 				'permission_callback' => [ $this, 'from_source_permissions_check' ],
 				'args'                => [
-					// Sibling post being edited. The handler verifies the
-					// caller can edit it (`edit_post` cap) before fetching
-					// source content from the corresponding source post.
+					// Sibling post being edited; edit_post on it is checked before the source is read.
 					'target_post_id' => [
 						'required' => true,
 						'type'     => 'integer',
 					],
-					// Position path of the block in the sibling's tree:
-					// [3, 1, 2] = top-level index 3, then inner index 1,
-					// then inner index 2. Server walks the SAME indices in
-					// the source post's tree to find the corresponding block.
+					// Index path of the block, e.g. [3, 1, 2]; the same indices are walked in the source post's tree.
 					'block_path'     => [
 						'required' => true,
 						'type'     => 'array',
 						'items'    => [ 'type' => 'integer' ],
 					],
-					// Sibling's language slug (target). Source language is
-					// derived server-side from the source post.
+					// Target language slug; the source language comes from the source post.
 					'target_lang'    => [
 						'required' => true,
 						'type'     => 'string',
 					],
-					// Optional: the attribute names to read from the source
-					// block (the editor's own attribute chain for the block
-					// type). Omitted = every text attribute of the block type.
+					// Optional attribute names to read (the editor's chain); omitted means every text attribute.
 					'source_attrs'   => [
 						'type'    => 'array',
 						'items'   => [ 'type' => 'string' ],
@@ -136,22 +107,18 @@ final class BlockTranslateController extends RestController {
 				'callback'            => [ $this, 'translate' ],
 				'permission_callback' => [ $this, 'mt_permissions_check' ],
 				'args'                => [
-					// Single-text path (legacy + most JS callers).
+					// Single-text path.
 					'text'        => [
 						'type'    => 'string',
 						'default' => '',
 					],
-					// Batch path: array of strings, all translated
-					// in one provider round-trip. When `texts` is non-empty
-					// it takes precedence over `text`.
+					// Batch path, one provider round-trip; a non-empty `texts` wins over `text`.
 					'texts'       => [
 						'type'    => 'array',
 						'items'   => [ 'type' => 'string' ],
 						'default' => [],
 					],
-					// Batch path: destination format of each entry, parallel to
-					// `texts`. `text` for plain-text attributes (image alt,
-					// title), `html` for rich text. Omitted = every entry html.
+					// Format per `texts` entry: `text` for plain attributes (alt, title), `html` (default) for rich text.
 					'formats'     => [
 						'type'    => 'array',
 						'items'   => [
@@ -183,11 +150,9 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	 * Per-post permission gate for `/from-source`. Runs the MT cap check
-	 * first, then `edit_post` on the body's `target_post_id`. The full
-	 * read-cap check on the SOURCE sibling stays in the handler - the
-	 * sibling resolution requires DB work that this gate intentionally
-	 * doesn't replicate.
+	 * Permission gate for `/from-source`: the MT cap, then edit_post on `target_post_id`.
+	 *
+	 * The read check on the source sibling is in the handler, which resolves the sibling.
 	 *
 	 * @param \WP_REST_Request $request
 	 * @return bool|\WP_Error
@@ -200,7 +165,7 @@ final class BlockTranslateController extends RestController {
 
 		$target_post_id = (int) $request->get_param( 'target_post_id' );
 		if ( $target_post_id <= 0 ) {
-			// Defer to the handler's 400 missing_params for descriptive errors.
+			// The handler returns the descriptive 400.
 			return true;
 		}
 
@@ -228,9 +193,7 @@ final class BlockTranslateController extends RestController {
 		$target_lang = sanitize_key( (string) $request->get_param( 'target_lang' ) );
 		$provider_id = sanitize_key( (string) $request->get_param( 'provider' ) );
 
-		// Detect batch mode: client supplied an array of texts. Each input
-		// must be a string; a non-array `texts` is treated as missing so
-		// the controller can fall back to the single-text path below.
+		// Batch mode for a non-empty `texts` array; anything else falls back to the single-text path.
 		$is_batch = is_array( $texts_param ) && count( $texts_param ) > 0;
 		$texts    = [];
 
@@ -261,9 +224,7 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'missing_params', __( 'source_lang and target_lang are required.', 'perflocale' ), 400 );
 		}
 
-		// The editor names the post being edited. A password-protected one is
-		// sent unless the perflocale/mt/send_password_protected filter refuses
-		// it; a post the user cannot edit is not looked at.
+		// The edited post: password-protected is sent unless the perflocale/mt/send_password_protected filter refuses it.
 		$post_id_param = $request->get_param( 'post_id' );
 		$post_id       = is_numeric( $post_id_param ) ? absint( $post_id_param ) : 0;
 
@@ -275,10 +236,7 @@ final class BlockTranslateController extends RestController {
 			}
 		}
 
-		// Validate both lang codes against active languages up front so an
-		// invalid code returns HTTP 400 (client error) instead of a
-		// provider-side 500 that surfaces as a generic "translation failed"
-		// the admin UI can't distinguish from a real server crash.
+		// Unknown language codes are a 400 here, not a provider 500 the UI cannot tell from a crash.
 		$router       = Plugin::get_instance()->get( 'router' );
 		$active       = $router->get_active_languages();
 		$active_codes = [];
@@ -308,9 +266,7 @@ final class BlockTranslateController extends RestController {
 		}
 
 		if ( $source_lang === $target_lang ) {
-			// No-op but return gracefully - the UI might pre-select the
-			// current language by mistake; save the caller from handling
-			// an error here.
+			// Same language: return the input unchanged rather than an error.
 			if ( $is_batch ) {
 				return $this->success(
 					[
@@ -328,9 +284,7 @@ final class BlockTranslateController extends RestController {
 			);
 		}
 
-		// Validate input lengths up-front. Single-text path: simple cap. Batch
-		// path: each entry must individually fit AND the SUM must too, so a
-		// single request can't slip past the cap by splitting.
+		// Each batch entry and the batch sum are capped, so splitting cannot pass the cap.
 		if ( $is_batch ) {
 			if ( count( $texts ) > self::MAX_BATCH_ENTRIES ) {
 				return $this->error(
@@ -344,13 +298,7 @@ final class BlockTranslateController extends RestController {
 				);
 			}
 
-			// mb_strlen, not strlen: every message below says "characters", and
-			// every other cap in the plugin (TranslationService, MetaTranslator,
-			// all four providers) is character-based. Counting bytes made the
-			// real limit 16,666 characters for Japanese, Chinese, Korean and
-			// Thai and 25,000 for Arabic, Hebrew and Russian, while telling the
-			// operator it was 50,000. Core polyfills mb_strlen at every
-			// supported version, so this needs no extension.
+			// Characters, not bytes (mb_strlen, polyfilled by core), as every other cap in the plugin.
 			$total_chars = 0;
 
 			foreach ( $texts as $i => $t ) {
@@ -369,9 +317,7 @@ final class BlockTranslateController extends RestController {
 				$total_chars += mb_strlen( $t );
 			}
 
-			// Batch sum cap = 4× single cap. Conservative enough that one
-			// "translate entire post" still fits, but a runaway client can't
-			// drain the whole monthly MT quota in a single request.
+			// Batch sum cap is 4x the single cap: a whole post fits, a runaway client cannot drain the monthly quota.
 			$batch_total_cap = self::MAX_INPUT_LENGTH * 4;
 
 			if ( $total_chars > $batch_total_cap ) {
@@ -417,11 +363,7 @@ final class BlockTranslateController extends RestController {
 			return $limited;
 		}
 
-		// 2.3 Translation Memory pre-flight (single-text path only): an exact
-		// match skips the MT call. Batch stays on MT (a multi-leaf walk rarely
-		// has every leaf hit TM). TranslationService is instantiated BELOW, so
-		// a TM hit short-circuits without constructing five providers + running
-		// the providers filter on the common cached path.
+		// Single text only: a pre_translate_lookup hit answers before TranslationService and its providers are built.
 		if ( ! $is_batch ) {
 			$tm_hit = $this->maybe_tm_lookup( $text, $source_lang, $target_lang );
 
@@ -443,10 +385,7 @@ final class BlockTranslateController extends RestController {
 
 		try {
 			if ( $is_batch ) {
-				// translate_batch_texts wraps Provider::translate_batch with
-				// per-entry filters and the sanitiser of each entry's format
-				// (sanitize_mt_html for html, the text sanitiser for text), so
-				// the response is safe to write to block attributes as is.
+				// Each entry is sanitized for its format, so the response is safe to write to block attributes.
 				$batch_result = $this->translate_by_format(
 					$service,
 					array_values( $texts ),
@@ -482,13 +421,7 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	/**
-	 * Translation-memory pre-flight hook point.
-	 *
-	 * The bundled translation memory was removed; this remains as the single
-	 * place an integration can short-circuit an MT call with its own cached
-	 * translation. Return a non-empty string from the filter to use it
-	 * instead of calling the provider.
+	 * Lookup filter that lets an integration answer an MT call from its own cache.
 	 *
 	 * @return string|null Translation to use, or null to call the provider.
 	 */
@@ -511,9 +444,7 @@ final class BlockTranslateController extends RestController {
 	/**
 	 * Walk a parsed-block tree to the position given by `$path`.
 	 *
-	 * `$path` is an array of integers: [3, 1, 2] means top-level block 3,
-	 * then inner block 1, then inner block 2. Returns null if any step in
-	 * the path is out of range (the source post has been restructured).
+	 * [3, 1, 2] is top-level block 3, inner block 1, inner block 2; null when a step is out of range.
 	 *
 	 * @param array<int, array<string, mixed>> $blocks Result of parse_blocks().
 	 * @param int[]                            $path Index path from root to target.
@@ -540,15 +471,9 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	 * Strip the empty whitespace-only entries `parse_blocks()` interleaves
-	 * between real blocks (an empty-string `blockName` entry between every
-	 * pair of adjacent blocks).
+	 * Drop the whitespace entries parse_blocks() puts between blocks.
 	 *
-	 * The editor's `wp.data.select('core/block-editor').getBlocks()` returns
-	 * ONLY real blocks - no whitespace placeholders. The JS-computed
-	 * position path therefore counts only real blocks, and the server-side
-	 * walk must do the same or every nested-block path will be off by N
-	 * (where N = number of preceding whitespace gaps).
+	 * The editor's block paths count real blocks only, so the server walk must too.
 	 *
 	 * @param array<int, array<string, mixed>> $blocks
 	 * @return array<int, array<string, mixed>> Re-indexed (0..n-1) array of real blocks.
@@ -570,38 +495,10 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	 * Translate the corresponding block in this post's SOURCE sibling and
-	 * return the translation in the target post's language.
+	 * Translate the same block of the source-language sibling into the target post's language.
 	 *
-	 * Use case: editing a French sibling that's still mostly English, click
-	 * "Fill in from source" on a paragraph → endpoint fetches the EN source
-	 * post's same-position paragraph → translates EN to FR → returns the FR
-	 * text for the JS to write back.
-	 *
-	 * Each text attribute of the source block is read from where its block
-	 * type stores it ({@see BlockAttributeSource}) and returned under its own
-	 * name in `attributes`, so the editor writes the paragraph's text into
-	 * `content` and an image's alt, caption and title into their own
-	 * attributes. `translated` / `source_attr` carry the first of them.
-	 *
-	 * A source block marked "Do not translate", or inside a marked block, is
-	 * returned verbatim (`source` = `kept`) with no provider call, no
-	 * translation-memory lookup and no rate-limit slot, the same rule
-	 * whole-post machine translation applies.
-	 *
-	 * Validation:
-	 *  - Caller has `edit_post` for `target_post_id`
-	 *  - target_post_id resolves to a post with a translation group
-	 *  - The translation group has a sibling in the default (source) language
-	 *  - The source-sibling's block tree has a node at `block_path`
-	 *  - The matched source block has translatable text
-	 *
-	 * Errors:
-	 *  - 403 `cannot_edit_post` (auth), 404 `no_source_sibling` /
-	 *    `block_not_found_in_source`, 422 `empty_source_text` for the
-	 *    "block has no text" case, 422 `unreadable_source_block` when the
-	 *    block type stores its text behind a selector this reader cannot
-	 *    evaluate.
+	 * Each text attribute comes back under its own name in `attributes`. A block under "Do not translate" is
+	 * returned verbatim (`source` = `kept`) with no provider call or rate-limit slot, as whole-post MT keeps it.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response|\WP_Error
@@ -612,8 +509,7 @@ final class BlockTranslateController extends RestController {
 		$target_lang    = sanitize_key( (string) $request->get_param( 'target_lang' ) );
 		$provider_id    = sanitize_key( (string) $request->get_param( 'provider' ) );
 
-		// Attribute names are camelCase (fileName, downloadButtonText), so they
-		// are validated by BlockAttributeSource, not lower-cased by sanitize_key().
+		// Attribute names are camelCase: BlockAttributeSource validates them, sanitize_key() would lower-case them.
 		$source_attrs = array_values( array_filter( (array) $request->get_param( 'source_attrs' ), 'is_string' ) );
 		$source_attr  = (string) $request->get_param( 'source_attr' );
 		$legacy_hint  = $source_attrs === [] && $source_attr !== '';
@@ -626,9 +522,7 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'missing_params', __( 'target_post_id and target_lang are required.', 'perflocale' ), 400 );
 		}
 
-		// Cap block_path depth before any other work - protects walk_block_path()
-		// from pathological recursion and bounds the JSON body size we'll
-		// process for malicious / malformed clients.
+		// Depth cap before any other work, against hostile input.
 		if ( count( $block_path ) > self::MAX_BLOCK_PATH_DEPTH ) {
 			return $this->error(
 				'block_path_too_deep',
@@ -641,8 +535,7 @@ final class BlockTranslateController extends RestController {
 			);
 		}
 
-		// Per-block-attribute auth - more granular than `edit_posts`.
-		// Confirms the caller has rights for THIS specific target post.
+		// Edit rights on this target post, not any post.
 		if ( ! current_user_can( 'edit_post', $target_post_id ) ) {
 			return $this->error( 'cannot_edit_post', __( 'You cannot edit this post.', 'perflocale' ), 403 );
 		}
@@ -653,28 +546,24 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'mt_disabled', __( 'Machine translation is disabled.', 'perflocale' ), 403 );
 		}
 
-		// Find the source post (the sibling in the default language).
+		// The source post is the default-language sibling.
 		$source_post = $this->find_source_sibling_post( $target_post_id );
 
 		if ( ! $source_post instanceof \WP_Post ) {
 			return $this->error( 'no_source_sibling', __( 'This post has no source-language sibling to translate from.', 'perflocale' ), 404 );
 		}
 
-		// Read-cap on the SOURCE post. `edit_post` on the target alone is not
-		// enough: the request translates the source's content, so the caller
-		// must be able to read the source too, even though it is a sibling.
+		// The source's text is sent, so the caller must also be able to read the source post.
 		if ( ! current_user_can( 'read_post', (int) $source_post->ID ) ) {
 			return $this->error( 'cannot_read_source', __( 'You do not have permission to read the source post.', 'perflocale' ), 403 );
 		}
 
-		// If editing the source itself was somehow routed here, that's a
-		// caller error - the JS should have used /block-translate instead.
+		// The source itself is a caller error: it belongs on /block-translate.
 		if ( (int) $source_post->ID === $target_post_id ) {
 			return $this->error( 'is_source', __( 'Target post IS the source post; use /block-translate to translate in place.', 'perflocale' ), 400 );
 		}
 
-		// The source's text is sent: a password-protected source is sent
-		// unless the perflocale/mt/send_password_protected filter refuses it.
+		// A password-protected source is sent unless the perflocale/mt/send_password_protected filter refuses it.
 		if ( ! TranslationService::may_send_post( $source_post, 'editor' ) ) {
 			return $this->error( 'password_protected', TranslationService::password_protected_skip_message(), 403 );
 		}
@@ -690,12 +579,11 @@ final class BlockTranslateController extends RestController {
 		$source_lang = (string) $default_lang->slug;
 
 		if ( $source_lang === $target_lang ) {
-			// Editing the source post (already handled above), but defensive.
+			// Defensive: the source post case is refused above.
 			return $this->error( 'same_lang', __( 'Source and target languages match; nothing to translate.', 'perflocale' ), 400 );
 		}
 
-		// Parse the source post's content into a block tree, then walk the
-		// position path to find the corresponding block.
+		// Walk the source post's block tree to the same position.
 		if ( ! function_exists( 'parse_blocks' ) ) {
 			return $this->error( 'parse_blocks_missing', __( 'Block parser unavailable.', 'perflocale' ), 500 );
 		}
@@ -713,8 +601,7 @@ final class BlockTranslateController extends RestController {
 
 		$read = BlockAttributeSource::read( $matched_block, $source_attrs );
 
-		// The single-name hint names a preference, not a restriction: an
-		// empty hinted attribute falls through to the block type's chain.
+		// The single-name hint is a preference: an empty hinted attribute falls back to the block type's chain.
 		if ( $legacy_hint && $read['values'] === [] ) {
 			$read = BlockAttributeSource::read( $matched_block );
 		}
@@ -738,8 +625,7 @@ final class BlockTranslateController extends RestController {
 			'source_post_id' => (int) $source_post->ID,
 		];
 
-		// "Do not translate" on the source block or any block above it: the
-		// target gets the source text verbatim, as whole-post MT keeps it.
+		// "Do not translate" on the block or an ancestor: the source text verbatim, as whole-post MT keeps it.
 		if ( BlockAttributeSource::path_is_skip_marked( $source_blocks, $block_path ) ) {
 			return $this->success(
 				$base + [
@@ -789,8 +675,7 @@ final class BlockTranslateController extends RestController {
 			return $limited;
 		}
 
-		// TM pre-flight per value - same filter as the regular translate
-		// path: a phrase translated before costs no MT quota.
+		// Lookup filter per value, as on the single-text path.
 		$translated = [];
 		$pending    = [];
 
@@ -820,8 +705,7 @@ final class BlockTranslateController extends RestController {
 			}
 
 			foreach ( $names as $i => $name ) {
-				// An empty result is a provider failure for that value; never
-				// hand the editor an empty string to write over its text.
+				// An empty result is a provider failure: never hand the editor an empty string to write over its text.
 				if ( isset( $results[ $i ] ) && $results[ $i ] !== '' ) {
 					$translated[ $name ] = $results[ $i ];
 				}
@@ -882,12 +766,7 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	 * Resolve the source-language sibling of a target post.
-	 *
-	 * Looks up the post's translation group, iterates linked posts, returns
-	 * the one whose language is the default (source) language. Returns null
-	 * when the post has no group, no source sibling, or the source post no
-	 * longer exists in WP.
+	 * The default-language sibling of a post, or null when there is none.
 	 */
 	private function find_source_sibling_post( int $target_post_id ): ?\WP_Post {
 		$plugin = Plugin::get_instance();
@@ -938,18 +817,13 @@ final class BlockTranslateController extends RestController {
 	}
 
 	/**
-	 * Per-user hourly rate limit - mirrors
-	 * MachineTranslateController::enforce_rate_limit so the two
-	 * endpoints share one budget under the `perflocale/mt/rate_limit`
-	 * filter.
+	 * Per-user hourly rate limit, one budget shared with MachineTranslateController.
 	 *
 	 * @param int $user_id Current user ID.
 	 * @return \WP_Error|null
 	 */
 	private function enforce_rate_limit( int $user_id ): ?\WP_Error {
-		// Delegates to the shared policy - see MachineTranslateController. The
-		// two copies had to agree on transient keys and lock name to share a
-		// budget at all; now they cannot disagree.
+		// The shared MtRateLimiter policy.
 		return MtRateLimiter::admit( $user_id );
 	}
 }

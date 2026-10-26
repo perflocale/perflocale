@@ -20,9 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Translates WooCommerce emails into the customer's language.
  *
- * Stores the language at order creation time, then translates email
- * subjects, headings, and additional content via PerfLocale's String
- * Translation system, and switches locale for email body rendering.
+ * Tags each order with its language; customer emails render in it, shop emails in the default language.
  */
 final class EmailTranslation {
 
@@ -56,70 +54,55 @@ final class EmailTranslation {
 	private bool $locale_switched = false;
 
 	/**
-	 * Whether we've already registered the shutdown-time locale-restore
-	 * safety net for the current request. Prevents stacking multiple
-	 * shutdown callbacks when several emails go out in one request.
+	 * Whether the shutdown locale-restore safety net is registered for this request.
 	 *
 	 * @var bool
 	 */
 	private bool $shutdown_restore_registered = false;
 
 	/**
-	 * Whether an order-language window is currently open.
+	 * Whether an order-language window is open (router overridden, restore owed).
 	 *
-	 * Tracked separately from $locale_switched because the two are NOT the same
-	 * thing: switch_to_locale() returns false without pushing a stack frame when
-	 * the target locale has no installed language pack, or already equals
-	 * determine_locale(). The window can therefore be open (router overridden,
-	 * restore owed) while nothing was pushed and nothing must be popped.
+	 * Not $locale_switched: switch_to_locale() can return false without pushing a frame.
 	 *
 	 * @var bool
 	 */
 	private bool $window_open = false;
 
 	/**
-	 * Whether the email body has finished rendering and a restore is owed.
+	 * Whether the email body finished rendering (footer fired) and a restore is owed.
 	 *
-	 * Set at woocommerce_email_footer, consumed by woocommerce_email_sent. Lets
-	 * the window stay open across get_headers(), get_attachments() and wp_mail()
-	 * while still telling a re-entering render that the previous email is done.
+	 * Keeps the window open through wp_mail() while telling the next render the previous email is done.
 	 *
 	 * @var bool
 	 */
 	private bool $restore_pending = false;
 
 	/**
-	 * The email the open window belongs to (window_key()), or '' for a window
-	 * opened without one (stock notifications).
+	 * The email the open window belongs to (window_key()), or '' (stock notifications).
 	 *
-	 * A render of a different email while the window is still open means the
-	 * previous email never reached its footer: WooCommerce catches an
-	 * exception thrown inside an email render and goes on with the next email
-	 * in the same request.
+	 * Another email while open: the previous render threw before its footer, and WooCommerce sends the next.
 	 *
 	 * @var string
 	 */
 	private string $window_key = '';
 
 	/**
-	 * Router language saved before an order-email override, restored by
-	 * restore_locale().
+	 * Router language saved before an order-email override, restored by restore_locale().
 	 *
 	 * @var object|null
 	 */
 	private ?object $previous_router_language = null;
 
 	/**
-	 * Whether the router's current language is currently overridden for an
-	 * email render.
+	 * Whether the router's current language is overridden for an email render.
 	 *
 	 * @var bool
 	 */
 	private bool $router_overridden = false;
 
 	/**
-	 * WooCommerce's default texts of the email being sent, read in the
-	 * sender's locale before the switch: field => text.
+	 * WooCommerce's default texts of the email being sent, in the sender's locale: field => text.
 	 *
 	 * @var array<string, string>
 	 */
@@ -158,42 +141,25 @@ final class EmailTranslation {
 			add_filter( "woocommerce_email_additional_content_{$id}", [ $this, 'translate_email_additional_content' ], 10, 3 );
 		}
 
-		// Switch locale for email body template rendering. Kept for
-		// third-party emails outside ORDER_EMAIL_IDS whose subject filters
-		// we don't hook; the primary switch happens in
-		// translate_email_field() so PLAIN-TEXT emails (whose templates
-		// never fire woocommerce_email_header) render in the order
-		// language too.
+		// For third-party emails outside ORDER_EMAIL_IDS; the primary switch is in
+		// translate_email_field(), as plain-text templates never fire woocommerce_email_header.
 		add_action( 'woocommerce_email_header', [ $this, 'switch_locale_for_email' ], 5, 2 );
 
-		// The body is done - but do NOT restore yet. woocommerce_email_footer
-		// fires from inside get_content(), which WC_Email::send() calls BEFORE
-		// get_headers(), get_attachments() and wp_mail(). Restoring here meant
-		// the From-name, every wp_mail filter, the attachment names and (on a
-		// multipart email) the entire plain-text alternative body were all
-		// produced in the TRIGGERING request's language rather than the
-		// customer's. Just record that a restore is owed.
+		// Do not restore here: the footer fires inside get_content(), before get_headers(),
+		// get_attachments() and wp_mail(), which must also run in the order's language.
 		add_action( 'woocommerce_email_footer', [ $this, 'mark_restore_pending' ], 99 );
 
-		// Plain-text emails have no footer action either - restore after
-		// the send completes so a multi-email request (order status
-		// cascade) can switch fresh per email.
+		// Restore after the send, so each email of a status cascade switches fresh.
 		add_action( 'woocommerce_email_sent', [ $this, 'restore_locale' ], 99, 0 );
 
-		// Stock notifications go to the shop. WooCommerce sends them from the
-		// request that changed the stock, usually a checkout in the customer's
-		// language: render them in the shop's language instead.
+		// Stock notifications go to the shop but are sent from the request that changed
+		// the stock, usually a customer's checkout: render them in the shop's language.
 		foreach ( [ 'woocommerce_low_stock_notification', 'woocommerce_no_stock_notification', 'woocommerce_product_on_backorder_notification' ] as $stock_hook ) {
 			add_action( $stock_hook, [ $this, 'switch_locale_for_shop' ], 1, 0 );
 			add_action( $stock_hook, [ $this, 'restore_locale' ], PHP_INT_MAX, 0 );
 		}
 
-		// Multisite: these per-language caches hold blog-specific data
-		// (slug→ID is a per-blog auto-increment; preloaded translations are
-		// per-blog rows). Drop them on switch_blog so an email sent for one
-		// blog during a multi-blog request (network order processing, CLI,
-		// scheduled actions) can't reuse the previous blog's mapping and
-		// send the wrong language. switch_blog only fires on multisite.
+		// The slug-to-ID map and preloaded translations are per blog.
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ $this, 'reset_caches' ] );
 		}
@@ -202,10 +168,7 @@ final class EmailTranslation {
 	/**
 	 * Register the order-language tagging hooks.
 	 *
-	 * The WooCommerce add-on registers these whenever it is active, whether
-	 * or not order emails are translated: the order's language is also read
-	 * by the personal-data export and by emails sent after the setting is
-	 * turned on.
+	 * Registered even when emails are not translated: the personal-data export and later emails read it.
 	 *
 	 * @return void
 	 */
@@ -217,10 +180,8 @@ final class EmailTranslation {
 		// Save the current language when an order is created.
 		add_action( 'woocommerce_new_order', [ $this, 'save_order_language' ], 10, 2 );
 
-		// Pay-for-order: an order without a language takes the language it is
-		// paid in, before the payment sends any email. The classic order-pay
-		// page and the Store API order-pay and checkout routes fire these
-		// actions before they process the payment.
+		// Pay-for-order: an order without a language takes the one it is paid in, before
+		// the payment sends any email.
 		add_action( 'woocommerce_before_pay_action', [ $this, 'save_pay_page_order_language' ], 10, 1 );
 		add_action( 'woocommerce_store_api_checkout_order_processed', [ $this, 'save_store_api_paid_order_language' ], 10, 1 );
 	}
@@ -248,8 +209,7 @@ final class EmailTranslation {
 			return;
 		}
 
-		// WooCommerce hands the order object to this hook; re-loading it was a
-		// second full load for no reason.
+		// WooCommerce passes the order object; load it only when missing.
 		if ( ! $order instanceof \WC_Order ) {
 			$order = wc_get_order( $order_id );
 		}
@@ -266,17 +226,13 @@ final class EmailTranslation {
 
 		$order->update_meta_data( self::ORDER_LANG_META, $slug );
 
-		// save_meta_data(), not save(). A full save() inside woocommerce_new_order
-		// writes the order table again, bumps date_modified and dispatches a
-		// nested woocommerce_update_order - on the checkout path, for one meta
-		// row. save_meta_data() writes just that row through the data store,
-		// which does its own postmeta backfill when HPOS compatibility mode is on.
+		// Not save(): inside woocommerce_new_order that rewrites the order, bumps
+		// date_modified and fires a nested woocommerce_update_order for one meta row.
 		$order->save_meta_data();
 	}
 
 	/**
-	 * Classic order-pay page: give an order without a language the language
-	 * of the page it is paid on. An order that has a language keeps it.
+	 * Classic order-pay page: give an order without a language the page's language.
 	 *
 	 * @param mixed $order Order being paid.
 	 * @return void
@@ -292,9 +248,7 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Store API order-pay and checkout routes: give an order without a
-	 * language the shopper's language, read as for a new order. An order
-	 * that has a language keeps it.
+	 * Store API order-pay and checkout: give an order without a language the shopper's language.
 	 *
 	 * @param mixed $order Order being paid.
 	 * @return void
@@ -364,9 +318,7 @@ final class EmailTranslation {
 	/**
 	 * Translate an email field (subject, heading, or additional_content).
 	 *
-	 * Retrieves the raw option value (with placeholders like {site_title}),
-	 * looks up the String Translation for the order's language, formats
-	 * placeholders, and returns the translated string.
+	 * Looks up the raw option value (placeholders intact), then formats the translation's placeholders.
 	 *
 	 * @param string    $formatted Already-formatted value from WC.
 	 * @param \WC_Order $order Order object.
@@ -379,33 +331,24 @@ final class EmailTranslation {
 			return $formatted;
 		}
 
-		// An email addressed to the shop, not the customer, renders in the
-		// shop's language (the default language), whatever the language of the
-		// request that sends it: a checkout in another language must not send
-		// the shop its own notification in the customer's language.
+		// An email to the shop renders in the default language, whatever the sending request's.
 		$for_shop = ! $this->email_uses_order_language( $email, $order );
 
 		$default_method = 'get_default_' . $field;
 		$has_default    = method_exists( $email, $default_method );
 
-		// Read before the switch below, in the locale WooCommerce used to
-		// format `$formatted`: the raw value (placeholders intact; for a shop
-		// that kept the default, WooCommerce's default text in that locale)
-		// and WooCommerce's default text itself.
+		// Read before the switch below, in the locale WooCommerce formatted `$formatted` in.
 		$raw_value      = $has_default ? (string) $email->get_option( $field, $email->{$default_method}() ) : '';
 		$default_before = $has_default ? (string) $email->{$default_method}() : '';
 		$wc_formatted   = $raw_value !== '' ? $email->format_string( $raw_value ) : '';
 
 		$key = $this->window_key( $email, $order );
 
-		// Opening a window for a new email: note WooCommerce's default texts
-		// in the sender's locale first, to tell a saved default from a custom
-		// text later (uses_default_text()).
+		// A new window first records WooCommerce's default texts in the sender's locale, so
+		// uses_default_text() can tell a saved default from a custom text.
 		if ( $this->window_open && ( $this->restore_pending || $this->window_key !== $key ) ) {
-			// The previous email is done: its body finished (footer fired), or
-			// it is another email whose render stopped before its footer. Close
-			// its window first, as switch_locale_to() would, so these are the
-			// sender's.
+			// The previous email is done (footer fired, or it stopped before it): close its
+			// window first, so the defaults read below are the sender's.
 			$this->restore_locale();
 		}
 
@@ -419,15 +362,11 @@ final class EmailTranslation {
 			}
 		}
 
-		// The subject filter is the FIRST per-email hook WC fires with the
-		// order in hand - switching here covers every email type,
-		// including plain text (whose templates never fire
-		// woocommerce_email_header).
+		// The subject filter is the first per-email hook with the order: switching here
+		// covers plain-text emails, which never fire woocommerce_email_header.
 		$this->switch_locale_for_order( $order, $for_shop, $key );
 
-		// WooCommerce formatted the {order_date} placeholder before the
-		// switch, in the sender's language (e.g. an English month in a French
-		// subject). Format it again in the order's language.
+		// WooCommerce formatted {order_date} before the switch, in the sender's language.
 		if ( $this->window_open && $this->locale_switched && isset( $email->placeholders['{order_date}'] ) && function_exists( 'wc_format_datetime' ) ) {
 			$created = $order->get_date_created();
 
@@ -461,13 +400,9 @@ final class EmailTranslation {
 			return $email->format_string( $translated );
 		}
 
-		// No stored translation. When the shop kept WooCommerce's default text
-		// and this email's locale was switched, WooCommerce may have formatted
-		// that text in the sender's language (an admin, a cron run, WP-CLI):
-		// the subject before the switch, and any text it filled into the
-		// email's settings earlier in the request. Format the default again,
-		// now in the order's language. A custom text, or a value another
-		// filter already changed, is kept as it is.
+		// No stored translation: a kept default text may have been formatted in the sender's
+		// language (admin, cron, WP-CLI), so format it again. A custom text, or a value
+		// another filter changed, stays.
 		if ( $this->window_open && $this->locale_switched
 			&& $this->uses_default_text( $email, $field, $this->sender_defaults[ $field ] ?? $default_before )
 			&& $formatted === $wc_formatted
@@ -485,12 +420,9 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Whether the shop left an email field at WooCommerce's default text.
+	 * Whether the shop left an email field at WooCommerce's default text (empty or equal to it).
 	 *
-	 * Reads the saved email settings: an empty value, or one equal to the
-	 * default text (the settings form pre-fills some fields with it), is the
-	 * default. The email object itself cannot tell: WooCommerce keeps the
-	 * default it filled in for the request in the object's settings.
+	 * Reads the saved option: the email object holds the default WooCommerce filled in for the request.
 	 *
 	 * @param \WC_Email $email          Email.
 	 * @param string    $field          subject, heading or additional_content.
@@ -509,10 +441,7 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Switch locale before email body template renders.
-	 *
-	 * Hooked to woocommerce_email_header (first action in email templates)
-	 * so all __() calls in the body use the customer's language .mo files.
+	 * Switch locale before the email body template renders (woocommerce_email_header).
 	 *
 	 * @param string    $email_heading Email heading text.
 	 * @param \WC_Email $email Email object.
@@ -535,8 +464,7 @@ final class EmailTranslation {
 	/**
 	 * Identify one email render: the email object, its type and its order.
 	 *
-	 * A saved order is identified by its id, so a reloaded copy of the same
-	 * order is the same render; an order without an id by its object.
+	 * A saved order is keyed by id, so a reloaded copy of it is the same render.
 	 *
 	 * @param \WC_Email $email Email being rendered.
 	 * @param \WC_Order $order Order it concerns.
@@ -550,8 +478,7 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Switch locale and router language to the shop's language for a
-	 * notification to the shop that is not an order email (stock levels).
+	 * Switch locale and router language to the shop's language for a stock notification.
 	 *
 	 * @return void
 	 */
@@ -578,24 +505,10 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Whether this email should be rendered in the ORDER's language.
+	 * Whether this email renders in the order's language.
 	 *
-	 * The default is WooCommerce's own answer: `is_customer_email()`. An email
-	 * addressed to the customer gets the customer's language; one addressed to
-	 * the shop gets the shop's. Of the nine order emails this class hooks,
-	 * `new_order`, `cancelled_order` and `failed_order` go to the store admin -
-	 * and until 1.0.3 those were rendered in the CUSTOMER's language, so a shop
-	 * whose orders came from three countries received its own notifications in
-	 * three languages. WooCommerce gates its own locale switch the same way
-	 * (`WC_Email::setup_locale()`), so this is agreement with core, not a
-	 * preference.
-	 *
-	 * Filterable rather than hard-coded because the plugin already lets a site
-	 * ADD email ids through `perflocale/woocommerce/translatable_email_ids`, and
-	 * a hard `is_customer_email()` test would silently overrule anyone who added
-	 * an admin email there on purpose - a shop with per-language fulfilment
-	 * staff being the obvious case. The two filters now compose: one chooses
-	 * WHICH emails are handled, this one chooses WHOSE language they use.
+	 * Default: is_customer_email(), as WC_Email::setup_locale() gates its own switch. Filterable: see
+	 * docs-ai/11-code-rationale.md, "EmailTranslation: whose language".
 	 *
 	 * @param \WC_Email $email Email being rendered.
 	 * @param \WC_Order $order Order it concerns.
@@ -616,21 +529,12 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Switch locale AND router language to an order's language for the
-	 * duration of an email render.
+	 * Switch locale and router language to an order's language for one email render.
 	 *
-	 * Anchored from the subject filter (which fires for EVERY email type -
-	 * the woocommerce_email_header action only exists in HTML templates,
-	 * so plain-text bodies used to render in the triggering request's
-	 * locale) and kept on the header action for third-party emails that
-	 * bypass the subject filters. The router override makes
-	 * language-keyed lookups (term names, attribute labels, string
-	 * translations) resolve in the ORDER language even when the email
-	 * fires from wp-admin, a gateway webhook, or cron.
+	 * The router override makes term, attribute and string lookups follow it from admin, webhooks or cron.
 	 *
 	 * @param \WC_Order $order    Order being rendered.
-	 * @param bool      $for_shop The email goes to the shop: use the shop's
-	 *                            language, not the order's.
+	 * @param bool      $for_shop The email goes to the shop: use the shop's language.
 	 * @param string    $key      The email render the window is for (window_key()).
 	 * @return void
 	 */
@@ -647,12 +551,9 @@ final class EmailTranslation {
 	 */
 	private function switch_locale_to( string $lang_slug, string $key = '' ): void {
 		if ( $this->window_open ) {
-			// A window is already open. The same email re-entering while its
-			// body still renders (the header action after the subject filter)
-			// leaves it alone. Otherwise the previous email is done: its footer
-			// fired (the NEXT email of a cascade), or this is another email and
-			// the previous render stopped before its footer. Close that window
-			// and open a fresh one, or email B renders in email A's language.
+			// The same email re-entering (header after subject) keeps its window. Otherwise the
+			// previous email is done (footer fired, or it stopped before it): close its window,
+			// or this email renders in the previous one's language.
 			if ( ! $this->restore_pending && $this->window_key === $key ) {
 				return;
 			}
@@ -670,27 +571,9 @@ final class EmailTranslation {
 			return;
 		}
 
-		// switch_to_locale() MUST run BEFORE the router override. WP core
-		// short-circuits (`if ( $current_locale === $locale ) return false;`)
-		// whenever determine_locale() already equals the target - and the
-		// router drives the `locale` filter, so overriding it first made the
-		// switch a guaranteed no-op: no text domain was ever reloaded and the
-		// email rendered in the TRIGGERING request's language instead of the
-		// order's. Ordering it this way, determine_locale() still reports the
-		// request language, so core performs the switch and reloads the
-		// domains.
-		//
-		// Capturing the router's "previous" language after the switch is safe:
-		// override_current_language() returns LanguageRouter's own static,
-		// which the locale switcher never touches, so it still holds the
-		// request's language here and restore_locale() puts it back.
-		// Record what switch_to_locale() ACTUALLY did. It returns false without
-		// pushing a stack frame when the locale has no installed language pack,
-		// or already equals determine_locale(). Assuming a push happened meant
-		// restore_previous_locale() later popped a frame somebody else had
-		// pushed - WooCommerce's own wc_switch_to_site_locale(), typically -
-		// leaving the rest of the request in a locale nobody chose. Reachable
-		// today on any store with a language whose pack is not installed.
+		// Switch before the router override (it drives the `locale` filter; core skips a switch
+		// to the current locale). False pushed no frame, so restore_locale() must not pop one.
+		// See docs-ai/11-code-rationale.md, "EmailTranslation: locale window".
 		$this->locale_switched = switch_to_locale( $locale );
 		$this->window_open     = true;
 		$this->window_key      = $key;
@@ -704,18 +587,12 @@ final class EmailTranslation {
 				$this->router_overridden        = true;
 			}
 		} catch ( \Throwable $e ) {
-			// Router unavailable (partial boot) - the locale switch alone
-			// still fixes the gettext strings.
+			// Router unavailable (partial boot): the locale switch alone still covers gettext.
 			unset( $e );
 		}
 
-		// Safety net: the paired `woocommerce_email_footer` action that
-		// calls restore_locale() won't fire if the email render dies mid
-		// template (fatal in an email meta hook, addon throwing, etc.).
-		// Without this, the site locale persists into subsequent
-		// requests on long-lived workers (php-fpm, opcache, roadrunner).
-		// Register exactly once per request; restore_locale() is
-		// no-op-safe when the hook has already fired normally.
+		// Safety net for a render that dies before woocommerce_email_sent. Once per request;
+		// restore_locale() does nothing when the window is already closed.
 		if ( ! $this->shutdown_restore_registered ) {
 			register_shutdown_function( [ $this, 'restore_locale' ] );
 			$this->shutdown_restore_registered = true;
@@ -723,13 +600,9 @@ final class EmailTranslation {
 	}
 
 	/**
-	 * Note that the email body has finished rendering.
+	 * Note that the email body has finished rendering (woocommerce_email_footer).
 	 *
-	 * Hooked to woocommerce_email_footer, which fires inside get_content() -
-	 * i.e. before get_headers(), get_attachments() and wp_mail(). The actual
-	 * restore is deferred to woocommerce_email_sent so the whole send happens in
-	 * the order's language; this only records that one is owed, which is what
-	 * lets a cascade of emails tell "same email re-entering" from "next email".
+	 * The restore waits for woocommerce_email_sent; this tells a re-entering email from the next one.
 	 *
 	 * @return void
 	 */
@@ -749,15 +622,13 @@ final class EmailTranslation {
 			return;
 		}
 
-		// Pop only if we pushed. See switch_locale_for_order().
+		// Pop only if we pushed. See switch_locale_to().
 		if ( $this->locale_switched ) {
 			restore_previous_locale();
 			$this->locale_switched = false;
 		}
 
-		// Deliberately OUTSIDE the guard above: the router override happens even
-		// when the locale switch was a no-op, so it always has to be undone or
-		// the rest of the request keeps serving the order's language.
+		// Outside the guard above: the router override happens even when the switch was a no-op.
 		if ( $this->router_overridden ) {
 			try {
 				Plugin::get_instance()->get( 'router' )->override_current_language( $this->previous_router_language );
@@ -793,11 +664,7 @@ final class EmailTranslation {
 	/**
 	 * The language a customer email for this order is written in.
 	 *
-	 * The order's own language; for an order without one (placed before
-	 * PerfLocale ran, or imported), the default content language, which is
-	 * the language the shop showed that customer. Without this fallback the
-	 * email took the language of whoever triggered it: the admin's, a cron
-	 * run's or the site's locale.
+	 * An order without one (older or imported) gets the default language, not the sender's.
 	 *
 	 * @param \WC_Order $order WooCommerce order.
 	 * @return string Language slug, or '' when there is no default language.
@@ -839,11 +706,8 @@ final class EmailTranslation {
 		$groups_table  = Schema::table( 'translation_groups' );
 		$st_table      = Schema::table( 'string_translations' );
 
-		// Single query: fetch all email string translations for this language.
-		// Joins the dedicated translations table via the composite PRIMARY KEY
-		// (string_id, language_id) - an indexed seek per row, replacing the
-		// pre-v2 CONCAT('perflocale_str_', s.id, '_', %d) wp_options join that
-		// couldn't use an index.
+		// All email string translations of this language; string_translations joins on its
+		// (string_id, language_id) primary key.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$results = $wpdb->get_results(
 			$wpdb->prepare(
@@ -913,25 +777,11 @@ final class EmailTranslation {
 			$router = Plugin::get_instance()->get( 'router' );
 			$slug   = $router->get_current_slug();
 
-			// Order creation is often a cookie-blind context for path-based
-			// detection (Store API /wp-json/wc/store/v1/checkout, admin manual
-			// orders), where the router resolves to the DEFAULT slug even though
-			// the shopper was browsing a non-default language. The perflocale_lang
-			// cookie set during front-end browsing is the reliable signal here, so
-			// prefer it when the router fell back to empty/default. An explicit
-			// non-default detection is never overridden.
-			// ...but only where the cookie can plausibly be the SHOPPER's. An order
-			// created by a shop manager in wp-admin would otherwise be tagged with
-			// the ADMIN's browsing language and every customer email for it sent
-			// in that language. The wp_doing_ajax() carve-out is load-bearing: the
-			// classic checkout posts to admin-ajax.php, where is_admin() is true
-			// but the cookie really is the shopper's. The Store API and
-			// /?wc-ajax= paths are not is_admin() at all.
+			// When the router fell back to empty/default (Store API checkout), prefer the shopper's
+			// cookie. Not in wp-admin (a manager's own language); admin-ajax.php stays in, as the
+			// classic checkout posts there.
 			if ( is_admin() && ! wp_doing_ajax() ) {
-				// Cast here, not at the tail return: the router's getter is typed
-				// mixed, and a second un-narrowed return would add an occurrence
-				// to the PHPStan baseline's return.type pattern - one of the three
-				// identifiers the release gate's static-analysis step greps for.
+				// Cast here: the getter returns mixed, and the release gate checks PHPStan's return.type baseline.
 				return (string) $slug;
 			}
 
@@ -943,10 +793,7 @@ final class EmailTranslation {
 				$default   = $lang_repo->get_default();
 				$ambiguous = ( $slug === '' || ( $default && $slug === $default->slug ) );
 
-				// Validate against the ACTIVE slug map (not find_by_slug, which
-				// falls through to a raw row even for a deactivated / renamed-away
-				// language) so this matches the router's own cookie detection and
-				// never records an order in an inactive language.
+				// The active slug map, not find_by_slug() (which returns inactive rows), as the router does.
 				if ( $ambiguous && isset( $lang_repo->get_slug_map()[ $cookie ] ) ) {
 					return $cookie;
 				}

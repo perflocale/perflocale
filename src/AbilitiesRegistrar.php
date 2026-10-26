@@ -1,16 +1,6 @@
 <?php
 /**
- * WordPress Abilities API integration.
- *
- * Registers PerfLocale translation operations as discoverable abilities
- * for AI tools, external consumers, and the WordPress Abilities REST API.
- *
- * On by default, through the `abilities_enabled` setting. Turn the whole
- * integration off with:
- *   add_filter( 'perflocale/abilities/enabled', '__return_false' );
- *
- * Requires WordPress 6.9+ (Abilities API). On older versions, the hooks
- * never fire and this class has zero overhead.
+ * WordPress Abilities API integration (WordPress 6.9+; inert before).
  *
  * @package PerfLocale
  */
@@ -61,8 +51,7 @@ final class AbilitiesRegistrar {
 			return;
 		}
 
-		// Idempotent for the same reason the abilities are - see the guards in
-		// the register_*() methods below.
+		// Idempotent, as the abilities are.
 		if ( true === self::call_optional( 'wp_has_ability_category', 'perflocale-translation' ) ) {
 			return;
 		}
@@ -94,13 +83,8 @@ final class AbilitiesRegistrar {
 		$this->register_detect_language();
 		$this->register_convert_url();
 
-		// ⚠️ WRITE abilities, gated separately and OFF by default.
-		// `translate-post` spends the site's machine-translation budget and
-		// `create-translation` creates posts. Both are capability-checked, so
-		// this is not a privilege boundary - it is a SURPRISE boundary: an
-		// agent acting for an administrator could legitimately do either, and
-		// the owner would have no idea it happened until the provider bill or
-		// the post list showed it.
+		// Write abilities are off by default: not a privilege boundary (both check capabilities) but
+		// a surprise one, since translate-post spends MT budget and create-translation creates posts.
 		if ( ! $this->write_abilities_enabled() ) {
 			return;
 		}
@@ -112,10 +96,7 @@ final class AbilitiesRegistrar {
 	/**
 	 * Whether the current blog allows the abilities that write.
 	 *
-	 * Read at registration and again in both write abilities' permission
-	 * callbacks: the registry is process-global and outlives
-	 * switch_to_blog(), so the blog an ability runs on decides, not the blog
-	 * that registered it.
+	 * Checked again at run time: the registry outlives switch_to_blog(), so the running blog decides.
 	 *
 	 * @return bool
 	 */
@@ -125,18 +106,9 @@ final class AbilitiesRegistrar {
 	}
 
 	/**
-	 * List all active languages.
-	 *
-	 * @return void
-	 */
-	/**
 	 * Invoke an optional core function by name, only when it exists.
 	 *
-	 * The Abilities API (`wp_register_ability*`, WP 6.9+) and AI Client
-	 * (WP 7.0+) are optional progressive enhancements - the plugin's minimum
-	 * is 6.4 and it is fully functional without them. Calling by name keeps
-	 * this guarded, optional usage from tripping static WP-version scanners
-	 * while preserving the function_exists() safety check at the point of use.
+	 * By name so static WordPress-version scanners do not flag these guarded calls.
 	 *
 	 * @param string $function Global function name.
 	 * @param mixed  ...$args  Arguments to forward.
@@ -147,17 +119,12 @@ final class AbilitiesRegistrar {
 	}
 
 	/**
-	 * Per-object read gate shared by the object-scoped read abilities.
+	 * Per-object read gate (edit_post or edit_term), as TranslationsController::object_permissions_check().
 	 *
-	 * Mirrors TranslationsController::object_permissions_check(): the broad
-	 * `perflocale_translate` cap (already enforced by the permission_callback)
-	 * PLUS edit_post / edit_term on the object actually named in the input.
-	 * The REST twin GET /perflocale/v1/translations/<type>/<id> returns the
-	 * same sibling map behind that gate, so the two answer alike.
+	 * The permission_callback checks only the broad capability; this checks the object named in the input.
 	 *
 	 * @param int    $object_id   Post or term ID (already validated > 0).
-	 * @param string $object_type Either 'post' or 'term'; anything else is
-	 *                            treated as 'post' (the stricter branch).
+	 * @param string $object_type 'post' or 'term'; anything else is treated as 'post'.
 	 * @return \WP_Error|null     WP_Error on denial, null when allowed.
 	 */
 	private function authorize_object_read( int $object_id, string $object_type ): ?\WP_Error {
@@ -184,12 +151,13 @@ final class AbilitiesRegistrar {
 		return null;
 	}
 
+	/**
+	 * List all active languages.
+	 *
+	 * @return void
+	 */
 	private function register_list_languages(): void {
-		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
-		// name is registered twice. Now that abilities register at BOOT by
-		// default, any path that re-enters registration in the same request
-		// would trip that - a test rig re-entering to add the write abilities
-		// is the live example.
+		// Idempotent: registering a name twice raises _doing_it_wrong.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/list-languages' ) ) {
 			return;
 		}
@@ -205,9 +173,7 @@ final class AbilitiesRegistrar {
 					'properties'           => (object) [],
 					'additionalProperties' => false,
 				],
-				// Every output property carries title + description, matching
-				// the WP 7.1 core-ability schema convention - MCP clients and
-				// LLM tool-use surface these to decide how to read the result.
+				// Each output property has a title and description: MCP clients show them to models.
 				'output_schema'       => [
 					'type'       => 'object',
 					'properties' => [
@@ -274,10 +240,7 @@ final class AbilitiesRegistrar {
 						'count'     => count( $result ),
 					];
 				},
-				// The same rule as GET /perflocale/v1/languages: public unless
-				// `perflocale/api/languages_public` returns false, then any
-				// logged-in user. The filter's second argument stays a
-				// WP_REST_Request for callbacks typed against the route.
+				// As GET /perflocale/v1/languages; the filter gets a WP_REST_Request for callbacks typed to the route.
 				'permission_callback' => static function (): bool {
 					if ( (bool) apply_filters( 'perflocale/api/languages_public', true, new \WP_REST_Request( 'GET', '/perflocale/v1/languages' ) ) ) {
 						return true;
@@ -303,11 +266,7 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_get_translations(): void {
-		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
-		// name is registered twice. Now that abilities register at BOOT by
-		// default, any path that re-enters registration in the same request
-		// would trip that - a test rig re-entering to add the write abilities
-		// is the live example.
+		// Idempotent: registering a name twice raises _doing_it_wrong.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/get-translations' ) ) {
 			return;
 		}
@@ -353,11 +312,7 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'invalid_id', __( 'Invalid object ID.', 'perflocale' ) );
 					}
 
-					// Per-object read gate. The permission_callback only checks
-					// the BROAD `perflocale_translate` cap, and the sibling map
-					// below lists every language version of this object. Same gate
-					// the REST twin GET /perflocale/v1/translations/<type>/<id>
-					// applies.
+					// Per-object read gate, as the REST twin: the map lists every language version.
 					$denied = $this->authorize_object_read( $object_id, (string) $object_type );
 
 					if ( $denied instanceof \WP_Error ) {
@@ -376,10 +331,7 @@ final class AbilitiesRegistrar {
 						}
 					}
 
-					// A sibling the caller may not see: language and existence
-					// only, as in the REST map. A post is seen through read or
-					// edit rights; a term through edit_term, the right the
-					// queried term is gated on.
+					// A sibling the caller may not see (post: read or edit; term: edit_term) is null, as in the REST map.
 					if ( $type === Enum\ObjectType::Post ) {
 						_prime_post_caches( array_values( $map ), false, false );
 					} else {
@@ -423,11 +375,7 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_detect_language(): void {
-		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
-		// name is registered twice. Now that abilities register at BOOT by
-		// default, any path that re-enters registration in the same request
-		// would trip that - a test rig re-entering to add the write abilities
-		// is the live example.
+		// Idempotent: registering a name twice raises _doing_it_wrong.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/detect-language' ) ) {
 			return;
 		}
@@ -489,9 +437,7 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'invalid_id', __( 'Invalid object ID.', 'perflocale' ) );
 					}
 
-					// Per-object read gate - the language assignment of a private
-					// or draft object is not public information. Same gate the REST
-					// twin GET /perflocale/v1/translations/<type>/<id> applies.
+					// Per-object read gate: a private or draft object's language is not public.
 					$denied = $this->authorize_object_read( $object_id, (string) $object_type );
 
 					if ( $denied instanceof \WP_Error ) {
@@ -542,11 +488,7 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_convert_url(): void {
-		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
-		// name is registered twice. Now that abilities register at BOOT by
-		// default, any path that re-enters registration in the same request
-		// would trip that - a test rig re-entering to add the write abilities
-		// is the live example.
+		// Idempotent: registering a name twice raises _doing_it_wrong.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/convert-url' ) ) {
 			return;
 		}
@@ -590,9 +532,7 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'missing_params', __( 'URL and target_language are required.', 'perflocale' ) );
 					}
 
-					// The schema's maxLength is enforced by the Abilities API before
-					// this runs; this check holds when that validation is filtered
-					// away (wp_ability_validate_input).
+					// Holds when the schema's maxLength validation is filtered away.
 					if ( is_string( $url ) && mb_strlen( $url ) > self::CONVERT_URL_MAX_LENGTH ) {
 						return new \WP_Error( 'url_too_long', __( 'The URL is too long.', 'perflocale' ), [ 'status' => 400 ] );
 					}
@@ -605,20 +545,10 @@ final class AbilitiesRegistrar {
 
 					return [ 'url' => $converter->convert( $url, $slug ) ];
 				},
-				// Require a logged-in user. The ability runs through
-				// UrlConverter::convert(), which is read-only and forces
-				// the host back to home_url, but unauthenticated URL
-				// rewriting on a public-facing MCP/REST surface is a
-				// sharper edge than necessary - gate on session presence
-				// at minimum so anonymous traffic can't burn cycles on
-				// the converter. Sites that want this ability genuinely
-				// public can override via the
-				// `perflocale/abilities/convert_url_permission` filter.
+				// Logged-in users only, so anonymous traffic cannot use the converter.
 				'permission_callback' => static function (): bool {
 					/**
-					 * Filter the permission gate for the
-					 * `perflocale/convert-url` MCP/REST ability. Default
-					 * requires a logged-in user.
+					 * Filter the permission gate for the `perflocale/convert-url` ability.
 					 *
 					 * @hook perflocale/abilities/convert_url_permission
 					 * @param bool $allowed Default `is_user_logged_in()`.
@@ -633,10 +563,7 @@ final class AbilitiesRegistrar {
 						'readonly'    => true,
 						'destructive' => false,
 					],
-					// MCP exposure follows the permission_callback above:
-					// authenticated by default; opt in to public via the
-					// filter if your deployment intentionally wants
-					// anonymous URL-rewriting via MCP.
+					// Not public over MCP, matching the permission_callback.
 					'mcp'          => [ 'public' => false ],
 					'show_in_rest' => true,
 				],
@@ -645,45 +572,19 @@ final class AbilitiesRegistrar {
 	}
 
 	/**
-	 * Machine-translation authorization for the translate-post ability.
+	 * Target-side guards, rate limit and mt_enabled() for translate-post, in MachineTranslateController's order.
 	 *
-	 * MachineTranslateController::translate() applies four gates before it
-	 * reaches TranslationService::translate_post():
-	 *
-	 *   1. edit_post on the SOURCE - kept inline in the execute_callback so
-	 *      its `cannot_edit_post` code and ordering are unchanged;
-	 *   2. the target-side guards - edit_post on the source is neither
-	 *      authority to rewrite a translation the caller cannot edit (the
-	 *      overwrite guard, `cannot_overwrite_translation`) nor, when no live
-	 *      translation exists, authority over the default-language post whose
-	 *      shell, slug, meta and terms the new one is copied from
-	 *      (`source_forbidden`), nor permission to create a post of that
-	 *      post's type (`cannot_create_type`);
-	 *   3. the per-user / site-wide hourly MT rate limit;
-	 *   4. mt_enabled().
-	 *
-	 * Gates 2 to 4 are enforced here against the same predicates and in the
-	 * same order the controller uses. The rate limiter lives in MtRateLimiter;
-	 * both REST controllers and the admin create action also call it, and this
-	 * is one more caller of that one implementation rather than a copy of it.
-	 *
-	 * ORDER MATTERS: admit() increments both counters when it allows, so it is
-	 * called in the same position the controllers call it - after both
-	 * target-side guards, before mt_enabled() - so the ability and the routes
-	 * cannot disagree about which denial a caller sees, and so a request is
-	 * counted exactly once.
+	 * Order matters: admit() counts when it allows, so it runs after the target guards and before mt_enabled().
 	 *
 	 * @param int    $post_id     Source post ID.
-	 * @param string $target_slug Target language slug, exactly as it will be
-	 *                            passed to TranslationService::translate_post().
+	 * @param string $target_slug Target language slug, as passed to TranslationService::translate_post().
 	 * @return \WP_Error|null     WP_Error on denial, null when allowed.
 	 */
 	private function authorize_mt( int $post_id, string $target_slug ): ?\WP_Error {
 		$cache    = $this->plugin->get( 'cache' );
 		$settings = $this->plugin->get( 'settings' );
 
-		// Overwrite guard: translate_post() rewrites an EXISTING
-		// target-language translation in place.
+		// Overwrite guard: translate_post() rewrites an existing translation in place.
 		$manager  = new Translation\PostTranslationManager( $cache, $settings );
 		$existing = (int) $manager->get_translation_id( $post_id, $target_slug );
 
@@ -695,10 +596,7 @@ final class AbilitiesRegistrar {
 			);
 		}
 
-		// No live translation: translate_post() creates one. Its translated
-		// title, body and excerpt come from $post_id, but the post shell, slug,
-		// meta and terms are copied from the group's default-language post,
-		// which can be a different one.
+		// A new translation copies shell, slug, meta and terms from the group's default-language post.
 		$copy_from = $manager->get_copy_source_id( $post_id, $target_slug );
 
 		if ( $copy_from > 0 && $copy_from !== $post_id && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
@@ -709,8 +607,7 @@ final class AbilitiesRegistrar {
 			);
 		}
 
-		// The new post is of the copy source's type, and wp_insert_post()
-		// checks no capability, so apply the type's own create gate here.
+		// wp_insert_post() checks no capability: apply the copy source type's create gate.
 		if ( $copy_from > 0 && ! Helper::user_can_create_like( $copy_from ) ) {
 			return new \WP_Error(
 				'cannot_create_type',
@@ -719,9 +616,7 @@ final class AbilitiesRegistrar {
 			);
 		}
 
-		// Gate 3: per-user quota, site-wide quota, and the rate lock. Shared
-		// with both REST controllers and the admin create action, so these
-		// entry points draw down the same two budgets.
+		// Shared limiter: every MT entry point draws on the same per-user and site-wide budgets.
 		$limited = Translation\MtRateLimiter::admit( get_current_user_id() );
 
 		if ( $limited instanceof \WP_Error ) {
@@ -745,11 +640,7 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_translate_post(): void {
-		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
-		// name is registered twice. Now that abilities register at BOOT by
-		// default, any path that re-enters registration in the same request
-		// would trip that - a test rig re-entering to add the write abilities
-		// is the live example.
+		// Idempotent: registering a name twice raises _doing_it_wrong.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/translate-post' ) ) {
 			return;
 		}
@@ -787,6 +678,11 @@ final class AbilitiesRegistrar {
 							'title'       => 'Language',
 							'description' => 'Slug of the language the post was translated into.',
 						],
+						'warnings'           => [
+							'type'        => 'array',
+							'items'       => [ 'type' => 'string' ],
+							'description' => 'What the translation left out, such as a page builder layout.',
+						],
 					],
 				],
 				'execute_callback'    => function ( $input ) {
@@ -803,10 +699,7 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'not_found', __( 'Post not found.', 'perflocale' ) );
 					}
 
-					// Per-target capability check. The permission_callback only
-					// gates the BROAD `perflocale_use_mt` cap, so edit rights on
-					// THIS post are checked here. Mirrors the per-target
-					// `edit_post` enforcement in MachineTranslateController.
+					// The permission_callback checks only the broad capability; edit rights on this post are checked here.
 					if ( ! current_user_can( 'edit_post', $post_id ) ) {
 						return new \WP_Error(
 							'cannot_edit_post',
@@ -815,21 +708,12 @@ final class AbilitiesRegistrar {
 						);
 					}
 
-					// A password-protected post is sent unless the
-					// perflocale/mt/send_password_protected filter refuses it;
-					// checked where MachineTranslateController::translate()
-					// checks it.
+					// Password-protected posts: checked where MachineTranslateController::translate() checks them.
 					if ( ! MachineTranslation\TranslationService::may_send_post( $post, 'ability' ) ) {
 						return new \WP_Error( 'password_protected', MachineTranslation\TranslationService::password_protected_skip_message(), [ 'status' => 403 ] );
 					}
 
-					// Remaining MachineTranslateController::translate() gates: the
-					// existing-target overwrite guard, the copy-source check
-					// (`source_forbidden`), the create check on its type
-					// (`cannot_create_type`), the shared MT rate limiter, and
-					// mt_enabled() - in that order, matching the controller so
-					// the two entry points cannot disagree about which denial a
-					// caller sees.
+					// The controller's remaining gates, in its order.
 					$denied = $this->authorize_mt( $post_id, (string) $slug );
 
 					if ( $denied instanceof \WP_Error ) {
@@ -851,6 +735,7 @@ final class AbilitiesRegistrar {
 						return [
 							'translated_post_id' => $translated_id,
 							'language'           => $slug,
+							'warnings'           => array_values( (array) ( $result['warnings'] ?? [] ) ),
 						];
 					} catch ( \Throwable $e ) {
 						return new \WP_Error( 'translation_failed', $e->getMessage() );
@@ -877,11 +762,7 @@ final class AbilitiesRegistrar {
 	 * @return void
 	 */
 	private function register_create_translation(): void {
-		// Idempotent: `wp_register_ability()` warns via _doing_it_wrong when a
-		// name is registered twice. Now that abilities register at BOOT by
-		// default, any path that re-enters registration in the same request
-		// would trip that - a test rig re-entering to add the write abilities
-		// is the live example.
+		// Idempotent: registering a name twice raises _doing_it_wrong.
 		if ( true === self::call_optional( 'wp_has_ability', 'perflocale/create-translation' ) ) {
 			return;
 		}
@@ -915,9 +796,9 @@ final class AbilitiesRegistrar {
 					'type'       => 'object',
 					'properties' => [
 						'translated_post_id' => [
-							'type'        => 'integer',
+							'type'        => [ 'integer', 'null' ],
 							'title'       => 'Translation stub ID',
-							'description' => 'ID of the newly created translation stub (a draft until published).',
+							'description' => 'ID of the translation stub (a draft until published); null for an existing translation the caller cannot view.',
 						],
 						'language'           => [
 							'type'        => 'string',
@@ -925,9 +806,9 @@ final class AbilitiesRegistrar {
 							'description' => 'Slug of the language the stub was created for.',
 						],
 						'edit_url'           => [
-							'type'        => 'string',
+							'type'        => [ 'string', 'null' ],
 							'title'       => 'Edit URL',
-							'description' => 'Admin URL for editing the new translation.',
+							'description' => 'Admin URL for editing the translation; null when its ID is not returned.',
 						],
 					],
 				],
@@ -946,11 +827,8 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'not_found', __( 'Source post not found.', 'perflocale' ) );
 					}
 
-					// Per-target capability check. The permission_callback
-					// only gates the BROAD `perflocale_translate` cap, and the
-					// new translation can carry the source's content, so the
-					// caller must be able to read the source.
-					if ( ! current_user_can( 'read_post', $source_id ) ) {
+					// The new translation can carry the source's content, so the caller must see it; host-aware, as REST.
+					if ( ! Helper::user_can_view_object( $source_id ) ) {
 						return new \WP_Error(
 							'cannot_read_source',
 							__( 'You do not have permission to read the source post.', 'perflocale' ),
@@ -958,16 +836,8 @@ final class AbilitiesRegistrar {
 						);
 					}
 
-					// ADDITIVE, never a replacement: edit_post does NOT imply
-					// read_post. On a private post owned by someone else read_post
-					// needs read_private_posts while edit_post needs
-					// edit_others_posts + edit_private_posts - independent
-					// primitives, so both checks stay. This second half is the
-					// write authority: create_translation() mints a post and a
-					// link row against the source, and the REST twin
-					// POST /perflocale/v1/translations/post/<id> already requires
-					// edit_post on that source before it will do so.
-					if ( ! current_user_can( 'edit_post', $source_id ) ) {
+					// Edit and read, not edit alone: edit_post does not imply read_post on a private post.
+					if ( ! Helper::user_can_copy_translation_source( $source_id ) ) {
 						return new \WP_Error(
 							'cannot_edit_source',
 							__( 'You cannot edit this post.', 'perflocale' ),
@@ -979,10 +849,7 @@ final class AbilitiesRegistrar {
 					$settings = $this->plugin->get( 'settings' );
 					$manager  = new Translation\PostTranslationManager( $cache, $settings );
 
-					// The two checks above cover the post named by source_id.
-					// create_translation() copies the group's default-language
-					// post, which can be a different one, so that post needs the
-					// same read and edit authority.
+					// The copied default-language post can differ from source_id and needs the same rights.
 					$copy_from = $manager->get_copy_source_id( $source_id, (string) $slug );
 
 					if ( $copy_from > 0 && $copy_from !== $source_id && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
@@ -993,9 +860,7 @@ final class AbilitiesRegistrar {
 						);
 					}
 
-					// The new post is of the copy source's type, and
-					// wp_insert_post() checks no capability, so apply the
-					// type's own create gate here.
+					// wp_insert_post() checks no capability: apply the copy source type's create gate.
 					if ( $copy_from > 0 && ! Helper::user_can_create_like( $copy_from ) ) {
 						return new \WP_Error(
 							'cannot_create_type',
@@ -1004,17 +869,14 @@ final class AbilitiesRegistrar {
 						);
 					}
 
-					$new_id = $manager->create_translation( $source_id, $slug, $copy_content, \PerfLocale\Enum\SourceType::Api );
+					$new_id = $manager->create_translation( $source_id, $slug, $copy_content, \PerfLocale\Enum\SourceType::Api, $created );
 
 					if ( ! $new_id ) {
 						return new \WP_Error( 'creation_failed', __( 'Failed to create translation.', 'perflocale' ) );
 					}
 
-					return [
-						'translated_post_id' => $new_id,
-						'language'           => $slug,
-						'edit_url'           => \PerfLocale\Admin\ObjectLinks::edit_url( (int) $new_id ),
-					];
+					// The REST create route's rule: an existing translation is named only to a user who may see it.
+					return \PerfLocale\Api\TranslationsController::ability_created( $new_id, $slug, $created );
 				},
 				'permission_callback' => function () {
 					return current_user_can( 'perflocale_translate' ) && $this->write_abilities_enabled();

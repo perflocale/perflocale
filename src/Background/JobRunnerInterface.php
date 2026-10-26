@@ -14,42 +14,24 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Abstraction over WP-Cron and Action Scheduler.
+ * Job runner contract over WP-Cron (WpCronRunner) and Action Scheduler (ActionSchedulerRunner).
  *
- * Two implementations:
- *   - {@see WpCronRunner}            - always available, uses wp_schedule_* primitives
- *   - {@see ActionSchedulerRunner}   - used when Action Scheduler is loaded (≥ 3.4)
- *
- * {@see JobRunnerFactory::pick()} returns the right one at runtime based on:
- *   1. The `perflocale/jobs/runner` filter (force override)
- *   2. `background_engine` setting (force_wp_cron / auto)
- *   3. Whether AS is loaded and at a compatible version
- *
- * Workers receive callbacks as `function ( string $job_id, array $args )`
- * regardless of which runner enqueued them - both runners normalise the
- * argument shape before calling the worker hook.
+ * JobRunnerFactory::pick() chooses one; both call the worker hook as `function ( string $job_id, array $args )`.
  */
 interface JobRunnerInterface {
 
 	/**
-	 * Enqueue a one-shot async action for the runner to execute as soon
-	 * as it picks it up (cron tick / AS claim).
+	 * Enqueue a one-shot action to run at the runner's next pick-up.
 	 *
-	 * @param string               $hook   The WordPress action hook the
-	 *                                     worker is listening on.
-	 *                                     Convention: `perflocale_job_run_<type>`.
-	 * @param array<string, mixed> $args   Worker args. MUST be JSON-serialisable
-	 *                                     (use IDs / scalars; never resources or
-	 *                                     closures). AS forbids non-serialisable
-	 *                                     args; WP-Cron tolerates more but we
-	 *                                     enforce the same contract for portability.
-	 * @param string               $job_id PerfLocale-owned job identifier (UUID v4).
-	 * @return string  Same job_id as the input (returned for fluent chaining).
+	 * @param string               $hook   Worker hook, `perflocale_job_run_<type>`.
+	 * @param array<string, mixed> $args   Worker args: JSON-serialisable scalars and ids only (Action Scheduler requires it).
+	 * @param string               $job_id Job id (UUID v4).
+	 * @return string  The job id.
 	 */
 	public function enqueue( string $hook, array $args, string $job_id ): string;
 
 	/**
-	 * Schedule an action to run at a specific UTC timestamp.
+	 * Schedule an action at a UTC timestamp.
 	 *
 	 * @param int                  $timestamp Unix UTC seconds.
 	 * @param string               $hook      Action hook name.
@@ -60,8 +42,7 @@ interface JobRunnerInterface {
 	public function schedule( int $timestamp, string $hook, array $args, string $job_id ): string;
 
 	/**
-	 * Cancel any pending action for {@param string $job_id}. Does NOT
-	 * interrupt a job already running - the worker's lock-TTL handles that.
+	 * Cancel the job's pending action; a running job is not interrupted (its lock TTL covers that).
 	 *
 	 * @param string $job_id Job identifier.
 	 * @return bool True if a pending action was found and cancelled; false otherwise.
@@ -69,7 +50,7 @@ interface JobRunnerInterface {
 	public function cancel( string $job_id ): bool;
 
 	/**
-	 * Whether {@param string $job_id} has a pending (not-yet-run) scheduled action.
+	 * Whether the job has a pending scheduled action.
 	 *
 	 * @param string $job_id Job identifier.
 	 * @return bool
@@ -77,8 +58,7 @@ interface JobRunnerInterface {
 	public function is_scheduled( string $job_id ): bool;
 
 	/**
-	 * Identifier used by the Jobs admin UI to label which engine is running
-	 * the job. One of: 'action_scheduler' | 'wp_cron'.
+	 * Engine label for the Jobs screen: 'action_scheduler' or 'wp_cron'.
 	 *
 	 * @return string
 	 */

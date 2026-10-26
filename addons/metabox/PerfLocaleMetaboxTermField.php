@@ -1,10 +1,8 @@
 <?php
 /**
- * PerfLocale MetaBox addon: the term display class of `taxonomy_advanced`
- * fields on a translated request.
+ * PerfLocale MetaBox addon: the `taxonomy_advanced` term display class on a translated request.
  *
- * Loaded only by PerfLocaleMetaboxTranslated::term_display_field_class(), after Meta
- * Box has loaded RWMB_Taxonomy_Advanced_Field.
+ * Loaded only by PerfLocaleMetaboxTranslated::term_display_field_class(), after Meta Box loaded its parent class.
  *
  * @package PerfLocale
  */
@@ -16,9 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Meta Box's `taxonomy_advanced` field class with one change: the term
- * format_single_value() prints is first mapped to the current language's
- * sibling term. Every other method, saves included, is Meta Box's own.
+ * Meta Box's `taxonomy_advanced` field class, printing the current language's sibling term.
+ *
+ * Only format_single_value() changes; saves and every other method stay Meta Box's own.
  */
 class PerfLocaleMetaboxTermField extends RWMB_Taxonomy_Advanced_Field {
 

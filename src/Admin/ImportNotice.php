@@ -14,14 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The import, migration and upload handlers of Settings > Export & Import
- * finish with a redirect back to the tab, which says what happened: a
- * success, a needs-attention or an error notice.
+ * Carries an Export & Import handler's notice to the tab it redirects to.
  *
- * The message travels as a short-lived record for that user (a transient,
- * ten minutes) under a random token, and the redirect carries only the
- * token. The tab reads the record once and deletes it. A link someone else
- * crafts names no record of the viewer's, so it shows nothing.
+ * The redirect holds only a random token for a per-user transient read once, so a crafted link shows nothing.
  */
 final class ImportNotice {
 
@@ -107,7 +102,8 @@ final class ImportNotice {
 
 		$type    = is_array( $stored ) ? ( $stored['type'] ?? '' ) : '';
 		$message = is_array( $stored ) ? ( $stored['message'] ?? '' ) : '';
-		$message = is_string( $message ) ? sanitize_text_field( $message ) : '';
+		// One line of plain text, printed through esc_html(): text such as "<file>" stays as written.
+		$message = is_string( $message ) ? trim( (string) preg_replace( '/[\r\n\t ]+/', ' ', $message ) ) : '';
 
 		if ( ! is_string( $type ) || ! in_array( $type, self::TYPES, true ) || '' === $message ) {
 			return null;

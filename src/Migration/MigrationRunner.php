@@ -18,18 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The one import sequence shared by WP-CLI and the three migration jobs
- * (which the admin buttons run inline or in the background).
+ * The one import sequence shared by WP-CLI and the three migration jobs (inline or background).
  *
- * Inside {@see MigrationLock}: the caller's own step (WP-CLI's
- * `--force-restart` clearing), the Polylang / TranslatePress language
- * check ({@see SourcePreflight}; the WPML importer checks for itself), the
- * import, the migration stamp, whether the import finished
- * ({@see MigrationState::record_outcome()}), and the post-import cache
- * flush. A refused import (`blocked`) writes nothing and flushes nothing.
- * An import that throws part-way is flushed too before the exception
- * leaves the lock. While the importer runs, CacheInvalidator leaves the
- * hreflang of the group changes it makes to that flush ({@see importing()}).
+ * Inside MigrationLock: caller step, language preflight, import, stamp, outcome and the cache flush, which
+ * also runs when the import throws (a `blocked` one wrote nothing). CacheInvalidator defers hreflang to it.
  */
 final class MigrationRunner {
 
@@ -48,9 +40,8 @@ final class MigrationRunner {
 	/**
 	 * Whether this process is running an importer on the current blog.
 	 *
-	 * Such a run ends with MigrationCacheHelper::flush_post_migration_caches()
-	 * on this blog, whether the importer returns or throws; an import refused
-	 * before it wrote anything (`blocked`) has nothing to flush.
+	 * A run that is not blocked by its preflight (blocked = nothing written) ends with flush_post_migration_caches()
+	 * on this blog, also when it throws, so per-change clears can wait.
 	 *
 	 * @internal Read by CacheInvalidator.
 	 *
@@ -63,16 +54,13 @@ final class MigrationRunner {
 	/**
 	 * Run an import.
 	 *
-	 * A MigrationLockedException from {@see MigrationLock::run()} reaches the
-	 * caller when another import holds the lock. An exception from the
-	 * importer or a heartbeat callback is passed on after the post-import
-	 * flush.
+	 * A MigrationLockedException reaches the caller; an importer or heartbeat exception follows the flush.
 	 *
 	 * @param string        $source           wpml, polylang or translatepress.
 	 * @param CacheManager  $cache            Cache manager.
 	 * @param callable|null $before           Runs inside the lock before the import.
-	 * @param callable|null $on_beat          Called with each importer heartbeat (after each batch), after the lock refresh, with the progress detail ({@see ImportHeartbeat}; an empty array when the call only keeps the lock).
-	 * @param bool          $sanitize_strings WPML only: store string translations through Helper::sanitize_untrusted_string_translation() ({@see WpmlImporter::set_sanitize_strings()}).
+	 * @param callable|null $on_beat          Called after each lock refresh with the progress detail ([] when it only keeps the lock).
+	 * @param bool          $sanitize_strings WPML only: sanitize string translations (WpmlImporter::set_sanitize_strings()).
 	 * @return array<string, mixed> The importer's result, with `blocked` and `preflight`.
 	 * @throws \InvalidArgumentException On an unknown source.
 	 */
@@ -103,8 +91,7 @@ final class MigrationRunner {
 					try {
 						$result = self::run_importer( $source, $cache, $heartbeat, $on_beat !== null, $sanitize_strings );
 					} finally {
-						// The record ends before the flush below, so a link made
-						// inside the flush clears as any other does.
+						// The record ends before the flush, so a link made inside the flush clears as any other.
 						if ( null === $was ) {
 							unset( self::$importing[ $blog_id ] );
 						} else {
@@ -112,10 +99,7 @@ final class MigrationRunner {
 						}
 					}
 				} catch ( \Throwable $stopped ) {
-					// An import stopped part-way (a cancel or a paused queue at a
-					// heartbeat, or an error) keeps the batches it committed:
-					// flush so the front end serves them, then pass the
-					// exception on.
+					// A stopped import keeps its committed batches: flush so the front end serves them.
 					try {
 						MigrationCacheHelper::flush_post_migration_caches();
 					} catch ( \Throwable $flush_error ) {
@@ -138,14 +122,8 @@ final class MigrationRunner {
 	/**
 	 * The heartbeat reporter of a migration job.
 	 *
-	 * Passes the importer's progress to the job's progress callback: the
-	 * stage's items done and in total, and in the detail the stage key, its
-	 * label and the import's overall percent, which never goes down. It
-	 * reports at most every {@see PROGRESS_INTERVAL} seconds, and at once
-	 * when a stage starts or reaches its total. A heartbeat without progress
-	 * repeats the last report at most every 30 seconds, which keeps the
-	 * job's locks and status fresh; a cancel or a paused queue then takes
-	 * effect between two batches.
+	 * Reports at most every PROGRESS_INTERVAL seconds (at once on a stage start or end); percent never goes down.
+	 * A bare heartbeat repeats the last report every 30 seconds: it keeps the job's locks fresh and lets a cancel act.
 	 *
 	 * @param callable $progress The job's progress callback: `function(int $processed, int $total, array $detail = []): void`.
 	 * @return callable(array<string, mixed>=):void
@@ -247,13 +225,9 @@ final class MigrationRunner {
 	}
 
 	/**
-	 * A job's view of the result: a refused import, or one that did not
-	 * finish, is a failed run with its reason.
+	 * A job's view of the result: a refused or unfinished import is a failed run with its reason.
 	 *
-	 * The worker records a result carrying `run_failed` as failed and does
-	 * not retry it (the refusal would repeat until the operator acts; an
-	 * unfinished import keeps what it imported, and the operator runs it
-	 * again).
+	 * `run_failed` is not retried: a refusal repeats until the operator acts.
 	 *
 	 * @param array<string, mixed> $result Import result.
 	 * @return array<string, mixed>
@@ -272,8 +246,7 @@ final class MigrationRunner {
 	}
 
 	/**
-	 * The lines that list what an import read and did not link, per reason,
-	 * in the source's own words (WPML rows, Polylang items).
+	 * The lines listing what an import read and did not link, per reason, in the source's own words.
 	 *
 	 * @param string               $source Source.
 	 * @param array<string, mixed> $result Import result.
@@ -324,8 +297,7 @@ final class MigrationRunner {
 
 		$result = $importer->import();
 
-		// A Polylang run keeps its failures in `errors` and the language
-		// check's findings with its other notices.
+		// Polylang keeps its failures in `errors` and the language check's findings in its notices.
 		if ( $source === 'polylang' ) {
 			$result['notices'] = array_merge( SourcePreflight::messages( $preflight ), (array) ( $result['notices'] ?? [] ) );
 		} else {
@@ -335,9 +307,7 @@ final class MigrationRunner {
 		$result['blocked']   = false;
 		$result['preflight'] = $preflight;
 
-		// Only a finished run marks the source imported: a run whose reads
-		// failed may have written nothing, and the first-import checks must
-		// still apply to the rerun.
+		// Only a finished run marks the source imported, so the first-import checks still apply to a rerun.
 		if ( empty( $result['incomplete'] ) && array_filter( $preflight['map'], static fn( $slug ): bool => $slug !== null ) !== [] ) {
 			MigrationState::mark_imported( $source );
 		}

@@ -3,7 +3,7 @@
  * Plugin Name: PerfLocale
  * Plugin URI: https://perflocale.com
  * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs, and keep your site fast.
- * Version: 1.0.7.3.1
+ * Version: 1.0.7.4
  * Requires at least: 6.4
  * Tested up to: 7.1
  * Requires PHP: 8.1
@@ -25,25 +25,17 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ---- Plugin constants ----
 
-define( 'PERFLOCALE_VERSION', '1.0.7.3.1' );
+define( 'PERFLOCALE_VERSION', '1.0.7.4' );
 define( 'PERFLOCALE_FILE', __FILE__ );
 define( 'PERFLOCALE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );
-// The canonical schema ships whole from a fresh install: Schema::create_tables()
-// already defines every column and index (including the polymorphic
-// translation_links.type + composite object_lang UNIQUE, the object_lookup
-// per-object index, and the CLDR plural extra_forms column). No migrate_to_N
-// methods exist - a future schema change bumps this and adds one; the
-// dispatcher in Migrator picks it up. NOTE: dbDelta can ADD indexes but can
-// never RESHAPE one under an existing name - an index reshape needs a
-// migrate_to_N that drops the old index first.
+// Schema::create_tables() ships the whole schema. dbDelta cannot reshape an index under an
+// existing name: an index reshape needs a migrate_to_N that drops the old index first.
 define( 'PERFLOCALE_DB_VERSION', 1 );
 
 // ---- Autoloader ----
 
-// Static class-map: FQCN → relative path under src/. Replaces a
-// per-class file_exists() syscall with a single array lookup. The PSR-4
-// fallback below covers any class not present in the map.
+// Static class map (FQCN to path under src/); the PSR-4 fallback below covers the rest.
 $perflocale_class_map = require PERFLOCALE_DIR . 'autoload-classmap.php';
 
 spl_autoload_register(
@@ -76,23 +68,14 @@ register_activation_hook(
 	__FILE__,
 	static function (): void {
 		if ( is_multisite() ) {
-			// A resume marker belongs to the uninstall that wrote it. Once the
-			// plugin is being activated again, that uninstall is over: the
-			// operator is installing, not recovering, and honouring the marker
-			// on the NEXT uninstall would silently skip every blog below it.
-			// Cleared here, once per activation, rather than per blog.
+			// A resume marker belongs to the uninstall that wrote it: activation ends that
+			// uninstall, and honouring it on the next one would skip every blog below it.
 			PerfLocale\Database\SiteCleanup::forget_uninstall_progress();
 		}
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( is_multisite() && ! empty( $_GET['networkwide'] ) ) {
-			// Network activation: iterate sites in chunks so networks with tens
-			// of thousands of sites don't spike memory loading every row at once.
-			//
-			// The default chunk of 100 IDs is tiny (~10 bytes/ID) - the real
-			// work is per-site Activator::activate(). Expose via filter so
-			// operators of unusual environments (very limited memory, very
-			// large networks) can tune it.
+			// Network activation: walk sites in chunks to keep memory flat on large networks.
 			/**
 			 * @hook perflocale/activation/chunk_size
 			 * @param int $chunk Sites fetched per iteration. Must be >= 1.
@@ -111,20 +94,10 @@ register_activation_hook(
 						'number'     => $chunk,
 						'offset'     => $offset,
 						'fields'     => 'ids',
-						// This network only. WP_Site_Query defaults
-						// `network_id` to 0, which core documents as "all
-						// networks" - and `active_sitewide_plugins`, the option
-						// "Network Activate" actually writes, is per-network.
-						// Unscoped, activating on one network would provision
-						// tables, force the Action Scheduler schema and write
-						// recurring crons on every blog of every OTHER network
-						// on the installation, for a plugin those networks
-						// never activated. Mirrors Deactivator's sweep.
+						// This network only: WP_Site_Query's network_id 0 means all networks,
+						// and network activation is per network. Mirrors Deactivator's sweep.
 						'network_id' => $network_id,
-						// Core already defaults to `orderby => 'id'`; stated
-						// explicitly because `offset` paging is only stable
-						// against a fixed sort, so the sort must not be
-						// something a later edit can quietly drop.
+						// Explicit: offset paging is only stable against a fixed sort.
 						'orderby'    => 'id',
 					]
 				);
@@ -135,11 +108,8 @@ register_activation_hook(
 					switch_to_blog( $site_id );
 
 					try {
-						// Force the Action Scheduler schema FIRST on never-visited
-						// subsites (AS creates it lazily), as wp_initialize_site
-						// does: the Activator's resume enqueue and the recurring
-						// schedules below would otherwise hit "Table doesn't
-						// exist" on every such blog.
+						// Force the Action Scheduler schema first (AS creates it lazily): the
+						// resume enqueue and the recurring schedules below need its tables.
 						if ( class_exists( '\\ActionScheduler_StoreSchema' ) ) {
 							try {
 								$as_schema = new \ActionScheduler_StoreSchema();
@@ -156,31 +126,20 @@ register_activation_hook(
 						}
 
 						try {
-							// NON-fatal mode, as wp_initialize_site uses. The
-							// default mode wp_die()s on a missing table, and
-							// wp_die() is not a Throwable: it ends the request
-							// at the first such site, before any later site is
-							// tried. Non-fatal mode logs the cause and returns
-							// false - a missing table, or no language after the
-							// seed - so every site is tried and the failures
-							// are reported together, below.
+							// Non-fatal mode: the default wp_die()s (not a Throwable) at the
+							// first missing table, so later sites would go untried.
 							if ( ! PerfLocale\Activator::activate( false ) ) {
 								$perflocale_failed_sites[] = $site_id;
 							}
 						} catch ( \Throwable $e ) {
-							// One site's failure must not abort the sweep: every
-							// later site would go untried, and the operator
-							// would learn about one broken site per attempt.
+							// One site's failure must not abort the sweep for the rest.
 							$perflocale_failed_sites[] = $site_id;
 							// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic on activation-failure path.
 							error_log( '[PerfLocale] network-activate failed for site ' . (int) $site_id . ': ' . $e->getMessage() );
 						}
 
-						// Schedule per-blog recurring tasks now so subsites never
-						// visited via wp-admin still get their GC + watchdog crons.
-						// Only while no site has failed: after that the activation
-						// is refused below, and a recurring event on a later site
-						// would have nothing to run it.
+						// Schedule per-blog recurring tasks so never-visited subsites get their
+						// crons; only while no site has failed, as a failure refuses activation below.
 						if ( [] === $perflocale_failed_sites
 						&& class_exists( 'PerfLocale\\Bootstrap' )
 						&& method_exists( 'PerfLocale\\Bootstrap', 'ensure_recurring_schedules' )
@@ -201,17 +160,9 @@ register_activation_hook(
 				$got_full_chunk = ( count( $sites ) === $chunk );
 			} while ( $got_full_chunk );
 
-			// Refuse the activation if any site could not be set up. wp_die()
-			// here stops core before it records the plugin as network-active,
-			// so PerfLocale never runs on a network with sites that have no
-			// tables or no language - a state nothing repairs on its own:
-			// Migrator retries only the tables, and only on admin, REST and CLI
-			// requests. (A missing settings row is not checked: it reads as the
-			// defaults.) Every site is still set up as far as it can be:
-			// tables, language, role and caps, and a one-shot resume event.
-			// Only the recurring schedules stop at the first failure, so the
-			// failed site and those after it get none. Activating again once
-			// the cause is fixed re-runs every site; each step is idempotent.
+			// Refuse the activation when any site failed: wp_die() here stops core recording the
+			// plugin as network-active, and nothing repairs a site without tables or a language.
+			// Each step is idempotent, so activating again re-runs every site.
 			if ( [] !== $perflocale_failed_sites ) {
 				$perflocale_shown = implode( ', ', array_slice( $perflocale_failed_sites, 0, 20 ) )
 					. ( count( $perflocale_failed_sites ) > 20 ? ', …' : '' );
@@ -252,10 +203,7 @@ register_deactivation_hook( __FILE__, [ PerfLocale\Deactivator::class, 'deactiva
 add_action(
 	'wp_initialize_site',
 	static function ( WP_Site $new_site ): void {
-		// wp_initialize_site fires whenever a subsite is created via
-		// wp_insert_site() - including programmatic/CLI/REST contexts where
-		// wp-admin/includes/plugin.php (which defines is_plugin_active_for_network)
-		// is not loaded. Load it on demand to avoid a fatal.
+		// May fire from CLI or REST, where wp-admin/includes/plugin.php is not loaded.
 		if ( ! function_exists( 'is_plugin_active_for_network' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
@@ -267,8 +215,7 @@ add_action(
 		switch_to_blog( $new_site->blog_id );
 
 		try {
-			// Skip activation if a conflicting multilingual plugin is active for
-			// this specific subsite. Mirror the constant check in Bootstrap::init().
+			// Skip a subsite with a conflicting multilingual plugin; mirrors Bootstrap::init().
 			$conflict_constants = [
 				'ICL_SITEPRESS_VERSION',
 				'POLYLANG_VERSION',
@@ -296,13 +243,8 @@ add_action(
 				}
 			}
 
-			// wp_initialize_site fires BEFORE Action Scheduler bootstraps its
-			// per-blog tables, so force the schema FIRST: both the Activator's
-			// resume-jobs enqueue below and the as_schedule_* calls further
-			// down would otherwise hit "Table doesn't exist" against
-			// wp_<id>_actionscheduler_* on every subsite creation (AS creates
-			// per-blog tables lazily, and its enqueue catch turns the failure
-			// into error-log spam rather than a fatal).
+			// AS creates per-blog tables lazily, after this hook: force its schema first so the
+			// resume enqueue and the as_schedule_* calls below find their tables.
 			if ( class_exists( '\\ActionScheduler_StoreSchema' ) ) {
 				try {
 					$as_schema = new \ActionScheduler_StoreSchema();
@@ -318,17 +260,8 @@ add_action(
 				}
 			}
 
-			// Use the non-fatal Activator path here. The default activation
-			// flow wp_die()'s on dbDelta failure, which would kill the
-			// network admin's site-creation request mid-flight and leave a
-			// half-provisioned subsite in `wp_blogs`. The Activator logs to
-			// PHP's error log when a table is missing on this code path and
-			// returns before the seeding steps. Nothing re-runs activation
-			// later: while `perflocale_db_version` is unset, the next request
-			// on the new subsite retries only the tables
-			// (Migrator::maybe_migrate()). The seeded default language and
-			// the settings row stay missing until activation runs on that
-			// site again.
+			// Non-fatal mode: the default wp_die()s on a dbDelta failure, which would abort the
+			// network admin's site-creation request and leave a half-provisioned subsite.
 			try {
 				PerfLocale\Activator::activate( false );
 			} catch ( \Throwable $e ) {
@@ -336,10 +269,8 @@ add_action(
 				error_log( '[PerfLocale] wp_initialize_site activator failed: ' . $e->getMessage() );
 			}
 
-			// Schedule per-blog recurring tasks immediately. Without this, a
-			// brand-new subsite that's never visited via wp-admin would never
-			// have its background-jobs GC + watchdog scheduled (the lazy
-			// admin_init handler in Bootstrap only runs on admin pageloads).
+			// Schedule per-blog recurring tasks: Bootstrap's lazy admin_init path never runs
+			// on a subsite nobody visits in wp-admin.
 			if ( class_exists( 'PerfLocale\\Bootstrap' )
 			&& method_exists( 'PerfLocale\\Bootstrap', 'ensure_recurring_schedules' )
 			) {
@@ -357,62 +288,35 @@ add_action(
 	200
 );
 
-// Multisite: clean up when a site is permanently deleted from the network.
-// FORCES a full purge regardless of the `delete_data_on_uninstall` setting.
-// Reason: blog deletion is irreversible - WP drops the blog's posts /
-// options / attachments along with the wp_blogs row. Keeping plugin tables
-// (`wp_<id>_perflocale_*`) for a no-longer-existing blog is just orphan
-// data. The `delete_data_on_uninstall` preference applies to plugin
-// UNINSTALL (a reversible action where the operator might want to keep
-// data for a later reinstall) - it does NOT apply to blog DELETION,
-// where nothing else survives anyway.
+// Multisite: purge a deleted site's data regardless of `delete_data_on_uninstall` (that
+// setting is for reversible plugin uninstall; blog deletion is irreversible).
 add_action(
 	'wp_uninitialize_site',
 	static function ( WP_Site $old_site ): void {
 		switch_to_blog( $old_site->blog_id );
 
 		try {
-			// single_site_teardown=true: only THIS subsite is being deleted, so
-			// network-global stores (wp_usermeta) must be left intact for the
-			// surviving sites.
+			// Single-site teardown: network-global stores (wp_usermeta) stay for the other sites.
 			PerfLocale\Database\SiteCleanup::purge_current_site( true, true );
 		} finally {
 			restore_current_blog();
 		}
 	},
-	// Priority 5 - BELOW core's own wp_uninitialize_site table-dropper (which
-	// registers at priority 10 in ms-default-filters.php). Core drops the
-	// deleted blog's wp_<id>_options / postmeta / termmeta, so PerfLocale must
-	// run FIRST while those are still readable: full_purge() reads addon
-	// manifests from options. An addon's purge runs only if this blog chose
-	// to delete its data (or a filter says so), and then with the
-	// single-site flag: it removes only what belongs to this blog and leaves
-	// the network-global targets (site options, user meta) to the sites that
-	// still use them. Skipped, it costs little: the addon's
-	// perflocale_-prefixed tables still go with Schema::drop_tables() and its
-	// per-blog rows with core's drop - only its custom before_uninstall()
-	// cleanup does not run. PerfLocale only drops its OWN perflocale_*
-	// tables/options/uploads-subdir, so running before core is safe.
+	// Priority 5: before core's priority-10 table drop, because full_purge() reads add-on
+	// manifests from this blog's options. See docs-ai/11-code-rationale.md, "perflocale.php: site deletion".
 	5
 );
 
 // ---- Screen option save filters (must register before set_screen_options() in admin.php) ----
-//
-// Every PerfLocale list page that exposes "Rows per page" in Screen Options
-// uses the same integer-coerce save logic. One closure reused across the
-// three hooks - no repeated callback allocation, single place to audit.
 $perflocale_per_page_save = static function ( $status, $option, $value ) {
-	// (int), not absint(): absint( -5 ) is 5, so a negative request used to
-	// be saved as a positive row count instead of being rejected.
+	// (int), not absint(): absint( -5 ) is 5, so a negative request would save as a positive count.
 	$value = (int) $value;
 
 	if ( $value < 1 ) {
 		return $status;
 	}
 
-	// ONE ceiling, shared with every screen's READ path - see
-	// Helper::normalize_per_page(). Capping only on save left previously
-	// stored oversized values driving the query untouched.
+	// The same ceiling as every screen's read path (Helper::normalize_per_page()).
 	return min( $value, \PerfLocale\Helper::per_page_ceiling( (string) $option ) );
 };
 
@@ -425,19 +329,9 @@ add_filter( 'set_screen_option_perflocale_translations_per_page', $perflocale_pe
 
 if ( ! function_exists( 'perflocale' ) ) {
 	/**
-	 * Get the PerfLocale helper instance for the fluent API.
+	 * Get the PerfLocale helper instance for the fluent API, e.g. perflocale()->slug().
 	 *
-	 * Usage:
-	 * perflocale()->slug() → "fr"
-	 * perflocale()->locale() → "fr_FR"
-	 * perflocale()->name() → "French"
-	 * perflocale()->native_name() → "Français"
-	 * perflocale()->is_rtl() → false
-	 * perflocale()->switcher() → "<nav>...</nav>"
-	 *
-	 * @api  Stable API surface - semver-bound; safe for themes, addons,
-	 *       and external plugins to depend on. Returns the {@see \PerfLocale\Helper}
-	 *       singleton whose public methods are themselves semver-bound.
+	 * @api Returns the {@see \PerfLocale\Helper} singleton.
 	 *
 	 * @return PerfLocale\Helper
 	 */

@@ -12,10 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Blocksy theme integration for PerfLocale.
- *
- * Registers the language switcher as a draggable header/footer builder
- * element in Blocksy's panel builder.
+ * Blocksy theme integration: the language switcher as a header and footer builder element.
  */
 final class PerfLocaleBlocksy implements \PerfLocale\Addon\AddonInterface {
 

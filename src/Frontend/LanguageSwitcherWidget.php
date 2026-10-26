@@ -41,15 +41,9 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	];
 
 	/**
-	 * Constructor. Runs at widgets_init (init:1) on every request. The name
-	 * and description are translated where something can show them: the
-	 * admin, the Customizer, REST and WP-CLI, and any request where the theme
-	 * has classic widget areas and one of them holds the widget (a theme's
-	 * sidebar filters, the legacy widget block and the_widget() read them
-	 * from the registered widget). Elsewhere, including every block theme,
-	 * they stay untranslated, and the page view neither loads the plugin's
-	 * catalog for them nor reads the sidebars until something renders the
-	 * widget ({@see label_the_widget()}, {@see label_sidebar_params()}).
+	 * Constructor: labels are translated only where they can show, else on first render.
+	 *
+	 * See docs-ai/11-code-rationale.md, "LanguageSwitcherWidget: lazy labels".
 	 */
 	public function __construct() {
 		$labels = \PerfLocale\Helper::shows_registration_labels() || is_customize_preview();
@@ -73,12 +67,9 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	}
 
 	/**
-	 * `widgets_init` callback at priority 99, after themes register their
-	 * widget areas and before core registers the widget's instances (100),
-	 * which copies the name and description: on a theme with classic widget
-	 * areas (register_sidebar() adds the `widgets` theme support) where a
-	 * sidebar holds the widget, the translated name and description, which
-	 * every render then reads (the render hooks are removed).
+	 * Translates the labels when a classic widget area holds the widget.
+	 *
+	 * Priority 99: after themes register sidebars, before core copies the labels at 100.
 	 *
 	 * @return void
 	 */
@@ -95,10 +86,7 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	}
 
 	/**
-	 * `the_widget` action on requests that registered the widget with
-	 * untranslated labels: the_widget() is about to render this widget (the
-	 * legacy widget block's idBase form, or a theme's direct call), so the
-	 * registered widget's name and description are translated first.
+	 * Translates the registered labels before the_widget() renders this widget.
 	 *
 	 * @param string $widget Widget class name.
 	 * @return void
@@ -110,11 +98,9 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	}
 
 	/**
-	 * `dynamic_sidebar_params` filter (priority 1, before a theme's own) on
-	 * requests that registered the widget with untranslated labels: an
-	 * instance of this widget rendered outside a sidebar that holds it (the
-	 * legacy widget block's id form, wp_render_widget()) gets the translated
-	 * name as widget_name, and the registered widget its translated labels.
+	 * Gives an instance rendered outside a holding sidebar its translated widget_name.
+	 *
+	 * Priority 1: before a theme's own filter reads the name.
 	 *
 	 * @param array<int, mixed> $params Sidebar parameters for one widget.
 	 * @return array<int, mixed>
@@ -148,11 +134,9 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	}
 
 	/**
-	 * Whether a sidebar (not the inactive widgets) holds an instance of this
-	 * widget, read from the stored `sidebars_widgets` option alone. The option
-	 * is autoloaded, so the read makes no query, and it runs none of the
-	 * `sidebars_widgets` filters, which may depend on the page being parsed.
-	 * Read only on a theme with classic widget areas.
+	 * Whether an active sidebar holds this widget, from the stored option alone.
+	 *
+	 * Not wp_get_sidebars_widgets(): its filters may depend on a page not yet parsed.
 	 *
 	 * @return bool
 	 */
@@ -188,10 +172,7 @@ class LanguageSwitcherWidget extends \WP_Widget {
 	public function widget( $args, $instance ): void {
 		$instance = wp_parse_args( $instance, self::DEFAULTS );
 
-		// Core's widget renderer always supplies the wrapper keys, but a
-		// programmatic caller (the_widget()/direct ->widget([], …)) may not -
-		// default them so kses never receives null and no "undefined array
-		// key" notice is raised.
+		// A programmatic caller may omit the wrapper keys.
 		$args = wp_parse_args(
 			$args,
 			[
@@ -227,14 +208,7 @@ class LanguageSwitcherWidget extends \WP_Widget {
 		$block = new LanguageSwitcherBlock();
 		$html  = LanguageSwitcherBlock::kses_switcher( $block->render( $render_args ) );
 
-		/*
-		 * Render before emitting any chrome. The block returns '' whenever it
-		 * has nothing to offer (an untranslated page with the current language
-		 * hidden and untranslated languages hidden skips every option), and the
-		 * theme's `before_widget`/`after_widget` is a real box - often a
-		 * bordered <section> carrying the title. Emitting it around nothing put
-		 * an empty "Languages" widget in the sidebar or footer.
-		 */
+		// No options to show: emit no empty widget box either.
 		if ( trim( $html ) === '' ) {
 			return;
 		}
@@ -245,9 +219,7 @@ class LanguageSwitcherWidget extends \WP_Widget {
 			echo wp_kses_post( $args['before_title'] ) . esc_html( $instance['title'] ) . wp_kses_post( $args['after_title'] );
 		}
 
-		// Re-wrapped at the sink deliberately -- see the note in
-		// CustomizerIntegration::output_custom_placement(). The scanner does not read
-		// phpcs:ignore, and kses_switcher() memoises, so this costs nothing.
+		// Re-escaped at the sink on purpose for scanners that ignore phpcs:ignore; kses_switcher() memoizes.
 		echo LanguageSwitcherBlock::kses_switcher( $html ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG-aware kses allowlist.
 
 		echo wp_kses_post( $args['after_widget'] );

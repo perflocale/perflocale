@@ -206,6 +206,31 @@ final class InventorySync {
 	}
 
 	/**
+	 * Suspend the stock mirror for one product or variation of the current
+	 * blog: a stock change WooCommerce reports for it is not copied to its
+	 * language copies (its captured delta is taken and dropped). A stock
+	 * alignment writes every copy itself and suspends each id around its own
+	 * write; a stock change another plugin makes to a different id meanwhile
+	 * is still mirrored. Nested calls need as many resume_stock_mirror().
+	 *
+	 * @param int $product_id Product or variation id.
+	 * @return void
+	 */
+	public function suspend_stock_mirror( int $product_id ): void {
+		StockSetMarker::suspend_mirror( $this->mirror_suspended, $product_id );
+	}
+
+	/**
+	 * End one suspend_stock_mirror() of this product or variation.
+	 *
+	 * @param int $product_id Product or variation id.
+	 * @return void
+	 */
+	public function resume_stock_mirror( int $product_id ): void {
+		StockSetMarker::resume_mirror( $this->mirror_suspended, $product_id );
+	}
+
+	/**
 	 * Whether WooCommerce's stock statement for this product of the current
 	 * blog left a delta not yet taken (capture_stock_operation()).
 	 *
@@ -470,6 +495,14 @@ final class InventorySync {
 	 * @var array<int, array<int, true>>
 	 */
 	private array $announced_stock_ops = [];
+
+	/**
+	 * Products and variations whose stock mirror is suspended
+	 * (suspend_stock_mirror()), keyed blog id => id => depth.
+	 *
+	 * @var array<int, array<int, int>>
+	 */
+	private array $mirror_suspended = [];
 
 	/**
 	 * Ids that share one physical stock with a stock id (see stock_group()),
@@ -1283,6 +1316,13 @@ final class InventorySync {
 	 * @return void
 	 */
 	public function sync_on_stock_change( \WC_Product $product ): void {
+		// A stock alignment's own write (suspend_stock_mirror()): it writes
+		// every copy itself. The delta WooCommerce captured is dropped.
+		if ( [] !== $this->mirror_suspended && isset( $this->mirror_suspended[ get_current_blog_id() ][ $product->get_id() ] ) ) {
+			$this->take_stock_delta( $product->get_id() );
+			return;
+		}
+
 		// Variations are NOT linked into translation groups (they inherit the
 		// parent's language - Bootstrap::auto_assign_default_language skips
 		// product_variation). So get_translations(variation_id) is always empty
@@ -1369,7 +1409,9 @@ final class InventorySync {
 		// locks. Dropping a 'set' on contention is safe in a way dropping a
 		// delta is not: the winner writes the same absolute value this call
 		// would have written.
-		if ( ! empty( $absolute ) && Lock::acquire( $this->lock_name( $product_id ), self::LOCK_TTL_OUTER ) ) {
+		if ( ! empty( $absolute ) && ! Lock::acquire( $this->lock_name( $product_id ), self::LOCK_TTL_OUTER ) ) {
+			StockSetMarker::note_skipped_set( $product_id, $product_id );
+		} elseif ( ! empty( $absolute ) ) {
 			++$this->writing;
 
 			try {
@@ -1378,6 +1420,7 @@ final class InventorySync {
 
 				foreach ( $absolute as $sibling_id ) {
 					if ( ! Lock::acquire( $this->lock_name( $sibling_id ), self::LOCK_TTL_INNER ) ) {
+						StockSetMarker::note_skipped_set( $product_id, $sibling_id );
 						continue;
 					}
 
@@ -1599,7 +1642,9 @@ final class InventorySync {
 		}
 
 		// PASS 2 - ABSOLUTE mirror (read-modify-write), so it takes the locks.
-		if ( ! empty( $absolute ) && Lock::acquire( $this->lock_name( $variation_id ), self::LOCK_TTL_OUTER ) ) {
+		if ( ! empty( $absolute ) && ! Lock::acquire( $this->lock_name( $variation_id ), self::LOCK_TTL_OUTER ) ) {
+			StockSetMarker::note_skipped_set( $variation_id, $variation_id );
+		} elseif ( ! empty( $absolute ) ) {
 			++$this->writing;
 
 			try {
@@ -1608,6 +1653,7 @@ final class InventorySync {
 
 				foreach ( $absolute as $sib_variation_id ) {
 					if ( ! Lock::acquire( $this->lock_name( $sib_variation_id ), self::LOCK_TTL_INNER ) ) {
+						StockSetMarker::note_skipped_set( $variation_id, $sib_variation_id );
 						continue;
 					}
 

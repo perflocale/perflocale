@@ -14,31 +14,17 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Writes an option the way update_option() does, except that the UPDATE
- * matches only while the row still holds the bytes the new value was built
- * from. Used by the plugin's read-modify-write of its own options
- * (Settings::update(), the language delete and rename prunes), so that a
- * concurrent writer's change is not undone, while code listening to core's
- * option hooks sees the same hooks, in the same order and with the same
- * arguments, as for update_option().
+ * Writes an option as update_option() does, but the UPDATE matches only while the row holds the bytes the value was built from.
+ *
+ * For the plugin's read-modify-write of its own options, so a concurrent change is not undone; core's option hooks fire as usual.
  */
 final class OptionWriter {
 
 	/**
-	 * Write $value to $option with a compare-and-set on the row.
+	 * Write $value to $option with a compare-and-set on the row, with update_option()'s filters, actions and cache updates in its order.
 	 *
-	 * In core's order: sanitize_option(); the `pre_update_option_{$option}`
-	 * and `pre_update_option` filters (their result is what is written);
-	 * nothing written when the filtered value equals $old_value; when there
-	 * is no row, what add_option() does (insert_absent()), except that the
-	 * INSERT never replaces a row another writer added; the `update_option`
-	 * action; the UPDATE (matching
-	 * only while the row holds $expected); the options cache updated as
-	 * update_option() updates it; the `update_option_{$option}` and
-	 * `updated_option` actions after a write. The filters and the
-	 * `update_option` action run on every call, so a caller that retries
-	 * after a lost compare-and-set runs them again with the value it read
-	 * again.
+	 * The filters and the `update_option` action run on every call, so a caller retrying after a lost compare-and-set runs them again.
+	 * Order: docs-ai/11-code-rationale.md, "OptionWriter: hook and cache order".
 	 *
 	 * @param string    $option    Option name.
 	 * @param mixed     $value     New value, before sanitize_option() and the filters.
@@ -46,9 +32,8 @@ final class OptionWriter {
 	 * @param ?string   $expected  The row's bytes the new value was built from; null: there is no row.
 	 * @param bool|null $autoload  As update_option()'s $autoload: null leaves the row's autoload as it is
 	 *                             (a new row gets add_option()'s default).
-	 * @return bool|null True when written; false when there was nothing to write; null when the row no
-	 *                   longer held $expected, when a row was added after the read that found none (or
-	 *                   the write failed).
+	 * @return bool|null True when written; false when there was nothing to write; null when the row did not
+	 *                   hold $expected, when a row was added after the read that found none (or the write failed).
 	 */
 	public static function compare_and_set( string $option, mixed $value, mixed $old_value, ?string $expected, ?bool $autoload = null ): ?bool {
 		global $wpdb;
@@ -107,18 +92,10 @@ final class OptionWriter {
 	}
 
 	/**
-	 * Add the row of an option that had none, as add_option() adds it: the
-	 * value through sanitize_option(), the autoload value add_option() gives,
-	 * the `add_option` action, the INSERT, the options cache and the
-	 * `notoptions` list updated, the `add_option_{$option}` and
-	 * `added_option` actions. The INSERT ignores a row that exists (on the
-	 * SQLite Database Integration an INSERT OR IGNORE, which does not fail
-	 * inside a transaction): when another writer added the row after the
-	 * read that found none, nothing is written, this process's cached
-	 * absence and copy of the option are dropped so that the caller's next
-	 * read sees that row, and null is returned. add_option() itself skips
-	 * its existence check when `notoptions` lists the option and then
-	 * overwrites such a row.
+	 * Add the row of an option that had none, as add_option() does, but never over a row another writer added.
+	 *
+	 * Not add_option(): it skips its existence check when `notoptions` lists the option and overwrites that row. On a lost
+	 * race this process's cached absence and copy are dropped so the caller's next read sees the row, and null is returned.
 	 *
 	 * @param string    $option   Option name.
 	 * @param mixed     $value    Value, after the pre_update_option filters.
@@ -180,11 +157,9 @@ final class OptionWriter {
 	}
 
 	/**
-	 * The autoload value add_option() writes for a new row: from WordPress
-	 * 6.6 what wp_determine_option_autoload_value() answers ('on' or 'off'
-	 * for a boolean; otherwise the `wp_default_autoload_value` filter's
-	 * boolean as 'auto-on' or 'auto-off', else 'auto'), before 6.6 'no' for
-	 * false and 'yes' otherwise.
+	 * The autoload value add_option() writes for a new row, as wp_determine_option_autoload_value() answers.
+	 *
+	 * Without that function (WordPress before 6.6): 'no' for false, else 'yes'.
 	 *
 	 * @param string    $option     Option name.
 	 * @param mixed     $value      Value.
@@ -224,9 +199,7 @@ final class OptionWriter {
 	}
 
 	/**
-	 * The autoload value update_option() writes for a boolean $autoload:
-	 * 'on' or 'off' from WordPress 6.6 (wp_determine_option_autoload_value()
-	 * answers a boolean with these, before any filter), 'yes' or 'no' before.
+	 * The autoload value update_option() writes for a boolean: 'on'/'off' from WordPress 6.6 (before any filter), else 'yes'/'no'.
 	 *
 	 * @param bool $autoload Whether to autoload.
 	 * @return string
@@ -240,10 +213,9 @@ final class OptionWriter {
 	}
 
 	/**
-	 * The autoload values that put an option in the alloptions list, as
-	 * wp_autoload_values_to_autoload() computes them from WordPress 6.6: its
-	 * four defaults through its filter, which can only remove one. The same
-	 * four before 6.6, where update_option() wrote only 'yes' or 'no'.
+	 * The autoload values that put an option in alloptions, as wp_autoload_values_to_autoload() computes them.
+	 *
+	 * Its four defaults through its filter, which can only remove one; the same four without it (WordPress before 6.6).
 	 *
 	 * @return array<int, string>
 	 */

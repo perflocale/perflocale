@@ -14,42 +14,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Extends WordPress core's sitemap renderer to support `xhtml:link` alternate
- * hreflang entries inside `<url>` elements.
+ * Core sitemap renderer that also writes `xhtml:link` hreflang alternates in each `<url>`.
  *
- * WP core's default renderer (`WP_Sitemaps_Renderer::get_sitemap_xml()`) only
- * accepts `loc`, `lastmod`, `changefreq`, and `priority` keys on each entry
- * and drops anything else with a `_doing_it_wrong` notice. This renderer
- * additionally accepts `xhtml:link` - an array of `[ href, hreflang ]`
- * items - and serializes each one as a child element:
- *
- * <xhtml:link rel="alternate" hreflang="de" href="https://…/de/…"/>
- *
- * This is the pattern documented at sitemaps.org and required by Google
- * Search Central for hreflang-in-sitemap signalling.
+ * Core's renderer drops any entry key except loc, lastmod, changefreq and priority.
  */
 final class SitemapRenderer extends \WP_Sitemaps_Renderer {
 
 	/**
-	 * Render the XML body for a sitemap page (urlset).
-	 *
-	 * Overrides the parent which doesn't know about xhtml:link. We build the
-	 * same SimpleXMLElement structure but recognize the xhtml:link key and
-	 * emit an `xmlns:xhtml` declaration on the root so the child elements
-	 * are namespace-correct.
+	 * Render the XML body for a sitemap page (urlset), declaring `xmlns:xhtml` on the root.
 	 *
 	 * @param array<int, array<string, mixed>> $url_list Array of URL items.
 	 * @return string XML body.
 	 */
 	public function get_sitemap_xml( $url_list ): string {
-		// No class_exists( 'SimpleXMLElement' ) guard here, deliberately.
-		// This method is only ever reached through the inherited
-		// WP_Sitemaps_Renderer::render_sitemap(), which calls its private
-		// check_for_simple_xml_availability() first and wp_die()s with an XML
-		// error document when the extension is absent. We do not override
-		// render_sitemap(), so on a SimpleXML-less host the request stops in
-		// core before it can dispatch here. Adding a second guard would be
-		// dead code that can never run.
+		// No SimpleXML guard: the inherited render_sitemap() checks for it and stops first.
 		$urlset = new \SimpleXMLElement(
 			sprintf(
 				'%1$s%2$s%3$s',
@@ -76,14 +54,11 @@ final class SitemapRenderer extends \WP_Sitemaps_Renderer {
 						$link_node = $url->addChild( 'link', '', 'http://www.w3.org/1999/xhtml' );
 						$link_node->addAttribute( 'rel', 'alternate' );
 						$link_node->addAttribute( 'hreflang', (string) $link['hreflang'] );
-						// esc_url_raw, NOT esc_url: addAttribute() XML-escapes
-						// '&' itself, so esc_url's display encoding (&#038;)
-						// would double-escape into a corrupt &amp;#038; for any
-						// href with query args (Plain permalinks, query mode).
+						// Not esc_url(): addAttribute() escapes '&' itself, so &#038; would double-escape.
 						$link_node->addAttribute( 'href', esc_url_raw( (string) $link['href'] ) );
 					}
 				}
-				// Unknown keys are silently dropped (same as parent behavior).
+				// Unknown keys are dropped, as in the parent.
 			}
 		}
 

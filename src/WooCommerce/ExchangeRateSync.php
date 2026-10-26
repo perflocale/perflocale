@@ -17,11 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Fetches live exchange rates from a configurable provider on a
- * scheduled interval and updates the per-language currency settings.
- *
- * Providers can be extended via the
- * {@see perflocale/woocommerce/exchange_rate_providers} filter.
+ * Fetches exchange rates on a schedule from a provider a site registers, and stores them per language.
  */
 final class ExchangeRateSync {
 
@@ -42,9 +38,7 @@ final class ExchangeRateSync {
 	/**
 	 * Dedicated option holding machine-fetched rates keyed by language slug.
 	 *
-	 * Kept separate from the main `perflocale_settings` blob so concurrent
-	 * writers (cron + manual sync + admin settings save) can't clobber each
-	 * other's updates in a read-modify-write cycle on the settings array.
+	 * Not in `perflocale_settings`: a sync and a settings save would overwrite each other's writes.
 	 *
 	 * @var string
 	 */
@@ -58,9 +52,7 @@ final class ExchangeRateSync {
 	private const PROVIDERS = [];
 
 	/**
-	 * Available sync intervals.
-	 *
-	 * Keys map to WordPress cron schedule names.
+	 * Available sync intervals, keyed by interval setting slug.
 	 *
 	 * @var array<string, string>
 	 */
@@ -84,9 +76,7 @@ final class ExchangeRateSync {
 	private readonly Settings $settings;
 
 	/**
-	 * Rates the last sync_rates() call of this instance accepted and stored:
-	 * currency code => rate. The manual "Sync Now" reply carries these, never
-	 * the provider's raw reply.
+	 * Rates the last sync_rates() call accepted and stored (currency code => rate), for "Sync Now".
 	 *
 	 * @var array<string, float>
 	 */
@@ -110,37 +100,21 @@ final class ExchangeRateSync {
 		// Register custom cron schedules.
 		add_filter( 'cron_schedules', [ $this, 'register_schedules' ] );
 
-		// Handle the cron event via a thin void wrapper. The hook ignores
-		// return values; sync_rates() returns the rates array because the
-		// AJAX caller at line ~872 needs them. Splitting keeps PHPStan happy
-		// (action callbacks shouldn't appear to return data) without losing
-		// the typed return for the AJAX path.
+		// Void wrapper: sync_rates() returns the rates for the AJAX caller.
 		add_action( self::CRON_HOOK, [ $this, 'cron_sync_rates' ] );
 
 		// Reschedule when settings change.
 		add_action( 'perflocale/settings/updated', [ $this, 'maybe_reschedule' ] );
 
-		// NOTE: The AJAX handler (wp_ajax_perflocale_sync_exchange_rates) is
-		// registered directly in Bootstrap::init() so it works regardless of
-		// addon boot order. See Bootstrap.php.
+		// The AJAX handler is registered in Bootstrap::init(), independent of add-on boot order.
 
-		// Surface a notice when auto-sync is enabled but rates have gone
-		// stale - e.g. a low-traffic site where WP-Cron missed runs, or a
-		// provider has been returning errors. Only register the hook when
-		// auto-sync is actually on, so sites that run rates manually don't
-		// pay the per-admin-page callback cost.
+		// Stale-rates notice, hooked only while auto-sync is on.
 		if ( (bool) $this->settings->get( 'wc_exchange_rate_auto', false ) ) {
 			add_action( 'admin_notices', [ $this, 'maybe_render_stale_notice' ] );
 		}
 
-		// The boot-time check of the schedule (reconcile_on_boot()) runs in
-		// write contexts only (admin, AJAX, cron, REST, WP-CLI), so plain
-		// frontend GETs never pay it, and at init priority 20, after
-		// action_scheduler_init: before it BackgroundEvents can neither see
-		// nor write Action Scheduler and picks WP-Cron. The authoritative
-		// scheduling path is the settings-update hook above. Action Scheduler
-		// 3.9.3+ fires action_scheduler_ensure_recurring_actions once a day,
-		// and that verifies its copy of the event.
+		// Write contexts only, at init 20: before action_scheduler_init BackgroundEvents cannot
+		// see Action Scheduler and picks WP-Cron. The settings-update hook is the main path.
 		if ( \PerfLocale\Helper::is_write_context() ) {
 			if ( did_action( 'init' ) && ! doing_action( 'init' ) ) {
 				$this->reconcile_on_boot();
@@ -164,22 +138,9 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Check the schedule once per write-context boot.
+	 * Check the schedule once per write-context boot; no query while the event is where the engine keeps it.
 	 *
-	 * With auto-sync off a WP-Cron copy is cleared; an Action Scheduler copy
-	 * is removed by the settings save that turned auto-sync off
-	 * (maybe_reschedule()).
-	 *
-	 * With Action Scheduler as the engine only a WP-Cron copy is looked for,
-	 * in the cron option every request loads. Such a copy is a duplicate that
-	 * runs the sync a second time each interval. The Action Scheduler copy is
-	 * checked (one query) and scheduled if missing, and the WP-Cron copy is
-	 * cleared only once Action Scheduler holds the event: when Action
-	 * Scheduler refuses it, the WP-Cron copy keeps the sync running and the
-	 * next write-context boot tries again. With WP-Cron as the engine, a boot
-	 * that finds no WP-Cron copy runs ensure_scheduled(), which schedules the
-	 * event unless an engine holds it. While the event is where the engine
-	 * keeps it, this runs no query.
+	 * Under Action Scheduler a WP-Cron copy is a duplicate, cleared only once Action Scheduler holds the event.
 	 *
 	 * @return void
 	 */
@@ -220,17 +181,12 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Staleness threshold multiplier applied to the configured interval.
-	 *
-	 * If rates haven't synced within `interval × STALE_THRESHOLD_MULTIPLIER`,
-	 * the admin notice fires. 2× tolerates one skipped cron run before
-	 * alerting.
+	 * Staleness threshold multiplier applied to the configured interval: one skipped run is tolerated.
 	 */
 	private const STALE_THRESHOLD_MULTIPLIER = 2;
 
 	/**
-	 * Determine whether the last successful FX sync is beyond the stale
-	 * threshold for the configured interval.
+	 * Whether the last successful sync is older than the stale threshold.
 	 *
 	 * @return bool True if rates are stale (or never synced while auto-sync enabled).
 	 */
@@ -252,14 +208,7 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Whether any rate source is wired at all.
-	 *
-	 * Mirrors the abort condition in do_sync_rates(): rates can only arrive
-	 * from a provider registered through `exchange_rate_providers` and then
-	 * selected in settings, or straight from the `exchange_rates_fetched`
-	 * filter. No provider ships with the plugin, so a site that enables
-	 * auto-sync without wiring either seam can never complete a sync - and
-	 * must be told that, rather than sent to check WP-Cron.
+	 * Whether any rate source is wired at all (mirrors do_sync_rates()'s abort condition).
 	 *
 	 * @return bool True when a sync could actually fetch something.
 	 */
@@ -315,11 +264,7 @@ final class ExchangeRateSync {
 			? human_time_diff( $timestamp ) . ' ' . __( 'ago', 'perflocale' )
 			: __( 'never', 'perflocale' );
 
-		// Two very different causes produce the same stale state, and the
-		// remedies are not interchangeable: if no rate source is wired, both
-		// the scheduled sync and the Sync Now button abort before any network
-		// call, so telling the operator to check WP-Cron sends them chasing a
-		// working cron. Say which one it actually is.
+		// Without a rate source every sync aborts before fetching: say so, not "check WP-Cron".
 		$message = $this->has_rate_source()
 			? sprintf(
 				/* translators: %s: Human-readable time since last sync, or "never". */
@@ -350,11 +295,7 @@ final class ExchangeRateSync {
 	 * @return array<string, array{interval: int, display: string}>
 	 */
 	public function register_schedules( array $schedules ): array {
-		// Schedule names are registered in WordPress's shared, global
-		// cron-schedules registry, so they carry the plugin's `perflocale_`
-		// prefix to avoid colliding with intervals registered by other
-		// plugins. The user-facing interval *setting* slugs (see INTERVALS)
-		// stay unprefixed and are mapped to these names by cron_schedule_name().
+		// Prefixed: the registry is global. Setting slugs stay unprefixed (cron_schedule_name()).
 		$custom = [
 			'perflocale_every_2_hours'  => [
 				'interval' => 2 * HOUR_IN_SECONDS,
@@ -392,12 +333,7 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Map an interval setting slug to the WP-Cron schedule name used by the
-	 * native-cron fallback path.
-	 *
-	 * Stock WordPress schedules (`hourly`, `daily`, `weekly`) are returned
-	 * as-is; the plugin's custom intervals resolve to their prefixed
-	 * `cron_schedules` registration name (see register_schedules()).
+	 * Map an interval setting slug to its WP-Cron schedule name.
 	 *
 	 * @param string $interval Interval setting slug.
 	 * @return string WP-Cron schedule name.
@@ -431,8 +367,7 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Schedule the recurring sync at the configured interval, in the engine
-	 * BackgroundEvents picks.
+	 * Schedule the recurring sync at the configured interval, in the engine BackgroundEvents picks.
 	 *
 	 * @return bool Whether the scheduler admitted the event.
 	 */
@@ -443,10 +378,6 @@ final class ExchangeRateSync {
 			$interval = 'daily';
 		}
 
-		// Route through BackgroundEvents so Action Scheduler picks it up
-		// when loaded (more reliable than WP-Cron on low-traffic stores -
-		// AS persists scheduled actions and catches up after missed runs).
-		// WP-Cron is used as fallback when AS isn't available.
 		return BackgroundEvents::enqueue_recurring(
 			self::CRON_HOOK,
 			time(),
@@ -479,9 +410,7 @@ final class ExchangeRateSync {
 	// ------------------------------------------------------------------
 
 	/**
-	 * Void-return cron callback. Delegates to sync_rates() and discards
-	 * the returned rates array (cron has no consumer). Pairs with the
-	 * AJAX handler which still calls sync_rates() directly for the array.
+	 * Cron callback: sync_rates() without its return value.
 	 *
 	 * @return void
 	 */
@@ -492,16 +421,12 @@ final class ExchangeRateSync {
 	/**
 	 * Sync exchange rates from the configured provider.
 	 *
-	 * Called manually via AJAX (which uses the return value) or indirectly
-	 * via cron_sync_rates() (which discards it).
-	 *
 	 * @return array<string, float> Fetched rates (currency_code => rate), empty on failure.
 	 */
 	public function sync_rates(): array {
 		$this->accepted_rates = [];
 
-		// Bail out if the plugin is being uninstalled - the WC/options
-		// state we touch may be partially dropped.
+		// During uninstall the options this touches may be partly dropped.
 		if ( \PerfLocale\Plugin::is_uninstalling() ) {
 			return [];
 		}
@@ -511,13 +436,8 @@ final class ExchangeRateSync {
 			return [];
 		}
 
-		// Circuit breaker: if recent fetches failed enough to trip the
-		// breaker, skip this tick. The breaker covers the FX provider
-		// only - config errors below (no API key, no targets) bypass
-		// it because those are operator misconfigurations that retrying
-		// won't fix. Default threshold of 3 failures opens for 5min
-		// (so a daily-cron sync only loses one tick per breaker cycle);
-		// override via `perflocale/breaker/cooldown_seconds/fx_sync`.
+		// The breaker covers provider failures only: config errors (no key, no targets) bypass it,
+		// as retrying cannot fix them.
 		$breaker_key = 'fx_sync';
 
 		if ( \PerfLocale\Concurrency\Breaker::is_open( $breaker_key ) ) {
@@ -532,12 +452,7 @@ final class ExchangeRateSync {
 			return [];
 		}
 
-		// Serialise concurrent ticks so two AS workers can't both hit
-		// the upstream provider (double-billing the quota), both write
-		// to RATES_OPTION (race-free thanks to update_option being
-		// atomic, but wasteful), and both fire the synced action twice.
-		// 5min lock TTL is more than enough - the full fetch + parse
-		// path runs in well under a second even with a slow provider.
+		// Serialise ticks so two workers do not both spend provider quota and fire the synced action.
 		$result = \PerfLocale\Concurrency\Lock::with(
 			'exchange_rate_sync',
 			5 * MINUTE_IN_SECONDS,
@@ -546,37 +461,15 @@ final class ExchangeRateSync {
 			}
 		);
 
-		// Lock contention → another tick is in flight. Treat as no-op;
-		// the other tick's record_success/failure is canonical.
+		// Lock held: another tick is in flight and records the breaker outcome.
 		return $result ?? [];
 	}
 
 	/**
-	 * Preserve previously-synced rates the current reply did not cover.
+	 * Keep stored rates the current reply did not cover: an omission means "unchanged", not "gone".
 	 *
-	 * RATES_OPTION is written wholesale, so before this a provider reply that
-	 * omitted a currency deleted that currency's rate: MultiCurrency reads it
-	 * with `isset()`, so the language silently fell back to an unconverted 1.0
-	 * price. Partial replies are ordinary - a free-tier plan, a per-symbol quota,
-	 * a currency temporarily unquoted - so the omission has to mean "unchanged",
-	 * not "gone".
-	 *
-	 * A carried rate is only kept when it is still provably meaningful:
-	 *
-	 *   - the store's BASE currency has not changed since that rate was fetched
-	 *     (every stored rate is relative to the base, so a base change makes the
-	 *     whole set meaningless at once);
-	 *   - the language is still configured for a non-base currency;
-	 *   - it is still configured for the SAME currency the rate was fetched for,
-	 *     proven against the `codes` map written beside the rates;
-	 *   - the stored value is a usable positive number.
-	 *
-	 * Fails safe: before the first sync that writes `codes` the map is absent, so
-	 * nothing is carried and behaviour is exactly what it was.
-	 *
-	 * Cost is one `get_option()` on each of two autoload=false rows, on the sync
-	 * tick only. Nothing here runs on a page request, and the shape written to
-	 * RATES_OPTION is unchanged, so the front-end read path is untouched.
+	 * Only while the base and the language's currency match the last record, from that record's own pairs.
+	 * See docs-ai/11-code-rationale.md, "ExchangeRateSync: carried rates".
 	 *
 	 * @param array<string, float> $fresh          Rates resolved from this reply.
 	 * @param array<string, mixed> $currencies     Per-language currency config.
@@ -584,72 +477,52 @@ final class ExchangeRateSync {
 	 * @return array<string, float> Fresh rates, plus any still-valid carried ones.
 	 */
 	private function carry_forward_rates( array $fresh, array $currencies, string $base_currency ): array {
-		// This runs under the sync lock, which leaves this request's
-		// `notoptions` as it is. When it lists either option, the reads below
-		// would return that absence even after another request's sync has
-		// created the row; dropping `notoptions` then sends them to the
-		// database. Otherwise nothing is dropped.
+		// This request's `notoptions` may predate another request's sync that created the rows:
+		// unlist both (the rates row is written next).
 		$notoptions = wp_cache_get( 'notoptions', 'options' );
 
 		if ( is_array( $notoptions ) && ( isset( $notoptions[ self::LAST_SYNC_OPTION ] ) || isset( $notoptions[ self::RATES_OPTION ] ) ) ) {
-			wp_cache_delete( 'notoptions', 'options' );
+			\PerfLocale\Database\NotOptions::unlist( [ self::LAST_SYNC_OPTION, self::RATES_OPTION ] );
 		}
 
 		$last = (array) get_option( self::LAST_SYNC_OPTION, [] );
 
-		// Base changed (or was never recorded) - discard the lot rather than
-		// mixing two bases in one map, which would misprice silently.
+		// Base changed (or never recorded): never mix two bases in one map.
 		if ( (string) ( $last['base'] ?? '' ) !== $base_currency ) {
 			return $fresh;
 		}
 
-		$previous = (array) get_option( self::RATES_OPTION, [] );
+		// Numbers and their currencies from the same record; a record without slug_rates has no bound pair.
+		$previous = is_array( $last['slug_rates'] ?? null ) ? $last['slug_rates'] : [];
+		$codes    = (array) ( $last['codes'] ?? [] );
+		$carried  = [];
 
-		if ( $previous === [] ) {
-			return $fresh;
-		}
-
-		$previous_codes = (array) ( $last['codes'] ?? [] );
-		$carried        = [];
-
-		foreach ( $previous as $slug => $rate ) {
+		foreach ( $currencies as $slug => $config ) {
 			$slug = (string) $slug;
+			$code = (string) ( $config['currency_code'] ?? '' );
 
-			// This reply covered it; the fresh value wins.
-			if ( isset( $fresh[ $slug ] ) ) {
+			// This reply covered it (the fresh value wins), or no rate is needed.
+			if ( isset( $fresh[ $slug ] ) || $code === '' || $code === $base_currency ) {
 				continue;
 			}
 
-			$code = (string) ( $currencies[ $slug ]['currency_code'] ?? '' );
+			// The recorded rate of this currency, under whichever slug it was synced (a rename keeps it).
+			foreach ( array_keys( $codes, $code, true ) as $synced ) {
+				$rate = $previous[ $synced ] ?? null;
 
-			// Language removed, or now priced in the base currency: sync skips
-			// base-currency codes entirely, so a rate here would be stale.
-			if ( $code === '' || $code === $base_currency ) {
-				continue;
+				if ( is_numeric( $rate ) && is_finite( (float) $rate ) && (float) $rate > 0 ) {
+					$carried[ $slug ] = (float) $rate;
+					break;
+				}
 			}
-
-			// Repointed at a different currency since that rate was fetched -
-			// carrying it would price the language with another currency's rate.
-			if ( ! isset( $previous_codes[ $slug ] ) || (string) $previous_codes[ $slug ] !== $code ) {
-				continue;
-			}
-
-			if ( ! is_numeric( $rate ) || (float) $rate <= 0 ) {
-				continue;
-			}
-
-			$carried[ $slug ] = (float) $rate;
 		}
 
-		// Union, NOT array_merge(): array_merge renumbers integer-like keys, and
-		// a language slug can be integer-like, which would hand one language's
-		// rate to another. `+` keeps keys and lets the left side (fresh) win.
+		// Union, not array_merge(), which renumbers integer-like slugs. Fresh rates win.
 		return $fresh + $carried;
 	}
 
 	/**
-	 * Body of sync_rates(), executed under the `exchange_rate_sync`
-	 * lock so two concurrent ticks can't double-hit the provider.
+	 * Body of sync_rates(), run under the `exchange_rate_sync` lock.
 	 *
 	 * @return array<string, float> Fetched rates (currency_code => rate),
 	 *                              empty on failure.
@@ -660,20 +533,12 @@ final class ExchangeRateSync {
 		// Track recurring-handler timing for the Jobs admin panel.
 		$started_at = time();
 
-		// Capture blog context up front. On multisite with switch_to_blog,
-		// a stale context would cause us to read one blog's WC currency
-		// while writing another blog's rates - a subtle source of cross-
-		// site bleed. Single-site installs skip the check entirely.
+		// Captured up front so a blog switch mid-sync cannot write one blog's rates into another.
 		$origin_blog_id = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
 
-		// Read the raw WC currency option - NOT get_woocommerce_currency() which
-		// passes through the woocommerce_currency filter. MultiCurrency hooks
-		// that filter to return the current language's currency (e.g. BGN),
-		// which would cause rates to be fetched relative to the wrong base.
+		// Raw option, not get_woocommerce_currency(): MultiCurrency filters that to the language's currency.
 		$base_currency = (string) get_option( 'woocommerce_currency', 'USD' );
 
-		// If something switched us mid-flight, bail rather than persisting
-		// rates into the wrong blog's options.
 		if ( is_multisite() && $origin_blog_id > 0 && $origin_blog_id !== (int) get_current_blog_id() ) {
 			$this->log_sync_error( 'Aborting sync: blog context changed mid-request.' );
 			return [];
@@ -682,12 +547,8 @@ final class ExchangeRateSync {
 		$provider_id = (string) $this->settings->get( 'wc_exchange_rate_provider', '' );
 		$provider    = $providers[ $provider_id ] ?? null;
 
-		// No rate providers ship with the plugin. Rates come from EITHER a
-		// provider registered through `exchange_rate_providers` (which gets
-		// this class's caching, breaker and key handling) OR straight from
-		// the `exchange_rates_fetched` filter. Only abort when NEITHER seam
-		// is wired - otherwise a site that supplies rates purely through the
-		// filter could never sync, because the filter runs further down.
+		// Abort only when neither a registered provider nor the exchange_rates_fetched filter is
+		// wired: a site may supply rates through the filter alone.
 		$has_rate_filter = has_filter( 'perflocale/woocommerce/exchange_rates_fetched' );
 
 		if ( null === $provider && ! $has_rate_filter ) {
@@ -711,9 +572,7 @@ final class ExchangeRateSync {
 			}
 		}
 
-		// Collect target currency codes from the per-language config.
-		// Ensure all active languages have entries - languages added after the
-		// last settings save would otherwise be skipped and revert to defaults.
+		// Target codes from the per-language config, with entries for languages added since the last save.
 		$currencies = (array) $this->settings->get( 'wc_currencies', [] );
 		$plugin     = \PerfLocale\Plugin::get_instance();
 
@@ -743,21 +602,16 @@ final class ExchangeRateSync {
 
 			$has_non_base = true;
 
-			// Skip manual-rate currencies - the overrides loop below discards the
-			// provider feed for them anyway, so fetching them only burns provider
-			// quota (and risks a rate-limit lockout) for no benefit.
+			// Manual-rate currencies are not fetched: the overrides loop below discards them anyway.
 			if ( empty( $config['manual_rate'] ) ) {
 				$target_codes[ $code ] = true;
 			}
 		}
 
 		if ( empty( $target_codes ) ) {
-			// $has_non_base distinguishes "every non-base currency is manual" (a
-			// valid config - nothing to fetch) from "no non-base currency at all".
+			// Every non-base currency is manual (valid) versus none at all.
 			if ( $has_non_base ) {
-				// All rates are manual: record a successful sync so is_stale()
-				// doesn't warn forever, and skip the pointless provider request
-				// that would otherwise run every tick and never persist a result.
+				// All manual: record a successful sync so is_stale() does not warn forever.
 				update_option(
 					self::LAST_SYNC_OPTION,
 					[
@@ -776,8 +630,7 @@ final class ExchangeRateSync {
 			return [];
 		}
 
-		// Fetch rates from the registered provider (if any). With no provider
-		// the array stays empty and the filter below is the sole source.
+		// Without a provider the filter below is the only source.
 		$rates = null !== $provider
 			? $this->fetch_rates( $provider_id, $provider, $base_currency, array_keys( $target_codes ), $api_key )
 			: [];
@@ -793,22 +646,12 @@ final class ExchangeRateSync {
 
 		if ( empty( $rates ) ) {
 			$this->log_sync_error( 'No rates returned from ' . ( $provider['name'] ?? ( $provider_id !== '' ? $provider_id : 'the exchange_rates_fetched filter' ) ) );
-			// Provider failure - feed the breaker so a persistently-broken
-			// provider trips after the configured threshold.
+			// Provider failure: feed the breaker.
 			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'fetch_empty' );
 			return [];
 		}
 
-		// NOTE: the breaker is NOT reset here. A non-empty $rates only means the
-		// transport worked; the payload can still be entirely unusable, and the
-		// validation loop below is what decides that. Recording success here
-		// zeroed the failure streak on every reply, so a provider returning
-		// well-formed garbage forever kept the breaker one step from OPEN and it
-		// never tripped. record_success() now runs after validation.
-
-		// Build the overrides map directly from the language configuration
-		// and the freshly fetched rates. No mutation of $currencies - that
-		// would be dead work now that we persist only to RATES_OPTION.
+		// Not record_success() yet: a non-empty reply can still be all invalid, and must still trip the breaker.
 		$rate_overrides = [];
 		$rejected       = [];
 		$accepted       = [];
@@ -820,39 +663,34 @@ final class ExchangeRateSync {
 				continue;
 			}
 
-			// Respect manual rates - user-overridden values win over the
-			// provider feed, matching the read-side merge in MultiCurrency.
+			// Manual rates win, matching the read-side merge in MultiCurrency.
 			if ( ! empty( $config['manual_rate'] ) ) {
 				continue;
 			}
 
-			// array_key_exists, not isset: a null rate is a provider fault we
-			// want to report, not silently skip.
+			// Not isset(): a null rate is a provider fault to report.
 			if ( ! array_key_exists( $code, $rates ) ) {
 				continue;
 			}
 
 			$raw = $rates[ $code ];
 
-			// Rates come from a site-registered provider or filter, so they are
-			// arbitrary input. A bare (float) cast turns 'unavailable' into 0.0
-			// and '4,2513' into 4.0 - both of which then silently price every
-			// product wrong (0, or off by ~100x). Reject anything non-numeric
-			// or non-positive instead of persisting it.
+			// Arbitrary input: a bare (float) cast turns 'unavailable' into 0.0 and '4,2513' into 4.0.
 			if ( ! is_scalar( $raw ) || ! is_numeric( $raw ) ) {
 				$rejected[ $code ] = is_scalar( $raw ) ? (string) $raw : get_debug_type( $raw );
 				continue;
 			}
 
-			$value = (float) $raw;
+			// Checked as stored: a tiny rate rounds to 0.
+			$value = MultiCurrency::usable_rate( round( (float) $raw, 6 ) );
 
-			if ( ! is_finite( $value ) || $value <= 0 ) {
+			if ( null === $value ) {
 				$rejected[ $code ] = (string) $raw;
 				continue;
 			}
 
-			$rate_overrides[ $slug ] = round( $value, 6 );
-			$accepted[ $code ]       = $rate_overrides[ $slug ];
+			$rate_overrides[ $slug ] = $value;
+			$accepted[ $code ]       = $value;
 		}
 
 		if ( $rejected !== [] ) {
@@ -871,35 +709,23 @@ final class ExchangeRateSync {
 			);
 		}
 
-		// Every target currency came back invalid - that is a provider fault,
-		// not a success, so feed the breaker rather than recording a clean run.
+		// Every target currency came back invalid: a provider fault, not a success.
 		if ( $rate_overrides === [] && $rejected !== [] ) {
 			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'fetch_invalid' );
 			return [];
 		}
 
-		// Validation is past: either usable rates came back, or there was
-		// genuinely nothing to validate (no non-base target currencies). Only
-		// now does the run count as a success and reset the failure streak.
+		// Past validation: the run counts as a success here, not before.
 		\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
 
 		if ( ! empty( $rate_overrides ) ) {
-			// A provider reply that omits some currencies used to WIPE them:
-			// this option was overwritten wholesale, so a language whose code
-			// was missing from one response silently lost its rate and fell
-			// back to 1.0 - every price in that language shown unconverted.
-			// Carry the untouched ones forward instead.
+			// The option is written whole: carry forward rates this reply omitted.
 			$rate_overrides = $this->carry_forward_rates( $rate_overrides, $currencies, $base_currency );
 
-			// Persist machine-fetched rates to a dedicated option (autoload
-			// off - only loaded when WooCommerce needs currency conversion).
-			// This isolates cron/manual-sync writes from concurrent writes to
-			// the shared settings blob, eliminating the prior race condition.
+			// Dedicated option, not autoloaded (see RATES_OPTION).
 			update_option( self::RATES_OPTION, $rate_overrides, false );
 
-			// Which currency each slug's rate was fetched FOR. carry_forward_rates()
-			// refuses to carry a rate whose language has since been repointed at a
-			// different currency, and without this map it could not tell.
+			// The currency each slug's rate was fetched for, read by carry_forward_rates().
 			$synced_codes = [];
 
 			foreach ( $currencies as $code_slug => $code_config ) {
@@ -914,11 +740,12 @@ final class ExchangeRateSync {
 			update_option(
 				self::LAST_SYNC_OPTION,
 				[
-					'timestamp' => time(),
-					'provider'  => $provider_id,
-					'rates'     => $rates,
-					'base'      => $base_currency,
-					'codes'     => $synced_codes,
+					'timestamp'  => time(),
+					'provider'   => $provider_id,
+					'rates'      => $rates,
+					'base'       => $base_currency,
+					'codes'      => $synced_codes,
+					'slug_rates' => $rate_overrides,
 				],
 				false
 			);
@@ -929,8 +756,7 @@ final class ExchangeRateSync {
 			$this->accepted_rates = $accepted;
 		}
 
-		// Record completion + duration for the Jobs admin observability
-		// panel. Only on a successful sync (when $rates is non-empty).
+		// Completion and duration for the Jobs panel, on a successful sync only.
 		if ( ! empty( $rates ) ) {
 			\PerfLocale\Background\BackgroundEvents::record_run( self::CRON_HOOK, $started_at );
 		}
@@ -959,19 +785,14 @@ final class ExchangeRateSync {
 			}
 		}
 
-		// No bundled providers: rates come from a provider the site registers
-		// via perflocale/woocommerce/exchange_rate_providers (with a
-		// fetch_callback), or from the exchange_rates_fetched filter.
+		// No bundled providers: only a registered fetch_callback or the exchange_rates_fetched filter.
 		return [];
 	}
 
 	/**
 	 * Remove credentials from sync error text before it is stored or logged.
 	 *
-	 * Provider exceptions and provider-supplied values are third-party text,
-	 * and a request URL in them can carry the API key. The key configured for
-	 * the selected provider is replaced wherever it appears, as typed and
-	 * URL-encoded; SecretMasker then redacts other credential-shaped runs.
+	 * Provider text can carry the API key in a URL: the key goes as typed and URL-encoded, then SecretMasker runs.
 	 *
 	 * @param string $message Error text.
 	 * @return string
@@ -996,10 +817,7 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Log a sync error (debug mode only).
-	 *
-	 * The message is stored and logged with credentials removed
-	 * (redact_secrets()).
+	 * Log a sync error (debug mode only) and store it for the admin UI, credentials removed.
 	 *
 	 * @param string $message Error message.
 	 * @return void
@@ -1011,33 +829,9 @@ final class ExchangeRateSync {
 			error_log( 'PerfLocale Exchange Rate Sync: ' . $message ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
 
-		// Store last error for display in the admin UI. Not autoloaded - it's
-		// read only on the admin settings screen, never on the front end.
-		//
-		// ⚠️ WRITE ONLY WHEN THE MESSAGE IS NEW OR HAS CHANGED.
-		//
-		// The plugin ships NO exchange-rate providers - `self::PROVIDERS` is empty
-		// by design, because rates come from the
-		// `perflocale/woocommerce/exchange_rate_providers` or
-		// `..._exchange_rates_fetched` filters. A site that has wired neither
-		// cannot resolve that from the UI, so its scheduled sync fails on every
-		// run and this option was being rewritten each time: a recurring write
-		// recording a condition that never changes. It also broke any
-		// "this request wrote nothing" assertion whenever cron happened to fire
-		// during the measured window - child HTTP requests do not inherit
-		// DISABLE_WP_CRON.
-		//
-		// Scheduling is deliberately NOT touched. Cron is only re-armed by
-		// maybe_reschedule() on `perflocale/settings/updated` - a SETTINGS save -
-		// but wiring a rate source is a CODE change that fires no settings update.
-		// Unscheduling on "no source configured" would therefore leave a developer
-		// who correctly registers the filter with a silently dead sync, which is a
-		// worse and far harder failure to diagnose than a single log entry.
-		//
-		// `timestamp` consequently means "when this condition was first recorded"
-		// rather than "the last time we noticed", which is the more useful of the
-		// two. That is safe: the only reader (ajax_sync_rates) deletes this option
-		// before triggering a sync and reads `message` alone.
+		// Written only when the message changes: an unwired site fails every run. Do not unschedule
+		// here: wiring a rate source is a code change that fires no settings save.
+		// See docs-ai/11-code-rationale.md, "ExchangeRateSync: last error write".
 		$existing = get_option( 'perflocale_exchange_rate_last_error', [] );
 
 		if ( is_array( $existing ) && isset( $existing['message'] ) && $existing['message'] === $message ) {
@@ -1064,9 +858,7 @@ final class ExchangeRateSync {
 	 * @return void
 	 */
 	public function ajax_sync(): void {
-		// Canonical WP-handbook order: nonce (CSRF) first, then capability.
-		// Default $die=true so an invalid nonce terminates the request
-		// before any input is read or any state mutates.
+		// Nonce first (dies on failure), then capability.
 		check_ajax_referer( 'perflocale_sync_rates', '_nonce' );
 
 		if ( ! current_user_can( 'manage_options' ) ) {
@@ -1087,8 +879,7 @@ final class ExchangeRateSync {
 
 		$last_sync = get_option( self::LAST_SYNC_OPTION, [] );
 
-		// The settings screen writes these into its rate inputs, so only the
-		// rates this sync accepted and stored go back, never a rejected value.
+		// The settings screen writes these into its inputs: accepted rates only, never a rejected value.
 		wp_send_json_success(
 			[
 				'rates'     => $this->accepted_rates,
@@ -1111,19 +902,7 @@ final class ExchangeRateSync {
 		/**
 		 * Filter exchange rate providers.
 		 *
-		 * Add custom providers with a `fetch_callback` key:
-		 *
-		 * add_filter( 'perflocale/woocommerce/exchange_rate_providers', function( $providers ) {
-		 * $providers['my_api'] = [
-		 * 'name' => 'My Custom API',
-		 * 'needs_key' => true,
-		 * 'key_setting' => 'wc_my_api_key',
-		 * 'fetch_callback' => function( string $base, array $targets, string $key ): array {
-		 * // Return [ 'EUR' => 0.85, 'GBP' => 0.73 ]
-		 * },
-		 * ];
-		 * return $providers;
-		 * } );
+		 * Each takes name, needs_key, key_setting and fetch_callback( $base, $targets, $key ) returning code => rate.
 		 *
 		 * @param array<string, array> $providers Provider definitions.
 		 */

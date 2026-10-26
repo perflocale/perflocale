@@ -16,30 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The per-site lock a data import holds from before it reads the file until
- * its last write, whatever started it: the import form (inline or as a
- * background job), `wp perflocale import` and each slice of
- * `wp perflocale network-import`. While it is held, another import on the
- * same site is refused.
+ * The per-site lock every data import (form, job, CLI, network-import slice) holds from reading the file to its last write.
  *
- * On MySQL and MariaDB it is a named lock of the database connection
- * (GET_LOCK), which the server frees as soon as the connection ends, so an
- * import that crashes or is killed never leaves it behind. Its name holds the
- * database name and the site's table prefix, so every site of a network, and
- * every install on the same database server, has its own.
- *
- * On SQLite, or where GET_LOCK cannot be used, it is the plugin's option lock
- * (Concurrency\Lock) with a time to live of ten minutes that the import
- * extends as it goes (heartbeat()); after a crash it is free again once that
- * time has run out.
- *
- * heartbeat() runs at least once a minute through every phase of an import:
- * it extends the option lock, and it takes the connection lock again when a
- * reconnect of the database connection (wpdb after "server has gone away")
- * ended it while no other import took it. A reconnect is noticed at the first
- * heartbeat() after it. When the lock has become another import's, or cannot
- * be taken again, heartbeat() throws, and the import stops before its next
- * write.
+ * GET_LOCK on MySQL (freed with the connection, so a crash leaves none), else an option lock with a TTL; heartbeat() keeps it.
+ * See docs-ai/11-code-rationale.md, "ImportLock: connection lock and heartbeat".
  */
 final class ImportLock {
 
@@ -54,6 +34,11 @@ final class ImportLock {
 	private const TTL = 600;
 
 	/**
+	 * Seconds the option lock lives through a Replace transaction (as DataImportJob::get_lock_ttl()).
+	 */
+	private const REPLACE_TTL = 14400;
+
+	/**
 	 * Locks this request holds: name => `mysql` or `option`.
 	 *
 	 * @var array<string, string>
@@ -66,16 +51,31 @@ final class ImportLock {
 	private static int $beat_at = 0;
 
 	/**
-	 * The database connection handle (wpdb's) the connection lock was taken
-	 * on, when wpdb exposes one.
+	 * The wpdb connection handle the connection lock was taken on, when wpdb exposes one.
 	 */
 	private static ?object $conn = null;
 
 	/**
+	 * While not '': the import holds connection state (a TEMPORARY table), so a reconnect ends it with this message.
+	 *
+	 * @var string
+	 */
+	private static string $session_lost = '';
+
+	/**
+	 * Bind the import to its connection: after a reconnect heartbeat() throws $lost_message. '' unbinds.
+	 *
+	 * @param string $lost_message The import's message for a lost connection, or ''.
+	 * @return void
+	 */
+	public static function bind_session( string $lost_message ): void {
+		self::$session_lost = $lost_message;
+	}
+
+	/**
 	 * Take the current site's import lock.
 	 *
-	 * @return bool False when another import holds it (or this request
-	 *              already does).
+	 * @return bool False when another import holds it (or this request already does).
 	 */
 	public static function acquire(): bool {
 		$name = self::name();
@@ -109,17 +109,12 @@ final class ImportLock {
 	}
 
 	/**
-	 * Keep the lock this request holds: an option lock is extended for
-	 * another TTL; a connection lock that a reconnect ended is taken again
-	 * while it is free. Does its work at most once per tenth of the TTL, and
-	 * at once after a reconnect, so an import calls it as often as it likes.
-	 * Never called inside an open transaction: a rolled-back extension would
-	 * leave the stored value different from the one this request releases.
+	 * Keep this request's lock: extend the option lock, or retake a connection lock a reconnect ended; throttled to TTL/10.
+	 *
+	 * Never call it inside an open transaction: a rolled-back extension would differ from the value release() deletes.
 	 *
 	 * @return void
-	 * @throws \RuntimeException When this request no longer holds the lock:
-	 *                           another import took it, or it could not be
-	 *                           extended or taken again.
+	 * @throws \RuntimeException When this request does not hold the lock: another import took it, or it could not be kept.
 	 */
 	public static function heartbeat(): void {
 		if ( [] === self::$held || ( self::connection_kept() && time() - self::$beat_at < intdiv( self::TTL, 10 ) ) ) {
@@ -134,6 +129,10 @@ final class ImportLock {
 		if ( 'option' === $kind ) {
 			$kept = Lock::extend( self::OPTION_LOCK, self::TTL );
 		} elseif ( 'mysql' === $kind ) {
+			if ( '' !== self::$session_lost && ! self::connection_kept() ) {
+				throw new \RuntimeException( esc_html( self::$session_lost ) );
+			}
+
 			$kept = self::mysql_holder( $name ) ?? self::mysql_lock( $name );
 
 			if ( true === $kept ) {
@@ -149,9 +148,26 @@ final class ImportLock {
 	}
 
 	/**
-	 * Whether the database connection the connection lock was taken on is
-	 * still the one wpdb uses. False after a reconnect: the old connection's
-	 * lock, and any transaction open on it, ended with it.
+	 * Before a Replace transaction, where heartbeat() cannot run: extend the
+	 * option lock for REPLACE_TTL; the next heartbeat() runs at once and puts TTL back.
+	 *
+	 * @return void
+	 * @throws \RuntimeException When this request does not hold the lock.
+	 */
+	public static function hold_for_transaction(): void {
+		if ( 'option' !== ( self::$held[ self::name() ] ?? '' ) ) {
+			return;
+		}
+
+		self::$beat_at = 0;
+
+		if ( ! Lock::extend( self::OPTION_LOCK, self::REPLACE_TTL ) ) {
+			throw new \RuntimeException( esc_html( self::busy_message() ) );
+		}
+	}
+
+	/**
+	 * Whether wpdb still uses the connection the lock was taken on; a reconnect ended that lock and any open transaction.
 	 *
 	 * @return bool True as well when this request holds no connection lock.
 	 */
@@ -167,6 +183,8 @@ final class ImportLock {
 	public static function release(): void {
 		$name = self::name();
 		$kind = self::$held[ $name ] ?? '';
+
+		self::$session_lost = '';
 
 		unset( self::$held[ $name ] );
 
@@ -201,15 +219,12 @@ final class ImportLock {
 	 * Take the connection lock.
 	 *
 	 * @param string $name Lock name.
-	 * @return bool|null True when taken, false when another connection holds
-	 *                   it, null when GET_LOCK gave no answer.
+	 * @return bool|null True when taken, false when another connection holds it, null when GET_LOCK gave no answer.
 	 */
 	private static function mysql_lock( string $name ): ?bool {
 		$wpdb = Typed::wpdb();
 
-		// A database layer with read replicas (HyperDB, LudicrousDB) sends a
-		// SELECT to a replica unless told otherwise; the lock must live on the
-		// connection that writes.
+		// HyperDB/LudicrousDB send a SELECT to a replica; the lock must live on the writing connection.
 		if ( method_exists( $wpdb, 'send_reads_to_masters' ) ) {
 			$wpdb->send_reads_to_masters();
 		}
@@ -234,8 +249,7 @@ final class ImportLock {
 	 * Whether this connection holds the connection lock.
 	 *
 	 * @param string $name Lock name.
-	 * @return bool|null True when this connection holds it, false when
-	 *                   another one does, null when it is free.
+	 * @return bool|null True when this connection holds it, false when another one does, null when it is free.
 	 */
 	private static function mysql_holder( string $name ): ?bool {
 		$wpdb = Typed::wpdb();
@@ -262,8 +276,7 @@ final class ImportLock {
 	}
 
 	/**
-	 * The lock name of the current site: at most 64 characters, as GET_LOCK
-	 * requires.
+	 * The current site's lock name (DB name and prefix): at most 64 characters, as GET_LOCK requires.
 	 *
 	 * @return string
 	 */

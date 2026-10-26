@@ -17,21 +17,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Wraps the main content with `<div data-nosnippet>` whenever the rendered
- * singular post's language differs from the URL's language - in practice
- * the show_default branch of `missing_translation_action`.
+ * Wraps singular content in `data-nosnippet` when the post's language differs from the URL's language.
  *
- * Without this wrapper, Google happily indexes the default-language text
- * under the non-default URL and shows (say) English snippets in German
- * SERPs. `data-nosnippet` tells Google not to use that content for snippet
- * generation, keeping the URL in the index but preventing mismatched
- * snippet text.
+ * Keeps fallback-language text out of search snippets for the translated URL.
  *
- * Reference: https://developers.google.com/search/docs/crawling-indexing/robots-meta-tag#data-nosnippet-attr
- *
- * Cost profile: one `the_content` filter at priority 1 that short-circuits
- * in 3 conditions - admin, not-main-query, or no language mismatch. When
- * fallback IS active, a single sprintf wrap. No regex, no parsing.
+ * @link https://developers.google.com/search/docs/crawling-indexing/robots-meta-tag#data-nosnippet-attr
  */
 final class FallbackSnippetGuard {
 
@@ -60,9 +50,7 @@ final class FallbackSnippetGuard {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Priority 1 wraps before oEmbed / shortcode / autoembed so they
-		// still run on the inner content. The closing </div> nests cleanly
-		// around the final HTML.
+		// Priority 1: wrap before oEmbed, shortcodes and autoembed so they still run on the inner content.
 		add_filter( 'the_content', [ $this, 'maybe_wrap' ], 1 );
 	}
 
@@ -83,9 +71,7 @@ final class FallbackSnippetGuard {
 			return $content;
 		}
 
-		// Only wrap on the main, singular query - not on archives (where the
-		// content filter runs once per post in the loop and the fallback
-		// notion doesn't apply).
+		// Main singular query only: on archives the filter runs per post in the loop.
 		if ( ! is_singular() || ! in_the_loop() || ! is_main_query() ) {
 			return $content;
 		}
@@ -102,14 +88,7 @@ final class FallbackSnippetGuard {
 			return $content;
 		}
 
-		// Resolve the post's actual language object. Posts with no
-		// translation-link entry are treated as being in the default
-		// language (matches the convention used by ContentChangeDetector
-		// and TermQueryFilter) - without this fallback, a page authored
-		// before PerfLocale was installed (or any page never linked into
-		// a translation group) would be served under every /xx/ prefix
-		// unguarded, leaking its default-language snippet into foreign
-		// SERPs.
+		// An unlinked post counts as default language, or it would be served unguarded under every prefix.
 		$post_lang = $this->manager->detect_post_language( $post_id );
 
 		if ( $post_lang === null || ! isset( $post_lang->id ) ) {
@@ -129,10 +108,7 @@ final class FallbackSnippetGuard {
 		}
 
 		/**
-		 * Filter whether to wrap the content with data-nosnippet.
-		 *
-		 * Fires only when we've already determined a fallback is active -
-		 * use this to opt out for specific post types or templates.
+		 * Filter whether to wrap the content with data-nosnippet; fires only when a fallback is active.
 		 *
 		 * @hook perflocale/fallback/wrap_nosnippet
 		 * @param bool $wrap Default: true.
@@ -143,11 +119,7 @@ final class FallbackSnippetGuard {
 		}
 
 		/**
-		 * Filter the wrapping tag for data-nosnippet.
-		 *
-		 * Default 'div' is safe for post content. Some themes wrap content
-		 * in inline contexts where a block-level div would break layout -
-		 * pass 'span' in those cases.
+		 * Filter the wrapping tag for data-nosnippet; return 'span' where a theme renders content inline.
 		 *
 		 * @hook perflocale/fallback/nosnippet_tag
 		 * @param string $tag Default: 'div'.
@@ -158,13 +130,8 @@ final class FallbackSnippetGuard {
 		// Allow only safe block/inline containers.
 		$tag = preg_match( '/^[a-z]{1,8}$/', $tag ) ? $tag : 'div';
 
-		// $tag is regex-validated to a lowercase letter run [a-z]{1,8}, so
-		// it's safe to embed unescaped. $content is the value WordPress
-		// passed through `the_content` - core has already filtered it for
-		// users without unfiltered_html. Re-escaping with `wp_kses_post()`
-		// here would double-filter post HTML and corrupt valid block markup
-		// (SVGs, figures, embeds), the same reason core's own
-		// `render_block_core_post_content()` returns $content unescaped.
+		// $tag is validated above. $content stays unescaped like core's post-content block: wp_kses_post()
+		// would corrupt valid block markup (SVG, figures, embeds).
 		return sprintf( '<%1$s data-nosnippet>%2$s</%1$s>', $tag, $content );
 	}
 }

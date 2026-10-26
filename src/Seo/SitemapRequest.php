@@ -32,10 +32,7 @@ final class SitemapRequest {
 	private readonly Settings $settings;
 
 	/**
-	 * Per-request caches populated by add_alternate_links()/add_taxonomy_alternate_links().
-	 *
-	 * Stored at class level so switch_blog() can nuke them on multisite
-	 * instead of relying on method-local statics that we can't reach.
+	 * Per-request caches of the alternate builders, static so reset_caches() can clear them on switch_blog.
 	 *
 	 * @var TranslationGroupRepository|null
 	 */
@@ -57,27 +54,21 @@ final class SitemapRequest {
 	private static ?object $default_lang_cache = null;
 
 	/**
-	 * Map of language slug → hreflang value.
+	 * Language slug -> hreflang value.
 	 *
 	 * @var array<string, string>|null
 	 */
 	private static ?array $slug_map_cache = null;
 
 	/**
-	 * Post types whose caches have been primed for this sitemap run.
-	 *
-	 * WordPress renders one sitemap per post type (and per taxonomy).
-	 * A single global $primed bool would prime on the first post type
-	 * and never again, so subsequent types miss the optimisation. Key
-	 * the prime state by post type to fix that.
+	 * Post types primed in this sitemap run, keyed by type: a run can render several post types.
 	 *
 	 * @var array<string, bool>
 	 */
 	private static array $primed_types = [];
 
 	/**
-	 * Taxonomies whose term caches have been primed for this sitemap run.
-	 * Mirrors $primed_types for the taxonomy path.
+	 * Taxonomies whose term caches are primed in this sitemap run.
 	 *
 	 * @var array<string, bool>
 	 */
@@ -101,11 +92,9 @@ final class SitemapRequest {
 	private const SIBLING_PRIME_CHUNK = 500;
 
 	/**
-	 * Terms of a taxonomy sitemap page whose links are primed per statement,
-	 * the bound UrlConverter::preload_term_languages() uses. The link query
-	 * has no ORDER BY: a larger batch can return a group's links in another
-	 * order than the per-term read, which would reorder the page's
-	 * alternates.
+	 * Terms whose links are primed per statement, as in UrlConverter::preload_term_languages().
+	 *
+	 * The link query has no ORDER BY: a larger batch could reorder a page's alternates.
 	 *
 	 * @var int
 	 */
@@ -175,10 +164,7 @@ final class SitemapRequest {
 	/**
 	 * Record the IDs of the posts a core post sitemap page lists.
 	 *
-	 * Only the query marked by include_all_languages() is recorded, and it
-	 * replaces the previous page's IDs (an empty page included). Over the
-	 * bulk-prime cap, the page's first entry primes the translation siblings
-	 * of exactly these posts.
+	 * Only the page query (PAGE_QUERY_VAR); each page, an empty one included, replaces the set.
 	 *
 	 * @param mixed $posts Posts the query returned.
 	 * @param mixed $query The query.
@@ -211,11 +197,8 @@ final class SitemapRequest {
 	/**
 	 * Record the term query a core taxonomy sitemap page runs.
 	 *
-	 * Only the query marked by include_all_languages_taxonomies() that loads
-	 * whole terms is recorded (not the page-count query), and it replaces the
-	 * previous page's query. Its terms are read by the page's first entry,
-	 * after the query has run: over the bulk-prime cap, that entry primes the
-	 * translation siblings of exactly these terms.
+	 * Only the page query loading whole terms (not the count query); the page's first entry
+	 * reads its terms once it has run.
 	 *
 	 * @param mixed $query The term query.
 	 * @return void
@@ -239,13 +222,9 @@ final class SitemapRequest {
 	}
 
 	/**
-	 * Add xhtml:link alternates to the blog-home sitemap entry
-	 * (`show_on_front=posts`).
+	 * Add xhtml:link alternates to the blog-home sitemap entry (`show_on_front=posts`).
 	 *
-	 * The blog home exists in every active language (no publish-status
-	 * gate applies), so one alternate per language is emitted, built via
-	 * the mode-aware converter - path prefixes in subdirectory mode,
-	 * `?lang=` in query mode, hosts in subdomain/domain modes.
+	 * The home exists in every active language: one alternate each, through the mode-aware converter.
 	 *
 	 * @param array<string, mixed> $entry Sitemap entry data (loc only).
 	 * @return array<string, mixed>
@@ -306,12 +285,7 @@ final class SitemapRequest {
 	/**
 	 * Add xhtml:link alternate entries to a sitemap post entry.
 	 *
-	 * Adds translation URLs as alternate links so search engines understand
-	 * the relationship between language versions of the same content.
-	 *
-	 * Uses batch preloading: when the first post in a sitemap page is
-	 * processed, all translation links for that page are loaded in a
-	 * single query. Subsequent calls use the preloaded cache.
+	 * The first entry primes the siblings' caches: per post type, or per page over the cap.
 	 *
 	 * @param array<string, mixed> $entry Sitemap entry data.
 	 * @param object               $post Post object (WP_Post or stdClass).
@@ -325,9 +299,7 @@ final class SitemapRequest {
 			return $entry;
 		}
 
-		// Prime the post cache for all translation IDs on first call
-		// PER post type. WordPress sitemaps render one page per post type,
-		// and priming only once would miss all subsequent types.
+		// Once per post type: a run can render several post types.
 		if ( empty( self::$primed_types[ $post_type ] ) ) {
 			self::$primed_types[ $post_type ] = true;
 			$this->prime_sitemap_caches( $post_type );
@@ -344,9 +316,7 @@ final class SitemapRequest {
 			unset( self::$page_post_ids[ $post_type ] );
 		}
 
-		// Per-post opt-out: a flagged entry advertises no alternates (and is
-		// skipped as a sibling below) so excluded translations never appear
-		// in any alternate set. O(1) against a per-request memoised id set.
+		// Per-post SEO opt-out: no alternates here, and skipped as a sibling below.
 		if ( \PerfLocale\Helper::is_seo_excluded( (int) $post->ID ) ) {
 			return $entry;
 		}
@@ -354,13 +324,8 @@ final class SitemapRequest {
 		$links = self::$repo_cache->get_translations( $post->ID, ObjectType::Post );
 
 		if ( empty( $links ) ) {
-			// Untranslated post. In host-based URL modes (subdomain/domain)
-			// every language host serves its own /wp-sitemap.xml, and the loc
-			// core built inherits the REQUEST host - so the same untranslated
-			// post would be advertised self-canonically on every language
-			// host (cross-host duplicate content). An unlinked object is
-			// default-language content by definition, so pin the loc to the
-			// default language; a no-op in path-based modes.
+			// Unlinked = default-language content: pin its loc, or in host modes every
+			// language host's sitemap would list it under its own host.
 			return $this->pin_entry_loc_to_default( $entry );
 		}
 
@@ -382,7 +347,6 @@ final class SitemapRequest {
 			? $plugin->get( 'url_converter' )
 			: null;
 
-		// Collect all translation object IDs for batch status/permalink check.
 		$alternates  = [];
 		$default_url = null;
 		$slug_map    = self::$slug_map_cache;
@@ -433,12 +397,7 @@ final class SitemapRequest {
 				];
 			}
 
-			// Store under the standard W3C key 'xhtml:link'. WordPress core's
-			// default renderer drops unknown fields silently - we swap in
-			// PerfLocaleSitemapRenderer via wp_sitemaps_init below so this
-			// array is serialized as real <xhtml:link rel="alternate" …> child
-			// elements of <url>, which is the documented hreflang-in-sitemap
-			// pattern (sitemaps.org + Google Search Central).
+			// Core's renderer drops unknown keys: SitemapRenderer writes this as <xhtml:link>.
 			$entry['xhtml:link'] = $alternates;
 		}
 
@@ -448,14 +407,7 @@ final class SitemapRequest {
 	/**
 	 * Pin a sitemap entry's loc to the default language's URL shape.
 	 *
-	 * Core builds loc from get_permalink() in the REQUEST context; in
-	 * subdomain/domain URL modes home_url() is host-mapped to the current
-	 * language, so on a language host an unlinked (default-language) object's
-	 * loc inherits that host. Every language host serves its own
-	 * /wp-sitemap.xml, so without this the same content is advertised
-	 * self-canonically on every host. UrlConverter::convert() to the default
-	 * language maps the host back to the base domain; in path-based modes the
-	 * default language is unprefixed, making this a byte-identical no-op.
+	 * In host modes the loc inherits the request's language host; in path modes this is a no-op.
 	 *
 	 * @param array<string, mixed> $entry Sitemap entry.
 	 * @return array<string, mixed>
@@ -509,10 +461,7 @@ final class SitemapRequest {
 	}
 
 	/**
-	 * Convert a WordPress locale to a canonical BCP 47 hreflang tag.
-	 *
-	 * Lowercase language + UPPERCASE region (`en_US` → `en-US`,
-	 * `pt_BR` → `pt-BR`). See {@see \PerfLocale\Helper::format_locale_as_bcp47()}.
+	 * Convert a WordPress locale to a BCP 47 hreflang tag (`en_US` -> `en-US`).
 	 *
 	 * @param string $locale WordPress locale.
 	 * @return string
@@ -537,9 +486,7 @@ final class SitemapRequest {
 			return $entry;
 		}
 
-		// Batch-prime term caches once per taxonomy (mirrors the post path):
-		// otherwise each sibling's get_term_link() below issues its own
-		// get_term() query, an N+1 that scales with page size × languages.
+		// Once per taxonomy, or each sibling's get_term_link() runs its own query.
 		if ( empty( self::$primed_taxonomies[ $taxonomy ] ) ) {
 			self::$primed_taxonomies[ $taxonomy ] = true;
 			$this->prime_sitemap_term_caches( $taxonomy );
@@ -558,8 +505,7 @@ final class SitemapRequest {
 		$links = self::$repo_cache->get_translations( $term_id, ObjectType::Term );
 
 		if ( empty( $links ) ) {
-			// Untranslated term - same cross-host duplicate-content guard as
-			// the post path.
+			// Unlinked: the same loc pin as the post path.
 			return $this->pin_entry_loc_to_default( $entry );
 		}
 
@@ -597,12 +543,7 @@ final class SitemapRequest {
 				];
 			}
 
-			// Store under the standard W3C key 'xhtml:link'. WordPress core's
-			// default renderer drops unknown fields silently - we swap in
-			// PerfLocaleSitemapRenderer via wp_sitemaps_init below so this
-			// array is serialized as real <xhtml:link rel="alternate" …> child
-			// elements of <url>, which is the documented hreflang-in-sitemap
-			// pattern (sitemaps.org + Google Search Central).
+			// Core's renderer drops unknown keys: SitemapRenderer writes this as <xhtml:link>.
 			$entry['xhtml:link'] = $alternates;
 		}
 
@@ -610,11 +551,7 @@ final class SitemapRequest {
 	}
 
 	/**
-	 * Batch-prime WordPress post caches for all translation siblings.
-	 *
-	 * Loads all translation link object IDs for the current post type
-	 * in a single query, then primes the WP post cache so subsequent
-	 * get_post_status() and get_permalink() calls are free.
+	 * Batch-prime the post caches of a post type's translated posts in one query.
 	 *
 	 * @param string $post_type Post type.
 	 * @return void
@@ -625,23 +562,12 @@ final class SitemapRequest {
 		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
 		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
 
-		// Memory bound: a sitemap PAGE renders at most wp_sitemaps_get_max_urls()
-		// (2000) URLs, so priming every translated post of the type is wasteful
-		// and, on a very large site (tens of thousands of translated posts),
-		// loads them all into memory on a single sitemap request. Cap the prime
-		// at a generous multiple of one page; SELECT one row past the cap so we
-		// can detect the over-limit case cheaply. When the type has MORE than
-		// the cap, only the translation siblings of the posts THIS page lists
-		// are primed (prime_page_siblings()). Filterable.
+		// Memory bound: one row past the cap marks the type over it, and each page then primes
+		// only its own siblings (prime_page_siblings()).
 		$max_urls = function_exists( 'wp_sitemaps_get_max_urls' ) ? (int) wp_sitemaps_get_max_urls( 'post' ) : 2000;
 
-		// Bound the prime by what ONE PAGE can actually consume, not by a flat
-		// multiple of it. A page renders at most $max_urls entries, and each
-		// entry needs its siblings - so $max_urls * languages is the most this
-		// request can use. A flat multiple would load far more posts than the
-		// page renders (about 4 KB each, so tens of MB on a large catalog) on
-		// every sitemap page request. Sites whose catalog fits inside one
-		// page's need are unaffected and still get the full bulk prime.
+		// Cap = max URLs x languages, what one page can use, never a flat multiple. See
+		// docs-ai/11-code-rationale.md, "SitemapRequest: prime cap".
 		$lang_count = max( 2, count( self::$languages_cache ) );
 		$prime_cap  = max( 2000, (int) apply_filters( 'perflocale/sitemap/max_prime', $max_urls * $lang_count ) );
 
@@ -674,11 +600,8 @@ final class SitemapRequest {
 		if ( ! empty( $all_ids ) ) {
 			$ids = array_map( 'intval', $all_ids );
 
-			// Prime WP post cache in one batch - makes get_post_status()
-			// and get_permalink() use the cache instead of querying.
-			// `_prime_post_caches` is an internal WP function that could
-			// in theory be renamed; fall back to a plain get_posts() pull
-			// which triggers the same cache priming via WP_Query.
+			// One batch for get_post_status()/get_permalink(); get_posts() primes the same
+			// caches should the internal _prime_post_caches() go away.
 			if ( function_exists( '_prime_post_caches' ) ) {
 				_prime_post_caches( $ids, true, false );
 			} else {
@@ -698,16 +621,10 @@ final class SitemapRequest {
 	}
 
 	/**
-	 * Prime the post caches of the translation siblings of the posts this
-	 * sitemap page lists, for a post type over the bulk-prime cap.
+	 * Prime the siblings of the posts this sitemap page lists, for a post type over the cap.
 	 *
-	 * The page's own posts come from core's page query (capture_page_posts()).
-	 * Their links are primed in one batch, then every sibling that is not on
-	 * the page is primed in chunks of SIBLING_PRIME_CHUNK, terms included as
-	 * the bulk prime does, so the per-entry get_post_status()/get_permalink()
-	 * calls read the cache instead of one query per sibling. Nothing is primed
-	 * when the page query was not seen (a provider that replaced core's
-	 * query): the per-entry lookups stay correct without it.
+	 * Links in one batch, siblings off the page in SIBLING_PRIME_CHUNK chunks. Without a
+	 * captured page query nothing is primed: the per-entry lookups stay correct.
 	 *
 	 * @param string $post_type Post type.
 	 * @return void
@@ -745,10 +662,7 @@ final class SitemapRequest {
 	}
 
 	/**
-	 * Batch-prime WordPress term caches for all translation siblings of a
-	 * taxonomy. Same bounded design as {@see prime_sitemap_caches()} for posts:
-	 * one query capped at a generous multiple of a sitemap page; over the cap,
-	 * each page primes its own siblings (prime_page_term_siblings()).
+	 * Batch-prime the term caches of a taxonomy's translated terms, bounded as prime_sitemap_caches().
 	 *
 	 * @param string $taxonomy Taxonomy name.
 	 * @return void
@@ -763,8 +677,7 @@ final class SitemapRequest {
 		$links_table  = \PerfLocale\Database\Schema::table( 'translation_links' );
 		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
 
-		// Page-proportional bound - see prime_sitemap_caches() for why a flat
-		// multiple of the page size over-fetches on large catalogues.
+		// Page-proportional cap, as in prime_sitemap_caches().
 		$max_urls   = function_exists( 'wp_sitemaps_get_max_urls' ) ? (int) wp_sitemaps_get_max_urls( 'term' ) : 2000;
 		$lang_count = max( 2, count( self::$languages_cache ) );
 		$prime_cap  = max( 2000, (int) apply_filters( 'perflocale/sitemap/max_prime', $max_urls * $lang_count ) );
@@ -798,16 +711,10 @@ final class SitemapRequest {
 	}
 
 	/**
-	 * Prime the term caches of the translation siblings of the terms this
-	 * sitemap page lists, for a taxonomy over the bulk-prime cap.
+	 * Prime the siblings of the terms this sitemap page lists, for a taxonomy over the cap.
 	 *
-	 * The page's terms come from core's page query (capture_page_term_query()).
-	 * Their links are primed in chunks of TERM_LINK_PRIME_CHUNK, then every
-	 * sibling that is not on the page is primed in chunks of
-	 * SIBLING_PRIME_CHUNK, without term meta (get_term_link() does not read
-	 * it), so the per-entry get_term_link() calls read the cache instead of
-	 * one query per sibling. Nothing is primed when the page query was not
-	 * seen: the per-entry lookups stay correct without it.
+	 * Siblings off the page are primed without term meta (get_term_link() does not read it).
+	 * Without a captured page query nothing is primed: the per-entry lookups stay correct.
 	 *
 	 * @param mixed $terms The page query's terms.
 	 * @return void

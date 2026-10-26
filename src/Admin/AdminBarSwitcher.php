@@ -21,14 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds a language switcher to the WordPress admin toolbar.
- *
- * Context-aware behavior:
- * - Frontend: shows current page language, dropdown links to translated pages
- * - Admin list pages (posts/pages/terms): shows active filter language or "All Languages",
- * dropdown items filter the list by language
- * - Admin post/term editor: shows the post's language, dropdown links to edit translations
- * - Admin other pages: shows site default language, quick links only
+ * Adds a language switcher to the admin toolbar: view links on the front end, filters on lists, edit links in editors.
  */
 final class AdminBarSwitcher {
 
@@ -146,13 +139,7 @@ final class AdminBarSwitcher {
 	}
 
 	/**
-	 * Build the admin area menu.
-	 *
-	 * Adapts based on current screen:
-	 * - List pages: shows filter state, dropdown filters by language
-	 * - Post editor: shows post language, dropdown links to translations
-	 * - Term editor: shows term language, dropdown links to translations
-	 * - Other: shows default language, quick links only
+	 * Build the admin area menu for list screens and post or term editors.
 	 *
 	 * @param \WP_Admin_Bar $wp_admin_bar Admin bar.
 	 * @param array<object> $languages Active languages.
@@ -191,10 +178,7 @@ final class AdminBarSwitcher {
 			return;
 		}
 
-		// PerfLocale admin list pages - Strings, Translations, Assignments.
-		// Same filter-by-language UX as native post/term list screens, with
-		// the canonical ?perflocale_lang=<slug> query param so bookmarks and
-		// switcher URLs work identically across every list in the plugin.
+		// PerfLocale list pages filter by the same perflocale_lang query arg as post and term lists.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$gp = isset( $_GET['page'] ) ? sanitize_key( $_GET['page'] ) : '';
 
@@ -203,15 +187,11 @@ final class AdminBarSwitcher {
 			return;
 		}
 
-		// Other admin pages - no translation context, don't show the switcher.
+		// Other admin pages have no translation context: no switcher.
 	}
 
 	/**
-	 * Build the language filter menu for list screens (posts, pages, terms).
-	 *
-	 * The parent node shows the currently active filter (or "All Languages").
-	 * Each dropdown item is a link that filters the list by that language.
-	 * An "All Languages" option clears the filter.
+	 * Build the language filter menu for list screens; "All Languages" clears the filter.
 	 *
 	 * @param \WP_Admin_Bar $wp_admin_bar Admin bar.
 	 * @param array<object> $languages Active languages.
@@ -246,9 +226,7 @@ final class AdminBarSwitcher {
 			);
 		}
 
-		// Build base URL for filter links (current list page without the
-		// lang filter or pagination). Pagination is dropped so switching
-		// language always lands the user on page 1 of the new result set.
+		// Pagination is dropped so a language switch lands on page 1.
 		$base_url = remove_query_arg( [ 'perflocale_lang', 'paged' ] );
 
 		// "All Languages" option (clears the filter).

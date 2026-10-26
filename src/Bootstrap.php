@@ -14,22 +14,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Handles plugin initialization and conditional service registration.
- *
- * This class ensures that only the services needed for the current request
- * context (admin, frontend, REST, CLI) are registered and loaded.
+ * Plugin initialization: registers only the services the request context needs.
  */
 final class Bootstrap {
 
 	/**
-	 * Known conflicting multilingual plugins.
-	 *
-	 * Structure: name => [ 'constant' => ..., 'files' => [ ... ] ]
-	 * - `constant` is the plugin's version define. Present once the plugin's
-	 * main file has loaded.
-	 * - `files` are active_plugins entries to match against. Used as a
-	 * fallback when the constant isn't defined yet (PerfLocale's main file
-	 * loaded before the competitor's in active_plugins order).
+	 * Known conflicting multilingual plugins: version constant, plus active_plugins files for
+	 * when PerfLocale loads before the competitor defines it.
 	 *
 	 * @var array<string, array{constant: string, files: string[]}>
 	 */
@@ -49,13 +40,8 @@ final class Bootstrap {
 	];
 
 	/**
-	 * Cron hook names duplicated from their owning classes so wiring these
-	 * add_action()/schedule calls doesn't autoload WebhookController (45KB,
-	 * plus its RestController parent) and Lock (17KB) on every request just
-	 * to read a class constant - the callbacks construct the classes lazily
-	 * when the hooks actually fire. HookNameDriftTest asserts these stay
-	 * byte-equal to Api\WebhookController::DELIVERY_HOOK / DRAIN_HOOK /
-	 * RETRY_HOOK and Concurrency\Lock::CLEANUP_HOOK.
+	 * Cron hook names copied so wiring them does not autoload WebhookController and Lock on
+	 * every request. HookNameDriftTest keeps them equal to the owning classes' constants.
 	 */
 	private const WEBHOOK_DELIVERY_HOOK = 'perflocale_deliver_webhook';
 	private const WEBHOOK_DRAIN_HOOK    = 'perflocale_drain_webhooks';
@@ -63,34 +49,26 @@ final class Bootstrap {
 	private const LOCK_CLEANUP_HOOK     = 'perflocale_lock_cleanup';
 
 	/**
-	 * Post meta on a WooCommerce page translation: md5 of the source title
-	 * machine translation last answered for, so an unchanged title is not
-	 * sent to the provider again on the next "Create page translations" run.
+	 * Post meta on a WooCommerce page translation: md5 of the source title MT last answered
+	 * for, so an unchanged title is not sent again.
 	 */
 	private const WC_PAGE_MT_ATTEMPT_META = '_perflocale_wc_page_mt_attempt';
 
 	/**
-	 * Key inside the `perflocale_settings` option, present while a boot with
-	 * a conflicting multilingual plugin active has not been followed by a
-	 * normal boot. It is not a setting: Settings::DEFAULTS does not list it.
+	 * Key in `perflocale_settings` set while a dormant boot (conflicting plugin active) has not
+	 * been followed by a normal boot. Not a setting: Settings::DEFAULTS does not list it.
 	 */
 	private const DORMANT_KEY = 'was_dormant';
 
 	/**
-	 * State options of the one-time jobs that admin_init dispatches,
-	 * duplicated from Background\Jobs\TemplateRefsBackfillJob::OPTION and
-	 * Background\Jobs\StringGroupRepairJob::OPTION so that an admin page
-	 * whose job is done loads neither class (reading a class constant
-	 * autoloads its class). BootstrapOneTimeJobGateTest asserts they equal
-	 * the jobs' constants.
+	 * One-time job state options, copied so a done job's class is not autoloaded on admin
+	 * pages. BootstrapOneTimeJobGateTest keeps them equal to the jobs' constants.
 	 */
 	private const TEMPLATE_REFS_BACKFILL_OPTION = 'perflocale_template_refs_backfill';
 	private const SQLITE_GROUP_REPAIR_OPTION    = 'perflocale_sqlite_string_groups_repair_job';
 
 	/**
 	 * Initialize the plugin.
-	 *
-	 * Called once from perflocale.php after the autoloader is loaded.
 	 *
 	 * @return void
 	 */
@@ -115,18 +93,8 @@ final class Bootstrap {
 				);
 			};
 
-			// BOTH hooks. Core dispatches these as if/elseif - `admin_notices`
-			// on ordinary screens, `network_admin_notices` in Network Admin -
-			// so registering both can never double-print, and registering only
-			// the first left the one operator most likely to hit this with no
-			// signal at all: a network-activated Polylang or WPML is detected
-			// here (detect_conflicting_plugin() merges `active_sitewide_plugins`),
-			// but the person who network-activated it works in Network Admin,
-			// where `admin_notices` never fires. They saw nothing, and
-			// `wp perflocale migrate` does not exist either - CLI registration
-			// sits far below this `return` - so the CLI told them nothing
-			// either. The second sentence exists because "deactivate your
-			// multilingual plugin" is alarming advice without it.
+			// Both hooks: core fires admin_notices or network_admin_notices, never both, and a
+			// network-activated conflicting plugin is managed from Network Admin.
 			add_action( 'admin_notices', $notice );
 			add_action( 'network_admin_notices', $notice );
 
@@ -135,8 +103,7 @@ final class Bootstrap {
 			return;
 		}
 
-		// The catalogs in languages/: WordPress loads them just in time when
-		// no language pack of the domain is installed for the locale.
+			// Catalogs in languages/: loaded just in time when no language pack is installed.
 		BundledTranslations::register_default();
 
 		$plugin = Plugin::get_instance();
@@ -160,12 +127,8 @@ final class Bootstrap {
 			true
 		);
 
-		// Shared repository singletons - one instance per request, with a
-		// single seam to mock for tests.
-		//
-		// Must be registered BEFORE the LanguageRouter (which calls
-		// $plugin->get( 'lang_repo' ) from its own constructor lifecycle
-		// during detect_locale_early()).
+		// Shared repository singletons; registered before the router, which needs lang_repo
+		// during detect_locale_early().
 		$plugin->register(
 			'lang_repo',
 			fn( Plugin $p ) => new Database\Repository\LanguageRepository( $p->get( 'cache' ) )
@@ -185,27 +148,13 @@ final class Bootstrap {
 			true
 		);
 
-		// Early language detection - resolve the current language from the
-		// URL immediately (during plugin file load) so the locale filter
-		// returns the correct value BEFORE plugins load their text domains
-		// at init. Without this, WooCommerce and other plugins would always
-		// load English strings because text domain loading runs before
-		// parse_request where the full detection happens.
+		// Detect the language from the URL now, during plugin load, so the locale filter is right
+		// before plugins load their text domains at init (parse_request is too late).
 		$router = $plugin->get( 'router' );
 		add_filter( 'locale', [ $router, 'filter_locale' ] );
 
-		// Resolve the language query-variable name HERE, before
-		// detect_locale_early() can resolve it as a side effect.
-		//
-		// detect_locale_early() runs on the front end only, and in query mode
-		// it calls UrlConverter::query_var(), which memoises. Admin requests
-		// take the early-return above it and so used to resolve the name later
-		// - after plugins_loaded, with more filters registered. A site whose
-		// filter was registered from a normal plugin therefore routed on `lang`
-		// on the front end and on the filtered name in wp-admin. Priming it
-		// unconditionally here means both contexts freeze the same value at the
-		// same point in the load, which is what UrlConverter::query_var()'s
-		// contract promises.
+		// Resolve the language query-var name here, at the same load point for admin and front
+		// end: it memoises, and a later first call would see more filters registered.
 		Router\UrlConverter::query_var();
 
 		$router->detect_locale_early();
@@ -262,12 +211,9 @@ final class Bootstrap {
 		// Decided once for the service registrations below that depend on it.
 		$write_context = Helper::is_write_context();
 
-		// Content sync: synchronize configured fields across translations on save.
-		// Registered whatever this blog's Sync Fields list holds: a request can
-		// switch to another blog and write there, and each blog's own list
-		// decides what syncs (an empty list syncs nothing).
-		// Booted up front in write contexts; in any other request it boots
-		// on the first write ({@see self::boot_write_services_on_first_write()}).
+		// Content sync: registered whatever this blog's Sync Fields list holds, since a request
+		// can switch blogs and write there. Booted up front in write contexts, else on the first
+		// write ({@see self::boot_write_services_on_first_write()}).
 		$plugin->register(
 			'content_sync',
 			fn( Plugin $p ) => new Translation\ContentSync(
@@ -277,17 +223,13 @@ final class Bootstrap {
 			$write_context
 		);
 
-		// Allow duplicate post slugs for posts in different languages.
-		// Must be global (admin + frontend) since WP checks uniqueness on save.
+		// Allow duplicate post slugs across languages (global: WP checks uniqueness on save).
 		add_filter( 'wp_unique_post_slug', [ self::class, 'allow_translation_duplicate_slugs' ], 10, 6 );
 
 		// Auto-assign default language to new posts on save (all contexts).
 		add_action( 'save_post', [ self::class, 'auto_assign_default_language' ], 5, 2 );
 
-		// Clean up translation_links when a post is permanently deleted.
-		// Without this the group row keeps pointing at a post ID that no
-		// longer exists, so `get_translations()` returns orphan IDs and the
-		// switcher / hreflang / fallback chain see ghost siblings.
+		// Remove a permanently deleted post's translation link, or its group keeps an orphan ID.
 		add_action( 'before_delete_post', [ self::class, 'cleanup_translation_link_on_delete' ] );
 
 		// Auto-create translation stubs when a post is published.
@@ -295,67 +237,31 @@ final class Bootstrap {
 			add_action( 'transition_post_status', [ self::class, 'auto_create_translation_stubs' ], 20, 3 );
 		}
 
-		// Auto-translate on publish - deferred to WP-Cron so publishing is instant.
+		// Auto-translate on publish: a background job per post, so publishing is instant.
 		if ( $plugin->get( 'settings' )->mt_enabled() && (bool) $plugin->get( 'settings' )->get( 'mt_auto_translate_on_publish' ) ) {
 			add_action( 'transition_post_status', [ self::class, 'auto_translate_on_publish' ], 25, 3 );
 		}
 
-		// Cron handler for deferred auto-translation (always registered so
-		// scheduled events fire even if the setting is later toggled off).
-		add_action( self::AUTO_TRANSLATE_CRON, [ self::class, 'process_auto_translate' ] );
+		// Always registered, so events scheduled before the upgrade still run.
+		add_action( self::AUTO_TRANSLATE_CRON, [ self::class, 'process_auto_translate' ], 10, 2 );
 
 		// Add language labels to page dropdowns (Reading Settings, etc.).
 		add_filter( 'wp_dropdown_pages', [ self::class, 'add_language_labels_to_dropdown' ] );
 
-		// Clear the `_perflocale_meta_copy_errors` warning meta on real
-		// post saves. Registered at always-loaded scope (not inside
-		// MetaBox) because MetaBox is admin-only behind
-		// `is_admin() && ! wp_doing_ajax()` - leaving the cleanup there
-		// would skip the block-editor REST save path AND WP-CLI saves,
-		// and the warning notice would persist forever in those contexts.
-		//
-		// Rationale: a state change such as `delete_post_meta` does not
-		// belong in `admin_notices`, a GET-driven render hook with no nonce.
-		// Moving the state change to `save_post` means it inherits the
-		// nonce + capability gates WP-core has already verified upstream
-		// in each save path:
-		//
-		// - Classic form save: `check_admin_referer('update-post_'.$id)`
-		// in wp-admin/post.php BEFORE wp_update_post fires save_post.
-		// - Block-editor / REST save: WP_REST_Posts_Controller's
-		// permission_callback enforces current_user_can('edit_post',$id)
-		// and the request carries X-WP-Nonce.
-		// - WP-CLI / cron / programmatic: no browser request, so no CSRF surface.
-		//
-		// Cost on the every-post-save hot path: one get_post_meta cache
-		// hit (~sub-µs on a warmed cache) + early return for the 99%+ of
-		// saves on posts that never had a copy-errors warning.
+		// Clear the `_perflocale_meta_copy_errors` warning on real saves. Always loaded, not in
+		// admin-only MetaBox, so REST and CLI saves clear it too; on save_post, not in a GET
+		// notice hook, so the state change sits behind core's save nonce and capability checks.
 		add_action(
 			'save_post',
 			static function ( int $post_id, ?\WP_Post $post = null ): void {
-				// Core hands this hook whatever its post-write re-read
-				// returned, which is null when the row was deleted in
-				// between; a non-nullable hint made that an uncaught
-				// TypeError. See auto_assign_default_language().
+				// Core passes null when the row was deleted after the write; see
+				// auto_assign_default_language().
 				if ( ! $post instanceof \WP_Post ) {
 					return;
 				}
 
-				// Bail on autosave + revision contexts so a heartbeat
-				// autosave doesn't silently dismiss the warning before
-				// the user has explicitly saved.
-				//
-				// Modern WP autosaves create a revision post and fire
-				// save_post for the revision (not the parent) -
-				// wp_is_post_revision() catches them. DOING_AUTOSAVE
-				// covers legacy / third-party paths where the constant
-				// is set but save_post fires for the parent post.
-				//
-				// No separate wp_is_post_autosave() check: per WP-core
-				// source, autosaves are a proper subset of revisions
-				// (wp_is_post_autosave internally requires
-				// wp_is_post_revision to be true and ADDS a post_name
-				// check), so the revision branch catches them already.
+				// Skip autosaves and revisions so a heartbeat autosave does not dismiss the
+				// warning. Autosaves are revisions, so wp_is_post_revision() covers them.
 				if (
 					( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE )
 					|| wp_is_post_revision( $post_id )
@@ -363,26 +269,15 @@ final class Bootstrap {
 					return;
 				}
 
-				// Read-first short-circuit so we skip the meta updates
-				// for the dominant case (posts that never had a copy-
-				// errors warning).
+				// Most posts never had a copy-errors warning.
 				$errors = get_post_meta( $post_id, '_perflocale_meta_copy_errors', true );
 
 				if ( empty( $errors ) || ! is_array( $errors ) ) {
 					return;
 				}
 
-				// Self-clearing dismissal: each failed step is only
-				// removed from the errors array if the underlying
-				// content "looks" populated. The warning persists for
-				// steps that still appear to lack content, so a user
-				// who clicks Update without actually filling in the
-				// failed fields keeps seeing the warning until they do.
-				//
-				// Without this gate (the prior implementation), any
-				// save unconditionally cleared the warning - silently
-				// dismissing a real problem and shipping an incomplete
-				// translation.
+				// Self-clearing: a failed step's entry is dropped only when its content looks
+				// populated, so saving without filling the fields keeps the warning.
 				$remaining = [];
 				foreach ( $errors as $err ) {
 					$step = is_array( $err ) && isset( $err['step'] ) ? (string) $err['step'] : '';
@@ -393,15 +288,8 @@ final class Bootstrap {
 							}
 							break;
 						case 'taxonomy_terms':
-							// User has populated terms if any taxonomy
-							// has at least one term BEYOND the WP-core
-							// default (e.g. WordPress assigns
-							// "Uncategorized" to every new post - that
-							// alone shouldn't dismiss the warning, since
-							// it means the copy didn't actually
-							// transfer the source post's categories).
-							// Same shape for default link_category /
-							// default_email_category on other types.
+							// Terms beyond the taxonomy default count: core gives every new post
+							// "Uncategorized", which does not mean the copy worked.
 							$has_term = false;
 							foreach ( get_object_taxonomies( $post->post_type ) as $tax ) {
 								$terms = wp_get_object_terms( $post_id, $tax, [ 'fields' => 'ids' ] );
@@ -423,15 +311,8 @@ final class Bootstrap {
 							}
 							break;
 						case 'post_meta':
-							// post_meta is vague - the user could have
-							// addressed any of N meta keys. We can't
-							// know which one was supposed to be copied
-							// without storing it at copy time. As a
-							// conservative proxy: if the post has ANY
-							// non-internal meta keys set, treat the
-							// failure as addressed. Internal keys (_
-							// prefix excluding _thumbnail_id which is
-							// covered by featured_image) are excluded.
+							// Proxy: any non-internal meta key counts as addressed (the failed key is
+							// not stored; _thumbnail_id belongs to featured_image).
 							$meta_keys     = get_post_meta( $post_id );
 							$has_user_meta = false;
 							if ( is_array( $meta_keys ) ) {
@@ -454,18 +335,14 @@ final class Bootstrap {
 							}
 							break;
 						default:
-							// Unknown step from a future code path -
-							// preserve it so we don't silently swallow
-							// signals we don't yet understand.
+							// Unknown step: keep it rather than drop a signal.
 							break;
 					}
 					$remaining[] = $err;
 				}
 
 				if ( count( $remaining ) === count( $errors ) ) {
-					// Nothing changed - the user saved without addressing
-					// any of the failed steps. Leave the meta alone so
-					// the warning persists.
+					// Nothing addressed: keep the warning.
 					return;
 				}
 
@@ -490,280 +367,34 @@ final class Bootstrap {
 			true
 		);
 
-		// Language-conditional content - block + shortcode + PHP helper.
-		// Registered eagerly so the shortcode tag resolves in feeds, REST
-		// preview, and admin-ajax contexts too. Cost when unused is a
-		// single in-memory class instance + two `init` hook callbacks.
+		// Language-conditional content (block, shortcode, PHP helper): eager so the shortcode
+		// resolves in feeds, REST previews and admin-ajax too.
 		$plugin->register(
 			'conditional_content',
 			fn() => new Frontend\ConditionalContent(),
 			true
 		);
 
-		// Block-toolbar "Do not translate" toggle: hooks the
-		// perflocale/mt/pre_translate + /post_translate pipeline so marked
-		// blocks survive MT verbatim. Those filters only fire during admin /
-		// REST / CLI MT ops, never on frontend GETs - hence the context gate.
+		// Block-toolbar "Do not translate": its MT filters only fire in write contexts.
 		$plugin->register(
 			'block_skip_filter',
 			fn() => new Translation\BlockSkipFilter(),
 			$write_context
 		);
 
-		// Block-toolbar editor assets - adds a "Translate" dropdown
-		// to every supported text block in the Gutenberg editor for
-		// users with the perflocale_translate capability. Loads only
-		// when (a) capability check passes and (b) the feature filter
-		// returns true; everyone else never downloads the script.
-		//
-		// `enqueue_block_editor_assets` only fires in the block editor
-		// (post editor + site editor + full-site editing) which is
-		// always an admin context. Gating the `add_action` saves the
-		// closure allocation + capture cost on every non-admin request.
+		// Every translation save keeps "Do not translate" blocks that match its source byte for
+		// byte. Class-string callbacks: the class loads on the first post save, never on a view.
+		add_filter( 'wp_insert_post_data', [ Translation\BlockSkipFilter::class, 'keep_on_save' ], PHP_INT_MAX, 3 );
+		add_filter( 'wp_insert_attachment_data', [ Translation\BlockSkipFilter::class, 'keep_on_save' ], PHP_INT_MAX, 3 );
+		add_filter( '_wp_post_revision_fields', [ Translation\BlockSkipFilter::class, 'note_restore' ], PHP_INT_MAX, 2 );
+		add_action( 'wp_restore_post_revision', [ MachineTranslation\ProtectedBlockSave::class, 'restore_done' ] );
+
+		// Block-toolbar "Translate" dropdown (the block editor is always an admin request).
 		if ( is_admin() ) {
-			add_action(
-				'enqueue_block_editor_assets',
-				static function (): void {
-					if ( ! current_user_can( 'perflocale_translate' ) ) {
-						return;
-					}
-
-					// Gate by screen so we don't load 53 KB JS + 2 KB CSS + the
-					// language-list query for editor contexts that can't possibly
-					// use them: the Site Editor (screen->base !== 'post'), the
-					// Widgets / Pattern editors, and post.php for post types the
-					// admin didn't mark translatable. Mirrors EditorSidebar's gate.
-					$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
-
-					if ( ! $screen instanceof \WP_Screen || 'post' !== $screen->base ) {
-						return;
-					}
-
-					$plugin       = Plugin::get_instance();
-					$translatable = $plugin->has( 'settings' )
-					? (array) $plugin->get( 'settings' )->get_translatable_post_types()
-					: [];
-
-					if ( ! in_array( $screen->post_type, $translatable, true ) ) {
-						return;
-					}
-
-					/**
-					 * Filter whether the PerfLocale block-toolbar extension loads.
-					 *
-					 * @hook perflocale/block_toolbar/enabled
-					 * @param bool $enabled Default true.
-					 */
-					if ( ! apply_filters( 'perflocale/block_toolbar/enabled', true ) ) {
-						return;
-					}
-
-					wp_enqueue_script(
-						'perflocale-block-toolbar',
-						PERFLOCALE_URL . 'assets/js/block-toolbar.js',
-						[ 'wp-blocks', 'wp-block-editor', 'wp-components', 'wp-compose', 'wp-data', 'wp-element', 'wp-hooks', 'wp-i18n', 'wp-api-fetch' ],
-						PERFLOCALE_VERSION,
-						true
-					);
-
-					// Load the JS translations for this handle. Without it the wp.i18n.__()
-					// strings in the script file stay untranslated no matter what a
-					// translator supplies - WordPress only wires a script's JSON language
-					// pack when the handle is registered here. No-ops until a language pack
-					// exists, so it is safe on a fresh install.
-					wp_set_script_translations( 'perflocale-block-toolbar', 'perflocale' );
-
-					wp_enqueue_style(
-						'perflocale-block-toolbar-editor',
-						PERFLOCALE_URL . 'assets/css/block-toolbar-editor.css',
-						[],
-						PERFLOCALE_VERSION
-					);
-
-					// Hoist the cache + repository instantiations out of the per-
-					// branch checks below. Previously this closure created TWO
-					// LanguageRepository instances (one for the languages map, one
-					// for sibling detection a few branches down), plus separate
-					// PostTranslationManager and TranslationGroupRepository
-					// instances - all sharing the same CacheManager. Now each
-					// service is created at most once per editor load.
-					$has_cache = $plugin->has( 'cache' );
-					$cache_svc = $has_cache ? $plugin->get( 'cache' ) : null;
-					$lang_repo = ( $cache_svc !== null ) ? new Database\Repository\LanguageRepository( $cache_svc ) : null;
-
-					$languages = [];
-					$current   = '';
-
-					if ( $lang_repo !== null ) {
-						$languages = array_map(
-							static fn( $lang ): array => [
-								'slug'   => (string) $lang->slug,
-								// Canonical BCP 47 form for visible labels in the JS UI.
-								// `slug` stays lowercase because it's used as an
-								// identifier (REST keys, URL segments, comparison
-								// against router state); `bcp47` is render-only.
-								'bcp47'  => Helper::format_locale_as_bcp47( (string) $lang->slug ),
-								'locale' => (string) $lang->locale,
-								'name'   => (string) ( $lang->name ?? $lang->native_name ?? $lang->slug ),
-							],
-							$lang_repo->get_active()
-						);
-					}
-
-					if ( $plugin->has( 'router' ) ) {
-						$cur = $plugin->get( 'router' )->get_current_language();
-						if ( is_object( $cur ) ) {
-							$current = (string) ( $cur->slug ?? '' );
-						}
-					}
-
-					// Source-language detection for block-level MT: use the *edited
-					// post's* language, not the admin router language. Editing the
-					// FR sibling of an EN post in a FR admin session must still
-					// translate FROM FR (what's in the editor) TO the picked target.
-					$post_source_lang = '';
-					$edited_post      = get_post();
-
-					if ( $edited_post instanceof \WP_Post && $cache_svc !== null ) {
-						$manager   = new Translation\PostTranslationManager(
-							$cache_svc,
-							$plugin->get( 'settings' )
-						);
-						$post_lang = $manager->detect_post_language( (int) $edited_post->ID );
-
-						if ( $post_lang && isset( $post_lang->slug ) ) {
-							$post_source_lang = (string) $post_lang->slug;
-						}
-					}
-
-					// "MT ready" = setting ON and the *selected* provider has its
-					// API key. Anything less and we can't actually translate, so
-					// the UI hides the submenu in favour of a setup-prompt link.
-					// Using the active-provider check (not "any provider") means a
-					// user with a wp-config DeepL key but the dropdown still on
-					// "-- Select --" sees the setup prompt instead of buttons that
-					// would fail at request time with an empty-provider error.
-					$mt_ready   = false;
-					$mt_service = null;
-
-					if ( $plugin->get( 'settings' )->mt_enabled() && $cache_svc !== null ) {
-						$mt_service = new MachineTranslation\TranslationService(
-							$plugin->get( 'settings' ),
-							$cache_svc
-						);
-						$mt_ready   = $mt_service->is_active_provider_ready();
-					}
-
-					// Deep-link to the MT settings subtab so the actionable
-					// "Set up machine translation" menu item lands the user in
-					// the right place instead of the generic settings page; a
-					// WordPress AI Client site without a connected AI provider
-					// goes to Settings → Connectors.
-					$mt_settings_url = admin_url( 'admin.php?page=perflocale-settings&tab=addons&subtab=machine-translation' );
-
-					if ( $mt_service !== null && ! $mt_ready ) {
-						$mt_settings_url = $mt_service->setup_url( $mt_settings_url );
-					}
-
-					// Sibling-aware toolbar. When the open post is a
-					// translation of a source-language sibling, the per-block menu
-					// flips from "Translate to <X>" (multi-target replace-in-place)
-					// to a single "Fill in from <source-lang> source" action.
-					//
-					// Resolve the source post + default language slug once, server-
-					// side, so the JS doesn't need to make extra REST calls just to
-					// detect sibling status. `is_sibling` is true iff the post's
-					// language ≠ default language AND a translation group with a
-					// source sibling exists.
-					$default_language           = $lang_repo !== null ? $lang_repo->get_default() : null;
-					$source_post_id_for_sibling = 0;
-					$is_sibling                 = false;
-
-					$default_lang_slug = ( $default_language && ! empty( $default_language->slug ) )
-					? (string) $default_language->slug
-					: '';
-
-					if (
-					$default_lang_slug !== ''
-					&& $post_source_lang !== ''
-					&& $post_source_lang !== $default_lang_slug
-					&& $edited_post instanceof \WP_Post
-					&& $cache_svc !== null
-					) {
-						try {
-							$group_repo   = new Database\Repository\TranslationGroupRepository( $cache_svc );
-							$translations = $group_repo->get_translations( (int) $edited_post->ID, \PerfLocale\Enum\ObjectType::Post );
-
-							foreach ( (array) $translations as $link ) {
-								if ( (int) ( $link->language_id ?? 0 ) !== (int) $default_language->id ) {
-									continue;
-								}
-
-								$candidate_id = (int) ( $link->object_id ?? 0 );
-
-								if ( $candidate_id > 0 && get_post( $candidate_id ) instanceof \WP_Post ) {
-									$source_post_id_for_sibling = $candidate_id;
-									$is_sibling                 = true;
-									break;
-								}
-							}
-						} catch ( \Throwable $e ) {
-							// Sibling detection is a non-critical UX hint; never
-							// fail the editor load over a translation-group lookup.
-							$is_sibling = false;
-						}
-					}
-
-					wp_localize_script(
-						'perflocale-block-toolbar',
-						'perflocaleBlockToolbar',
-						[
-							'languages'       => $languages,
-							'currentLang'     => $current,
-							'postSourceLang'  => $post_source_lang,
-							'mtReady'         => $mt_ready,
-							'mtSettingsUrl'   => $mt_settings_url,
-							// Active provider id (e.g. "deepl", "google"). Pre-resolved
-							// to the display name client-side; null when MT is off so
-							// the toolbar can fall back to a generic label without
-							// pretending a provider is configured.
-							'mtProvider'      => $mt_ready ? (string) $plugin->get( 'settings' )->get_mt_provider() : '',
-							// Sibling-detection payload.
-							'isSibling'       => $is_sibling,
-							'sourceLang'      => $default_lang_slug,
-							'sourcePostId'    => $source_post_id_for_sibling,
-							'targetPostId'    => ( $edited_post instanceof \WP_Post ) ? (int) $edited_post->ID : 0,
-							'supportedBlocks' => [
-								'core/paragraph',
-								'core/heading',
-								'core/list-item',
-								'core/quote',
-								'core/pullquote',
-								'core/button',
-								'core/preformatted',
-								'core/verse',
-								'core/code',
-								// Disclosure widget (WP 6.5+): translates the
-								// `summary` attribute. The collapsible body lives
-								// in inner blocks which are independently
-								// translatable per their own block type.
-								'core/details',
-							],
-							'i18n'            => [
-								'translating'  => __( 'Translating…', 'perflocale' ),
-								/* translators: %s: target language name */
-								'translatedTo' => __( 'Translated to %s', 'perflocale' ),
-								'wrapTitle'    => __( 'Show only for certain languages', 'perflocale' ),
-								'setUpMt'      => __( 'Set up machine translation…', 'perflocale' ),
-							],
-						]
-					);
-				}
-			);
+			add_action( 'enqueue_block_editor_assets', [ Admin\BlockToolbarAssets::class, 'enqueue' ] );
 		}
 
-		// CDN Cache-Tag emitter - only instantiate when enabled so sites
-		// without a CDN pay zero cost (no send_headers hook registered).
+		// CDN Cache-Tag emitter: only registered when enabled.
 		if ( $plugin->get( 'settings' )->cdn_cache_tags_enabled() ) {
 			$plugin->register(
 				'cache_tag_emitter',
@@ -772,9 +403,8 @@ final class Bootstrap {
 			);
 		}
 
-		// Content change detector - flags translations when source changes.
-		// Booted up front in write contexts only; see
-		// boot_write_services_on_first_write() for every other request.
+		// Content change detector: flags translations when the source changes. Booted up front in
+		// write contexts; see boot_write_services_on_first_write() otherwise.
 		$plugin->register(
 			'content_change_detector',
 			fn( Plugin $p ) => new Translation\ContentChangeDetector(
@@ -804,24 +434,16 @@ final class Bootstrap {
 			true
 		);
 
-		// Translator role and caps. The role/caps hooks only fire in
-		// admin/CLI context, so skip the eager boot on frontend GETs.
+		// Translator role and caps: their hooks fire in admin and CLI only.
 		$plugin->register(
 			'translator_role',
 			fn() => new Admin\TranslatorRole(),
 			$write_context
 		);
 
-		// User deletion, however, is NOT admin-only: membership and
-		// account-management plugins delete users straight from a front-end
-		// POST, where the service above is never constructed and the
-		// created_by anonymisation would silently never run - leaving the
-		// deleted user's ID on background-job rows. Wire the three deletion
-		// hooks directly instead: they cost three add_action() calls and
-		// instantiate nothing until a user is actually deleted.
-		// (wpmu_delete_user is separate because the network-admin path does
-		// not fire delete_user; it reaches the user's OTHER sites only through
-		// remove_user_from_blog, fired once per site.)
+		// User deletion is not admin-only (front-end account plugins delete users), so wire the
+		// job anonymisation directly. wpmu_delete_user does not fire delete_user; other sites are
+		// reached through remove_user_from_blog.
 		$anonymize_jobs = static function ( $user_id ): void {
 			Background\JobState::anonymize_for_user( (int) $user_id );
 		};
@@ -830,10 +452,7 @@ final class Bootstrap {
 		add_action( 'wpmu_delete_user', $anonymize_jobs );
 		add_action( 'remove_user_from_blog', [ self::class, 'anonymize_jobs_on_blog' ], 10, 2 );
 
-		// WordPress Privacy API integration: exporter + eraser + Policy Guide
-		// text. All three hooks fire inside the WP privacy admin flows only;
-		// the service has no frontend work, so we don't need to instantiate
-		// or wire it on visitor pageviews.
+		// Privacy API exporter, eraser and policy text: privacy admin flows only.
 		$plugin->register(
 			'privacy_integration',
 			fn( Plugin $p ) => new Admin\PrivacyIntegration( $p->get( 'settings' ) ),
@@ -847,10 +466,8 @@ final class Bootstrap {
 			true
 		);
 
-		// Theme builder integrations must register early (before Customizer reads items).
-		// The addon registry boots at init:0 (an eager service started by
-		// Plugin::boot), which is too late for builder APIs that read their
-		// component lists during after_setup_theme.
+		// Theme builder add-ons boot here: the add-on registry boots at init:0, too late for
+		// builder APIs that read their component lists during after_setup_theme.
 		$early_theme_addons = [
 			'blocksy' => 'addons/blocksy/PerfLocaleBlocksy.php',
 			'kadence' => 'addons/kadence/PerfLocaleKadence.php',
@@ -885,13 +502,9 @@ final class Bootstrap {
 
 			$addon_id = $theme_addon->get_id();
 
-			// This early path boots ahead of AddonRegistry and then marks the
-			// addon booted, so the registry's boot loop skips it - including
-			// its quarantine gate and the perflocale/addon/enabled filter.
-			// Apply both here, in the registry's order, so the auto-quarantine
-			// counter, the operator toggle and the filter reach theme addons
-			// exactly as they reach every other addon. Both options are
-			// autoloaded, so these reads add no queries.
+			// This path boots ahead of AddonRegistry and marks the add-on booted, so apply the
+			// registry's quarantine gate and perflocale/addon/enabled filter here, in its order.
+			// Both options are autoloaded.
 			$failures  = (array) get_option( 'perflocale_addon_failures', [] );
 			$threshold = (int) apply_filters( 'perflocale/addons/quarantine_threshold', 3 );
 
@@ -903,8 +516,7 @@ final class Bootstrap {
 
 			/** This filter is documented in src/Addon/AddonRegistry.php */
 			if ( ! (bool) apply_filters( 'perflocale/addon/enabled', $default_on, $addon_id ) ) {
-				// Hand the decision to the registry so it neither boots the
-				// addon later nor asks the filter a second time.
+				// Hand the decision to the registry so it neither boots the add-on nor asks again.
 				add_action(
 					'plugins_loaded',
 					static function () use ( $plugin, $theme_addon, $addon_id, $default_on ): void {
@@ -919,9 +531,8 @@ final class Bootstrap {
 				continue;
 			}
 
-			// is_compatible() and boot() are third-party code; a throw here
-			// would otherwise be an uncaught sitewide fatal that never feeds
-			// the quarantine counter. Mirror AddonRegistry::boot_addons().
+			// Third-party code: catch so a throw feeds the quarantine counter instead of a
+			// sitewide fatal. Mirrors AddonRegistry::boot_addons().
 			try {
 				if ( ! $theme_addon->is_compatible() ) {
 					continue;
@@ -940,16 +551,8 @@ final class Bootstrap {
 				continue;
 			}
 
-			// Booted cleanly, so retire any historical failure - the counter
-			// AND the operator-visible record, which are the same fact.
-			// AddonRegistry::boot_addons() does this for plugin addons; this
-			// loop had no success branch at all, so a theme addon that failed
-			// once (very often just a request landing mid-file-write during an
-			// update) carried a red admin notice forever with no way out but a
-			// WP-CLI command. Scoped to the `boot` stage: a failed migration
-			// or uninstall is a separate fact a successful boot does not
-			// invalidate. Only runs when a failure was actually recorded, so
-			// the ordinary path pays nothing.
+			// Booted cleanly: clear the boot failure counter and its admin record (boot stage only,
+			// like AddonRegistry::boot_addons()).
 			if ( isset( $failures[ $addon_id ] ) ) {
 				unset( $failures[ $addon_id ] );
 				update_option( 'perflocale_addon_failures', $failures, true );
@@ -982,11 +585,7 @@ final class Bootstrap {
 		);
 
 		// ---- Query filters (always registered, both admin AND frontend) ----
-		//
-		// PostQueryFilter + TermQueryFilter hook WP_Query / get_terms to
-		// restrict results to the current language. They MUST run in admin
-		// too - otherwise the Categories metabox, Posts nav-menu picker,
-		// etc. all show terms/posts from every language mixed together.
+		// Admin too: otherwise metaboxes and menu pickers mix every language.
 		$plugin->register(
 			'post_query_filter',
 			fn( Plugin $p ) => new Translation\PostQueryFilter(
@@ -1005,12 +604,8 @@ final class Bootstrap {
 			true
 		);
 
-		// Swap post→term assignments that end up with a wrong-language
-		// term_id (classic-editor tag box submits tag NAMES, not IDs, so
-		// term_exists() can resolve to a same-named sibling in another
-		// language and silently attach the wrong term).
-		// Booted up front in write contexts only, so a visitor pageview
-		// never instantiates it.
+		// Swap a wrong-language term on post assignment: the classic tag box submits names, which
+		// term_exists() can resolve to a same-named term in another language. Write contexts only.
 		$plugin->register(
 			'term_assignment_filter',
 			fn( Plugin $p ) => new Translation\TermAssignmentFilter(
@@ -1020,25 +615,14 @@ final class Bootstrap {
 			$write_context
 		);
 
-		// Writes also happen outside those contexts: a front-end POST form
-		// (acf_form(), post-submission plugins), XML-RPC, and WP-Cron run
-		// inside a page view (ALTERNATE_WP_CRON), which is only known after
-		// this point. There the three services above boot on the first write.
+		// Writes also happen outside write contexts (front-end POST forms, XML-RPC, WP-Cron inside
+		// a page view), known only later: there the three services above boot on the first write.
 		if ( ! $write_context ) {
 			self::boot_write_services_on_first_write( $plugin );
 		}
 
-		// The shared "Translations" panel renderer, plus the registry an addon
-		// uses to mount it on a host plugin's own editor screen.
-		//
-		// Registered in the ALWAYS-ON scope on purpose, and lazily. Addons boot
-		// before the admin gate below decides anything, so an addon calling
-		// `$plugin->get( 'translations_panel' )->mount( ... )` from boot() must
-		// not depend on which context the request turned out to be - putting it
-		// in register_admin_services() would throw "service not registered" on
-		// the front end and during AJAX. Being lazy, the factory does not run
-		// until something actually mounts or renders, so the front end pays a
-		// closure and nothing else.
+		// The shared "Translations" panel renderer and its mount registry. Always registered (and
+		// lazy): add-ons mount it from boot(), before the admin gate below decides the context.
 		$plugin->register(
 			'translations_panel',
 			fn( Plugin $p ) => new Admin\TranslationsPanel( $p->get( 'cache' ) ),
@@ -1053,25 +637,9 @@ final class Bootstrap {
 			\PerfLocale\Addon\AddonMigrationErrors::register_hooks();
 		}
 
-		// WP Site Health integration - an info section plus status tests covering
-		// config, DB tables, rewrite rules, conflicts, MT usage, FX staleness,
-		// translation files and addon quarantine.
-		//
-		// Deliberately NOT inside the admin gate above. WordPress runs
-		// `wp_site_health_scheduled_check` weekly from cron, where `is_admin()`
-		// is false - so while this lived with the other admin services, that run
-		// never saw a single PerfLocale test. It is that run which writes the
-		// `health-check-site-status-result` transient behind the Tools-menu
-		// count bubble and the Dashboard "Site Health Status" widget, and it
-		// overwrites whatever a manual visit left there. The result was that a
-		// site with translation exports readable over HTTP, no default language
-		// or missing tables still showed a PerfLocale issue count of zero.
-		//
-		// Both registrations are filters; their callbacks only run when core
-		// asks, so this costs a single object on a cron request and nothing on
-		// the front end. The three tests that make a loopback request or a
-		// blocking DNS lookup opt out with `skip_cron` in register_tests(),
-		// which core honours at class-wp-site-health.php:3374.
+		// WP Site Health info section and status tests. Not inside the admin gate: core's weekly
+		// scheduled check runs from cron (is_admin() false) and writes the result behind the
+		// Tools count bubble. Tests that make a loopback or DNS request set `skip_cron`.
 		if ( is_admin() || wp_doing_cron() ) {
 			$plugin->register(
 				'site_health',
@@ -1080,16 +648,11 @@ final class Bootstrap {
 			);
 		}
 
-		// Admin AJAX handlers that need to work during wp_doing_ajax().
-		// AdminController and TermMetaBox are not loaded during AJAX (by
-		// design), so these lightweight handlers are registered directly.
+		// AJAX handlers needed while wp_doing_ajax(): AdminController and TermMetaBox do not load
+		// during AJAX.
 		if ( wp_doing_ajax() ) {
-			// Quick Edit language save - fires from `inline-save` AJAX in
-			// edit.php. The full PostListColumns service is admin-only
-			// (gated above), but its `save_quick_edit_language` save_post
-			// handler MUST be wired during AJAX or every Quick Edit
-			// language change is silently dropped. Reuse the eager service
-			// registration so a single class owns the hook + nonce check.
+			// Quick Edit language save (`inline-save` AJAX): PostListColumns' save_post handler
+			// must be wired during AJAX, so register the service here too.
 			$plugin->register(
 				'post_list_columns',
 				fn( Plugin $p ) => new Admin\PostListColumns(
@@ -1099,13 +662,8 @@ final class Bootstrap {
 				true
 			);
 
-			// Same problem, term flavour: `inline-save-tax` AJAX fires
-			// `edited_term` on save, but the term Quick Edit hooks (in
-			// TermListColumns) only register inside register_admin_services()
-			// which is gated on `! wp_doing_ajax()`. Register the term list
-			// columns service eagerly during AJAX too so categories, tags,
-			// product_cat, and any registered translatable taxonomy persist
-			// language changes from inline editing.
+			// The same for terms: `inline-save-tax` fires edited_term, and TermListColumns' hooks
+			// otherwise register only outside AJAX.
 			$plugin->register(
 				'term_list_columns',
 				fn( Plugin $p ) => new Admin\TermListColumns(
@@ -1115,8 +673,7 @@ final class Bootstrap {
 				true
 			);
 
-			// Term language save - fires when adding terms via AJAX (add-tag).
-			// TermMetaBox is not instantiated during AJAX, so we handle it here.
+			// Term language save for AJAX term creation (add-tag); TermMetaBox does not load here.
 			add_action(
 				'admin_init',
 				static function (): void {
@@ -1137,8 +694,7 @@ final class Bootstrap {
 									return;
 								}
 
-								// The new term's own edit right, which follows the
-								// taxonomy's capabilities.
+								// The new term's own edit right (follows the taxonomy's caps).
 								if ( ! current_user_can( 'edit_term', $term_id ) ) {
 									return;
 								}
@@ -1160,31 +716,23 @@ final class Bootstrap {
 				}
 			);
 
-			// The import form's upload in pieces (Settings → Export & Import,
-			// a file larger than PHP accepts in one request). The class loads
-			// only when the action runs.
+			// The import form's chunked upload (Settings > Export & Import). The class loads only
+			// when the action runs.
 			add_action( 'wp_ajax_perflocale_import_upload', [ Admin\ImportUpload::class, 'handle_ajax' ] );
 
 			add_action(
 				'wp_ajax_perflocale_save_hidden_columns',
 				static function (): void {
-					// Use the default $die=true behaviour so an invalid nonce
-					// terminates the request before any input is read. This is
-					// the canonical wp.org-reviewer-friendly pattern.
+					// Default $die=true: an invalid nonce ends the request before any input is read.
 					check_ajax_referer( 'perflocale_hidden_columns', '_wpnonce' );
 
-					// Per-user UI state - any authenticated user that reaches
-					// the Strings screen needs to be able to hide columns.
-					// `read` is the minimum authenticated capability.
+					// Per-user UI state: `read` is the minimum authenticated capability.
 					if ( ! is_user_logged_in() || ! current_user_can( 'read' ) ) {
-						wp_send_json_error( 'Insufficient permissions.' );
+						wp_send_json_error( 'Insufficient permissions.', 403 );
 					}
 
-					// Cap the payload so user_meta can't be flooded with a
-					// multi-megabyte JSON string. sanitize_text_field() is safe
-					// to apply to the JSON envelope here: it strips tags/control
-					// chars but leaves `[`, `]`, `{`, `}`, `"`, `,`, `:` intact.
-					// Per-element sanitization (`sanitize_key`) runs after decode.
+					// Cap the payload so user meta cannot be flooded. sanitize_text_field() keeps the
+					// JSON punctuation; per-element sanitize_key() runs after decode.
 					$raw = isset( $_POST['hidden'] ) ? sanitize_text_field( wp_unslash( $_POST['hidden'] ) ) : '[]';
 
 					if ( strlen( $raw ) > 4096 ) {
@@ -1205,11 +753,8 @@ final class Bootstrap {
 				}
 			);
 
-			// Generic hidden-columns saver used by the Translations + Assignments
-			// pages. Client sends `meta_key` along with the nonce/payload so the
-			// same handler can route to the right per-page user-meta bucket. The
-			// meta_key is strictly allow-listed below to prevent writing into
-			// arbitrary user-meta keys.
+			// Generic hidden-columns saver; `meta_key` is allow-listed so no arbitrary user meta
+			// key can be written.
 			add_action(
 				'wp_ajax_perflocale_save_hidden_columns_generic',
 				static function (): void {
@@ -1223,12 +768,11 @@ final class Bootstrap {
 						wp_send_json_error( 'Invalid meta key.' );
 					}
 
-					// Default $die=true so an invalid nonce terminates the request
-					// before any input is read. Canonical wp.org-reviewer pattern.
+					// Default $die=true: an invalid nonce ends the request before any input is read.
 					check_ajax_referer( $allowed[ $meta_key_raw ], '_wpnonce' );
 
 					if ( ! is_user_logged_in() || ! current_user_can( 'read' ) ) {
-						wp_send_json_error( 'Insufficient permissions.' );
+						wp_send_json_error( 'Insufficient permissions.', 403 );
 					}
 
 					$raw = isset( $_POST['hidden'] ) ? (string) wp_unslash( $_POST['hidden'] ) : '[]'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitize_text_field applied below on the serialized-JSON string before decode.
@@ -1252,39 +796,14 @@ final class Bootstrap {
 			);
 		}
 
-		// RTL stylesheet twins: one late pass over every registered
-		// perflocale* style instead of add_data calls at a dozen
-		// registration sites. 999 so every page and add-on registration has
-		// happened; no-op on LTR locales.
-		//
-		// Registered OUTSIDE the frontend/admin split below: these used to
-		// live in register_frontend_services(), which only runs when
-		// `! is_admin() || wp_doing_ajax()`, so the admin_enqueue_scripts
-		// hook was never attached on a normal wp-admin request and every
-		// shipped -rtl.css twin was dead in the admin. Each hook is inert in
-		// the context where its action never fires, so registering both
-		// unconditionally is free.
+		// RTL stylesheet twins: one late pass (999) over every registered perflocale* style; no-op
+		// on LTR. Outside the frontend/admin split below, or admin_enqueue_scripts never attaches.
 		add_action( 'wp_enqueue_scripts', [ Helper::class, 'register_rtl_styles' ], 999 );
 		add_action( 'admin_enqueue_scripts', [ Helper::class, 'register_rtl_styles' ], 999 );
 
-		// ⚠️ An imposed rendering language must reach the STRING layer too.
-		//
-		// `override_current_language()` exists so an order email rendered outside
-		// the customer's request resolves "term names, attribute labels, string
-		// translations" in the ORDER's language (LanguageRouter.php:2360-2372).
-		// But both string services load their whole per-language map ONCE, on
-		// `perflocale/language/detected`, and never reload - so inside an override
-		// window every `__()` kept serving the language the REQUEST arrived in.
-		// `get_locale()` follows the override correctly, which is what made this
-		// hard to see: the locale said Polish while the loader still held German.
-		//
-		// The reset the blog-switch registry already uses is exactly the right
-		// one, so it is reused rather than duplicated. Unlike that registry this
-		// is NOT gated on is_multisite() - the override window is a single-site
-		// feature too. It costs nothing until an override actually changes the
-		// language: the action only fires on a real change
-		// (LanguageRouter.php:2382), and the reload is lazy, so a request that
-		// never overrides pays one no-op hook registration.
+		// An imposed rendering language must reach the string layer too: both string services load
+		// their per-language map once, on language/detected. Not gated on multisite; the action
+		// fires only on a real change and the reload is lazy.
 		add_action(
 			'perflocale/language/overridden',
 			static function (): void {
@@ -1305,29 +824,10 @@ final class Bootstrap {
 			5
 		);
 
-		// Per-language site title and tagline.
-		//
-		// ⚠️ Registered HERE, outside the frontend/admin split below, and the
-		// distinction is load-bearing. register_frontend_services() only runs
-		// when `! is_admin() || wp_doing_ajax()`, so while this lived there the
-		// class did not exist on an ordinary wp-admin request. Three consequences:
-		//
-		//   1. The Strings screen showed `blogname` instead of "Site Title",
-		//      because the context-label filter was never added.
-		//   2. Renaming the title in Settings > General did not register the new
-		//      source string - `update_option_blogname` had no listener.
-		//   3. Worst: `Migrator::maybe_update()` also runs on `admin_init`, and
-		//      stamps the new version IMMEDIATELY after firing
-		//      `perflocale/updated`. An operator whose first request after
-		//      updating is a wp-admin page - which is the normal case, since that
-		//      is where you click update - fired that action into the void and
-		//      the option strings were then NEVER registered, on any later
-		//      request either.
-		//
-		// Registering everywhere is safe and cheap: register_hooks() attaches the
-		// write-side veto and the registration hooks, then returns before the
-		// read filters in admin, CLI, XML-RPC and cron. The front end is
-		// unaffected - same object, same hooks, same cost.
+		// Per-language site title and tagline. Outside the frontend/admin split below on purpose:
+		// in wp-admin it registers option strings and catches `perflocale/updated`, which
+		// Migrator fires on admin_init. See docs-ai/11-code-rationale.md, "Bootstrap: services
+		// outside the frontend/admin split".
 		$plugin->register(
 			'option_strings',
 			fn( Plugin $p ) => new Frontend\OptionStrings( $p->get( 'router' ) ),
@@ -1335,60 +835,9 @@ final class Bootstrap {
 		);
 
 		// ---- Block-theme template translation (FSE) ----
-		//
-		// ⚠️ REGISTERED HERE, OUTSIDE THE FRONTEND/ADMIN SPLIT BELOW, AND THE
-		// DISTINCTION IS LOAD-BEARING - this is the THIRD service in this file
-		// to have been mis-placed the same way (see option_strings and the RTL
-		// stylesheet twins above, both moved out for exactly this reason).
-		//
-		// While these two lived in register_frontend_services() they did not
-		// exist on an ordinary wp-admin request, because that method only runs
-		// when `! is_admin() || wp_doing_ajax()`. Measured over authenticated
-		// HTTP on WP 7.1 with the feature enabled:
-		//
-		//   context            frontend branch   perflocale/translation/post_data
-		//   front end          yes               BlockTemplateSupport::shape_post_data
-		//   admin-ajax.php     yes (ajax)        BlockTemplateSupport::shape_post_data
-		//   REST               yes               BlockTemplateSupport::shape_post_data
-		//   WP-CLI             yes               BlockTemplateSupport::shape_post_data
-		//   normal wp-admin    NO                (nothing - the filter was absent)
-		//
-		// So `admin_post_perflocale_create_translation` created a template
-		// translation with NO `-pfl-<lang>` slug and NO `wp_theme` term, while
-		// the SAME operation through the bulk AJAX button produced a correct row.
-		//
-		// ⚠️ Scope, stated honestly: for the two TEMPLATE types that route is
-		// currently reachable only by a hand-built URL. Its only emitter is the
-		// classic metabox (Admin\MetaBox), metaboxes need an edit screen, and
-		// wp-admin/post.php refuses `show_ui => false` types - which these are.
-		// That makes the defect LATENT rather than operator-facing, and the fix
-		// is worth making anyway: the shape is wrong, the row it produced was
-		// unfindable by core forever, and any future per-row create action
-		// would have walked straight into it.
-		//
-		// ⭐ The unshaped row is not merely invisible. `get_edit_post_link()`
-		// builds a template's edit URL as `get_stylesheet() . '//' . post_name`
-		// (wp-includes/link-template.php:1479-1481) - from the SLUG, never the
-		// ID. A translation sharing the source's slug therefore yields the
-		// SOURCE's Site Editor URL, so "create translation" handed the operator
-		// their English original to type into.
-		//
-		// Registering in every context is safe and cheap. BlockTemplateSupport
-		// only adds two hooks that fire while a translation is being created and
-		// return immediately unless the post type IS a template type.
-		// BlockTemplateTranslator was ALREADY written for this: its
-		// register_hooks() attaches the listing filter everywhere on purpose
-		// (translations must be hidden from the Site Editor) and returns before
-		// the front-end-only content swap. Only the registration was wrong.
-		//
-		// ⚠️ Position matters as much as the branch: these stay BEFORE
-		// `addon_registry` in the eager order, which is only safe because
-		// neither constructor nor register_hooks() reads
-		// get_translatable_post_types(). is_enabled() does read it, but lazily,
-		// inside the filter callback. Verified at runtime: the first
-		// get_block_templates() of a request fires after the addon filters are
-		// bound, with the full addon-aware type list, in admin and on the front
-		// end alike. Do NOT add an eager read here.
+		// Outside the frontend/admin split below: an admin-post create must shape template
+		// translations too. Kept before `addon_registry`, so neither constructor nor
+		// register_hooks() may read get_translatable_post_types(): no eager read here.
 		$plugin->register(
 			'block_template_translator',
 			fn( Plugin $p ) => new Frontend\BlockTemplateTranslator( $p->get( 'router' ), $p->get( 'settings' ), $p->get( 'lang_repo' ) ),
@@ -1404,13 +853,8 @@ final class Bootstrap {
 		if ( ! is_admin() || wp_doing_ajax() ) {
 			self::register_frontend_services( $plugin );
 		} else {
-			// Admin (non-AJAX) still needs the switcher WIDGET + shortcode
-			// registered: Appearance → Widgets, the block-widgets Legacy
-			// Widget picker, and the customizer all enumerate widget types
-			// in plain admin requests - without this the switcher widget
-			// doesn't exist there and can never be added or managed.
-			// Registration is cheap (one widgets_init + one shortcode); the
-			// heavy frontend services stay frontend-only.
+			// Admin still needs the switcher widget and shortcode: the widget screens and the
+			// customizer enumerate widget types in plain admin requests.
 			$plugin->register(
 				'language_switcher',
 				fn( Plugin $p ) => new Frontend\LanguageSwitcher(
@@ -1426,9 +870,8 @@ final class Bootstrap {
 			self::register_cli_services( $plugin );
 		}
 
-		// Exchange rate sync AJAX - registered directly in Bootstrap so it
-		// works regardless of whether the WooCommerce addon boots successfully.
-		// The handler itself checks WooCommerce availability at execution time.
+		// Exchange rate sync AJAX: registered here so it works even when the WooCommerce add-on
+		// does not boot; the handler checks WooCommerce itself.
 		if ( wp_doing_ajax() ) {
 			add_action(
 				'wp_ajax_perflocale_sync_exchange_rates',
@@ -1472,9 +915,7 @@ final class Bootstrap {
 		// REST API controllers - registered on rest_api_init.
 		add_action( 'rest_api_init', [ self::class, 'register_rest_routes' ] );
 
-		// Invalidate the edge-config cache whenever languages or settings
-		// change. Cheap no-op when the feature is off - just removes a
-		// cache entry that was never written.
+		// Invalidate the edge-config cache when languages or settings change.
 		add_action( 'perflocale/language/added', [ Api\ConfigController::class, 'invalidate' ] );
 		add_action( 'perflocale/language/updated', [ Api\ConfigController::class, 'invalidate' ] );
 		add_action( 'perflocale/language/deleted', [ Api\ConfigController::class, 'invalidate' ] );
@@ -1482,12 +923,8 @@ final class Bootstrap {
 		add_action( 'perflocale/default_language/changed', [ Api\ConfigController::class, 'invalidate' ] );
 		add_action( 'perflocale/settings/updated', [ Api\ConfigController::class, 'invalidate' ] );
 
-		// When string translation mode is switched to files, regenerate all
-		// .l10n.php files immediately so they exist before the next frontend
-		// request. Runs synchronously in the same admin/REST request that
-		// saved the settings - acceptable for the typically small number of
-		// strings. Clears the regenerating transient on completion so
-		// TranslationFileLoader stops retrying after files are ready.
+		// Switching string mode to files: regenerate all .l10n.php files in the saving request,
+		// then clear the transient so TranslationFileLoader stops retrying.
 		add_action(
 			'perflocale/strings/regenerate_files',
 			static function ( Cache\CacheManager $cache ): void {
@@ -1497,25 +934,18 @@ final class Bootstrap {
 			}
 		);
 
-		// Files mode compiles files for the active non-default languages only,
-		// and a full run deletes every file outside that set. Activating a
-		// non-default language, changing an active non-default language's
-		// locale (files are named by locale) and changing the default language
-		// each leave a language without files, so they queue one full
-		// regeneration for the end of the request. See
-		// queue_files_regeneration().
+		// Files mode compiles active non-default languages only, so activating one, changing its
+		// locale or changing the default queues one full regeneration at request end.
+		// See queue_files_regeneration().
 		add_action( 'perflocale/language/updated', [ self::class, 'regenerate_files_after_language_update' ], 20, 2 );
 		add_action( 'perflocale/default_language/changed', [ self::class, 'queue_files_regeneration' ], 20, 0 );
 
-		// After a plugin update in files mode: one full regeneration in the
-		// background, which writes the files a site is missing (an up-to-date
-		// site only pays the md5 comparisons). Never inside the request that
-		// noticed the update.
+		// After a plugin update in files mode: one full regeneration in the background, never in
+		// the request that noticed the update.
 		add_action( 'perflocale/updated', [ self::class, 'queue_files_regeneration_after_update' ], 10, 0 );
 		add_action( self::FILES_REGENERATE_HOOK, [ self::class, 'regenerate_files_in_background' ], 10, 0 );
 
-		// Webhook delivery runs on WP-Cron so the originating request
-		// isn't blocked on slow endpoints or bad DNS.
+		// Webhook delivery runs on WP-Cron so the originating request is not blocked.
 		add_action(
 			self::WEBHOOK_DELIVERY_HOOK,
 			static function ( string $webhook_id, string $event, array $data, string $timestamp ): void {
@@ -1525,10 +955,8 @@ final class Bootstrap {
 			4
 		);
 
-		// Drains the coalesced delivery queue on the WP-Cron engine - one
-		// tick dispatches a bounded batch of the deliveries a bulk fan-out
-		// buffered, so the autoloaded `cron` option holds one event instead
-		// of thousands.
+		// Drains the coalesced delivery queue in bounded batches, so the autoloaded `cron` option
+		// holds one event instead of thousands.
 		add_action(
 			self::WEBHOOK_DRAIN_HOOK,
 			static function (): void {
@@ -1536,8 +964,7 @@ final class Bootstrap {
 			}
 		);
 
-		// Retry cron hook for failed webhook deliveries (attempts 2+) and
-		// breaker-deferred re-deliveries (same attempt, deferral count 7th).
+		// Retries failed deliveries (attempt 2+) and breaker-deferred re-deliveries.
 		add_action(
 			self::WEBHOOK_RETRY_HOOK,
 			static function ( string $webhook_id, string $event, array $data, string $timestamp, int $attempt, string $delivery_id = '', int $breaker_deferrals = 0 ): void {
@@ -1547,25 +974,9 @@ final class Bootstrap {
 			7
 		);
 
-		// Fan out plugin translation/content actions to subscribed webhooks.
-		// Lazy: registers the forwarding hooks only after plugins_loaded so
-		// that get_option() is safe to call and no-op for sites without any
-		// subscribers. The WebhookController class is only autoloaded
-		// (reflection + file parse, ~50–100µs first time) when actually
-		// needed - do the empty-option check here so the hook and the class
-		// never touch the runtime on single-site installs that have no
-		// webhooks configured.
-		//
-		// Gated to write-contexts because every event the dispatchers listen
-		// to (perflocale/translation/created|linked|status_changed) fires
-		// exclusively from admin / REST / CLI / CRON translation operations. A
-		// frontend GET will never invoke them, so paying the ~140 µs
-		// get_option roundtrip on every visitor pageview is pure waste.
-		//
-		// wp_doing_cron() is load-bearing: background jobs (bulk translate,
-		// scheduled publishes) execute inside the WP-Cron worker, where NONE
-		// of the other conditions hold - without it, every translation created
-		// by a background job silently fired no webhooks at all.
+		// Fan out translation events to webhooks, in write contexts only (the events never fire
+		// on a front-end GET). wp_doing_cron() is required: background jobs create translations
+		// in the cron worker.
 		if (
 			is_admin()
 			|| wp_doing_ajax()
@@ -1576,12 +987,8 @@ final class Bootstrap {
 			add_action(
 				'plugins_loaded',
 				static function (): void {
-					// Single-site only: on multisite the boot blog's option
-					// says nothing about the blogs this request may
-					// switch_to_blog() into - an event fired under a switched
-					// blog must still reach THAT blog's subscribers, so the
-					// dispatchers always register and fire_webhook() no-ops
-					// per blog via its own webhook lookup instead.
+					// Single-site only: on multisite an event under a switched blog must reach that
+					// blog's subscribers, so fire_webhook() checks per blog.
 					if ( ! is_multisite() ) {
 						$webhooks = get_option( 'perflocale_webhooks', [] );
 
@@ -1596,47 +1003,23 @@ final class Bootstrap {
 			);
 		}
 
-		// Multisite: clear per-request static caches when switching blog
-		// context so cross-site data doesn't leak into the new blog's
-		// queries. UrlConverter already resets its own cache; add the
-		// post/term query filter caches too.
-		//
-		// Gated behind is_multisite() because (a) `switch_to_blog()` is a
-		// no-op on single-site WP yet still fires the `switch_blog` action,
-		// so without the gate any third-party plugin that calls
-		// switch_to_blog(get_current_blog_id()) (WooCommerce / AIOWPSecurity
-		// / etc. do this) would needlessly wipe our per-request caches
-		// mid-request - costing both work and correctness; (b) skipping
-		// these add_action calls on single-site shaves ~20 µs from boot.
-		//
-		// NOTE: LanguageRouter hooks its OWN switch_blog listener
-		// (maybe_reset_on_switch) in register_hooks() - do NOT add a
-		// raw ::reset here or same-blog switch_to_blog() calls (common in
-		// WooCommerce, AIOWPSecurity, etc.) will wipe the detected-language
-		// state mid-request and break the switcher/hreflang/PostQueryFilter.
+		// Multisite: clear per-request static caches on blog switch. Gated on is_multisite():
+		// single-site switch_to_blog() still fires switch_blog, and plugins call it with the
+		// current blog. LanguageRouter has its own same-blog-aware listener: never add a raw
+		// reset of it here.
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ self::class, 'reset_static_state' ] );
 		}
 
-		// Mirror the same data-derived invalidation pattern used by
-		// LanguageRouter / UrlConverter / SlugManager: when a language is
-		// added / updated / renamed / deleted within the same request,
-		// the slug-repo's per-request `has_any_slugs_memo` can outlive
-		// its underlying truth (e.g. deleting the last language with
-		// translated slugs empties the table but keeps the memo TRUE).
-		// Two lines here keep all four routing-layer classes on one
-		// consistent invalidation pattern.
+		// Language changes within a request invalidate the slug repo's has_any_slugs memo, as
+		// for the other routing classes.
 		$reset_slug_repo = [ Database\Repository\SlugTranslationRepository::class, 'reset_static_caches' ];
 
 		add_action( 'perflocale/language/added', $reset_slug_repo );
 		add_action( 'perflocale/language/updated', $reset_slug_repo );
 		add_action( 'perflocale/language/slug_renamed', $reset_slug_repo );
 
-		// Helper's per-request current-language memo (added so themes
-		// calling perflocale()->locale() in a template loop don't re-hit
-		// the DI container per call). Same data-derived invalidation
-		// triggers as the slug repo above - a language slug rename mid-
-		// request would otherwise leave Helper returning the old slug.
+		// Helper's per-request current-language memo: same invalidation triggers.
 		$reset_helper = [ Helper::class, 'reset_static_caches' ];
 
 		add_action( 'perflocale/language/added', $reset_helper );
@@ -1644,34 +1027,13 @@ final class Bootstrap {
 		add_action( 'perflocale/language/slug_renamed', $reset_helper );
 		add_action( 'perflocale/language/deleted', $reset_helper );
 
-		// ⚠️ And when a rendering window IMPOSES a language. Without this the
-		// memo keeps answering with the language the REQUEST arrived in, so
-		// inside a WooCommerce order-email window - the live consumer of
-		// override_current_language() - perflocale()->slug(), ->locale() and
-		// ->is_rtl() all describe the wrong language, and an RTL order can be
-		// rendered left-to-right. Helper::with_language() depends on this being
-		// wired: it is the difference between the public API telling the truth
-		// inside a window and quietly lying.
+		// And when a rendering window imposes a language, or Helper::with_language() and
+		// perflocale()->slug()/is_rtl() describe the request's language inside the window.
 		add_action( 'perflocale/language/overridden', $reset_helper );
 		add_action( 'perflocale/language/deleted', $reset_slug_repo );
 
-		// Glossary entries reference (source_language_id, target_language_id).
-		// When a language is renamed/deleted, the cached per-(src,tgt) entry
-		// lists need to be invalidated so the next read sees the fresh DB
-		// state (including any cascade-deleted rows from
-		// LanguageRepository::delete). Mirrors the slug-repo pattern above.
-
-		// Translation Memory cache key includes language IDs. When a
-		// language is renamed/deleted, the cascade in
-		// LanguageRepository::delete drops the TM rows but the per-
-
-		// Scheduled cleanup for abandoned import temp files.
-		//
-		// Path-traversal guard: the hook is publicly callable via
-		// do_action(), so without a realpath + prefix check any caller
-		// could pass an arbitrary path and trigger wp_delete_file() on it.
-		// Mirrors the same canonical pattern used by DataImportJob's
-		// is_safe_upload_path() and the export-download endpoint.
+		// Scheduled cleanup for abandoned import temp files. The hook is publicly callable, so
+		// only files inside the temp dir are deleted (realpath + prefix check).
 		add_action(
 			'perflocale_cleanup_temp_import',
 			static function ( string $file ): void {
@@ -1679,13 +1041,10 @@ final class Bootstrap {
 					return;
 				}
 
-				// An upload sent in pieces that was never imported gives up
-				// its place in the upload quota, whether or not its file is
-				// still there (the name alone identifies it).
+				// An unimported chunked upload frees its quota slot, whether or not its file remains.
 				Admin\ImportUpload::release_path( $file );
 
-				// Path-traversal guard: only files inside `uploads/perflocale/temp/`
-				// may be deleted via this publicly-callable hook.
+				// Only files inside `uploads/perflocale/temp/`.
 				$temp_dir = realpath( Helper::uploads_temp_dir() );
 				$real     = realpath( $file );
 
@@ -1701,10 +1060,8 @@ final class Bootstrap {
 			}
 		);
 
-		// Daily reaper for expired lock rows - crashed requests leak a
-		// row in wp_options, which accumulates over time. One DELETE per
-		// day keeps the options table lean. Wrap so the action hook
-		// discards reap_expired()'s int return (number of rows cleaned).
+		// Daily reaper for expired lock rows (crashed requests leak them); the wrapper discards
+		// reap_expired()'s return.
 		add_action(
 			self::LOCK_CLEANUP_HOOK,
 			static function (): void {
@@ -1712,43 +1069,15 @@ final class Bootstrap {
 			}
 		);
 
-		// Action Scheduler integration - only register when AS is loaded
-		// (woocommerce/jetpack/many others ship it; standalone too). On a
-		// vanilla site without AS, every `add_action( 'action_scheduler_*' )`
-		// is wasted: WP stores the callback in $wp_filter, AS never fires,
-		// callback never runs.
-		// DEFERRED TO `init`. Bootstrap::init() runs while the plugin file is
-		// being included, and Action Scheduler is not loaded then on a stock
-		// WooCommerce site - it is absent at `plugins_loaded` too, appearing
-		// only between there and `init`. So this guard used to evaluate FALSE
-		// and NOTHING in this block ever registered: verified at runtime with
-		// WooCommerce active, `has_filter( 'action_scheduler_failure_period' )`
-		// was false and the AS→JobState failure bridge - the thing that stops a
-		// killed worker leaving a row `running` until the six-hour watchdog -
-		// did not exist. Priority 1 is early enough to precede any queue run.
+		// Action Scheduler integration, deferred to `init`: AS is not loaded yet while this file
+		// runs, nor at plugins_loaded on a stock WooCommerce site. Priority 1 precedes any queue run.
 		add_action(
 			'init',
 			static function (): void {
 				if ( class_exists( 'ActionScheduler' ) || class_exists( 'ActionScheduler_Store' ) ) {
-					// Action Scheduler's default "action failure" timeout is 5
-					// minutes - actions that haven't returned in that window are
-					// re-claimed and re-fired. Our long-running migration / import /
-					// scan jobs can legitimately run for many minutes, so without
-					// raising this filter AS would silently retry while the original
-					// worker is still alive (the per-job lock blocks the second
-					// instance from running, but the operator sees ghost "failed
-					// (timed out)" actions in AS admin). Match `STUCK_TIMEOUT` so AS
-					// gives up on the same cadence as our own watchdog.
-					//
-					// SCOPED, because this filter is store-wide: Action Scheduler hands
-					// the callback no action context, so raising it unconditionally
-					// would extend the failure window for EVERY plugin's actions - a
-					// stuck WooCommerce or Jetpack action would sit un-reclaimed for six
-					// hours instead of five minutes. Only extend it while one of OUR
-					// jobs is running with a live worker (a recent status update or an
-					// unexpired lock, JobState::has_live_job_in_flight()); otherwise
-					// return whatever AS or another filter proposed, untouched. A
-					// killed worker's job stops extending it once its lock expires.
+					// Raise AS's 5-minute failure period to STUCK_TIMEOUT so long jobs are not
+					// re-claimed while alive. The filter is store-wide (no action context), so raise
+					// it only while one of our jobs has a live worker; otherwise pass it through.
 					add_filter(
 						'action_scheduler_failure_period',
 						static function ( $time_limit ) {
@@ -1760,122 +1089,16 @@ final class Bootstrap {
 						}
 					);
 
-					// Bridge Action Scheduler failure states to JobState. When a worker
-					// triggers a PHP fatal, hits AS's timeout, or fires the shutdown
-					// monitor, AS marks its own action failed but our JobState row stays
-					// `running` until our watchdog catches it ~6h later. These three
-					// hooks close that gap so the Jobs admin UI matches *Tools →
-					// Scheduled Actions* within one cron tick.
-					//
-					// `failed_execution` and `unexpected_shutdown` fire in the process
-					// that ran the action, which is the job's current attempt: they fail
-					// the job. `failed_action` is AS's queue cleaner timing out an action
-					// that has been in progress too long. That action can be a stale
-					// attempt (the job was cancelled and retried, or a newer worker runs
-					// it), so this hook follows the plugin's own liveness rule: a
-					// running job fails only when its worker is gone
-					// (JobState::fail_if_worker_gone()), a queued job only when nothing
-					// else is scheduled to run it.
-					//
-					// Multisite note: AS uses `$wpdb->prefix . 'actionscheduler_*'`
-					// tables (per-blog, NOT $base_prefix), and AS's queue runner is
-					// registered per blog. The failure hook therefore fires in the
-					// SAME blog context that owns the action - no switch_to_blog is
-					// needed here. JobState options also live on that blog. Verified
-					// 2026-05-18: action_id is per-blog, so a stray cross-blog handler
-					// would resolve action_id to a DIFFERENT action in the wrong blog.
-					//
-					// The job id, status and engine of a failed action in the plugin's
-					// group, or null when the action is someone else's or its job is
-					// finished.
-					$as_failed_job = static function ( $action_id ) {
-						if ( ! class_exists( '\\ActionScheduler' ) ) {
-							return null;
-						}
-						try {
-							$action = \ActionScheduler::store()->fetch_action( (int) $action_id );
-						} catch ( \Throwable $e ) {
-							return null;
-						}
-						if ( ! is_object( $action ) || ! method_exists( $action, 'get_group' )
-						|| $action->get_group() !== Background\ActionSchedulerRunner::GROUP ) {
-							return null;
-						}
-						$as_args = method_exists( $action, 'get_args' ) ? $action->get_args() : [];
-						$job_id  = isset( $as_args[0] ) ? (string) $as_args[0] : '';
-						if ( $job_id === '' || ! Background\JobState::is_safe_id( $job_id ) ) {
-							return null;
-						}
-						$state = Background\JobState::get( $job_id );
-						if ( ! $state ) {
-							return null;
-						}
-						$status = (string) ( $state['status'] ?? '' );
-						if ( in_array( $status, [ 'complete', 'failed', 'canceled' ], true ) ) {
-							return null;
-						}
-						$engine = $state['engine'] ?? '';
-						return [ $job_id, $status, is_string( $engine ) ? $engine : '' ];
-					};
-
-					$bridge_as_failure = static function ( $action_id, $exception_or_timeout = null ) use ( $as_failed_job ) {
-						$job = $as_failed_job( $action_id );
-						if ( null === $job ) {
-							return;
-						}
-						[ $job_id ] = $job;
-						$detail     = '';
-						if ( $exception_or_timeout instanceof \Throwable ) {
-							$detail = ': ' . $exception_or_timeout->getMessage();
-						} elseif ( is_array( $exception_or_timeout ) && isset( $exception_or_timeout['message'] ) ) {
-							$detail = ': ' . (string) $exception_or_timeout['message'];
-						}
-						Background\JobState::mark_failed(
-							$job_id,
-							/* translators: %s is an optional AS-supplied error message starting with ": ". */
-							sprintf( __( '[AS marked failed] Worker terminated before completion%s', 'perflocale' ), $detail )
-						);
-					};
-
-					$bridge_as_timeout = static function ( $action_id ) use ( $as_failed_job ) {
-						$job = $as_failed_job( $action_id );
-						if ( null === $job ) {
-							return;
-						}
-						[ $job_id, $status, $engine ] = $job;
-						if ( 'running' === $status ) {
-							Background\JobState::fail_if_worker_gone( $job_id );
-							return;
-						}
-						// AS marks the timed-out action failed before it fires this
-						// hook, so only another attempt counts as scheduled.
-						try {
-							if ( Background\JobRunnerFactory::for_engine( $engine )->is_scheduled( $job_id ) ) {
-								return;
-							}
-						} catch ( \Throwable $e ) {
-							return;
-						}
-						Background\JobState::fail_queued(
-							$job_id,
-							/* translators: %s is an optional AS-supplied error message starting with ": ". */
-							sprintf( __( '[AS marked failed] Worker terminated before completion%s', 'perflocale' ), '' )
-						);
-					};
-
-					add_action( 'action_scheduler_failed_execution', $bridge_as_failure, 10, 2 );
-					add_action( 'action_scheduler_failed_action', $bridge_as_timeout, 10, 1 );
-					add_action( 'action_scheduler_unexpected_shutdown', $bridge_as_failure, 10, 2 );
+					// AS failure states reach the jobs table; the bridge loads only when one fires.
+					add_action( 'action_scheduler_failed_execution', [ Background\ActionSchedulerFailureBridge::class, 'on_failed_execution' ], 10, 2 );
+					add_action( 'action_scheduler_failed_action', [ Background\ActionSchedulerFailureBridge::class, 'on_timed_out' ], 10, 1 );
+					add_action( 'action_scheduler_unexpected_shutdown', [ Background\ActionSchedulerFailureBridge::class, 'on_unexpected_shutdown' ], 10, 2 );
 				}
 			},
 			1
 		);
 
-		// Weekly GC for `perflocale_mt_usage_YYYY_MM` options. The MT usage
-		// admin UI only ever reads the current month + the last 12 months;
-		// older rows accumulate forever otherwise. AbstractProvider's
-		// static helper does the LIKE-scan + per-row delete with a 13-month
-		// retention window. Scheduled per-blog (MT usage is per-blog).
+		// Weekly GC for `perflocale_mt_usage_YYYY_MM` options (13-month retention), per blog.
 		add_action(
 			'perflocale_mt_usage_gc',
 			static function ( $blog_id = 0 ): void {
@@ -1890,22 +1113,15 @@ final class Bootstrap {
 			1
 		);
 
-		// Daily GC for the background-jobs system: removes per-job options
-		// for completed/failed/canceled jobs older than 24h. Action Scheduler
-		// and WP-Cron keep their queues per blog, so each blog schedules its
-		// own event; the blog id travels as the event's argument and
-		// run_recurring_for_blog() switches to it, so the handler always
-		// works on the blog that scheduled it.
+		// Daily background-jobs GC, scheduled per blog: the blog id is the event argument and
+		// run_recurring_for_blog() switches to it.
 		add_action(
 			'perflocale_jobs_gc',
 			static function ( $blog_id = 0 ): void {
 				Background\JobState::run_recurring_for_blog( (int) $blog_id, [ Background\JobState::class, 'gc' ] );
 
-				// Same daily window also sweeps empty translation_groups rows:
-				// orphans from any write path that bypasses
-				// unlink_by_object_id(), and groups that unlink_by_object_id()
-				// kept on purpose because it could not read how many links were
-				// left. 1000-row cap per tick keeps the query bounded.
+				// Also sweep empty translation_groups rows (orphans, and groups unlink_by_object_id()
+				// kept when it could not count the links left), capped per tick.
 				Background\JobState::run_recurring_for_blog(
 					(int) $blog_id,
 					static function (): void {
@@ -1917,11 +1133,7 @@ final class Bootstrap {
 					}
 				);
 
-				// And the daily safety-net sweep for abandoned temp / export
-				// files. The per-import 24h scheduled-cleanup event handles
-				// the happy path, but if cron is disabled or a scheduled
-				// event is lost, files would linger forever otherwise.
-				// Default: anything 7+ days old.
+				// Safety-net sweep for abandoned temp/export files (7+ days), for lost cleanup events.
 				Background\JobState::run_recurring_for_blog(
 					(int) $blog_id,
 					static function (): void {
@@ -1931,13 +1143,8 @@ final class Bootstrap {
 					}
 				);
 
-				// Expired perflocale_* transients sweep. WP core's
-				// delete_expired_transients() runs lazily on get_transient()
-				// and via the twice-daily wp_scheduled_delete cron; neither
-				// catches our transients reliably if nothing reads them or
-				// if WP-Cron is disabled. Bounded single-statement DELETE
-				// joining _transient_timeout_<key> rows (which carry the
-				// expiry) against the corresponding _transient_<key> rows.
+				// Expired perflocale_* transients: core's sweeps miss them when nothing reads them or
+				// WP-Cron is off. One bounded DELETE joining value and timeout rows.
 				Background\JobState::run_recurring_for_blog(
 					(int) $blog_id,
 					static function (): void {
@@ -1959,11 +1166,8 @@ final class Bootstrap {
 					}
 				);
 
-				// Strings mark-and-sweep: delete strings rows whose
-				// last_seen_at is older than the retention window
-				// (default 90 days, filter perflocale/strings/stale_retention_days).
-				// Covers the disabled-plugin / removed-theme cleanup case.
-				// Cascades to string_translations in the same call.
+				// Strings mark-and-sweep: delete rows unseen past the retention window (filter
+				// perflocale/strings/stale_retention_days), cascading to string_translations.
 				Background\JobState::run_recurring_for_blog(
 					(int) $blog_id,
 					static function (): void {
@@ -1981,10 +1185,7 @@ final class Bootstrap {
 					}
 				);
 
-				// Defensive orphan-sweep for string_translations: catches
-				// any row whose parent strings.id has been deleted by a
-				// path that bypassed the gc_stale_strings() cascade.
-				// Single-statement LEFT JOIN; cheap when nothing to do.
+				// Orphan sweep for string_translations whose parent string was deleted elsewhere.
 				Background\JobState::run_recurring_for_blog(
 					(int) $blog_id,
 					static function (): void {
@@ -2012,42 +1213,16 @@ final class Bootstrap {
 			}
 		);
 
-		// Schedule both recurring events under the current engine.
-		//
-		// Drift-detection probe - runs JobRunnerFactory::pick() (which
-		// probes Action Scheduler availability) and queries the schedule
-		// store on every request it fires on. Costs ~1 ms. Hooked to
-		// `admin_init` rather than plain `init` so visitors don't pay for
-		// it on every frontend pageview; drift is only actionable from
-		// an admin context. Direct setting changes still trigger
-		// re-migration through `maybe_remigrate_engine` below.
-		//
-		// Timing: `admin_init` fires inside `init` priority 10, which is
-		// still after `action_scheduler_init` (AS hooks init@1), so the
-		// engine selector returns the correct value.
-		//
-		// Skip the registration entirely on non-admin requests - the
-		// `admin_init` hook never fires outside wp-admin so the callback
-		// is unreachable, but the add_action call itself is still ~5µs
-		// of $wp_filter bookkeeping we can avoid on visitor pageviews.
+		// Schedule both recurring events under the current engine: admin_init only (the drift
+		// probe queries the schedule store), which runs after AS's init@1 hook.
 		if ( is_admin() ) {
 			add_action( 'admin_init', [ self::class, 'ensure_recurring_schedules_throttled' ] );
 		}
 
-		// Engine-flip migration: when the operator changes
-		// `background_engine` (auto <-> force_wp_cron), unschedule the
-		// recurring events from both engines and re-schedule them under
-		// the new engine. Without this, in-flight schedules stay on the
-		// old engine until they naturally expire - mixed-state until the
-		// next interval.
+		// Engine flip: move the recurring events to the new engine at once.
 		add_action( 'update_option_perflocale_settings', [ self::class, 'maybe_remigrate_engine' ], 10, 2 );
 
-		// Bust the Settings::$settings in-memory cache when the option is
-		// updated. Without this, REST/admin code that reads a setting
-		// AFTER persisting it in the same request still sees the prior
-		// value (Settings::load() memoises on first access). The hook is
-		// cheap - reset_cache is an array assignment - and fires only on
-		// actual settings saves, which are infrequent.
+		// Reset Settings' memo on save, so code reading a setting after saving it sees the new value.
 		add_action(
 			'update_option_perflocale_settings',
 			static function (): void {
@@ -2066,25 +1241,12 @@ final class Bootstrap {
 			1
 		);
 
-		// Settings-flip → immediate (un)schedule. ensure_recurring_schedules()
-		// is idempotent and figures out the current desired state from the
-		// freshly-saved settings (relies on the cache-reset above at priority 1
-		// and the engine remigrate at priority 10 having already run). Without
-		// this, flipping a recurring feature off via REST / CLI leaves its
-		// cron firing until the next admin pageview triggers the existing
-		// `admin_init` ensure call. Cheap (one option read + one
-		// scheduled-event lookup per recurring hook); only runs on actual
-		// settings saves.
+		// Settings change: (un)schedule recurring features at once. Priority 20, after the memo
+		// reset (1) and engine remigration (10).
 		add_action( 'update_option_perflocale_settings', [ self::class, 'ensure_recurring_schedules' ], 20 );
 
-		// One-shot resume after activation. The deactivation hook removes
-		// every queued worker event, but it intentionally leaves the
-		// JobState rows in place so the operator's history survives
-		// reactivation. On reactivate, Activator::activate() schedules a
-		// `perflocale_resume_jobs` event for time() - this handler scans
-		// the index and re-enqueues any `queued` or `running` rows via
-		// the now-fully-initialised runner factory. Wrap so the action
-		// hook discards resume()'s int return (number resumed).
+		// One-shot resume after activation: deactivation clears worker events but keeps JobState
+		// rows, and Activator schedules `perflocale_resume_jobs` to re-enqueue queued or running ones.
 		add_action(
 			'perflocale_resume_jobs',
 			static function (): void {
@@ -2092,12 +1254,8 @@ final class Bootstrap {
 			}
 		);
 
-		// Register Tier-2 background workers. Each call binds the worker
-		// hook (`perflocale_job_run_<type>`) to WorkerRegistry::run(), so
-		// dispatched jobs land in the same lock + cap-check + retry pipeline.
-		//
-		// Factory closures (not instances) so workers get a fresh object per
-		// invocation - stateless across jobs.
+		// Background workers: each binds `perflocale_job_run_<type>` to WorkerRegistry::run().
+		// Factories give each run a fresh object.
 		Background\WorkerRegistry::register(
 			'data_import',
 			static fn(): Background\AbstractJob => new Background\Jobs\DataImportJob()
@@ -2106,14 +1264,8 @@ final class Bootstrap {
 			'data_export',
 			static fn(): Background\AbstractJob => new Background\Jobs\DataExportJob()
 		);
-		// One-off migration importers (WPML / Polylang / TranslatePress).
-		// A migration is dispatched from wp-admin and executed by cron or
-		// Action Scheduler - never by a visitor pageview - so the worker
-		// hooks are bound only in job-capable contexts. On the hot frontend
-		// path this skips three add_action() calls and, more importantly,
-		// keeps the importer classes out of any code path a visitor can
-		// reach. The factories are closures either way, so the importer
-		// classes themselves are still only autoloaded when a job runs.
+		// Migration importers and template jobs run from cron or Action Scheduler, never a page
+		// view: bind them in job-capable contexts only.
 		if ( $write_context ) {
 			Background\WorkerRegistry::register(
 				'wpml_migration',
@@ -2127,15 +1279,13 @@ final class Bootstrap {
 				'translatepress_migration',
 				static fn(): Background\AbstractJob => new Background\Jobs\TranslatePressMigrationJob()
 			);
-			// One-time backfill of menu and pattern references in the translated
-			// templates a site already has: dispatched by the first wp-admin
-			// request of a user who may edit templates, run by the job runner.
+			// One-time backfill of menu and pattern references in existing translated templates.
 			Background\WorkerRegistry::register(
 				'template_refs_backfill',
 				static fn(): Background\AbstractJob => new Background\Jobs\TemplateRefsBackfillJob()
 			);
-			// The containers a menu or pattern event reaches beyond those the
-			// request that made the change rewrote (TemplateBlockRefs::fan_out()).
+			// Containers a menu or pattern event reaches beyond the changing request
+			// (TemplateBlockRefs::fan_out()).
 			Background\WorkerRegistry::register(
 				'template_refs_fanout',
 				static fn(): Background\AbstractJob => new Background\Jobs\TemplateRefsFanoutJob()
@@ -2145,16 +1295,12 @@ final class Bootstrap {
 				add_action( 'admin_init', [ self::class, 'maybe_dispatch_template_refs_backfill' ], 20 );
 			}
 
-			// The one-time jobs (the backfill above, the SQLite repair below)
-			// record a cancel in their dispatch state (a final failure is
-			// recorded by the worker), so that an admin page decides from
-			// that option alone.
+			// One-time jobs record a cancel in their dispatch state, so an admin page decides
+			// from that option alone.
 			add_action( 'perflocale/jobs/canceled', [ Background\OneTimeDispatch::class, 'on_canceled' ], 10, 2 );
 
-			// SQLite sites only: the repair of the string groups a scan before
-			// 1.0.7.3 shared. The engine is read first, so on MySQL and MariaDB
-			// no hook is added and nothing of the repair is loaded. wp-admin
-			// only queues the job; the job runner does the work in slices.
+			// SQLite only: repair of string groups an older scan shared. The engine is checked first,
+			// so MySQL loads nothing; wp-admin only queues the job.
 			if ( defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ) {
 				Background\WorkerRegistry::register(
 					'sqlite_group_repair',
@@ -2174,15 +1320,13 @@ final class Bootstrap {
 			'bulk_translate',
 			static fn(): Background\AbstractJob => new Background\Jobs\BulkTranslateJob()
 		);
+		Background\WorkerRegistry::register(
+			'auto_translate',
+			static fn(): Background\AbstractJob => new Background\Jobs\AutoTranslateJob()
+		);
 
-		// Pre-dispatch MT budget gate: veto a bulk MT dispatch whose estimated
-		// character volume would blow past the monthly cap BEFORE any provider
-		// spend, instead of letting the job burn quota until the per-post cap
-		// check throws mid-run (posts) or never throws at all (strings - that
-		// path is tracked but historically not cap-blocked). The estimate uses
-		// the jobs' own skip-existing semantics via CostEstimator, so already-
-		// translated pairs don't inflate the number. Opt-out setting for sites
-		// that prefer the old run-until-cap behaviour.
+		// Pre-dispatch MT budget gate: veto a bulk MT dispatch whose estimate (skip-existing aware,
+		// via CostEstimator) exceeds the monthly cap, before any provider spend. Opt-out setting.
 		add_filter(
 			'perflocale/jobs/should_dispatch',
 			static function ( $proceed, Background\AbstractJob $job, array $args ) {
@@ -2209,8 +1353,7 @@ final class Bootstrap {
 						! empty( $args['include_meta'] )
 					);
 				} else {
-					// With Overwrite on (skip_existing false), rows that already
-					// have a translation are sent again, so the estimate counts them.
+					// With Overwrite on (skip_existing false), translated rows are sent again and counted.
 					$string_job = $job instanceof Background\Jobs\BulkStringTranslateJob
 						? $job
 						: new Background\Jobs\BulkStringTranslateJob();
@@ -2221,10 +1364,7 @@ final class Bootstrap {
 					);
 				}
 
-				// Only deny when there is ACTUAL work to send: a dispatch whose
-				// entire selection is already translated (chars=0) would be a
-				// no-op job, and blocking it with an over-budget error is
-				// confusing. The real over-cap case (chars>0) still denies.
+				// Deny only when there is work to send: an all-translated selection (chars 0) is a no-op.
 				if ( ! empty( $estimate['would_exceed'] ) && (int) $estimate['chars'] > 0 ) {
 					return sprintf(
 						/* translators: 1: estimated characters, 2: remaining monthly characters, 3: monthly limit. */
@@ -2241,12 +1381,9 @@ final class Bootstrap {
 			3
 		);
 
-		// A bulk machine-translation dispatch is one request of the dispatching
-		// user to the hourly limiter, so a user the limiter refuses cannot go on
-		// spending through a bulk job. Priority 1000 puts it after the budget gate
-		// above and after vetoes at lower priorities: a dispatch they refuse is
-		// not counted. A site-wide chain's next chunk (after_id > 0) continues a
-		// dispatch that was already counted.
+		// A bulk MT dispatch counts as one request of the user to the hourly limiter. Priority
+		// 1000: after the budget gate and other vetoes, so a refused dispatch is not counted. A
+		// site-wide chain's next chunk (after_id > 0) was already counted.
 		add_filter(
 			'perflocale/jobs/should_dispatch',
 			static function ( $proceed, Background\AbstractJob $job, array $args ) {
@@ -2288,17 +1425,11 @@ final class Bootstrap {
 			true
 		);
 
-		// Invalidate the AddonRegistry bootable-set transient whenever the
-		// environment changes in a way that could flip a compat closure
-		// (plugin activation, theme switch, plugin update). Registered
-		// once at plugin load - the hooks live until the request ends and
-		// are idempotent, so safe in every context.
+		// Invalidate the add-on bootable-set transient when plugins or the theme change.
 		Addon\AddonRegistry::register_cache_invalidation();
 
-		// The stored stock maps of WooCommerce copies are retired when the
-		// stock sync, the add-on list or WooCommerce itself is switched, in
-		// every context: their listeners run only while all three are on.
-		// Class-name callbacks, so InventorySync loads only when one fires.
+		// Retire stored WooCommerce stock maps when stock sync, the add-on list or WooCommerce is
+		// switched, in every context. Class-name callbacks: InventorySync loads only when one fires.
 		add_action( 'perflocale/settings/updated', [ WooCommerce\InventorySync::class, 'retire_after_settings_change' ], 10, 2 );
 		add_action( 'update_option_perflocale_disabled_addons', [ WooCommerce\InventorySync::class, 'retire_stored_maps' ], 10, 0 );
 		add_action( 'activated_plugin', [ WooCommerce\InventorySync::class, 'retire_after_plugin_toggle' ], 10, 1 );
@@ -2317,16 +1448,11 @@ final class Bootstrap {
 			true
 		);
 
-		// Boot all eager services - this calls register_hooks() on each.
-		// Priority 0 on init to run before most other plugins.
+		// Boot all eager services (register_hooks() on each) at init priority 0.
 		add_action( 'init', [ $plugin, 'boot' ], 0 );
 
-		// Abilities API (WP 6.9+). On by default through the abilities_enabled
-		// setting; the perflocale/abilities/enabled filter overrides it. The
-		// write abilities are separate and off by default
-		// (abilities_write_enabled). Registers PerfLocale operations as
-		// discoverable abilities for AI tools and external consumers; nothing
-		// is registered when it is off.
+		// Abilities API (WP 6.9+): the abilities_enabled setting, overridable by the filter. Write
+		// abilities are a separate setting, off by default.
 		/** @hook perflocale/abilities/enabled Enable the WordPress Abilities API integration. Default: the `abilities_enabled` setting. */
 		if ( apply_filters( 'perflocale/abilities/enabled', (bool) $plugin->get( 'settings' )->get( 'abilities_enabled', true ) ) ) {
 			$registrar = new AbilitiesRegistrar( $plugin );
@@ -2337,11 +1463,8 @@ final class Bootstrap {
 		// Register the [perflocale_language] utility shortcode.
 		add_action( 'init', [ self::class, 'register_language_shortcode' ], 20 );
 
-		// Expose the per-post opt-out flags to the block editor: the
-		// Gutenberg document panel reads/writes them through the REST meta
-		// channel (the classic Translations metabox has its own fields).
-		// Priority 20 so custom post types registered at default priority
-		// exist before the per-subtype registration.
+		// Expose the per-post opt-out flags to the block editor via REST meta. Priority 20 so CPTs
+		// registered at the default priority exist.
 		add_action(
 			'init',
 			static function (): void {
@@ -2360,9 +1483,8 @@ final class Bootstrap {
 					'auth_callback'     => static fn( $allowed, $meta_key, $post_id ): bool => current_user_can( 'edit_post', (int) $post_id ),
 				];
 
-				// REST writes `meta` only after wp_update_post() has fired
-				// save_post, so the opt-out flag is stored early in any
-				// request that can save (see apply_rest_sync_optout()).
+				// REST writes `meta` after save_post has fired, so the opt-out flag is stored early
+				// (see apply_rest_sync_optout()).
 				$early_optout = Helper::is_write_context();
 
 				foreach ( $plugin->get( 'settings' )->get_translatable_post_types() as $post_type ) {
@@ -2382,50 +1504,24 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Option that stores the last-known ACTIVE engine (the value
-	 * `JobRunnerFactory::pick()->get_engine_name()` returned the last
-	 * time `ensure_recurring_schedules()` ran). Used to detect drift
-	 * caused by Action Scheduler disappearing (WooCommerce / standalone
-	 * AS plugin deactivated) or reappearing - cases that don't trigger
-	 * the `update_option_perflocale_settings` hook, so
-	 * `maybe_remigrate_engine()` doesn't catch them on its own.
-	 *
-	 * Autoloaded so the read is free (already cached in `alloptions`).
+	 * Option holding the last active engine, to detect Action Scheduler appearing or disappearing,
+	 * which `maybe_remigrate_engine()` cannot see. Autoloaded.
 	 *
 	 * @var string
 	 */
 	private const ACTIVE_ENGINE_OPTION = 'perflocale_active_engine';
 
 	/**
-	 * Timestamp of the last full recurring-schedule verification
-	 * (autoloaded; written at most every 6 hours by the throttled path).
+	 * Timestamp of the last full recurring-schedule check (autoloaded; written at most every 6 hours).
 	 */
 	private const SCHEDULES_VERIFIED_OPTION = 'perflocale_schedules_verified_at';
 
 	/**
-	 * Drop the per-request memos that hold one blog's data: run on
-	 * switch_blog (multisite), and by CacheManager::refresh_if_changed() when
-	 * a long-running process's checkpoint finds data another process changed.
+	 * Drop the per-request memos that hold one blog's data: on switch_blog and from refresh_if_changed().
 	 *
-	 * - Post/TermQueryFilter, PostTranslationManager, TranslationGroupRepository,
-	 *   SlugTranslationRepository, SitemapIntegration, SchemaEnricher and
-	 *   MediaTranslationManager memoise per-blog lookups.
-	 * - AddonSettings: addon settings are keyed per blog (one autoloaded
-	 *   option per site).
-	 * - Helper memoises current_language(); templates after a switch must see
-	 *   the new blog's language (a theme calling perflocale()->locale() after
-	 *   switch_to_blog() would read the previous blog's value).
-	 * - String translation is a shared singleton holding a per-blog memo;
-	 *   only one of its two services is registered (database or files mode),
-	 *   so whichever exists drops it.
-	 * - Settings loads its per-blog options blob once and memoises it;
-	 *   without a reset the memo keeps another blog's (or an older) url_mode,
-	 *   translatable_post_types, hide_default_prefix and mt_provider. Resolved
-	 *   lazily so Settings is not instantiated on blogs that never read it.
-	 *
-	 * LanguageRouter keeps its own switch_blog listener (maybe_reset_on_switch):
-	 * a raw reset here would wipe the detected-language state on same-blog
-	 * switches (common in WooCommerce, AIOWPSecurity, etc.).
+	 * Every blog-affine static or singleton memo must be reset here or be blog-keyed. Only one
+	 * string service exists per mode, so whichever is registered resets. LanguageRouter has its
+	 * own same-blog-aware switch_blog listener: never reset it here.
 	 *
 	 * @return void
 	 */
@@ -2460,16 +1556,14 @@ final class Bootstrap {
 				$plugin->get( 'settings' )->reset_cache();
 			}
 		} catch ( \Throwable $e ) {
-			// Mid-deactivation / container missing - fail closed.
+			// Mid-deactivation or container missing: fail closed.
 		}
 	}
 
 	/**
-	 * `admin_init`: Background\Jobs\TemplateRefsBackfillJob::maybe_dispatch().
-	 * Once the backfill is done (the state of every admin page after it
-	 * ran), this returns on the autoloaded state option, before the job,
-	 * AbstractJob and OneTimeDispatch are loaded; every other state goes
-	 * to the job, which makes all the checks.
+	 * `admin_init`: TemplateRefsBackfillJob::maybe_dispatch(), unless the state option says done.
+	 *
+	 * The done check reads the autoloaded option before any job class loads.
 	 *
 	 * @return void
 	 */
@@ -2496,9 +1590,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Whether a one-time job's state option records it as done
-	 * (`done:<unix time>`, Background\OneTimeDispatch). Reads the option
-	 * only.
+	 * Whether a one-time job's state option says done (`done:<unix time>`).
 	 *
 	 * @param string $option State option.
 	 * @return bool
@@ -2510,35 +1602,16 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Ensure the plugin's two recurring background events
-	 * (`Concurrency\Lock::CLEANUP_HOOK` and `perflocale_jobs_gc`) are
-	 * scheduled under the currently-active engine.
+	 * Throttled ensure_recurring_schedules() for admin_init: full run on engine drift, else every 6 hours.
 	 *
-	 * Performs proactive engine-drift detection: if the engine has
-	 * changed since this method last ran (e.g. Action Scheduler was
-	 * disabled by deactivating WooCommerce, or re-enabled by installing
-	 * it back), unschedule the recurring events from BOTH engines
-	 * before re-enqueueing. Without this, a downgrade leaves stranded
-	 * actions in the AS tables (harmless until AS comes back, then they
-	 * fire alongside the new WP-Cron schedules and double-trigger our
-	 * handlers).
-	 *
-	 * Hooked on admin_init (wp-admin requests only). The unthrottled
-	 * ensure_recurring_schedules() runs on every perflocale_settings save
-	 * (update_option_perflocale_settings:20, after maybe_remigrate_engine()
-	 * at :10), from WP-CLI, on network activation and on wp_initialize_site.
+	 * Settings saves (update_option_perflocale_settings:20), WP-CLI, network activation and
+	 * wp_initialize_site call the unthrottled method.
 	 *
 	 * @return void
 	 */
 	public static function ensure_recurring_schedules_throttled(): void {
-		// The full verification below costs 4–8 ms per call under Action
-		// Scheduler (each is_scheduled() is an AS table query) - too much
-		// for EVERY admin_init. The engine-DRIFT check is cheap (one
-		// autoloaded option read + factory pick), so it stays per-request:
-		// drift forces the full run immediately. Otherwise the schedule
-		// verification is a self-heal for externally-lost events and a
-		// 6-hour cadence is plenty (settings saves still trigger the full
-		// run synchronously via update_option_perflocale_settings@20).
+		// The full check costs several ms under AS (one table query per is_scheduled()), so it
+		// runs at most every 6 hours; the cheap drift check stays per request.
 		$current_engine = Background\JobRunnerFactory::pick()->get_engine_name();
 		$stored_engine  = get_option( self::ACTIVE_ENGINE_OPTION, $current_engine );
 		$drifted        = ! is_string( $stored_engine ) || $stored_engine !== $current_engine;
@@ -2556,10 +1629,10 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Full recurring-schedule verification + engine-drift migration. See the
-	 * docblock above ensure_recurring_schedules_throttled() for the cadence;
-	 * this method itself is unthrottled (settings saves and CLI call it
-	 * directly for immediate effect).
+	 * Ensure the recurring background events are scheduled under the active engine.
+	 *
+	 * On engine drift (Action Scheduler gone or back) it first unschedules them from both
+	 * engines, or stranded AS actions would fire alongside the new WP-Cron ones. Unthrottled.
 	 *
 	 * @return void
 	 */
@@ -2568,32 +1641,19 @@ final class Bootstrap {
 		$stored_engine  = (string) get_option( self::ACTIVE_ENGINE_OPTION, $current_engine );
 
 		if ( $stored_engine !== $current_engine ) {
-			// Drift detected. Most common cause is AS disappearing or
-			// reappearing without a settings change. Wipe schedules in
-			// BOTH engines so the stranded ones from the old engine
-			// don't fire alongside the new ones we're about to create.
-			//
-			// Bonus: this also catches the case where the operator
-			// changed `background_engine` while plugin code wasn't
-			// running (CLI option update bypassing the
-			// update_option_perflocale_settings hook).
+			// Drift (also catches a `background_engine` change written without our hook): wipe
+			// schedules in both engines so old ones do not fire alongside the new.
 			$blog_arg_for_drift = function_exists( 'get_current_blog_id' ) ? [ (int) get_current_blog_id() ] : [ 0 ];
 			Background\BackgroundEvents::unschedule_recurring( self::LOCK_CLEANUP_HOOK );
 			Background\BackgroundEvents::unschedule_recurring( 'perflocale_jobs_gc', $blog_arg_for_drift );
 			Background\BackgroundEvents::unschedule_recurring( 'perflocale_jobs_watchdog', $blog_arg_for_drift );
-			// Also clear any pre-fix (no-arg) schedules from older versions so
-			// they don't fire alongside the new per-blog ones.
+			// Also the legacy no-arg form, so it does not fire alongside the per-blog one.
 			Background\BackgroundEvents::unschedule_recurring( 'perflocale_jobs_gc' );
 			Background\BackgroundEvents::unschedule_recurring( 'perflocale_jobs_watchdog' );
-			// The three newer recurring hooks are engine-bound as well - clear
-			// both the per-blog and legacy no-arg forms so an engine flip
-			// doesn't leave them running on the old back-end.
+			// MT usage GC is engine-bound too: clear the per-blog and no-arg forms.
 			Background\BackgroundEvents::unschedule_recurring( 'perflocale_mt_usage_gc', $blog_arg_for_drift );
 			Background\BackgroundEvents::unschedule_recurring( 'perflocale_mt_usage_gc' );
-			// Resumer is one-shot, not recurring, but if a queued resume
-			// event is pending under the old engine, an engine flip leaves
-			// it stranded. Clear all of its scheduled instances in both
-			// back-ends.
+			// A pending one-shot resume under the old engine would be stranded: clear it.
 			Background\BackgroundEvents::unschedule_all( Background\Resumer::HOOK );
 
 			update_option( self::ACTIVE_ENGINE_OPTION, $current_engine, true );
@@ -2608,11 +1668,8 @@ final class Bootstrap {
 			);
 		}
 
-		// Multisite-safe: schedule with the current blog id as args so each
-		// blog has its own scheduled action under AS (which uses a network-
-		// shared table). The handler switches into the right blog before
-		// reading per-blog state. WP-Cron is per-blog natively so this is
-		// a no-op there.
+		// The blog id as args: the handler switches into that blog before it reads site state.
+		// Action Scheduler's tables are per blog too.
 		$blog_arg = function_exists( 'get_current_blog_id' ) ? [ (int) get_current_blog_id() ] : [ 0 ];
 
 		if ( ! Background\BackgroundEvents::is_scheduled( 'perflocale_jobs_gc', $blog_arg ) ) {
@@ -2635,9 +1692,7 @@ final class Bootstrap {
 			);
 		}
 
-		// Drop perflocale_mt_usage_YYYY_MM options older than 13 months.
-		// One row per month per blog accumulates forever otherwise. Weekly
-		// is plenty - the row never grows mid-month and the GC is cheap.
+		// Weekly drop of perflocale_mt_usage_YYYY_MM options older than 13 months.
 		if ( ! Background\BackgroundEvents::is_scheduled( 'perflocale_mt_usage_gc', $blog_arg ) ) {
 			Background\BackgroundEvents::enqueue_recurring(
 				'perflocale_mt_usage_gc',
@@ -2648,25 +1703,16 @@ final class Bootstrap {
 			);
 		}
 
-		// First call after install / after a `delete_option` (e.g. via
-		// uninstall preserve-purge that wiped settings) - seed the
-		// option so subsequent calls have a baseline to compare against.
+		// First call after install or after the option was deleted: seed the baseline.
 		if ( get_option( self::ACTIVE_ENGINE_OPTION ) === false ) {
 			update_option( self::ACTIVE_ENGINE_OPTION, $current_engine, true );
 		}
 	}
 
 	/**
-	 * Engine-flip migration hook. Compares the old and new
-	 * `perflocale_settings` arrays; if `background_engine` changed
-	 * (auto <-> force_wp_cron), cancels every recurring event on BOTH
-	 * engines and re-schedules them. Without this, schedules created
-	 * before the flip stay on the old engine until they naturally
-	 * expire - mixed-state for one cycle.
+	 * On a `background_engine` change, move every recurring event to the new engine.
 	 *
-	 * Also triggers a re-schedule of the exchange-rate-sync cron via
-	 * `ExchangeRateSync::maybe_reschedule()` so WooCommerce stores
-	 * with auto-sync enabled migrate immediately too.
+	 * Also reschedules the exchange-rate sync via `ExchangeRateSync::maybe_reschedule()`.
 	 *
 	 * @param mixed $old_value Previous option payload (array or scalar).
 	 * @param mixed $new_value New option payload (array or scalar).
@@ -2684,16 +1730,8 @@ final class Bootstrap {
 			return;
 		}
 
-		// Bust the Settings cache before scheduling. Settings::load()
-		// memoises the option into `$this->settings` on first access -
-		// without this reset, `JobRunnerFactory::pick()` would still see
-		// the OLD engine when called from `BackgroundEvents::use_action_scheduler()`
-		// during the re-schedule below, and our migration would re-stamp
-		// the old engine's events.
-		// Also forget the memoized runner: pick() may have resolved earlier in
-		// this same request (admin_init schedule throttle), and the Settings
-		// reset below can't reach an already-constructed runner instance -
-		// the re-schedule would silently re-stamp events under the OLD engine.
+		// Forget the memoized runner and reset Settings' memo first: pick() may already have run in
+		// this request, and either would re-stamp the events under the old engine.
 		Background\JobRunnerFactory::reset_memo();
 
 		$plugin = Plugin::get_instance();
@@ -2704,36 +1742,23 @@ final class Bootstrap {
 					$settings->reset_cache();
 				}
 			} catch ( \Throwable $e ) {
-				// Non-fatal - fall through to the re-schedule; worst case
-				// the schedule lands under the old engine and gets fixed
-				// on the next request.
+				// Non-fatal: at worst the schedule lands under the old engine until the next request.
 				unset( $e );
 			}
 		}
 
-		// Cancel both recurring events on both back-ends, then re-enqueue
-		// under the new engine via the common scheduler helper. The
-		// `enqueue_recurring()` call inside `ensure_recurring_schedules()`
-		// reads the updated setting (this hook runs AFTER the option is
-		// already written) and routes to AS or WP-Cron accordingly.
-		// Also clear `perflocale_active_engine` so the drift-detector
-		// inside `ensure_recurring_schedules()` re-seeds it under the
-		// new engine.
+		// Cancel the recurring events on both back-ends and clear the active-engine option; the
+		// re-enqueue below reads the saved setting (this hook runs after the write).
 		delete_option( self::ACTIVE_ENGINE_OPTION );
 		$blog_arg_for_remig = function_exists( 'get_current_blog_id' ) ? [ (int) get_current_blog_id() ] : [ 0 ];
 		Background\BackgroundEvents::unschedule_recurring( self::LOCK_CLEANUP_HOOK );
 		Background\BackgroundEvents::unschedule_recurring( 'perflocale_jobs_gc', $blog_arg_for_remig );
 		Background\BackgroundEvents::unschedule_recurring( 'perflocale_jobs_watchdog', $blog_arg_for_remig );
-		// The MT-usage/TM GC + MT-quality-score recurring hooks are engine-bound
-		// too; without unscheduling them here an engine flip strands them on the
-		// old back-end (ensure_recurring_schedules re-creates them below).
+		// MT usage GC is engine-bound too (re-created below).
 		Background\BackgroundEvents::unschedule_recurring( 'perflocale_mt_usage_gc', $blog_arg_for_remig );
 		self::ensure_recurring_schedules();
 
-		// Re-schedule the exchange-rate-sync cron too if WooCommerce
-		// is loaded and the service is registered. `maybe_reschedule()`
-		// unschedules then re-schedules via the same BackgroundEvents
-		// helper, so it picks up the new engine automatically.
+		// Exchange-rate sync reschedules through the same helper, so it follows the new engine.
 		if ( $plugin->has( 'exchange_rate_sync' ) ) {
 			try {
 				$ers = $plugin->get( 'exchange_rate_sync' );
@@ -2741,8 +1766,7 @@ final class Bootstrap {
 					$ers->maybe_reschedule();
 				}
 			} catch ( \Throwable $e ) {
-				// Best-effort - failure here is non-fatal; the next init
-				// will reconcile state.
+				// Best-effort: the next init reconciles state.
 				unset( $e );
 			}
 		}
@@ -2750,8 +1774,6 @@ final class Bootstrap {
 
 	/**
 	 * Register admin-only services.
-	 *
-	 * These are never instantiated on frontend requests.
 	 *
 	 * @param Plugin $plugin Service container.
 	 * @return void
@@ -2769,17 +1791,14 @@ final class Bootstrap {
 			true
 		);
 
-		// Dashboard widget (translation overview). Eager so its
-		// wp_dashboard_setup hook registers; the widget itself renders
-		// only on the Dashboard screen, gated on a setting + capability.
+		// Dashboard widget: eager so its wp_dashboard_setup hook registers.
 		$plugin->register(
 			'dashboard_widget',
 			fn( Plugin $p ) => new Admin\DashboardWidget( $p->get( 'settings' ) ),
 			true
 		);
 
-		// Surface quarantined addons in an admin notice.
-		// Eager so admin_notices hooks register in time.
+		// Quarantined add-on notice: eager so its admin_notices hooks register in time.
 		$plugin->register(
 			'quarantine_notice',
 			fn() => new Admin\QuarantineNotice(),
@@ -2830,9 +1849,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Register frontend-only services.
-	 *
-	 * These are never instantiated in admin (non-AJAX) context.
+	 * Register frontend-only services (never in a non-AJAX admin request).
 	 *
 	 * @param Plugin $plugin Service container.
 	 * @return void
@@ -2864,43 +1881,30 @@ final class Bootstrap {
 			true
 		);
 
-		// 301 redirector for renamed language slugs (`/en/...` → `/en-us/...`
-		// after the admin renames `en` → `en-us`). No-op when the redirect
-		// map is empty - single get_option() check on the frontend hot path.
+		// 301 redirector for renamed language slugs; no-op when the redirect map is empty.
 		$plugin->register(
 			'slug_redirector',
 			fn() => new Frontend\SlugRedirector(),
 			true
 		);
 
-		// Per-language synced patterns (`core/block`) and block-theme navigation
-		// menus (`core/navigation`). Both hold only a `ref` to another post, so
-		// translating the page that uses them cannot reach their text.
-		//
-		// Front-end only, and the class says so itself: a `ref` rewritten in the
-		// editor is written back into the source page on the next save, so
-		// Frontend\BlockRefTranslator::register_hooks() refuses to attach anything
-		// under is_admin() and detaches before REST dispatch. Registered
-		// unconditionally because the cost on a page with none of these blocks is
-		// one array lookup per block, and zero on the default language (the filter
-		// is never attached at all).
+		// Per-language synced patterns and navigation menus (they hold only a `ref`). Front end
+		// only: a `ref` rewritten in the editor would be saved into the source page, so
+		// BlockRefTranslator refuses to attach under is_admin() and detaches before REST dispatch.
 		$plugin->register(
 			'block_ref_translator',
 			fn( Plugin $p ) => new Frontend\BlockRefTranslator( $p->get( 'router' ), $p->get( 'settings' ) ),
 			true
 		);
 
-		// Per-language date/time formats: hook into option_date_format /
-		// option_time_format so every WP date render on the frontend
-		// respects the active language's override automatically.
+		// Per-language date and time formats (option_date_format / option_time_format filters).
 		$plugin->register(
 			'locale_date_format',
 			fn( Plugin $p ) => new Frontend\LocaleDateFormat( $p->get( 'router' ) ),
 			true
 		);
 
-		// Content-Language HTTP header - W3C standard, one header() call per
-		// frontend request. Gated by the `content_language_header` setting.
+		// Content-Language header, gated by the `content_language_header` setting.
 		$plugin->register(
 			'content_language_header',
 			fn( Plugin $p ) => new Frontend\ContentLanguageHeader(
@@ -2910,9 +1914,7 @@ final class Bootstrap {
 			true
 		);
 
-		// View Transitions API emitter - experimental, opt-in. No cost when
-		// disabled (service registers hooks but the emit() method bails
-		// immediately on the setting check).
+		// View Transitions emitter: opt-in; emit() returns at once when the setting is off.
 		$plugin->register(
 			'view_transitions',
 			fn( Plugin $p ) => new Frontend\ViewTransitionsEmitter(
@@ -2921,9 +1923,7 @@ final class Bootstrap {
 			true
 		);
 
-		// Speculation Rules API emitter - prerender translation targets on
-		// switcher hover. Experimental, opt-in. Only emits when the current
-		// page has translation alternates.
+		// Speculation Rules emitter: prerenders translation targets on switcher hover. Opt-in.
 		$plugin->register(
 			'speculation_rules',
 			fn( Plugin $p ) => new Frontend\SpeculationRulesEmitter(
@@ -2934,9 +1934,8 @@ final class Bootstrap {
 			true
 		);
 
-		// data-nosnippet wrapper: wraps the content whenever the rendered
-		// singular post's language differs from the URL's language - in
-		// practice the show_default branch of missing_translation_action.
+		// data-nosnippet wrapper when the singular post's language differs from the URL's (the
+		// show_default missing-translation case).
 		$plugin->register(
 			'fallback_snippet_guard',
 			fn( Plugin $p ) => new Translation\FallbackSnippetGuard(
@@ -2971,16 +1970,12 @@ final class Bootstrap {
 			);
 		}
 
-		// NOTE: Do NOT register PostQueryFilter / TermQueryFilter here -
-		// they're in the always-registered section of boot() because admin
-		// screens (Categories metabox, nav-menus Pages picker, etc.) need
-		// them too. Re-adding would fatal from Plugin::register().
+		// Not PostQueryFilter / TermQueryFilter: they are always registered above, and
+		// registering them again here would fatal.
 	}
 
 	/**
 	 * Register WP-CLI commands.
-	 *
-	 * Only loaded when WP_CLI is defined and true.
 	 *
 	 * @param Plugin $plugin Service container.
 	 * @return void
@@ -2992,18 +1987,15 @@ final class Bootstrap {
 			true
 		);
 
-		// Addon lifecycle subcommands (wp perflocale addon …). Registered
-		// as a separate service so it eagerly calls WP_CLI::add_command
-		// without being intertwined with the main PerfLocaleCommand.
+		// Add-on lifecycle subcommands (wp perflocale addon ...), a separate service.
 		$plugin->register(
 			'cli_addon',
 			fn() => new Cli\AddonCommand(),
 			true
 		);
 
-		// Per-addon settings subcommands (wp perflocale addon settings …).
-		// Registered under its own command namespace so WP-CLI groups
-		// `get` / `set` / `list` under the `settings` help layer.
+		// Per-add-on settings subcommands (wp perflocale addon settings ...), their own namespace
+		// so WP-CLI groups get/set/list under `settings`.
 		$plugin->register(
 			'cli_addon_settings',
 			fn() => new Cli\AddonSettingsCommand(),
@@ -3012,9 +2004,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Register REST API routes.
-	 *
-	 * Called on rest_api_init hook.
+	 * Register REST API routes on rest_api_init.
 	 *
 	 * @return void
 	 */
@@ -3037,20 +2027,12 @@ final class Bootstrap {
 			new Api\JobsController(),
 		];
 
-		// MT REST routes register UNCONDITIONALLY. Both handlers enforce
-		// `mt_enabled()` at request time and return a graceful `mt_disabled`
-		// 403 when off, so disabling MT mid-session no longer surfaces a
-		// confusing `rest_no_route` 404 to clients (e.g. the Block Editor
-		// toolbar caches the route at page load; if mt_enabled was flipped
-		// off in another tab between page-load and click, the request 404'd).
-		// Memory cost of always-loading two controllers + their permission /
-		// route arrays: <1 KB. Worth the better failure UX.
+		// MT routes register unconditionally: the handlers check mt_enabled() per request and
+		// answer `mt_disabled`, not `rest_no_route`, to an editor that cached the route.
 		$controllers[] = new Api\MachineTranslateController();
 		$controllers[] = new Api\BlockTranslateController();
 
-		// Only register the public edge-config endpoint when edge
-		// integration is explicitly enabled. Keeps the REST surface
-		// minimal on sites that don't use a Worker / Edge runtime.
+		// The public edge-config endpoint exists only when edge integration is enabled.
 		if ( Plugin::get_instance()->get( 'settings' )->edge_integration_enabled() ) {
 			$controllers[] = new Api\ConfigController();
 		}
@@ -3064,21 +2046,11 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Hold back a bulk language tool while imported data is missing or an
-	 * import runs.
+	 * Hold back a bulk language tool while imported data is missing or an import runs.
 	 *
-	 * Assign Default Language, Generate Missing Translations, Create Taxonomy
-	 * Translations and Create page translations, run before WPML, Polylang or
-	 * TranslatePress data is imported, give that plugin's translations the
-	 * default language and create duplicate drafts beside them. While such
-	 * data is not imported, or the last import of it did not finish, the
-	 * tool answers with the error code
-	 * `perflocale_unimported_source` and a question; the screen asks the
-	 * operator and resends the request with `continue_unimported=1` to run it
-	 * anyway. While an import holds the import lock the tool answers
-	 * `perflocale_import_running`.
-	 *
-	 * Each handler calls it right after its own nonce and capability checks.
+	 * Run before a WPML, Polylang or TranslatePress import, these tools would give that data the
+	 * default language. The screen confirms `perflocale_unimported_source` and resends with
+	 * `continue_unimported=1`. Call after the handler's nonce and capability checks.
 	 *
 	 * @return bool True when the handler may run; false after a JSON error was sent.
 	 */
@@ -3124,11 +2096,9 @@ final class Bootstrap {
 	}
 
 	/**
-	 * AJAX handler: create WooCommerce page translations for all languages.
+	 * AJAX handler: create Cart, Checkout, My Account and Shop translations in every language.
 	 *
-	 * Creates translation stubs for Cart, Checkout, My Account, and Shop
-	 * pages in every active non-default language. If machine translation is
-	 * enabled and configured, page titles are auto-translated.
+	 * Titles are machine-translated when MT is enabled and configured.
 	 *
 	 * @return void
 	 */
@@ -3174,9 +2144,8 @@ final class Bootstrap {
 			wp_send_json_error( [ 'message' => __( 'No WooCommerce pages found.', 'perflocale' ) ] );
 		}
 
-		// Set up MT if available. Titles are sent through TranslationService, so
-		// the monthly character limit and the plain-text sanitiser apply as on
-		// every other MT path, and languages travel as slugs (pt-br, not pt).
+		// MT through TranslationService, so the monthly limit and plain-text sanitiser apply and
+		// languages travel as slugs (pt-br, not pt).
 		$mt_provider = null;
 		$mt_service  = null;
 
@@ -3185,7 +2154,7 @@ final class Bootstrap {
 				$mt_service  = new MachineTranslation\TranslationService( $settings, $cache );
 				$mt_provider = $mt_service->get_provider();
 			} catch ( \Throwable $e ) {
-				// MT not configured - continue without translation.
+				// MT not configured: continue without translation.
 				$mt_service  = null;
 				$mt_provider = null;
 			}
@@ -3195,10 +2164,7 @@ final class Bootstrap {
 		$created = 0;
 		$skipped = 0;
 		$details = [];
-		// Track whether machine translation actually produced a title, so the
-		// "Titles were machine-translated" note only shows when it's true - a
-		// configured provider may still be skipped (local .mo hit, target ==
-		// default language) or fail, in which case the source title is kept.
+		// Whether MT produced any title: a configured provider may be skipped or fail.
 		$mt_used = false;
 
 		global $wpdb;
@@ -3216,8 +2182,7 @@ final class Bootstrap {
 				continue;
 			}
 
-			// A translation this click creates is published only when its
-			// source page is published and the user may publish that type.
+			// A created translation is published only when its source is and the user may publish.
 			$source_type = get_post_type_object( $source_post->post_type );
 			$may_publish = 'publish' === $source_post->post_status
 				&& $source_type instanceof \WP_Post_Type
@@ -3231,9 +2196,7 @@ final class Bootstrap {
 
 				$label = ucfirst( $key ) . ' → ' . $lang->slug;
 
-				// MT-tagged when an MT provider was resolved above; otherwise
-				// the page shell was created without translation, so Manual
-				// reflects what landed in the row.
+				// MT-tagged when a provider was resolved above; otherwise Manual.
 				$link_source = $mt_provider !== null
 					? \PerfLocale\Enum\SourceType::MachineTranslation
 					: \PerfLocale\Enum\SourceType::Manual;
@@ -3252,20 +2215,13 @@ final class Bootstrap {
 					continue;
 				}
 
-				// Translate the title: try local WP/plugin translations first, then MT.
-				// Initialize to the source title so the UPDATE below never writes
-				// an empty string when no local translation matched and MT is not
-				// configured, failed, or was already tried for this title.
+				// Title: local translations first, then MT; defaults to the source title so the UPDATE
+				// below never writes an empty string.
 				$original_title   = $source_post->post_title;
 				$translated_title = $original_title;
 
-				// Only resolve a title (local lookup, then a PAID provider call)
-				// when this row still needs one: a fresh shell, an unpublished or
-				// slug-mismatched row, or a title still equal to the source.
-				// create_translation() is idempotent, so a re-run of the bulk
-				// action lands here with the already-translated published page -
-				// re-resolving would spend an MT call per page per click for a
-				// guaranteed no-op.
+				// Resolve a title (maybe a paid MT call) only when the row still needs one:
+				// create_translation() is idempotent, so a re-run reaches finished pages too.
 				$needs_title = (
 					$new_post->post_status !== 'publish'
 					|| $new_post->post_name !== $source_post->post_name
@@ -3282,9 +2238,8 @@ final class Bootstrap {
 					if ( $local_translation !== '' ) {
 						$translated_title = $local_translation;
 					} elseif ( $mt_service !== null && get_post_meta( $new_id, self::WC_PAGE_MT_ATTEMPT_META, true ) !== $title_hash ) {
-						// A title the provider already answered for is not sent
-						// again: one it returns unchanged ("Checkout") would
-						// otherwise be billed on every run.
+						// A title the provider already answered for is not sent again (an unchanged
+						// "Checkout" would be billed on every run).
 						try {
 							$mt_titles = $mt_service->translate_batch_texts( [ $original_title ], (string) $default->slug, (string) $lang->slug, '', false, 'text' );
 							$mt_title  = sanitize_text_field( (string) ( $mt_titles[0] ?? '' ) );
@@ -3295,18 +2250,16 @@ final class Bootstrap {
 								$mt_translated_this = true;
 							}
 						} catch ( \Throwable $e ) {
-							// Keep the original title on failure, including a
-							// refusal by the monthly character limit.
+							// Keep the original title on failure, including a monthly-limit refusal.
 							$translated_title = $original_title;
 						}
 					}
 				} else {
-					// Existing translated title is authoritative on re-runs.
+					// An existing translated title wins on re-runs.
 					$translated_title = $new_post->post_title;
 				}
 
-				// Matching slug and translated title. A translation that existed
-				// before this click keeps its status.
+				// Matching slug and translated title; a translation that existed before keeps its status.
 				$target_status = $inserted && $may_publish ? 'publish' : $new_post->post_status;
 				$needs_update  = (
 					$new_post->post_status !== $target_status
@@ -3314,8 +2267,7 @@ final class Bootstrap {
 					|| $new_post->post_title !== $translated_title
 				);
 
-				// The "Titles were machine-translated" note must reflect writes
-				// that actually happened, not provider calls that were discarded.
+				// The MT note reflects titles actually written, not discarded provider answers.
 				if ( $needs_update && $mt_translated_this ) {
 					$mt_used = true;
 				}
@@ -3369,46 +2321,11 @@ final class Bootstrap {
 	}
 
 	/**
-	 * AJAX handler: create translations for all terms in translatable taxonomies.
+	 * Release the debug query log and report whether a bulk admin run nears PHP's memory limit.
 	 *
-	 * Iterates through each translatable taxonomy, finds terms in the default
-	 * language (or unassigned terms), and creates translation stubs for every
-	 * non-default active language. Uses local WordPress translations first,
-	 * then falls back to MT if available.
-	 *
-	 * @return void
-	 */
-	/**
-	 * Release the debug query log and report whether a bulk admin run must stop
-	 * because it is approaching PHP's memory limit.
-	 *
-	 * ⭐ WHY THIS EXISTS - A REAL 500, REPRODUCED AND MEASURED.
-	 *
-	 * The Taxonomy Translations button returned HTTP 500 on a site with ~2,000
-	 * terms. Traced: `PHP Fatal error: Allowed memory size of 268435456 bytes
-	 * exhausted` inside the Redis client, after 90 created terms and 7,590
-	 * queries - memory climbing a flat 2.6 MB per created term.
-	 *
-	 * The cause was NOT the plugin's own data. `SAVEQUERIES` stores the SQL AND
-	 * a full backtrace for EVERY query in `$wpdb->queries`, and this work does
-	 * roughly 70 queries per created term. The decisive A/B, same batch, only
-	 * that array discarded as it grew:
-	 *
-	 *     as-is                    7,590 queries,  90 created, 256 MB -> FATAL
-	 *     $wpdb->queries dropped  12,266 queries, 173 created,  44 MB -> 200 OK
-	 *
-	 * More work, more queries, six times less memory. So: drop the log. It is a
-	 * debugging aid, and a bulk writer that fatals because of it helps nobody.
-	 * `num_queries` is a separate counter and is deliberately left intact, so
-	 * anything counting queries still gets the truth.
-	 *
-	 * ⚠️ A MEMORY CEILING IS A BUDGET, EXACTLY LIKE THE CLOCK. `SAVEQUERIES` was
-	 * this host's reason for running out; another host will find its own -
-	 * a large taxonomy, a verbose object cache, a profiler. Rather than pick a
-	 * smaller fixed batch and hope it fits everywhere, the caller yields when
-	 * real usage crosses 80% of the real limit and returns its cursor, so the
-	 * next request resumes. That adapts to the host instead of guessing at it,
-	 * and costs nothing when there is headroom.
+	 * Under SAVEQUERIES `$wpdb->queries` keeps SQL plus a backtrace per query, enough to fatal a
+	 * bulk run, so it is dropped (`num_queries` stays). The caller yields its cursor past the
+	 * ceiling. See docs-ai/11-code-rationale.md, "Bootstrap: bulk memory pressure".
 	 *
 	 * @param bool $release_query_log Whether to drop `$wpdb->queries` first.
 	 * @return bool True when the caller should stop and hand back its cursor.
@@ -3443,9 +2360,16 @@ final class Bootstrap {
 		return memory_get_usage( true ) > (int) ( $limit * $ceiling );
 	}
 
+	/**
+	 * AJAX handler: create translations for every term of the translatable taxonomies.
+	 *
+	 * Uses local WordPress translations first, then MT if available. Resumable: the client sends
+	 * back the cursor.
+	 *
+	 * @return void
+	 */
 	private static function ajax_create_taxonomy_translations(): void {
-		// Verify the caller before any side effects (resource-limit
-		// raises, DB scans, etc.) - nonce + capability checks first.
+		// Verify the caller before any side effect.
 		check_ajax_referer( 'perflocale_create_taxonomy_translations', '_nonce' );
 
 		if ( ! current_user_can( 'manage_options' ) ) {
@@ -3456,16 +2380,8 @@ final class Bootstrap {
 			return;
 		}
 
-		// Caller verified - now raise limits for the heavy lift. Large
-		// sites with many terms + languages can run up against php.ini
-		// max_execution_time (default 30-60s on shared hosts) even though
-		// the work is cheap per-term. A single blocking MT call per term
-		// is slow enough to blow the timeout before the handler gets to
-		// batch-translate below. `function_exists` skips cleanly when
-		// the host lists it in disable_functions.
-		// Filterable so hosts that DO want a hard cap can set one. Default
-		// 0 (no limit) only applies inside this caller-verified handler;
-		// it does NOT run on init/__construct.
+		// Caller verified: lift the time limit (filterable; default 0) and keep running on abort.
+		// Inside this handler only, never on init.
 		if ( function_exists( 'set_time_limit' ) ) {
 			/**
 			 * Time limit for the WC-pages / taxonomy-translation bulk admin handlers.
@@ -3490,40 +2406,21 @@ final class Bootstrap {
 		$languages = $lang_repo->get_active();
 		$default   = $lang_repo->get_default();
 
-		// ⚠️ RESUMABLE CURSOR, not a re-scan. This handler walked EVERY term of
-		// EVERY translatable taxonomy in one request, behind set_time_limit()
-		// and ignore_user_abort() - on a large site the gateway 504s while PHP
-		// carries on writing, so the operator sees a failure while the work is
-		// in fact still happening.
-		//
-		// A clock alone would NOT fix it: each run would restart at the first
-		// taxonomy and spend its whole budget re-skipping finished terms, so a
-		// large site could never reach the end and the client would loop
-		// forever making no progress. The caller carries the position back.
+		// Resumable cursor, not a re-scan: one request for every term would hit the gateway
+		// timeout, and restarting each run at the first taxonomy would never finish.
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
 		$tax_index = isset( $_POST['tax_index'] ) ? max( 0, (int) $_POST['tax_index'] ) : 0;
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
 		$term_offset = isset( $_POST['term_offset'] ) ? max( 0, (int) $_POST['term_offset'] ) : 0;
 
-		// ⚠️ CONCURRENCY GUARD. Two operators (or two impatient clicks) running
-		// this at once both read the same "already translated?" map, so both
-		// decide a term needs creating and both create it - duplicate terms
-		// that the unique link key cannot prevent, because the duplicate is a
-		// WP TERM, not a link row.
-		//
-		// acquire()/release() rather than Lock::with(): every exit from this
-		// handler is wp_send_json_*(), which calls die() - and die() does NOT
-		// run `finally`, so a with() wrapper would hold the lock until its TTL
-		// expired on every single successful run. The TTL is a backstop here,
-		// not the mechanism; release() is called on each exit path below.
+		// Concurrency guard: two runs would both create the same missing term (a WP term, which
+		// the unique link key cannot stop). acquire()/release(), not Lock::with(): every exit is
+		// wp_send_json_*(), whose die() skips `finally`. Release on each exit path.
 		$lock_name = 'create_term_translations';
 
 		if ( ! Concurrency\Lock::acquire( $lock_name, 120 ) ) {
-			// ⚠️ A HELD LOCK IS NOT PROOF A RUN IS ALIVE. release() only works in
-			// the process that took the lock, so a run that fataled leaves it
-			// standing for the rest of its TTL - and the operator then sees
-			// "already in progress" describing a run that died. Say how long,
-			// so a two-minute mystery becomes a two-minute wait.
+			// A held lock may belong to a run that died (release() works only in its process):
+			// say how long until it clears.
 			$held_for = Concurrency\Lock::seconds_remaining( $lock_name );
 
 			wp_send_json_error(
@@ -3550,16 +2447,13 @@ final class Bootstrap {
 		$next_offset = 0;
 
 		if ( ! $default || count( $languages ) < 2 ) {
-			// Release first: this exit is past the acquire(), and wp_send_json_*
-			// dies - without this the lock would sit until its TTL and block
-			// every retry for two minutes.
+			// Release first: wp_send_json_*() dies, and the lock would block retries until its TTL.
 			Concurrency\Lock::release( $lock_name );
 			wp_send_json_error( [ 'message' => __( 'At least two active languages are required.', 'perflocale' ) ] );
 		}
 
-		// Set up MT if available. Names are sent through TranslationService, so
-		// the monthly character limit and the plain-text sanitiser apply as on
-		// every other MT path, and languages travel as slugs (pt-br, not pt).
+		// MT through TranslationService, so the monthly limit and plain-text sanitiser apply and
+		// languages travel as slugs (pt-br, not pt).
 		$mt_provider = null;
 		$mt_service  = null;
 
@@ -3573,14 +2467,11 @@ final class Bootstrap {
 			}
 		}
 
-		// flush_all (not flush_group): clear all three cache layers before the
-		// bulk-read map. flush_group clears only L2, so a stale L3 transient
-		// would rehydrate L2 and disagree with the direct-DB prefetch below,
-		// making the idempotency check miscount existing terms as new.
+		// flush_all, not flush_group: a stale L3 transient would rehydrate L2 and disagree with
+		// the direct-DB prefetch below, miscounting existing terms as new.
 		$cache->flush_all();
 
-		// Build a bulk term → language map in one query to avoid N+1 queries.
-		// This is critical for performance with thousands of terms.
+		// One bulk term-to-language map query instead of N+1.
 		global $wpdb;
 
 		$links_table  = Database\Schema::table( 'translation_links' );
@@ -3601,15 +2492,9 @@ final class Bootstrap {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// $term_lang_map      : term_id → language slug (what language is this term in?)
-		// $term_group_map     : term_id → group_id    (which group does this term belong to?)
-		// $group_lang_map     : group_id → lang_slug → term_id
-		// (for a given group, which term represents each language?)
-		// Idempotency check in the inner loop is:
-		// isset( $group_lang_map[ $group_of_source ][ $target_lang ] )
-		// Without this, create_translation()'s own "already exists" short-circuit
-		// returns the same int either way and the caller counted existing
-		// translations as newly-created on every click.
+		// term_lang_map: term_id to language slug; term_group_map: term_id to group_id;
+		// group_lang_map: group_id to slug to term_id. The idempotency check uses the last,
+		// since create_translation() returns the same int for an existing translation.
 		$term_lang_map  = [];
 		$term_group_map = [];
 		$group_lang_map = [];
@@ -3632,25 +2517,21 @@ final class Bootstrap {
 		$taxonomy_details = [];
 		$mt_used          = false;
 
-		// Pre-cache local translations per locale to avoid repeated switch_to_locale() calls.
-		// Cache: locale → original_name → translated_name.
+		// Local translations per locale (locale to original to translated), to avoid repeated
+		// switch_to_locale() calls.
 		$local_cache = [];
 
-		// Collected MT rename-jobs (lang_slug → taxonomy → new_term_id =>
-		// source_name). A batched second pass runs one MT call per (lang,
-		// taxonomy) chunk-of-50 instead of one blocking call per term, which
-		// keeps large taxonomies under PHP's max_execution_time.
+		// MT rename jobs (lang slug to taxonomy to new term_id => source name), translated in a
+		// batched second pass of 50 per call instead of one blocking call per term.
 		$mt_pending = [];
 
-		// Defer term counting until all inserts are done - avoids expensive
-		// wp_update_term_count() calls per wp_insert_term().
+		// Defer term counting until all inserts are done.
 		wp_defer_term_counting( true );
 
 		$taxonomies = array_values( $taxonomies );
 
 		foreach ( $taxonomies as $tax_i => $taxonomy ) {
-			// Resume: a taxonomy the previous run finished is skipped
-			// outright, so every run starts where the last one stopped.
+			// Resume: skip taxonomies the previous run finished.
 			if ( $tax_i < $tax_index ) {
 				continue;
 			}
@@ -3694,9 +2575,8 @@ final class Bootstrap {
 					continue;
 				}
 
-				// Assign default language if not set. set_term_language also
-				// creates a group for this term, so re-query the group id so
-				// the idempotency check below can see it.
+				// Assign the default language if unset; this creates a group, so re-read its id for
+				// the idempotency check below.
 				if ( $lang_slug === null ) {
 					if ( ! $term_manager->set_term_language( $tid, $default->slug ) ) {
 						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; the term batch continues with remaining terms.
@@ -3718,19 +2598,14 @@ final class Bootstrap {
 						continue;
 					}
 
-					// Idempotency: the source term's group already has a
-					// sibling for this language → that's "existed", not a
-					// fresh create. This is what makes repeated clicks of
-					// the button report "0 created, N existed" instead of
-					// re-reporting the same N as newly-created each time.
+					// Idempotency: the group already has this language, so it "existed" (repeated
+					// clicks report 0 created).
 					if ( $group_id !== null && isset( $group_lang_map[ $group_id ][ $lang->slug ] ) ) {
 						++$tax_skipped;
 						continue;
 					}
 
-					// Same MT-vs-Manual decision as the post path above -
-					// the term-translation row reflects whether MT actually
-					// ran during this batch.
+					// MT-tagged when a provider was resolved, as on the post path.
 					$term_source = $mt_provider !== null
 						? \PerfLocale\Enum\SourceType::MachineTranslation
 						: \PerfLocale\Enum\SourceType::Manual;
@@ -3742,14 +2617,9 @@ final class Bootstrap {
 						continue;
 					}
 
-					// Safety net: if create_translation returned a term it did
-					// not insert, or a term_id that was already present in our
-					// bulk-read map at the start of this run, the translation
-					// already existed (covers edge cases where our group-aware
-					// pre-check couldn't see it - e.g. another request created
-					// it meanwhile, a stale-cache rehydrate or a prior
-					// corruption where the source term had multiple group
-					// memberships). Its name is left as it is.
+					// Safety net: a term create_translation() did not insert, or one already in the
+					// start-of-run map, already existed (another request, stale cache, or a source in
+					// several groups). Its name stays.
 					if ( ! $inserted || isset( $term_lang_map[ $new_id ] ) ) {
 						++$tax_skipped;
 						continue;
@@ -3758,9 +2628,7 @@ final class Bootstrap {
 					// Track the new term in our map.
 					$term_lang_map[ $new_id ] = $lang->slug;
 
-					// Keep the group-aware map in sync so sibling terms
-					// processed later in the same run see this translation
-					// already exists.
+					// Keep the group map in sync for sibling terms later in this run.
 					if ( $group_id === null ) {
 						$group_id = $term_manager->get_group_id_for_term( $tid );
 						if ( $group_id !== null ) {
@@ -3773,12 +2641,8 @@ final class Bootstrap {
 						$group_lang_map[ $group_id ][ $lang->slug ] = $new_id;
 					}
 
-					// Local-translation lookup (fast, no network). WP core's
-					// .mo files ship translations for common strings like
-					// "Uncategorized", so this short-circuits the MT path
-					// for free and prevents "Uncategorized" from becoming
-					// "Безкатегория" via MT when the WP-core Bulgarian .mo
-					// already has a curated translation.
+					// Local translations first (no network): core's .mo files carry curated names such
+					// as "Uncategorized", which MT must not replace.
 					if ( ! isset( $local_cache[ $lang->locale ][ $term->name ] ) ) {
 						$local_cache[ $lang->locale ][ $term->name ] = self::find_local_translation( $term->name, $lang->locale );
 					}
@@ -3792,10 +2656,7 @@ final class Bootstrap {
 							error_log( sprintf( 'PerfLocale migration: wp_update_term name localization failed for term %d: %s', (int) $new_id, $name_result->get_error_message() ) );
 						}
 					} elseif ( $mt_service !== null ) {
-						// Defer MT to a batched second pass. See $mt_pending:
-						// one call per chunk instead of one serial HTTP call
-						// per term keeps large taxonomies under PHP's
-						// max_execution_time.
+						// Deferred to the batched MT pass (see $mt_pending).
 						$mt_pending[ $lang->slug ][ $taxonomy ][ (int) $new_id ] = $term->name;
 					}
 
@@ -3804,14 +2665,9 @@ final class Bootstrap {
 
 				++$in_tax;
 
-				// The atomic unit is a TERM, not a language: the cursor may only
-				// pass a term once every language has been attempted for it, or
-				// a resumed run would skip languages silently.
-				// ⚠️ TIME OR MEMORY. The memory arm is what stops this handler
-				// FATALING instead of yielding on a host whose limit this batch
-				// cannot fit in - see bulk_memory_pressure(). Both arms stop the
-				// same way, by handing the cursor back so the next request
-				// resumes exactly here.
+				// The cursor passes a term only after every language was attempted for it, or a
+				// resumed run would skip languages. Time or memory (bulk_memory_pressure()) both
+				// stop by handing the cursor back.
 				if ( ( microtime( true ) - $started_at ) >= $budget_seconds || self::bulk_memory_pressure() ) {
 					$hit_budget = true;
 					break;
@@ -3831,7 +2687,7 @@ final class Bootstrap {
 				$next_index  = $tax_i;
 				$next_offset = $base_offset + $page_count;
 			} else {
-				// Taxonomy exhausted - the next run starts at the next one.
+				// Taxonomy exhausted: the next run starts at the next one.
 				$next_index  = $tax_i + 1;
 				$next_offset = 0;
 			}
@@ -3853,14 +2709,10 @@ final class Bootstrap {
 			}
 		}
 
-		// Flush deferred term counts now that all inserts are done.
+		// Flush the deferred term counts.
 		wp_defer_term_counting( false );
 
-		// ─── Second pass: batched MT rename of the pending term translations.
-		// One MT HTTP call per (target-lang, taxonomy, 50-term chunk) instead
-		// of one call per term per language. DeepL and Google both accept
-		// arrays of up to 50 strings per request; this collapses hundreds of
-		// serial API calls into single-digit batch calls.
+		// Second pass: batched MT rename, one call per (language, taxonomy, 50-term chunk).
 		if ( $mt_service !== null && ! empty( $mt_pending ) ) {
 			foreach ( $mt_pending as $lang_slug => $by_taxonomy ) {
 				foreach ( $by_taxonomy as $taxonomy => $pending_terms ) {
@@ -3868,9 +2720,7 @@ final class Bootstrap {
 					$name_map     = [];
 
 					foreach ( array_chunk( $source_names, 50 ) as $chunk ) {
-						// Each chunk is checked against the monthly character
-						// limit before it is sent; a refused chunk keeps its
-						// source names.
+						// Each chunk is checked against the monthly limit; a refused one keeps its source names.
 						try {
 							$translated_chunk = $mt_service->translate_batch_texts(
 								$chunk,
@@ -3934,7 +2784,7 @@ final class Bootstrap {
 			$message .= ' ' . __( 'Term names were machine-translated.', 'perflocale' );
 		}
 
-		// Released BEFORE the response, because wp_send_json_success() dies.
+		// Release before the response: wp_send_json_success() dies.
 		Concurrency\Lock::release( $lock_name );
 
 		wp_send_json_success(
@@ -3943,8 +2793,7 @@ final class Bootstrap {
 				'created'          => $created,
 				'skipped'          => $skipped,
 				'taxonomy_details' => $taxonomy_details,
-				// The caller hands these straight back, so the next run starts
-				// exactly where this one stopped rather than re-scanning.
+				// The caller sends these back, so the next run resumes here.
 				'more'             => $more,
 				'tax_index'        => $next_index,
 				'term_offset'      => $next_offset,
@@ -3955,34 +2804,10 @@ final class Bootstrap {
 	/**
 	 * AJAX handler: create the missing translation drafts for existing content.
 	 *
-	 * ⭐ WHY THIS EXISTS. Until now there was NO bulk, non-machine-translation
-	 * way to make translations exist. Every creation path in the plugin handles
-	 * exactly one (source, language) pair, and the automatic path fails six
-	 * separate ways - `auto_create_stubs` is off by default, it is bound once at
-	 * boot so enabling it is not retroactive, it is publish-only and
-	 * first-transition-only, it BAILS PERMANENTLY once a group has any
-	 * translation (so partial coverage can never be completed), there is no
-	 * backfill anywhere, and it depends on the post type being in a memo that
-	 * has been poisoned before. With machine translation off, the only route to
-	 * translating a few thousand Contact Form 7 forms was a few thousand
-	 * individual nonce'd requests.
-	 *
-	 * ⚠️ THIS IS A WRITE PATH THAT CREATES POSTS, so the guards matter more than
-	 * the feature:
-	 *   - drafts only. `create_translation()` inserts as draft/pending per the
-	 *     Default Translation Status setting, so nothing becomes publicly
-	 *     visible as a side effect of pressing a button.
-	 *   - content is NOT copied. An empty draft is an obvious "not done yet";
-	 *     a copy of the source reads as a finished translation that happens to
-	 *     be in the wrong language, which is worse.
-	 *   - never machine translation. That spends money and belongs behind the
-	 *     explicit bulk-MT action.
-	 *   - idempotent. An existing translation is skipped, so pressing the button
-	 *     twice creates nothing the second time.
-	 *   - authorized per source, with the checks of every other create path;
-	 *     a refused pair is counted in `skipped_permission`.
-	 *   - bounded and resumable, on the same cursor contract as the other bulk
-	 *     admin actions, so a large site cannot 504 while PHP keeps writing.
+	 * The bulk, non-MT way to make translations exist. A write path that creates posts, so:
+	 * drafts only (the Default Translation Status), content not copied (an empty draft reads as
+	 * unfinished), never MT, idempotent, authorized per source (refusals in `skipped_permission`),
+	 * and bounded and resumable on the bulk cursor contract.
 	 *
 	 * @return void
 	 */
@@ -3990,7 +2815,7 @@ final class Bootstrap {
 		check_ajax_referer( 'perflocale_generate_missing_translations', '_nonce' );
 
 		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
-			wp_send_json_error( [ 'message' => __( 'Insufficient permissions.', 'perflocale' ) ] );
+			wp_send_json_error( [ 'message' => __( 'Insufficient permissions.', 'perflocale' ) ], 403 );
 		}
 
 		if ( ! self::guard_bulk_tool() ) {
@@ -4020,12 +2845,9 @@ final class Bootstrap {
 
 		$lock_name = 'generate_missing_translations';
 
-		// See ajax_create_taxonomy_translations() for why this is
-		// acquire()/release() and not Lock::with(): wp_send_json_*() dies, and
-		// die() does not run `finally`.
+		// Manual acquire and release, not a with() wrapper: see the taxonomy translations handler.
 		if ( ! Concurrency\Lock::acquire( $lock_name, 120 ) ) {
-			// See ajax_create_taxonomy_translations(): a lock left by a crashed
-			// run is indistinguishable from a live one, so report the wait.
+			// A lock left by a crashed run looks live: report the wait.
 			$held_for = Concurrency\Lock::seconds_remaining( $lock_name );
 
 			wp_send_json_error(
@@ -4043,11 +2865,7 @@ final class Bootstrap {
 
 		$types = array_values( $settings->get_translatable_post_types() );
 
-		// ⭐ OPTIONAL SCOPING. Without it this is an all-or-nothing button over
-		// every translatable type - which is how it created 200 drafts of real
-		// content the first time it was exercised. An operator who only wants
-		// their contact forms translated should be able to say so, and a test
-		// must be able to confine it to a fixture type instead of the whole site.
+		// Optional scoping to some post types (also lets a test confine it to a fixture type).
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
 		$requested = isset( $_POST['post_types'] ) && is_array( $_POST['post_types'] )
 			? array_values( array_filter( array_map( 'sanitize_key', wp_unslash( $_POST['post_types'] ) ) ) )
@@ -4057,9 +2875,8 @@ final class Bootstrap {
 			$types = array_values( array_intersect( $types, $requested ) );
 		}
 
-		// ⭐ COUNT-FIRST MODE. The caller asks how much work this is BEFORE any
-		// of it happens, so the confirmation can state a number instead of the
-		// operator discovering the scale afterwards. Creates nothing.
+		// Count-first mode: report the scale before any work, so the confirmation can state a
+		// number. Creates nothing.
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
 		if ( isset( $_POST['mode'] ) && 'count' === sanitize_key( wp_unslash( $_POST['mode'] ) ) ) {
 			$counts = [];
@@ -4070,8 +2887,7 @@ final class Bootstrap {
 					continue;
 				}
 
-				// Same definition of "source" as the run below, or the estimate
-				// would describe different work from the work that happens.
+				// The same "source" definition as the run below.
 				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 				$n = (int) $wpdb->get_var(
 					$wpdb->prepare(
@@ -4100,9 +2916,7 @@ final class Bootstrap {
 			wp_send_json_success(
 				[
 					'mode'    => 'count',
-					// A ceiling, not a prediction: pairs that already exist are
-					// skipped, so the real number is this or fewer. Saying "up
-					// to" is honest; quoting an exact figure would not be.
+					// A ceiling, not a prediction: existing pairs are skipped.
 					'max'     => $total,
 					'types'   => $counts,
 					'message' => sprintf(
@@ -4136,8 +2950,7 @@ final class Bootstrap {
 		$per_type     = [];
 		$hit_budget   = false;
 
-		// Pairs refused by the per-source checks below; not part of $skipped,
-		// which counts translations that already exist.
+		// Pairs refused by the per-source checks; $skipped counts existing translations.
 		$skipped_permission = 0;
 
 		foreach ( $types as $ti => $post_type ) {
@@ -4153,15 +2966,9 @@ final class Bootstrap {
 			$in_type = 0;
 			$made    = 0;
 
-			// ⚠️ Only SOURCE-language posts. `perflocale_lang` is NOT a query arg
-			// that filters this - passing it returned every post of the type,
-			// including the translations created by the previous run, so a
-			// second run enumerated 9 "sources" for 3 real ones and did three
-			// times the work. Nothing was created (every pair already existed),
-			// which is exactly why it would have gone unnoticed.
-			//
-			// Join the link table instead: a row IS a source when it carries the
-			// DEFAULT language. Ordering by ID keeps the offset stable across runs.
+			// Source-language posts only, via the link table: `perflocale_lang` is not a query arg
+			// that filters here, so it would also return earlier runs' translations. ID order keeps
+			// the offset stable across runs.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			$source_ids = $wpdb->get_col(
 				$wpdb->prepare(
@@ -4189,9 +2996,8 @@ final class Bootstrap {
 						continue;
 					}
 
-					// The checks every other create path applies: edit on the
-					// source, edit and read on the post the new translation is
-					// copied from, and the create capability of that post's type.
+					// The checks of every other create path: edit on the source, edit and read on the
+					// copy-from post, and the create capability of its type.
 					$copy_from = $manager->get_copy_source_id( $source_id, (string) $lang->slug );
 
 					if ( ! Helper::user_can_edit_object( $source_id )
@@ -4208,9 +3014,7 @@ final class Bootstrap {
 					if ( ! is_int( $new_id ) || $new_id <= 0 ) {
 						++$failed;
 					} elseif ( ! $inserted ) {
-						// Returned but not inserted by this call: it already
-						// existed, though the check above did not see it
-						// (another request can create it in between).
+						// Not inserted by this call: another request created it in between.
 						++$skipped;
 					} else {
 						++$created;
@@ -4220,14 +3024,8 @@ final class Bootstrap {
 
 				++$in_type;
 
-				// A SOURCE is the atomic unit - every target language is
-				// attempted before the cursor may pass it, or a resumed run
-				// would skip languages silently.
-				// ⚠️ TIME OR MEMORY. The memory arm is what stops this handler
-				// FATALING instead of yielding on a host whose limit this batch
-				// cannot fit in - see bulk_memory_pressure(). Both arms stop the
-				// same way, by handing the cursor back so the next request
-				// resumes exactly here.
+				// The cursor passes a source only after every language was attempted for it. Time
+				// or memory (bulk_memory_pressure()) both stop by handing the cursor back.
 				if ( ( microtime( true ) - $started_at ) >= $budget || self::bulk_memory_pressure() ) {
 					$hit_budget = true;
 					break;
@@ -4305,31 +3103,16 @@ final class Bootstrap {
 	}
 
 	/**
-	 * AJAX handler: assign the site's default language to every translatable
-	 * post/page/CPT that currently has no translation-link row.
+	 * AJAX handler: assign the default language to every translatable post without a link row.
 	 *
-	 * Pre-existing sites (installed before PerfLocale) commonly have posts
-	 * that were never linked to any language. PostQueryFilter's fallback
-	 * clause (`language = X OR object_id IS NULL`) correctly shows those
-	 * unmanaged posts in every locale, which makes language-scoped pickers
-	 * (nav-menu Pages accordion, category checklists on post.php, etc.)
-	 * appear to "leak" other-language content.
-	 *
-	 * This one-click cleanup links every unlinked post to the default
-	 * language. Posts that already have a language stay untouched - the
-	 * assumption is the user meant them. The operation is idempotent:
-	 * running it twice does nothing on the second run.
-	 *
-	 * Nothing here infers a post's actual language from its title/slug
-	 * (that kind of heuristic is noisy and unreliable). Sites with mixed-
-	 * language content need to explicitly assign other languages post by
-	 * post via the editor sidebar, or use a translation import.
+	 * Unlinked posts show in every language (PostQueryFilter's `OR object_id IS NULL`), so
+	 * language-scoped pickers look leaky. Posts with a language stay untouched; nothing infers a
+	 * language from content. Idempotent.
 	 *
 	 * @return void
 	 */
 	private static function ajax_assign_post_languages(): void {
-		// Verify the caller before any side effects (resource-limit
-		// raises, DB scans, etc.) - nonce + capability checks first.
+		// Verify the caller before any side effect.
 		check_ajax_referer( 'perflocale_assign_post_languages', '_nonce' );
 
 		if ( ! current_user_can( 'manage_options' ) ) {
@@ -4340,14 +3123,8 @@ final class Bootstrap {
 			return;
 		}
 
-		// Caller verified - raise limits so very large sites don't blow
-		// PHP max_execution_time on the first run. set_post_language()
-		// does a single small DB write per post, so this is fast - but
-		// 10 000+ posts still needs room. `function_exists` skips cleanly
-		// when the host lists it in disable_functions.
-		// Filterable so hosts that DO want a hard cap can set one. Default
-		// 0 (no limit) only applies inside this caller-verified handler;
-		// it does NOT run on init/__construct.
+		// Caller verified: lift the time limit (filterable; default 0) and keep running on abort.
+		// Inside this handler only, never on init.
 		if ( function_exists( 'set_time_limit' ) ) {
 			/**
 			 * Time limit for the WC-pages / taxonomy-translation bulk admin handlers.
@@ -4377,14 +3154,8 @@ final class Bootstrap {
 
 		$types = array_values( $settings->get_translatable_post_types() );
 
-		// ⭐ OPTIONAL SCOPING, mirroring ajax_generate_missing_translations().
-		// This is the OTHER bulk writer on the Settings screen and it was the
-		// only one that could not be confined: it always walked every
-		// translatable type. That matters twice over - an operator who only
-		// wants their forms assigned should be able to say so, and a
-		// regression test that exercises this handler on a real site MUST be
-		// able to scope it to its own fixture type rather than writing a link
-		// row for every unlinked post on the site.
+		// Optional scoping, as in ajax_generate_missing_translations() (lets a test confine it to
+		// a fixture type).
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
 		$requested = isset( $_POST['post_types'] ) && is_array( $_POST['post_types'] )
 			? array_values( array_filter( array_map( 'sanitize_key', wp_unslash( $_POST['post_types'] ) ) ) )
@@ -4402,9 +3173,7 @@ final class Bootstrap {
 		$links_table  = Database\Schema::table( 'translation_links' );
 		$groups_table = Database\Schema::table( 'translation_groups' );
 
-		// Look up unlinked posts in a single query per post type - explicit
-		// LEFT JOIN to the 'post'-type translation_group. Posts whose group
-		// row is NULL have never been linked.
+		// Unlinked posts, one query per post type: LEFT JOIN to the 'post' group; NULL means never linked.
 		$manager        = new Translation\PostTranslationManager( $cache, $settings );
 		$per_type       = [];
 		$total_assigned = 0;
@@ -4417,13 +3186,8 @@ final class Bootstrap {
 		$batch_size     = max( 1, (int) apply_filters( 'perflocale/assign_languages/batch_size', 500 ) );
 
 		foreach ( $types as $post_type ) {
-			// Find posts with NO valid post-type translation link. The
-			// previous LEFT JOIN approach expanded to one row per link, so
-			// a post with one good link AND one orphan link (link whose
-			// group_id references a deleted/non-existent group) was
-			// returned as "unlinked" - false positive that re-assigns the
-			// already-linked post and never settles. NOT EXISTS evaluates
-			// once per post and short-circuits cleanly.
+			// Posts with no valid post-group link. NOT EXISTS, not a LEFT JOIN: a post with one good
+			// and one orphan link would otherwise count as unlinked and never settle.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table names from Schema::table(), post_type sanitized.
 			$ids = $wpdb->get_col(
 				$wpdb->prepare(
@@ -4452,18 +3216,8 @@ final class Bootstrap {
 					++$assigned;
 				}
 
-				// ⚠️ BOUNDED. This loop used to run over EVERY unassigned post of
-				// every translatable type in one request, with no LIMIT, behind
-				// set_time_limit() and ignore_user_abort(). On a large site that
-				// fails INVISIBLY: the gateway returns 504 while PHP carries on
-				// writing, so the operator sees a failure and the work is
-				// actually still happening. Stop on a clock and report what is
-				// left; the caller resumes.
-				// ⚠️ TIME OR MEMORY. The memory arm is what stops this handler
-				// FATALING instead of yielding on a host whose limit this batch
-				// cannot fit in - see bulk_memory_pressure(). Both arms stop the
-				// same way, by handing the cursor back so the next request
-				// resumes exactly here.
+				// Bounded: stop on a clock or memory pressure (bulk_memory_pressure()) and report what
+				// is left, or a large site gets a gateway 504 while PHP keeps writing. The caller resumes.
 				if ( ( microtime( true ) - $started_at ) >= $budget_seconds || self::bulk_memory_pressure() ) {
 					$hit_budget = true;
 					break;
@@ -4482,8 +3236,7 @@ final class Bootstrap {
 			}
 		}
 
-		// What is still unassigned, across every type - this is what makes the
-		// run resumable rather than merely truncated.
+		// What is still unassigned across every type: this makes the run resumable.
 		$remaining = 0;
 
 		foreach ( $types as $post_type ) {
@@ -4532,30 +3285,18 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Find a local WordPress translation for a string across all loaded textdomains.
+	 * Find a local WordPress translation for a string across all loaded text domains.
 	 *
-	 * Switches to the target locale and checks every loaded Translations object
-	 * for a match. Useful for strings that ship with plugin/theme translations
-	 * (e.g., WooCommerce page titles, default category names).
-	 *
-	 * A locale WordPress cannot switch to counts as a miss, so callers fall back
-	 * exactly as they do when no loaded domain translates the text.
+	 * A locale WordPress cannot switch to counts as a miss.
 	 *
 	 * @param string $text Original text to translate.
 	 * @param string $locale Target WordPress locale (e.g., 'de_DE', 'ar').
 	 * @return string Translated text, or empty string if no local translation found.
 	 */
 	private static function find_local_translation( string $text, string $locale ): string {
-		// switch_to_locale() returns false WITHOUT pushing a stack frame in two
-		// cases (wp-includes/class-wp-locale-switcher.php:76-83, WP 7.1): the
-		// locale already equals determine_locale(), or it is not in the list the
-		// switcher built at construction (:50) from 'en_US' plus the filterable
-		// get_available_languages() (wp-includes/l10n.php:1552-1581). In the
-		// first case the loaded translations are already the target's. In the
-		// second nothing was reloaded, so $l10n answers in the CURRENT locale -
-		// and both callers save the result as the target language's page title
-		// or term name. The failed call changed nothing, so determine_locale()
-		// here is the value core compared against.
+		// switch_to_locale() returns false without pushing a frame both when the locale is already
+		// current and when it has no language pack; in the second case $l10n answers in the current
+		// locale, and callers would save that as the target's title or name.
 		$switched = switch_to_locale( $locale );
 
 		if ( ! $switched && determine_locale() !== $locale ) {
@@ -4577,8 +3318,7 @@ final class Bootstrap {
 			}
 		}
 
-		// Pop only a frame this call pushed. On a false return the top of the
-		// stack, if any, belongs to whoever switched before this call.
+		// Pop only a frame this call pushed.
 		if ( $switched ) {
 			restore_previous_locale();
 		}
@@ -4587,10 +3327,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Add language labels to wp_dropdown_pages output.
-	 *
-	 * Appends a language code (e.g., "[EN]", "[FR]") to each page option
-	 * in dropdown selects used by Reading Settings, etc.
+	 * Add language labels ("[EN]") to wp_dropdown_pages options.
 	 *
 	 * @param string $output Dropdown HTML.
 	 * @return string Modified HTML.
@@ -4600,14 +3337,8 @@ final class Bootstrap {
 			return $output;
 		}
 
-		// Per-request memo of the page-id → language-code map. wp_dropdown_pages
-		// fires multiple times on a single Customizer / Reading-Settings
-		// render (one per dropdown, sometimes one per partial). Without the
-		// memo each call re-runs the 4-table JOIN below; with it, every call
-		// after the first is a single array lookup. Keyed by blog id because
-		// page ids are per-blog auto-increments - a network-admin render that
-		// switch_to_blog()s between dropdowns would otherwise mislabel pages
-		// with the first blog's map. Self-correcting, so no reset hook needed.
+		// Per-request memo of page id to language code (the dropdown renders several times).
+		// Keyed by blog id: a network-admin render may switch blogs between dropdowns.
 		static $page_lang_map = [];
 
 		$blog_id = get_current_blog_id();
@@ -4662,11 +3393,7 @@ final class Bootstrap {
 				$page_id = (int) $m[2];
 
 				if ( isset( $map[ $page_id ] ) ) {
-					// Escape late: $map holds language slugs read from the
-					// languages table. They are sanitize_key()'d on write, so
-					// nothing hostile can be stored today - but this string is
-					// returned straight into the dropdown's HTML, so it is
-					// escaped at the point of output regardless of what wrote it.
+					// Escape late: the slug goes straight into the dropdown's HTML.
 					return $m[1] . $m[3] . ' [' . esc_html( $map[ $page_id ] ) . ']' . $m[4];
 				}
 
@@ -4677,11 +3404,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Allow duplicate post slugs for posts that are translations of each other.
-	 *
-	 * WordPress enforces unique slugs per post type. For multilingual sites,
-	 * posts in different languages should share the same slug - uniqueness
-	 * is provided by the language prefix in the URL (/de/about/ vs /about/).
+	 * Allow duplicate post slugs across languages; the URL's language prefix keeps them apart.
 	 *
 	 * @param string $slug The slug WP wants to assign (possibly with -2, -3, etc.).
 	 * @param int    $post_id Post ID.
@@ -4699,12 +3422,8 @@ final class Bootstrap {
 		int $post_parent,
 		string $original_slug
 	): string {
-		// ⚠️ NEVER collapse a template translation's slug. This filter
-		// deliberately removes WordPress's `-2` suffix so a German page keeps
-		// a clean slug - correct for content, fatal here: a template
-		// translation's DISTINCT post_name is the only handle core's
-		// `post_name__in` lookup has, and collapsing it onto the source's
-		// makes two rows answer one query.
+		// Never collapse a template translation's slug: its distinct post_name is core's only
+		// lookup handle (`post_name__in`), and a shared one makes two rows answer one query.
 		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post_type ) ) {
 			return $slug;
 		}
@@ -4722,17 +3441,13 @@ final class Bootstrap {
 			return $slug;
 		}
 
-		// We only collapse the slug back to the original when the conflicting
-		// post(s) live in a DIFFERENT language. Same-language slug collisions
-		// must keep WP's deduplication (-2, -3) because the URLs would
-		// otherwise be identical and unroutable.
+		// Collapse only when the conflicting posts are in a different language; a same-language
+		// collision keeps WP's -N suffix, or the URLs would be identical.
 		$cache     = $plugin->get( 'cache' );
 		$manager   = new Translation\PostTranslationManager( $cache, $settings );
 		$lang_repo = new Database\Repository\LanguageRepository( $cache );
 
-		// PostTranslationManager::create_translation() sets a class-level hint
-		// before its wp_insert_post() call so this filter can know the new
-		// post's language - the translation_links row hasn't been written yet.
+		// create_translation() sets this hint before wp_insert_post(): the link row does not exist yet.
 		$current_lang = null;
 		if ( Translation\PostTranslationManager::$creating_translation_lang_slug !== null ) {
 			$current_lang = $lang_repo->find_by_slug(
@@ -4745,15 +3460,13 @@ final class Bootstrap {
 		}
 
 		if ( ! $current_lang ) {
-			// Can't tell what language we're in - be conservative.
+			// Unknown language: be conservative.
 			return $slug;
 		}
 
 		global $wpdb;
 
-		// All same-slug, same-type, non-trash siblings in the system. We need
-		// every one of them to live in a different language than ours; even
-		// one same-language conflict means WP's -N suffix has to stay.
+		// All same-slug, same-type, non-trash siblings; one same-language conflict keeps the suffix.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$conflict_ids = $wpdb->get_col(
 			$wpdb->prepare(
@@ -4775,29 +3488,24 @@ final class Bootstrap {
 		foreach ( (array) $conflict_ids as $conflict_id ) {
 			$conflict_lang = $manager->detect_post_language( (int) $conflict_id );
 
-			// Same-language conflict (or unassigned conflict treated as
-			// default): keep WP's deduplicated slug.
+			// Same-language or unassigned (treated as default) conflict: keep WP's slug.
 			if ( ! $conflict_lang || (int) $conflict_lang->id === (int) $current_lang->id ) {
 				return $slug;
 			}
 		}
 
-		// Every conflict is in a different language - safe to use the
-		// original slug; the language router prefixes the URL.
+		// Every conflict is in another language: the language router prefixes the URL.
 		return $original_slug;
 	}
 
 	/**
-	 * Remove a post's translation_links + slug/content-hash rows when the
-	 * post is permanently deleted. Fires on `before_delete_post` so the
-	 * rows are gone by the time related caches get invalidated.
+	 * Remove a permanently deleted post's translation link and slug/content-hash rows.
 	 *
 	 * @param int $post_id Post being deleted.
 	 * @return void
 	 */
 	public static function cleanup_translation_link_on_delete( int $post_id ): void {
-		// Revisions never carry translation links; skip the cache + DB lookup
-		// noise on every autosave-revision purge.
+		// Revisions never carry translation links.
 		if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
 			return;
 		}
@@ -4808,36 +3516,26 @@ final class Bootstrap {
 			return;
 		}
 
-		// The post's and its siblings' hreflang are cleared while the link
-		// still names the siblings; once it is removed, the delete_post
-		// invalidation finds only the post itself.
+		// Clear the post's and its siblings' hreflang while the link still names the siblings.
 		if ( $plugin->has( 'cache_invalidator' ) ) {
 			$plugin->get( 'cache_invalidator' )->clear_hreflang_before_unlink( $post_id );
 		}
 
-		// translation_links + group GC. Existing helper handles both.
+		// Translation link plus group GC.
 		$groups = new Database\Repository\TranslationGroupRepository( $plugin->get( 'cache' ) );
 		$groups->unlink_by_object_id( $post_id, 'post' );
 
-		// Drop the L1 lang memo for this post so any same-request caller
-		// that detected its language before the delete doesn't keep
-		// returning the now-stale value.
+		// Drop this post's language memo so same-request callers do not keep the stale value.
 		Translation\PostTranslationManager::forget_post_language( $post_id );
 
-		// Tables-exist guard so the cleanup is safe during the brief
-		// activation window where Bootstrap fires before Schema finishes
-		// provisioning, and during uninstall ordering where
-		// Schema::drop_tables may have already fired.
+		// Tables may not exist yet (activation) or any more (uninstall).
 		if ( ! Database\Schema::tables_exist() ) {
 			return;
 		}
 
 		global $wpdb;
 
-		// slug_translations rows for this post. Without this, every deleted
-		// translated post leaves N orphan rows (one per language) pointing at
-		// an ID that no longer exists. Index seek on the (object_type,
-		// object_id, language_id) UNIQUE key + small N per post.
+		// The post's slug_translations rows (one per language).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->delete(
 			Database\Schema::table( 'slug_translations' ),
@@ -4848,12 +3546,8 @@ final class Bootstrap {
 			[ '%d', '%s' ]
 		);
 
-		// content_hashes row for this post. ContentChangeDetector cleans this
-		// on its own delete hook, but it is only booted in admin/AJAX/REST/CLI
-		// contexts - a permanent delete from a front-end context would otherwise
-		// orphan the hash row. This handler is always booted, so mirror the
-		// slug_translations cleanup here. Index seek on the (object_type,
-		// object_id) UNIQUE key; perf-neutral.
+		// The post's content_hashes row: ContentChangeDetector's own delete hook is not booted on
+		// the front end, and this handler always is.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->delete(
 			Database\Schema::table( 'content_hashes' ),
@@ -4868,15 +3562,9 @@ final class Bootstrap {
 	/**
 	 * Store a sync opt-out flag sent in a REST update before the post is saved.
 	 *
-	 * The REST posts controller writes `meta` after wp_update_post() has
-	 * fired save_post, so ContentSync (save_post:20) would read the previous
-	 * flag: ticking "keep out of sync" in the block editor still pushed the
-	 * same Update's synced fields to every sibling once, and unticking it held
-	 * them back once. The classic metabox stores the flag at save_post:10.
-	 * This stores it with the same permission check and sanitising core
-	 * applies to the registered meta; core's own write later stores the same
-	 * value. A create has no siblings yet, and an autosave is not a save of
-	 * the post, so both are left to core.
+	 * REST writes `meta` after save_post, so ContentSync (save_post:20) would read the old flag
+	 * for that Update. Same permission check and sanitising as core's later write; creates and
+	 * autosaves are left to core.
 	 *
 	 * @param \stdClass|\WP_Error   $prepared_post Post prepared for the database.
 	 * @param \WP_REST_Request|null $request       Request being handled.
@@ -4916,19 +3604,12 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Boot the write-hook services the first time a write starts in a request
-	 * that was not a write context when the plugin loaded.
+	 * Boot the write-hook services on the first write of a request that was not a write context.
 	 *
-	 * Each signal fires before the hooks those services register (a post save
-	 * filters its data before save_post, a meta write runs its short-circuit
-	 * filter before the added/updated/deleted action, a term edit fires
-	 * edit_terms before edited_term, and set_object_terms runs this at a
-	 * priority below the filter's own), so the write that triggered the boot
-	 * is already handled. A scheduled post published by wp_publish_post()
-	 * passes no data filter: its `future_to_publish` boots them before its
-	 * save hooks, and ContentSync's own listener on that action runs after
-	 * the boot. A request that writes nothing builds nothing.
-	 * Deletions need no signal: their hash and link clean-up is always hooked.
+	 * Each signal fires before the hooks those services register, so the triggering write is
+	 * handled; a scheduled publish has no data filter, so `future_to_publish` boots them.
+	 * Deletions need no signal. See docs-ai/11-code-rationale.md, "Bootstrap: write services on
+	 * first write".
 	 *
 	 * @param Plugin $plugin Service container.
 	 * @return void
@@ -4974,8 +3655,7 @@ final class Bootstrap {
 	/**
 	 * Anonymise a user's background-job rows on the site they are removed from.
 	 *
-	 * Hooked to `remove_user_from_blog` in every request context: core's
-	 * wpmu_delete_user() reaches each of the user's other sites only through
+	 * Hooked in every context: wpmu_delete_user() reaches the user's other sites only through
 	 * this action, and account plugins run it from a front-end POST.
 	 *
 	 * @param int|string $user_id User being removed.
@@ -4990,10 +3670,7 @@ final class Bootstrap {
 			return;
 		}
 
-		// Site teardown: core's wp_uninitialize_site() removes every member
-		// of a site being permanently deleted AFTER SiteCleanup has dropped
-		// that site's plugin tables. Nothing is left to anonymise, and the
-		// UPDATE would only log "Table doesn't exist" per deleted site.
+		// Site teardown removes members after SiteCleanup dropped the tables: nothing to anonymise.
 		if ( $blog_id > 0 && Database\SiteCleanup::was_site_purged( $blog_id ) ) {
 			return;
 		}
@@ -5006,8 +3683,7 @@ final class Bootstrap {
 		}
 
 		try {
-			// A site where the plugin was never activated (per-site activation
-			// on a network) has no jobs table to update.
+			// A site where the plugin was never activated has no jobs table.
 			if ( Database\Schema::tables_exist() ) {
 				Background\JobState::anonymize_for_user( $user_id );
 			}
@@ -5019,20 +3695,15 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Auto-assign the default language to new translatable posts.
-	 *
-	 * Runs on save_post at priority 5 across ALL contexts (admin, REST, CLI)
-	 * so that every new post gets a language assigned immediately.
+	 * Auto-assign the default language to new translatable posts (save_post:5, every context).
 	 *
 	 * @param int      $post_id Post ID.
 	 * @param \WP_Post $post Post object.
 	 * @return void
 	 */
 	public static function auto_assign_default_language( int $post_id, ?\WP_Post $post = null ): void {
-		// WordPress re-reads the row after the write and hands the hook
-		// whatever it got, which is null when the post was deleted in the
-		// interim; some plugins also fire save_post with one argument. A
-		// non-nullable hint turned either into an uncaught TypeError.
+		// Core passes null when the post was deleted after the write, and some plugins fire
+		// save_post with one argument.
 		if ( ! $post instanceof \WP_Post ) {
 			return;
 		}
@@ -5041,8 +3712,7 @@ final class Bootstrap {
 			return;
 		}
 
-		// Skip child post types that inherit language from their parent.
-		// e.g. product_variation inherits from its parent product.
+		// Child types inherit the parent's language (product_variation).
 		if ( $post->post_type === 'product_variation' ) {
 			return;
 		}
@@ -5062,7 +3732,7 @@ final class Bootstrap {
 		$cache   = $plugin->get( 'cache' );
 		$manager = new Translation\PostTranslationManager( $cache, $settings );
 
-		// Already has a language - nothing to do.
+		// Already has a language.
 		if ( $manager->detect_post_language( $post_id ) !== null ) {
 			return;
 		}
@@ -5074,6 +3744,9 @@ final class Bootstrap {
 			return;
 		}
 
+		// The template reference rules at request end learn the post's type from here.
+		Translation\TemplateBlockRefs::note_known_type( $post_id, $post->post_type );
+
 		if ( ! $manager->set_post_language( $post_id, $default_lang->slug ) ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; the post stays unassigned and is treated as default-language by the fallback convention.
 			error_log( sprintf( 'PerfLocale: auto default-language assignment failed for new post %d.', $post_id ) );
@@ -5081,9 +3754,8 @@ final class Bootstrap {
 			return;
 		}
 
-		// Terms passed to wp_insert_post() were attached before the post had
-		// a language, so the wrong-language term swap had nothing to compare
-		// them with. Run it once now that the language is known.
+		// Terms passed to wp_insert_post() were attached before the post had a language: run the
+		// wrong-language term swap once, with the language known.
 		$term_filter = $plugin->has( 'term_assignment_filter' ) ? $plugin->get( 'term_assignment_filter' ) : null;
 
 		if ( $term_filter instanceof Translation\TermAssignmentFilter ) {
@@ -5115,17 +3787,9 @@ final class Bootstrap {
 	/**
 	 * Auto-create empty translation stubs when a post is first published.
 	 *
-	 * Creates draft posts for every active non-default language and links
-	 * them in the translation group. Only runs once per post (skips if
-	 * translations already exist).
-	 *
-	 * The publish transition fires inside wp_insert_post(), before the REST
-	 * API writes a new post's terms, featured image and meta, and before
-	 * WooCommerce writes a new product's data and type. So this only records
-	 * the post; the stubs are made once its save is complete
-	 * ({@see self::create_stubs_after_insert()}, the WooCommerce product
-	 * hooks, and a shutdown fallback for inserts that never fire
-	 * wp_after_insert_post).
+	 * The transition fires before REST and WooCommerce write terms, meta and product data, so
+	 * this only records the post; stubs are made once its save completes
+	 * ({@see self::create_stubs_after_insert()}, the WooCommerce hooks, a shutdown fallback).
 	 *
 	 * @param string   $new_status New post status.
 	 * @param string   $old_status Previous post status.
@@ -5133,10 +3797,7 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function auto_create_translation_stubs( string $new_status, string $old_status, \WP_Post $post ): void {
-		// ⚠️ No empty stubs for templates. A published-but-EMPTY translation
-		// is exactly the state that rendered a blank header, and stubs would
-		// mint one per language on every template publish - junk rows in a
-		// table the operator cannot browse.
+		// No empty stubs for templates: a published empty translation renders a blank header.
 		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post->post_type ) ) {
 			return;
 		}
@@ -5179,10 +3840,8 @@ final class Bootstrap {
 	/**
 	 * Create the stubs of a post whose save has just completed.
 	 *
-	 * A WooCommerce product is written by its data store AFTER
-	 * wp_insert_post() returns (price, categories, product type), so a
-	 * product waits for the WooCommerce hook unless that save already ran
-	 * inside this post save (the product editor saves at save_post).
+	 * A WooCommerce product waits for its data store's hook, unless that save already ran inside
+	 * this post save.
 	 *
 	 * @param int|string $post_id Post ID.
 	 * @return void
@@ -5216,9 +3875,8 @@ final class Bootstrap {
 			return;
 		}
 
-		// Saved from inside the product's own save_post (the product editor,
-		// quick edit): the language select and other save_post writers have
-		// not run yet, so wait for wp_after_insert_post.
+		// Saved inside the product's own save_post: the language select and other save_post
+		// writers have not run yet, so wait for wp_after_insert_post.
 		if ( doing_action( 'save_post' ) ) {
 			self::$stub_products_saved[ $blog_id ][ $product_id ] = true;
 
@@ -5229,9 +3887,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Create the stubs still pending at the end of the request: posts
-	 * inserted with `$fire_after_hooks = false` whose caller never fired
-	 * wp_after_insert_post, and products saved without WooCommerce's hooks.
+	 * Create the stubs still pending at request end (no wp_after_insert_post or WooCommerce hook).
 	 *
 	 * @return void
 	 */
@@ -5261,8 +3917,7 @@ final class Bootstrap {
 	/**
 	 * Create the translation stubs of one recorded post on the current blog.
 	 *
-	 * The post's language is read here, after the save, so a language set
-	 * during the save (the editor's language select) is respected.
+	 * The language is read after the save, so the editor's language select is respected.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return void
@@ -5296,15 +3951,8 @@ final class Bootstrap {
 			return;
 		}
 
-		// Lock around the existence check + per-language create_translation
-		// loop. Without this, two near-simultaneous publish transitions (e.g.
-		// quick-edit + autosave colliding, double-clicks, cron race) both
-		// pass the `count($existing) > 1` guard and both call create_translation
-		// per language; the second then waits on the first's creation locks,
-		// one language at a time, to get its translations back. With this lock
-		// the second skips the loop.
-		// 60s TTL is well above any realistic per-post stub-creation time and
-		// well below WP-Cron's 15-min hard timeout.
+		// Lock the existence check and create loop: two near-simultaneous publish transitions would
+		// both pass the `count > 1` guard. 60s TTL, below WP-Cron's 15-minute timeout.
 		Concurrency\Lock::with(
 			'auto_stubs_' . $post->ID,
 			60,
@@ -5327,8 +3975,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Blogs whose compiled translation files get one full regeneration at the
-	 * end of this request (files mode), keyed by blog id.
+	 * Blogs whose compiled translation files are fully regenerated at request end (files mode).
 	 *
 	 * @var array<int, true>
 	 */
@@ -5343,11 +3990,10 @@ final class Bootstrap {
 	public const FILES_REGENERATE_HOOK = 'perflocale_regenerate_translation_files';
 
 	/**
-	 * Queue a full file regeneration after a language update that leaves a
-	 * language without compiled files: a non-default language activated, or
-	 * the locale of an active non-default language changed. $language is the
-	 * row re-read after the write, so an update that wrote nothing (the same
-	 * row) queues nothing.
+	 * Queue a full file regeneration when a language update leaves a language without files.
+	 *
+	 * That is a non-default language activated or its locale changed; $language is re-read after
+	 * the write, so an update that wrote nothing queues nothing.
 	 *
 	 * @param mixed $language Language row after the update (null when it could not be read).
 	 * @param mixed $before   Language row before the update, as an array.
@@ -5367,12 +4013,9 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Queue one full regeneration of this blog's compiled translation files
-	 * for the end of the request, in files mode.
+	 * Queue one full regeneration of this blog's compiled files for request end (files mode).
 	 *
-	 * Debounced per request and blog: every language edit of an import or a
-	 * bulk update queues the same single run, which then sees their final
-	 * state.
+	 * Debounced per request and blog, so an import's many edits share one run on the final state.
 	 *
 	 * @return void
 	 */
@@ -5389,9 +4032,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Run the regenerations queue_files_regeneration() queued: one full
-	 * generate_all() per blog, in that blog's context, while that blog is
-	 * still in files mode.
+	 * Run the queued regenerations: one generate_all() per blog still in files mode.
 	 *
 	 * @return void
 	 */
@@ -5419,8 +4060,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Queue the background regeneration after a plugin update, in files mode.
-	 * One pending event at a time.
+	 * Queue the background regeneration after a plugin update (files mode; one pending event).
 	 *
 	 * @return void
 	 */
@@ -5435,8 +4075,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Handler of FILES_REGENERATE_HOOK: one full regeneration, while the site
-	 * is still in files mode.
+	 * Handler of FILES_REGENERATE_HOOK: one full regeneration while still in files mode.
 	 *
 	 * @return void
 	 */
@@ -5458,9 +4097,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Full regeneration of the current blog's compiled translation files. A
-	 * failure is logged: it must not break the request or the language save
-	 * that asked for it.
+	 * Full regeneration of the current blog's compiled files; a failure is logged, never thrown.
 	 *
 	 * @return void
 	 */
@@ -5474,280 +4111,33 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Cron hook for deferred auto-translation.
-	 *
-	 * Public so Deactivator can clear it on deactivation.
+	 * Hook of the auto-translate events 1.0.7.3 and earlier scheduled; each now queues a job.
 	 */
 	public const AUTO_TRANSLATE_CRON = 'perflocale_auto_translate_post';
 
 	/**
-	 * Schedule auto-translation for a newly published post via WP-Cron.
-	 *
-	 * Deferred to a background job so publishing is never blocked by
-	 * slow or failing translation API calls. Without this, a down API
-	 * with 3 retries × N languages could block the publish for 20+ seconds.
-	 * The job runs in a later request, when the stubs (created once the
-	 * publishing save completes) already exist; when it finds a language
-	 * without one, it creates the translation itself.
+	 * transition_post_status: queue auto-translation of a newly published post (Background\Jobs\AutoTranslateJob).
 	 *
 	 * @param string   $new_status New post status.
 	 * @param string   $old_status Previous post status.
-	 * @param \WP_Post $post Post object.
+	 * @param \WP_Post $post       Post object.
 	 * @return void
 	 */
 	public static function auto_translate_on_publish( string $new_status, string $old_status, \WP_Post $post ): void {
-		// ⚠️ Never machine-translate raw block markup. A template's content is
-		// `<!-- wp:… {"json":"here"} -->` delimiters; sending those to a
-		// provider risks corrupting the markup, and costs provider budget on
-		// every Site Editor save.
-		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post->post_type ) ) {
-			return;
-		}
-
-		if ( $new_status !== 'publish' || $old_status === 'publish' ) {
-			return;
-		}
-
-		if ( wp_is_post_revision( $post->ID ) || wp_is_post_autosave( $post->ID ) ) {
-			return;
-		}
-
-		$plugin = Plugin::get_instance();
-
-		if ( ! $plugin->has( 'settings' ) || ! $plugin->has( 'cache' ) ) {
-			return;
-		}
-
-		$settings = $plugin->get( 'settings' );
-
-		if ( ! in_array( $post->post_type, $settings->get_translatable_post_types(), true ) ) {
-			return;
-		}
-
-		$cache     = $plugin->get( 'cache' );
-		$manager   = new Translation\PostTranslationManager( $cache, $settings );
-		$lang_repo = new Database\Repository\LanguageRepository( $cache );
-		$default   = $lang_repo->get_default();
-
-		if ( ! $default ) {
-			return;
-		}
-
-		// Only auto-translate default-language posts.
-		$post_lang = $manager->detect_post_language( $post->ID );
-
-		if ( $post_lang && $post_lang->slug !== $default->slug ) {
-			return;
-		}
-
-		// The job runs without a user; what it cannot save is shown to the
-		// user publishing now.
-		Admin\MtCreateNotice::remember_publisher( (int) $post->ID );
-
-		// Defer to async runner - Action Scheduler when available
-		// (immediate claim, no per-minute cron tick wait), WP-Cron otherwise.
-		if ( ! Background\BackgroundEvents::is_scheduled( self::AUTO_TRANSLATE_CRON, [ $post->ID ] ) ) {
-			Background\BackgroundEvents::enqueue( self::AUTO_TRANSLATE_CRON, [ $post->ID ] );
+		if ( 'publish' === $new_status && 'publish' !== $old_status ) {
+			Background\Jobs\AutoTranslateJob::on_publish( $post );
 		}
 	}
 
 	/**
-	 * Process deferred auto-translation for a single post.
+	 * AUTO_TRANSLATE_CRON: run an event an earlier version scheduled as a job.
 	 *
-	 * A refusal, and each language whose machine translation failed or was
-	 * refused by a save guard, is shown once on the post's edit screen to
-	 * the user who published it (the post's author when nobody did); see
-	 * Admin\MtCreateNotice. The debug log line stays.
-	 *
-	 * @param int $post_id Post ID to translate.
+	 * @param int $post_id Post ID.
+	 * @param int $attempt Handoffs tried before.
 	 * @return void
 	 */
-	public static function process_auto_translate( int $post_id ): void {
-		$plugin = Plugin::get_instance();
-
-		if ( ! $plugin->has( 'settings' ) || ! $plugin->has( 'cache' ) ) {
-			return;
-		}
-
-		// Early-exit if the source post was deleted between cron-schedule and
-		// cron-run; without this the loop logs a "Source post not found" error
-		// per language for one benign race.
-		$source = get_post( $post_id );
-
-		if ( ! $source instanceof \WP_Post ) {
-			return;
-		}
-
-		// A password-protected post is sent only when the
-		// perflocale/mt/send_password_protected filter allows it.
-		if ( ! MachineTranslation\TranslationService::may_send_post( $source, 'auto_publish' ) ) {
-			self::remember_auto_translate_failures(
-				$source,
-				[
-					[
-						'reason'   => __( 'The post is password-protected, and machine translation does not send password-protected posts when they are published.', 'perflocale' ),
-						'own'      => false,
-						'language' => '',
-					],
-				]
-			);
-			return;
-		}
-
-		// The job was queued at publish; a source that is no longer published
-		// is not sent.
-		if ( 'publish' !== $source->post_status ) {
-			return;
-		}
-
-		// Prevent two WP-Cron workers from double-translating the same post
-		// (e.g. a quick-edit toggle firing two near-simultaneous publish hooks,
-		// or a cron runner with overlapping tick windows). TTL of 120 s covers
-		// the maximum expected wall-clock time for one post across all languages.
-		if ( ! Concurrency\Lock::acquire( 'auto_translate_' . $post_id, 120 ) ) {
-			return;
-		}
-
-		try {
-			$settings  = $plugin->get( 'settings' );
-			$cache     = $plugin->get( 'cache' );
-			$lang_repo = new Database\Repository\LanguageRepository( $cache );
-			$default   = $lang_repo->get_default();
-
-			if ( ! $default || ! $settings->mt_enabled() ) {
-				return;
-			}
-
-			// The job was queued at publish, which can come before the post
-			// is given its language (an importer assigns it after the
-			// insert). Only a default-language source is translated from.
-			$manager   = new Translation\PostTranslationManager( $cache, $settings );
-			$post_lang = $manager->detect_post_language( $post_id );
-
-			if ( $post_lang && ( $post_lang->slug ?? '' ) !== ( $default->slug ?? '' ) ) {
-				return;
-			}
-
-			$service   = new MachineTranslation\TranslationService( $settings, $cache );
-			$languages = $lang_repo->get_active();
-
-			// Explicit target subset stored in mt_auto_translate_languages
-			// limits the fan-out; the empty default means "every active
-			// language" (and automatically includes languages added later).
-			$scope = (array) $settings->get( 'mt_auto_translate_languages', [] );
-
-			$translations = $manager->get_translations( $post_id );
-			$failures     = [];
-
-			foreach ( $languages as $lang ) {
-				if ( $lang->slug === $default->slug ) {
-					continue;
-				}
-
-				if ( $scope !== [] && ! in_array( $lang->slug, $scope, true ) ) {
-					continue;
-				}
-
-				// Never overwrite a human-touched translation: a republish of
-				// the source fires this whole flow again, and translate_post's
-				// update path would put raw MT over a live, human-refined
-				// sibling. Auto-MT may only fill languages with no translation
-				// yet or an untouched stub - stubs are created with EMPTY
-				// content, so non-empty content means a person (or a prior MT
-				// run the translator may since have edited) owns the text.
-				// The source_type link column cannot discriminate here: auto
-				// stubs are recorded as Manual and translate_post never
-				// upgrades provenance.
-				$existing_id = (int) ( $translations[ $lang->slug ] ?? 0 );
-				$should      = true;
-
-				// The post's own slot: translating it would overwrite the
-				// source with a same-language rewrite of itself.
-				if ( $existing_id === $post_id ) {
-					continue;
-				}
-
-				if ( $existing_id > 0 ) {
-					$existing = get_post( $existing_id );
-					$should   = ! $existing || (string) $existing->post_content === '';
-				}
-
-				/**
-				 * Whether the auto-translate flow may (re)translate this
-				 * language for this post. Return true to force re-MT of an
-				 * already-filled translation, false to skip a language.
-				 *
-				 * @hook perflocale/mt/should_auto_translate
-				 * @param bool   $should      Computed decision (skip non-empty translations).
-				 * @param int    $post_id     Source post ID.
-				 * @param string $lang_slug   Target language slug.
-				 * @param int    $existing_id Existing translation post ID (0 = none).
-				 */
-				if ( ! (bool) apply_filters( 'perflocale/mt/should_auto_translate', $should, $post_id, (string) $lang->slug, $existing_id ) ) {
-					continue;
-				}
-
-				// The source can be unpublished while earlier languages run; the
-				// status is read from the table, not from this process's cache.
-				$db = $GLOBALS['wpdb'] ?? null;
-
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One primary-key read per language.
-				if ( ! $db instanceof \wpdb || 'publish' !== $db->get_var( $db->prepare( 'SELECT post_status FROM %i WHERE ID = %d', $db->posts, $post_id ) ) ) {
-					break;
-				}
-
-				try {
-					$service->translate_post( $post_id, $lang->slug );
-				} catch ( \Throwable $e ) {
-					// The common benign cases (post deleted mid-cron, stub
-					// reused) are neither logged nor shown, so debug.log
-					// stays usable for real failures.
-					$msg    = $e->getMessage();
-					$benign = str_contains( $msg, 'Source post not found' )
-						|| str_contains( $msg, 'Invalid post ID' )
-						|| str_contains( $msg, 'Невалидно ID' );
-
-					if ( ! $benign ) {
-						if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-							error_log( 'PerfLocale auto-translate failed for ' . $lang->slug . ': ' . $msg ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-						}
-
-						$lang_vars  = get_object_vars( $lang );
-						$lang_name  = $lang_vars['name'] ?? '';
-						$failures[] = [
-							'reason'   => $msg,
-							'own'      => $e instanceof MachineTranslation\NotSavedException,
-							'language' => is_string( $lang_name ) && '' !== $lang_name ? $lang_name : ( is_string( $lang_vars['slug'] ?? null ) ? $lang_vars['slug'] : '' ),
-						];
-					}
-				}
-			}
-
-			self::remember_auto_translate_failures( $source, $failures );
-		} finally {
-			Concurrency\Lock::release( 'auto_translate_' . $post_id );
-		}
-	}
-
-	/**
-	 * Record what an auto-translate on publish run could not save, for the
-	 * user who published the post, or for its author when nobody did (a
-	 * scheduled publish, WP-CLI): the author answers for the post, and the
-	 * notice is shown only to a user who can edit it. A run with no failures
-	 * removes an earlier run's record.
-	 *
-	 * @param \WP_Post                         $source   The published post.
-	 * @param array<int, array<string, mixed>> $failures Failures, in language order (see MtCreateNotice::remember_publish()).
-	 * @return void
-	 */
-	private static function remember_auto_translate_failures( \WP_Post $source, array $failures ): void {
-		$user_id = Admin\MtCreateNotice::take_publisher( (int) $source->ID );
-
-		if ( $user_id <= 0 ) {
-			$user_id = (int) $source->post_author;
-		}
-
-		Admin\MtCreateNotice::remember_publish( $user_id, (int) $source->ID, $failures );
+	public static function process_auto_translate( int $post_id, int $attempt = 0 ): void {
+		Background\Jobs\AutoTranslateJob::from_legacy_event( $post_id, $attempt );
 	}
 
 	/**
@@ -5759,14 +4149,12 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function auto_assign_default_term_language( int $term_id, int $tt_id, string $taxonomy, array $args = [] ): void {
-		// Skip WP-internal taxonomies that should never be translated.
+		// Skip WP-internal taxonomies.
 		if ( in_array( $taxonomy, [ 'nav_menu', 'link_category', 'post_format', 'wp_theme', 'wp_template_part_area' ], true ) ) {
 			return;
 		}
 
-		// If the user explicitly selected a language via the term form,
-		// defer to the AJAX save handler which runs on created_{taxonomy}
-		// - don't override with the default language.
+		// A language chosen in the term form is saved by the created_{taxonomy} handler.
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing
 		if ( ! empty( $_POST['perflocale_term_language'] ) ) {
 			return;
@@ -5787,7 +4175,7 @@ final class Bootstrap {
 		$cache   = $plugin->get( 'cache' );
 		$manager = new Translation\TermTranslationManager( $cache );
 
-		// Already has a language - nothing to do.
+		// Already has a language.
 		if ( $manager->detect_term_language( $term_id ) !== null ) {
 			return;
 		}
@@ -5802,15 +4190,10 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Record a boot where a conflicting multilingual plugin keeps PerfLocale
-	 * from running.
+	 * Record a boot where a conflicting multilingual plugin keeps PerfLocale from running.
 	 *
-	 * None of PerfLocale's cache listeners run during such a boot, so content
-	 * changed in that time can leave cached hreflang alternates stale. The
-	 * record is DORMANT_KEY inside the autoloaded settings option, read here
-	 * without a query. Only the first dormant boot writes it, at
-	 * plugins_loaded, where every plugin and pluggable function is loaded for
-	 * the option-update listeners.
+	 * No cache listener runs then, so hreflang may go stale. Only the first dormant boot writes
+	 * DORMANT_KEY, at plugins_loaded, when the option-update listeners can run.
 	 *
 	 * @return void
 	 */
@@ -5839,26 +4222,11 @@ final class Bootstrap {
 	}
 
 	/**
-	 * On the first normal boot after a dormant one (see note_dormant_boot()),
-	 * retire the hreflang cache and drop the record.
+	 * On the first normal boot after a dormant one, retire the hreflang cache and drop the record.
 	 *
-	 * The record is read from the settings this boot has already loaded, so a
-	 * boot without it costs one array lookup.
-	 *
-	 * At plugins_loaded (priority 0), before any hreflang read,
-	 * CacheManager::invalidate_group() retires the group: a new L2 generation
-	 * and, without a persistent object cache, its transients deleted. No
-	 * public hook fires.
-	 *
-	 * At the end of init, after Action Scheduler has initialized, the record
-	 * is removed. That write runs the perflocale_settings update listeners,
-	 * which reconcile the recurring background events with the engine
-	 * JobRunnerFactory picks; before action_scheduler_init it would pick
-	 * WP-Cron on a site that runs Action Scheduler. The removal runs under the
-	 * settings lock on a fresh read of the option, so a concurrent settings
-	 * save is kept; while another save holds the lock the record stays, and
-	 * the next boot retires the group again, as it does when the request ends
-	 * before init completes.
+	 * The group is retired at plugins_loaded:0. The record goes at the end of init, after Action
+	 * Scheduler init (the settings listeners pick the engine), under the settings lock on a fresh
+	 * read. See docs-ai/11-code-rationale.md, "Bootstrap: dormant boot".
 	 *
 	 * @param Plugin $plugin Plugin container.
 	 * @return void
@@ -5913,19 +4281,14 @@ final class Bootstrap {
 	 * @return string|null Display name of the conflicting plugin, or null.
 	 */
 	private static function detect_conflicting_plugin(): ?string {
-		// Primary check: does the competitor's version constant exist? This is
-		// defined inside the competitor's main file once it has loaded.
+		// Primary check: the competitor's version constant.
 		foreach ( self::CONFLICTING_PLUGINS as $name => $meta ) {
 			if ( defined( $meta['constant'] ) ) {
 				return $name;
 			}
 		}
 
-		// Fallback: check active_plugins directly. PerfLocale's main file may
-		// load BEFORE the competitor's main file (alphabetical / active_plugins
-		// order), in which case the competitor's constant isn't defined yet at
-		// the moment Bootstrap::init() runs. Reading the option covers that
-		// case - and keeps conflict detection order-independent on ALL sites.
+		// Fallback: active_plugins, for when PerfLocale loads before the competitor.
 		$active = (array) get_option( 'active_plugins', [] );
 
 		// Multisite: a competitor may be network-activated; merge that list in.
@@ -5946,10 +4309,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Register the [perflocale_language] utility shortcode.
-	 *
-	 * Outputs current language info in various formats.
-	 * Usage: [perflocale_language format="slug|locale|name|native_name|display_name|flag"]
+	 * Register the [perflocale_language] shortcode: format="slug|locale|name|native_name|display_name|flag".
 	 *
 	 * @return void
 	 */

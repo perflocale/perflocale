@@ -1,6 +1,6 @@
 <?php
 /**
- * Pre-dispatch machine-translation cost estimator.
+ * Machine-translation cost estimate before dispatch.
  *
  * @package PerfLocale
  */
@@ -17,23 +17,21 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Computes the character volume a bulk MT operation is ABOUT to send -
- * before any provider spend - so confirm dialogs can show real numbers and
- * the dispatch-time budget gate can veto over-cap jobs up front.
- *
- * Estimates are SQL reads (CHAR_LENGTH sums, and per-row lengths for meta
- * and plural rows), never N get_post() loops, so estimating a 10k-post site
- * costs a handful of indexed queries.
- *
- * Estimates are documented as APPROXIMATE, not billing-grade: placeholder
- * masking and provider-side tag wrapping (DeepL) shift billed characters
- * slightly, "Do not translate" blocks and meta values made only of
- * placeholders are counted although they are not sent, and the
- * skip-existing subtraction mirrors - but does not atomically reserve
- * against - the jobs' own skip rules. Enforcement truth remains the atomic
- * monthly usage counter.
+ * The characters a bulk machine translation will send, before any spend, for the confirm dialogs and the budget
+ * gate: SQL length sums, never a get_post() loop. Approximate (masking, provider tag wrapping, unsent placeholder-only
+ * values, a skip-existing count that reserves nothing); the monthly usage counter is what enforces.
  */
 final class CostEstimator {
+
+	/**
+	 * Longest meta value (characters) read whole when it may be serialized.
+	 */
+	private const META_WHOLE_MAX = 1024;
+
+	/**
+	 * Characters read from each end of a longer value that may be serialized.
+	 */
+	private const META_EDGE = 64;
 
 	/**
 	 * Plugin settings.
@@ -52,11 +50,8 @@ final class CostEstimator {
 	}
 
 	/**
-	 * Estimate a posts bulk translation (the BulkTranslateJob shape).
-	 *
-	 * Mirrors the job's semantics: (source, target-language) pairs that
-	 * already have a translation are SKIPPED (BulkTranslateJob never
-	 * overwrites), so their characters are subtracted from the estimate.
+	 * Estimate a posts bulk translation (BulkTranslateJob): pairs that already have a translation are skipped by the
+	 * job, so their characters are subtracted.
 	 *
 	 * @param int[] $post_ids        Source post IDs.
 	 * @param int[] $target_lang_ids Target language IDs.
@@ -72,13 +67,12 @@ final class CostEstimator {
 		$target_lang_ids = array_values( array_unique( array_filter( array_map( 'intval', $target_lang_ids ), static fn( int $i ): bool => $i > 0 ) ) );
 
 		if ( $post_ids === [] || $target_lang_ids === [] ) {
-			return $this->summarize( 0, 0, 0 );
+			return $this->summarize( 0, 0, 0 ) + self::builder_fields( 0 );
 		}
 
 		$ph = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
 
-		// Per-post character volume in ONE aggregate query (title+content+excerpt,
-		// the exact fields translate_post() sends to the provider).
+		// One aggregate query over title, content and excerpt, the fields translate_post() sends.
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
@@ -98,13 +92,8 @@ final class CostEstimator {
 			$type_by_post[ (int) $r['ID'] ]  = (string) $r['post_type'];
 		}
 
-		// Optional meta volume: the values MetaTranslator actually sends. Keys
-		// come from its own key resolution (the registry minus credential-named
-		// keys and Sync Fields mirror keys), resolved once per post TYPE (the
-		// registry's per-post expansions are ignored here - estimate-grade
-		// approximation). Per (post, key) only the first row counts, as
-		// get_post_meta( …, true ) reads it, and only when it is a non-blank
-		// string: serialized arrays and objects are never sent.
+		// Meta as MetaTranslator sends it: its own key resolution, once per post type (per-post registry expansions are
+		// ignored); the first row per (post, key), non-blank strings only.
 		$meta_translator = $include_meta && $chars_by_post !== [] ? $this->meta_translator() : null;
 
 		if ( $meta_translator !== null ) {
@@ -121,50 +110,13 @@ final class CostEstimator {
 				if ( $ids_of_type === [] ) {
 					continue;
 				}
-				$idph  = implode( ',', array_fill( 0, count( $ids_of_type ), '%d' ) );
-				$keyph = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
-
-				// `raw` is fetched only for values that may be serialized; the
-				// blank test mirrors PHP's trim() character set.
-				$meta_rows = $wpdb->get_results(
-					$wpdb->prepare(
-						"SELECT post_id, meta_key, CHAR_LENGTH(meta_value) AS chars,
-						        TRIM( REPLACE( REPLACE( REPLACE( REPLACE( REPLACE( meta_value, CHAR(9), '' ), CHAR(10), '' ), CHAR(13), '' ), CHAR(11), '' ), CHAR(0), '' ) ) = '' AS blank,
-						        CASE WHEN LEFT( meta_value, 2 ) IN ( 'a:', 'O:', 'C:', 'b:', 'i:', 'd:', 's:', 'S:', 'E:', 'N;' ) THEN meta_value ELSE NULL END AS raw
-						 FROM {$wpdb->postmeta}
-						 WHERE post_id IN ({$idph}) AND meta_key IN ({$keyph})
-						 ORDER BY meta_id ASC",
-						array_merge( $ids_of_type, $keys )
-					),
-					ARRAY_A
-				);
-
-				$seen = [];
-				foreach ( is_array( $meta_rows ) ? $meta_rows : [] as $mr ) {
-					if ( ! is_array( $mr ) ) {
-						continue;
-					}
-
-					$post_id = self::to_int( $mr['post_id'] ?? 0 );
-					$pk      = $post_id . '|' . self::to_string( $mr['meta_key'] ?? '' );
-					if ( isset( $seen[ $pk ] ) ) {
-						continue;
-					}
-					$seen[ $pk ] = true;
-
-					$raw   = $mr['raw'] ?? null;
-					$chars = self::sent_meta_chars( self::to_int( $mr['chars'] ?? 0 ), self::to_int( $mr['blank'] ?? 0 ) === 1, is_string( $raw ) ? $raw : null );
-
-					if ( $chars > 0 ) {
-						$chars_by_post[ $post_id ] = ( $chars_by_post[ $post_id ] ?? 0 ) + $chars;
-					}
+				foreach ( self::meta_chars( $ids_of_type, $keys ) as $post_id => $chars ) {
+					$chars_by_post[ $post_id ] = ( $chars_by_post[ $post_id ] ?? 0 ) + $chars;
 				}
 			}
 		}
 
-		// Which (source, language) pairs already exist - the job skips them.
-		// One join across the translation graph: every sibling language of
-		// every source post's group.
+		// Pairs that exist (the job skips them): one join over each source group's sibling languages.
 		$links_table  = Schema::table( 'translation_links' );
 		$groups_table = Schema::table( 'translation_groups' );
 		$pairs        = $wpdb->get_results(
@@ -186,9 +138,11 @@ final class CostEstimator {
 			$existing[ (int) $p['source_id'] ][ (int) $p['language_id'] ] = true;
 		}
 
-		$chars   = 0;
-		$items   = 0;
-		$skipped = 0;
+		$chars    = 0;
+		$items    = 0;
+		$skipped  = 0;
+		$layouts  = 0;
+		$builders = BuilderLayout::names_by_post( array_keys( $chars_by_post ) );
 
 		foreach ( $chars_by_post as $pid => $post_chars ) {
 			foreach ( $target_lang_ids as $lang_id ) {
@@ -198,10 +152,155 @@ final class CostEstimator {
 				}
 				$chars += $post_chars;
 				++$items;
+				$layouts += isset( $builders[ $pid ] ) ? 1 : 0;
 			}
 		}
 
-		return $this->summarize( $chars, $items, $skipped );
+		return $this->summarize( $chars, $items, $skipped ) + self::builder_fields( $layouts );
+	}
+
+	/**
+	 * The estimate's page builder fields: items whose builder layout is not sent, and the sentence for them.
+	 *
+	 * @param int $items Items.
+	 * @return array{builder_layouts: int, builder_note: string}
+	 */
+	public static function builder_fields( int $items ): array {
+		return [
+			'builder_layouts' => max( 0, $items ),
+			'builder_note'    => self::builder_note( $items ),
+		];
+	}
+
+	/**
+	 * The sentence for items whose page builder layout is not sent, or '' for none.
+	 *
+	 * @param int $items Items.
+	 * @return string
+	 */
+	public static function builder_note( int $items ): string {
+		if ( $items <= 0 ) {
+			return '';
+		}
+
+		return sprintf(
+			/* translators: %d: number of items (post and language pairs). */
+			_n( 'The page builder layout of %d item is not included: machine translation does not send it.', 'The page builder layouts of %d items are not included: machine translation does not send them.', $items, 'perflocale' ),
+			$items
+		);
+	}
+
+	/**
+	 * Meta characters MetaTranslator sends, per post, for one post type's keys.
+	 *
+	 * One SELECT; a long maybe-serialized value returns only its edges. First row per (post, key) counts.
+	 *
+	 * @param array<int, int> $ids_of_type Post IDs of the type.
+	 * @param array<string>   $keys        The type's MT meta keys.
+	 * @return array<int, int> Post ID => characters (posts with 0 left out).
+	 */
+	private static function meta_chars( array $ids_of_type, array $keys ): array {
+		global $wpdb;
+
+		$idph  = implode( ',', array_fill( 0, count( $ids_of_type ), '%d' ) );
+		$keyph = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+
+		// The blank test mirrors PHP's trim() character set.
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		$meta_rows = $wpdb->get_results(
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge(), which WPCS cannot count: the five bounds, then the IDs, then the keys.
+			$wpdb->prepare(
+				"SELECT post_id, meta_key, CHAR_LENGTH(meta_value) AS chars,
+				        TRIM( REPLACE( REPLACE( REPLACE( REPLACE( REPLACE( meta_value, CHAR(9), '' ), CHAR(10), '' ), CHAR(13), '' ), CHAR(11), '' ), CHAR(0), '' ) ) = '' AS blank,
+				        CASE WHEN LEFT( meta_value, 2 ) IN ( 'a:', 'O:', 'C:', 'b:', 'i:', 'd:', 's:', 'S:', 'E:', 'N;' ) AND CHAR_LENGTH(meta_value) <= %d THEN meta_value ELSE NULL END AS raw,
+				        CASE WHEN LEFT( meta_value, 2 ) IN ( 'a:', 'O:', 'C:', 'b:', 'i:', 'd:', 's:', 'S:', 'E:', 'N;' ) AND CHAR_LENGTH(meta_value) > %d THEN LEFT( meta_value, %d ) ELSE NULL END AS head,
+				        CASE WHEN LEFT( meta_value, 2 ) IN ( 'a:', 'O:', 'C:', 'b:', 'i:', 'd:', 's:', 'S:', 'E:', 'N;' ) AND CHAR_LENGTH(meta_value) > %d THEN SUBSTR( meta_value, -%d ) ELSE NULL END AS tail
+				 FROM {$wpdb->postmeta}
+				 WHERE post_id IN ({$idph}) AND meta_key IN ({$keyph})
+				 ORDER BY meta_id ASC",
+				array_merge( [ self::META_WHOLE_MAX, self::META_WHOLE_MAX, self::META_EDGE, self::META_WHOLE_MAX, self::META_EDGE ], $ids_of_type, $keys )
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		$out  = [];
+		$seen = [];
+		foreach ( is_array( $meta_rows ) ? $meta_rows : [] as $mr ) {
+			if ( ! is_array( $mr ) ) {
+				continue;
+			}
+
+			$post_id = self::to_int( $mr['post_id'] ?? 0 );
+			$pk      = $post_id . '|' . self::to_string( $mr['meta_key'] ?? '' );
+			if ( isset( $seen[ $pk ] ) ) {
+				continue;
+			}
+			$seen[ $pk ] = true;
+
+			$raw   = $mr['raw'] ?? null;
+			$head  = $mr['head'] ?? null;
+			$tail  = $mr['tail'] ?? null;
+			$chars = self::to_int( $mr['chars'] ?? 0 );
+
+			$blank = self::to_int( $mr['blank'] ?? 0 ) === 1;
+
+			if ( ! $blank && is_string( $head ) && is_string( $tail ) ) {
+				$chars = self::long_meta_chars( $chars, $head, $tail );
+			} else {
+				$chars = self::sent_meta_chars( $chars, $blank, is_string( $raw ) ? $raw : null );
+			}
+
+			if ( $chars > 0 ) {
+				$out[ $post_id ] = ( $out[ $post_id ] ?? 0 ) + $chars;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Characters sent for a long maybe-serialized value, decided from its edges as is_serialized_string() would;
+	 * an upper bound when the edges cannot settle it (wrong length, blank string, long number).
+	 *
+	 * @param int    $chars CHAR_LENGTH of the stored value.
+	 * @param string $head  Its first META_EDGE characters.
+	 * @param string $tail  Its last META_EDGE characters.
+	 * @return int
+	 */
+	private static function long_meta_chars( int $chars, string $head, string $tail ): int {
+		$end      = rtrim( $tail, " \t\n\r\0\x0B" );
+		$trailing = strlen( $tail ) - strlen( $end );
+
+		if ( strlen( $end ) < 2 || strlen( $head ) < 4 || ':' !== $head[1] ) {
+			return $chars;
+		}
+
+		$last = substr( $end, -1 );
+		if ( ';' !== $last && '}' !== $last ) {
+			return $chars;
+		}
+
+		$token = $head[0];
+
+		if ( 'a' === $token || 'O' === $token || 'E' === $token ) {
+			return preg_match( '/^' . $token . ':[0-9]+:/', $head ) ? 0 : $chars;
+		}
+
+		if ( 's' !== $token || '"' !== substr( $end, -2, 1 ) || ! preg_match( '/^s:[0-9]+:/', $head ) ) {
+			return $chars;
+		}
+
+		// Serialized: only a string whose header opens a quote unserializes to text.
+		if ( ';' !== $last || ! preg_match( '/^s:([0-9]+):"/', $head, $m ) ) {
+			return 0;
+		}
+
+		$text  = $chars - strlen( $m[0] ) - 2 - $trailing;
+		$bytes = (int) $m[1];
+
+		// UTF-8 text of $text characters takes $text to 4 x $text bytes.
+		return $text > 0 && $bytes >= $text && $bytes <= 4 * $text ? $text : 0;
 	}
 
 	/**
@@ -221,8 +320,7 @@ final class CostEstimator {
 			return $chars;
 		}
 
-		// A serialized STRING unserializes to text and is sent; anything else
-		// (array, object, number, bool) is structural and skipped.
+		// A serialized string unserializes to text and is sent; arrays, objects, numbers and bools are skipped.
 		if ( ! is_serialized_string( $raw ) ) {
 			return 0;
 		}
@@ -234,8 +332,7 @@ final class CostEstimator {
 	}
 
 	/**
-	 * MetaTranslator for its key resolution, or null when the cache service
-	 * is unavailable (then no meta is counted).
+	 * MetaTranslator for its key resolution, or null without the cache service (then no meta is counted).
 	 *
 	 * @return MetaTranslator|null
 	 */
@@ -270,12 +367,8 @@ final class CostEstimator {
 	}
 
 	/**
-	 * Estimate a strings bulk translation (the BulkStringTranslateJob shape).
-	 *
-	 * Mirrors the job: with skip_existing (the default) strings that already
-	 * carry a non-empty translation for a target language are subtracted; an
-	 * Overwrite run sends them too. A plural row counts every plural form the
-	 * job sends for a target language with three or more forms.
+	 * Estimate a strings bulk translation (BulkStringTranslateJob): with skip_existing, strings already translated for
+	 * a language are subtracted; a plural row counts every form sent for a language with three or more forms.
 	 *
 	 * @param int[] $string_ids      String row IDs (pre-resolved by the caller;
 	 *                               mode=filter/all callers resolve first).
@@ -308,7 +401,7 @@ final class CostEstimator {
 			ARRAY_A
 		);
 
-		// Already-translated volume per target language (skip_existing).
+		// Volume already translated per target language (skip_existing).
 		$done = $overwrite ? [] : $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT st.language_id, COUNT(*) AS cnt, COALESCE( SUM( CHAR_LENGTH(s.original) ), 0 ) AS chars
@@ -321,9 +414,7 @@ final class CostEstimator {
 			ARRAY_A
 		);
 
-		// Plural rows: the job sends one text per plural form 1..N-1 in a
-		// language with three or more forms, instead of the row's own text.
-		// ' (plural)' holds no LIKE wildcard, so it needs no escaping.
+		// Plural rows: one text per form 1..N-1 in a language with three or more forms. ' (plural)' has no LIKE wildcard.
 		$plural_found = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT id, context, original FROM %i
@@ -430,8 +521,7 @@ final class CostEstimator {
 	}
 
 	/**
-	 * Wrap a raw character count in the monthly-budget context every confirm
-	 * dialog and the dispatch gate need.
+	 * A character count with the monthly budget context the confirm dialogs and the dispatch gate need.
 	 *
 	 * @param int $chars   Characters about to be sent.
 	 * @param int $items   Translatable (source, language) work items.
@@ -449,8 +539,7 @@ final class CostEstimator {
 			'monthly_used'      => $used,
 			'monthly_limit'     => $limit,
 			'monthly_remaining' => $limit === 0 ? -1 : max( 0, $limit - $used ),
-			// Mirrors TranslationService::would_exceed_limit exactly (incl.
-			// its used >= limit early return, which matters at chars=0).
+			// As TranslationService::would_exceed_limit(), including its used >= limit answer at chars 0.
 			'would_exceed'      => $limit !== 0 && ( $used >= $limit || ( $used + $chars ) > $limit ),
 		];
 	}

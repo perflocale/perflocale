@@ -18,10 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds language selector and translation panel to taxonomy term screens.
- *
- * On the "Add New" form: shows a language dropdown.
- * On the "Edit" form: shows translation rows with status and create/edit links.
+ * Adds the language selector (Add form) and the translation rows (Edit form) to term screens.
  */
 final class TermMetaBox {
 
@@ -49,8 +46,7 @@ final class TermMetaBox {
 	/**
 	 * Register hooks for all translatable taxonomies.
 	 *
-	 * Deferred to admin_init so all addons (including WooCommerce) have booted
-	 * and their pa_* taxonomies appear in the translatable list.
+	 * On admin_init, so add-on taxonomies (WooCommerce pa_*) are already in the translatable list.
 	 *
 	 * @return void
 	 */
@@ -77,7 +73,7 @@ final class TermMetaBox {
 	/**
 	 * Render language field on the "Add New Term" form.
 	 *
-	 * @param string $taxonomy Taxonomy slug - required by the WP `{$taxonomy}_add_form_fields` hook signature; the rendered field is taxonomy-agnostic.
+	 * @param string $taxonomy Taxonomy slug (unused: hook signature).
 	 * @return void
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- WP {$taxonomy}_add_form_fields hook signature; the rendered language field is taxonomy-agnostic.
@@ -129,11 +125,7 @@ final class TermMetaBox {
 
 		wp_nonce_field( 'perflocale_term_lang', 'perflocale_term_nonce' );
 
-		// Withhold Create from a user the Create action is certain to refuse (no
-		// perflocale_translate, or no right to create a term in this taxonomy).
-		// The action also requires edit_term on the default-language term a
-		// translation is seeded from, which only the action checks. Resolved
-		// once for every row.
+		// Hide Create when the action would refuse it; the action alone also checks edit_term on the seed term.
 		$can_create = current_user_can( 'perflocale_translate' ) && \PerfLocale\Helper::user_can_create_term_like( $term->term_id );
 
 		// Translation rows.
@@ -248,17 +240,14 @@ final class TermMetaBox {
 			return;
 		}
 
-		// The edit form belongs to the term being edited. Another term saved
-		// in the same request (a translation the term sync updates) keeps its
-		// language. The add-term form carries no tag_ID.
+		// The edit form's value is for its own term (tag_ID), not a sibling the term sync saves in this request.
 		$form_term = isset( $_POST['tag_ID'] ) && is_scalar( $_POST['tag_ID'] ) ? absint( $_POST['tag_ID'] ) : 0;
 
 		if ( $form_term !== $term_id && str_starts_with( (string) current_action(), 'edited_' ) ) {
 			return;
 		}
 
-		// The term's own edit right, as core's term screens and Quick Edit use:
-		// a taxonomy can register capabilities other than manage_categories.
+		// The term's own edit right, as core uses: a taxonomy may not use manage_categories.
 		if ( ! current_user_can( 'edit_term', $term_id ) ) {
 			return;
 		}
@@ -269,10 +258,7 @@ final class TermMetaBox {
 			$manager = new TermTranslationManager( $this->cache );
 
 			if ( ! $manager->set_term_language( $term_id, $language ) ) {
-				// Same per-user one-shot transient that
-				// MetaBox::maybe_show_language_save_error() renders -
-				// admin_notices fires on term screens too, so the post
-				// metabox's renderer covers this writer.
+				// MetaBox::maybe_show_language_save_error() shows this transient on term screens too.
 				$user_id = get_current_user_id();
 
 				if ( $user_id > 0 ) {

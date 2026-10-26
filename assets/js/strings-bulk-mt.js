@@ -103,6 +103,43 @@
 	var selectAllCb       = document.querySelector( '[data-perflocale-mt-select-all]' );
 	var rowCheckboxes     = function () { return document.querySelectorAll( '.perflocale-str-mt-cb' ); };
 
+	// ─── JavaScript hooks (wp.hooks) ──────────────────────────────────
+	// Language is described in block-toolbar.js.
+
+	var hookWarned = {};
+
+	// wp.hooks.doAction in a try/catch: a callback that throws does not stop
+	// the screen. With SCRIPT_DEBUG it is reported once per hook in the console.
+	function doAction( name, context ) {
+		var hooks = window.wp && window.wp.hooks;
+
+		try {
+			if ( hooks && typeof hooks.doAction === 'function' ) {
+				hooks.doAction( name, context );
+			}
+		} catch ( e ) {
+			if ( cfg.debug && ! hookWarned[ name ] && window.console ) {
+				hookWarned[ name ] = true;
+				window.console.warn( 'PerfLocale: ' + name + ': a callback threw.' );
+			}
+		}
+	}
+
+	// The Language objects of the chosen target language ids.
+	function targetLanguages( ids ) {
+		return ( cfg.targets || [] ).filter( function ( t ) {
+			return ids.indexOf( parseInt( t.id, 10 ) ) !== -1;
+		} ).map( function ( t ) {
+			return {
+				slug:       String( t.slug ),
+				locale:     String( t.locale || '' ),
+				name:       String( t.name || '' ),
+				nativeName: String( t.nativeName || t.name || '' ),
+				isDefault:  !! t.isDefault
+			};
+		} );
+	}
+
 	// ─── Helpers ──────────────────────────────────────────────────────
 
 	function format( tpl, parts ) {
@@ -275,9 +312,40 @@
 
 			if ( data.mode === 'async' ) {
 				setStatus( i18n.queued || 'Queued.', 'success' );
+
+				var stays = hasDirtyEdits();
+
+				/**
+				 * @hook perflocale.strings.bulkQueued
+				 * @kind action
+				 * @since 1.0.7.4
+				 * @cardinality transition
+				 * @fires Strings screen bulk machine translation: the server queued a background run; before the page moves to Jobs (or stays, with unsaved edits). It ends in perflocale.jobs.statusChanged (type bulk_string_translate, job.id = jobId).
+				 * @context {Object} context
+				 * @property {number} context.version 1.
+				 * @property {string} context.jobId The background job's id.
+				 * @property {string} context.selection 'ids' (the checked rows), 'filter' (the filtered strings) or 'all'.
+				 * @property {number} context.requested The checked rows for 'ids'; the count the confirm dialog showed (capped at the run limit) for 'filter' and 'all'.
+				 * @property {Language[]} context.targetLanguages The chosen target languages.
+				 * @property {boolean} context.overwrite Existing translations are replaced.
+				 * @property {boolean} context.staysOnPage The page stays (unsaved edits) instead of moving to Jobs.
+				 * @example wp.hooks.addAction( 'perflocale.strings.bulkQueued', 'acme/log', function ( ctx ) {
+				 *     window.sessionStorage.setItem( 'acme-job', ctx.jobId );
+				 * } );
+				 */
+				doAction( 'perflocale.strings.bulkQueued', {
+					version:         1,
+					jobId:           String( data.job_id || '' ),
+					selection:       payload.mode,
+					requested:       payload.requested,
+					targetLanguages: targetLanguages( payload.target_lang_ids ),
+					overwrite:       !! payload.overwrite,
+					staysOnPage:     stays
+				} );
+
 				// Hand off to Jobs page so the user sees live progress -
 				// unless it would destroy typed-but-unsaved translations.
-				if ( hasDirtyEdits() ) {
+				if ( stays ) {
 					// Staying on the page: the "Redirecting…" text would be wrong.
 					setStatus( i18n.dirtyStay || 'Job started - your unsaved edits were kept; save them, then check the Jobs page.', 'success' );
 					// The user stays on the page to save; release the busy
@@ -315,6 +383,38 @@
 			setStatus( head + detail + reload, failed > 0 ? 'warn' : 'success' );
 			setBusy( false );
 
+			/**
+			 * @hook perflocale.strings.bulkFinished
+			 * @kind action
+			 * @since 1.0.7.4
+			 * @cardinality transition
+			 * @fires Strings screen bulk machine translation: a run finished inside the request; before the soft reload is scheduled.
+			 * @context {Object} context
+			 * @property {number} context.version 1.
+			 * @property {string} context.selection 'ids', 'filter' or 'all'.
+			 * @property {number} context.requested As in perflocale.strings.bulkQueued.
+			 * @property {Language[]} context.targetLanguages The chosen target languages.
+			 * @property {boolean} context.overwrite Existing translations were replaced.
+			 * @property {number} context.translated Translations written.
+			 * @property {number} context.skipped Strings left as they were.
+			 * @property {number} context.failed Strings that failed.
+			 * @property {number} context.capped Strings the run limit left for the next run.
+			 * @example wp.hooks.addAction( 'perflocale.strings.bulkFinished', 'acme/log', function ( ctx ) {
+			 *     console.log( ctx.translated + ' translated, ' + ctx.failed + ' failed' );
+			 * } );
+			 */
+			doAction( 'perflocale.strings.bulkFinished', {
+				version:         1,
+				selection:       payload.mode,
+				requested:       payload.requested,
+				targetLanguages: targetLanguages( payload.target_lang_ids ),
+				overwrite:       !! payload.overwrite,
+				translated:      translated,
+				skipped:         skipped,
+				failed:          failed,
+				capped:          capped
+			} );
+
 			if ( translated > 0 ) {
 				if ( hasDirtyEdits() ) {
 					// The reload would wipe typed-but-unsaved translations;
@@ -351,6 +451,7 @@
 
 		dispatch( {
 			mode:            'ids',
+			requested:       ids.length,
 			string_ids:      ids,
 			target_lang_ids: targets,
 			overwrite:       overwriteInput && overwriteInput.checked,
@@ -376,6 +477,7 @@
 
 		dispatch( {
 			mode:            'filter',
+			requested:       Math.min( total, maxPerDispatch ),
 			filter:          filter,
 			target_lang_ids: targets,
 			overwrite:       overwriteInput && overwriteInput.checked,
@@ -397,6 +499,7 @@
 
 		dispatch( {
 			mode:            'all',
+			requested:       Math.min( total, maxPerDispatch ),
 			target_lang_ids: targets,
 			overwrite:       overwriteInput && overwriteInput.checked,
 			provider_id:     cfg.provider || ''

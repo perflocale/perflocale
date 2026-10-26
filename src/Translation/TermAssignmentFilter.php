@@ -17,20 +17,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Corrects post→term assignments that end up with a wrong-language term_id.
+ * Swaps a post's wrong-language terms for their siblings in the post's language.
  *
- * The classic-editor tag box submits tags as *name strings*, so WP resolves
- * them via term_exists(), which matches against the first term with that
- * name - regardless of language. On a site with sibling tags "tag1" (EN)
- * and "tag1" (ES), term_exists('tag1') returns whichever was inserted
- * first, so saving a Spanish post with "tag1" can attach the English
- * term_id and the frontend links to /en/tag/tag1/.
- *
- * This filter runs after wp_set_object_terms() and, for each assigned
- * term whose language doesn't match the post's language, looks up the
- * sibling term in the correct language via translation groups and
- * re-assigns it. If no sibling exists, the assignment is left as-is
- * (we do not silently create new terms here).
+ * The classic tag box submits names, and term_exists() returns the first term with that name in any language.
+ * A term without a sibling stays assigned; no term is created here.
  */
 final class TermAssignmentFilter {
 
@@ -45,8 +35,7 @@ final class TermAssignmentFilter {
 	private readonly Settings $settings;
 
 	/**
-	 * Guard to prevent our own wp_set_object_terms() call from re-entering
-	 * the filter and looping.
+	 * Posts whose terms this class is rewriting, so its own wp_set_object_terms() does not re-enter.
 	 *
 	 * @var array<int, true>
 	 */
@@ -88,14 +77,12 @@ final class TermAssignmentFilter {
 			return;
 		}
 
-		// Only act on translatable taxonomies; other taxonomies have no
-		// per-language siblings to swap to.
+		// Only translatable taxonomies have per-language siblings.
 		if ( ! in_array( $taxonomy, $this->settings->get_translatable_taxonomies(), true ) ) {
 			return;
 		}
 
-		// Only act on posts - term→term and user→term assignments don't
-		// have a "post language" to coordinate against.
+		// Only posts have a language to match; the object may be a user or other object.
 		if ( get_post( $object_id ) === null ) {
 			return;
 		}
@@ -118,11 +105,8 @@ final class TermAssignmentFilter {
 	/**
 	 * Normalize every translatable taxonomy of a post to the post's language.
 	 *
-	 * For a post that has just received its first language. Terms passed to
-	 * wp_insert_post() (tags_input, post_category, tax_input) are attached
-	 * before save_post assigns that language, so the set_object_terms pass
-	 * above had nothing to compare them with. One query reads the terms of
-	 * all those taxonomies.
+	 * For a post that has just received its first language: wp_insert_post() attaches its terms before
+	 * save_post assigns the language, so the set_object_terms pass had nothing to compare them with.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return void
@@ -177,8 +161,7 @@ final class TermAssignmentFilter {
 	}
 
 	/**
-	 * Swap a post's wrong-language terms in one taxonomy for their siblings
-	 * in the post's language.
+	 * Swap a post's wrong-language terms in one taxonomy for their siblings in the post's language.
 	 *
 	 * @param int             $object_id      Post ID.
 	 * @param string          $taxonomy       Translatable taxonomy slug.
@@ -196,9 +179,7 @@ final class TermAssignmentFilter {
 			$term_id   = (int) $term_id;
 			$term_lang = $term_manager->detect_term_language( $term_id );
 
-			// Unmanaged term (no language link yet) - leave it alone. The
-			// operator may be intentionally using a shared term across
-			// languages.
+			// A term without a language may be shared across languages on purpose.
 			if ( ! $term_lang || ! isset( $term_lang->slug ) ) {
 				$corrected[] = $term_id;
 				continue;
@@ -209,7 +190,6 @@ final class TermAssignmentFilter {
 				continue;
 			}
 
-			// Wrong language - try to swap to the sibling in the correct one.
 			$sibling_id = $term_manager->get_translation_id( $term_id, $post_lang_slug );
 
 			if ( $sibling_id && $sibling_id !== $term_id ) {
@@ -218,10 +198,7 @@ final class TermAssignmentFilter {
 				continue;
 			}
 
-			// No sibling exists for the post's language. Leave the wrong
-			// assignment in place rather than silently dropping the tag -
-			// the operator can fix manually or create the missing
-			// translation.
+			// No sibling: keep the term rather than silently drop it.
 			$corrected[] = $term_id;
 		}
 

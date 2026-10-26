@@ -87,63 +87,6 @@ a.perflocale-badge:focus {
 	box-shadow: inset 0 0 0 1.5px currentColor;
 }
 
-/* Section headings */
-.perflocale-dash-section {
-	margin-top: 28px;
-}
-
-.perflocale-dash-section h2 {
-	font-size: 16px;
-	font-weight: 600;
-	color: #1d2327;
-	margin: 0 0 14px;
-	padding: 0;
-}
-
-.perflocale-dash-card {
-	background: #fff;
-	border: 1px solid #e0e0e0;
-	border-radius: 8px;
-	overflow: hidden;
-}
-
-.perflocale-dash-card__body:not(:empty) {
-	padding: 4px 0;
-}
-
-/* Quick Actions */
-.perflocale-dash-action {
-	display: inline-flex;
-	align-items: center;
-	gap: 8px;
-	background: #fff;
-	border: 1px solid #e0e0e0;
-	border-radius: 8px;
-	padding: 12px 20px;
-	text-decoration: none;
-	color: #1d2327;
-	font-size: 13px;
-	font-weight: 500;
-	transition: border-color 0.15s, box-shadow 0.15s;
-}
-
-.perflocale-dash-action:hover {
-	border-color: var(--perflocale-blue);
-	box-shadow: 0 0 0 1px var(--perflocale-blue);
-	color: var(--perflocale-blue);
-}
-
-.perflocale-dash-action .dashicons {
-	font-size: 18px;
-	width: 18px;
-	height: 18px;
-	color: #646970;
-}
-
-.perflocale-dash-action:hover .dashicons {
-	color: var(--perflocale-blue);
-}
-
 /* Language list */
 .perflocale-lang-list {
 	display: flex;
@@ -308,55 +251,6 @@ a.perflocale-badge:focus {
 	.perflocale-lang-item {
 			flex-wrap: wrap;
 		}
-}
-
-/* ==========================================================================
- Settings Page Tabs
- ========================================================================== */
-.perflocale-settings-nav {
-	display: flex;
-	gap: 0;
-	border-bottom: 2px solid var(--perflocale-card-border);
-	margin-bottom: 24px;
-	position: sticky;
-	top: 32px;
-	background: var(--perflocale-bg);
-	z-index: 10;
-	padding-top: 8px;
-}
-
-.perflocale-settings-nav__tab {
-	padding: 10px 20px;
-	font-size: 14px;
-	font-weight: 500;
-	color: var(--perflocale-text-light);
-	text-decoration: none;
-	border-bottom: 2px solid transparent;
-	margin-bottom: -2px;
-	cursor: pointer;
-	background: none;
-	border-top: none;
-	border-left: none;
-	border-right: none;
-	transition: color 0.15s, border-color 0.15s;
-}
-
-.perflocale-settings-nav__tab:hover {
-	color: var(--perflocale-text);
-}
-
-.perflocale-settings-nav__tab--active {
-	color: var(--perflocale-primary);
-	border-bottom-color: var(--perflocale-primary);
-	font-weight: 600;
-}
-
-.perflocale-settings-section {
-	display: none;
-}
-
-.perflocale-settings-section--active {
-	display: block;
 }
 
 /* ==========================================================================
@@ -744,33 +638,6 @@ a.perflocale-mb__status:hover {
 .perflocale-str-mt-toolbar__status.is-warn    { color: #b25500; }
 
 .perflocale-str-mt-toolbar__status.is-error   { color: #d63638; }
-
-/* Shared empty-state look - applied as a <td class="perflocale-empty-row">
-   inside a table tbody (Translations). The two
-   classes resolve to the same visual so the empty state is consistent
-   across every admin list page. Text aligns left (matching the rest of
-   the table column-content) rather than centered - center-aligned text
-   inside a wide table makes the message look like a floating tooltip
-   detached from the table grid. */
-.perflocale-str-empty {
-	padding: 16px 12px;
-	color: #646970;
-	text-align: left;
-	font-size: 13px;
-}
-
-/* The dashicon previously rendered above the message is hidden so the
-   The empty state matches the other admin list pages (which carry
-   only a centered text message). The element stays in the markup so any
-   third-party CSS targeting it doesn't break. */
-.perflocale-str-empty .dashicons {
-	display: none;
-}
-
-.perflocale-str-empty p {
-	margin: 0;
-	font-size: 13px;
-}
 
 /*
  * Language column header layout - shared by StringsPage (per-string
@@ -1251,46 +1118,6 @@ a.perflocale-panel-status:hover {
 	animation: perflocale-spin 0.6s linear infinite;
 }
 
-/* ==========================================================================
- Responsive Breakpoints
- ========================================================================== */
-@media screen and (max-width: 960px) {
-	.perflocale-settings-nav {
-			flex-wrap: wrap;
-			position: static;
-		}
-
-	.perflocale-settings-nav__tab {
-			padding: 8px 14px;
-			font-size: 13px;
-		}
-}
-
-@media screen and (max-width: 782px) {
-	.perflocale-toast {
-			left: 16px;
-			right: 16px;
-			bottom: 16px;
-			min-width: 0;
-			max-width: none;
-		}
-
-	.perflocale-language-table {
-			font-size: 13px;
-		}
-
-	.perflocale-language-table th,
-		.perflocale-language-table td {
-			padding: 8px;
-		}
-}
-
-@media screen and (max-width: 600px) {
-	.perflocale-dialog {
-			padding: 18px;
-		}
-}
-
 .perflocale-translations-table .perflocale-flag {
 	line-height: 1;
 }
@@ -1318,9 +1145,7 @@ a.perflocale-status-badge--pending:focus      { background: #f8e9b8; }
 a.perflocale-status-badge--needs-update:hover,
 a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 
-/* Empty-state row - shared across every admin list table (Assignments,
-   Translations). Matches the .perflocale-str-empty div style
-   above for visual consistency. */
+/* Empty-state row of the admin list tables (Translations). */
 .perflocale-empty-row {
 	text-align: left;
 	padding: 16px 12px;
@@ -1415,34 +1240,6 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 .wp-list-table .check-column input[type="checkbox"][data-perflocale-bulk-row],
 .wp-list-table .check-column input[type="checkbox"][data-perflocale-bulk-select-all] {
 	margin: 0;
-}
-
-@media screen and (max-width: 782px) {
-	.perflocale-settings-section .form-table th,
-		.perflocale-settings-section .form-table td {
-			padding-block: 8px;
-		}
-
-	.perflocale-settings-section .form-table input[type="text"],
-		.perflocale-settings-section .form-table input[type="email"],
-		.perflocale-settings-section .form-table input[type="url"],
-		.perflocale-settings-section .form-table input[type="password"],
-		.perflocale-settings-section .form-table select,
-		.perflocale-settings-section .form-table textarea {
-			max-width: 100%;
-			box-sizing: border-box;
-		}
-
-	.perflocale-dash-action {
-			width: 100%;
-			justify-content: flex-start;
-		}
-}
-
-@media screen and (max-width: 600px) {
-	.perflocale-settings-section .form-table {
-			margin-top: 8px;
-		}
 }
 
 @media screen and (max-width: 480px) {
@@ -1700,6 +1497,12 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 			z-index: 2;
 			background-color: inherit;
 			box-shadow: 1px 0 0 rgba(0, 0, 0, .08);
+		}
+
+	/* Translators get no check column: the title is then the first cell. */
+	.perflocale-table-responsive .perflocale-translations-table > thead > tr > th.perflocale-col-title:first-child,
+		.perflocale-table-responsive .perflocale-translations-table > tbody > tr > td.perflocale-col-title:first-child {
+			left: 0;
 		}
 
 

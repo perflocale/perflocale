@@ -12,11 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * All in One SEO (AIOSEO) integration for PerfLocale.
- *
- * Registers SEO meta keys as translatable, disables AIOSEO's own
- * hreflang output (PerfLocale handles it), sets OG locale to the
- * current language, and injects alternate URLs into AIOSEO sitemaps.
+ * All in One SEO integration: translatable SEO meta, sitemap alternates and schema.
  */
 final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 
@@ -26,14 +22,14 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	private const MIN_VERSION = '4.0.0';
 
 	/**
-	 * Translation group repository - lazily resolved.
+	 * Translation group repository, resolved on first use.
 	 *
 	 * @var \PerfLocale\Database\Repository\TranslationGroupRepository|null
 	 */
 	private ?\PerfLocale\Database\Repository\TranslationGroupRepository $repo = null;
 
 	/**
-	 * Language repository - lazily resolved.
+	 * Language repository, resolved on first use.
 	 *
 	 * @var \PerfLocale\Database\Repository\LanguageRepository|null
 	 */
@@ -71,10 +67,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function is_compatible(): bool {
-		// AIOSEO defines AIOSEO_VERSION at load time; that's the most
-		// reliable signal that the plugin is actually running. The old
-		// AIOSEO_FILE constant is redundant and was dropped from the
-		// post-4.0 bootstrap.
+		// The main class means AIOSEO is running; AIOSEO_VERSION gates the minimum version.
 		if ( ! class_exists( 'AIOSEO\\Plugin\\AIOSEO' ) ) {
 			return false;
 		}
@@ -117,9 +110,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
-	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context - where AIOSEO's canonical filter still fires for its own
-	 * analysis passes but there is no fallback render to pin.
+	 * Null in admin (non-AJAX): the service is front-end only.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
 	 */
@@ -144,63 +135,39 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
-		// A field a person empties stays empty: its clear is recorded in the
-		// post's seed-cleared marker, which machine translation and the seed
-		// honour.
+		// A field a person empties stays empty: the clear is recorded in the
+		// post's seed-cleared marker, which machine translation and the seed honour.
 		\PerfLocale\Translation\SyncMeta::track_seed_clears( $this->add_meta_keys( [], '' ) );
 
-		// AIOSEO renders from its own `aioseo_posts` table, not from the
-		// `_aioseo_*` post-meta mirror that PerfLocale translates, so a
-		// translation post (which has no row there) would fall back to
-		// auto-generated titles/descriptions. Overlay the translated meta
-		// onto the in-memory model instead of writing into their table.
+		// AIOSEO renders from its `aioseo_posts` table, not the `_aioseo_*` meta PerfLocale
+		// translates: overlay that meta on the in-memory model, never write their table.
 		add_filter( 'aioseo_get_post', [ $this, 'overlay_translated_meta' ] );
 
-		// NOTE: AIOSEO's `aioseo_disable` filter is a global off-switch
-		// (disables all AIOSEO head output - title, description, schema,
-		// hreflang), not a hreflang-specific one. There's no way to use
-		// it to suppress only hreflang. PerfLocale emits its own hreflang
-		// via HreflangManager; AIOSEO's own hreflang output requires a
-		// multilingual plugin integration anyway, so in practice this is
-		// a non-issue.
+		// No hreflang suppression: `aioseo_disable` switches off all AIOSEO head output,
+		// and AIOSEO emits head hreflang only through a multilingual integration.
 
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so AIOSEO's own og:locale already reflects the current language.
 
-		// Missing-translation canonical guard. PerfLocale registers it on
-		// core's `get_canonical_url`, but AIOSEO removes core's rel_canonical
-		// and emits its own, so that filter never fires and the guard is inert
-		// whenever this plugin is active. Re-register it on AIOSEO's own
-		// canonical filter. AIOSEO fires that filter at three call sites, and
-		// the `canonical_url` column a site owner filled in travels through one
-		// of them - so it is the permalink-equality gate inside HreflangTags,
-		// not the call site, that leaves such an override alone, exactly as it
-		// leaves the empty string AIOSEO passes on 404/search.
+		// AIOSEO removes core's rel_canonical, so the missing-translation canonical guard
+		// rides AIOSEO's filter. An owner's `canonical_url` passes through the same filter:
+		// HreflangTags' permalink-equality test, not the call site, leaves it alone.
 		add_filter( 'aioseo_canonical_url', [ $this, 'pin_fallback_canonical' ] );
 
-		// Inject alternate URLs into AIOSEO sitemap entries.
-		// AIOSEO fires this with 4 args in post-content sitemaps
-		// (entry, post_id, post_type, 'post') and 3 in legacy paths -
-		// register for 4 so we don't silently truncate the type label.
-		// PHP_INT_MAX so we run AFTER any third-party URL rewriter on the
-		// same filter; otherwise our `languages` array would key off a
-		// pre-rewrite URL that doesn't match the final emitted entry.
+		// Sitemap alternates. PHP_INT_MAX: after any URL rewriter, so `languages` matches the
+		// final entry. 4 args: post sitemaps pass 4, some callers 3 (the 4th has a default).
 		add_filter( 'aioseo_sitemap_post', [ $this, 'add_sitemap_alternates' ], PHP_INT_MAX, 4 );
 
 		// Inject alternate URLs into AIOSEO taxonomy sitemap entries.
 		add_filter( 'aioseo_sitemap_term', [ $this, 'add_taxonomy_sitemap_alternates' ], PHP_INT_MAX, 4 );
 
-		// Include all language terms in AIOSEO taxonomy sitemaps.
-		// Sitemap predicate is request-constant (REQUEST_URI is fixed before
-		// plugins_loaded) - register the get_terms_args callback only on
-		// sitemap requests instead of no-op dispatching on every term query.
+		// All languages' terms in taxonomy sitemaps; registered on sitemap requests only,
+		// because get_terms_args runs on every term query.
 		if ( $this->is_sitemap_request() ) {
 			add_filter( 'get_terms_args', [ $this, 'include_all_languages_in_sitemap' ] );
 		}
 
-		// Enrich AIOSEO's schema graph with inLanguage + translation siblings.
-		// Hook name stable across AIOSEO 4.x. Gated on the setting to
-		// avoid a no-op filter callback on every request when disabled.
+		// Schema inLanguage and translation siblings, registered only when enrichment is on.
 		if ( $plugin->has( 'settings' ) && $plugin->get( 'settings' )->seo_schema_enrichment_enabled() ) {
 			add_filter( 'aioseo_schema_output', [ $this, 'filter_schema_graph' ] );
 		}
@@ -242,8 +209,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Add AIOSEO meta keys as translatable.
 	 *
-	 * AIOSEO primarily uses a custom `aioseo_posts` table, but also
-	 * stores data in post meta for compatibility.
+	 * AIOSEO also stores these fields in post meta, besides its `aioseo_posts` table.
 	 *
 	 * @param array<int, string> $keys Meta keys.
 	 * @param string             $post_type Post type.
@@ -261,19 +227,14 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Machine-translatable SEO meta: titles/descriptions/social text ONLY.
-	 * The focus keyword is deliberately excluded - keyword targeting in the
-	 * target language is a human decision (add it back via this same filter
-	 * if a site wants it). Gated by the mt_meta_seo setting.
+	 * Machine-translatable SEO meta (titles, descriptions, social), gated by mt_meta_seo.
 	 *
 	 * @param array<int, string> $keys      Meta keys.
 	 * @param string             $post_type Post type.
 	 * @return array<int, string>
 	 */
 	/**
-	 * The AIOSEO meta keys this addon machine-translates. All plain-text SEO
-	 * fields (title / description / social), so all route to the provider's
-	 * text mode via mt_meta_key_format().
+	 * AIOSEO meta keys this addon machine-translates, all plain text (text mode).
 	 */
 	private const MT_TEXT_KEYS = [
 		'_aioseo_title',
@@ -295,9 +256,9 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Route AIOSEO's plain-text SEO meta to the provider's text mode so the
-	 * stored translation isn't entity-escaped (a '&' stays literal instead of
-	 * becoming '&amp;' that AIOSEO would double-escape on output).
+	 * Route AIOSEO's plain-text SEO meta to the provider's text mode.
+	 *
+	 * A stored '&amp;' would be escaped again by AIOSEO on output.
 	 *
 	 * @param string $format    Inherited format ('html' default).
 	 * @param string $key       Meta key.
@@ -312,14 +273,8 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Overlay PerfLocale-translated SEO meta onto the model AIOSEO renders from.
 	 *
-	 * Every AIOSEO output surface (title, meta description, og:*, twitter:*)
-	 * reads this model, so one seam covers them all - unlike the
-	 * `aioseo_title`/`aioseo_description` value filters, which carry no post
-	 * context and also fire for other objects prepared in the same request.
-	 * An existing `aioseo_posts` row means the post's SEO fields were edited
-	 * directly in AIOSEO and stays authoritative. Write flows (admin, AJAX,
-	 * REST, cron, CLI) fetch the model to mutate-and-save it, which would
-	 * persist the overlay into AIOSEO's table - render reads only.
+	 * An existing `aioseo_posts` row stays authoritative. Render reads only: write flows
+	 * save the model, which would persist the overlay into AIOSEO's table.
 	 *
 	 * @param \AIOSEO\Plugin\Common\Models\Post|mixed $model AIOSEO post model.
 	 * @return \AIOSEO\Plugin\Common\Models\Post|mixed
@@ -380,9 +335,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Whether the current request renders an XML sitemap.
 	 *
-	 * REQUEST_URI is fixed before plugins_loaded, so the verdict is
-	 * request-constant - used both to gate the get_terms_args registration
-	 * and inside the callback for callers that invoke it directly.
+	 * Memoised: REQUEST_URI is fixed before plugins_loaded.
 	 *
 	 * @return bool
 	 */
@@ -402,11 +355,6 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Add alternate language URLs to AIOSEO sitemap entries.
 	 *
-	 * AIOSEO's `aioseo_sitemap_post` filter is inconsistent across the
-	 * plugin: post sitemaps pass 4 args (entry, id, post_type, 'post'),
-	 * while a few specialised callers pass 3. Registering for 4 handles
-	 * both thanks to PHP's trailing-default; the 4th arg is optional.
-	 *
 	 * @param array<string, mixed>|mixed $entry Sitemap entry.
 	 * @param int                        $post_id Post ID.
 	 * @param string                     $post_type Post type.
@@ -415,31 +363,15 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	 *                                    entry array.
 	 */
 	public function add_sitemap_alternates( $entry, int $post_id, string $post_type, string $type = 'post' ) {
-		// AIOSEO carries whatever this filter returns straight through to the
-		// renderer without an array check - Sitemap/Helpers.php:661-671 only
-		// tests `isset( $item['loc'] )`, and Views/sitemap/xml/default.php:23
-		// then does `if ( empty( $entry['loc'] ) ) { continue; }`. A falsy
-		// return is therefore how you drop an entry from an AIOSEO sitemap,
-		// exactly as it is on Yoast's `wpseo_sitemap_entry`. This callback runs
-		// at PHP_INT_MAX - after every other one - so it binds whatever they
-		// returned, and declaring `array` made PHP throw at argument binding,
-		// before any guard in this body could run. That is the identical shape
-		// that turned an excluded Yoast sitemap entry into a live fatal.
-		// Anything that is not an entry array goes back exactly as it came in.
+		// Untyped on purpose: a falsy return drops an AIOSEO sitemap entry, so an earlier
+		// callback can pass one, and a typed parameter would fatal. See
+		// docs-ai/11-code-rationale.md, "PerfLocaleAioseo: sitemap filter contract".
 		if ( ! is_array( $entry ) ) {
 			return $entry;
 		}
 
-		// The filter is not post-only. AIOSEO also fires it for BuddyPress
-		// activities, groups and members (Content.php 776/835/891), passing a
-		// BuddyPress row id and one of its pseudo post types ('bp-activity',
-		// 'bp-group', 'bp-member') - none of which is a registered post type.
-		// Such an id says nothing about PerfLocale's translation links, so
-		// both things keyed off it here are wrong for those entries: an
-		// alternate set built from a coincidental id collision, and the
-		// unlinked-loc pin, which would rewrite a component URL PerfLocale
-		// never routes onto the default host. Leave the entry as AIOSEO
-		// built it.
+		// AIOSEO also fires this for BuddyPress pseudo post types (`bp-activity` ...), whose
+		// ids are not post ids: alternates and the loc pin would be wrong for them.
 		if ( ! post_type_exists( $post_type ) ) {
 			return $entry;
 		}
@@ -458,10 +390,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	 *                                    entry array.
 	 */
 	public function add_taxonomy_sitemap_alternates( $entry, int $term_id, string $taxonomy, string $type ) {
-		// Same exclusion contract as add_sitemap_alternates() above -
-		// Sitemap/Content.php:385 fires this filter into the same renderer,
-		// and this callback is likewise registered at PHP_INT_MAX. Return an
-		// entry we do not recognise unchanged instead of throwing on it.
+		// Untyped on purpose: same exclusion contract as add_sitemap_alternates().
 		if ( ! is_array( $entry ) ) {
 			return $entry;
 		}
@@ -482,17 +411,9 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 		$links  = $this->repo()->get_translations( $object_id, $object_type );
 
 		if ( $links === [] ) {
-			// Unlinked object = default-language content by definition, but
-			// AIOSEO builds every loc from get_permalink()/get_term_link() in
-			// the REQUEST context. In subdomain/domain URL modes each language
-			// host's sitemap would then advertise the same object under its
-			// own host (cross-host duplicate content). Same guard core's
-			// SitemapIntegration applies to its own entries, for the sitemap
-			// AIOSEO replaces it with. Being unlinked is also what makes the
-			// pin safe - not the URL mode: pin_sitemap_url_to_default()
-			// strips a language prefix from any URL it is handed, so in
-			// path-based modes it comes out a no-op only because an unlinked
-			// object's loc has no prefix to strip.
+			// Unlinked = default-language content, but its loc carries the request host, so
+			// in host modes every language host would list it. Pinning is safe only because
+			// an unlinked loc has no language prefix for pin_sitemap_url_to_default() to strip.
 			return $this->pin_untranslated_loc( $entry );
 		}
 
@@ -500,9 +421,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 			return $entry;
 		}
 
-		// Per-post opt-out: a flagged post advertises no alternates and is
-		// skipped as a sibling below, so excluded translations never appear
-		// in any alternate set.
+		// Per-post SEO opt-out: no alternates here, and skipped as a sibling below.
 		if ( $object_type === \PerfLocale\Enum\ObjectType::Post && \PerfLocale\Helper::is_seo_excluded( $object_id ) ) {
 			return $entry;
 		}
@@ -528,11 +447,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 				: null;
 		}
 
-		// Active languages only. get_slug_map() is the bootstrap bundle's
-		// active-only slug -> row hash - the same source core's hreflang and
-		// sitemap paths filter on. find_by_slug() resolves DEACTIVATED
-		// languages too, which would advertise them as alternates; the map
-		// lookup is also O(1) instead of a per-sibling cache descent.
+		// Active languages only: find_by_slug() also resolves deactivated languages.
 		$slug_map = $this->lang_repo()->get_slug_map();
 
 		$languages = [];
@@ -600,10 +515,7 @@ final class PerfLocaleAioseo implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Convert a WordPress locale to an hreflang value.
-	 *
-	 * Simplifies redundant region codes (fr_FR → fr, de_DE → de)
-	 * while preserving meaningful ones (en_US → en-us, pt_BR → pt-br).
+	 * Convert a WordPress locale to a BCP 47 hreflang tag (`fr_FR` -> `fr-FR`, region kept).
 	 *
 	 * @param string $locale WordPress locale.
 	 * @return string

@@ -17,20 +17,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Base class for machine translation providers.
- *
- * Provides common functionality: rate limiting, error handling,
- * retry with exponential backoff, and usage tracking.
+ * Base of the machine translation providers: guarded requests, retries with backoff, the circuit breaker and usage
+ * counting.
  */
 abstract class AbstractProvider implements ProviderInterface {
 
 	/**
-	 * Hostnames of public MT providers that never need SSRF validation.
-	 *
-	 * Skipping DNS resolution for these avoids the theoretical multi-
-	 * second hang in `gethostbyname()` on hosts with a broken resolver
-	 * (the function has no timeout parameter). These are all well-known
-	 * public services.
+	 * Public provider hosts that skip the SSRF lookup (gethostbyname() has no timeout and hangs on a broken resolver).
 	 *
 	 * @var array<int, string>
 	 */
@@ -39,6 +32,19 @@ abstract class AbstractProvider implements ProviderInterface {
 		'api.deepl.com',
 		'api-free.deepl.com',
 		'api.cognitive.microsofttranslator.com',
+	];
+
+	/**
+	 * Provider id => the setting holding its credential, masked by exact value in error text.
+	 *
+	 * @var array<string, string>
+	 */
+	private const CREDENTIAL_SETTING = [
+		'deepl'           => 'mt_deepl_api_key',
+		'google'          => 'mt_google_api_key',
+		'microsoft'       => 'mt_microsoft_api_key',
+		'libretranslate'  => 'mt_libre_api_key',
+		'external_agency' => 'mt_agency_api_key',
 	];
 
 	/**
@@ -56,8 +62,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	protected int $session_usage = 0;
 
 	/**
-	 * Breaker key of a 2xx response whose body has not been proven usable
-	 * yet. Empty when there is nothing outstanding.
+	 * Breaker key of a 2xx response whose body is not yet proven usable ('' for none).
 	 *
 	 * @var string
 	 */
@@ -73,18 +78,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Normalize a language code to a consistent lowercase dash-form.
-	 *
-	 * Accepts any common input shape ('en', 'EN', 'en_US', 'en-us', 'EN-US')
-	 * and returns lowercased, dash-separated form (e.g. 'en-us' or 'en').
-	 *
-	 * Providers that need specific formats (e.g. base-only codes, or
-	 * provider-specific variant defaults) should call this first, then
-	 * apply provider-specific rules on top.
-	 *
-	 * Fixes a class of bugs where WordPress locale strings like 'en_US' /
-	 * 'de_DE' were passed straight to an MT API that expected 'en' / 'de'
-	 * or 'en-US' / 'de-DE' and returned HTTP 400 "unsupported language".
+	 * A language code in lowercase dash form ('en_US', 'EN-US' => 'en-us'); providers apply their own rules on top.
 	 *
 	 * @param string $code Input language code.
 	 * @return string Lowercased, dash-separated code.
@@ -94,10 +88,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Reduce a language code to its base ISO 639-1 form.
-	 *
-	 * Used by providers that only accept base codes (no variants),
-	 * e.g. LibreTranslate, DeepL source_lang, Google source.
+	 * A language code's base ISO 639-1 form, for providers that take no variants.
 	 *
 	 * @param string $code Input language code.
 	 * @return string Base ISO 639-1 code in lowercase.
@@ -115,14 +106,8 @@ abstract class AbstractProvider implements ProviderInterface {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint: 'html' (default) or
-	 *   'text'. In HTML mode the MT APIs entity-escape markup-significant
-	 *   characters in their output (&amp;, &#39;), which is wrong for
-	 *   plain-text destinations like post titles - those callers pass
-	 *   'text'. The parameter is deliberately NOT on ProviderInterface:
-	 *   adding it there would fatal third-party implementations, whereas
-	 *   an extra positional arg to an implementation without it is simply
-	 *   ignored by PHP (the provider stays in its historical mode).
+	 * @param string $format 'html' (default) or 'text' (no entity escaping, for plain-text destinations). Not on
+	 *   ProviderInterface: that would fatal third-party implementations, which ignore an extra argument.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
 		$results = [];
@@ -132,6 +117,16 @@ abstract class AbstractProvider implements ProviderInterface {
 		}
 
 		return $results;
+	}
+
+	/**
+	 * Whether placeholders (block, shortcode, "Do not translate") go as empty elements, for a provider that returns HTML comments as text.
+	 *
+	 * @since 1.0.7.4
+	 * @return bool
+	 */
+	public function placeholders_as_elements(): bool {
+		return false;
 	}
 
 	/**
@@ -151,34 +146,27 @@ abstract class AbstractProvider implements ProviderInterface {
 	 *
 	 * @throws \RuntimeException If all retries fail or URL is blocked.
 	 * @throws \PerfLocale\Concurrency\BreakerOpenException When the circuit breaker for this provider is open.
+	 * @throws DeadlineReachedException When a call or wait does not fit before a slice's deadline ({@see CallDeadline}).
 	 */
 	protected function make_request( string $url, array $args, int $retries = 3, bool $fast_fail = false ): array {
-		// SSRF protection: block requests to internal/private networks. For a
-		// host name the check returns the address it judged, and each attempt
-		// connects to that address (Helper::remote_request_pinned()) rather
-		// than to whatever a second lookup by the transport answers.
+		// SSRF check; for a host name each attempt connects to the address it judged (Helper::remote_request_pinned()).
+		// Docs: docs-ai/11-code-rationale.md, "AbstractProvider: request guards".
 		$pinned_ip = $this->validate_url( $url );
 
-		// Circuit breaker: if a recent spate of failures tripped the
-		// breaker for this provider, throw immediately so callers can
-		// route to a fallback (TM cache, "service unavailable" UI, etc.)
-		// without burning 3 retries × 7-30s on a known-bad endpoint.
-		// `mt_{provider_id}` is the canonical breaker key - matches what
-		// Site Health card surfaces and what the global classify_error()
-		// path in WpAiClientProvider feeds into.
+		if ( '' !== $pinned_ip && self::proxy_refuses( $url ) ) {
+			throw new \RuntimeException( 'Machine translation refused: this site sends the provider request through an HTTP proxy, and a filter on this site refuses proxied requests to custom hosts.' );
+		}
+
+		// An open breaker throws at once so callers can fall back without burning the retries; `mt_{id}` is the key
+		// Site Health shows.
 		$breaker_key = 'mt_' . $this->get_id();
 
-		// A previous call on this instance may have armed a success that its
-		// caller never confirmed (a raw consumer that reads the body itself).
-		// Drop it rather than let it settle against this call's result.
+		// Drop a success armed by an earlier call whose caller never confirmed it.
 		$this->pending_success_key = '';
 
 		if ( \PerfLocale\Concurrency\Breaker::is_open( $breaker_key ) ) {
 			$status = \PerfLocale\Concurrency\Breaker::status( $breaker_key );
-			// $breaker_key is built from a sanitize_key()-passed provider
-			// slug; safe to pass through. esc_html() here is defence in
-			// depth for the static-analyser's "all string args to throw
-			// must be escaped" rule.
+			// The key is a sanitized slug; esc_html() satisfies the escaped-exception rule.
 			throw new \PerfLocale\Concurrency\BreakerOpenException(
 				esc_html( $breaker_key ),
 				esc_html(
@@ -197,42 +185,19 @@ abstract class AbstractProvider implements ProviderInterface {
 			$args['timeout'] = min( (int) ( $args['timeout'] ?? 30 ), 8 );
 		}
 
-		// Enforce SSL verification to prevent MITM attacks.
+		// SSL verification on.
 		if ( ! isset( $args['sslverify'] ) ) {
 			$args['sslverify'] = true;
 		}
 
-		// SSRF defense-in-depth: do not follow redirects. validate_url() above
-		// already rejects localhost / private / cloud-metadata destinations,
-		// but a validated public host could still 30x the request into one of
-		// those. MT REST APIs reply directly and never need a redirect. (We do
-		// NOT set reject_unsafe_urls here: it rejects non-80/443/8080 ports,
-		// which would break a self-hosted LibreTranslate on e.g. :5000.) Set
-		// if-absent so the request_args filter can re-enable for an odd endpoint.
+		// No redirects: a validated public host could redirect into an internal one. Not reject_unsafe_urls (it refuses
+		// ports like a self-hosted LibreTranslate's :5000). Set only when absent, so request_args can change it.
 		if ( ! isset( $args['redirection'] ) ) {
 			$args['redirection'] = 0;
 		}
 
-		// Bound the response body. Nothing above limits how much a provider - or
-		// a proxy, or a captive portal answering for one - may send back, and
-		// wp_remote_request() buffers the WHOLE body in memory before this method
-		// sees a byte, so a runaway reply is a PHP fatal in the middle of a bulk
-		// run. Size the cap FROM THE REQUEST rather than pinning a constant: a
-		// fixed ceiling either truncates a legitimate long translation or is too
-		// loose to bound anything. 8x the submitted payload plus 16 KB covers the
-		// worst realistic expansion (ASCII source into a 3-4 byte-per-character
-		// script, plus the JSON envelope and any entity escaping in html mode),
-		// with a 64 KB floor for the tiny probe requests (test_connection,
-		// DeepL /usage).
-		//
-		// Two consequences to know about. (1) A body over the cap is TRUNCATED
-		// SILENTLY - WpOrg\Requests\Transport\Curl::stream_body() stops storing
-		// bytes but still reports the full length, so there is no transport-level
-		// error. The truncated body then fails JSON decoding, which is how an
-		// oversized response surfaces: as a parse error, not as an OOM. That is
-		// the intended trade. (2) The cap bounds MEMORY, not transfer time - a
-		// slow trickle is still the `timeout` argument's job. Set if-absent, so the
-		// request_args filter below can raise or remove it for an odd endpoint.
+		// Cap the buffered response body at 8 x the payload + 16 KB (at least 64 KB): a runaway reply would be a fatal.
+		// Over the cap the body is cut silently and fails as a JSON parse error; set only when absent.
 		if ( ! isset( $args['limit_response_size'] ) ) {
 			$payload = $args['body'] ?? '';
 
@@ -247,13 +212,8 @@ abstract class AbstractProvider implements ProviderInterface {
 		}
 
 		/**
-		 * Filter the wp_remote_request() arguments before they are sent to a
-		 * machine-translation provider. Integrators behind corporate proxies,
-		 * or needing a longer timeout for bulk jobs, or injecting custom
-		 * tracing headers should hook here.
-		 *
-		 * SSL verification stays forced-on unless the caller explicitly sets
-		 * `sslverify => false` - PerfLocale does not override a false value.
+		 * Filter the wp_remote_request() arguments sent to a machine-translation provider (proxies, longer timeouts,
+		 * tracing headers). sslverify stays on unless set to false.
 		 *
 		 * @hook perflocale/mt/request_args
 		 *
@@ -263,40 +223,49 @@ abstract class AbstractProvider implements ProviderInterface {
 		 */
 		$args = (array) apply_filters( 'perflocale/mt/request_args', $args, $url, $this->get_id() );
 
+		// WordPress's default when nothing sets one.
+		$requested = is_numeric( $args['timeout'] ?? null ) ? (float) $args['timeout'] : 5.0;
+		$started   = microtime( true );
+
 		$last_error     = null;
 		$failure_reason = '';
 
 		for ( $attempt = 1; $attempt <= $retries; $attempt++ ) {
-			// A retry judges the host again. After a transport error the cached
-			// DNS answers are dropped (below), so an address that changed is
-			// looked up and judged before it is used.
+			// A retry judges the host again (after a transport error the cached DNS answers are dropped below).
 			if ( $attempt > 1 ) {
 				$pinned_ip = $this->validate_url( $url );
 			}
 
-			$response = Helper::remote_request_pinned( $url, $args, $pinned_ip );
+			// Clamped after the filter, so no filtered timeout outlasts a slice's request.
+			$call_args = $args;
+			$timeout   = CallDeadline::timeout( $requested );
+
+			if ( $timeout < $requested ) {
+				$call_args['timeout'] = $timeout;
+			}
+
+			$response = Helper::remote_request_pinned( $url, $call_args, $pinned_ip );
 
 			if ( is_wp_error( $response ) ) {
-				// A WP_Error from the transport layer is not automatically
-				// safe text: a site-local `pre_http_request` / `http_api_curl`
-				// filter, a custom transport or a proxy integration composes
-				// that message and can fold the outgoing request - headers,
-				// credential and all - into it. It then reaches a thrown
-				// exception that a background job persists on the job row and
-				// the Jobs page renders. Mask it exactly like a response body.
-				$last_error     = self::mask_credentials( $response->get_error_message() );
+				// A transport error message can carry the outgoing request (filters, custom transports, proxies) and ends up on
+				// the job row: masked like a response body.
+				$last_error     = $this->mask_error_text( $response->get_error_message() );
 				$failure_reason = 'transient';
 
-				// The host may have moved: drop its cached DNS answers so the
-				// next attempt, and the next call, look it up again.
+				// The host may have moved: drop its cached DNS answers.
 				if ( '' !== $pinned_ip ) {
 					self::forget_dns( $url );
 				}
 
 				if ( $attempt < $retries ) {
 					// Exponential backoff: 1s, 2s, 4s.
-					sleep( (int) pow( 2, $attempt - 1 ) );
-					continue;
+					$backoff = (int) pow( 2, $attempt - 1 );
+
+					if ( CallDeadline::wait( $backoff ) ) {
+						continue;
+					}
+
+					self::stop_unless_slow( max( $timeout, microtime( true ) - $started ), $backoff );
 				}
 
 				break;
@@ -304,13 +273,7 @@ abstract class AbstractProvider implements ProviderInterface {
 
 			$code = wp_remote_retrieve_response_code( $response );
 
-			// Rate limit hit - wait and retry. Cap the upstream Retry-After
-			// at a sensible ceiling so a malicious / buggy provider returning
-			// e.g. `Retry-After: 86400` cannot block this PHP worker for ~24h
-			// per retry attempt. 300s default - matches what real providers
-			// (DeepL, OpenAI, Azure) advise during sustained overload, so
-			// legitimate long-backoff hints aren't truncated into a quick
-			// retry that re-trips the breaker. Filterable.
+			// 429: wait for Retry-After, capped (default 300 s) so a hostile value cannot hold the worker for hours.
 			if ( $code === 429 && $attempt < $retries ) {
 				$retry_after_header = wp_remote_retrieve_header( $response, 'retry-after' );
 				$retry_after        = self::parse_retry_after( $retry_after_header );
@@ -323,20 +286,23 @@ abstract class AbstractProvider implements ProviderInterface {
 				 */
 				$max_wait = (int) apply_filters( 'perflocale/mt/retry_after_max_seconds', 300 );
 				$wait     = min( $wait, max( 1, $max_wait ) );
-				sleep( $wait );
+
+				// A wait past the slice's deadline: the job continues at the provider's time.
+				if ( ! CallDeadline::wait( $wait ) ) {
+					\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'rate_limit' );
+
+					throw new DeadlineReachedException( time() + $wait, true ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int; the message is escaped in the class.
+				}
+
+				// A rate-limit wait is not the provider failing: it does not count toward the call's window.
+				$started       += $wait;
 				$failure_reason = 'rate_limit';
 				continue;
 			}
 
 			if ( $code >= 200 && $code < 300 ) {
-				// HTTP 200 is not yet success. A provider (or a proxy, or a
-				// captive portal) that answers every call with an unparseable
-				// body is failing in the only way that matters, and clearing
-				// the counter here made that failure INVISIBLE to the breaker:
-				// each call reset the streak before the parse could fail, so
-				// the count could never reach the threshold and a permanently
-				// broken endpoint got billed and retried forever. Arm the
-				// success instead and let parse_json_response() decide.
+				// 200 is not yet success: an unusable body must count as a failure, so parse_json_response() settles it.
+				// Docs: docs-ai/11-code-rationale.md, "AbstractProvider: breaker accounting".
 				$this->pending_success_key = $breaker_key;
 
 				$body = wp_remote_retrieve_body( $response );
@@ -347,16 +313,12 @@ abstract class AbstractProvider implements ProviderInterface {
 				];
 			}
 
-			// Truncate error body to avoid leaking API keys or sensitive data
-			// in error messages that may reach the client or logs.
-			$error_body = mb_substr( wp_remote_retrieve_body( $response ), 0, 200 );
+			// Masked and truncated: error text reaches the client and the logs.
+			$error_body = mb_substr( $this->mask_configured_credential( wp_remote_retrieve_body( $response ) ), 0, 200 );
 			$error_body = self::mask_credentials( $error_body );
 			$last_error = sprintf( 'HTTP %d: %s', $code, $error_body );
 
-			// Categorise so the breaker uses an appropriate trip
-			// threshold: auth errors (401/403) trip on the FIRST hit
-			// because no amount of retries will fix a bad key; rate
-			// limits and 5xx use the default sliding-window threshold.
+			// 401/403 trips the breaker on the first hit (retries cannot fix a bad key); 429 and 5xx use the sliding window.
 			if ( $code === 401 || $code === 403 ) {
 				$failure_reason = 'auth';
 			} elseif ( $code === 429 ) {
@@ -368,30 +330,23 @@ abstract class AbstractProvider implements ProviderInterface {
 			}
 
 			if ( $code >= 400 && $code < 500 && $code !== 429 ) {
-				// Client error - don't retry.
+				// Client error: no retry.
 				break;
 			}
 
-			// 5xx: back off with the same 1s/2s schedule as the transport-
-			// error branch. Retrying immediately would hammer an endpoint
-			// that just said it is overloaded and burn every attempt inside
-			// an outage blip the backoff is meant to outlast.
+			// 5xx: back off 1 s, 2 s like a transport error instead of hammering an overloaded endpoint.
 			if ( $code >= 500 && $attempt < $retries ) {
-				sleep( (int) pow( 2, $attempt - 1 ) );
+				$backoff = (int) pow( 2, $attempt - 1 );
+
+				if ( ! CallDeadline::wait( $backoff ) ) {
+					self::stop_unless_slow( max( $timeout, microtime( true ) - $started ), $backoff );
+					break;
+				}
 			}
 		}
 
-		// All retries exhausted - record one failure with the most
-		// telling category we saw. Auth errors get a one-shot trip so a
-		// rotated/revoked API key takes the provider OUT immediately
-		// instead of after 5 more retries × 7-30s each.
-		// Only provider-health signals count toward the breaker: auth (revoked
-		// key), rate_limit (429), transient (5xx / network). A per-request 4xx
-		// such as 400 "unsupported language pair" is specific to that request -
-		// recording it would let a batch of unsupported-language calls trip the
-		// breaker and take the whole provider offline for unrelated, valid
-		// requests. The exception is still thrown either way so the caller
-		// learns this particular translation failed.
+		// Only provider-health failures count toward the breaker (auth, rate_limit, transient); a per-request 4xx such as
+		// an unsupported language pair does not, or one bad batch would take the provider offline.
 		if ( in_array( $failure_reason, [ 'auth', 'rate_limit', 'transient' ], true ) ) {
 			$threshold_override = $failure_reason === 'auth' ? 1 : 0;
 			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, $failure_reason, $threshold_override );
@@ -411,11 +366,22 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Parse and validate a JSON response body.
+	 * No time left for a retry: stop the slice so the next one retries, unless this call (all attempts) had a long
+	 * window and failed on its own; then it fails, so a slow provider cannot loop.
 	 *
-	 * Some providers (Microsoft Translator) return a numerically-indexed
-	 * top-level JSON array, others (DeepL, Google) return a string-keyed
-	 * object. The decoded array could therefore use int OR string keys.
+	 * @param float $timeout Seconds this call had: its attempts so far, or the failed attempt's timeout.
+	 * @param int   $backoff Wait before the next attempt.
+	 * @return void
+	 * @throws DeadlineReachedException When the window was short.
+	 */
+	private static function stop_unless_slow( float $timeout, int $backoff ): void {
+		if ( $timeout < CallDeadline::SLOW_CALL_SECONDS ) {
+			throw new DeadlineReachedException( time() + $backoff ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int; the message is escaped in the class.
+		}
+	}
+
+	/**
+	 * Decode a JSON body (a list for Microsoft, an object for DeepL and Google) and settle the armed success.
 	 *
 	 * @param string $body Raw response body.
 	 * @return array<int|string, mixed> Decoded JSON data.
@@ -453,11 +419,8 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Confirm that the last 2xx body was usable, closing out the success the
-	 * transport armed. Call this from any provider that consumes a
-	 * {@see make_request()} body WITHOUT going through
-	 * {@see parse_json_response()}; otherwise the breaker never learns the
-	 * call worked and an old failure streak lingers until it expires.
+	 * Confirm the last 2xx body was usable, for a provider that reads make_request()'s body without
+	 * parse_json_response(); otherwise an old failure streak lingers.
 	 *
 	 * @return void
 	 */
@@ -473,9 +436,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Report a 2xx response whose body could not be used. Counts toward the
-	 * breaker exactly like a transport failure, because for the caller it is
-	 * one: the call was paid for and produced nothing.
+	 * Report a 2xx body that could not be used; counts toward the breaker like a transport failure.
 	 *
 	 * @param string $reason Short failure tag stored for Site Health.
 	 * @return void
@@ -488,18 +449,17 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Validate a URL to prevent SSRF attacks.
+	 * Refuse a URL that targets localhost, a private range or a cloud metadata address.
 	 *
-	 * Blocks requests to localhost, private IP ranges, and cloud metadata endpoints.
-	 *
-	 * @param string $url URL to validate.
+	 * @param string $url      URL to validate.
+	 * @param bool   $resolved Whether the URL holds an address a host name resolved to.
 	 * @return string For a host name, the IPv4 address it resolved to and that
 	 *   was judged here (the request is pinned to it); '' for a host on
 	 *   perflocale/mt/trusted_hosts and for an IP literal.
 	 *
 	 * @throws \RuntimeException If URL targets an internal network.
 	 */
-	private function validate_url( string $url ): string {
+	private function validate_url( string $url, bool $resolved = false ): string {
 		$parsed = wp_parse_url( $url );
 		$host   = $parsed['host'] ?? '';
 
@@ -509,70 +469,34 @@ abstract class AbstractProvider implements ProviderInterface {
 
 		$host_lc = strtolower( $host );
 
-		// Block localhost and loopback.
-		$blocked_hosts = [ 'localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]' ];
-
-		if ( in_array( $host_lc, $blocked_hosts, true ) ) {
-			throw new \RuntimeException( 'Provider URL cannot target localhost.' );
-		}
-
-		// Fast path: known public MT providers skip the slow gethostbyname()
-		// step. Their hostnames are operator-controlled (wp-config / settings).
-		// The hard-coded localhost/loopback check above ALWAYS runs and is not
-		// filterable; everything below this point - the IPv4/IPv6 private-range
-		// gates and the DNS resolution - is skipped for a listed entry. Be
-		// precise about that when reading it as a security boundary: a match
-		// here returns, so an IP LITERAL added to the list is not re-checked
-		// against the private-range gates either. That is deliberate: the list
-		// is the way to reach a self-hosted provider on an internal network (a
-		// private LAN range, or the shared 100.64.0.0/10 range that Tailscale
-		// and carrier-grade NAT use), and the refusal message says so. It means
-		// the list is a full bypass, not a fast path with a safety net.
 		/**
-		 * Filter the hostnames that skip DNS validation in the SSRF check.
+		 * Filter the hosts that skip the SSRF address and DNS checks: the way to reach a provider on an internal network.
 		 *
-		 * Use this to add custom MT provider hosts (e.g. when registering
-		 * an OpenAI- or Anthropic- backed translator add-on) so their
-		 * outbound calls don't hit the slow `gethostbyname()` path, or to
-		 * reach a self-hosted provider (LibreTranslate) on an internal
-		 * network (a private LAN range, or the shared 100.64.0.0/10 range
-		 * that Tailscale and carrier-grade NAT use), which the private-IP
-		 * gate refuses. This filter is the way to reach such a provider.
-		 *
-		 * Treat an entry here as a full SSRF exemption for that host: the
-		 * private-IP and DNS gates do NOT run for it, whether it is a
-		 * hostname or an IP literal. Only the hard-coded localhost/loopback
-		 * literals stay blocked. Add only hosts you control.
+		 * A full exemption, IP literals included (add only hosts you control); localhost, 127.0.0.1, 0.0.0.0 and [::1]
+		 * only when listed exactly.
 		 *
 		 * @hook perflocale/mt/trusted_hosts
-		 *
 		 * @param array<int, string> $hosts Lowercase trusted hostnames.
 		 */
 		$trusted = (array) apply_filters( 'perflocale/mt/trusted_hosts', self::TRUSTED_HOSTS );
 		$trusted = array_map( 'strtolower', array_filter( $trusted, 'is_string' ) );
 
+		// Loopback only as the URL's own listed host, never as an address another name resolves to.
+		if ( in_array( $host_lc, [ 'localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]' ], true ) && ( $resolved || ! in_array( $host_lc, $trusted, true ) ) ) {
+			throw new \RuntimeException( 'Provider URL cannot target localhost.' );
+		}
+
 		if ( in_array( $host_lc, $trusted, true ) ) {
 			return '';
 		}
 
-		// wp_parse_url() returns IPv6 hosts wrapped in brackets per RFC 3986
-		// (e.g. "[fc00::1]"). Strip them before passing to filter_var() /
-		// inet_pton(), which want the bare literal.
+		// wp_parse_url() keeps IPv6 hosts in brackets; filter_var() and inet_pton() want the bare literal.
 		$host_ip = ( strlen( $host ) >= 2 && $host[0] === '[' && $host[-1] === ']' )
 			? substr( $host, 1, -1 )
 			: $host;
 
-		// Unwrap IPv4-mapped IPv6 (::ffff:0:0/96) to the IPv4 it carries, so
-		// the range checks judge the address the socket reaches. Mirrors
-		// {@see \PerfLocale\Api\WebhookController::is_url_safe()}; keep them in
-		// sync.
-		//
-		// Unwrapping rather than blanket-rejecting keeps the rule identical for
-		// both spellings of the same address: a mapped PUBLIC IPv4 still passes
-		// exactly as the bare form does.
-		// Gated on FILTER_FLAG_IPV6 first so inet_pton() only ever sees a
-		// literal it can parse - same shape as the fc00::/fe80:: byte check
-		// further down.
+		// Judge an IPv4-mapped IPv6 address as the IPv4 it carries (both spellings get the same rule), as
+		// WebhookController::is_url_safe() does; keep them in sync.
 		if ( Helper::is_ipv6( $host_ip ) ) {
 			$host_bin = inet_pton( $host_ip );
 
@@ -585,18 +509,14 @@ abstract class AbstractProvider implements ProviderInterface {
 			}
 		}
 
-		// If the host is already an IP literal, skip DNS entirely - this is
-		// both faster and avoids a potential hang on misconfigured resolvers.
+		// An IP literal needs no DNS.
 		if ( Helper::is_ip( $host_ip ) ) {
-			// Helper::is_public_outbound_address() judges both families; the
-			// fc00::/7 and fe80::/10 byte checks below are a second layer.
+			// Both families; the fc00::/7 and fe80::/10 checks below are a second layer.
 			if ( ! Helper::is_public_outbound_address( $host_ip ) ) {
 				throw new \RuntimeException( 'Provider URL targets a private or reserved IP address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 			}
 
-			// IPv6 unique-local (fc00::/7) and link-local (fe80::/10), both
-			// "private" in the SSRF sense, checked again as a second layer.
-			// Mirrors the byte check in WebhookController::is_url_safe().
+			// Unique-local fc00::/7 and link-local fe80::/10, again as a second layer (as WebhookController::is_url_safe()).
 			if ( Helper::is_ipv6( $host_ip ) ) {
 				$bin = inet_pton( $host_ip );
 
@@ -604,12 +524,12 @@ abstract class AbstractProvider implements ProviderInterface {
 					$first  = ord( $bin[0] );
 					$second = ord( $bin[1] );
 
-					// fc00::/7 - first 7 bits = 1111110 (0xFC or 0xFD).
+					// fc00::/7: first 7 bits 1111110.
 					if ( ( $first & 0xFE ) === 0xFC ) {
 						throw new \RuntimeException( 'Provider URL targets an IPv6 unique-local address.' );
 					}
 
-					// fe80::/10 - first 10 bits = 1111111010.
+					// fe80::/10: first 10 bits 1111111010.
 					if ( $first === 0xFE && ( $second & 0xC0 ) === 0x80 ) {
 						throw new \RuntimeException( 'Provider URL targets an IPv6 link-local address.' );
 					}
@@ -619,11 +539,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			return '';
 		}
 
-		// Cache DNS lookups for a few minutes. gethostbyname() has no timeout
-		// parameter - on a host with a broken /etc/resolv.conf it can block
-		// for the full system timeout (often 30s per nameserver). Caching
-		// the resolution limits the blast radius to one slow request per
-		// host per 5 minutes.
+		// DNS answers cached for 5 minutes: gethostbyname() has no timeout and a broken resolver blocks for long.
 		$cache_key = 'perflocale_dns_' . \PerfLocale\Cache\CacheManager::flush_scoped_hash( $host );
 		$ip        = get_transient( $cache_key );
 
@@ -632,10 +548,8 @@ abstract class AbstractProvider implements ProviderInterface {
 			set_transient( $cache_key, $ip, 5 * MINUTE_IN_SECONDS );
 		}
 
-		// Fail closed, mirroring WebhookController::is_url_safe(). gethostbyname()
-		// returns the input unchanged on resolution failure and does not
-		// canonicalise hex or octal IPv4 literals, so require a real resolution
-		// to a public IP.
+		// Fail closed (as WebhookController::is_url_safe()): gethostbyname() returns its input on failure and does not
+		// canonicalise hex or octal literals, so a real public address is required.
 		if ( ! is_string( $ip ) || $ip === $host || ! Helper::is_ip( $ip ) ) {
 			throw new \RuntimeException( 'Provider URL could not be resolved to a verifiable public IP.' );
 		}
@@ -644,33 +558,52 @@ abstract class AbstractProvider implements ProviderInterface {
 			throw new \RuntimeException( 'Provider URL resolves to a private or reserved IP address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 		}
 
-		// Loopback 127.0.0.0/8. Helper::is_public_outbound_address() above
-		// already rejects it; this second layer matches
-		// WebhookController::is_url_safe().
+		// Loopback 127.0.0.0/8, a second layer as in WebhookController::is_url_safe().
 		if ( str_starts_with( $ip, '127.' ) ) {
 			throw new \RuntimeException( 'Provider URL resolves to a loopback address.' );
 		}
 
-		// gethostbyname() is IPv4-only, so each AAAA record is checked too.
-		//
-		// Re-run THIS method against each AAAA literal rather than restating the
-		// rules: the bracketed form goes through the hard-coded loopback list,
-		// the IPv4-mapped unwrap above and the fc00::/fe80:: byte checks exactly
-		// as a literal URL would, so the two spellings of one address can never
-		// drift apart. An IP literal returns before the DNS branch, so the
-		// recursion is exactly one level deep. A host on
-		// perflocale/mt/trusted_hosts returned long before this point - that
-		// documented full exemption is still the way to reach an internal
-		// endpoint.
+		// gethostbyname() is IPv4-only: each AAAA record goes through this method as a literal, so both spellings get the
+		// same rules (one level deep).
 		foreach ( self::resolve_aaaa( $host ) as $ipv6 ) {
 			try {
-				$this->validate_url( 'https://[' . $ipv6 . ']/' );
+				$this->validate_url( 'https://[' . $ipv6 . ']/', true );
 			} catch ( \RuntimeException ) {
 				throw new \RuntimeException( 'Provider URL resolves to a private or reserved IPv6 address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 			}
 		}
 
 		return $ip;
+	}
+
+	/**
+	 * Whether the site refuses to send this request to a resolved host through the HTTP proxy.
+	 *
+	 * The proxy resolves the host itself, so the address validate_url() judged cannot be pinned.
+	 *
+	 * @param string $url Request URL.
+	 * @return bool
+	 */
+	private static function proxy_refuses( string $url ): bool {
+		$proxy = new \WP_HTTP_Proxy();
+
+		if ( ! $proxy->is_enabled() || ! $proxy->send_through_proxy( $url ) ) {
+			return false;
+		}
+
+		/**
+		 * Filter whether to refuse a proxied request to a custom MT provider or webhook host.
+		 *
+		 * Asked only for a host name PerfLocale resolved (not an IP literal or a perflocale/mt/trusted_hosts entry).
+		 *
+		 * @hook  perflocale/http/refuse_proxied_custom_hosts
+		 * @since 1.0.7.4
+		 *
+		 * @param bool   $refuse Whether to refuse. Default false: the proxy's own destination policy applies.
+		 * @param string $url    Request URL.
+		 * @return bool
+		 */
+		return (bool) apply_filters( 'perflocale/http/refuse_proxied_custom_hosts', false, $url );
 	}
 
 	/**
@@ -691,17 +624,8 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Resolve a hostname's AAAA records, cached like the A-record lookup.
-	 *
-	 * Fails open when the resolver cannot answer; the A-record check still
-	 * applies. `dns_get_record` is disabled outright on some managed hosts, and
-	 * refusing every provider URL there would take machine translation offline
-	 * on those sites. The result is cached for the same 5 minutes as the A
-	 * record, so a slow or broken resolver is paid once per host per window
-	 * rather than once per request - and hosts on the trusted list, and every
-	 * IP literal, return before this is ever called.
-	 *
-	 * Mirrored in {@see \PerfLocale\Api\WebhookController}; keep them in sync.
+	 * A hostname's AAAA records, cached like the A lookup. Fails open (dns_get_record() is disabled on some hosts; the
+	 * A check still applies). Mirrored in WebhookController: keep them in sync.
 	 *
 	 * @param string $host Hostname (never an IP literal - the caller returns first).
 	 * @return array<int, string> IPv6 literals; empty when there are none or the
@@ -737,26 +661,8 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Redact anything token-like from a provider error message.
-	 *
-	 * Provider error responses *shouldn't* echo the API key back, but they
-	 * do: OpenAI's 401 body is literally `Incorrect API key provided:
-	 * sk-…`, and a misbehaving proxy can echo an Authorization header. The
-	 * text eventually reaches the admin UI via the RuntimeException thrown
-	 * below - and, for a background job, is persisted on the job row that
-	 * the Jobs page and the REST detail endpoint render. Masking long
-	 * alphanumeric runs is a cheap defense in depth: anything that looks
-	 * like a 24+ character credential gets replaced with "[REDACTED]".
-	 * Legitimate error text (HTTP verbs, short words, status codes) is
-	 * untouched.
-	 *
-	 * `protected` rather than private because providers that do NOT route
-	 * through make_request() - {@see \PerfLocale\MachineTranslation\Provider\WpAiClientProvider},
-	 * which is invoked through a PHP callback - have to apply the same
-	 * masking to the upstream message themselves.
-	 *
-	 * The rule itself lives in {@see \PerfLocale\Util\SecretMasker} so the
-	 * webhook failure log applies exactly the same one.
+	 * Replace credential-shaped runs (24+ characters) in provider error text with "[REDACTED]" (Util\SecretMasker).
+	 * Providers echo keys back, and the text is stored on job rows. Protected for providers outside make_request().
 	 *
 	 * @param string $body Truncated error body or upstream error message.
 	 * @return string
@@ -766,23 +672,62 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Cron handler: drop `perflocale_mt_usage_YYYY_MM` options that no
-	 * longer fall inside the retention window. Counter rows accumulate at
-	 * one per month per blog forever otherwise; after a few years the
-	 * options table carries dozens of historical rows nobody reads. The
-	 * MtUsageView admin UI only ever queries the current and previous
-	 * 12 months, so retaining 13 is sufficient.
+	 * Error text with this provider's configured credential and credential-shaped runs masked.
 	 *
-	 * Scheduled weekly from Bootstrap (`perflocale_mt_usage_gc` event,
-	 * per-blog). Idempotent - safe to re-run.
+	 * @param string $text Error text.
+	 * @return string
+	 */
+	private function mask_error_text( string $text ): string {
+		return self::mask_credentials( $this->mask_configured_credential( $text ) );
+	}
+
+	/**
+	 * Replace this provider's configured credential, as sent, trimmed or URL-encoded, with `[REDACTED]`.
+	 *
+	 * A key of 1-3 characters only as a whole token, so the words around it stay readable; a longer one anywhere.
+	 *
+	 * @param string $text Text.
+	 * @return string
+	 */
+	private function mask_configured_credential( string $text ): string {
+		$setting = self::CREDENTIAL_SETTING[ $this->get_id() ] ?? '';
+		$secret  = '' === $setting ? '' : $this->settings->get( $setting, '' );
+		$secret  = is_string( $secret ) ? $secret : '';
+		$trimmed = trim( $secret );
+
+		if ( '' === $trimmed ) {
+			return $text;
+		}
+
+		$short = mb_strlen( $trimmed ) <= 3;
+		$forms = array_unique( $short ? [ $trimmed, rawurlencode( $trimmed ) ] : [ $secret, $trimmed, rawurlencode( $trimmed ) ] );
+
+		// Longest first, so a form that contains another is replaced whole.
+		usort( $forms, static fn( string $a, string $b ): int => strlen( $b ) <=> strlen( $a ) );
+
+		if ( $short ) {
+			$quoted = array_map( static fn( string $f ): string => preg_quote( $f, '/' ), $forms );
+			$masked = preg_replace( '/(?<![\p{L}\p{N}_])(?:' . implode( '|', $quoted ) . ')(?![\p{L}\p{N}_])/u', '[REDACTED]', $text );
+
+			// Text that is not UTF-8 fails the match: masked everywhere instead.
+			if ( null !== $masked ) {
+				return $masked;
+			}
+		}
+
+		return str_replace( $forms, '[REDACTED]', $text );
+	}
+
+	/**
+	 * Weekly `perflocale_mt_usage_gc` handler: delete `perflocale_mt_usage_YYYY_MM` options older than the current
+	 * month and the 12 before it (all MtUsageView reads). Idempotent.
 	 *
 	 * @return int Number of options deleted.
 	 */
 	public static function gc_old_usage_counters(): int {
 		global $wpdb;
 
-		// Retain current month + 12 prior months. Any earlier YYYY_MM key
-		// is dropped.
+		// Keep this month and the 12 before it.
 		$cutoff = gmdate( 'Y_m', strtotime( '-12 months' ) );
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -796,8 +741,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		$deleted = 0;
 		foreach ( $names as $name ) {
 			$name = (string) $name;
-			// Extract the YYYY_MM suffix. Format is always
-			// "perflocale_mt_usage_YYYY_MM".
+			// The YYYY_MM suffix of "perflocale_mt_usage_YYYY_MM".
 			$suffix = substr( $name, strlen( 'perflocale_mt_usage_' ) );
 			if ( $suffix !== '' && strcmp( $suffix, $cutoff ) < 0 ) {
 				delete_option( $name );
@@ -819,9 +763,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Batch-safe version of track_usage - single option write for any number
-	 * of characters. Call once per batch request with the total character
-	 * count, instead of calling track_usage() N times inside a loop.
+	 * Add a batch's characters to the month's counter in one write.
 	 *
 	 * @param int $chars Total characters translated.
 	 * @return void
@@ -836,26 +778,9 @@ abstract class AbstractProvider implements ProviderInterface {
 
 		global $wpdb;
 
-		// Increment ATOMICALLY at the database in ONE upsert, NOT via a
-		// read-modify-write of get_option(). The old lock+get_option RMW was
-		// wrong two ways under concurrent MT (bulk_translate /
-		// bulk_string_translate runs in parallel under
-		// distinct type-locks, plus REST processes): (1) a long-lived worker's
-		// get_option reads its OWN last-written value from the per-process
-		// object cache, never other processes' committed increments →
-		// last-writer-wins even under a perfect lock; (2) the lock's
-		// non-blocking fallback ran the increment unlocked. Both silently
-		// undercounted the monthly char total by up to ~90%, so the overage cap
-		// never engaged → real paid-API charges.
-		//
-		// INSERT … ON DUPLICATE KEY UPDATE option_value = option_value + N is
-		// the whole operation under the row lock: the row is created with $chars
-		// if absent, or has $chars ADDED if present. Note we can NOT use
-		// add_option() to pre-create the row - modern WP's add_option issues
-		// `ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)`, so a
-		// concurrent add_option('0') would RESET a row another worker had
-		// already incremented. autoload 'no' keeps it out of alloptions on every
-		// supported WP version.
+		// One atomic upsert at the database: a get_option() read-modify-write undercounts under parallel runs and the cap
+		// never engages; not add_option(), whose upsert resets a row another worker incremented.
+		// Docs: docs-ai/11-code-rationale.md, "AbstractProvider: atomic usage counter".
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic counter upsert; the whole point is to bypass the object-cache RMW.
 		$wpdb->query(
 			$wpdb->prepare(
@@ -867,22 +792,8 @@ abstract class AbstractProvider implements ProviderInterface {
 			)
 		);
 
-		// Drop the cached option so every process's next get_option (the cap
-		// check in TranslationService::would_exceed_limit) re-reads the fresh
-		// committed total instead of a stale per-process value.
-		// The raw INSERT bypasses add_option(), so when this month's row is
-		// being CREATED the option name is still listed in the persistent
-		// 'notoptions' cache (a prior get_option() miss put it there) - and a
-		// stale notoptions entry makes every later get_option() return the
-		// default 0 REGARDLESS of the DB value, silently disabling the monthly
-		// cap. Mirror core add_option()'s cache maintenance: drop the name from
-		// notoptions, then drop the per-option value cache.
-		// 'notoptions' / 'options' are WordPress CORE's own cache key and group,
-		// intentionally unprefixed. Core records "this option does not exist"
-		// here; after we create the counter option we must clear our key from
-		// core's negative-lookup list or every later get_option() for it keeps
-		// short-circuiting to false. Writing this under a perflocale_ key would
-		// leave core's cache untouched and reintroduce a query per request.
+		// As add_option() does: drop the name from core's `notoptions` (else every get_option() answers 0 and the cap is
+		// off) and the cached value, so the cap check reads the committed total.
 		$notoptions = wp_cache_get( 'notoptions', 'options' );
 		if ( is_array( $notoptions ) && isset( $notoptions[ $month_key ] ) ) {
 			unset( $notoptions[ $month_key ] );
@@ -892,12 +803,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Parse an HTTP `Retry-After` header into seconds.
-	 *
-	 * RFC 7231 §7.1.3 allows both an integer (delta-seconds) and an
-	 * HTTP-date form ("Wed, 21 Oct 2026 07:28:00 GMT"). A naive int-cast
-	 * collapses the date form to 0 - letting the request retry immediately
-	 * after a 429, which is the opposite of what the upstream asked for.
+	 * Retry-After in seconds: delta-seconds or an HTTP date (RFC 7231 7.1.3), which an int cast would read as 0.
 	 *
 	 * @param mixed $header Raw header value (string or empty).
 	 * @return int Seconds to wait, 0 if unparseable.
@@ -909,12 +815,12 @@ abstract class AbstractProvider implements ProviderInterface {
 
 		$trimmed = trim( $header );
 
-		// Delta-seconds form - pure integer string.
+		// Delta-seconds.
 		if ( Helper::is_ascii_digits( $trimmed ) ) {
 			return (int) $trimmed;
 		}
 
-		// HTTP-date form - fall back to strtotime + diff against now.
+		// HTTP date.
 		$ts = strtotime( $trimmed );
 		if ( false === $ts ) {
 			return 0;

@@ -1,6 +1,6 @@
 <?php
 /**
- * Generates .l10n.php translation files from database string translations.
+ * Generates .l10n.php translation files from the database string translations.
  *
  * @package PerfLocale
  */
@@ -17,46 +17,31 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Generates WordPress 6.5+ .l10n.php translation files per domain per locale,
- * plus one combined per-locale bundle pre-keyed for TranslationFileLoader's
- * O(1) fast path.
- *
- * Files are written to wp-content/uploads/perflocale/translations/;
- * TranslationFileLoader includes them and serves their strings through the
- * gettext filters.
+ * Writes WordPress 6.5+ .l10n.php files per domain and locale, plus one combined bundle per locale pre-keyed for
+ * TranslationFileLoader, under uploads/perflocale/translations/. Docs: docs-ai/11-code-rationale.md,
+ * "TranslationFileGenerator: generation order".
  */
 final class TranslationFileGenerator {
 
 	/**
-	 * Autoloaded option holding the exact list of .l10n.php basenames that
-	 * exist on disk after the last generation. The loader reads this to skip a
-	 * per-request directory glob; this generator is the sole writer/deleter of
-	 * the directory, so the manifest reflects disk by construction. Per-blog on
-	 * multisite (autoloaded options are blog-scoped, matching the per-blog
-	 * uploads dir).
+	 * Autoloaded per-blog option listing the .l10n.php basenames on disk after the last generation, so the loader skips
+	 * a glob; this class is the directory's only writer.
 	 *
 	 * @var string
 	 */
 	public const MANIFEST_OPTION = 'perflocale_l10n_manifest';
 
 	/**
-	 * Combined-bundle format version embedded in every combined per-locale
-	 * file and required by TranslationFileLoader before it trusts one. The
-	 * bundle persists TranslationFileLoader::map_key() composite keys, so any
-	 * change to that key format (or to the bundle's array shape) must bump
-	 * this - otherwise a bundle written by an older plugin version would be
-	 * served with keys the current lookup can never match.
+	 * Combined bundle format version the loader requires: bump it on any change to TranslationFileLoader::map_key() or
+	 * the bundle's shape, or an older bundle is served with keys that never match.
 	 *
 	 * @var int
 	 */
 	public const COMBINED_VERSION = 1;
 
 	/**
-	 * Filename prefix of the combined per-locale bundle. Shared as a constant
-	 * because the loader derives the bundle name as
-	 * `COMBINED_PREFIX . $suffix` from its already-built per-domain suffix -
-	 * one shared literal instead of a second sanitize_file_name() call on the
-	 * hot path.
+	 * Filename prefix of the combined bundle; shared so the loader builds the name from its own suffix without another
+	 * sanitize_file_name() call.
 	 *
 	 * @var string
 	 */
@@ -75,16 +60,14 @@ final class TranslationFileGenerator {
 	private readonly CacheManager $cache;
 
 	/**
-	 * Locales whose source translations could not be read during the last
-	 * generate_all() run. Their files were left as they were.
+	 * Locales whose source translations could not be read in the last generate_all(); their files were kept.
 	 *
 	 * @var string[]
 	 */
 	private array $read_failed_locales = [];
 
 	/**
-	 * Translation rows the orphan repair of the last generate_all() run
-	 * removed or connected again (see get_repaired_count()).
+	 * Translation rows the last generate_all()'s orphan repair removed or linked again.
 	 *
 	 * @var int
 	 */
@@ -100,26 +83,11 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Generate .l10n.php files for all domains and all active languages.
+	 * Generate the .l10n.php files of every domain and active language, after repairing orphaned translations so the
+	 * fetch's JOIN reaches them.
 	 *
-	 * Self-heals orphaned data before generating: strings that have rows in
-	 * `string_translations` but are missing their `translation_groups` /
-	 * `translation_links` connection are auto-relinked so the generator can
-	 * produce files for them on this run. This prevents the historical
-	 * "Regenerate Translation Files reports 0" loop where translations
-	 * existed in the DB but the generator's JOIN could not reach them.
-	 *
-	 * @param int[]|null $only_language_ids When set, regenerate only these
-	 *                                      languages' files: the fetch, the
-	 *                                      orphan cleanup, and the manifest
-	 *                                      update are all scoped to them and
-	 *                                      other languages' files stay
-	 *                                      untouched on disk. A single-string
-	 *                                      admin save otherwise re-fetched
-	 *                                      EVERY language's full translation
-	 *                                      set - O(total translations
-	 *                                      sitewide) per save. Null = full run
-	 *                                      (Regenerate button, mode switch).
+	 * @param int[]|null $only_language_ids Regenerate only these languages (fetch, repair and manifest scoped to them;
+	 *                                      other files untouched), as a single-string save does; null: full run.
 	 * @return int Number of per-domain files that were actually written to
 	 *             disk on this run. Excludes files skipped because their
 	 *             content was already current, and excludes writes that
@@ -152,12 +120,7 @@ final class TranslationFileGenerator {
 			}
 		}
 
-		// The default language serves source strings unchanged - the loader's
-		// activate() fast-path never loads a default-locale bundle - so
-		// generating one is wasted work and leaves a dead, confusing file
-		// (e.g. a default-locale bundle for a string a user "translated" into
-		// the source language). Exclude it here; the Step-3 cleanup below then
-		// reclaims any default-locale file a prior run may have written.
+		// The default language serves source strings and the loader never loads its bundle: no files (step 3 removes old ones).
 		$languages = array_values(
 			array_filter(
 				(array) $languages,
@@ -169,10 +132,7 @@ final class TranslationFileGenerator {
 			return 0;
 		}
 
-		// Self-heal orphans first so the JOIN-based fetch below can see
-		// them. We deliberately do this on every Regenerate run, not just
-		// when there is a problem - repair is idempotent and cheap when
-		// nothing needs fixing.
+		// Repair orphans first, on every run (idempotent and cheap), so the JOIN below sees them.
 		$repair               = $this->repair_orphaned_translations();
 		$this->repaired_count = $repair['dangling'] + $repair['repaired_rows'];
 
@@ -180,11 +140,8 @@ final class TranslationFileGenerator {
 		$failed_language_ids = [];
 		$all_translations    = $this->fetch_all_translations( $languages, $failed_language_ids );
 
-		// A language whose source read failed has an unknown target state, not
-		// an empty one. It is removed from this run: its combined bundle and
-		// per-domain files stay on disk and in the manifest exactly as they
-		// were (Step 3 treats them as out of scope), and the failure is
-		// reported. Healthy languages in the same run are regenerated.
+		// A language whose read failed has an unknown state, not an empty one: it leaves this run, its files and manifest
+		// entries stay, and the failure is reported.
 		if ( $failed_language_ids !== [] ) {
 			$healthy = [];
 
@@ -203,19 +160,8 @@ final class TranslationFileGenerator {
 			$languages = $healthy;
 		}
 
-		// Step 1: compute the full target state (path => content) without
-		// touching disk. Strings whose `messages` array is empty don't
-		// produce a file; if such a file existed on disk it'll be cleaned
-		// up by Step 3 below.
-		//
-		// Alongside the per-domain files, each locale gets ONE combined
-		// bundle: the same messages re-keyed into the loader's composite
-		// map_key() format, so load_translations() can bind a single
-		// OPcache-shared array instead of re-walking every message of every
-		// domain on each request. Kept out of $target because its write
-		// ordering differs - a stale bundle would SHADOW fresh per-domain
-		// files, so it is deleted before any per-domain mutation and
-		// rewritten last.
+		// Step 1: the target state (path => content) without touching disk; empty sets make no file (step 3 removes it).
+		// Each locale also gets one combined bundle in map_key() form, kept apart because a stale bundle shadows the files.
 		$target          = [];
 		$combined_target = [];
 
@@ -231,9 +177,7 @@ final class TranslationFileGenerator {
 				$target[ $path ] = $this->compute_l10n_content( $messages );
 
 				foreach ( $messages as $key => $value ) {
-					// .l10n.php keys are `context\x04original`; a purely
-					// numeric original is stored by PHP as an int array key,
-					// so stringify to match the loader's read side exactly.
+					// Keys are `context\x04original`; a numeric original is an int array key, so stringify as the loader reads it.
 					$context  = '';
 					$original = $key;
 
@@ -250,13 +194,8 @@ final class TranslationFileGenerator {
 			}
 		}
 
-		// A combined bundle takes priority over per-domain files in the
-		// loader, so a stale one must never outlive a change to its locale's
-		// files: delete a changed/obsolete bundle BEFORE any per-domain write
-		// or delete (readers fall back to the per-domain path meanwhile) and
-		// write the fresh bundle last, after Step 3 has settled the
-		// directory. Unchanged bundles stay live untouched - no write, no
-		// OPcache invalidation.
+		// A changed or obsolete combined bundle is deleted before any per-domain change and the new one written last;
+		// an unchanged one stays.
 		$combined_pending = [];
 
 		foreach ( $languages as $language ) {
@@ -286,16 +225,8 @@ final class TranslationFileGenerator {
 			}
 		}
 
-		// Step 2: write only files whose content actually changed.
-		// Comparing md5 of existing-file vs new-content (each .l10n.php
-		// is small - typically 1-50 KB) costs ~50-200 µs per file but
-		// saves a full disk write + opcache invalidation when content is
-		// identical. On a typical save that touches one string in one
-		// language, this collapses 15 file-writes into 1.
-		// Only a write that actually landed is counted. write_l10n_file()
-		// reports its own failures through `perflocale/strings/file_write_failed`;
-		// what must not happen here is counting the attempt, because this
-		// number is what the Regenerate screen shows the operator.
+		// Step 2: write only changed files (md5 compare), and count only writes that landed: the count is what the
+		// Regenerate screen shows.
 		$count = 0;
 
 		foreach ( $target as $path => $content ) {
@@ -308,21 +239,8 @@ final class TranslationFileGenerator {
 			}
 		}
 
-		// Step 3: delete orphans - any .l10n.php on disk that no longer
-		// belongs (its domain was removed, its language was deleted, or
-		// every translation in that bucket was cleared). Doing this AFTER
-		// the writes eliminates the "transient empty directory" window
-		// that the old clean_all-then-write flow had - if a frontend
-		// request landed during that window, every translated string
-		// briefly fell back to its source.
-		//
-		// On a language-scoped run, files belonging to OTHER languages are
-		// out of scope: $target only covers the subset, so deleting
-		// everything not in it would wipe every other language's bundles.
-		// A run with a failed source read is scoped to its healthy languages
-		// the same way, so the failed languages' files are kept; files of
-		// deleted languages and default-locale leftovers are then reclaimed
-		// by the next run without a read failure.
+		// Step 3: delete files outside the target state, after the writes so no request sees an empty directory. A scoped run
+		// (subset, failed reads) keeps other languages' files.
 		$subset_suffixes = null;
 
 		if ( $only_language_ids !== null || $this->read_failed_locales !== [] ) {
@@ -347,7 +265,7 @@ final class TranslationFileGenerator {
 				}
 
 				if ( ! $in_subset ) {
-					$kept[] = $existing; // Another language's file - keep untouched.
+					$kept[] = $existing; // Another language's file.
 					continue;
 				}
 			}
@@ -355,40 +273,20 @@ final class TranslationFileGenerator {
 			if ( ! isset( $target[ $existing ] ) && ! isset( $combined_target[ $existing ] ) ) {
 				wp_delete_file( $existing );
 
-				// Drop opcache for the deleted file too.
+				// And its OPcache entry.
 				if ( function_exists( 'opcache_invalidate' ) ) {
 					opcache_invalidate( $existing, true );
 				}
 			}
 		}
 
-		// Write the fresh combined bundles LAST - per-domain writes and
-		// orphan deletion are settled, so a reader that binds a bundle sees
-		// exactly this run's final state. Not counted in $count: bundles are
-		// an internal cache tier, not user-visible domain files.
+		// Combined bundles last, once the directory is settled; not counted (an internal cache tier).
 		foreach ( $combined_pending as $cpath => $content ) {
 			$this->write_l10n_file( $cpath, $content );
 		}
 
-		// Step 4: persist the file manifest so the loader can skip its
-		// per-request directory glob. $target's and $combined_target's keys
-		// are the subset's intended files; $kept holds the out-of-scope files
-		// Step 3 left alone (empty on a full run). Autoloaded + per-blog; the
-		// loader falls back to glob when this option is absent. A combined
-		// bundle absent from the manifest is never trusted by the loader, so
-		// listing it here is what activates the fast path.
-		//
-		// The list is filtered through is_file() rather than taken on trust:
-		// an intended path is not a written path. On a host where the writes
-		// above failed (read-only uploads, no WP_Filesystem credentials) the
-		// unfiltered list published basenames that do not exist, and the
-		// loader - which prefers the manifest over a glob - then walked a set
-		// of phantom files. Its realpath guard skips each one, so the outcome
-		// was untranslated output rather than an error, but the option is
-		// documented as reflecting disk and now does by observation.
-		// clearstatcache() first: the writes just went through
-		// WP_Filesystem::move(), which does not invalidate PHP's stat cache
-		// for the destination path.
+		// Step 4: the manifest, filtered through is_file() (an intended path is not a written one) after clearstatcache()
+		// (WP_Filesystem::move() leaves the stat cache stale). A bundle not listed is never trusted.
 		clearstatcache();
 
 		$manifest = [];
@@ -407,8 +305,7 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Locales whose source translations could not be read during the last
-	 * generate_all() run. Their existing files were kept unchanged.
+	 * Locales whose source translations could not be read in the last generate_all(); their files were kept.
 	 *
 	 * @return string[]
 	 */
@@ -417,12 +314,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Translation rows the last generate_all() run repaired before
-	 * generating: the dangling rows it deleted plus the rows it linked again
-	 * (a regrouped string's rows are among the linked ones). This is the
-	 * number of rows count_repairable_orphans() stops counting because of
-	 * the run, without its two full-table counts. 0 when the run returned
-	 * before the repair.
+	 * Translation rows the last generate_all() repaired (dangling rows deleted plus rows linked again): what
+	 * count_repairable_orphans() stops counting. 0 when the run returned before the repair.
 	 *
 	 * @return int
 	 */
@@ -445,10 +338,7 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Build the .l10n.php content body for a translation set.
-	 *
-	 * Kept pure (no I/O, no globals) so generate_all can hash the result
-	 * against existing files on disk before deciding whether to write.
+	 * The .l10n.php content of a translation set; pure, so generate_all() can compare it with the file first.
 	 *
 	 * @param array<string, string> $messages Translations [original => translation].
 	 * @return string PHP source ready for file_put_contents.
@@ -463,17 +353,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Basename of a locale's combined bundle (every domain's messages
-	 * re-keyed into TranslationFileLoader::map_key() format).
-	 *
-	 * Ends in the same `-<locale>.l10n.php` suffix as the per-domain files ON
-	 * PURPOSE: every locale-wide cleanup glob (clean_all(), the
-	 * language-delete cleanup in LanguageRepository) then removes the bundle
-	 * together with the per-domain files it was derived from - a bundle that
-	 * outlived its locale would shadow fresh state if that locale were ever
-	 * re-added. The `_` prefix is reserved: fetch_all_translations() skips
-	 * `_`-prefixed (internal) domains, so generated per-domain files never
-	 * carry it.
+	 * Basename of a locale's combined bundle. Same `-<locale>.l10n.php` suffix as the domain files on purpose, so every
+	 * locale-wide cleanup glob removes it too; the `_` prefix is reserved (internal domains are skipped).
 	 *
 	 * @param string $locale Locale (e.g. fr_FR).
 	 * @return string
@@ -493,11 +374,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Build the combined-bundle content body for a pre-keyed composite map.
-	 *
-	 * Deliberately a different shape from compute_l10n_content() ('v' +
-	 * 'map', no 'messages') so the loader's per-domain fallback loop skips a
-	 * bundle it does not trust instead of mis-parsing it as a text domain.
+	 * The combined bundle's content: 'v' + 'map', no 'messages', so the loader's per-domain loop skips one it does not
+	 * trust instead of reading it as a domain.
 	 *
 	 * @param array<string, string> $map Composite map [map_key => translation].
 	 * @return string PHP source ready for file_put_contents.
@@ -513,18 +391,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Remove all generated translation files.
-	 *
-	 * Also sweeps `*.l10n.php.<hex>.tmp` staging files. write_l10n_file()
-	 * writes to a randomly-suffixed sibling and then moves it onto the final
-	 * name, and it deletes its own temp on both failure paths - but a process
-	 * killed between the write and the move (max_execution_time on a large
-	 * regeneration, an OOM, a deploy restart) leaves the temp behind. Those
-	 * names do not end in `.l10n.php`, so neither this method's original glob
-	 * nor generate_all()'s orphan sweep could ever see them and the debris
-	 * accumulated for the life of the install. Switching string mode back to
-	 * "database" is the operator's "remove everything" action, so it is the
-	 * right place to reclaim them.
+	 * Remove every generated file, including `*.l10n.php.<hex>.tmp` left by a process killed between write and move
+	 * (switching back to database mode is the "remove everything" action).
 	 *
 	 * @return void
 	 */
@@ -557,10 +425,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Ensure the translations directory exists with defense-in-depth
-	 * protection files (.htaccess + index.php + web.config) installed via
-	 * the shared helper. Also hardens the parent `uploads/perflocale/` dir
-	 * since `wp_mkdir_p` creates the parent implicitly without protection.
+	 * Create the translations directory with its protection files (.htaccess, index.php, web.config), also in the
+	 * parent `uploads/perflocale/` that wp_mkdir_p() creates bare.
 	 *
 	 * @return void
 	 */
@@ -575,10 +441,7 @@ final class TranslationFileGenerator {
 
 		\PerfLocale\Helper::harden_directory( $dir );
 
-		// Also harden the parent `uploads/perflocale/` dir which
-		// `wp_mkdir_p` created implicitly. Without this, an autoindex-on
-		// host would expose the `translations/` subdir name from the
-		// parent listing.
+		// The parent too: with autoindex on, its listing would show `translations/`.
 		$parent = dirname( $dir );
 		if ( $parent !== '' && $parent !== '.' && $parent !== '/' ) {
 			\PerfLocale\Helper::harden_directory( $parent );
@@ -586,19 +449,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Self-heal `string_translations` rows that have lost their connection
-	 * to `translation_groups` / `translation_links`. Repairs three shapes
-	 * (idempotent - running it when nothing is broken is a no-op):
-	 *
-	 *   1. Dangling rows where `string_translations.string_id` points at a
-	 *      `strings.id` that no longer exists → DELETE the row (the source
-	 *      string is gone; we cannot recover the translation usefully).
-	 *   2. Strings with `group_id = 0` or pointing at a non-string-type
-	 *      group → create a fresh `translation_groups` row of type='string'
-	 *      and point the string at it.
-	 *   3. Strings that ARE in a string group, AND have a translation row,
-	 *      but the matching `translation_links` row is missing → INSERT it
-	 *      so the generator's JOIN sees the pair.
+	 * Repair translation rows the generator cannot reach (idempotent): delete rows whose string is gone, give strings
+	 * without a string group a new one, insert missing links of translated languages.
 	 *
 	 * @return array{dangling: int, regrouped: int, relinked: int, repaired_rows: int} Repair counts: `relinked`
 	 *         counts inserted links, `repaired_rows` the translation rows those links made reachable.
@@ -619,19 +471,16 @@ final class TranslationFileGenerator {
 			'repaired_rows' => 0,
 		];
 
-		// (1) Dangling: string_translations rows whose string_id is gone.
+		// (1) Rows whose string is gone. One table per DELETE: the SQLite integration's 2.2.x legacy driver mishandles a JOIN.
 		$out['dangling'] = (int) $wpdb->query(
 			$wpdb->prepare(
-				'DELETE st FROM %i st
-				LEFT JOIN %i s ON s.id = st.string_id
-				WHERE s.id IS NULL',
+				'DELETE FROM %i WHERE string_id NOT IN ( SELECT id FROM %i )',
 				$st_table,
 				$strings_table
 			)
 		);
 
-		// (2) Strings that have at least one translation, but no usable
-		// group. Give them a fresh string-type group apiece.
+		// (2) Translated strings without a usable group: a new string group each.
 		$ungrouped = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT DISTINCT s.id FROM %i s
@@ -668,31 +517,9 @@ final class TranslationFileGenerator {
 			++$out['regrouped'];
 		}
 
-		// (3) Missing translation_links: there is a (string, language)
-		// pair with a translation row, the string lives in a string-type
-		// group, but no link row exists for that (group, language).
-		// `object_id` on the link is the string_id (per the
-		// TranslationGroupRepository::link_object contract for
-		// string groups).
-		//
-		// translation_links carries TWO unique keys (Schema.php:123-124), and
-		// the LEFT JOIN below only tests one of them:
-		//
-		// - group_lang (group_id, language_id) - what "l.id IS NULL" tests.
-		// - object_lang (type, object_id, language_id) - untested here.
-		//
-		// So a row absent from this group but present for the SAME
-		// (type='string', string_id, language) under a DIFFERENT group would
-		// collide on object_lang, and INSERT IGNORE would swallow it: the
-		// string stays unreachable to fetch_all_translations()'s
-		// `l.group_id = s.group_id` join and count_repairable_orphans() keeps
-		// counting it, run after run. No code path was found that can produce
-		// that state - groups are immutable (TranslationGroupRepository::update()
-		// returns false), every group delete removes its links first, and step
-		// (2) above is the only writer of strings.group_id - so this is
-		// recorded, not guarded against. Do not "simplify" the comment back to
-		// naming one key: believing translation_links has a single unique key
-		// is what produced the upsert defect fixed in release week.
+		// (3) Missing links (object_id = string id). translation_links has TWO unique keys: the JOIN tests group_lang only,
+		// and a row under another group would collide on object_lang. Docs: docs-ai/11-code-rationale.md,
+		// "TranslationFileGenerator: orphan repair and the two link keys".
 		if ( ! $wpdb instanceof \wpdb ) {
 			return $out;
 		}
@@ -713,10 +540,7 @@ final class TranslationFileGenerator {
 			)
 		);
 
-		// Several translation rows can share one (group, language) slot: one
-		// link makes all of them reachable, so the slot's row count is
-		// credited once its link is written, and later rows of a linked slot
-		// are not written again (group_lang would ignore them).
+		// Several rows can share one (group, language) slot: one link reaches them all, so the slot is credited once.
 		$rows     = [];
 		$per_slot = [];
 		foreach ( (array) $missing as $row ) {
@@ -729,10 +553,8 @@ final class TranslationFileGenerator {
 		}
 		$linked = [];
 
-		// One INSERT IGNORE per batch, rows in the order read. A row is
-		// skipped when its slot is linked (group_lang) or its string already
-		// has a link in that language under another group (object_lang), so
-		// a later row of the same slot can still link it.
+		// One INSERT IGNORE per batch, in read order: a row is skipped when its slot is linked (group_lang) or its string
+		// has a link in that language under another group (object_lang).
 		foreach ( array_chunk( $rows, self::RELINK_BATCH ) as $batch ) {
 			$values = [];
 			$slots  = [];
@@ -742,8 +564,7 @@ final class TranslationFileGenerator {
 				if ( isset( $linked[ $slot ] ) ) {
 					continue;
 				}
-				// `type` mirrors the owning group's type (Schema.php:89); this
-				// repair only ever re-links string-type groups.
+				// `type` is the group's type: this repair links string groups only.
 				$value = $wpdb->prepare( '(%d, %d, %d, %s, %s, %s)', $group_id, $string_id, $language_id, 'string', 'published', 'manual' );
 				if ( ! is_string( $value ) ) {
 					continue;
@@ -762,9 +583,7 @@ final class TranslationFileGenerator {
 			if ( $inserted <= 0 ) {
 				continue;
 			}
-			// A slot takes at most one row (group_lang): when every slot of
-			// the batch took one, the count says which; otherwise the batch's
-			// slots that now have a link are read back.
+			// A slot takes one row: when every slot took one the count says which; else the linked slots are read back.
 			$done = array_keys( $slots );
 			if ( $inserted < count( $slots ) ) {
 				$done  = [];
@@ -795,17 +614,14 @@ final class TranslationFileGenerator {
 		}
 		// phpcs:enable
 
-		// No explicit cache flush needed: `fetch_all_translations()` reads
-		// the relevant tables directly with wpdb, not through CacheManager.
+		// No cache flush: fetch_all_translations() reads the tables directly.
 
 		return $out;
 	}
 
 	/**
-	 * Count rows that the generator currently cannot compile (orphans of
-	 * any of the three shapes that `repair_orphaned_translations()`
-	 * handles). The Regenerate notice reports the repair's own count
-	 * instead (get_repaired_count()); the regression suites read this one.
+	 * Rows the generator cannot compile (the three shapes repair_orphaned_translations() handles), for the regression
+	 * suites; the Regenerate notice uses get_repaired_count().
 	 *
 	 * @return int
 	 */
@@ -837,11 +653,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Fetch all string translations grouped by locale and domain.
-	 *
-	 * A language whose reads fail is left out of the result and its id is
-	 * added to $failed_language_ids, so a database error is never mistaken
-	 * for a language without translations (see last_read_failed()).
+	 * Every string translation by locale and domain; a language whose reads fail is left out and its id added to
+	 * $failed_language_ids, so a database error never reads as no translations.
 	 *
 	 * @param array<int, object> $languages           Active languages.
 	 * @param int[]              $failed_language_ids Receives the ids of languages whose reads failed.
@@ -866,7 +679,7 @@ final class TranslationFileGenerator {
 				continue;
 			}
 
-			// Get all strings with translations for this language.
+			// The language's translated strings.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$rows = $wpdb->get_results(
 				$wpdb->prepare(
@@ -892,10 +705,7 @@ final class TranslationFileGenerator {
 				continue;
 			}
 
-			// Batch-fetch translations from the dedicated table.
-			// Using StringTranslationRepository::get_map() runs one query
-			// keyed on (string_id, language_id) PRIMARY KEY - was N SELECTs
-			// against wp_options via CONCAT-joins before.
+			// One query on the (string_id, language_id) primary key (StringTranslationRepository::get_map()).
 			$string_ids = array_map( static fn( $row ): int => (int) $row->string_id, $rows );
 			$tr_map     = $translations_repo->get_map( $string_ids, $language_id );
 
@@ -904,8 +714,7 @@ final class TranslationFileGenerator {
 				continue;
 			}
 
-			// Plural forms 2..N (Polish/Russian/Arabic) for the rows that
-			// have them - usually empty.
+			// Plural forms 2..N (Polish, Russian, Arabic), usually none.
 			$extra_map = $translations_repo->get_extra_forms_map( $string_ids, $language_id );
 
 			if ( $this->last_read_failed() ) {
@@ -913,7 +722,7 @@ final class TranslationFileGenerator {
 				continue;
 			}
 
-			// Group by domain.
+			// By domain.
 			foreach ( $rows as $row ) {
 				$value = $tr_map[ (int) $row->string_id ] ?? '';
 
@@ -921,29 +730,21 @@ final class TranslationFileGenerator {
 					continue;
 				}
 
-				// Skip internal, output-buffer-served domains (a leading "_",
-				// such as "_pfl_dyn"). These are never resolved
-				// through __()/gettext - only via that addon's own DB-sourced
-				// maps - so writing a .l10n.php for them just leaks a dead file
-				// and makes the gettext filters register on languages that have
-				// no real string translations.
+				// Internal output-buffer domains (leading "_", such as "_pfl_dyn") never go through gettext: no file for them.
 				if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
 					continue;
 				}
 
 				$domain = $row->domain ?: 'default';
 
-				// A plural-context row that carries extra forms is stored
-				// NUL-joined (form1\0form2\0…) - the gettext convention the
-				// loader splits back apart per CLDR form index. Only the
-				// plural-context rows of 3+ form languages hit this.
+				// A plural row with extra forms is stored NUL-joined (form1\0form2...), which the loader splits per CLDR form.
 				$extra = $extra_map[ (int) $row->string_id ] ?? null;
 
 				if ( is_array( $extra ) && $extra !== [] ) {
 					$value = $value . "\0" . implode( "\0", $extra );
 				}
 
-				// WordPress .l10n.php uses context\x04original as key for contextual strings.
+				// `context\x04original` for a string with context.
 				$key = ! empty( $row->context ) ? $row->context . "\x04" . $row->original : $row->original;
 
 				$result[ $locale ][ $domain ][ $key ] = $value;
@@ -955,11 +756,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Whether the database read that just ran failed.
-	 *
-	 * On a query error wpdb returns an empty result, and it clears last_error
-	 * at the start of every query, so a non-empty last_error right after a
-	 * read belongs to that read.
+	 * Whether the read that just ran failed: wpdb clears last_error at the start of every query and returns an empty
+	 * result on an error.
 	 *
 	 * @phpstan-impure
 	 *
@@ -972,19 +770,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Write a pre-computed .l10n.php file to disk.
-	 *
-	 * Path and content are computed by compute_l10n_path() and
-	 * compute_l10n_content() respectively, so generate_all can decide
-	 * whether the write is needed (via md5 compare) before calling here.
-	 *
-	 * Every failure path here is survivable - the site keeps serving source
-	 * strings - but it must not be invisible. This used to return void, so
-	 * generate_all() counted an attempt as a file and reported that count to
-	 * the operator: on a host where the uploads directory is read-only, or
-	 * where WP_Filesystem cannot initialise without FTP credentials, the
-	 * Regenerate screen said "15 translation files generated" while nothing
-	 * whatsoever reached disk, and files mode silently never worked.
+	 * Write a computed .l10n.php file. A failure is survivable (source strings are served) but reported, so the
+	 * Regenerate count never claims files that did not reach disk.
 	 *
 	 * @param string $path    Absolute filesystem path.
 	 * @param string $content PHP source to write.
@@ -999,24 +786,12 @@ final class TranslationFileGenerator {
 			return false;
 		}
 
-		// Write to a sibling temp file, then atomic-move onto $path so a
-		// concurrent frontend `include $file` (TranslationFileLoader) can
-		// never see a truncated or half-written PHP file. put_contents() is
-		// fopen('wb')+fwrite+fclose under the hood, which truncates the
-		// existing inode in place - a reader landing in that window gets a
-		// parse error. Both the write AND the move route through $wp_filesystem
-		// so they share the same UID - on FTPext/SSH2 backends, mixing
-		// $wp_filesystem->put_contents() with native PHP rename() would write
-		// the temp as the FTP user and try to rename it as the web-server
-		// user, which fails. The random suffix isolates concurrent writers.
+		// A random sibling then a move, so a concurrent include never reads a half-written file; both through
+		// $wp_filesystem so FTP and SSH backends write and move as the same user. Docs: docs-ai/11-code-rationale.md,
+		// "TranslationFileGenerator: atomic file writes".
 		$tmp = $path . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
 
-		// FS_CHMOD_FILE is defined by WP_Filesystem(), not by WordPress boot.
-		// Helper::filesystem() returns an already-populated `$wp_filesystem`
-		// global untouched, and a plugin that assembles one itself (to skip
-		// the credentials form) leaves the constant undefined - referencing it
-		// bare is then an "Undefined constant" Error, i.e. a fatal inside the
-		// Regenerate handler. Mirrors the guard Helper.php:1542 already uses.
+		// FS_CHMOD_FILE is defined only by WP_Filesystem(); a plugin that builds $wp_filesystem itself leaves it undefined.
 		$mode = defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644;
 
 		$written = $wp_filesystem->put_contents( $tmp, $content, $mode );
@@ -1028,11 +803,7 @@ final class TranslationFileGenerator {
 			return false;
 		}
 
-		// $wp_filesystem->move($source, $destination, $overwrite=true). On the
-		// Direct backend this is a native rename() - atomic on POSIX same-fs.
-		// On FTPext/SSH2 it's a backend-protocol rename - stays within the
-		// FTP/SSH UID that wrote the temp, so it actually succeeds where the
-		// previous native rename() would silently fail on FTP-only hosts.
+		// Direct: a native rename(), atomic on one filesystem; FTP and SSH: the backend's rename as the writing user.
 		if ( ! $wp_filesystem->move( $tmp, $path, true ) ) {
 			$wp_filesystem->delete( $tmp );
 			$this->report_write_failure( $path, 'move' );
@@ -1040,7 +811,7 @@ final class TranslationFileGenerator {
 			return false;
 		}
 
-		// Clear OPcache for this file so the new content is picked up.
+		// Drop the OPcache copy so the new content is read.
 		if ( function_exists( 'opcache_invalidate' ) ) {
 			opcache_invalidate( $path, true );
 		}
@@ -1049,12 +820,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Report a translation file that did not reach disk.
-	 *
-	 * Mirrors SlugTranslationRepository::report_write_failure(): an action so
-	 * an integrator, a bulk job or Site Health can react, plus a log line
-	 * gated behind WP_DEBUG so a large regeneration on a broken host cannot
-	 * flood a production log with one line per locale per domain.
+	 * Report a file that did not reach disk: an action (integrators, bulk jobs, Site Health) and, under WP_DEBUG only,
+	 * a log line (as SlugTranslationRepository::report_write_failure()).
 	 *
 	 * @param string $path   Absolute path the write targeted.
 	 * @param string $reason One of: no_filesystem, put_contents, move.
@@ -1082,11 +849,8 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Report a language whose source translations could not be read.
-	 *
-	 * Fires the same action as a write failure, with the language's combined
-	 * bundle path and the reason `source_read_failed`, plus a log line gated
-	 * behind WP_DEBUG. The language's existing files are left in place.
+	 * Report a language whose source translations could not be read: the write-failure action with its combined bundle
+	 * path and `source_read_failed`, and a WP_DEBUG log line. Its files stay.
 	 *
 	 * @param string $locale Locale whose read failed.
 	 * @return void

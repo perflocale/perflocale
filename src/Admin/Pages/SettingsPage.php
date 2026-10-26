@@ -18,11 +18,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Renders the PerfLocale settings page with a tabbed interface.
- *
- * Tabs: URL & Routing, Translation, SEO, Performance, Language
- * Switcher, Addons (feature subtabs such as Machine Translation),
- * Export & Import, Advanced. Each tab renders its own set of
- * settings fields with full sanitization and nonce verification.
  */
 final class SettingsPage {
 
@@ -75,14 +70,9 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Register and attach the fallback-chain editor CSS and JS through
-	 * the standard WordPress style/script pipeline.
+	 * Registers and attaches the fallback-chain editor CSS and JS.
 	 *
-	 * The fallback editor markup only appears on the URL-routing tab of the
-	 * settings page, but enqueuing the (small) inline CSS + JS on every
-	 * settings-page load is cheaper than tracking tab state from
-	 * admin_enqueue_scripts time - and means we never echo raw style/script
-	 * tags into the page body.
+	 * Enqueued on every settings tab: cheaper than tracking the tab at admin_enqueue_scripts time.
 	 *
 	 * @param string $hook Current admin page hook.
 	 * @return void
@@ -116,18 +106,14 @@ final class SettingsPage {
 					'dragHint'     => __( 'Draggable fallback', 'perflocale' ),
 					/* translators: 1: ordinal position, 2: language name or redirect method name */
 					'positionTpl'  => __( 'Position %1$d: %2$s', 'perflocale' ),
-					// ⚠️ Touch has neither drag-and-drop nor arrow keys, so on a
-					// phone the chain could be built but never REORDERED. These
-					// label the explicit move buttons that close that gap.
+					// Touch has no drag-and-drop or arrow keys: these label the move buttons for phones.
 					'moveUp'       => __( 'Move earlier', 'perflocale' ),
 					'moveDown'     => __( 'Move later', 'perflocale' ),
 				],
 			]
 		);
 
-		// Redirect-priority editor reuses the .pl-fb-chip CSS for chip styling.
-		// Its own JS lives in a small separate file because the behaviour is
-		// stripped-down (sortable only, no add/remove, no max).
+		// The redirect-priority editor reuses the .pl-fb-chip CSS; its JS is a separate, sortable-only file.
 		wp_enqueue_script(
 			'perflocale-redirect-priority-editor',
 			PERFLOCALE_URL . 'assets/js/redirect-priority-editor.js',
@@ -136,12 +122,7 @@ final class SettingsPage {
 			true
 		);
 
-		// Conditional-field show/hide for the auto-generated addon
-		// settings subtab. Enqueued unconditionally on the Settings page
-		// because the user can navigate between subtabs without a page
-		// reload (well - currently they do reload, but enqueuing here
-		// keeps the asset available wherever the form might render). The
-		// script no-ops gracefully when no addon form is present.
+		// Conditional fields of the auto-generated addon subtab; a no-op without an addon form.
 		wp_enqueue_script(
 			'perflocale-addon-settings-conditional',
 			PERFLOCALE_URL . 'assets/js/addon-settings-conditional.js',
@@ -185,7 +166,7 @@ final class SettingsPage {
 					<p><?php echo esc_html__( 'Settings saved successfully.', 'perflocale' ); ?></p>
 				</div>
 			<?php elseif ( $message === 'false' ) : ?>
-				<?php // A save that wpdb refused. It reported success before this existed. ?>
+				<?php // A save that wpdb refused. ?>
 				<div class="notice notice-error is-dismissible">
 					<p><?php echo esc_html__( 'Settings could not be saved. The database refused the write, which usually means one value is too long for its column or contains characters it cannot store. Your previous settings are unchanged.', 'perflocale' ); ?></p>
 				</div>
@@ -214,17 +195,9 @@ final class SettingsPage {
 			<?php endif; ?>
 
 			<?php
-			// A multisite network resolves the requested hostname against its
-			// own site list in ms-settings.php, BEFORE any plugin loads - so
-			// picking subdomain or per-language-domain mode with hostnames that
-			// are not registered as sites takes every translated link to
-			// WordPress's "site does not exist" screen, and no plugin code can
-			// intercept it. SiteHealth has always said so, but only to whoever
-			// opens Tools -> Site Health; the operator breaks the network HERE,
-			// at save time, so the same check runs on the tab that owns the
-			// setting. Same code, not a copy: SiteHealth::language_host_report()
-			// costs zero queries on a single site and in subdirectory / query
-			// mode, both of which return before the first lookup.
+			// On multisite, ms-settings.php resolves the host against the site list before any plugin loads,
+			// so unregistered language hostnames get "site does not exist". Checked on the tab that sets the
+			// mode; SiteHealth::language_host_report() costs no query outside multisite host modes.
 			if ( $active_tab === 'url-routing' ) :
 				$perflocale_host_report = \PerfLocale\Admin\SiteHealth::language_host_report();
 
@@ -269,10 +242,8 @@ final class SettingsPage {
 			?>
 
 			<?php
-			// Addon-settings saves (Settings → Addons → <addon> subtab) redirect
-			// back HERE with perflocale_msg - the flash renderer on the Addons
-			// LIST page never runs for this screen, so without this block a
-			// successful save showed no feedback at all.
+			// Addon-settings saves redirect back here with perflocale_msg; the Addons list page's flash
+			// renderer does not run on this screen.
 			// phpcs:disable WordPress.Security.NonceVerification.Recommended -- read-only flash params on a redirect.
 			$perflocale_flash_msg  = isset( $_GET['perflocale_msg'] ) ? sanitize_key( $_GET['perflocale_msg'] ) : '';
 			$perflocale_flash_slug = isset( $_GET['perflocale_addon'] ) ? sanitize_key( $_GET['perflocale_addon'] ) : '';
@@ -418,25 +389,10 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Sanitize the GeoIP country-mapping input.
+	 * Sanitizes the GeoIP country-mapping input into `[ slug => "AA,BB" ]`.
 	 *
-	 * Hard contract:
-	 *   - The DEFAULT language is unconditionally dropped (any visitor
-	 *     whose IP doesn't match a mapped country falls through to the
-	 *     default automatically; mapping the default actively causes
-	 *     over-redirects, and a malicious / mistaken save must NOT be
-	 *     able to introduce one).
-	 *   - Each language's value is split on commas, uppercased, and only
-	 *     `[A-Z]{2}` codes are kept. Anything else (emoji, HTML, IDN,
-	 *     longer strings) is dropped silently.
-	 *   - Posted slugs not in the active-language list are dropped.
-	 *   - Empty rows produce no entry (caller's `?? ''` keeps the UI
-	 *     consistent without bloating the saved option).
-	 *   - Stored rows of languages that are not active have no row on the
-	 *     form and are kept (see merge_language_map()).
-	 *
-	 * Returned shape: `[ slug => "AA,BB,CC" ]` - same shape the existing
-	 * runtime expects.
+	 * The default language (a mapping for it over-redirects), inactive slugs and non-`[A-Z]{2}` codes
+	 * are dropped; stored rows of inactive languages are kept (merge_language_map()).
 	 *
 	 * @param mixed $input Raw POSTed value (expected: assoc array).
 	 * @return array<string, string>
@@ -463,17 +419,12 @@ final class SettingsPage {
 		foreach ( wp_unslash( $input ) as $slug => $raw ) {
 			$slug = (string) $slug;
 
-			// Server-side guard: never store a mapping for the default
-			// language, regardless of what was submitted. The UI hides
-			// this row but a hand-crafted POST or HTML injection must NOT
-			// be able to bypass it.
+			// Never store the default language's mapping, whatever was posted: the UI only hides its row.
 			if ( $default_slug !== '' && $slug === $default_slug ) {
 				continue;
 			}
 
-			// Drop slugs the user can't actually have configured (active
-			// list is the truth - no mapping for inactive / removed
-			// languages is meaningful).
+			// Only active languages can have a mapping.
 			if ( ! isset( $active_slugs[ $slug ] ) ) {
 				continue;
 			}
@@ -500,12 +451,8 @@ final class SettingsPage {
 	/**
 	 * Merge a posted per-language map onto the stored one.
 	 *
-	 * The URL & Routing tab renders one row per ACTIVE language, so the post
-	 * says nothing about any other language. Entries of the rendered languages
-	 * come from the post: a row posted blank, or not posted, is removed.
-	 * Entries of any other language (one deactivated for now) are kept as
-	 * stored. The stored key order is kept, so a save that changes nothing
-	 * writes the same array back.
+	 * The tab renders a row per active language: rendered entries come from the post (blank removes),
+	 * others stay as stored, and the stored key order is kept so an unchanged save writes the same array.
 	 *
 	 * @template T
 	 * @param array<int|string, T> $stored   Stored map.
@@ -551,11 +498,8 @@ final class SettingsPage {
 	/**
 	 * The redirect priority order to store from a URL & Routing save.
 	 *
-	 * The form renders chips only for the redirect methods that are on (all
-	 * three as hidden inputs when exactly one is on, none when none is), in the
-	 * order get_redirect_priority_order() returns. An order posted exactly as
-	 * rendered keeps the stored value; a reordered one is written back into the
-	 * positions its methods hold, so a method without a chip keeps its place.
+	 * The form renders chips only for enabled methods; a reordered post is written into the positions
+	 * its methods hold, so a method without a chip keeps its place.
 	 *
 	 * @param array<int, string>|null $posted Sanitized posted order, or null when none was posted.
 	 * @return array<int, string>
@@ -588,15 +532,8 @@ final class SettingsPage {
 	/**
 	 * A checkbox list to store from a save.
 	 *
-	 * Entries that have a checkbox on the form come from the post. A stored
-	 * entry without one (a post type or taxonomy the tab does not offer or that
-	 * is not registered right now, a menu location of another theme) is kept.
-	 * The Translation tab also ticks every entry that is translatable right
-	 * now, including those an addon adds through
-	 * `perflocale/translatable_post_types` or `perflocale/translatable_taxonomies`.
-	 * Writing those into the stored list would keep them translatable after the
-	 * addon is turned off, so a ticked entry the filter added is not stored (one
-	 * the stored list already holds stays). The stored order is kept.
+	 * Checked entries come from the post; a stored entry without a checkbox is kept, in stored order.
+	 * A ticked entry only an addon filter made translatable is not stored, so it ends with the addon.
 	 *
 	 * @param array<int|string, mixed> $posted    Sanitized posted list.
 	 * @param array<int|string, mixed> $stored    Stored list.
@@ -628,9 +565,7 @@ final class SettingsPage {
 	/**
 	 * Keep a fallback chain's targets that have no chip on the form.
 	 *
-	 * The chain editor shows a chip only for an ACTIVE target language, so a
-	 * stored target that is not active right now is never posted. It goes
-	 * back into its row at its stored position.
+	 * The editor shows chips for active targets only; a stored inactive target returns to its position.
 	 *
 	 * @param array<string, array<int, string>> $posted   Posted rows without empty ones.
 	 * @param array<int|string, mixed>          $stored   Stored fallback map.
@@ -660,10 +595,7 @@ final class SettingsPage {
 	/**
 	 * Render a right-aligned "Help" nav-tab inside the settings tab bar.
 	 *
-	 * Styled as a regular nav-tab (native WP admin look) but floated right
-	 * with a book icon. Clicking opens the most relevant /docs/ page for
-	 * the active settings tab in a new browser tab. Unknown tabs fall
-	 * through to the docs index.
+	 * Opens the docs page of the active tab in a new tab; unknown tabs get the docs index.
 	 *
 	 * @param string $active_tab Active settings tab key.
 	 * @return void
@@ -702,12 +634,8 @@ final class SettingsPage {
 	 * @return array<string, mixed> Sanitized values.
 	 */
 	public function extract_tab_values( string $tab ): array {
-		// AdminController::on_admin_init() verifies `perflocale_save_settings`
-		// before reaching this method, but we re-check here so static
-		// analysers (Plugin Check, wporg-pluginchecker) see a nonce gate
-		// adjacent to the $_POST reads instead of relying on the caller.
-		// Removing this would still be safe - defense in depth, not the
-		// authoritative gate.
+		// AdminController::on_admin_init() verifies the nonce first; this repeat puts a nonce check next
+		// to the $_POST reads for Plugin Check.
 		$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
 		if ( ! wp_verify_nonce( $nonce, 'perflocale_save_settings' ) ) {
 			return [];
@@ -749,10 +677,7 @@ final class SettingsPage {
 							$out = [];
 
 							foreach ( $raw as $slug => $row ) {
-								// Keys are language slugs and arrive from the POST
-								// body too - sanitize them, not just the row values.
-								// Settings::sanitize_language_fallbacks() re-checks
-								// on write; this keeps intake clean as well.
+								// Keys are language slugs from the POST body: sanitized here as well as on write.
 								$slug = sanitize_key( (string) $slug );
 
 								if ( $slug === '' ) {
@@ -778,10 +703,7 @@ final class SettingsPage {
 				'cookie_lifetime'            => isset( $_POST['cookie_lifetime'] ) ? absint( $_POST['cookie_lifetime'] ) : 365,
 				'disable_language_cookie'    => isset( $_POST['disable_language_cookie'] ),
 				'excluded_paths'             => isset( $_POST['excluded_paths'] ) ? array_map( 'sanitize_text_field', array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( wp_unslash( $_POST['excluded_paths'] ) ) ) ) ) ) : [],
-				// Normalize each entry to a bare lowercase host: strip any scheme,
-				// path/trailing slash, and case so apply_domain()'s host-equality
-				// check and ://host string-replace work (a stored "https://De.X/"
-				// would otherwise never match the request host "de.x"). A blank
+				// Stored as a bare lowercase host: apply_domain() compares hosts and replaces ://host. A blank
 				// row is not stored.
 				'language_domains'           => self::merge_language_map(
 					array_filter( (array) $this->settings->get( 'language_domains', [] ), 'is_string' ),
@@ -813,16 +735,12 @@ final class SettingsPage {
 					: [],
 					$rendered_slugs
 				),
-				// Rendered only inside `if ( edge_integration_enabled() )`, so on a
-				// save with the edge worker off the checkbox was never printed and
-				// isset() reads false - clearing a setting the operator could not
-				// see. Mirror the renderer's gate and keep the stored value.
+				// Rendered only while edge integration is on; otherwise keep the stored value, since an
+				// unprinted checkbox would read as unticked.
 				'redirect_edge_hint_enabled' => $this->settings->edge_integration_enabled()
 					? isset( $_POST['redirect_edge_hint_enabled'] )
 					: (bool) $this->settings->get( 'redirect_edge_hint_enabled' ),
-				// Redirect-priority chip order. Sanitisation also lives in
-				// Settings::get_redirect_priority_order() (drops unknowns,
-				// dedupes, backfills missing methods).
+				// Chip order; Settings::get_redirect_priority_order() also drops unknowns, dedupes and backfills.
 				'redirect_priority_order'    => $this->merge_redirect_priority_order(
 					isset( $_POST['redirect_priority_order'] )
 						? array_values( array_filter( array_map( 'sanitize_key', (array) wp_unslash( $_POST['redirect_priority_order'] ) ) ) )
@@ -852,16 +770,9 @@ final class SettingsPage {
 				'translate_slugs'            => isset( $_POST['translate_slugs'] ),
 				'sync_term_hierarchy'        => isset( $_POST['sync_term_hierarchy'] ),
 			],
-			// The renderer returns early when machine translation is OFF
-			// (render_machine_translation_tab), so the enabling save posts
-			// ONLY mt_enabled - every other control below was never printed.
-			// Extracting them anyway turned "not rendered" into "operator
-			// cleared it": mt_auto_translate_languages in particular became
-			// the explicit no-language scope, so auto-translate silently did
-			// nothing after being switched on. Mirror the renderer's own gate
-			// and read the flag as it is STORED, before Settings::update()
-			// runs (AdminController::on_admin_init extracts at :242 and
-			// updates at :245).
+			// With MT off the tab prints only mt_enabled: the other fields are read only while the stored flag
+			// is on (extraction runs before Settings::update()), or unprinted fields would save as cleared and
+			// mt_auto_translate_languages would become the no-language scope.
 			'machine-translation' => $values = $this->settings->mt_enabled() ? [
 				'mt_enabled'                   => isset( $_POST['mt_enabled'] ),
 				'mt_provider'                  => isset( $_POST['mt_provider'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_provider'] ) ) : '',
@@ -875,19 +786,14 @@ final class SettingsPage {
 				'mt_agency_url'                => isset( $_POST['mt_agency_url'] ) ? esc_url_raw( wp_unslash( $_POST['mt_agency_url'] ) ) : '',
 				'mt_agency_api_key'            => isset( $_POST['mt_agency_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_agency_api_key'] ) ) : '',
 				'mt_auto_translate_on_publish' => isset( $_POST['mt_auto_translate_on_publish'] ),
-				// Sanitize against ACTIVE language slugs; when every active
-				// language is checked, store [] ("all") so languages added
-				// later are included automatically instead of silently
-				// excluded by a stale explicit list.
+				// Active slugs only; with every target checked store [] ("all"), so later languages are included.
 				'mt_auto_translate_languages'  => ( function (): array {
 					$posted  = array_values( array_filter( array_map( 'sanitize_key', (array) wp_unslash( $_POST['mt_auto_translate_languages'] ?? [] ) ) ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- each entry sanitize_key'd then whitelisted against active slugs.
 					$router  = \PerfLocale\Plugin::get_instance()->get( 'router' );
 					$default = $router->get_default_language();
 					$active  = [];
 
-					// The default language is the MT source, never a target -
-					// the UI renders no checkbox for it, so it must not count
-					// toward the "every target checked" comparison below.
+					// The default language is the MT source, not a target: it has no checkbox and is not counted.
 					foreach ( $router->get_active_languages() as $l ) {
 						if ( isset( $l->slug ) && ( ! $default || $l->slug !== $default->slug ) ) {
 							$active[] = (string) $l->slug;
@@ -896,10 +802,7 @@ final class SettingsPage {
 
 					$subset = array_values( array_intersect( $posted, $active ) );
 
-					// All targets unchecked = auto-MT nowhere. [] is taken
-					// (it means "all"), so store the reserved sentinel - a
-					// scope that matches no language - instead of silently
-					// flipping the admin's "none" back into "all".
+					// None checked: [] means "all", so store the reserved no-language sentinel.
 					if ( $subset === [] && $active !== [] ) {
 						return [ \PerfLocale\Settings::MT_SCOPE_NONE ];
 					}
@@ -943,16 +846,9 @@ final class SettingsPage {
 				'switcher_arrow_style'       => isset( $_POST['switcher_arrow_style'] ) && in_array( $_POST['switcher_arrow_style'], [ 'single', 'double', 'none' ], true ) ? sanitize_key( wp_unslash( $_POST['switcher_arrow_style'] ) ) : 'single',
 				'switcher_trigger_format'    => isset( $_POST['switcher_trigger_format'] ) && in_array( $_POST['switcher_trigger_format'], [ 'inherit', 'native', 'english', 'both', 'slug' ], true ) ? sanitize_key( wp_unslash( $_POST['switcher_trigger_format'] ) ) : 'inherit',
 				'switcher_auto_insert'       => isset( $_POST['switcher_auto_insert'] ),
-				// Validate against the theme's REGISTERED locations so a
-				// crafted POST can't persist arbitrary strings.
-				// Whitelist against the theme's REGISTERED location keys
-				// VERBATIM - core stores nav-menu slugs case-sensitively
-				// (a theme may register `headerMenu`), and sanitize_key()
-				// would lowercase them so the array_intersect never matched,
-				// silently dropping the operator's choice. The intersect is
-				// the whole security check; no extra sanitizer is needed.
-				// Stored locations the active theme does not register have no
-				// checkbox and are kept for when that theme is active again.
+				// Whitelisted verbatim against the theme's registered locations: core slugs are case-sensitive
+				// (`headerMenu`), so no sanitize_key(); the intersect is the security check. Stored locations
+				// of another theme have no checkbox and are kept.
 				'switcher_menu_locations'    => self::merge_checkbox_list(
 					array_values(
 						array_intersect(
@@ -970,26 +866,18 @@ final class SettingsPage {
 				'cache_object_enabled'    => isset( $_POST['cache_object_enabled'] ),
 				'cache_preload_slugs'     => isset( $_POST['cache_preload_slugs'] ),
 				'string_translation_mode' => isset( $_POST['string_translation_mode'] ) ? sanitize_text_field( wp_unslash( $_POST['string_translation_mode'] ) ) : 'files',
-				// Background-processing settings - whitelist values explicitly
-				// so an attacker can't post arbitrary keys that would survive
-				// sanitisation only because Settings::DEFAULTS[$key] is a string.
+				// Whitelisted values: the string default alone would let any posted string through sanitising.
 				'background_processing'   => isset( $_POST['background_processing'] ) && in_array( $_POST['background_processing'], [ 'auto', 'always', 'never' ], true )
 					? sanitize_key( wp_unslash( $_POST['background_processing'] ) )
 					: 'auto',
-				// The radio renders only when Action Scheduler is loaded, so a
-				// Performance save on a site without it never posts the field and
-				// the fallback below would silently reset the operator's choice.
+				// The radio renders only while Action Scheduler is loaded; without it, keep the stored choice.
 				'background_engine'       => ! \PerfLocale\Background\JobRunnerFactory::action_scheduler_available()
 					? (string) $this->settings->get( 'background_engine', 'auto' )
 					: ( isset( $_POST['background_engine'] ) && in_array( $_POST['background_engine'], [ 'auto', 'force_wp_cron' ], true )
 						? sanitize_key( wp_unslash( $_POST['background_engine'] ) )
 						: 'auto' ),
-				// Per-job threshold overrides. Whitelist keys against the
-				// registered job types (self::background_job_types()) so an
-				// attacker can't POST arbitrary keys that would persist via
-				// the array setting. Zero or missing values drop back to the
-				// job's default (we don't store zero - that would force every
-				// dispatch async).
+				// Per-job overrides, keys whitelisted against background_job_types(); zero or missing uses the
+				// job default (a stored zero would force every dispatch async).
 				'background_thresholds'   => $this->extract_background_thresholds(),
 				'background_paused'       => isset( $_POST['background_paused'] ),
 			],
@@ -1058,27 +946,15 @@ final class SettingsPage {
 	private function get_addon_subtabs(): array {
 		$subtabs = [];
 
-		// Machine Translation is ALWAYS listed, on or off. Its own
-		// enable checkbox lives inside this subtab, so gating the subtab
-		// on mt_enabled made the feature unreachable: the tab was hidden
-		// until the flag was set, and the only control that sets the flag
-		// was inside the hidden tab. The nav still shows the on/off state
-		// beside the label (see $statuses below), which is what the
-		// listing-page sync was actually for.
+		// Machine Translation is always listed: its enable checkbox is inside this subtab.
 		$subtabs['machine-translation'] = __( 'Machine Translation', 'perflocale' );
 
-		// WooCommerce subtab - needs the WC plugin active AND the
-		// WooCommerce addon not in the operator-controlled disabled
-		// list. Disabling the addon hides the subtab so the operator
-		// isn't configuring features that won't run.
+		// WooCommerce subtab: needs WooCommerce and the add-on not disabled.
 		if ( class_exists( 'WooCommerce' ) && ! \PerfLocale\Addon\AddonRegistry::is_disabled( 'woocommerce' ) ) {
 			$subtabs['woocommerce'] = __( 'WooCommerce', 'perflocale' );
 		}
 
-		// Auto-add subtabs for any registered addon that exposes
-		// user-editable fields via get_settings_fields(). Skips addons
-		// already covered by the built-in subtabs (e.g. WooCommerce)
-		// to avoid duplication.
+		// One subtab per registered addon with editable fields, except those with a built-in subtab.
 		foreach ( $this->get_auto_addon_subtab_ids() as $id => $label ) {
 			if ( ! isset( $subtabs[ $id ] ) ) {
 				$subtabs[ $id ] = $label;
@@ -1094,11 +970,9 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Auto-generated subtab IDs - one per registered addon that exposes
-	 * user-editable fields. Used by {@see get_addon_subtabs()} to merge
-	 * registry-derived subtabs into the static list, AND by
-	 * {@see render_addons_tab()} to route those subtabs to the auto-
-	 * generated form renderer instead of the static built-in flow.
+	 * Auto-generated subtab IDs: one per registered addon with user-editable fields.
+	 *
+	 * Used by get_addon_subtabs() and to route render_addons_tab() to the generated form.
 	 *
 	 * @return array<string, string> addon_id => display name
 	 */
@@ -1116,10 +990,7 @@ final class SettingsPage {
 			return [];
 		}
 
-		// Skip addons the operator has explicitly disabled - their
-		// settings subtab would just confuse: "why am I configuring an
-		// addon that isn't running?" When the user re-enables, the
-		// subtab comes back automatically.
+		// Operator-disabled addons get no subtab; it returns when re-enabled.
 		$disabled = \PerfLocale\Addon\AddonRegistry::get_disabled();
 
 		$out = [];
@@ -1173,14 +1044,8 @@ final class SettingsPage {
 			$subtab = array_key_first( $subtabs );
 		}
 
-		// Nothing to configure. This is NO LONGER the default state: since
-		// Machine Translation is listed unconditionally, get_addon_subtabs()
-		// always returns at least one entry, so this branch is now reachable
-		// only when a filter empties the list. It stays because that filter is
-		// public, and because admin-render.php drives exactly this path.
-		// It used to fall through to the form below with $subtab = null, which
-		// rendered an empty nav, an empty table and a lone "Save Changes"
-		// button that saved nothing: a blank screen with no explanation.
+		// Reachable only when the public addon_subtabs filter empties the list (admin-render.php drives
+		// this path): explain instead of rendering an empty form.
 		if ( $subtab === null ) {
 			$addons_url = admin_url( 'admin.php?page=perflocale-addons' );
 			?>
@@ -1269,11 +1134,8 @@ final class SettingsPage {
 			<div class="perflocale-addons-content">
 				<?php
 				if ( $is_auto_addon ) :
-					// Auto-generated addon settings subtab. Renders its own
-					// form (admin-post.php → handle_save_addon_settings).
-					// Bypasses the perflocale_save_settings wrapper because
-					// addon settings live in their own option keyed by
-					// addon ID, not in the main settings option.
+					// Auto-generated addon subtab: its own form to handle_save_addon_settings, since addon
+					// settings live in their own option.
 					$this->render_auto_addon_subtab( $subtab );
 				else :
 					?>
@@ -1312,22 +1174,9 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Render the WooCommerce settings subtab by delegating to the WC
-	 * addon class. The addon owns the entire bespoke UI (pages section,
-	 * products section, emails section, per-language exchange-rate
-	 * matrix, auto-sync controls, provider-conditional API keys,
-	 * sync-now button) - SettingsPage just routes the subtab to it.
+	 * Renders the WooCommerce subtab through the WC addon class, which owns that UI.
 	 *
-	 * The match() in render_addons_tab() calls this for the
-	 * 'woocommerce' subtab. WC isn't part of the auto-addon-subtab
-	 * pipeline because its data still lives in `perflocale_settings.wc_*`
-	 * keys (read by ExchangeRateSync, EmailTranslation, MultiCurrency,
-	 * the REST APIs, etc.) - so it shares the main settings form's
-	 * save handler instead of admin-post.php → handle_save_addon_settings.
-	 *
-	 * Falls back to a "WooCommerce not active" notice when the WC plugin
-	 * isn't loaded (the addon class is only available via the bundled
-	 * manifest's compat check, which gates on class_exists('WooCommerce')).
+	 * It uses the main settings form: its data lives in the `perflocale_settings.wc_*` keys.
 	 *
 	 * @return void
 	 */
@@ -1359,10 +1208,7 @@ final class SettingsPage {
 	}
 
 	/**
-	 * True if an auto-addon subtab corresponds to an addon that is
-	 * currently booted. Used for the "Active / Inactive" pill in the
-	 * subtab nav so disabled / quarantined / unbooted addons surface as
-	 * inactive without us having to mirror the registry's state machine.
+	 * True if an auto-addon subtab's addon is booted, for the subtab nav's Active pill.
 	 *
 	 * @param string $addon_id
 	 * @return bool
@@ -1384,11 +1230,8 @@ final class SettingsPage {
 	/**
 	 * Render the auto-generated settings form for one addon.
 	 *
-	 * Form posts to admin-post.php → handle_save_addon_settings, which
-	 * routes through {@see \PerfLocale\Addon\AddonSettings::set_addon()}
-	 * (size cap, lock, before/after_save hooks). The form is rendered
-	 * independently of the parent Settings page's perflocale_save_settings
-	 * wrapper because addon settings live in their own option.
+	 * Posts to handle_save_addon_settings (AddonSettings::set_addon(): size cap, lock, save hooks),
+	 * outside the perflocale_save_settings form, since addon settings live in their own option.
 	 *
 	 * @param string $addon_id
 	 * @return void
@@ -1417,9 +1260,7 @@ final class SettingsPage {
 			$fields = [];
 		}
 
-		// Filter to user-editable fields only; hidden / addon-managed
-		// state stays out of the form (the storage layer preserves it
-		// untouched on save).
+		// Editable fields only; the storage layer keeps addon-managed state on save.
 		$editable = [];
 		foreach ( $fields as $key => $field ) {
 			if ( is_string( $key ) && $key !== '' && is_array( $field )
@@ -1454,9 +1295,7 @@ final class SettingsPage {
 		$hide_default     = $this->settings->hide_default_prefix();
 		$redirect_browser = (bool) $this->settings->get( 'redirect_browser_lang' );
 		$redirect_geo     = (bool) $this->settings->get( 'redirect_geo_enabled' );
-		// Edge-hint redirect is gated by both its own toggle AND the global
-		// edge integration setting (the underlying detect_from_edge_hint()
-		// bails when edge integration is off).
+		// The edge-hint redirect needs its own toggle and edge integration on.
 		$redirect_edge_hint    = (bool) $this->settings->get( 'redirect_edge_hint_enabled' )
 			&& $this->settings->edge_integration_enabled();
 		$geo_provider          = (string) $this->settings->get( 'geo_provider', '' );
@@ -1501,12 +1340,8 @@ final class SettingsPage {
 				</fieldset>
 
 				<?php
-				// Per-language domain table - shown in domain mode only: subdomain
-				// mode builds each language's host from its slug and reads no
-				// entry of it. Rendered (hidden) in every mode, so a save keeps
-				// the stored domains and switching back to domain mode loses
-				// none. assets/js/admin-settings.js shows and hides it when the
-				// URL mode radio changes.
+				// Per-language domain table: used in domain mode only, but rendered hidden in every mode so a
+				// save keeps the stored domains; admin-settings.js toggles it with the URL mode.
 				$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository( \PerfLocale\Plugin::get_instance()->get( 'cache' ) );
 				$all_langs = $lang_repo->get_active();
 				$domains   = $this->settings->get_language_domains();
@@ -1614,11 +1449,8 @@ final class SettingsPage {
 		<?php endif; ?>
 
 		<?php
-		// Redirect-priority editor. The drag-to-reorder UI is shown only when
-		// 2+ redirect mechanisms are enabled - with a single mechanism there is
-		// nothing to order. When exactly one is on, the saved order is still
-		// round-tripped via hidden inputs so re-enabling a second mechanism
-		// later restores the admin's chosen order instead of reverting it.
+		// The reorder UI shows with 2+ redirect methods; with one, the order still round-trips in
+		// hidden inputs so it survives.
 		$enabled_count  = (int) $redirect_browser + (int) $redirect_geo + (int) $redirect_edge_hint;
 		$priority_order = $enabled_count > 0 ? $this->settings->get_redirect_priority_order() : [];
 
@@ -1704,9 +1536,8 @@ final class SettingsPage {
 				<?php else : ?>
 					<select id="perflocale-geo-provider" name="geo_provider">
 						<?php
-						// A stored id that no provider registers right now (its plugin is
-						// off, or it was renamed) gets its own option, so saving the tab
-						// unchanged keeps it instead of posting the first registered one.
+						// A stored id no provider registers (its plugin is off, or the id changed) gets its own option,
+						// so saving the tab unchanged keeps it instead of posting the first registered one.
 						if ( '' !== $geo_provider && ! isset( $geo_providers[ $geo_provider ] ) ) :
 							?>
 							<option value="<?php echo esc_attr( $geo_provider ); ?>" selected="selected">
@@ -1740,9 +1571,7 @@ final class SettingsPage {
 		$geo_default      = $geo_lang_repo->get_default();
 		$geo_default_slug = is_object( $geo_default ) && ! empty( $geo_default->slug ) ? (string) $geo_default->slug : '';
 
-		// Only render the table when there's at least one non-default
-		// active language to map. Single-language sites + the default-only
-		// case have nothing to configure here.
+		// The table renders only with a non-default active language to map.
 		$geo_mappable = array_values( array_filter( $geo_langs, static fn( $l ) => ! empty( $l->slug ) && (string) $l->slug !== $geo_default_slug ) );
 
 		if ( count( $geo_mappable ) >= 1 ) :
@@ -1752,10 +1581,8 @@ final class SettingsPage {
 			<td>
 				<p class="description" style="margin-bottom:8px;"><?php echo esc_html__( 'Map country codes to languages. Comma-separated ISO 3166-1 alpha-2 codes (e.g., US,GB,AU).', 'perflocale' ); ?></p>
 				<?php
-				// Tailor the note to whether the default language's locale
-				// carries a country code. GeoIP only redirects AWAY from the
-				// default, so a generic-locale default (ar/zh/es) shouldn't
-				// trigger a false "you must map something" alarm.
+				// The note depends on whether the default locale has a country: GeoIP redirects only away from
+				// the default, so a generic default (ar) needs no mapping.
 				$default_label        = is_object( $geo_default ) ? ( $geo_default->native_name ?? $geo_default->name ?? $geo_default_slug ) : $geo_default_slug;
 				$default_locale       = is_object( $geo_default ) ? (string) ( $geo_default->locale ?? '' ) : '';
 				$default_locale_parts = explode( '_', $default_locale );
@@ -1798,12 +1625,8 @@ final class SettingsPage {
 						$flag      = \PerfLocale\Helper::get_flag_emoji( $gl );
 						$saved_val = $geo_country_map[ $gl->slug ] ?? '';
 
-						// Locale-derived suggestion: `en_US` → `US`. Used only
-						// as the input PLACEHOLDER (so the user sees what
-						// would be auto-derived at runtime if they leave the
-						// row blank) - never pre-filled into the value, so
-						// the saved option stays small and the auto-derive
-						// path is the single source of truth.
+						// The locale's country (`en_US` gives `US`) is only the placeholder: the runtime derives it for a
+						// blank row, so it is never stored.
 						$locale_parts     = explode( '_', (string) ( $gl->locale ?? '' ) );
 						$placeholder_code = isset( $locale_parts[1] ) && preg_match( '/^[A-Za-z]{2}$/', $locale_parts[1] )
 							? strtoupper( substr( $locale_parts[1], 0, 2 ) )
@@ -1837,16 +1660,11 @@ final class SettingsPage {
 			</td>
 		</tr>
 		<?php
-		// Language Fallback Chain - per-language ordered list of fallback
-		// languages. Each list is self-contained (no transitive walking
-		// through other languages' own fallback configurations), so the
-		// order here is the exact order the walker tries.
+		// Fallback chains: each list is the exact order tried, with no walk through other chains.
 		$all_langs = ( new \PerfLocale\Database\Repository\LanguageRepository( \PerfLocale\Plugin::get_instance()->get( 'cache' ) ) )->get_active();
 		$fallbacks = $this->settings->get_language_fallbacks();
 
-		// Maximum fallbacks per language. Capped at 4 (sensible UI limit),
-		// and never more than (total active languages − 1) since the
-		// current language itself can't fall back to itself.
+		// At most 4 fallbacks, and never more than the other active languages.
 		$max_fb = min( 4, max( 1, count( $all_langs ) - 1 ) );
 
 		// Build a quick slug→lang map for pretty labels on prefilled chips.
@@ -1973,11 +1791,8 @@ final class SettingsPage {
 	 * @return array<int, string>
 	 */
 	private function merge_sync_fields(): array {
-		// Re-verify the settings-save nonce here so static analysers see a
-		// nonce check adjacent to the $_POST reads (Plugin Check /
-		// wporg-pluginchecker don't follow block-scope phpcs:disable across
-		// long methods or to a caller). The authoritative gate is the
-		// nonce + capability check in AdminController::on_admin_init().
+		// Repeated nonce check next to the $_POST reads for Plugin Check; AdminController::on_admin_init()
+		// is the real gate.
 		$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
 		if ( ! wp_verify_nonce( $nonce, 'perflocale_save_settings' ) ) {
 			return [];
@@ -1993,11 +1808,8 @@ final class SettingsPage {
 
 		$fields = array_values( array_unique( array_merge( $checkbox_fields, $custom_meta ) ) );
 
-		// The plugin's own meta keys (the data registry's post-meta entries
-		// with sync `never`, and any key of its `_perflocale_` namespace that
-		// no entry lets Sync Fields list) describe one post each: mirrored,
-		// a sibling would take over another post's diagnostics, marks or
-		// per-language texts. They are left out and named on the screen.
+		// The plugin's own meta keys (registry entries with sync `never`, and `_perflocale_` keys) describe
+		// one post each: mirrored, a sibling would take over another post's data. Left out and named.
 		self::$refused_sync_fields = array_values( array_filter( $fields, [ DataRegistry::class, 'is_never_sync_meta' ] ) );
 
 		return array_values( array_diff( $fields, self::$refused_sync_fields ) );
@@ -2016,18 +1828,8 @@ final class SettingsPage {
 	/**
 	 * Keep `wp_template` and `wp_template_part` switched on together.
 	 *
-	 * ⭐ WHY ONE CHECKBOX, NOT TWO. They are two storage types behind ONE
-	 * feature. A block theme's page layout is a `wp_template` and its header is
-	 * a `wp_template_part`, so enabling either alone produces a HALF-translated
-	 * page - the body in German above an English header - which reads as a bug
-	 * rather than as a setting the operator chose. Offering "Templates" and
-	 * "Template Parts" as separate checkboxes also names WordPress's storage
-	 * rather than the thing the operator is looking for, which is full site
-	 * editing.
-	 *
-	 * The setting itself still stores the two type names, so nothing downstream
-	 * changes and `perflocale/translatable_post_types` can still enable exactly
-	 * one for a developer who genuinely wants that.
+	 * One feature behind two types: a template without its parts renders a half-translated page.
+	 * `perflocale/translatable_post_types` can still enable one alone.
 	 *
 	 * @param array<int, string> $types Submitted post types.
 	 * @return array<int, string>
@@ -2054,44 +1856,13 @@ final class SettingsPage {
 	private function translation_tab_post_types(): array {
 		$all_post_types = get_post_types( [ 'public' => true ], 'objects' );
 
-		// ⚠️ `attachment` is public, so it lands in that list - but PerfLocale
-		// does not translate media by DUPLICATING attachment posts. Media is
-		// translated in place by {@see \PerfLocale\Translation\MediaTranslationManager},
-		// which stores per-language alt text, captions and descriptions as
-		// language-suffixed meta on the SAME attachment. The plugin already
-		// refuses the type everywhere it matters - `get_site_translate_post_types()`
-		// skips it explicitly (Settings.php:1237) - so offering the checkbox
-		// only let an operator turn on something no code implements, while
-		// language-scoping every front-end attachment query as a side effect.
-		// Removing it takes no feature away: media translation is unaffected.
+		// `attachment` is never offered: media is translated in place (MediaTranslationManager), and
+		// scoping it would language-filter every front-end attachment query.
 		unset( $all_post_types['attachment'] );
 
-		// Non-public post types PerfLocale can actually translate.
-		//
-		// ⚠️ This is a curated allowlist, NOT get_post_types( [ 'public' => false ] ).
-		// That call returns `revision`, `nav_menu_item`, `wp_global_styles`,
-		// `oembed_cache` and friends - checkboxes that would either do nothing or
-		// do harm.
-		//
-		// A type earns its place here only once something rewrites or serves its
-		// translation on the front end. `wp_block` and `wp_navigation` qualify
-		// because {@see \PerfLocale\Frontend\BlockRefTranslator} rewrites the
-		// `ref` of `core/block` and `core/navigation` at render time.
-		//
-		// `wp_template` and `wp_template_part` now qualify too, through
-		// {@see \PerfLocale\Frontend\BlockTemplateTranslator}: a content swap on
-		// `get_block_templates` for templates, and an `attrs['slug']` rewrite on
-		// `render_block_data` for parts.
-		//
-		// ⚠️ THE HISTORY MATTERS, because a previous attempt shipped a checkbox
-		// that BROKE working templates. Marking the type translatable made
-		// `PostQueryFilter` hide the customised template on every non-default
-		// language - it was dropped for being LINKED, not for being TRANSLATED,
-		// so it happened even with no translation present, and core silently
-		// fell back to the theme FILE. That is closed by
-		// `PostQueryFilter::never_scoped_post_types()`, proven with a control
-		// that reproduces the original failure. Do not offer these types on a
-		// build where that deny-list is absent.
+		// Curated, not get_post_types( [ 'public' => false ] ): listed only when something serves the
+		// translation. Template types rely on PostQueryFilter::never_scoped_post_types(): see
+		// docs-ai/11-code-rationale.md, "SettingsPage: non-public post types".
 		/**
 		 * Non-public post types offered on the settings screen.
 		 *
@@ -2108,9 +1879,7 @@ final class SettingsPage {
 		foreach ( $non_public_names as $non_public_name ) {
 			$non_public_object = get_post_type_object( (string) $non_public_name );
 
-			// Skip anything not registered on this site, and anything that is
-			// actually public - it is already in the list above and must not
-			// appear twice with two checkboxes writing the same key.
+			// Registered and not public only: a public type is already listed above.
 			if ( $non_public_object && empty( $non_public_object->public ) ) {
 				$non_public_types[ $non_public_object->name ] = $non_public_object;
 			}
@@ -2149,15 +1918,13 @@ final class SettingsPage {
 		$builtin_keys     = array_keys( $available_sync_fields );
 		$custom_sync_meta = array_filter( $sync_fields, fn( $f ) => ! in_array( $f, $builtin_keys, true ) );
 
-		// The three bulk tools below (Create Taxonomy Translations, Assign
-		// Default Language, Generate Missing Translations): settings-bulk-tools.js,
-		// on top of the shared request helper window.perflocaleBulkFetch
-		// (admin-bulk-fetch.js). Enqueued here, so only this tab loads them.
+		// The bulk tools below run from admin-settings.js on perflocaleBulkFetch (admin-bulk-fetch.js);
+		// this tab loads the helper and gives them their data.
 		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-admin-bulk-fetch', 'admin-bulk-fetch.js' );
-		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-settings-bulk-tools', 'settings-bulk-tools.js', [ 'perflocale-admin-bulk-fetch' ] );
+		\PerfLocale\Admin\Assets::add_dependency( 'perflocale-admin-settings', 'perflocale-admin-bulk-fetch' );
 
 		wp_localize_script(
-			'perflocale-settings-bulk-tools',
+			'perflocale-admin-settings',
 			'perflocaleTranslationData',
 			[
 				'taxNonce'         => wp_create_nonce( 'perflocale_create_taxonomy_translations' ),
@@ -2191,12 +1958,7 @@ final class SettingsPage {
 				</fieldset>
 				<?php if ( $non_public_types ) : ?>
 					<?php
-					// Kept in a SEPARATE collapsed group rather than mixed into the
-					// list above: "Patterns" and "Posts" are not comparable choices,
-					// and a flat list invites an operator to tick something whose
-					// consequences they cannot see. Collapsed by default so the
-					// common case - the operator only wants posts and pages - is
-					// unchanged.
+					// A separate collapsed group: patterns and posts are not comparable choices.
 					?>
 					<details class="perflocale-settings__advanced-types">
 						<summary><?php echo esc_html__( 'Advanced content types', 'perflocale' ); ?></summary>
@@ -2246,14 +2008,7 @@ final class SettingsPage {
 			</td>
 		</tr>
 		<?php
-		// ⭐ ITS OWN ROW, NOT BURIED UNDER "Advanced content types".
-		//
-		// Full site editing is not an obscure storage type an expert goes
-		// looking for - on a block theme it is where the header, footer and
-		// page layouts live, so it is the FIRST thing many operators will want
-		// after posts and pages. Hiding it behind a collapsed <details> meant
-		// the feature was effectively undiscoverable, which is most of the
-		// distance between "shipped" and "used".
+		// Full site editing gets its own row: on a block theme it holds the header, footer and layouts.
 		$fse_types   = array_filter(
 			$non_public_types,
 			static fn( $t ) => \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $t->name )
@@ -2511,12 +2266,8 @@ final class SettingsPage {
 					<option value="libretranslate" <?php selected( $mt_provider, 'libretranslate' ); ?>><?php echo esc_html__( 'LibreTranslate', 'perflocale' ); ?></option>
 					<option value="external_agency" <?php selected( $mt_provider, 'external_agency' ); ?>><?php echo esc_html__( 'External Agency', 'perflocale' ); ?></option>
 					<?php
-					// WP 7.0 AI Client option - show only when the host has the API
-					// loaded (or has plugged in a custom resolver via
-					// perflocale/mt/wp_ai_client_resolver). Falls back to listing it
-					// disabled so users on older WP versions can see the option but
-					// not select it (avoids "where did it go?" support churn).
-					// Detection mirrors WpAiClientProvider::resolve_client_callback().
+					// WP AI Client: selectable when the API is loaded or a resolver is plugged in, else listed
+					// disabled. Detection mirrors WpAiClientProvider::resolve_client_callback().
 					$supports_fn         = 'wp_supports_ai'; // Called by name: optional WP 7.0 fn, guarded.
 					$ai_client_available = (
 						function_exists( 'wp_ai_client_prompt' )
@@ -2700,6 +2451,15 @@ final class SettingsPage {
 			</th>
 			<td>
 				<?php $this->render_api_key_field( 'mt_libre_url', 'perflocale-libre-url', $libre_url, 'url' ); ?>
+				<p class="description">
+					<?php
+					printf(
+						/* translators: %s: filter name */
+						esc_html__( 'For a server on this machine (localhost) or on a private network, add its host to the %s filter.', 'perflocale' ),
+						'<code>perflocale/mt/trusted_hosts</code>'
+					);
+					?>
+				</p>
 			</td>
 		</tr>
 		<tr>
@@ -3231,15 +2991,7 @@ final class SettingsPage {
 	/**
 	 * Render the Background-processing rows on the Performance tab.
 	 *
-	 * Four fields, all of them read back by this page's own
-	 * {@see self::extract_tab_values()} under the `performance` tab (there is
-	 * no separate per-tab save handler):
-	 *   - `background_processing`: Auto / Always / Never radio.
-	 *   - `background_engine`: shown only when Action Scheduler is loaded;
-	 *     "Auto (Action Scheduler)" vs "Force WP-Cron".
-	 *   - `background_paused`: the emergency-brake checkbox.
-	 *   - `background_thresholds[<type>]`: one optional per-job override per
-	 *     registered job type, via {@see self::extract_background_thresholds()}.
+	 * Its four fields are read back by extract_tab_values() under the `performance` tab.
 	 *
 	 * @return void
 	 */
@@ -3348,6 +3100,8 @@ final class SettingsPage {
 			'bulk_translate'           => static fn() => new \PerfLocale\Background\Jobs\BulkTranslateJob(),
 			'bulk_string_translate'    => static fn() => new \PerfLocale\Background\Jobs\BulkStringTranslateJob(),
 			'site_translate'           => static fn() => new \PerfLocale\Background\Jobs\SiteTranslateJob(),
+			'wc_stock_check'           => static fn() => new \PerfLocale\WooCommerce\StockCheckJob(),
+			'wc_stock_align'           => static fn() => new \PerfLocale\WooCommerce\StockAlignJob(),
 		];
 		?>
 		<tr>
@@ -3357,15 +3111,8 @@ final class SettingsPage {
 					<?php esc_html_e( 'In Auto mode, operations below their threshold run inline; above, they queue. Leave a row blank to use the default. Filter perflocale/jobs/threshold/<type> is the programmatic equivalent.', 'perflocale' ); ?>
 				</p>
 				<?php
-				// ⚠️ The per-cell `data-label`s are what make the phone layout
-				// work: below 782px WordPress's own `.form-table td { display:
-				// block }` matches THIS table's cells too (it is a descendant
-				// selector, and this table sits inside a form-table cell), so
-				// the three columns stack and the header row is stranded above
-				// them as three loose words. Rather than fight that, the CSS
-				// leans into it and turns each row into a card - but a stacked
-				// cell needs to say what it is, and a CSS `content:` string
-				// cannot be translated. Hence the attribute.
+				// The data-label attributes make the phone layout: below 782px core's `.form-table td` rule
+				// stacks these cells too, and a CSS `content:` string cannot be translated.
 				$bg_label_default  = __( 'Default', 'perflocale' );
 				$bg_label_override = __( 'Override', 'perflocale' );
 				?>
@@ -3380,7 +3127,7 @@ final class SettingsPage {
 					</thead>
 					<tbody>
 						<?php
-						foreach ( self::background_job_types() as $type => $label ) :
+						foreach ( self::shown_background_job_types() as $type => $label ) :
 							$default  = (int) $factories[ $type ]()->get_default_threshold();
 							$override = isset( $thresholds[ $type ] ) ? (int) $thresholds[ $type ] : 0;
 							$field_id = 'perflocale-bgthresh-' . $type;
@@ -3414,9 +3161,7 @@ final class SettingsPage {
 	/**
 	 * Render the "Integrations" tab - CDN / edge worker / SEO schema toggles.
 	 *
-	 * All three toggles are opt-in (except schema which defaults on - it's
-	 * pure-SEO upside with zero runtime cost). When a feature is off, no
-	 * related hooks are registered and no REST routes are exposed.
+	 * Opt-in except schema; an off feature registers no hooks and no REST routes.
 	 *
 	 * @return void
 	 */
@@ -3529,11 +3274,8 @@ final class SettingsPage {
 	/**
 	 * Extract and sanitize per-job background-threshold overrides from POST.
 	 *
-	 * Whitelists keys against the registered job types listed by
-	 * {@see self::background_job_types()} so an attacker can't POST arbitrary
-	 * keys that would persist in the array setting.
-	 * Empty / zero / negative inputs are dropped so {@see AbstractJob::effective_threshold()}
-	 * falls back to the job's default.
+	 * Keys are whitelisted against background_job_types(); empty, zero or negative inputs are
+	 * dropped so the job's default applies.
 	 *
 	 * @return array<string, int>
 	 */
@@ -3543,9 +3285,23 @@ final class SettingsPage {
 			return [];
 		}
 
-		$out = [];
+		$out   = [];
+		$shown = self::shown_background_job_types();
+		$kept  = (array) $this->settings->get( 'background_thresholds', [] );
 
 		foreach ( self::background_job_types() as $type => $_label ) {
+			// A row this screen did not show (the WooCommerce stock jobs
+			// while the add-on or Inventory Sync is off) keeps its override.
+			if ( ! isset( $shown[ $type ] ) ) {
+				$value = $kept[ $type ] ?? null;
+
+				if ( is_numeric( $value ) && (int) $value > 0 ) {
+					$out[ $type ] = (int) $value;
+				}
+
+				continue;
+			}
+
 			$raw = isset( $_POST['background_thresholds'][ $type ] )
 				? sanitize_text_field( wp_unslash( (string) $_POST['background_thresholds'][ $type ] ) )
 				: '';
@@ -3567,10 +3323,9 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Map of registered Tier-2 job types → human label. Mirrors the
-	 * WorkerRegistry registrations in Bootstrap. The labels are used by
-	 * the Performance-tab threshold rows; adding a new job type means
-	 * adding it here too so operators can override its threshold.
+	 * Registered job types and their labels, for the Performance tab threshold rows.
+	 *
+	 * Mirrors the WorkerRegistry registrations in Bootstrap that dispatch by threshold; auto_translate always queues.
 	 *
 	 * @return array<string, string>
 	 */
@@ -3585,14 +3340,40 @@ final class SettingsPage {
 			'bulk_translate'           => __( 'Bulk machine translation', 'perflocale' ),
 			'bulk_string_translate'    => __( 'Bulk MT translation of strings', 'perflocale' ),
 			'site_translate'           => __( 'Site-wide MT translation (chunked)', 'perflocale' ),
+			'wc_stock_check'           => __( 'WooCommerce stock check', 'perflocale' ),
+			'wc_stock_align'           => __( 'WooCommerce stock alignment', 'perflocale' ),
 		];
 	}
 
 	/**
-	 * Render the import outcome the Export & Import handlers redirect back
-	 * with (ImportNotice: a record of this user's, named by the redirect's
-	 * token). Printed in the page's notice area, above the tab strip, where
-	 * WordPress's admin script would otherwise move it after first paint.
+	 * The job types whose threshold row the Performance tab shows: every
+	 * type, except the WooCommerce stock jobs while the WooCommerce add-on
+	 * did not boot or Inventory Sync is off.
+	 *
+	 * @return array<string, string>
+	 */
+	private static function shown_background_job_types(): array {
+		$types    = self::background_job_types();
+		$plugin   = \PerfLocale\Plugin::get_instance();
+		$settings = $plugin->has( 'settings' ) ? $plugin->get( 'settings' ) : null;
+		$stock    = \PerfLocale\Helper::get_instance()->is_addon_active( 'woocommerce' )
+			&& $settings instanceof \PerfLocale\Settings
+			&& (bool) $settings->get( 'wc_sync_stock', true );
+
+		// Aligning stock is off in this version (Api::align_off()).
+		unset( $types['wc_stock_align'] );
+
+		if ( ! $stock ) {
+			unset( $types['wc_stock_check'] );
+		}
+
+		return $types;
+	}
+
+	/**
+	 * Renders the import outcome the Export & Import handlers redirect back with (ImportNotice).
+	 *
+	 * Printed above the tab strip, where core's admin script would otherwise move it.
 	 *
 	 * @return void
 	 */
@@ -3692,9 +3473,9 @@ final class SettingsPage {
 	}
 
 	/**
-	 * The export section's label as the screen shows it, translated. The
-	 * data registry holds the English label (it is pure data, loaded without
-	 * WordPress); a section this list does not know shows the registry's.
+	 * The export section's label as the screen shows it, translated.
+	 *
+	 * The registry holds the English label (it loads without WordPress); unknown sections show it.
 	 *
 	 * @param string $key   Section key.
 	 * @param string $label The registry's label.
@@ -3748,19 +3529,8 @@ final class SettingsPage {
 		$sections                 = \PerfLocale\Admin\DataExporter::sections();
 		$addon_groups             = \PerfLocale\Admin\DataExporter::addon_groups();
 
-		// The ceiling an operator will actually hit, named on the import form
-		// so the limit is visible BEFORE a doomed upload rather than only after
-		// it - the same pair of ceilings StringsPage names on the PO form, and
-		// the smaller one binds: what PHP will accept
-		// (`AdminController::max_upload_bytes()`, the one that binds on every
-		// stock host) and the importer's own ceiling
-		// (`AdminController::import_max_bytes()`, the one AdminController's
-		// gate applies). One admin-page-only call to each; nothing on the
-		// front end.
-		// A file larger than PHP accepts in one request is sent in pieces
-		// (assets/js/import-upload.js, ImportUpload), so the ceiling the
-		// screen names is the importer's own; the PHP limit decides only
-		// whether a file goes in one request or in pieces.
+		// The import form names the importer's ceiling: a file larger than one request is sent in
+		// pieces (admin-settings.js, ImportUpload), so PHP's limit only decides whether it is split.
 		$single_request_bytes = \PerfLocale\Admin\AdminController::max_upload_bytes();
 		$import_ceiling_bytes = \PerfLocale\Admin\AdminController::import_max_bytes();
 		$import_ceiling       = \PerfLocale\Admin\AdminController::format_bytes( $import_ceiling_bytes );
@@ -3776,9 +3546,7 @@ final class SettingsPage {
 			\PerfLocale\Admin\AdminController::format_bytes( \PerfLocale\Admin\ImportUpload::MIN_PIECE )
 		);
 
-		// A full export larger than the import ceiling cannot come back
-		// through this screen; say so before the operator relies on it as a
-		// backup. Two queries per table, on this tab only.
+		// Warn when a full export exceeds the import ceiling; two queries per table, on this tab only.
 		$export_estimate = ( new \PerfLocale\Admin\DataExporter() )->estimate_bytes();
 
 		?>
@@ -3944,12 +3712,8 @@ final class SettingsPage {
 		</tr>
 
 		<?php
-		// Migration cards. Each `covers` line names ONLY what that importer really
-		// imports, verified against src/Migration/: WpmlImporter does posts, terms and
-		// strings; PolylangImporter does posts, terms and single-language objects and NO
-		// strings; TranslatePressImporter does posts, slugs and strings and NO terms.
-		// NONE of the three touches nav menus. This is the only place a user is told
-		// what a migration will and will not bring across - keep it honest.
+		// Each `covers` line names only what that importer imports (src/Migration/); none of them
+		// touches nav menus.
 		?>
 		<!-- Migration -->
 		<tr>
@@ -4037,19 +3801,10 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Render an API key field that respects external overrides (env var or
-	 * PHP constant).
+	 * Render an API key field that respects external overrides (env var or PHP constant).
 	 *
-	 * When the value comes from getenv() or a defined PHP constant, the
-	 * input is disabled and shows the source so the admin knows their edit
-	 * here would be ignored anyway. Both sources share one canonical name
-	 * (see Settings::CONSTANT_MAP) - the env var and the constant use the
-	 * same uppercase string (e.g. PERFLOCALE_DEEPL_API_KEY).
-	 *
-	 * A key stored in the database is never printed: the password input
-	 * renders empty, with a masked placeholder when a key is stored, and an
-	 * empty submission keeps the stored key ({@see self::MT_SECRET_KEYS}).
-	 * A `url` field prints its value.
+	 * An override disables the input and names its source; a stored key is never printed, and an
+	 * empty submission keeps it ({@see self::MT_SECRET_KEYS}).
 	 *
 	 * @param string $key Setting key (e.g., 'mt_deepl_api_key').
 	 * @param string $id HTML input ID.

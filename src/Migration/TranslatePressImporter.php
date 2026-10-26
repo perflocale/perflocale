@@ -26,17 +26,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Imports translation data from TranslatePress.
- *
- * Reads TranslatePress's wp_trp_* tables, maps language codes to
- * PerfLocale language IDs, and creates translated posts with content
- * reconstructed from dictionary entries.
- *
- * TranslatePress stores string-level translations (not whole posts),
- * so this importer reconstructs full translated post content by
- * replacing each whole text, attribute value, block attribute, shortcode
- * value and translation block that TranslatePress translated
- * ({@see TranslatePressContentRebuilder}).
+ * Imports TranslatePress data: maps its languages, and rebuilds each translated post from TranslatePress's
+ * string-level dictionary by replacing every translated text, attribute, block attribute, shortcode value and
+ * translation block (TranslatePressContentRebuilder).
  */
 final class TranslatePressImporter {
 
@@ -53,17 +45,14 @@ final class TranslatePressImporter {
 	private const BATCH_SIZE = 50;
 
 	/**
-	 * TranslatePress status: 1 = machine-translated. TRP DISPLAYS everything
-	 * with status != 0, so machine-translated strings are live on the source
-	 * site and must be migrated by default (auto-translate is TRP's headline
-	 * feature - the common case is a site with mostly status-1 content).
+	 * TranslatePress status 1, machine-translated: TranslatePress shows every status but 0, so these are live and
+	 * imported by default.
 	 */
 	private const MACHINE_TRANSLATED = 1;
 
 	/**
-	 * Minimum TranslatePress status to import. Defaults to MACHINE_TRANSLATED so
-	 * the migration is faithful to what the source site actually displays;
-	 * filter to 2 (human-reviewed) for a reviewed-only import.
+	 * Lowest TranslatePress status imported: machine-translated by default (what the site shows); 2 imports reviewed
+	 * strings only.
 	 *
 	 * @hook perflocale/migration/translatepress/min_status
 	 *
@@ -74,10 +63,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Highest TranslatePress gettext status that is TranslatePress's own
-	 * translation (1 machine, 2 reviewed). Status 3 is a copy of a similar
-	 * string's translation and 4 a copy of the language pack's; importing
-	 * those would freeze the pack's text into overrides.
+	 * Highest gettext status that is TranslatePress's own translation (1 machine, 2 reviewed); 3 and 4 copy a similar
+	 * string's or the language pack's, which would freeze the pack's text into overrides.
 	 */
 	private const GETTEXT_OWN_MAX_STATUS = 2;
 
@@ -98,38 +85,24 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Option name for the post-translation resumability checkpoint.
-	 *
-	 * After each successfully-committed batch we store the highest
-	 * post_id processed. A subsequent invocation (after watchdog kill,
-	 * timeout, manual restart) starts AFTER that id instead of redoing
-	 * the whole import - which on big sites would otherwise iterate
-	 * tens of thousands of already-imported posts looking up "is this
-	 * already in a group?" for each one.
+	 * Option of the highest source post id whose batch committed, so a run after a kill or timeout starts after it.
 	 */
 	public const POST_CHECKPOINT_OPTION = 'perflocale_trp_import_post_checkpoint';
 
 	/**
-	 * Option holding the language selection the post checkpoint was written under.
-	 *
-	 * A checkpoint only says which source posts were done for the languages
-	 * mapped at the time. When the source language or the mapped targets have
-	 * changed since, the posts below the checkpoint still lack the new
-	 * targets, so the run starts from the first post instead (already
-	 * translated targets are skipped, so that repeats no work).
+	 * Option of the language selection the post checkpoint was written under: when the source or targets changed, the
+	 * run starts from the first post (translated targets are skipped).
 	 */
 	public const POST_CHECKPOINT_FINGERPRINT_OPTION = 'perflocale_trp_import_post_checkpoint_fp';
 
 	/**
-	 * Rows per batch when streaming the per-language gettext dictionary.
-	 * Caps memory; filterable via `perflocale/migration/translatepress/gettext_batch_size`.
+	 * Rows per batch of the per-language gettext dictionary (filter `perflocale/migration/translatepress/gettext_batch_size`).
 	 */
 	private const GETTEXT_BATCH_SIZE = 1000;
 
 	/**
-	 * Most targets named in `existing_targets`, which keeps the migration
-	 * job's stored result far below JobState::MAX_RESULT_BYTES (a larger
-	 * result is dropped whole). The `existing` count is exact.
+	 * Most targets named in `existing_targets`, so the job's stored result stays under JobState::MAX_RESULT_BYTES (a
+	 * larger one is dropped whole). The `existing` count is exact.
 	 */
 	private const EXISTING_TARGETS_CAP = 100;
 
@@ -154,13 +127,8 @@ final class TranslatePressImporter {
 	private readonly StringRepository $strings;
 
 	/**
-	 * Source-map for cross-restore idempotency. Symmetric with the
-	 * WPML + Polylang importers. TRP's main idempotency mechanism is
-	 * the per-(post, language) existing-translation pre-check + the
-	 * POST_CHECKPOINT_OPTION (perflocale_trp_import_post_checkpoint),
-	 * but the source_map gives operators a single tool (the
-	 * `--force-restart` CLI flag) to clear migration state across
-	 * all three importers consistently.
+	 * Source map, as in the WPML and Polylang importers, so `--force-restart` clears all three importers' state the
+	 * same way (this importer's idempotency is the existing-translation check and the post checkpoint).
 	 *
 	 * @var MigrationSourceMapRepository
 	 */
@@ -184,9 +152,7 @@ final class TranslatePressImporter {
 	private array $trp_settings = [];
 
 	/**
-	 * Set by stop_if_batch_broken() when the current batch's transaction was
-	 * lost, so the batch's catch runs the batch once more outside a
-	 * transaction.
+	 * Set by stop_if_batch_broken() when the batch's transaction was lost: its catch runs it once more outside one.
 	 *
 	 * @var bool
 	 */
@@ -207,20 +173,9 @@ final class TranslatePressImporter {
 	private string $source_locale = '';
 
 	/**
-	 * Migration results.
-	 *
-	 * `existing` counts the (post, language) targets whose TranslatePress
-	 * translation was not imported because the post already had a
-	 * translation in that language that this importer did not write (an
-	 * auto-created stub, or a manual or machine translation), which is kept
-	 * as it is. `existing_targets` names the first EXISTING_TARGETS_CAP of
-	 * them: source post id, language slug, id of the kept translation.
-	 *
-	 * `errors` holds every message for the operator: notices (a language
-	 * that was not mapped or published, strings that matched nothing) and
-	 * failures. `incomplete` is true when a failure left part of the
-	 * TranslatePress data not imported (a source read or a write failed);
-	 * a run of the import again imports the rest. A notice never sets it.
+	 * Migration results. `existing`: targets skipped as the post had a translation this importer did not write (kept);
+	 * `existing_targets` names the first EXISTING_TARGETS_CAP. `errors`: notices and failures. `incomplete`: a failed
+	 * read or write left data not imported; running again imports the rest.
 	 *
 	 * @var array<string, int|bool|array>
 	 */
@@ -265,7 +220,7 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Check if TranslatePress tables exist.
+	 * Whether the TranslatePress tables exist.
 	 *
 	 * @return bool
 	 */
@@ -286,26 +241,66 @@ final class TranslatePressImporter {
 	}
 
 	/**
+	 * PHP's time limit the import runs under (0 = none), given the current one: raised, never lowered.
+	 *
+	 * @param int $current max_execution_time now.
+	 * @return int
+	 */
+	public static function time_limit( int $current ): int {
+		$limit = self::filtered_limit();
+
+		return self::raises( $current, $limit ) ? max( 0, $limit ) : $current;
+	}
+
+	/**
+	 * The perflocale/migration/time_limit value (default 300 s), the same for the admission and the import.
+	 *
+	 * @return int
+	 */
+	private static function filtered_limit(): int {
+		return (int) apply_filters( 'perflocale/migration/time_limit', 300 );
+	}
+
+	/**
+	 * Whether the import sets $limit: no limit (0, as under WP-CLI) or a longer one stays; an equal one is set again,
+	 * which restarts the timer. function_exists(): a disabled function is gone in PHP 8.
+	 *
+	 * @param int $current max_execution_time now.
+	 * @param int $limit   Filtered limit.
+	 * @return bool
+	 */
+	private static function raises( int $current, int $limit ): bool {
+		return function_exists( 'set_time_limit' ) && 0 !== $current && ( $limit <= 0 || $limit >= $current );
+	}
+
+	/**
+	 * Raise PHP's time limit for the import ({@see time_limit()}).
+	 *
+	 * @return void
+	 */
+	private static function raise_time_limit(): void {
+		$current = (int) ini_get( 'max_execution_time' );
+		$limit   = self::filtered_limit();
+
+		if ( self::raises( $current, $limit ) ) {
+			set_time_limit( max( 0, $limit ) ); // phpcs:ignore Generic.PHP.ForbiddenFunctions.Found, Squiz.PHP.DiscouragedFunctions.Discouraged -- Large imports may exceed default time limit.
+		}
+	}
+
+	/**
 	 * Run the full migration.
 	 *
 	 * @return array<string, int|bool|array> Results with counts, errors and the `incomplete` flag.
 	 */
 	public function import(): array {
-		// function_exists() skips cleanly when the host lists set_time_limit in
-		// disable_functions - since PHP 8 a disabled function is removed from
-		// the function table, so calling it unguarded is a fatal, not a
-		// warning, and the migration would die on its first statement. Matches
-		// the guarded siblings in Bootstrap.
-		if ( function_exists( 'set_time_limit' ) ) {
-			set_time_limit( (int) apply_filters( 'perflocale/migration/time_limit', 300 ) ); // phpcs:ignore Generic.PHP.ForbiddenFunctions.Found, Squiz.PHP.DiscouragedFunctions.Discouraged -- Large imports may exceed default time limit.
-		}
+		self::raise_time_limit();
 
 		if ( ! $this->can_import() ) {
 			$this->result['errors'][] = __( 'TranslatePress tables not found.', 'perflocale' );
 			return $this->result;
 		}
 
-		// Load TranslatePress settings.
+		// TranslatePress settings.
 		$this->trp_settings = get_option( 'trp_settings', [] );
 
 		if ( empty( $this->trp_settings ) || ! is_array( $this->trp_settings ) ) {
@@ -313,14 +308,11 @@ final class TranslatePressImporter {
 			return $this->result;
 		}
 
-		// A hard-killed batch rolls its SQL transaction back, but whatever it
-		// wrote to a persistent object cache (translation-group entries, the
-		// eager link map in alloptions) survives the kill. A resumed run would
-		// then see rolled-back links in the idempotency pre-checks and silently
-		// skip re-creating those translations. Start from committed DB state.
+		// A killed batch's transaction rolls back but its persistent cache writes survive, which would make the resumed
+		// run's idempotency checks skip translations: start from the committed state.
 		wp_cache_flush();
 
-		// Build language mapping.
+		// Language mapping.
 		$this->build_language_map();
 
 		if ( empty( $this->language_map ) ) {
@@ -330,23 +322,15 @@ final class TranslatePressImporter {
 
 		$this->dictionary = new TranslatePressDictionary( $this->wpdb, $this->cache, $this->min_status(), \Closure::fromCallable( [ $this, 'beat' ] ) );
 
-		// Term names first, so the terms copied onto created posts are the
-		// translated ones; menus after the posts their items point to.
-		// The import lock's heartbeat runs with each step's progress: between
-		// the steps and after each batch inside them.
-		//
-		// A dictionary or term read that fails stops the run where it is:
-		// posts created after a failed term read would get target terms under
-		// their source names, which a later run keeps as translations.
+		// Term names first (created posts get translated terms), menus after the posts their items point to; the lock's
+		// heartbeat runs with each step's progress. A failed dictionary or term read stops the run where it is.
 		try {
 			$this->result['terms'] = $this->import_term_names();
 			$this->result['posts'] = $this->import_post_translations();
 			$this->beat();
 
-			// Menu items point to the posts' translations, and a menu that
-			// already has a copy in a language is never copied again. When
-			// the post step did not finish (a failed read, insert, batch or
-			// commit), the menus wait for the run that imports those posts.
+			// Menus point to the posts' translations and are copied once per language: they wait for a run whose post step
+			// finished.
 			if ( ! $this->result['incomplete'] ) {
 				$this->result['menus'] = $this->import_menu_labels();
 			}
@@ -386,11 +370,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * The error left by the source read that just ran, or '' when it worked.
-	 *
-	 * A failed get_col()/get_results() returns [] exactly as an empty result
-	 * does; only last_error tells them apart, and the next query resets it,
-	 * so call this straight after the read.
+	 * The error left by the source read that just ran, or '' when it worked: a failed read returns [] like an empty
+	 * one, and the next query resets last_error, so call it straight after the read.
 	 *
 	 * @phpstan-impure
 	 *
@@ -410,17 +391,10 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Throw so the batch's catch takes over when the batch transaction is
-	 * lost or one of the batch's own statements failed.
+	 * Throw so the batch's catch takes over when its transaction was lost or one of its own statements failed.
 	 *
-	 * Lost (Schema::transaction_lost() without an own failure): a query that
-	 * failed while the transaction was open ended it (on SQLite any failed
-	 * query; on MySQL a deadlock, or a lock wait timeout with
-	 * innodb_rollback_on_timeout ON); the batch is rolled back and run once
-	 * more outside a transaction ($batch_lost). An own failure (a DB error
-	 * behind wp_insert_post()'s WP_Error) fails the batch on every engine.
-	 * Any other failed query of another plugin leaves a MySQL transaction
-	 * intact, and the batch goes on.
+	 * Lost (Schema::transaction_lost()): rolled back and run once more outside a transaction. An own failure fails the
+	 * batch on every engine; another plugin's failed query leaves a MySQL transaction intact.
 	 *
 	 * @param bool   $in_tx      Whether the batch runs in a transaction.
 	 * @param int    $errors     Schema::query_error_count() when the batch started.
@@ -445,12 +419,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
-	 *
-	 * That text can carry table names with their prefix and row values.
-	 * Migration results and job rows are shown to every user with Jobs
-	 * access, so the messages stored there say only that a database error
-	 * happened; the detail is here.
+	 * Log a database error's text when WP_DEBUG_LOG is on: it can carry prefixed table names and values, so results and
+	 * job rows (shown to all Jobs users) only say a database error happened.
 	 *
 	 * @param string $where What was running, for the log line.
 	 * @param string $error The database error.
@@ -466,7 +436,7 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Build a mapping of TranslatePress locales to PerfLocale language IDs.
+	 * Map TranslatePress locales to PerfLocale language ids.
 	 *
 	 * @return void
 	 */
@@ -481,15 +451,13 @@ final class TranslatePressImporter {
 
 		$perflocale_languages = $this->languages->get_active();
 
-		// Languages TranslatePress had not published were shown to editors
-		// only. Their translations go only into a PerfLocale language that is
-		// switched off, so importing never publishes them.
+		// A language TranslatePress had not published goes only into a switched-off PerfLocale language: never published.
 		$published = $this->trp_settings['publish-languages'] ?? null;
 		$published = is_array( $published ) ? array_map( 'strval', $published ) : null;
 
 		foreach ( $trp_languages as $trp_locale ) {
 			if ( $trp_locale === $this->source_locale ) {
-				continue; // Skip source language - it maps to default.
+				continue; // The source language maps to the default.
 			}
 
 			if ( $published !== null && ! in_array( (string) $trp_locale, $published, true ) ) {
@@ -499,9 +467,7 @@ final class TranslatePressImporter {
 
 			$matched = false;
 
-			// Pass 1: an EXACT locale match must win first, so a regional variant
-			// (e.g. de_AT) is never shadowed by a greedy slug-prefix match on its
-			// base language (de). Mirrors the WPML/Polylang two-pass mapping.
+			// Pass 1, exact locale, so a regional variant (de_AT) is never taken by its base's slug prefix (as WPML/Polylang).
 			foreach ( $perflocale_languages as $pl_lang ) {
 				if ( $pl_lang->locale === $trp_locale ) {
 					$this->language_map[ $trp_locale ] = (int) $pl_lang->id;
@@ -510,7 +476,7 @@ final class TranslatePressImporter {
 				}
 			}
 
-			// Pass 2: slug-prefix fallback only when no exact locale matched.
+			// Pass 2: slug prefix, only without an exact match.
 			if ( ! $matched ) {
 				foreach ( $perflocale_languages as $pl_lang ) {
 					if ( str_starts_with( $trp_locale, $pl_lang->slug ) ) {
@@ -530,11 +496,8 @@ final class TranslatePressImporter {
 			}
 		}
 
-		// A slug-prefix fallback (Pass 2) can map two TRP regional locales
-		// (e.g. de_DE and de_AT) onto the SAME PerfLocale language when only the
-		// base language exists. The loop would then process both into one
-		// language and silently drop/overwrite the second. Keep the exact-locale
-		// claimant (or the first mapped) per PerfLocale id and report the rest.
+		// The slug-prefix pass can map two regional locales (de_DE, de_AT) onto one language when only the base exists:
+		// keep the exact-locale claimant (or the first) per language and report the rest.
 		$by_pl_id = [];
 		foreach ( $this->language_map as $trp_loc => $pl_id ) {
 			$by_pl_id[ $pl_id ][] = $trp_loc;
@@ -566,16 +529,8 @@ final class TranslatePressImporter {
 			}
 		}
 
-		// A target locale must never resolve to the SAME PerfLocale language as
-		// the SOURCE. The source is excluded from language_map (line ~259), so
-		// the by_pl_id dedup above cannot catch it: e.g. TRP source de_DE +
-		// target de_AT with only a base "de" language (locale de_DE) - de_AT
-		// slug-prefix-maps to that same language. Left unguarded, the post loop
-		// creates a PUBLISHED duplicate per post and set_post_language(source)
-		// evicts the source from its own group (a re-runnable corruption). The
-		// fallback-to-default in get_source_perflocale_language() is included on
-		// purpose - mapping a target onto the default language triggers the same
-		// eviction. Refuse those targets with an actionable error.
+		// No target may resolve to the source's language (or the default it falls back to): every post would get a
+		// published duplicate and set_post_language() would evict the source from its group. Refused with an error.
 		$source_lang = $this->get_source_perflocale_language();
 
 		if ( $source_lang && isset( $source_lang->id ) ) {
@@ -732,12 +687,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Map a language TranslatePress had not published.
-	 *
-	 * Only a PerfLocale language that is switched off takes its translations
-	 * (matched as the published ones are: exact locale first, then slug
-	 * prefix); visitors do not see them until the language is switched on.
-	 * Otherwise the language is skipped with a notice.
+	 * Map a language TranslatePress had not published, only onto a switched-off PerfLocale language (exact locale, then
+	 * slug prefix), so visitors see nothing until it is switched on; otherwise skip it with a notice.
 	 *
 	 * @param string $trp_locale TranslatePress locale.
 	 * @return void
@@ -788,13 +739,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Import post/page translations from TranslatePress dictionary tables.
-	 *
-	 * TranslatePress stores string-level translations. This method:
-	 * 1. Finds all posts that have translated strings
-	 * 2. For each post + target language, reconstructs translated content
-	 * 3. Creates a new WordPress post with the translated content
-	 * 4. Links it in a PerfLocale translation group
+	 * Import post translations: for each post with translated strings and each target language, rebuild the content,
+	 * insert the translation and link it in the post's group.
 	 *
 	 * @return int Number of posts imported.
 	 */
@@ -810,7 +756,7 @@ final class TranslatePressImporter {
 		$original_table = $this->wpdb->prefix . 'trp_original_strings';
 		$meta_table     = $this->wpdb->prefix . 'trp_original_meta';
 
-		// Check if meta table exists (older TRP versions may not have it).
+		// Older TranslatePress versions have no meta table.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$meta_exists = (int) $this->wpdb->get_var(
 			$this->wpdb->prepare(
@@ -824,7 +770,7 @@ final class TranslatePressImporter {
 			return 0;
 		}
 
-		// Get all unique post IDs that have translations.
+		// Every post id that has translations.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$post_ids = $this->wpdb->get_col(
 			$this->wpdb->prepare(
@@ -834,8 +780,7 @@ final class TranslatePressImporter {
 			)
 		);
 
-		// On a failed read keep the resume checkpoint: the sweep below is for
-		// a source with nothing left to import.
+		// A failed read keeps the resume checkpoint: the sweep below is for a source with nothing left.
 		$read_error = $this->read_error();
 
 		if ( $read_error !== '' ) {
@@ -851,27 +796,18 @@ final class TranslatePressImporter {
 		}
 
 		if ( empty( $post_ids ) ) {
-			// Sweep any leftover checkpoint from a prior run - there's
-			// nothing more to import, so the option becomes stale.
+			// Nothing left to import: drop a stale checkpoint.
 			delete_option( self::POST_CHECKPOINT_OPTION );
 			delete_option( self::POST_CHECKPOINT_FINGERPRINT_OPTION );
 			return 0;
 		}
 
-		// meta_value is a longtext column, so the SQL ORDER BY sorts it
-		// LEXICOGRAPHICALLY ("10" < "2"). The resume checkpoint (highest
-		// committed post_id) is only a valid high-water mark under NUMERIC
-		// ascending order - otherwise a committed batch holding a
-		// numerically-large id pushes the checkpoint past lower-numbered ids
-		// that were never processed, and a resumed run skips them forever.
+		// meta_value is longtext, so SQL sorts it as text ("10" < "2"); the checkpoint is a high-water mark only in
+		// numeric order, or a resume would skip lower ids for good.
 		$post_ids = array_map( 'intval', $post_ids );
 		sort( $post_ids, SORT_NUMERIC );
 
-		// Resumability checkpoint: pick up where a previous run stopped.
-		// The option stores the highest post_id committed by the last
-		// successful batch. Skip anything ≤ that id so a watchdog-killed
-		// import doesn't redo work on restart (and so the operator can
-		// re-trigger the job without manually filtering).
+		// Resume after the highest post id the last committed batch recorded.
 		$checkpoint  = (int) get_option( self::POST_CHECKPOINT_OPTION, 0 );
 		$fingerprint = $this->checkpoint_fingerprint();
 
@@ -898,9 +834,7 @@ final class TranslatePressImporter {
 			$post_ids = $post_ids_filtered;
 
 			if ( empty( $post_ids ) ) {
-				// Everything past the checkpoint was already processed.
-				// Clear the checkpoint so a future fresh-run doesn't
-				// silently no-op.
+				// Everything past the checkpoint is done: clear it so a later fresh run does not do nothing.
 				delete_option( self::POST_CHECKPOINT_OPTION );
 				delete_option( self::POST_CHECKPOINT_FINGERPRINT_OPTION );
 				return 0;
@@ -908,10 +842,8 @@ final class TranslatePressImporter {
 		}
 
 		/**
-		 * Posts processed per transaction during TranslatePress migration.
-		 * Default 50. Each post triggers a post-insert + translation-link
-		 * write; bigger batches = fewer transactions but longer rollback
-		 * windows on error. Clamped to 5–500.
+		 * Filter the posts per transaction of the TranslatePress migration (default 50, clamped 5-500): larger batches mean
+		 * fewer transactions and longer rollbacks.
 		 *
 		 * @hook perflocale/migration/translatepress/batch_size
 		 * @param int $size Default 50.
@@ -919,20 +851,16 @@ final class TranslatePressImporter {
 		$batch_size = (int) apply_filters( 'perflocale/migration/translatepress/batch_size', self::BATCH_SIZE );
 		$batch_size = max( 5, min( 500, $batch_size ) );
 
-		// Process in batches.
+		// In batches.
 		$batches = array_chunk( array_map( 'intval', $post_ids ), $batch_size );
 
-		// Resume low-water mark: once any batch fails, the checkpoint must not
-		// advance past it - otherwise a later committed batch pushes the
-		// checkpoint beyond the failed ids and a resume skips them forever.
+		// After a failed batch the checkpoint never passes its ids, or a resume would skip them.
 		$first_failed_floor = PHP_INT_MAX;
 
 		$this->beat( 'posts', 0, count( $post_ids ) );
 
-		// Each batch runs in one transaction ($in_tx). A batch whose
-		// transaction was lost (see stop_if_batch_broken()) is rolled back and
-		// queued once more, to run outside a transaction, where another
-		// plugin's failed query is tolerated.
+		// One transaction per batch; a batch whose transaction was lost is rolled back and queued once more outside one,
+		// where another plugin's failed query is tolerated.
 		$queue = [];
 
 		foreach ( $batches as $batch_index => $batch ) {
@@ -946,41 +874,28 @@ final class TranslatePressImporter {
 			$this->beat( 'posts', min( count( $post_ids ), (int) $batch_index * $batch_size ), count( $post_ids ) );
 			$rebuilder->forget();
 
-			// The status selections a rolled-back batch asked to delete, if
-			// any. A pending entry of a rolled-back final batch is never
-			// released: its ROLLBACK undid the status changes, and import()
-			// ends with flush_all().
+			// Release the status selections a rolled-back batch asked to delete. A rolled-back final batch's pending entry is
+			// never released: its ROLLBACK undid them, and import() ends with flush_all().
 			$this->groups->release_status_selectors();
 
 			if ( $in_tx ) {
 				$this->wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				// Register this raw transaction so nested create_group()/link_object()
-				// calls join it instead of issuing a second START TRANSACTION (which
-				// MySQL treats as an implicit COMMIT of this outer one, defeating the
-				// batch ROLLBACK below). Cleared in the finally on every exit path.
+				// Nested create_group() and link_object() join this transaction instead of a second START TRANSACTION, which
+				// MySQL treats as a COMMIT. Cleared in the finally.
 				$this->groups->set_in_transaction( true );
 			}
 
-			// Failed queries before this batch's writes, for
-			// stop_if_batch_broken() after each write step.
+			// Failed queries before this batch's writes, for stop_if_batch_broken().
 			$batch_errors     = Schema::query_error_count();
 			$this->batch_lost = false;
 
-			// Snapshot the running totals so a mid-batch failure can roll
-			// them back together with the SQL transaction. Previously, a
-			// throw inside wp_insert_post / set_post_language / link_object
-			// after the SQL rows had been written but BEFORE COMMIT would
-			// silently abort the batch and the `imported` / `errors`
-			// counters drifted from the actual database state - surfacing
-			// to the operator as "we imported 50 posts" when only 12
-			// actually persisted.
+			// Totals before the batch, restored with its ROLLBACK so the counts match the database.
 			$pre_batch_imported = $imported;
 			$pre_batch_skipped  = (int) ( $this->result['skipped'] ?? 0 );
 			$pre_batch_existing = [ $this->result['existing'], $this->result['existing_targets'] ];
 			$pre_batch_errors   = (array) ( $this->result['errors'] ?? [] );
 
-			// Posts this batch inserted; a failed batch deletes the ones its
-			// ROLLBACK did not remove (see delete_unlinked_batch_posts()).
+			// Posts this batch inserted; a failed batch deletes those its ROLLBACK did not remove.
 			$batch_new_posts = [];
 
 			$batch_failed = false;
@@ -995,15 +910,10 @@ final class TranslatePressImporter {
 						continue;
 					}
 
-					// NOTE: no coarse "post already has ANY translation" skip here.
-					// get_translations() returns every group link including the
-					// source's own, so a `count > 1` guard skipped a post that had
-					// a translation in SOME OTHER language - dropping still-pending
-					// languages on a resume/re-import (es done, de never imported).
-					// Per-(post, language) idempotency is enforced below by
-					// get_translation_in_language(), which is the correct grain.
+					// No "post has any translation" skip: get_translations() includes the source's own link, so it would drop pending
+					// languages on a resume. Idempotency is per (post, language), below.
 
-					// Get all original_id values for this post.
+					// The post's original_id values.
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$original_ids = $this->wpdb->get_col(
 						$this->wpdb->prepare(
@@ -1013,8 +923,7 @@ final class TranslatePressImporter {
 						)
 					);
 
-					// Throw on a failed read, so the catch below rolls the batch
-					// back and the checkpoint stays below this post.
+					// A failed read throws, so the batch rolls back and the checkpoint stays below this post.
 					$read_error = $this->read_error();
 
 					if ( $read_error !== '' ) {
@@ -1027,7 +936,7 @@ final class TranslatePressImporter {
 						continue;
 					}
 
-					// Get original strings for these IDs.
+					// The originals of these ids.
 					$id_placeholders = implode( ',', array_fill( 0, count( $original_ids ), '%d' ) );
 
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -1062,10 +971,10 @@ final class TranslatePressImporter {
 						$with_blocks = $with_blocks || str_contains( (string) $row->original, '<' );
 					}
 
-					// The post's fields split into translatable units, once for all languages.
+					// The post's fields as translatable units, once for every language.
 					$parsed = null;
 
-					// For each target language, build translated content.
+					// Per target language.
 					foreach ( $this->language_map as $trp_locale => $pl_lang_id ) {
 						$dict_table = $this->get_dictionary_table( $this->source_locale, $trp_locale );
 
@@ -1073,9 +982,7 @@ final class TranslatePressImporter {
 							continue;
 						}
 
-						// Get translations for these original IDs (manually translated only).
-						// With translation blocks among the originals, every column is
-						// read, so each row carries block_type where the table has it.
+						// The translations of these originals; with translation blocks every column is read, for block_type.
 						$columns = $with_blocks ? '*' : 'original_id, translated';
 
 						// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -1099,19 +1006,14 @@ final class TranslatePressImporter {
 							continue;
 						}
 
-						// Reconstruct translated content from the whole units
-						// TranslatePress translated: a text run, an attribute value,
-						// a block attribute, a shortcode value or a translation
-						// block is replaced only as a whole, never inside URLs or
-						// other text, and a replaced unit is never scanned again.
+						// Rebuild from whole units only (text run, attribute value, block attribute, shortcode value, translation block):
+						// never inside URLs or other text, and a replaced unit is not scanned again.
 						$title   = $post->post_title;
 						$content = $post->post_content;
 						$excerpt = $post->post_excerpt;
 
-						// An empty original is skipped; when two ids share an
-						// original, the first row's translation wins. TranslatePress
-						// does not serve a deprecated translation block
-						// (block_type 2), so it is left out.
+						// Empty originals are skipped; two ids with one original: the first row wins. A deprecated translation block
+						// (block_type 2) is not served by TranslatePress and is left out.
 						$pairs = [];
 
 						foreach ( $translations as $trans ) {
@@ -1153,9 +1055,7 @@ final class TranslatePressImporter {
 							$excerpt = $parsed['excerpt'] !== null ? $rebuilder->render( $parsed['excerpt'], $pairs ) : $excerpt;
 						}
 
-						// TranslatePress attributes a post's excerpt (a WooCommerce
-						// short description) to no post: look it up whole, or line
-						// by line.
+						// TranslatePress ties an excerpt (a WooCommerce short description) to no post: look it up whole, or per line.
 						if ( $excerpt === $post->post_excerpt && $this->dictionary !== null ) {
 							try {
 								$excerpt = $this->dictionary->excerpt( $dict_table, $excerpt ) ?? $excerpt;
@@ -1166,19 +1066,13 @@ final class TranslatePressImporter {
 							}
 						}
 
-						// Skip if nothing was actually translated.
+						// Nothing translated: skip.
 						if ( $title === $post->post_title && $content === $post->post_content && $excerpt === $post->post_excerpt ) {
 							continue;
 						}
 
-						// Cross-restore idempotency check - does a PerfLocale
-						// translation already exist for this (source_post,
-						// target_lang)? Without this, a re-import after a DB
-						// restore that lost POST_CHECKPOINT_OPTION (but kept
-						// the translation_links rows) duplicates every
-						// translation post on every subsequent run. Reads
-						// from the translation_links table, so it survives
-						// any restore that includes the perflocale tables.
+						// A translation for (source, language) in translation_links already: without this check a re-import after a
+						// restore that lost the checkpoint would duplicate every translation.
 						$existing_link = null;
 
 						foreach ( $this->groups->get_translations( $post_id, ObjectType::Post ) as $link ) {
@@ -1189,9 +1083,7 @@ final class TranslatePressImporter {
 						}
 
 						if ( $existing_link !== null ) {
-							// Translation already exists; re-record the
-							// source_map so a subsequent --force-restart
-							// can clear it cleanly. Cheap (single UPSERT).
+							// Exists: record the source map again (one upsert) so --force-restart can clear it.
 							$source_group_existing = $this->groups->find_for_object( $post_id, ObjectType::Post );
 							if ( $source_group_existing ) {
 								$this->source_map->set_group_id(
@@ -1201,10 +1093,7 @@ final class TranslatePressImporter {
 								);
 							}
 
-							// A translation this importer wrote on an earlier run
-							// is the re-run case. Anything else keeps its content
-							// and this TranslatePress translation is not
-							// imported, so it is counted and named in the result.
+							// One this importer wrote is the re-run case; any other translation keeps its content and is counted and named.
 							if ( SourceType::ImportedTrp->value !== (string) ( $existing_link->source ?? '' ) ) {
 								++$this->result['existing'];
 
@@ -1225,9 +1114,7 @@ final class TranslatePressImporter {
 							continue;
 						}
 
-						// The source's language goes first, so the unique-slug check
-						// sees the source in another language and lets the
-						// translation keep the same slug.
+						// The source's language first, so the unique-slug check lets the translation keep the source's slug.
 						$source_lang = $this->get_source_perflocale_language();
 
 						$source_set = ! $source_lang || $manager->set_post_language( $post_id, $source_lang->slug );
@@ -1243,26 +1130,17 @@ final class TranslatePressImporter {
 							);
 						}
 
-						// A child page goes under its parent's translation when
-						// there is one, as PerfLocale's own translations do.
+						// A child page goes under its parent's translation when there is one.
 						$parent_id = (int) $post->post_parent;
 
 						if ( $parent_id > 0 ) {
 							$parent_id = (int) ( $manager->get_translations( $parent_id )[ $pl_lang->slug ] ?? $parent_id );
 						}
 
-						// Create the translated post. Pass $wp_error=true so the
-						// is_wp_error() guard below sees real DB-level failures
-						// (unique-violation, FK orphan) instead of just the 0
-						// "couldn't insert" path that silently masks them.
-						// The translation keeps the source's author, dates,
-						// discussion settings, password and slug: TranslatePress
-						// served the same post under the same slug in every
-						// language, so the old URLs keep working.
+						// $wp_error = true, so real database failures are seen. The translation keeps the source's author, dates,
+						// discussion, password and slug: TranslatePress served one slug in every language, so old URLs keep working.
 						$new_post_id = $this->insert_translation_post(
-							// wp_slash: reconstructed content comes from raw DB
-							// reads (unslashed); wp_insert_post() unslashes
-							// internally, stripping backslashes otherwise.
+							// wp_slash: the rebuilt content comes unslashed from the database, and wp_insert_post() unslashes.
 							wp_slash(
 								[
 									'post_type'      => $post->post_type,
@@ -1284,9 +1162,7 @@ final class TranslatePressImporter {
 							(string) $pl_lang->slug
 						);
 
-						// A failed INSERT/UPDATE of the post fails the batch; a
-						// post WordPress refused (any other WP_Error, such as
-						// empty content) stays a recorded skip.
+						// A failed INSERT or UPDATE fails the batch; a post WordPress refused (empty content) is a recorded skip.
 						$this->stop_if_batch_broken(
 							$in_tx,
 							$batch_errors,
@@ -1320,7 +1196,7 @@ final class TranslatePressImporter {
 						// Recorded before anything below can throw.
 						$batch_new_posts[] = (int) $new_post_id;
 
-						// Link to translation group.
+						// Into the translation group.
 						$language_set = $manager->set_post_language( $new_post_id, $pl_lang->slug );
 
 						$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'setting the language of post ' . (int) $new_post_id );
@@ -1334,16 +1210,11 @@ final class TranslatePressImporter {
 							);
 						}
 
-						// Ensure both are in the same group.
+						// Same group as the source.
 						$source_group = $this->groups->find_for_object( $post_id, ObjectType::Post );
 
 						if ( $source_group ) {
-							// Throw on link_object false so the
-							// surrounding try/catch ROLLBACKs the batch.
-							// Without the throw, $imported is still
-							// bumped (line below) for posts that never
-							// got linked into their translation group,
-							// inflating the success count over reality.
+							// A false link_object() throws, so the batch rolls back instead of counting an unlinked post.
 							$link_id = $this->groups->link_object(
 								(int) $source_group->id,
 								$new_post_id,
@@ -1357,39 +1228,21 @@ final class TranslatePressImporter {
 
 							$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'linking post ' . (int) $new_post_id );
 
-							// Record the source_map mapping so the
-							// `--force-restart` CLI flag can clear it
-							// symmetrically with WPML and Polylang.
-							// Outside the link_object transaction by
-							// design - TRP doesn't go through
-							// create_group(), so the in-transaction
-							// optimisation that WPML/PLL get isn't
-							// available here. Worst case: a crash
-							// between link_object commit and this row
-							// leaves a missing map row for one (post,
-							// lang); the next re-import re-records it
-							// via the same path.
+							// The source map row, for --force-restart (as WPML and Polylang), outside the link transaction: a crash in between
+							// leaves one missing row that the next import records again.
 							$this->source_map->set_group_id(
 								'trp',
 								$post_id . '|' . $pl_lang_id,
 								(int) $source_group->id
 							);
 
-							// What PerfLocale's own translations get: the source's
-							// meta (page template, product data), featured image and
-							// terms, then perflocale/translation/created, where the
-							// WooCommerce addon sets the product type and creates
-							// the variations.
+							// As PerfLocale's own translations: the source's meta, featured image and terms, then
+							// perflocale/translation/created (the WooCommerce add-on sets product type and variations there).
 							$manager->complete_imported_translation( (int) $new_post_id, (int) $post_id, (string) $pl_lang->slug );
 
 							$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'completing post ' . (int) $new_post_id );
 						} else {
-							// No source group (e.g. the source set_post_language
-							// above failed): the freshly-inserted translation
-							// post can't be linked. Throw - same rationale as
-							// the link_object-false path - so the batch rolls
-							// back and the catch deletes the post instead of
-							// leaving it unlinked AND counting it in $imported.
+							// No source group (its set_post_language() failed): throw, so the batch rolls back and the post is deleted.
 							throw new \RuntimeException( 'trp_import: source post ' . $post_id . ' has no translation group; cannot link translation post ' . $new_post_id );
 						}
 
@@ -1399,19 +1252,13 @@ final class TranslatePressImporter {
 
 				$this->stop_if_batch_broken( $in_tx, $batch_errors, false, 'finishing batch ' . (int) $batch_index );
 			} catch ( \Throwable $e ) {
-				// Any throw inside the batch (hook callback, KSES filter,
-				// MySQL deadlock, failed source read, etc.) lands here.
-				// ROLLBACK undoes the batch's writes to transactional
-				// tables and the counters return to their pre-batch values,
-				// so the result reflects what's actually in the DB. The
-				// translation posts a non-transactional (MyISAM) wp_posts
-				// kept are deleted below.
+				// Any throw in the batch lands here: ROLLBACK undoes its transactional writes, the counters go back, and posts a
+				// non-transactional (MyISAM) wp_posts kept are deleted below.
 				if ( $in_tx ) {
 					$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				}
 
-				// A lost transaction (SQLite): the same batch once more,
-				// outside a transaction, from its pre-batch state.
+				// A lost transaction (SQLite): the batch once more, outside a transaction, from its pre-batch state.
 				if ( $in_tx && $this->batch_lost ) {
 					$imported                = $pre_batch_imported;
 					$this->result['skipped'] = $pre_batch_skipped;
@@ -1419,11 +1266,8 @@ final class TranslatePressImporter {
 
 					[ $this->result['existing'], $this->result['existing_targets'] ] = $pre_batch_existing;
 
-					// This process still remembers the rolled-back links (the
-					// repository's per-request lookups and the cache manager's
-					// request-scoped layer); the second run must read the
-					// database, or it takes a rolled-back translation for an
-					// existing one.
+					// This process still remembers the rolled-back links (repository lookups, the request cache layer): the second run
+					// must read the database.
 					wp_cache_flush();
 					\PerfLocale\Database\Repository\TranslationGroupRepository::reset_static_caches();
 					$this->cache->reset_static();
@@ -1449,40 +1293,29 @@ final class TranslatePressImporter {
 				$batch_failed = true;
 				$this->mark_incomplete();
 
-				// Clamp the resume checkpoint below this failed batch's ids so a
-				// later committed batch can't push it past them (re-attempted on
-				// resume; the line-391 "already translated" guard makes re-runs
-				// of committed posts idempotent).
+				// Keep the checkpoint below this failed batch's ids; committed posts are skipped on the retry.
 				$first_failed_floor = min( $first_failed_floor, (int) min( $batch ) );
 				wp_cache_flush();
 
 				// After the flush, so the delete hooks see committed state.
 				$this->delete_unlinked_batch_posts( (int) $batch_index, $batch_new_posts );
 
-				// Continue to the next batch instead of aborting the
-				// entire migration: one batch's bad data shouldn't lock
-				// the operator out of migrating everything else.
+				// One batch's bad data does not stop the rest of the migration.
 				continue;
 			} finally {
-				// Always clear the shared transaction flag, on success OR throw,
-				// so it can't leak `true` into later create_group()/link_object().
+				// Always cleared, so `true` never leaks into later create_group() and link_object() calls.
 				$this->groups->set_in_transaction( false );
 			}
 
 			if ( ! $batch_failed ) {
 				$committed = $in_tx ? $this->wpdb->query( 'COMMIT' ) : 0; // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-				// The status selections this batch asked to delete, on any
-				// blog, now that its transaction has ended either way.
+				// Release the status selections this batch asked to delete, on any blog, once its transaction has ended.
 				$this->groups->release_status_selectors();
 
 				if ( false === $committed ) {
-					// COMMIT failed (lock timeout / deadlock / connection
-					// loss): the server has rolled the batch's transactional
-					// writes back. Undo the in-PHP bookkeeping, delete the
-					// translation posts a non-transactional wp_posts kept, and
-					// skip the checkpoint advance so a resume re-runs this
-					// batch instead of treating it as committed.
+					// COMMIT failed (lock timeout, deadlock, lost connection): the server rolled back. Undo the bookkeeping, delete the
+					// posts a non-transactional wp_posts kept, and leave the checkpoint so a resume runs this batch again.
 					$imported                 = $pre_batch_imported;
 					$this->result['skipped']  = $pre_batch_skipped;
 					$this->result['errors']   = $pre_batch_errors;
@@ -1502,35 +1335,24 @@ final class TranslatePressImporter {
 					continue;
 				}
 
-				// Advance the resumability checkpoint to the highest
-				// post_id in the just-committed batch. Recording it AFTER
-				// the COMMIT means a crash between COMMIT and this update
-				// at worst re-imports one batch (idempotent - the
-				// existing "skip if post already has PerfLocale
-				// translations" guard inside the loop handles re-runs
-				// cleanly). update_option's autoload flag stays false so
-				// this doesn't bloat alloptions for sites that ran the
-				// importer once and forgot to clean up.
+				// The checkpoint moves to the batch's highest post id after the COMMIT: a crash in between re-imports one batch,
+				// which the per (post, language) check makes idempotent. Not autoloaded.
 				$checkpoint = (int) max( $batch );
 				if ( $first_failed_floor !== PHP_INT_MAX ) {
-					// A prior batch failed - never record a checkpoint at or
-					// above its lowest id, so the resume re-attempts it.
+					// After a failed batch the checkpoint stays below its lowest id, so a resume retries it.
 					$checkpoint = min( $checkpoint, $first_failed_floor - 1 );
 				}
 				update_option( self::POST_CHECKPOINT_FINGERPRINT_OPTION, $fingerprint, false );
 				update_option( self::POST_CHECKPOINT_OPTION, $checkpoint, false );
 
-				// The batch is committed, so a persistent cache holds only
-				// committed state; drop this process's runtime copies.
+				// Committed: the persistent cache holds committed state only; drop the runtime copies.
 				\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 			}
 		}
 
 		$this->beat( 'posts', count( $post_ids ), count( $post_ids ) );
 
-		// Migration finished - drop the checkpoint so a future fresh-run
-		// starts from the top instead of skipping every previously-
-		// migrated id.
+		// Finished: drop the checkpoint so a later fresh run starts at the top.
 		delete_option( self::POST_CHECKPOINT_OPTION );
 		delete_option( self::POST_CHECKPOINT_FINGERPRINT_OPTION );
 
@@ -1540,10 +1362,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Fingerprint of the language selection a post checkpoint belongs to.
-	 *
-	 * The TranslatePress source locale, the PerfLocale language it resolves
-	 * to, and every mapped target (locale => PerfLocale language id).
+	 * Fingerprint of the language selection a checkpoint belongs to: the source locale, its PerfLocale language and every
+	 * mapped target.
 	 *
 	 * @return string
 	 */
@@ -1565,21 +1385,15 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Delete the translation posts a failed batch inserted that are still in wp_posts.
-	 *
-	 * ROLLBACK removes the batch's links, groups and source-map rows, but a
-	 * wp_posts table on a non-transactional engine (MyISAM) keeps the inserted
-	 * posts: published, unlinked (so listed in every language), and inserted
-	 * again by the next run. On InnoDB the ROLLBACK already removed them, so
-	 * the SELECT finds none and no delete hook fires.
+	 * Delete the posts a failed batch inserted that are still in wp_posts: on MyISAM the ROLLBACK keeps them (published,
+	 * unlinked, inserted again next run); on InnoDB none are left and no delete hook fires.
 	 *
 	 * @param int        $batch_index Batch number, for the error message.
 	 * @param array<int> $post_ids    Post IDs this batch's wp_insert_post() calls returned.
 	 * @return void
 	 */
 	private function delete_unlinked_batch_posts( int $batch_index, array $post_ids ): void {
-		// The batch transaction is over: the delete hooks' writes must not
-		// treat it as still open.
+		// The batch transaction is over: the delete hooks' writes must not join it.
 		$this->groups->set_in_transaction( false );
 
 		if ( $post_ids === [] ) {
@@ -1590,8 +1404,7 @@ final class TranslatePressImporter {
 
 		$id_placeholders = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
 
-		// Read wp_posts itself: wp_insert_post() cached these posts, so
-		// get_post() would still find the ones the ROLLBACK removed.
+		// wp_posts itself: get_post() would still find the cached posts the ROLLBACK removed.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$remaining = $this->wpdb->get_col(
 			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are unpacked, which WPCS cannot count; the %i table name leads, then one %d per id.
@@ -1622,8 +1435,7 @@ final class TranslatePressImporter {
 		$not_deleted = [];
 
 		foreach ( array_map( 'intval', $remaining ) as $remaining_id ) {
-			// One caller is the batch's catch block: an exception here would
-			// escape import().
+			// Called from the batch's catch block: an exception here would escape import().
 			try {
 				$deleted = wp_delete_post( $remaining_id, true );
 			} catch ( \Throwable $e ) {
@@ -1660,7 +1472,7 @@ final class TranslatePressImporter {
 
 		$gettext_original_table = $this->wpdb->prefix . 'trp_gettext_original_strings';
 
-		// Check if gettext tables exist.
+		// Gettext tables present?
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$exists = (int) $this->wpdb->get_var(
 			$this->wpdb->prepare(
@@ -1673,9 +1485,7 @@ final class TranslatePressImporter {
 			return 0;
 		}
 
-		// Gettext batch size is filterable: large-string sites tune down,
-		// generous-memory hosts crank up. Bounded floor of 100 prevents
-		// degenerate per-row pagination if someone passes garbage.
+		// Filterable batch size, at least 100.
 		$gettext_batch_size = (int) apply_filters(
 			'perflocale/migration/translatepress/gettext_batch_size',
 			self::GETTEXT_BATCH_SIZE
@@ -1691,7 +1501,7 @@ final class TranslatePressImporter {
 		foreach ( $this->language_map as $trp_locale => $pl_lang_id ) {
 			$gettext_table = Schema::sanitize_table( $this->wpdb->prefix . 'trp_gettext_' . strtolower( str_replace( '-', '_', $trp_locale ) ) );
 
-			// Check if this language's gettext table exists.
+			// This language's gettext table present?
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$lang_exists = (int) $this->wpdb->get_var(
 				$this->wpdb->prepare(
@@ -1707,23 +1517,12 @@ final class TranslatePressImporter {
 			// Plural forms 2..N, stored once their plural row exists.
 			$extra_forms = [];
 
-			// Tables from TranslatePress versions without plural support have
-			// neither column.
+			// TranslatePress versions without plural support have neither column.
 			$plural_columns = $this->has_column( $gettext_original_table, 'original_plural' ) && $this->has_column( $gettext_table, 'plural_form' )
 				? 'o.original_plural, g.plural_form'
 				: 'NULL AS original_plural, 0 AS plural_form';
 
-			// Keyset-paginated batch loop. Replaces a single SELECT with a
-			// flat `LIMIT 10000` cap that:
-			// (a) silently truncated any site with >10k gettext strings
-			// per language - rows past the cap never imported.
-			// (b) pulled the whole dictionary into PHP memory at once -
-			// 10000 rows × ~500 B per row = ~5 MB per language, and
-			// on a 5-language site this peaked at ~25 MB before the
-			// inner loop even started running.
-			// WHERE g.original_id > $last_id is index-seek-cheap per
-			// batch (constant time vs OFFSET's linear scan), and the
-			// `unset( $rows )` between batches lets PHP reclaim memory.
+			// Keyset pages on g.id: every row is imported (no fixed LIMIT) and memory stays one batch.
 			$last_id = 0;
 
 			do {
@@ -1745,8 +1544,7 @@ final class TranslatePressImporter {
 					)
 				);
 
-				// A failed SELECT also returns no rows; without this check the
-				// rest of this language would end silently under a success result.
+				// A failed SELECT also returns no rows: without this the language would end silently under a success result.
 				$read_error = $this->read_error();
 
 				if ( $read_error !== '' ) {
@@ -1766,29 +1564,17 @@ final class TranslatePressImporter {
 				}
 
 				foreach ( $rows as $row ) {
-					// Sanitize the domain ONCE and use the same value for both
-					// the dedup lookup and the insert - otherwise find_by_hash()
-					// (raw domain) and insert() (sanitized domain) compute
-					// different hashes, breaking idempotency for domains that
-					// change under sanitize_text_field().
+					// Sanitize the domain once, for both find_by_hash() and insert(): different values would hash differently.
 					$domain = sanitize_text_field( (string) ( $row->domain ?? 'default' ) );
 
-					// TRP stores no-context strings under the literal 'trp_context'
-					// sentinel and real _x() contexts verbatim. Map the sentinel to
-					// PerfLocale's empty context so imported strings share the
-					// runtime identity (domain|context|original) that _x()/
-					// find_by_hash() use - otherwise an _x() string imports under
-					// context '' and stays untranslated at runtime.
+					// TranslatePress's 'trp_context' sentinel is PerfLocale's empty context; real _x() contexts are kept, so imported
+					// strings have the runtime identity (domain|context|original).
 					$raw_context = (string) ( $row->context ?? '' );
 					$context     = ( $raw_context === '' || $raw_context === 'trp_context' ) ? '' : $raw_context;
 					$original    = (string) $row->original;
 
-					// A plural string's forms are separate rows (plural_form 0..N).
-					// PerfLocale keeps form 0 on the singular under the context
-					// 'singular' (or the _nx() context), form 1 on the plural
-					// under 'plural' (or '<context> (plural)'), and forms 2..N in
-					// that plural row's extra forms, as the scanner and the
-					// ngettext filters do.
+					// A plural string's forms are rows plural_form 0..N: form 0 goes on the singular ('singular' or the _nx() context),
+					// form 1 on the plural ('plural' or '<context> (plural)'), 2..N in the plural row's extra forms.
 					$plural_original = (string) ( $row->original_plural ?? '' );
 					$plural_form     = (int) ( $row->plural_form ?? 0 );
 
@@ -1806,11 +1592,11 @@ final class TranslatePressImporter {
 						}
 					}
 
-					// Check if string already exists in PerfLocale (with its group's type).
+					// An existing string, with its group's type.
 					$existing = $this->find_string( $domain, $context, $original );
 
 					if ( ! $existing ) {
-						// Insert the string (hash is computed by StringRepository::insert()).
+						// StringRepository::insert() computes the hash.
 						$string_id = $this->strings->insert(
 							[
 								'domain'    => $domain,
@@ -1824,29 +1610,16 @@ final class TranslatePressImporter {
 					}
 
 					if ( $string_id ) {
-						// Idempotency: don't clobber an existing translation (e.g. a
-						// human correction made after a prior migration run) - skip
-						// only the value write. The link upsert below must still run:
-						// the value row alone is never served (every serving layer
-						// INNER JOINs translation_links), so a value whose link write
-						// once failed can only self-heal through a re-run here.
+						// An existing translation (perhaps a later human correction) is kept; the link upsert still runs, since a value
+						// without a link is never served and a re-run is how a failed link write heals.
 						$has_translation = $string_translations->get( (int) $string_id, (int) $pl_lang_id ) !== '';
 
 						if ( ! $has_translation ) {
-							// The return decides both the count and the link. A
-							// discarded false counted a string as imported and then
-							// marked its group 'translated' for a value that was
-							// never stored - the operator read a success total over
-							// rows the site cannot serve. Same shape as the WPML
-							// importer's string loop.
+							// The return decides the count and the link: a value never stored is neither counted nor linked (as WPML's loop).
 							$saved = $string_translations->set(
 								(int) $string_id,
 								(int) $pl_lang_id,
-								// sanitize_textarea_field (not sanitize_text_field) so
-								// multi-line translations keep their newlines - TRP's
-								// own save path (trp_sanitize_string) preserves \r\n\t
-								// and collapsing them here would diverge from the
-								// source and from the native PerfLocale save path.
+								// Keeps newlines, as TranslatePress's own save (trp_sanitize_string) and PerfLocale's do.
 								sanitize_textarea_field( $row->translated )
 							);
 
@@ -1856,19 +1629,13 @@ final class TranslatePressImporter {
 							}
 						}
 
-						// Mark the string's group translated for this language.
-						// Idempotent ON DUPLICATE KEY upsert; on human-touched rows
-						// it refreshes status/source, which is acceptable - the
-						// link's presence, not its source, is what serving needs.
+						// The group marked translated for this language: an idempotent upsert (it may refresh a human row's status).
 						$group_id = $existing
 							? (int) $existing->group_id
 							: (int) ( $this->strings->find( (int) $string_id )->group_id ?? 0 );
 
 						if ( $has_translation && $group_id > 0 ) {
-							// A string link goes only into a string group. A new
-							// string's group is the one insert() just created; an
-							// existing string pointing at a post or term group (or
-							// at none) gets a new string group first.
+							// String links go into string groups only: an existing string in a post or term group (or none) gets one first.
 							if ( ! $existing || ( isset( $existing->group_type ) && 'string' === $existing->group_type ) ) {
 								TranslationGroupRepository::remember_string_group( $group_id );
 							} else {
@@ -1890,16 +1657,13 @@ final class TranslatePressImporter {
 					}
 				}
 
-				// Advance the keyset cursor on g.id (the PK). original_id is
-				// NON-unique - plural strings share it across rows - so paginating
-				// on it would skip the rest of a plural group at a batch boundary.
+				// The cursor is g.id (the primary key): original_id repeats across a plural string's rows.
 				$last_id   = (int) end( $rows )->gettext_row_id;
 				$row_count = count( $rows );
 
 				unset( $rows );
 
-				// Bound worker memory between streamed gettext batches (runtime
-				// cache + SAVEQUERIES log only; persistent cache untouched).
+				// Runtime cache and SAVEQUERIES log between batches; the persistent cache is untouched.
 				\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 
 				$done += $row_count;
@@ -1920,8 +1684,7 @@ final class TranslatePressImporter {
 
 				$plural_row = $this->strings->find_by_hash( $domain, $context, $original );
 
-				// Forms 2..N only complete a plural row that has form 1, and never
-				// replace forms already there.
+				// Forms 2..N only complete a plural row that has form 1, and never replace forms already there.
 				if ( $plural_row === null
 					|| $string_translations->get( (int) $plural_row->id, (int) $pl_lang_id ) === ''
 					|| $string_translations->get_extra_forms( (int) $plural_row->id, (int) $pl_lang_id ) !== [] ) {
@@ -1956,8 +1719,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * A PerfLocale string by domain, context and original, with the type of
-	 * its group (`group_type`, null when the group is missing), in one read.
+	 * A PerfLocale string by domain, context and original, with its group's type (`group_type`, null without a group),
+	 * in one read.
 	 *
 	 * @param string $domain   Text domain.
 	 * @param string $context  Context.
@@ -2001,7 +1764,7 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Import slug translations (if TranslatePress SEO Pack tables exist).
+	 * Import slug translations (TranslatePress SEO Pack tables, when present).
 	 *
 	 * @return int Number of slugs imported.
 	 */
@@ -2011,7 +1774,7 @@ final class TranslatePressImporter {
 		$slug_originals = $this->wpdb->prefix . 'trp_slug_originals';
 		$slug_trans     = $this->wpdb->prefix . 'trp_slug_translations';
 
-		// Check if slug tables exist.
+		// Slug tables present?
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$exists = (int) $this->wpdb->get_var(
 			$this->wpdb->prepare(
@@ -2032,9 +1795,7 @@ final class TranslatePressImporter {
 		$this->beat( 'slugs', 0, 0 );
 
 		foreach ( $this->language_map as $trp_locale => $pl_lang_id ) {
-			// Keyset-paginate on st.id so a site with more than 5000
-			// translated slugs in one language imports ALL of them, instead
-			// of silently dropping everything past the first 5000.
+			// Keyset pages on st.id, so every translated slug is imported.
 			$last_id = 0;
 
 			do {
@@ -2054,11 +1815,7 @@ final class TranslatePressImporter {
 					)
 				);
 
-				// Surface a query failure instead of hiding it: the slug tables
-				// are TranslatePress SEO Pack (premium) and their schema may not
-				// match this SELECT, in which case the query errors and returns
-				// no rows - which would otherwise look identical to "no slugs to
-				// import" and silently migrate zero slugs.
+				// SEO Pack's schema may not match this SELECT: report the error instead of reading it as no slugs.
 				if ( $this->wpdb->last_error !== '' ) {
 					self::log_db_error( 'reading the ' . $trp_locale . ' slugs', $this->wpdb->last_error );
 
@@ -2075,14 +1832,10 @@ final class TranslatePressImporter {
 					break;
 				}
 
-				// Advance the cursor past this batch's highest id.
+				// Past this batch's highest id.
 				$last_id = (int) ( end( $rows )->trp_row_id ?? 0 );
 
-				// Batch-prime the post object cache for every post_id we're
-				// about to look up below - without this, get_post_field()
-				// issues one SELECT against wp_posts PER ROW. Mirrors the
-				// pattern in PolylangImporter and is safe whenever
-				// _prime_post_caches() is available (WP 4.7+).
+				// Prime the post cache for the batch, or get_post_field() queries once per row (as PolylangImporter).
 				if ( function_exists( '_prime_post_caches' ) ) {
 					$prime_ids = array_values(
 						array_unique(
@@ -2099,11 +1852,7 @@ final class TranslatePressImporter {
 
 				foreach ( $rows as $row ) {
 					if ( $row->post_id > 0 ) {
-						// Look up the post_type to use as object_subtype.
-						// Without it, the slug_lookup UNIQUE on
-						// (language, object_type, object_subtype, slug) would
-						// either reject a legit cross-post-type duplicate or
-						// collapse two distinct post types into one URL space.
+						// The post type is the object_subtype of the slug_lookup unique key (language, type, subtype, slug).
 						$post_type = (string) get_post_field( 'post_type', (int) $row->post_id );
 
 						if ( $post_type === '' ) {
@@ -2112,9 +1861,7 @@ final class TranslatePressImporter {
 
 						$slug_manager = new \PerfLocale\Router\SlugManager( $this->cache );
 
-						// Only count a slug the write actually stored - a failed
-						// write reports itself through perflocale/slug/write_failed,
-						// and inflating the migration summary would hide it.
+						// Count only stored slugs; a failed write reports itself through perflocale/slug/write_failed.
 						$stored = $slug_manager->set_slug(
 							'post',
 							$post_type,
@@ -2129,8 +1876,7 @@ final class TranslatePressImporter {
 					}
 				}
 
-				// Bound worker memory between streamed slug batches (runtime
-				// cache + SAVEQUERIES log only; persistent cache untouched).
+				// Runtime cache and SAVEQUERIES log between batches; the persistent cache is untouched.
 				\PerfLocale\Background\MigrationCacheHelper::release_batch_memory();
 
 				$done += count( $rows );
@@ -2158,10 +1904,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * The gettext rows the string import reads in every mapped language, for its progress.
-	 *
-	 * The same rows as the import's batch query: translated, with a status in
-	 * the imported range, and an original.
+	 * The gettext rows the string import reads in every mapped language (translated, status in range, with an
+	 * original), for its progress.
 	 *
 	 * @param string $original_table TranslatePress's gettext originals table.
 	 * @return int
@@ -2205,16 +1949,9 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Copy TranslatePress's order language (`trp_language`) to PerfLocale's order meta.
-	 *
-	 * Orders only, and only those without a PerfLocale language yet
-	 * ({@see OrderLanguageCopy}). An order in TranslatePress's default
-	 * language gets the language the source content was imported into, one
-	 * in a translation language the language its content went into. An
-	 * order in a locale whose content was not imported (a language
-	 * TranslatePress had not published) gets the PerfLocale language with
-	 * that locale, active or not: it sets the order's email language and
-	 * publishes nothing.
+	 * Copy TranslatePress's order language (`trp_language`) to orders without a PerfLocale language (OrderLanguageCopy):
+	 * the language the matching content went into, or for an unimported locale the PerfLocale language of that locale,
+	 * active or not (it sets the email language and publishes nothing).
 	 *
 	 * @return int Orders given a language.
 	 */
@@ -2288,13 +2025,9 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Save-time automation that must not see an imported translation: each
-	 * runs inside wp_insert_post(), before this importer assigns the post's
-	 * language, so it would take the post for a new default-language source
-	 * (auto-assign would label it default, Auto-Create Stubs would make a
-	 * group of empty drafts for it, auto-translate would queue machine
-	 * translation over the imported text). Hook, callback method, priority
-	 * and accepted args exactly as Bootstrap registers them.
+	 * Save-time automation paused around an imported insert: it runs before the importer sets the language and would
+	 * take the post for a new default-language source (auto-assign, Auto-Create Stubs, auto-translate). Hook, method,
+	 * priority and args exactly as Bootstrap registers them.
 	 *
 	 * @var array<int, array{0:string, 1:string, 2:int, 3:int}>
 	 */
@@ -2305,14 +2038,8 @@ final class TranslatePressImporter {
 	];
 
 	/**
-	 * Insert one translated post with the save-time automation paused.
-	 *
-	 * Only a callback hooked at exactly its registered priority is removed,
-	 * and only those are put back, so a caller that detached one itself
-	 * keeps it detached.
-	 *
-	 * The post's language is passed on to the unique-slug check, so the
-	 * translation may keep the slug its source uses in another language.
+	 * Insert one translated post with that automation paused (only callbacks at their registered priority are removed
+	 * and put back); the language goes to the unique-slug check, so the source's slug may be kept.
 	 *
 	 * @param array<string, mixed> $postarr   Slashed post data.
 	 * @param string               $lang_slug Language slug of the translation ('' when not known).
@@ -2344,9 +2071,7 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Get the dictionary table name for a language pair.
-	 *
-	 * TranslatePress creates one dictionary table per source→target language pair.
+	 * The dictionary table of a language pair (TranslatePress has one per source and target).
 	 *
 	 * @param string $source_locale Source language locale.
 	 * @param string $target_locale Target language locale.
@@ -2359,7 +2084,7 @@ final class TranslatePressImporter {
 		$target = strtolower( str_replace( '-', '_', $target_locale ) );
 		$table  = Schema::sanitize_table( $this->wpdb->prefix . 'trp_dictionary_' . $source . '_' . $target );
 
-		// Verify table exists.
+		// Table present?
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$exists = (int) $this->wpdb->get_var(
 			$this->wpdb->prepare(
@@ -2374,15 +2099,14 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Get the PerfLocale language object for the source (default) language.
+	 * The PerfLocale language of the source (default) language.
 	 *
 	 * @return object|null Language object.
 	 */
 	private function get_source_perflocale_language(): ?object {
 		$perflocale_languages = $this->languages->get_active();
 
-		// Exact locale match wins first; only then fall back to a slug-prefix
-		// match, so a regional variant is not shadowed by its base language.
+		// Exact locale first, then the slug prefix, so a regional variant is not taken by its base.
 		foreach ( $perflocale_languages as $pl_lang ) {
 			if ( $pl_lang->locale === $this->source_locale ) {
 				return $pl_lang;

@@ -42,13 +42,16 @@ final class LibreTranslateProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Get the (optional) API key from settings.
+	 * {@inheritDoc}
+	 */
+	public function placeholders_as_elements(): bool {
+		return true;
+	}
+
+	/**
+	 * The optional API key (env var or constant PERFLOCALE_LIBRE_API_KEY, then the database).
 	 *
-	 * Self-hosted LibreTranslate instances often don't require a key, so an
-	 * empty result here is normal. The configured URL is the actual gating
-	 * signal - see is_configured(). Resolved transparently as env var →
-	 * PHP constant → database via Settings::get() (see CONSTANT_MAP:
-	 * PERFLOCALE_LIBRE_API_KEY ↔ mt_libre_api_key).
+	 * A self-hosted instance often needs none: the configured URL is what is_configured() checks.
 	 *
 	 * @return string
 	 */
@@ -59,8 +62,7 @@ final class LibreTranslateProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch().
+	 * @param string $format Destination format hint ('html'|'text'), see AbstractProvider::translate_batch().
 	 *
 	 * @throws \RuntimeException When the LibreTranslate API returns an unexpected response or all retries fail.
 	 */
@@ -70,7 +72,6 @@ final class LibreTranslateProvider extends AbstractProvider {
 		$base_url = rtrim( (string) $this->settings->get( 'mt_libre_url' ), '/' );
 
 		// LibreTranslate accepts only base ISO 639-1 codes (no variants).
-		// Strip any variant suffix and normalize underscore-locale input.
 		$body = [
 			'q'      => $text,
 			'source' => $this->base_language_code( $source_lang ),
@@ -114,14 +115,34 @@ final class LibreTranslateProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @throws \RuntimeException When the probe translate() call fails (auth, network, or unexpected response).
+	 * Translates with a pair the instance lists on /languages: an instance loads only some languages.
+	 *
+	 * @throws \RuntimeException When /languages or the probe translate() call fails, or no pair is listed.
 	 */
 	public function test_connection(): bool {
-		try {
-			$this->translate( 'test', 'en', 'es' );
-			return true;
-		} catch ( \RuntimeException $e ) {
-			throw $e;
+		$url      = $this->settings->get( 'mt_libre_url' );
+		$response = $this->make_request(
+			rtrim( is_string( $url ) ? $url : '', '/' ) . '/languages',
+			[
+				'method'  => 'GET',
+				'timeout' => 30,
+			],
+			1
+		);
+
+		foreach ( $this->parse_json_response( is_string( $response['body'] ?? null ) ? $response['body'] : '' ) as $language ) {
+			$source = is_array( $language ) && is_string( $language['code'] ?? null ) ? $language['code'] : '';
+
+			foreach ( is_array( $language ) ? (array) ( $language['targets'] ?? [] ) : [] as $target ) {
+				// Base codes only: translate() sends base codes.
+				if ( is_string( $target ) && $target !== $source && $this->base_language_code( $source ) === $source && $this->base_language_code( $target ) === $target ) {
+					$this->translate( 'test', $source, $target );
+
+					return true;
+				}
+			}
 		}
+
+		throw new \RuntimeException( esc_html__( 'LibreTranslate lists no language pair to test with.', 'perflocale' ) );
 	}
 }

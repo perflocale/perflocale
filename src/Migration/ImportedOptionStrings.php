@@ -21,16 +21,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Stores imported translations of the options PerfLocale translates per
- * language ({@see OptionStrings}: the site title and tagline).
+ * Stores imported translations of the site title and tagline (OptionStrings).
  */
 final class ImportedOptionStrings {
 
 	/**
 	 * The translated options with their stored values, sources registered.
 	 *
-	 * Registering is idempotent, and it makes sure each option's string row
-	 * exists before a translation is attached to it.
+	 * Registering (idempotent) makes sure each option's string row exists before a translation is attached.
 	 *
 	 * @return array<string, string> Option name => stored value (non-empty only).
 	 */
@@ -53,10 +51,8 @@ final class ImportedOptionStrings {
 	/**
 	 * Store one option's translation, unless the language already has one.
 	 *
-	 * Either way the string ends up linked in the language: a string whose
-	 * group is not a string group gets a new string group first, and a
-	 * translation the language already has is linked when it has no link
-	 * there (an earlier import that stored it and could not link it).
+	 * Either way the string ends up linked in a string group; an existing translation without a link
+	 * (an earlier import could not link it) is linked.
 	 *
 	 * @param string     $option      Option name (a key of OptionStrings::labels()).
 	 * @param string     $raw         The option's stored value.
@@ -97,16 +93,14 @@ final class ImportedOptionStrings {
 		/** @var \PerfLocale\Database\Repository\TranslationGroupRepository $groups */
 		$groups = $plugin->get( 'group_repo' );
 
-		// A string link goes only into a string group: a string pointing at
-		// a post or term group (or at none) gets a new string group first.
+		// A string link goes only into a string group: one in a post or term group (or none) gets a new one.
 		$moved = ! $groups->is_string_group( $group_id );
 
 		if ( $moved ) {
 			$group_id = $groups->assign_new_string_group( $string_id );
 		}
 
-		// A translation the language already had, in its own string group and
-		// linked there, is left as it is.
+		// An existing translation, already linked in its own string group, is left as it is.
 		if ( ! $stored && ! $moved && null !== $groups->get_link_state( $string_id, $language_id, ObjectType::String ) ) {
 			return false;
 		}

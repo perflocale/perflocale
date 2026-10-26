@@ -1,6 +1,6 @@
 <?php
 /**
- * WP-Cron-backed implementation of the job runner.
+ * WP-Cron job runner.
  *
  * @package PerfLocale
  */
@@ -14,18 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Fallback runner used when Action Scheduler isn't available (or the user
- * explicitly forced WP-Cron via the `background_engine` setting).
+ * Runner used without Action Scheduler or when `background_engine` forces WP-Cron.
  *
- * Workers are invoked with `(string $job_id, array $args)` - same shape as
- * {@see ActionSchedulerRunner} produces, so a single worker callback works
- * regardless of which runner enqueued it.
- *
- * WP-Cron caveats this runner has to handle that AS would handle natively:
- *   - No claim/lock semantics → caller must use {@see JobLock}.
- *   - No retry on failure → worker hook implements exponential backoff.
- *   - `wp_unschedule_event()` needs the original args triplet → we read
- *     args from {@see JobState} to reconstruct the lookup key.
+ * WP-Cron has no claim, lock or retry: JobLock and the worker's backoff cover those, and cancel rebuilds the
+ * scheduled args from JobState because wp_unschedule_event() needs them.
  */
 final class WpCronRunner implements JobRunnerInterface {
 
@@ -33,8 +25,7 @@ final class WpCronRunner implements JobRunnerInterface {
 	 * {@inheritDoc}
 	 */
 	public function enqueue( string $hook, array $args, string $job_id ): string {
-		// Run on the next cron tick (typically <60s on a busy site, longer on
-		// a quiet one; document this limitation in the Jobs admin page).
+		// Runs on the next cron tick, which on a quiet site can be minutes away.
 		self::schedule_or_throw( time() + 1, $hook, [ $job_id, $args ] );
 		return $job_id;
 	}
@@ -48,13 +39,8 @@ final class WpCronRunner implements JobRunnerInterface {
 	}
 
 	/**
-	 * Schedule a single cron event, HONOURING wp_schedule_single_event()'s
-	 * return so a silent scheduling failure (a plugin short-circuiting the
-	 * `pre_schedule_event` filter, a storage error) can't leave a JobState row
-	 * that never runs. A duplicate-event WP_Error counts as success (the event
-	 * already exists - expected on a double-resume or busy/retry reschedule);
-	 * any other failure throws so Dispatcher::enqueue()'s catch tears down the
-	 * orphaned JobState row and reports mode:error.
+	 * Schedule one cron event and throw when scheduling fails, so Dispatcher::enqueue() removes the row instead of
+	 * leaving a job that never runs. A duplicate-event error counts as success (double resume, busy reschedule).
 	 *
 	 * @param int               $timestamp When to run.
 	 * @param string            $hook      Cron hook.
@@ -81,15 +67,7 @@ final class WpCronRunner implements JobRunnerInterface {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Clears ALL scheduled occurrences of this job's worker event (a job
-	 * can legitimately have multiple instances queued from pause-reschedule,
-	 * type-busy reschedule, or retry paths). `wp_clear_scheduled_hook()`
-	 * matches on (hook, args) and removes every matching event regardless
-	 * of timestamp - the safe one-shot equivalent of a loop of
-	 * wp_unschedule_event() calls.
-	 *
-	 * Returns true if the call succeeded; WP returns the number of cleared
-	 * events (0+) or false on internal failure.
+	 * Clears every queued occurrence of the job's event (pause, busy and retry reschedules can queue several).
 	 */
 	public function cancel( string $job_id ): bool {
 		$state = JobState::get( $job_id );
@@ -103,21 +81,14 @@ final class WpCronRunner implements JobRunnerInterface {
 		$cleared   = false;
 
 		foreach ( $this->candidate_arg_shapes( $job_id, $base_args, $state ) as $args ) {
-			// `wp_clear_scheduled_hook` removes every occurrence with this
-			// (hook, args) tuple. Returns the count cleared (0+) or false
-			// on internal failure - treat anything non-false as success.
+			// Returns the count cleared, or false on an internal failure.
 			if ( wp_clear_scheduled_hook( $hook, $args ) !== false ) {
 				$cleared = true;
 			}
 		}
 
-		// Belt-and-braces: the busy-count enumeration above can't predict every
-		// arg shape - a job can carry BOTH a type-busy and a lock-busy counter
-		// at once, and type-busy has no count cap, so it can exceed the
-		// enumeration ceiling. Scan the cron array for ANY remaining event
-		// under this hook whose first arg is this job_id (schedule() always
-		// stores args as [job_id, …]) and clear it, so a "successful" cancel
-		// never leaves a live event that later fires against the dead job.
+		// The enumeration cannot predict every arg shape (both busy counters at once, a type-busy count past its ceiling):
+		// also clear any event under this hook whose first arg is this job id, so a cancel leaves no live event.
 		foreach ( $this->scheduled_events_for_job( $hook, $job_id ) as $event ) {
 			wp_unschedule_event( $event['ts'], $hook, $event['args'] );
 			$cleared = true;
@@ -127,12 +98,8 @@ final class WpCronRunner implements JobRunnerInterface {
 	}
 
 	/**
-	 * Collect EVERY pending cron event under $hook whose first argument is
-	 * $job_id, regardless of the trailing arg shape, as a flat list of
-	 * `{ ts, args }`. A flat list (not a timestamp-keyed map) is required
-	 * because the cron array can hold several DISTINCT arg shapes for the same
-	 * job at the SAME timestamp (nested under different arg-hash keys); a map
-	 * keyed by timestamp would collapse them and leave the extras scheduled.
+	 * Every pending cron event under $hook whose first argument is $job_id, as a flat list: one timestamp can hold
+	 * several arg shapes of the same job, which a timestamp-keyed map would collapse.
 	 *
 	 * @param string $hook   Worker hook.
 	 * @param string $job_id Job UUID (always args[0] per schedule()).
@@ -185,16 +152,12 @@ final class WpCronRunner implements JobRunnerInterface {
 			}
 		}
 
-		// Catch arg shapes the enumeration can't predict (see cancel()).
+		// Arg shapes the enumeration cannot predict (see cancel()).
 		return $this->scheduled_events_for_job( $hook, $job_id ) !== [];
 	}
 
 	/**
-	 * Yield each candidate (hook, args) shape this job could have been
-	 * scheduled under. The dispatcher injects a blog-id sentinel; the
-	 * worker's type-busy reschedule path further injects a busy-count
-	 * sentinel. A cancel must clear every variant or stale events fire
-	 * after the operator was told the job was canceled.
+	 * Each args shape the job could be scheduled under (blog-id sentinel, busy-count sentinels); cancel clears them all.
 	 *
 	 * @param string               $job_id
 	 * @param array<string, mixed> $base_args
@@ -212,11 +175,7 @@ final class WpCronRunner implements JobRunnerInterface {
 			yield [ $job_id, $with_blog ];
 		}
 
-		// Type-busy retries add `__perflocale_type_busy_count` to args. We
-		// don't know the exact count an in-flight retry was scheduled
-		// with; enumerate 1..10 which covers any realistic cascade given
-		// the exponential cap (the busy-count delay saturates well before
-		// 10 attempts).
+		// Type-busy retries add `__perflocale_type_busy_count`; 1..10 covers any chain (its delay saturates sooner).
 		for ( $n = 1; $n <= 10; $n++ ) {
 			$with_busy                                 = $base_args;
 			$with_busy['__perflocale_type_busy_count'] = $n;
@@ -229,11 +188,7 @@ final class WpCronRunner implements JobRunnerInterface {
 			}
 		}
 
-		// Per-job-lock-busy retries add `__perflocale_lock_busy_count` to
-		// args (introduced when WorkerRegistry stopped silently returning
-		// on JobLock::acquire failure). Same enumeration pattern - the
-		// cancel path probes 1..20 (matching the lock_busy_max_retries
-		// cap so an in-flight retry chain can be fully cleared by cancel).
+		// Lock-busy retries add `__perflocale_lock_busy_count`; 1..20 matches the lock_busy_max_retries cap.
 		for ( $n = 1; $n <= 20; $n++ ) {
 			$with_lock_busy                                 = $base_args;
 			$with_lock_busy['__perflocale_lock_busy_count'] = $n;

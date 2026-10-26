@@ -17,23 +17,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Applies a menu or pattern event (a translation created, linked, trashed,
- * deleted, restored, or moved to another language) to the translated
- * templates and template parts of its language that the request making the
- * change did not reach: that request rewrites the first containers
- * ({@see TemplateBlockRefs}, HOW MUCH RUNS AT ONCE) and queues this job with
- * the rest.
- *
- * Args: `task` (the event: kind, language, menu or pattern type, the post the
- * references name and the post they name afterwards) and `after` (the last
- * container the request did). Run by the job runner (WP-Cron or Action
- * Scheduler) as the user who made the change, in time slices that resume
- * from the last container done. Each page first checks that the event still
- * stands ({@see TemplateBlockRefs::fan_out_job_page()}); one that no longer
- * does ends the job with nothing written. A page that could not be read, or
- * a container whose write failed, fails the job with its cause on its Jobs
- * row ({@see self::failure_message()}); the job runner tries it again with
- * backoff, from the last container done.
+ * Applies a menu or pattern event (translation created, linked, trashed, deleted, restored or moved) to the translated
+ * templates and parts its request did not reach. Args: `task` (the event) and `after` (the resume point). Each page
+ * first checks the event still stands; a read or write failure fails the job for a retry from the last container.
  */
 final class TemplateRefsFanoutJob extends AbstractJob {
 
@@ -55,8 +41,7 @@ final class TemplateRefsFanoutJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Templates and template parts are edited by users who may edit the
-	 * theme's options.
+	 * `edit_theme_options`: who edits templates and template parts.
 	 */
 	public function get_required_capability(): string {
 		return 'edit_theme_options';
@@ -75,9 +60,7 @@ final class TemplateRefsFanoutJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Result: `read` containers read, `updated` containers written,
-	 * `references` references changed, `after` the last container done (the
-	 * resume point).
+	 * Result: `read`, `updated` and `references` counts, and `after` (the last container done, the resume point).
 	 *
 	 * @param array<string, mixed> $args     Worker args (`__perflocale_slice` from the worker).
 	 * @param callable             $progress Progress reporter.
@@ -129,9 +112,8 @@ final class TemplateRefsFanoutJob extends AbstractJob {
 	}
 
 	/**
-	 * The message a failed page leaves on the job's row: one per cause. The
-	 * job runner tries every cause again (a missing default language too: the
-	 * job goes on once one is set).
+	 * The Jobs-row message of a failed page, one per cause. The runner retries every cause (a missing default language
+	 * too: the job goes on once one is set).
 	 *
 	 * @param bool   $write Whether a container's write failed (otherwise the page could not be read).
 	 * @param string $cause A write: 'conflict' (every compare-and-set attempt lost to a concurrent edit) or

@@ -44,11 +44,7 @@ final class MicrosoftProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Get the API key from settings.
-	 *
-	 * Resolved transparently as env var → PHP constant → database via
-	 * Settings::get() (see Settings::CONSTANT_MAP for the env/constant
-	 * name binding: PERFLOCALE_MICROSOFT_API_KEY ↔ mt_microsoft_api_key).
+	 * The API key: env var or constant PERFLOCALE_MICROSOFT_API_KEY first, then the database (Settings::get()).
 	 *
 	 * @return string
 	 */
@@ -59,19 +55,14 @@ final class MicrosoftProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch(). Maps to Azure's textType
-	 *   (plain|html).
+	 * @param string $format Destination format hint ('html'|'text'), sent as Azure's textType (plain|html).
 	 *
 	 * @throws \RuntimeException When the Microsoft Translator API returns an unexpected response or all retries fail.
 	 */
 	public function translate( string $text, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): string {
 		$text = apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'microsoft', $target_lang );
 
-		// Microsoft Translator v3 expects BCP 47 codes. Accepts base forms
-		// ('en', 'de') and specific variants where meaningful ('zh-Hans',
-		// 'pt-pt', 'sr-Latn'). Normalize underscore-locale input so
-		// WP-style codes ('en_US', 'de_DE') resolve to valid BCP 47 form.
+		// BCP 47 codes, variants kept ('zh-hans', 'sr-latn'); 'en_US' becomes 'en-us'.
 		$url = self::API_URL
 			. '&from=' . rawurlencode( $this->normalize_language_code( $source_lang ) )
 			. '&to=' . rawurlencode( $this->normalize_language_code( $target_lang ) )
@@ -111,9 +102,7 @@ final class MicrosoftProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Azure /translate request ceilings: at most 100 array elements and
-	 * 50,000 total characters per call. Chunks are built with character
-	 * headroom so a batch near the ceiling isn't rejected outright.
+	 * Azure /translate ceilings per call: 100 elements, 50,000 characters (chunks keep character headroom).
 	 */
 	private const BATCH_MAX_ITEMS = 100;
 	private const BATCH_MAX_CHARS = 45000;
@@ -121,15 +110,9 @@ final class MicrosoftProvider extends AbstractProvider {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * Azure Translator v3 accepts an array of texts natively, so a whole
-	 * chunk travels in ONE request instead of the inherited per-text loop.
-	 * Besides latency, one request per chunk is atomic on the billing side:
-	 * with the loop, a mid-batch failure discards translations Azure has
-	 * already billed, and the caller's re-run bills them a second time.
+	 * One request per chunk, not the inherited per-text loop: a mid-batch failure there discards texts Azure billed.
 	 *
-	 * @param string $format Destination format hint ('html'|'text') - see
-	 *   AbstractProvider::translate_batch(). Maps to Azure's textType
-	 *   (plain|html).
+	 * @param string $format Destination format hint ('html'|'text'), sent as Azure's textType (plain|html).
 	 *
 	 * @throws \RuntimeException When Microsoft Translator returns an unexpected batch response or all retries fail.
 	 */
@@ -159,10 +142,7 @@ final class MicrosoftProvider extends AbstractProvider {
 
 		$region = (string) $this->settings->get( 'mt_microsoft_region', 'global' );
 
-		// Split into API-compliant chunks, preserving each text's index so
-		// the results can be reassembled in the caller's order. An oversized
-		// single text gets a chunk of its own - it would exceed the ceiling
-		// on the per-text path too, so the failure mode is unchanged.
+		// Chunks keep each text's index; an oversized text gets a chunk of its own (it fails on any path).
 		$chunks      = [];
 		$current     = [];
 		$current_len = 0;
@@ -212,9 +192,7 @@ final class MicrosoftProvider extends AbstractProvider {
 			$data = $this->parse_json_response( $response['body'] );
 			$keys = array_keys( $chunk );
 
-			// Azure returns one element per input, in order. A short / long /
-			// malformed response would scramble the positional mapping, so
-			// treat any shape mismatch as a hard failure.
+			// One element per input, in order: any shape mismatch would scramble the mapping, so it fails.
 			if ( count( $data ) !== count( $keys ) ) {
 				throw new \RuntimeException(
 					esc_html__( 'Microsoft Translator returned an unexpected batch response.', 'perflocale' )
@@ -241,8 +219,7 @@ final class MicrosoftProvider extends AbstractProvider {
 				);
 			}
 
-			// Bill per completed chunk: Azure has charged for it even if a
-			// LATER chunk fails, so the usage counter must not lose it.
+			// Usage per completed chunk: Azure charged for it even when a later chunk fails.
 			$chunk_chars = 0;
 
 			foreach ( $chunk as $text ) {

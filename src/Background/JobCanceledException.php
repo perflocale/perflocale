@@ -1,7 +1,6 @@
 <?php
 /**
- * Sentinel exception used to break out of a running worker when the
- * operator cancels the job mid-flight.
+ * Exception that stops a running worker when its job is canceled.
  *
  * @package PerfLocale
  */
@@ -15,18 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Thrown by the progress callback {@see WorkerRegistry::run()} hands to
- * each job's `execute()`. Distinct from {@see \Throwable} so the worker's
- * catch block can route cancellation through the {@see JobState::cancel()}
- * path instead of {@see JobState::mark_failed()} + retry-with-backoff.
- *
- * Long-running jobs that periodically call `$progress($processed, $total)`
- * get the cancel signal for free - the next progress tick throws. Jobs
- * that don't call progress (sub-second work) finish naturally; the
- * cancellation arrives too late to interrupt them, which is fine.
- *
- * A job may attach the counts it reached before the cancel with
- * set_result(); the worker stores them on the canceled job.
+ * Thrown by the worker's progress callback (WorkerRunner::run()) once the job is canceled, taken over or paused, so
+ * WorkerRunner's catch cancels, re-queues (pause) or logs the takeover instead of mark_failed() and a retry. A job that never reports progress finishes.
+ * set_result() attaches the counts reached before the cancel.
  */
 final class JobCanceledException extends \RuntimeException {
 

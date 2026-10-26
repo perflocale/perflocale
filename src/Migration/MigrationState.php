@@ -16,36 +16,25 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Records, per blog, that an import from a source plugin has run.
+ * Records, per blog, that an import from a source plugin has run (one non-autoloaded option).
  *
- * The stamp lives in one option that is not autoloaded. A site that
- * imported with an older PerfLocale has no stamp; is_imported() then looks
- * for the rows that import left (source-map rows, or links it wrote) and
- * writes the stamp when it finds them, so that lookup runs once.
- *
- * The stamp means "an import ran". Whether the last run imported
- * everything is kept apart, under {@see INCOMPLETE}: a run that left part
- * of the source data not imported (a failed read or write) sets it, a run
- * that finished clears it.
+ * Without a stamp, is_imported() looks once for rows an import left and stamps the site when found.
+ * The stamp means "an import ran"; whether the last run finished is kept apart under INCOMPLETE.
  */
 final class MigrationState {
 
 	/**
-	 * Option holding `[ source => [ 'imported_at' => int, 'version' => string ] ]`,
-	 * plus the import flags under {@see FLAGS} and the unfinished imports
-	 * under {@see INCOMPLETE}.
+	 * Option: `[ source => [ 'imported_at' => int, 'version' => string ] ]`, plus FLAGS and INCOMPLETE.
 	 */
 	public const OPTION = 'perflocale_migration_state';
 
 	/**
-	 * State key holding `[ source => [ flag => time ] ]`: what an import did
-	 * once and must not repeat on a later run.
+	 * State key: `[ source => [ flag => time ] ]`, what an import did once and must not repeat.
 	 */
 	private const FLAGS = 'flags';
 
 	/**
-	 * State key holding `[ source => time ]`: sources whose last import did
-	 * not finish.
+	 * State key: `[ source => time ]`, sources whose last import did not finish.
 	 */
 	private const INCOMPLETE = 'incomplete';
 
@@ -213,12 +202,7 @@ final class MigrationState {
 	/**
 	 * Sources whose translation data is on this blog but has not been imported.
 	 *
-	 * A source counts only when its data holds at least one translation, so
-	 * a site whose leftover tables hold a single language is never reported:
-	 * WPML a row with a source language in `icl_translations`, Polylang a
-	 * `post_translations` or `term_translations` group with two or more
-	 * members, TranslatePress a translated row in a dictionary table of one
-	 * of its languages.
+	 * Only data holding a translation counts, so leftover single-language tables are never reported.
 	 * Memoised per blog for the request; recording an import clears it.
 	 *
 	 * @return list<string>
@@ -232,9 +216,8 @@ final class MigrationState {
 
 		$out = [];
 
-		// The source data is checked first: those reads are indexed or end
-		// at a missing table, so a site that never ran the plugin never
-		// reaches is_imported()'s lookup on translation_links.source.
+		// Source data first: those reads are cheap, so a site without the plugin's data never reaches
+		// is_imported()'s lookup on translation_links.source.
 		if ( self::wpml_has_translations() && ! self::is_imported( 'wpml' ) ) {
 			$out[] = 'wpml';
 		}
@@ -268,8 +251,7 @@ final class MigrationState {
 
 		$out = [];
 
-		// The stamp first: the source-data reads run only for a source that
-		// has an unfinished import.
+		// The stamp first: the source-data reads run only for a source with an unfinished import.
 		foreach ( array_keys( self::SOURCES ) as $source ) {
 			if ( ! self::is_incomplete( $source ) ) {
 				continue;
@@ -350,10 +332,7 @@ final class MigrationState {
 	/**
 	 * True when Polylang left a translation group with two or more members.
 	 *
-	 * The group is a `post_translations` or `term_translations` term whose
-	 * description is the serialized language => object map. Polylang gives
-	 * every term a group, also an untranslated one, so a one-member map
-	 * (`a:1:{…}`) is not a translation.
+	 * Polylang gives every term a group, also an untranslated one, so a one-member map (`a:1:{…}`) does not count.
 	 *
 	 * @return bool
 	 */
@@ -377,8 +356,7 @@ final class MigrationState {
 	}
 
 	/**
-	 * True when a TranslatePress dictionary table of one of its translation
-	 * languages holds a translated row.
+	 * True when a TranslatePress dictionary table of a translation language holds a translated row.
 	 *
 	 * @return bool
 	 */

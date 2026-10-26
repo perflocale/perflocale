@@ -14,16 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * A read of TranslatePress data failed.
+ * A read of TranslatePress data failed: the import stops rather than read missing rows as "no translation".
  *
- * A failed SELECT returns no rows, exactly as an empty result does; only
- * `$wpdb->last_error` tells them apart. The import stops at this exception
- * ({@see TranslatePressImporter::import()}) instead of reading the missing
- * rows as "no translation", and the run is reported as not finished.
- *
- * The message names what was being read, without table names or values;
- * the database's own error is in {@see self::$db_error}, for the debug log
- * only.
+ * The message has no table names or values; the DB error in $db_error is for the debug log only.
  */
 final class TranslatePressSourceReadException extends \RuntimeException {
 

@@ -18,15 +18,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Contract for PerfLocale addons.
  *
- * Each addon must implement this interface to be discovered
- * and managed by the AddonRegistry.
- *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 interface AddonInterface {
 
 	/**
 	 * Get the addon's unique identifier.
+	 *
+	 * Must match AddonSchemaManager::ADDON_ID_PATTERN, or register() rejects the addon.
 	 *
 	 * @return string
 	 */
@@ -40,7 +39,7 @@ interface AddonInterface {
 	public function get_name(): string;
 
 	/**
-	 * Get the addon version.
+	 * Get the addon version: a dot-version string such as 1.0.0 or 1.0.0-beta.
 	 *
 	 * @return string
 	 */
@@ -61,41 +60,10 @@ interface AddonInterface {
 	public function is_compatible(): bool;
 
 	/**
-	 * Boot the addon - register hooks, filters, etc.
+	 * Boot the addon: register its hooks and filters.
 	 *
-	 * The `$plugin` argument is the full PerfLocale DI container. Addons
-	 * can use it to reach the plugin's internal toolkit:
-	 *
-	 *   • Repositories      $plugin->lang_repo(), $plugin->group_repo()
-	 *   • Cache             $plugin->cache()
-	 *   • Settings          $plugin->settings()
-	 *   • Router            $plugin->router()
-	 *   • URL conversion    $plugin->url_converter(), $plugin->slug_manager()
-	 *   • Addon registry    $plugin->addon_registry()
-	 *   • Any registered    $plugin->get( Plugin::SERVICE_* )
-	 *     service by ID
-	 *
-	 * Beyond the container, these classes form the addon-facing @api
-	 * surface - call them directly, no DI lookup needed:
-	 *
-	 *   • \PerfLocale\Concurrency\Lock       Atomic critical-section guard
-	 *   • \PerfLocale\Concurrency\Breaker    Circuit breaker for external calls
-	 *   • \PerfLocale\Background\Dispatcher  Background-job dispatch
-	 *   • \PerfLocale\Background\AbstractJob Base for custom jobs
-	 *   • \PerfLocale\Background\JobState    Persistent job state
-	 *   • \PerfLocale\Helper                 Fluent helper API +
-	 *                                       load_addon_textdomain() (modern i18n)
-	 *   • \PerfLocale\Addon\AddonSettings    Read/write the addon-settings option
-	 *
-	 * Opt-in capability interfaces (implement alongside AddonInterface):
-	 *
-	 *   • \PerfLocale\Addon\HasSchema             dbDelta() on activation
-	 *   • \PerfLocale\Addon\HasUninstallTargets   declarative uninstall sweep
-	 *   • \PerfLocale\Addon\HasCustomUninstall    custom uninstall logic
-	 *   • \PerfLocale\Addon\HasVersionRequirement skip-with-notice on old hosts
-	 *   • \PerfLocale\Addon\HasCardInfo           override Addons-page card metadata
-	 *
-	 * Full reference + examples: /docs/addon-system/developer-toolkit/
+	 * `$plugin` is the full DI container; opt-in capabilities are the Has* interfaces in this namespace.
+	 * Toolkit reference: /docs/addon-system/developer-toolkit/
 	 *
 	 * @param Plugin $plugin The PerfLocale plugin container.
 	 * @return void

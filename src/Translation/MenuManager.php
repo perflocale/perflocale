@@ -18,11 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Enables per-language nav menus.
- *
- * Stores the language for each nav menu via term meta.
- * On the frontend, filters wp_nav_menu to show the correct language version.
- * On the admin Menus screen, injects a language dropdown into Menu Settings.
+ * Per-language nav menus: menu language and links in term meta, swapped on the front end.
  */
 final class MenuManager {
 
@@ -63,39 +59,30 @@ final class MenuManager {
 		// Frontend: swap menus based on current language.
 		add_filter( 'wp_nav_menu_args', [ $this, 'filter_menu_args' ] );
 
-		// Frontend: point post/term menu items at the current language's
-		// sibling (the classic-menu twin of the FSE navigation-link fix -
-		// classic items render their SAVED object's permalink, which
-		// resolves to the object's OWN language). Priority 9 so the
-		// front-page fix below still wins for front-page items.
+		// Frontend: point post/term items at the current language's sibling.
+		// Priority 9 so the front-page fix below still wins for front-page items.
 		add_filter( 'wp_nav_menu_objects', [ $this, 'localize_menu_item_urls' ], 9, 2 );
 
 		// Frontend: fix front page URLs in nav menus to use language homepage.
 		add_filter( 'wp_nav_menu_objects', [ $this, 'fix_front_page_urls' ], 10 );
 
-		// Admin: save language on menu update and creation.
-		// Priority 10 for normal updates, also hook into load for edge cases.
+		// Admin: save language on menu update and creation, and on load for edge cases.
 		add_action( 'wp_update_nav_menu', [ $this, 'save_menu_language' ] );
 		add_action( 'wp_create_nav_menu', [ $this, 'save_menu_language' ] );
 		add_action( 'load-nav-menus.php', [ $this, 'save_menu_language_on_load' ] );
 
-		// Admin: enqueue the Menu Language field and the language badges
-		// scripts on the Menus screen, and prepare their data.
+		// Admin: Menu Language field and language badges on the Menus screen.
 		add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_nav_menus_assets' ], 20 );
 
-		// Admin: the Menu Language field's data, printed as a data attribute
-		// at admin_footer, which runs before the footer scripts print.
+		// Admin: the field's data at admin_footer, which runs before the footer scripts print.
 		add_action( 'admin_footer', [ $this, 'print_menu_language_data' ] );
 
-		// Admin: filter "Add to Menu" items by menu language (still needs
-		// admin_head to install get_pages + pre_get_posts filters before WP
-		// starts rendering the metaboxes).
+		// Admin: filter "Add to Menu" items by menu language; admin_head installs the filters before the metaboxes render.
 		add_action( 'admin_head-nav-menus.php', [ $this, 'setup_menu_item_filtering' ] );
 	}
 
 	/**
-	 * Enqueue the Menu Language field and language-badges scripts on the
-	 * nav-menus.php admin screen.
+	 * Enqueue the Menu Language field and language-badges scripts on nav-menus.php.
 	 *
 	 * @param string $hook Current admin page hook suffix.
 	 * @return void
@@ -152,15 +139,9 @@ final class MenuManager {
 	}
 
 	/**
-	 * Point classic menu post/term items at the current language's sibling.
+	 * Point classic menu post/term items at the current language's published sibling.
 	 *
-	 * A classic menu item renders its saved object's permalink, which the
-	 * permalink filters resolve to the object's OWN language - so on a
-	 * translated page every explicit item linked back to the source
-	 * language. When a published sibling exists in the current language,
-	 * swap the item URL for the sibling's permalink (mirrors the FSE
-	 * navigation-link fix). Menus with an explicit language assignment are
-	 * skipped - those are curated per language.
+	 * An item renders its saved object's permalink, which resolves to that object's own language.
 	 *
 	 * @param array<int, \WP_Post> $items Menu items.
 	 * @param object|null          $args  wp_nav_menu args (carries the menu term).
@@ -177,11 +158,7 @@ final class MenuManager {
 			return $items;
 		}
 
-		// A menu with an EXPLICIT language assignment is curated for that
-		// language - its items were authored deliberately; leave them
-		// untouched. (filter_menu_args already swapped to the per-language
-		// menu when one exists; item-level mapping only serves the shared
-		// single-menu setup.)
+		// A menu with an explicit language is curated for it: item mapping serves only a shared menu.
 		$menu = is_object( $args ) && isset( $args->menu ) ? $args->menu : null;
 
 		if ( $menu instanceof \WP_Term && (string) get_term_meta( $menu->term_id, '_perflocale_language', true ) !== '' ) {
@@ -236,11 +213,7 @@ final class MenuManager {
 	}
 
 	/**
-	 * Fix front page URLs in nav menu items.
-	 *
-	 * When the static front page (or its translation) is added as a menu item,
-	 * WordPress links to /en/homepage/ instead of /en/. This replaces those
-	 * URLs with the correct language homepage URL.
+	 * Point front page menu items (and their translations) at the language homepage, not the page's slug URL.
 	 *
 	 * @param array<int, \WP_Post> $items Menu items.
 	 * @return array<int, \WP_Post>
@@ -272,9 +245,7 @@ final class MenuManager {
 		$url_converter  = \PerfLocale\Plugin::get_instance()->get( 'url_converter' );
 		$default_lang   = $lang_repo->get_default();
 
-		// Raw (unfiltered) site home - the home_url filter re-prefixes with the
-		// current request language, so we pass the bare option to the converter,
-		// which re-derives the correct per-language home for the active url mode.
+		// Raw option: the home_url filter would re-prefix it with the request's language.
 		$home_base = trailingslashit( (string) get_option( 'home' ) );
 
 		// Build a quick lookup: page_id → language object.
@@ -308,12 +279,7 @@ final class MenuManager {
 				continue;
 			}
 
-			// Delegate to the canonical URL converter so the per-language home is
-			// correct in EVERY url mode - subdirectory (path prefix, with the
-			// default hidden), subdomain (de.host), and per-language domain
-			// (host.de) - instead of unconditionally appending a path prefix.
-			// convert() also suppresses the home_url filter internally, so the
-			// current request language can't re-prefix the result.
+			// The converter gets the home right in every URL mode, not only path prefixes.
 			$item->url = $url_converter->convert( $home_base, $page_lang->slug );
 		}
 
@@ -339,15 +305,8 @@ final class MenuManager {
 		if ( $linked_menu > 0 ) {
 			$target_lang = (string) get_term_meta( $linked_menu, '_perflocale_language', true );
 
-			// The reverse pointer can go stale when the target menu's language
-			// is later changed or the menu is deleted (save_menu_language does
-			// not reconcile siblings). Reject it only when the target has been
-			// RE-LABELED to a different language. An UNLABELED target ('') is
-			// the normal linked-menu case - the admin sets the language on one
-			// menu of the group and links the rest without labelling each - so
-			// we still trust it, but only if the menu actually still exists
-			// (a deleted menu's term meta is gone, so it too reads '', and we
-			// must not serve a dangling pointer).
+			// Pointers can go stale (siblings are not reconciled): reject a relabelled target, and trust an
+			// unlabelled one (the normal case) only while the menu exists, as a deleted one also reads ''.
 			if ( ( $target_lang === '' || $target_lang === $lang_slug ) && is_nav_menu( $linked_menu ) ) {
 				return $linked_menu;
 			}
@@ -359,12 +318,7 @@ final class MenuManager {
 	/**
 	 * Label a set of menus that translate each other and link them all to each other.
 	 *
-	 * Writes `_perflocale_language` on every menu and a
-	 * `_perflocale_menu_<slug>` pointer from every menu to every other, the
-	 * term meta get_menu_for_language() reads. Nothing is written when a menu
-	 * already carries a different language, or a pointer for one of the set's
-	 * languages to another existing menu: a set the site already curated wins.
-	 * A value already in place is not written again.
+	 * Writes nothing when a menu has another language or a pointer to another existing menu: curated sets win.
 	 *
 	 * @param array<string, int> $set Language slug => nav menu term ID.
 	 * @return array{written: int, conflict: string|null} Meta rows written, and why nothing was written.
@@ -437,17 +391,7 @@ final class MenuManager {
 	}
 
 	/**
-	 * Save menu language and linked menus when a menu is updated.
-	 *
-	 * @param int $menu_id Menu ID.
-	 * @return void
-	 */
-	/**
-	 * Fallback: save menu language during page load processing.
-	 *
-	 * Handles edge cases where wp_update_nav_menu fires before our
-	 * JS-injected field is processed, or during new menu creation
-	 * where the menu ID changes mid-request.
+	 * Fallback: save menu language on load, for when the save action misses the field or the ID changes.
 	 *
 	 * @return void
 	 */
@@ -457,13 +401,7 @@ final class MenuManager {
 			return;
 		}
 
-		// Verify core's nav-menu save nonce: field `update-nav-menu-nonce`,
-		// action `update-nav_menu` - the exact pair nav-menus.php posts.
-		// Empty and invalid nonces are both rejected outright.
-		// Canonical WP order: nonce (CSRF) first, then capability. We use
-		// silent `return` on either failure because this hooks into core's
-		// nav-menu save flow - no-op is the correct response if our slot
-		// is absent or the user lacks our specific cap.
+		// Core's nav-menu save nonce, then the capability; silent return because this rides core's save flow.
 		$nonce = isset( $_POST['update-nav-menu-nonce'] )
 			? sanitize_text_field( wp_unslash( $_POST['update-nav-menu-nonce'] ) )
 			: '';
@@ -498,14 +436,7 @@ final class MenuManager {
 	 * @return void
 	 */
 	public function save_menu_language( int $menu_id ): void {
-		// Self-contained CSRF check. WordPress core already verifies this same
-		// `update-nav_menu` nonce before firing wp_update_nav_menu /
-		// wp_create_nav_menu, and save_menu_language_on_load() verifies it too;
-		// re-checking here keeps the CSRF guarantee LOCAL and visible instead of
-		// relying on an upstream check a static analyser can't see. A
-		// programmatic menu save (importer, WP-CLI) carries neither this nonce
-		// NOR our POST fields, so the early return loses nothing there - the
-		// perflocale_menu_language isset() guard below would no-op anyway.
+		// Local CSRF check, though core verified it: programmatic saves carry neither the nonce nor our fields.
 		$nonce = isset( $_POST['update-nav-menu-nonce'] )
 			? sanitize_text_field( wp_unslash( $_POST['update-nav-menu-nonce'] ) )
 			: '';
@@ -565,40 +496,17 @@ final class MenuManager {
 	}
 
 	/**
-	 * Inject the language selector into the Menu Settings section via JS.
-	 *
-	 * This places the dropdown after the "Display location" checkboxes,
-	 * inside the existing form, so it saves properly with the menu.
-	 *
-	 * @return void
-	 */
-	/**
-	 * Set up filtering of "Add to Menu" items when a menu language is set.
-	 *
-	 * Hooks into page/post queries on the nav-menus.php screen so that
-	 * only items in the menu's language are shown in the metabox panels.
-	 * Also injects JS to show language badges on all menu item labels.
+	 * Show only items in the menu's language in the "Add to Menu" metaboxes.
 	 *
 	 * @return void
 	 */
 	public function setup_menu_item_filtering(): void {
-		// Hooked on admin_head-nav-menus.php - gate by capability so the
-		// $_REQUEST['menu'] read only happens for users who can already
-		// view the nav-menus screen, then the URL parameter is treated
-		// purely as a display filter (no state mutation).
+		// The menu parameter is only a display filter, read after the capability check.
 		if ( ! current_user_can( 'edit_theme_options' ) ) {
 			return;
 		}
 
-		// (language-badges JS is enqueued from enqueue_nav_menus_assets so
-		// it rides the normal script-print cycle instead of admin_footer-*)
-
-		// Resolve the menu being edited. WP core's nav-menus.php falls
-		// back to "the first menu" when no ?menu=N is in the URL, so we
-		// mirror that - otherwise the filter would silently bail on a
-		// bare /wp-admin/nav-menus.php load. $_REQUEST['menu'] is the
-		// SAME parameter core's own nav-menus.php screen reads - display-
-		// only filter on an already-capability-gated admin page.
+		// Without ?menu=N core edits the first menu by name, so mirror that.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display filter on an already cap-gated nav-menus admin screen; matches WP core's own use of $_REQUEST['menu'] in nav-menus.php.
 		$menu_id = isset( $_REQUEST['menu'] ) ? absint( $_REQUEST['menu'] ) : 0;
 
@@ -613,11 +521,7 @@ final class MenuManager {
 			return;
 		}
 
-		// Only filter when the menu has an EXPLICIT _perflocale_language
-		// term-meta set via the "Menu Language" dropdown in Menu Settings.
-		// Sites with a single mixed-language menu intentionally leave this
-		// unset; auto-falling-back to the default language would force-empty
-		// those sites' menu pickers for every non-default menu.
+		// Explicit menu language only: defaulting would empty the pickers of a single mixed-language menu.
 		$menu_lang_slug = (string) get_term_meta( $menu_id, '_perflocale_language', true );
 
 		if ( $menu_lang_slug === '' ) {
@@ -657,11 +561,7 @@ final class MenuManager {
 					return;
 				}
 
-				// Strict mode: pickers here should NOT show unmanaged/unlinked
-				// posts - otherwise every nav-menu picker leaks pre-PerfLocale
-				// content into every language's menu. PostQueryFilter reads
-				// this flag in modify_query_clauses and omits the OR-NULL
-				// fallback when it's set.
+				// Strict: PostQueryFilter omits its unlinked-post fallback, so pickers do not leak them.
 				$query->set( 'perflocale_strict_language', true );
 
 				$query->set( 'perflocale_language_id', $language_id );
@@ -712,11 +612,7 @@ final class MenuManager {
 			array_filter(
 				$pages,
 				static function ( \WP_Post $page ) use ( $matching_set ): bool {
-					// Strict: only pages explicitly linked to this language. Unlinked
-					// pages are intentionally excluded - same rationale as the
-					// perflocale_strict_language query flag for WP_Query above. A
-					// nav menu representing the "ar" locale should NOT silently
-					// include every pre-PerfLocale page.
+					// Strict, like perflocale_strict_language: unlinked pages are excluded.
 					return isset( $matching_set[ $page->ID ] );
 				}
 			)
@@ -724,10 +620,7 @@ final class MenuManager {
 	}
 
 	/**
-	 * Inject JS to show language badges on all "Add to Menu" items.
-	 *
-	 * Fetches language info for visible post/page items via a single AJAX call
-	 * and appends language codes as badges next to item labels.
+	 * Enqueue the language badges script for "Add to Menu" items, with a post ID to language map.
 	 *
 	 * @return void
 	 */
@@ -747,10 +640,7 @@ final class MenuManager {
 		$groups_table = \PerfLocale\Database\Schema::table( 'translation_groups' );
 		$langs_table  = \PerfLocale\Database\Schema::table( 'languages' );
 
-		// Only fetch published pages/posts that the nav-menu metabox can
-		// actually show. Biased to the most recently modified rows so large
-		// sites still see badges on items they're likely to add. The limit
-		// is filterable; set to 0 to load all rows (use carefully).
+		// Published rows only, most recently modified first, so large sites badge the likely items.
 		/**
 		 * Filter the maximum number of posts loaded for nav-menu language badges.
 		 *
@@ -766,9 +656,7 @@ final class MenuManager {
 			INNER JOIN {$wpdb->posts} p ON l.object_id = p.ID AND p.post_status = 'publish'
 			ORDER BY p.post_modified DESC";
 
-		// Bind the LIMIT through prepare() rather than concatenating the
-		// cast int directly. A filter value of 0 means "unlimited", so the
-		// LIMIT clause is omitted entirely in that case.
+		// A limit of 0 means unlimited: no LIMIT clause.
 		if ( $badge_limit > 0 ) {
 			$sql = $wpdb->prepare( $sql . ' LIMIT %d', $badge_limit ); // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
 		}
@@ -787,10 +675,7 @@ final class MenuManager {
 			return;
 		}
 
-		// Enqueue the static JS asset and seed the post-id -> language-slug
-		// map via wp_localize_script. The behaviour file lives under
-		// assets/js/ so it's covered by the standard WP scripts pipeline
-		// rather than a heredoc'd inline blob.
+		// Static script, seeded with the post ID to language map.
 		wp_enqueue_script(
 			'perflocale-menu-badges',
 			PERFLOCALE_URL . 'assets/js/menu-badges.js',
@@ -815,8 +700,7 @@ final class MenuManager {
 		$languages = $lang_repo->get_active();
 		$nav_menus = wp_get_nav_menus();
 
-		// Detect the current menu ID. WordPress may load a menu even without
-		// ?menu=X in the URL (it defaults to the most recently edited menu).
+		// Detect the current menu ID; core loads a menu even without ?menu=X.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		$menu_id = isset( $_REQUEST['menu'] ) ? absint( $_REQUEST['menu'] ) : 0;
 
@@ -854,8 +738,7 @@ final class MenuManager {
 				$linked = (int) get_term_meta( $menu_id, '_perflocale_menu_' . $lang->slug, true );
 				$flag   = Helper::get_flag_emoji( $lang );
 
-				// Match the Menu Language dropdown format ("flag NativeName (SLUG)")
-				// so both selectors read consistently at a glance.
+				// Same label format as the Menu Language dropdown.
 				$lang_label = $flag . ' ' . ( $lang->native_name ?: $lang->name ) . ' (' . Helper::format_locale_as_bcp47( $lang->slug ) . ')';
 
 				$linked_html .= '<p class="menu-settings-input-container" style="margin:6px 0;"><label style="display:inline-block;min-width:170px;">';
@@ -881,23 +764,11 @@ final class MenuManager {
 				. esc_html__( 'Linked Menus', 'perflocale' ) . '</strong></p>' . $linked_html;
 		}
 
-		// Enqueue the static behaviour asset and pass the per-language data
-		// as a JSON payload. The pre-rendered options/linked-menus HTML is
-		// server-built (per-language flags, native names, currently selected
-		// slug) so it has to travel as data; the script file itself is static
-		// and runs the DOM injection.
+		// The server-built options HTML travels as JSON data to the static script.
 		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-menu-lang-field', 'menu-lang-field.js' );
 
-		// NOT wp_localize_script(): WP_Scripts::localize() runs every scalar
-		// through html_entity_decode() (wp-includes/class-wp-scripts.php), which
-		// UNDOES the esc_html() applied to the language labels above - and the
-		// consumer assigns these strings to innerHTML. Language names come from
-		// the languages table, so a label containing markup would be re-inflated
-		// into live HTML on the way out. wp_json_encode() performs no entity
-		// decoding, and the JSON_HEX_* flags turn every < > & ' " into a \u
-		// escape, so esc_attr() in print_menu_language_data() changes nothing
-		// and the browser decodes nothing: JSON.parse() gets this exact JSON,
-		// with the escaping intact.
+		// Not wp_localize_script(): it html_entity_decode()s every scalar, undoing esc_html() before innerHTML.
+		// JSON_HEX_* keeps the escaping intact through esc_attr() and JSON.parse().
 		$json = wp_json_encode(
 			[
 				'legendLabel' => __( 'Menu Language', 'perflocale' ),
@@ -912,10 +783,7 @@ final class MenuManager {
 	}
 
 	/**
-	 * Print the Menu Language field's data on the Menus screen: a hidden
-	 * element whose data-perflocale-menu-lang attribute holds the JSON that
-	 * menu-lang-field.js reads. Printed once, only after
-	 * inject_menu_language_field() prepared it.
+	 * Print the Menu Language field's JSON in a hidden data attribute for menu-lang-field.js, once.
 	 *
 	 * @return void
 	 */

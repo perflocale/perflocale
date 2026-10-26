@@ -19,24 +19,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds a compact "PerfLocale" widget to the WordPress Dashboard showing
- * active languages and content-translation coverage.
- *
- * Loads ONLY on the Dashboard: it hooks `wp_dashboard_setup`, which core
- * fires solely while building the dashboard screen. Gated on the
- * `dashboard_widget_enabled` setting and the `perflocale_manage_languages`
- * capability. All numbers come from a cached stats array (short-circuited
- * by the autoloaded `perflocale_has_any_groups` sentinel), so a dashboard
- * load never triggers a live COUNT query while the cache is warm.
+ * Dashboard widget with the active languages and translation coverage.
  */
 final class DashboardWidget {
 
 	private const WIDGET_ID = 'perflocale_dashboard_overview';
 
 	/**
-	 * Cache key + TTL for the computed stats. Dashboard glance data does
-	 * not need to be real-time; a short TTL caps recompute to at most once
-	 * per window per blog.
+	 * Cache key and TTL of the computed stats; glance data need not be real-time.
 	 */
 	private const CACHE_KEY = 'dashboard_widget_stats';
 	private const CACHE_TTL = 15 * MINUTE_IN_SECONDS;
@@ -44,8 +34,7 @@ final class DashboardWidget {
 	public function __construct( private readonly Settings $settings ) {}
 
 	/**
-	 * Register the dashboard-setup hook. Cheap: a single add_action whose
-	 * callback only fires on the Dashboard screen.
+	 * Registers the dashboard-setup hook.
 	 *
 	 * @return void
 	 */
@@ -54,8 +43,7 @@ final class DashboardWidget {
 	}
 
 	/**
-	 * Register the widget if it's enabled and the user may manage
-	 * translations. Runs only on the Dashboard (wp_dashboard_setup).
+	 * Adds the widget when the setting is on and the user may manage languages.
 	 *
 	 * @return void
 	 */
@@ -98,14 +86,14 @@ final class DashboardWidget {
 			return;
 		}
 
-		// ── Metrics row ──────────────────────────────────────────────
+		// Metrics row.
 		echo '<div class="perflocale-dashwidget__stats">';
 		$this->metric( (string) $s['languages'], __( 'Languages', 'perflocale' ) );
 		$this->metric( (string) $s['translated'], __( 'Translated', 'perflocale' ) );
 		$this->metric( $s['percent'] . '%', __( 'Coverage', 'perflocale' ) );
 		echo '</div>';
 
-		// ── Coverage bar (pure CSS; width is data-driven) ────────────
+		// Coverage bar.
 		if ( ! $s['has_targets'] ) {
 			// Only the default language exists - nothing to translate into.
 			printf(
@@ -142,7 +130,7 @@ final class DashboardWidget {
 			}
 		}
 
-		// ── Language chips (each links to its edit screen) ───────────
+		// Language chips, each linked to its edit screen.
 		if ( ! empty( $s['lang_chips'] ) ) {
 			echo '<div class="perflocale-dashwidget__langs">';
 			foreach ( $s['lang_chips'] as $chip ) {
@@ -167,7 +155,7 @@ final class DashboardWidget {
 			echo '</div>';
 		}
 
-		// ── Actions ──────────────────────────────────────────────────
+		// Actions.
 		printf(
 			'<p class="perflocale-dashwidget__actions"><a class="button button-primary" href="%s">%s</a> <a class="button" href="%s">%s</a></p>',
 			esc_url( $manage_url ),
@@ -195,13 +183,7 @@ final class DashboardWidget {
 	}
 
 	/**
-	 * Compute (and cache) the widget stats.
-	 *
-	 * Cheap by construction: the active-language list is already cached in
-	 * the language bootstrap; the coverage matrix query is skipped entirely
-	 * when the autoloaded `perflocale_has_any_groups` sentinel says there
-	 * are no translation links yet. The whole result is memoized via the
-	 * CacheManager cascade for {@see CACHE_TTL}.
+	 * Computes and caches the widget stats.
 	 *
 	 * @return array{
 	 *     has_languages: bool,
@@ -249,8 +231,7 @@ final class DashboardWidget {
 
 			$stats['has_targets'] = $default_id > 0 && ! empty( $non_default_langs );
 
-			// No targets, or no translation links exist yet → coverage is 0
-			// and we skip every count query (sentinel short-circuit).
+			// No targets, or no links yet (autoloaded sentinel): coverage is 0 without a count query.
 			if ( ! $stats['has_targets'] || get_option( 'perflocale_has_any_groups', '' ) !== '1' ) {
 				return $stats;
 			}

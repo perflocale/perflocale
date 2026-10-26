@@ -16,29 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Parse diagnostics in plain text: DataImporter answers with its own messages by the exception code, and only WP-CLI prints this text, in a terminal.
 
 /**
- * Reads a PerfLocale export file in pieces, so an import never holds the whole
- * file, or the whole decoded envelope, in memory.
+ * Reads a PerfLocale export file in pieces, so an import never holds the whole file or decoded envelope in memory.
  *
- * An export is one JSON object. Its top-level members other than `data`
- * (`settings`, `roles`, an add-on's section, the envelope fields) are small
- * and are decoded whole by {@see self::index()}. `data` maps each table to a
- * list of rows; for those lists the index records only where each one starts
- * and how many rows it holds, and {@see self::rows()} later decodes the rows
- * one at a time. Any valid JSON layout is read: the exporter's one row per
- * line, a pretty-printed network slice, a hand-edited file. A file that is
- * not valid JSON is refused as a whole before the importer writes anything:
- * the index checks the structure of the envelope and of every list, and each
- * row is checked by json_decode() when it is read.
- *
- * Memory: one read buffer (1 MB), the row being decoded, and the decoded
- * top-level members other than `data`. A single value larger than the limit
- * the caller passes is refused rather than read; limit() bounds what an
- * index keeps in all (bytes, top-level members, members of `data`), and a
- * caller can name the top-level members it reads, so the others are walked
- * over without being kept.
- *
- * Errors are thrown as \UnexpectedValueException with one of the ERR_*
- * codes; the importer turns them into its own messages.
+ * The index checks the whole JSON structure before any write; rows() decodes one row at a time; errors carry ERR_* codes.
+ * See docs-ai/11-code-rationale.md, "ImportReader: streaming index".
  */
 final class ImportReader {
 
@@ -73,14 +54,12 @@ final class ImportReader {
 	public const ERR_TOO_MANY_MEMBERS = 6;
 
 	/**
-	 * `data`, or a network export's `sites`, has more members than limit()
-	 * allows.
+	 * `data`, or a network export's `sites`, has more members than limit() allows.
 	 */
 	public const ERR_TOO_MANY_DATA_MEMBERS = 7;
 
 	/**
-	 * A top-level member is larger than the cap its key has (a settings key).
-	 * The exception message is the member's key.
+	 * A top-level member is larger than its key's cap (a settings key); the exception message is the key.
 	 */
 	public const ERR_TOO_LARGE_SETTING = 8;
 
@@ -95,11 +74,9 @@ final class ImportReader {
 	private const MAX_KEY_BYTES = 65536;
 
 	/**
-	 * Deepest nesting of objects and arrays accepted in one value: the depth
-	 * json_decode() accepts by default, so no value nested deeper could be
-	 * decoded.
+	 * Deepest nesting of objects and arrays: json_decode()'s default depth 512 counts the innermost scalar level too.
 	 */
-	private const MAX_DEPTH = 512;
+	private const MAX_DEPTH = 511;
 
 	/**
 	 * File path, kept so each row walk opens its own handle.
@@ -165,9 +142,7 @@ final class ImportReader {
 	private bool $data_is_container = false;
 
 	/**
-	 * Slices of a network export (index_network()): site key => where its
-	 * `export` value starts, whether it is an object, and the slice's own
-	 * `site_url`.
+	 * Slices of a network export (index_network()): site key => `export` offset, whether it is an object, its `site_url`.
 	 *
 	 * @var array<array-key, array{offset: int|null, is_object: bool, site_url: mixed}>
 	 */
@@ -181,8 +156,7 @@ final class ImportReader {
 	private $sink = null;
 
 	/**
-	 * Most bytes an index keeps in all: the text of the values it decodes
-	 * and the keys of the members it walks.
+	 * Most bytes an index keeps in all: decoded value text plus walked member keys.
 	 *
 	 * @var int
 	 */
@@ -210,18 +184,15 @@ final class ImportReader {
 	private int $kept = 0;
 
 	/**
-	 * Top-level members the current index walked over without reading them,
-	 * in file order.
+	 * Top-level members the current index walked over without reading them, in file order.
 	 *
 	 * @var list<string>
 	 */
 	private array $skipped = [];
 
 	/**
-	 * Members of `data` in file order: name => table entry. A row list read
-	 * from the file has `offset` (file offset of its `[` or `{`) and `count`;
-	 * a member that is not a list or object has `value` (decoded) and no
-	 * offset; a member held in memory has `rows`.
+	 * Members of `data` in file order: a file row list has `offset` (of its `[` or `{`) and `count`,
+	 * a scalar member has `value`, a member held in memory has `rows`.
 	 *
 	 * @var array<array-key, array{offset?: int, count?: int, value?: mixed, rows?: array<array-key, mixed>}>
 	 */
@@ -263,15 +234,11 @@ final class ImportReader {
 	}
 
 	/**
-	 * Bound what index() and index_network() keep, so a file cannot make an
-	 * index hold more than the caller allows. Unbounded until called.
+	 * Bound what index() and index_network() keep; unbounded until called.
 	 *
-	 * @param int $max_kept_bytes   Most bytes kept in all: the text of every
-	 *                              value decoded and the key of every member
-	 *                              walked at the levels the index records.
+	 * @param int $max_kept_bytes   Most bytes kept in all: decoded value text plus walked member keys.
 	 * @param int $max_members      Most top-level members.
-	 * @param int $max_data_members Most members of `data` (index()) or
-	 *                              slices in `sites` (index_network()).
+	 * @param int $max_data_members Most members of `data` (index()) or slices in `sites` (index_network()).
 	 * @return void
 	 */
 	public function limit( int $max_kept_bytes, int $max_members, int $max_data_members ): void {
@@ -281,8 +248,7 @@ final class ImportReader {
 	}
 
 	/**
-	 * Top-level members the last index walked over without reading them,
-	 * because the caller's $read did not name them.
+	 * Top-level members the last index walked over because the caller's $read did not name them.
 	 *
 	 * @return list<string>
 	 */
@@ -291,21 +257,13 @@ final class ImportReader {
 	}
 
 	/**
-	 * Read the file's structure once: decode the top-level members other
-	 * than `data` that $read names, and record where each list inside `data`
-	 * starts and how many entries it holds. The other top-level members are
-	 * walked over without being kept, and listed by skipped().
+	 * Read the structure once: decode the top-level members $read names, record each `data` list's offset and count.
 	 *
-	 * A top-level JSON array is read as an envelope with no members, as the
-	 * importer has always treated a decoded file that is not an object.
-	 * Repeated keys keep the last value, as json_decode() does.
+	 * A top-level JSON array is an envelope with no members; repeated keys keep the last value, as json_decode() does.
 	 *
-	 * @param int                           $max_value_bytes Largest top-level member (and `data` member
-	 *                                                       that is not a list) decoded whole, in bytes.
-	 * @param (callable(string): bool)|null $read            Whether a top-level member other than `data`
-	 *                                                       is decoded; null decodes every one.
-	 * @param (callable(string): ?int)|null $member_cap      A smaller byte cap for a top-level member,
-	 *                                                       by key (null: $max_value_bytes applies).
+	 * @param int                           $max_value_bytes Largest top-level member (or non-list `data` member) decoded whole.
+	 * @param (callable(string): bool)|null $read            Whether a top-level member other than `data` is decoded; null: all.
+	 * @param (callable(string): ?int)|null $member_cap      A smaller byte cap for a top-level member, by key.
 	 * @return void
 	 * @throws \UnexpectedValueException On invalid JSON, a value or count over a limit, or a read error.
 	 */
@@ -386,9 +344,7 @@ final class ImportReader {
 					return;
 				}
 
-				// `data` as a JSON array (a hand-made file): decoded whole,
-				// within the limit, and each entry is a table held in memory,
-				// named by its position, as json_decode() would have given it.
+				// `data` as a JSON array (a hand-made file): decoded whole, each entry an in-memory table named by position.
 				$value = self::decode( $this->capture( $max_value_bytes ) );
 
 				if ( is_array( $value ) ) {
@@ -413,16 +369,12 @@ final class ImportReader {
 	}
 
 	/**
-	 * Read the structure of a network export (`wp perflocale network-export`):
-	 * decode the top-level members other than `sites` that $read names, and
-	 * for each slice in `sites` record its `site_url` and where its `export`
-	 * envelope starts, without reading the rest. Each slice is later copied
-	 * out byte for byte (copy_export()) and imported from its own file, so a
-	 * large network is never held whole.
+	 * Read a network export's structure: decode the top-level members $read names, record each slice's `site_url` and `export` offset.
+	 *
+	 * Each slice is copied out (copy_export()) and imported from its own file, so a large network is never held whole.
 	 *
 	 * @param int                           $max_value_bytes Largest member decoded whole, in bytes.
-	 * @param (callable(string): bool)|null $read            Whether a top-level member other than
-	 *                                                       `sites` is decoded; null decodes every one.
+	 * @param (callable(string): bool)|null $read            Whether a top-level member other than `sites` is decoded; null: all.
 	 * @return void
 	 * @throws \UnexpectedValueException On invalid JSON, a value or count over a limit, or a read error.
 	 */
@@ -582,11 +534,9 @@ final class ImportReader {
 	}
 
 	/**
-	 * Members of `data` in file order, each as its row count, or as its
-	 * decoded value when it is not a list.
+	 * Members of `data` in file order, each as its row count, or as its decoded value when it is not a list.
 	 *
-	 * The shape the importer's planning helpers read: a list's count is
-	 * empty() exactly when the list is.
+	 * The importer's planning helpers rely on a list's count being empty() exactly when the list is.
 	 *
 	 * @return array<array-key, mixed>
 	 */
@@ -607,8 +557,7 @@ final class ImportReader {
 	}
 
 	/**
-	 * Forget members of `data`: every later call treats them as absent, so
-	 * their rows are never read.
+	 * Forget members of `data`: every later call treats them as absent, so their rows are never read.
 	 *
 	 * @param array<int, int|string> $names Member names.
 	 * @return void
@@ -652,13 +601,11 @@ final class ImportReader {
 	/**
 	 * The rows of one member of `data`, decoded one at a time.
 	 *
-	 * Each walk opens its own handle, so two walks may run at once and the
-	 * index is never disturbed.
+	 * Each walk opens its own handle, so two walks may run at once and the index is never disturbed.
 	 *
 	 * @param int|string $table         Member name.
 	 * @param int        $max_row_bytes Largest row read, in bytes.
-	 * @return \Generator<array-key, mixed> Row key (position, or the member
-	 *                                      key of an object) => decoded row.
+	 * @return \Generator<array-key, mixed> Row key (position, or an object's member key) => decoded row.
 	 * @throws \UnexpectedValueException On invalid JSON, a row over the limit, or a read error.
 	 */
 	public function rows( $table, int $max_row_bytes ): \Generator {
@@ -733,8 +680,7 @@ final class ImportReader {
 	}
 
 	/**
-	 * Index one member of `data`: a list or object of rows is skipped over
-	 * and counted; anything else is decoded within the limit.
+	 * Index one member of `data`: a list or object of rows is skipped and counted; anything else is decoded within the limit.
 	 *
 	 * @param int $max_value_bytes Limit for a member that is not a list.
 	 * @return array{offset?: int, count?: int, value?: mixed}
@@ -793,9 +739,9 @@ final class ImportReader {
 	}
 
 	/**
-	 * Walk the members of the object at the current position. The callback
-	 * receives each key and must consume its value. Each key counts towards
-	 * the bytes the index keeps (limit()).
+	 * Walk the members of the object at the current position; the callback must consume each value.
+	 *
+	 * Each key counts towards the bytes the index keeps (limit()).
 	 *
 	 * @param callable(string): void $on_member Member callback.
 	 * @param int                    $max_count Most members.
@@ -842,8 +788,7 @@ final class ImportReader {
 	}
 
 	/**
-	 * Decode the value at the current position for the index to keep, within
-	 * $max bytes and within what limit() leaves.
+	 * Capture the value at the current position for the index to keep, within $max bytes and what limit() leaves.
 	 *
 	 * @param int $max Largest value, in bytes.
 	 * @return string The value's text.
@@ -883,8 +828,7 @@ final class ImportReader {
 	}
 
 	/**
-	 * Walk over a top-level member without reading it, and list it in
-	 * skipped().
+	 * Walk over a top-level member without reading it, and list it in skipped().
 	 *
 	 * @param string $key Member key.
 	 * @return void
@@ -948,14 +892,9 @@ final class ImportReader {
 	/**
 	 * Consume one JSON value at the current position.
 	 *
-	 * The value's own structure is checked for balanced brackets and closed
-	 * strings; the rest of its syntax is checked by json_decode() when the
-	 * caller decodes the returned text. A row walked without capturing is
-	 * decoded on a later walk before anything is written; a top-level member
-	 * the caller does not read (skipped()) is only walked.
+	 * Only brackets and strings are checked here; json_decode() checks the rest when the text is decoded.
 	 *
-	 * @param int $max Capture up to this many bytes and return them; -1 to
-	 *                 walk over the value without keeping it.
+	 * @param int $max Capture up to this many bytes and return them; -1 to walk over the value without keeping it.
 	 * @return string|null The value's text, or null when not capturing.
 	 * @throws \UnexpectedValueException When the JSON is malformed, a value is over the size limit, or the file cannot be read or written.
 	 */
@@ -1017,8 +956,7 @@ final class ImportReader {
 				return;
 			}
 
-			// A backslash and the byte it escapes travel together, so an
-			// escaped quote never ends the string.
+			// A backslash and the byte it escapes travel together, so an escaped quote never ends the string.
 			if ( ! $this->ensure( 2 ) ) {
 				throw new \UnexpectedValueException( 'unterminated string', self::ERR_SYNTAX );
 			}
@@ -1098,8 +1036,7 @@ final class ImportReader {
 	}
 
 	/**
-	 * Move $n bytes from the buffer into the capture, or to the copy stream,
-	 * or past them.
+	 * Move $n bytes from the buffer into the capture, or to the copy stream, or past them.
 	 *
 	 * @param int         $n   Bytes; all must be in the buffer.
 	 * @param string|null $out Capture buffer, null when not capturing.

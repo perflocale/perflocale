@@ -2,9 +2,7 @@
 /**
  * PerfLocale Pods addon: the front-end field reads.
  *
- * Loaded only by PerfLocalePods on the first Pods field read of a front-end
- * request (pods_pods_field or pods_pods_field_related_output_type). A
- * request that reads no Pods field never loads this file.
+ * Loaded by PerfLocalePods on the first Pods field read of a front-end request, never before.
  *
  * @package PerfLocale
  */
@@ -16,15 +14,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Front-end field reads for the Pods addon: relationship (pick) field values
- * mapped to the current language for the IDs, arrays and objects outputs,
- * and the rows a display read formats.
+ * Front-end Pods field reads: relationship (pick) values mapped to the current language.
  */
 final class PerfLocalePodsDisplay {
 
 	/**
-	 * Translated posts or terms loaded per statement by prime_post_targets()
-	 * and prime_term_targets().
+	 * Translated posts or terms loaded per statement by the prime_*_targets() methods.
 	 *
 	 * @var int
 	 */
@@ -45,37 +40,25 @@ final class PerfLocalePodsDisplay {
 	private ?\PerfLocale\Database\Repository\TranslationGroupRepository $repo = null;
 
 	/**
-	 * True while map_display_source() reads a field for a display read; the
-	 * rows Pods keeps from that read are mapped there, not in
-	 * translate_field_value().
+	 * True while map_display_source() reads a field: it maps those rows, translate_field_value() does not.
 	 *
 	 * @var bool
 	 */
 	private bool $reading_display_source = false;
 
 	/**
-	 * The rows map_display_source() mapped, per display read (its params
-	 * object): the Pods item, the field name and the rows as Pods kept them.
-	 * translate_field_value(), at the end of that read, puts them back, so a
-	 * later read of the item in another language starts from the item's own
-	 * rows. Null until a display read is mapped.
+	 * Per display read (its params object): the Pods item, field name and the item's own rows,
+	 * put back at the end of the read so a later read starts from them.
 	 *
 	 * @var \WeakMap<object, array<int, mixed>>|null
 	 */
 	private ?\WeakMap $display_rows = null;
 
 	/**
-	 * Translate Pods field values on the frontend.
+	 * Translate Pods relationship field values on the frontend.
 	 *
-	 * Intercepts relationship (pick) field values and replaces
-	 * post/term IDs with their translated counterparts for the
-	 * current language.
-	 *
-	 * The value is mapped for the outputs that carry IDs: arrays (Pods'
-	 * default), ids and objects. A form read (in_form), a display read
-	 * (the formatted text the Pods shortcode and blocks print) and the
-	 * names, pods and find outputs are returned as they are: a form saves
-	 * what it reads back to the item, and the others carry no ID to map.
+	 * Only the outputs that carry IDs (arrays, ids, objects); a form read is left alone because
+	 * a form saves what it reads back to the item.
 	 *
 	 * @param mixed  $value Field value.
 	 * @param array  $row Current row data.
@@ -84,13 +67,12 @@ final class PerfLocalePodsDisplay {
 	 * @return mixed
 	 */
 	public function translate_field_value( mixed $value, mixed $row, mixed $params, mixed $obj ): mixed {
-		// Only translate pick (relationship) fields.
+		// A field() read has a named params object.
 		if ( ! is_object( $params ) || ! isset( $params->name ) ) {
 			return $value;
 		}
 
-		// The end of a display read whose rows map_display_source() mapped:
-		// the item keeps its own rows again.
+		// End of a display read map_display_source() mapped: restore the item's own rows.
 		if ( null !== $this->display_rows && isset( $this->display_rows[ $params ] ) ) {
 			[ $item, $name, $rows ] = $this->display_rows[ $params ];
 			unset( $this->display_rows[ $params ] );
@@ -104,9 +86,7 @@ final class PerfLocalePodsDisplay {
 			return $value;
 		}
 
-		// Resolve the language first: nothing is translated on the default
-		// language, so bail BEFORE the (more expensive) Pods field-config
-		// lookup below - matching the ACF and Meta Box addons' ordering.
+		// Language first: the default language maps nothing, so skip the costlier field-config lookup.
 		$lang_slug = $this->get_target_slug();
 
 		if ( $lang_slug === '' ) {
@@ -120,9 +100,7 @@ final class PerfLocalePodsDisplay {
 			$field_data = $obj->fields( $params->name );
 		}
 
-		// Pods' fields() can return a Field object, an array, null, or
-		// false depending on field state. Only proceed when we have
-		// something usable to avoid downstream method-on-null errors.
+		// fields() may return a Field object, an array, null or false.
 		if ( ! is_object( $field_data ) && ! is_array( $field_data ) ) {
 			return $value;
 		}
@@ -148,15 +126,8 @@ final class PerfLocalePodsDisplay {
 	/**
 	 * Map the related items a display read formats.
 	 *
-	 * A display read ($pod->display(), a magic tag, the [pods] shortcode and
-	 * the Pods blocks) formats a relationship field before pods_pods_field
-	 * runs. It formats the rows Pods keeps in the item's row under the field
-	 * name, the arrays output. This filter runs at the start of that read:
-	 * it maps those rows to the current language, after reading the field
-	 * once with the arrays output when Pods has not read it yet (the read the
-	 * display would make). Pods then formats and escapes the mapped rows as
-	 * it does any rows, and translate_field_value() puts the item's own rows
-	 * back at the end of the read. The output type is returned unchanged.
+	 * A display read formats the item's arrays-output rows before pods_pods_field runs, so this maps
+	 * those rows at the start of the read (reading the field first when Pods has not); output is unchanged.
 	 *
 	 * @param mixed $output How Pods outputs the related items.
 	 * @param mixed $row    Current row.
@@ -281,10 +252,7 @@ final class PerfLocalePodsDisplay {
 	 * What a pick field relates to, from its pick_object: 'post' for posts
 	 * of any post type and media, 'term' for terms, '' for anything else.
 	 *
-	 * Pods saves the related type as pick_object "post_type" or "taxonomy"
-	 * with the post type or taxonomy name in pick_val. The combined form of
-	 * the field editor's Related Type list, "post_type-NAME" or
-	 * "taxonomy-NAME", is read the same way.
+	 * Pods saves "post_type" or "taxonomy" with the name in pick_val; the editor's "post_type-NAME" form reads the same.
 	 *
 	 * @param mixed $pick_object The field's pick_object.
 	 * @return string
@@ -306,17 +274,9 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * Resolve a post's current-language sibling, but only when the visitor is
-	 * allowed to see it.
+	 * Resolve a post's current-language sibling, only when the visitor may see it.
 	 *
-	 * `pods_pods_field` is filtered on the FRONT END, so a pick field whose
-	 * sibling is still a draft/pending/private translation would otherwise put
-	 * that unpublished post's title on a public page and link to a URL an
-	 * anonymous visitor cannot open. PerfLocale creates translations as drafts,
-	 * so that is the normal state of a half-finished translation, not an edge
-	 * case. Returning null keeps the published source in place - the same rule
-	 * the ACF addon applies to its relationship / post-object fields and the
-	 * WooCommerce addon to cross-sell and upsell IDs.
+	 * Translations start as drafts; null keeps the published source instead of a draft's title and URL.
 	 *
 	 * @param int    $post_id   Source post ID.
 	 * @param string $lang_slug Target language slug.
@@ -347,11 +307,7 @@ final class PerfLocalePodsDisplay {
 	/**
 	 * Translate post reference IDs to their current-language equivalents.
 	 *
-	 * Handles a list (Pods' multi-select value; its keys are kept) of IDs,
-	 * row arrays (output=arrays) or WP_Post objects, and one of each (a
-	 * single-select value). A sibling the visitor may not see is skipped -
-	 * see {@see self::public_translation_id()}. Anything that is not a post
-	 * reference is returned as it is.
+	 * A list (keys kept) or one item: IDs, row arrays or WP_Post objects. A sibling the visitor may not see is skipped.
 	 *
 	 * @param mixed  $value Post reference value(s).
 	 * @param string $lang_slug Target language slug.
@@ -372,10 +328,9 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * One related post in the current language, in the shape it came in: an
-	 * ID, a row array (see {@see self::row_for()}) or a WP_Post. The item is
-	 * returned as it is when it is not a post reference or has no sibling
-	 * the visitor may see.
+	 * One related post in the current language, in the shape it came in.
+	 *
+	 * Unchanged when it is not a post reference or has no sibling the visitor may see.
 	 *
 	 * @param mixed  $item      Related post.
 	 * @param string $lang_slug Target language slug.
@@ -402,14 +357,9 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * A related item's row array (Pods' arrays output: the row's columns and
-	 * pod_item_id) for another post or term, with the same keys: a key the
-	 * object has takes the object's value, pod_item_id takes the object's
-	 * ID, any other key keeps the row's value. A number goes in as a string
-	 * where the row held a string, as the database row Pods read does. The
-	 * row then goes through Pods' pods_access_bleep_data(), as every row Pods
-	 * reads does, so a password the object holds is not in it. It reads the
-	 * loaded object only, so it costs no query.
+	 * A related item's row array (Pods' arrays output) for another post or term, with the same keys.
+	 *
+	 * Strings stay strings as in Pods' database row; pods_access_bleep_data() drops a password, as Pods does.
 	 *
 	 * @param array<int|string, mixed> $row    Source row.
 	 * @param object                   $object Translated WP_Post or WP_Term.
@@ -456,15 +406,9 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * Load what the mapping of a list of related posts reads, in batches:
-	 * the links of every referenced post in one prime, then their
-	 * current-language posts in chunks of TARGET_PRIME_CHUNK. The mapping
-	 * then finds them in the cache instead of paying one link lookup (above
-	 * the eager-map cap) and one post query per item. It only fills caches:
-	 * the per-item visibility check, the fallback to the source and the
-	 * order are the mapping's. Terms and meta are not read by the mapping,
-	 * so they are not loaded. A list with fewer than two distinct posts is
-	 * left to the mapping.
+	 * Batch-load the links and current-language posts the mapping of a list of related posts reads.
+	 *
+	 * Fills caches only (visibility, fallback and order stay the mapping's); under two distinct posts it does nothing.
 	 *
 	 * @param array<int|string, mixed> $value     Relationship field value.
 	 * @param string                   $lang_slug Target language slug.
@@ -506,9 +450,7 @@ final class PerfLocalePodsDisplay {
 	/**
 	 * Translate term reference IDs to their current-language equivalents.
 	 *
-	 * Handles a list (its keys are kept) of IDs, row arrays or WP_Term
-	 * objects, and one of each. Anything that is not a term reference is
-	 * returned as it is.
+	 * A list (keys kept) or one item: IDs, row arrays or WP_Term objects.
 	 *
 	 * @param mixed  $value Term reference value(s).
 	 * @param string $lang_slug Target language slug.
@@ -529,9 +471,7 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * One related term in the current language, in the shape it came in: an
-	 * ID, a row array (see {@see self::row_for()}) or a WP_Term. The item is
-	 * returned as it is when it is not a term reference or has no sibling.
+	 * One related term in the current language, in the shape it came in.
 	 *
 	 * @param mixed  $item      Related term.
 	 * @param string $lang_slug Target language slug.
@@ -585,11 +525,7 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * Load what the mapping of a list of related terms reads, in batches:
-	 * the links of every referenced term in one prime, then their
-	 * current-language terms in chunks of TARGET_PRIME_CHUNK, without term
-	 * meta. Like prime_post_targets() it only fills caches, and a list with
-	 * fewer than two distinct terms is left to the mapping.
+	 * Batch-load the links and current-language terms (no meta) the mapping of a list of related terms reads.
 	 *
 	 * @param array<int|string, mixed> $value     Relationship field value.
 	 * @param string                   $lang_slug Target language slug.
@@ -655,8 +591,7 @@ final class PerfLocalePodsDisplay {
 	}
 
 	/**
-	 * The current language slug when it is not the default language, the
-	 * language whose pages are mapped; '' otherwise.
+	 * The current language slug when it is not the default language; '' otherwise.
 	 *
 	 * @return string
 	 */

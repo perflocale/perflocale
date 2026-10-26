@@ -14,43 +14,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Compares the block structure of a machine translation with its source
- * before the translation is saved.
+ * Refuses a machine translation whose block structure differs from its source's, checked as it would be saved.
  *
- * A provider receives block content whole, block delimiter comments included.
- * When it changes or cuts a delimiter, the block is lost on save: a raw `<`
- * in the attribute JSON makes wp_kses() escape the opener to `&lt;!-- wp:`, a
- * raw newline makes the JSON undecodable so the block is saved without its
- * attributes, and a cut-off opener is left behind as text. The check therefore
- * runs on the result as it would be saved (after sanitize_mt_html()).
- *
- * Delimiters are read with the expression WP_Block_Parser::next_token() uses,
- * so the list holds exactly the delimiters parse_blocks() reads, inner blocks
- * included. Comparing delimiters rather than the parsed tree also catches a
- * missing closer, which parse_blocks() fills in silently. A result passes when
- *
- * - it has the source's delimiters in the same order: the same kind (start,
- *   end or self-closing) and the same block name at every position;
- * - every delimiter whose attribute JSON decodes to a non-empty object in the
- *   source carries attribute JSON that decodes to a non-empty object;
- * - the text between delimiters, inside blocks or outside them, holds no
- *   more block-delimiter text (`<!-- wp:` or `&lt;!-- wp:`, closers included)
- *   than the source's does. wp_kses() closes a block whose closer was cut off,
- *   so a cut-off closer survives only as such text inside the block.
- *
- * Content without block delimiters is not checked. The check is pure PHP: one
- * regular-expression pass over each text.
+ * Compares delimiters, not the parsed tree, which fills in a missing closer silently: see
+ * docs-ai/11-code-rationale.md, "BlockStructureGuard: what a result must keep".
  */
 final class BlockStructureGuard {
 
 	/**
-	 * Block delimiter grammar, as in WP_Block_Parser::next_token().
+	 * Block delimiter grammar of WP_Block_Parser::next_token(): keep it identical, so the list is what parse_blocks() reads.
 	 */
 	private const DELIMITER = '/<!--\s+(?P<closer>\/)?wp:(?P<namespace>[a-z][a-z0-9_-]*\/)?(?P<name>[a-z][a-z0-9_-]*)\s+(?P<attrs>{(?:(?:[^}]+|}+(?=})|(?!}\s+\/?-->).)*+)?}\s+)?(?P<void>\/)?-->/s';
 
 	/**
-	 * Block-delimiter text that is not a delimiter: raw, or escaped by
-	 * wp_kses() or an entity encoder.
+	 * Block-delimiter text that is not a delimiter: raw, or escaped by wp_kses() or an entity encoder.
 	 */
 	private const STRAY = '/(?:<|&lt;|&#0*60;|&#x0*3c;)!--\s*\/?wp:/i';
 
@@ -59,9 +36,7 @@ final class BlockStructureGuard {
 	 *
 	 * @param string $source Source content (the post as stored).
 	 * @param string $result Translated content as it would be saved.
-	 * @return string '' when the result keeps the source's block structure or
-	 *                the source has no blocks; otherwise the reason, one
-	 *                sentence for the job log, the REST response and WP-CLI.
+	 * @return string '' when the structure is kept or the source has no blocks; else one sentence for log, REST and CLI.
 	 */
 	public static function mismatch( string $source, string $result ): string {
 		if ( ! str_contains( $source, '<!-- wp:' ) ) {
@@ -71,6 +46,71 @@ final class BlockStructureGuard {
 		$detail = self::difference( $source, $result );
 
 		return '' === $detail ? '' : self::reason( $detail );
+	}
+
+	/**
+	 * Why a provider answer may not be saved: text between two block delimiters came back without any.
+	 *
+	 * Script and style bodies are no text. Checked on the raw answer: the sanitizer empties some markup on purpose.
+	 *
+	 * @param string $sent   Content as sent, delimiters in place.
+	 * @param string $answer The answer with its delimiters put back.
+	 * @return string '' when each stretch with text kept text, or the delimiters differ (mismatch() reports that).
+	 */
+	public static function lost_text( string $sent, string $answer ): string {
+		$src = self::delimiters( $sent );
+		$out = self::delimiters( $answer );
+
+		if ( null === $src || null === $out || [] === $src || count( $src ) !== count( $out ) ) {
+			return '';
+		}
+
+		$count = count( $src );
+		$stack = [];
+
+		// Stretch $g runs from the end of delimiter $g - 1 to the start of delimiter $g (the end of the content for the last).
+		for ( $g = 0; $g <= $count; $g++ ) {
+			if ( $g < $count && ( $src[ $g ]['kind'] !== $out[ $g ]['kind'] || $src[ $g ]['name'] !== $out[ $g ]['name'] ) ) {
+				return '';
+			}
+
+			$a = 0 === $g ? 0 : $src[ $g - 1 ]['end'];
+			$b = 0 === $g ? 0 : $out[ $g - 1 ]['end'];
+
+			if ( self::has_text( $g < $count ? substr( $sent, $a, $src[ $g ]['start'] - $a ) : substr( $sent, $a ) )
+				&& ! self::has_text( $g < $count ? substr( $answer, $b, $out[ $g ]['start'] - $b ) : substr( $answer, $b ) ) ) {
+				return sprintf(
+					/* translators: 1: block name, 2: position of the nearest block delimiter. */
+					__( 'the text of block %1$s (at block delimiter %2$d) came back empty', 'perflocale' ),
+					[] === $stack ? 'core/freeform' : (string) end( $stack ),
+					min( $g + 1, $count )
+				);
+			}
+
+			if ( $g < $count && 'start' === $src[ $g ]['kind'] ) {
+				$stack[] = $src[ $g ]['name'];
+			} elseif ( $g < $count && 'end' === $src[ $g ]['kind'] ) {
+				array_pop( $stack );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Whether HTML shows a letter or digit (comments, tags, script and style bodies aside).
+	 *
+	 * @param string $html HTML.
+	 * @return bool
+	 */
+	public static function has_text( string $html ): bool {
+		if ( '' === trim( $html ) ) {
+			return false;
+		}
+
+		$html = (string) preg_replace( '#<(script|style)\b[^>]*+>.*?</\1\s*>#is', '', $html );
+
+		return 1 === preg_match( '/[\p{L}\p{N}]/u', html_entity_decode( strip_tags( $html ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.strip_tags_strip_tags -- A text check, not output; script and style are removed above.
 	}
 
 	/**
@@ -149,31 +189,10 @@ final class BlockStructureGuard {
 	}
 
 	/**
-	 * Damaged block markup in a stored content, for a read-only scan.
+	 * Damaged block markup in a stored content, for a read-only scan (pure).
 	 *
-	 * Counts four kinds: `escaped` (block-delimiter text escaped by wp_kses()
-	 * or an entity encoder, `&lt;!-- wp:`), `text` (raw block-delimiter text
-	 * that is not a delimiter, such as a cut-off opener), `unbalanced` (an end
-	 * with no matching start, or a start never ended) and `attributes` (blocks
-	 * that lost comment attributes their source block has; only counted when
-	 * $source is given). `first` is the earliest finding, `at` the earliest
-	 * of each kind found.
-	 *
-	 * Lost attributes: the blocks of both texts are paired in order when their
-	 * names match one to one. A key the source block has and the translation
-	 * block lacks is lost unless the block editor itself leaves it out of the
-	 * comment. The editor's serializer (getCommentAttributes() in
-	 *
-	 * @wordpress/blocks) writes only attributes its block type defines, never
-	 * one with a `source` (it lives in the HTML) or the role `local`, and never
-	 * a value equal to the schema default; core's PHP serialize_block_attributes()
-	 * writes every key it is given. So for a block type in $schemas a key counts
-	 * as lost when the schema defines it, gives it no source and no local role,
-	 * and the source value is not its default. A block type without a schema
-	 * (registered in JavaScript only) counts only when every attribute is gone,
-	 * which is what wp_kses() leaves of attribute JSON that no longer decodes.
-	 *
-	 * Pure: the result depends on the arguments only.
+	 * Kinds `escaped`, `text` (delimiter text that is no delimiter), `unbalanced`, `attributes` (with $source only, see
+	 * docs-ai/11-code-rationale.md, "BlockStructureGuard: lost attributes"); `first` is the earliest hit, `at` per kind.
 	 *
 	 * @param string                              $html    Content.
 	 * @param string|null                         $source  The source content (null: no attribute check).
@@ -267,8 +286,7 @@ final class BlockStructureGuard {
 	}
 
 	/**
-	 * Blocks of a content that lost comment attributes of their source block
-	 * (rule in damage()).
+	 * Blocks that lost comment attributes of their source block (rule in damage()).
 	 *
 	 * @param string                              $html    Content.
 	 * @param string                              $source  Source content.
@@ -328,8 +346,7 @@ final class BlockStructureGuard {
 	}
 
 	/**
-	 * Start and self-closing delimiters of a content with their decoded
-	 * attributes, in order.
+	 * Start and self-closing delimiters with their decoded attributes, in order.
 	 *
 	 * @param string $html Content.
 	 * @return array<int, array{0: string, 1: array<mixed>, 2: int}>|null [ block name, attributes ([] when none or undecodable), offset ].
@@ -356,9 +373,7 @@ final class BlockStructureGuard {
 	/**
 	 * Read the block delimiters of a text, in order.
 	 *
-	 * `kind` is start, end or void; `name` carries the core/ namespace when
-	 * the delimiter omits it; `attrs` is whether the attribute JSON decodes
-	 * to a non-empty object; `start` and `end` are byte offsets.
+	 * `name` gets core/ when the delimiter omits it; `attrs`: the JSON decodes to a non-empty object; byte offsets.
 	 *
 	 * @param string $html Content.
 	 * @return array<int, array{kind: string, name: string, attrs: bool, start: int, end: int}>|null

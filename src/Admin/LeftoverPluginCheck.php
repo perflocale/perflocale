@@ -14,16 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Finds WooCommerce Multilingual and WPML String Translation while they are
- * active.
+ * Finds WooCommerce Multilingual and WPML String Translation while they are active.
  *
- * Neither is a conflict PerfLocale refuses to run beside (WPML itself is):
- * String Translation does nothing without WPML, and WooCommerce Multilingual
- * keeps its own currency switcher and currency settings running without
- * WPML, next to PerfLocale's. Both are left active easily after a
- * migration, so {@see SiteHealth} reports them and shows a notice with a
- * button that deactivates WooCommerce Multilingual through core's own
- * Plugins action.
+ * Not a hard conflict like WPML itself: SiteHealth only reports them, since WCML keeps its currency switcher running.
  */
 final class LeftoverPluginCheck {
 
@@ -95,11 +88,9 @@ final class LeftoverPluginCheck {
 	}
 
 	/**
-	 * Core's deactivate link for WooCommerce Multilingual, or '' for any
-	 * other plugin or when the current user may not deactivate it here.
+	 * Core's deactivate link for WooCommerce Multilingual, or '' when not allowed here.
 	 *
-	 * A plugin active network-wide is deactivated from the network admin,
-	 * so no link is offered for it on a site's screens.
+	 * No link for a network-wide activation: only the network admin can deactivate it.
 	 *
 	 * @param string $name Display name from {@see PLUGINS}.
 	 * @param string $file Plugin file.

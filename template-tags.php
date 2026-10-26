@@ -1,8 +1,6 @@
 <?php
 /**
- * PerfLocale template tags.
- *
- * Public functions for theme developers to use in templates.
+ * PerfLocale template tags for themes.
  *
  * @package PerfLocale
  */
@@ -12,11 +10,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Internal: dev-mode guard that nudges callers who hit a template tag before
- * the plugin container has booted. Returns true (caller should bail with the
- * type-appropriate default) when the call is too early, false otherwise. The
- * `_doing_it_wrong` notice is gated on WP_DEBUG by core, so production is a
- * pure boolean check.
+ * Whether a template tag was called before plugins_loaded; reports it through _doing_it_wrong().
  *
  * @internal
  * @param string $function Calling function name (pass `__FUNCTION__`).
@@ -35,10 +29,7 @@ function perflocale_doing_it_wrong_too_early( string $function ): bool {
 }
 
 /**
- * Output the language switcher HTML.
- *
- * Echoes the switcher directly. Use perflocale_get_language_switcher()
- * to get the HTML as a string instead.
+ * Output the language switcher HTML; perflocale_get_language_switcher() returns it instead.
  *
  * @param array<string, mixed> $args Display arguments.
  * @return void
@@ -47,10 +38,6 @@ function perflocale_language_switcher( array $args = [] ): void {
 	if ( perflocale_doing_it_wrong_too_early( __FUNCTION__ ) ) {
 		return;
 	}
-	// perflocale_get_language_switcher() now applies kses_switcher() itself,
-	// so its return is already an SVG-aware-sanitized string. The memo
-	// keyed by sha1 inside kses_switcher() makes double-wrap calls free,
-	// but here we just echo the pre-sanitized return directly.
 	echo perflocale_get_language_switcher( $args ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- return value of perflocale_get_language_switcher() is wp_kses'd via LanguageSwitcherBlock::kses_switcher().
 }
 
@@ -114,11 +101,7 @@ function perflocale_get_languages(): array {
 /**
  * Get the translated permalink for a post in a specific language.
  *
- * Accepts whatever `get_permalink()` accepts - a post ID, a WP_Post, or null
- * for the current post - because that is what it hands the value to, and a
- * template that passes `$post` or `get_queried_object()` must not fatal on
- * the way in. Anything that does not resolve to a post yields an empty
- * string, the same as an unknown ID.
+ * Accepts what get_permalink() accepts; anything that does not resolve to a post yields ''.
  *
  * @param int|WP_Post|null $post_id Post ID, post object, or null for the current post.
  * @param string           $lang_slug Target language slug.
@@ -140,10 +123,7 @@ function perflocale_get_permalink( int|WP_Post|null $post_id, string $lang_slug 
 		return '';
 	}
 
-	// The translation in that language has its own address (its own slug,
-	// and the language root for a front page translation). Converting the
-	// source URL would put the source slug under the target prefix, a URL
-	// that only reaches the translation through a fallback redirect.
+	// Prefer the translation's own permalink: a converted source URL keeps the source slug.
 	$post        = get_post( $post_id );
 	$groups      = $plugin->has( 'group_repo' ) ? $plugin->get( 'group_repo' ) : null;
 	$translation = 0;
@@ -171,10 +151,7 @@ function perflocale_get_permalink( int|WP_Post|null $post_id, string $lang_slug 
 /**
  * Get the translated term link for a term in a specific language.
  *
- * Accepts a term ID or a WP_Term, matching `get_term_link()`, which is where
- * the value goes: `get_the_terms()` and `get_queried_object()` both hand a
- * theme WP_Term objects, and a template tag that fataled on one would take
- * the whole page down. A term that cannot be resolved yields an empty string.
+ * Accepts a term ID or a WP_Term, as get_term_link() does; an unresolvable term yields ''.
  *
  * @param int|WP_Term $term_id Term ID or term object.
  * @param string      $lang_slug Target language slug.
@@ -197,8 +174,7 @@ function perflocale_get_term_link( int|WP_Term $term_id, string $lang_slug ): st
 		return '';
 	}
 
-	// As in perflocale_get_permalink(): the translated term's own link
-	// carries its own slug.
+	// As in perflocale_get_permalink(): the translated term's own link carries its own slug.
 	$term        = $term_id instanceof WP_Term ? $term_id : get_term( $term_id );
 	$groups      = $plugin->has( 'group_repo' ) ? $plugin->get( 'group_repo' ) : null;
 	$translation = 0;
@@ -259,42 +235,17 @@ function perflocale_is_rtl(): bool {
 }
 
 /**
- * Internal: resolve whichever string-translation service this blog is running.
+ * Resolve whichever string-translation service this blog registered (database or files mode).
  *
- * String translation ships as two interchangeable implementations and
- * `Bootstrap::register_frontend_services()` registers exactly ONE of them,
- * picked by the `string_translation_mode` setting: `Strings\StringTranslation`
- * under the id `string_translation` (database mode), and
- * `Strings\TranslationFileLoader` under `translation_file_loader` (files mode
- * - the default, and what a stock install runs). Both expose the same
- * `get_translation( string $text, string $domain, string $context ): ?string`,
- * so a caller only ever needs whichever one is there. Looking up a single id
- * is how perflocale_t() came to be inert on every files-mode site; the id
- * order below is the same walk
- * `PerfLocaleWooCommerce::translate_attribute_label()` makes, so the two
- * cannot drift apart.
- *
- * Returning null is a normal outcome, not an error: the frontend service
- * block is skipped wholesale on plain wp-admin requests, and a site can be
- * mid-mode-switch with neither id yet registered. Callers serve the original
- * string. Nothing here throws - these tags run inside theme templates, where
- * an exception takes the page down instead of losing one translation.
+ * Both ids must be tried (same order as PerfLocaleWooCommerce::translate_attribute_label());
+ * null is normal, e.g. on plain wp-admin requests, and callers serve the original string.
  *
  * @internal
  * @return object|null Service exposing get_translation(), or null when neither id is registered.
  */
 function perflocale_string_translation_service(): ?object {
-	// Resolve once per request, per blog. perflocale_t() is a loop tag - a
-	// theme can call it hundreds of times on one page - and the container
-	// walk below measures 0.106us against the 0.020us lookup it guards, so
-	// repeating it is the dominant cost of the tag. Keyed by blog id and
-	// never a bare static: a static holding blog-affine data across
-	// switch_to_blog() is this plugin's most repeated defect, and
-	// `string_translation_mode` is a per-blog setting. A MISS is deliberately
-	// not memoised, so nothing is pinned to "no service" for the rest of a
-	// request that resolved before the services existed - which also keeps
-	// the negative path re-checking the container on every call rather than
-	// needing a reset hook.
+	// Memoised per blog (the mode is a per-blog setting); a miss is not memoised,
+	// so a call before the services exist does not pin "no service" for the request.
 	static $resolved = [];
 
 	$blog_id = get_current_blog_id();
@@ -312,9 +263,7 @@ function perflocale_string_translation_service(): ?object {
 
 		$service = $plugin->get( $service_id );
 
-		// Checked, not assumed: either id can be re-registered through the
-		// container by an addon or a site, and this tag needs only the one
-		// method. Calling it blind would fatal inside a theme template.
+		// Checked: an addon can re-register either id, and a blind call would fatal a template.
 		if ( method_exists( $service, 'get_translation' ) ) {
 			$resolved[ $blog_id ] = $service;
 
@@ -326,19 +275,13 @@ function perflocale_string_translation_service(): ?object {
 }
 
 /**
- * Get a translated string by key from the PerfLocale string translations.
+ * Get a translated string by key from the PerfLocale string translations, in the 'perflocale' domain.
  *
- * Looks up translations directly from PerfLocale's string translation
- * engine rather than through WordPress gettext. This avoids using variable
- * parameters in __() / _x() which would violate i18n guidelines.
+ * Bypasses gettext, so callers need not pass variables to __(); returns the key when nothing is found.
  *
- * Works in both string-translation modes: it asks
- * {@see perflocale_string_translation_service()} for whichever service this
- * blog registered instead of assuming the database-mode one, and returns the
- * key untouched when neither is available.
- *
- * @param string $key String key / original text.
- * @param string $context Optional context.
+ * @param string                         $key      String key / original text.
+ * @param string                         $context  Optional context.
+ * @param string|int|WP_Post|object|null $language Optional language; '' for the current one.
  * @return string Translated string (or original if no translation found).
  */
 function perflocale_t( string $key, string $context = '', $language = '' ): string {
@@ -346,11 +289,7 @@ function perflocale_t( string $key, string $context = '', $language = '' ): stri
 		return $key;
 	}
 
-	// A named language takes the targeted-lookup path instead of the loaded map.
-	// The map holds exactly ONE language per request, so answering for another
-	// one from it is impossible - and switching the request's language to read a
-	// single string would rebuild the whole map. Helper::translate() reads just
-	// that value.
+	// The loaded map holds one language only: a named language takes Helper::translate()'s lookup.
 	if ( $language !== '' && $language !== null ) {
 		return function_exists( 'perflocale' )
 			? perflocale()->translate( $key, $language, [ 'context' => $context ] )
@@ -365,15 +304,7 @@ function perflocale_t( string $key, string $context = '', $language = '' ): stri
 
 	$translated = $service->get_translation( $key, 'perflocale', $context );
 
-	// Type-checked as well as null-checked. Both shipped implementations
-	// return null for "no translation" and never an empty string, so this is
-	// a no-op for them; it matters because the service comes out of a
-	// container an addon can re-register, and this function is declared
-	// `: string` - a non-string from a replacement service would surface in a
-	// theme as a TypeError on the way out rather than as a missing
-	// translation. An empty string is treated as "no translation" for the
-	// same reason both implementations already do: a template must not
-	// silently render nothing.
+	// Type-checked: a re-registered service could return a non-string; '' means no translation.
 	if ( is_string( $translated ) && $translated !== '' ) {
 		return $translated;
 	}
@@ -384,22 +315,7 @@ function perflocale_t( string $key, string $context = '', $language = '' ): stri
 /**
  * Whether content should display for the current language.
  *
- * Accepts any of:
- * - Single slug: perflocale_if_language( 'bg' )
- * - Comma-separated string: perflocale_if_language( 'bg,de' )
- * - Array of slugs: perflocale_if_language( [ 'bg', 'de' ] )
- *
- * Pass `$invert=true` to flip the semantics: "show everywhere EXCEPT these".
- *
- * Usage in a theme template:
- *
- * if ( perflocale_if_language( [ 'bg', 'de' ] ) ) {
- * echo 'Shown only to Bulgarian or German visitors.';
- * }
- *
- * This is the canonical entry point shared with the Gutenberg block
- * `perflocale/if-language` and the `[perflocale_if]` shortcode - all three
- * delegate to the same core predicate so semantics can't drift.
+ * Shares ConditionalContent::should_show() with the if-language block and the [perflocale_if] shortcode.
  *
  * @param string|array<int,string> $languages One slug, comma-separated string, or array.
  * @param bool                     $invert Invert: true = "NOT in the list".
@@ -417,10 +333,7 @@ function perflocale_if_language( string|array $languages, bool $invert = false )
 }
 
 /**
- * Get the date format for the current language.
- *
- * Falls back to the site's `date_format` option when the language has no
- * override.
+ * Get the date format for the current language, else the site's `date_format` option.
  *
  * @return string PHP date format string (e.g. "j F Y").
  */
@@ -429,7 +342,7 @@ function perflocale_date_format(): string {
 }
 
 /**
- * Get the time format for the current language. Falls back to site default.
+ * Get the time format for the current language, else the site default.
  *
  * @return string
  */
@@ -468,12 +381,9 @@ function perflocale_format_datetime( $timestamp = null ): string {
 }
 
 /**
- * Get the current page's URL in another language.
+ * Get the current page's URL in another language, as the switcher uses it.
  *
- * Returns the canonical translated URL the language switcher uses;
- * empty string if there is no translation in the target language on
- * the current singular page (callers can fall back to
- * {@see perflocale_home_url()} or render an "untranslated" UI).
+ * Empty when the current singular page has no translation in that language.
  *
  * @param string $lang_slug Target language slug.
  * @return string
@@ -487,8 +397,6 @@ function perflocale_current_url( string $lang_slug ): string {
 
 /**
  * Build a structured list of switcher items for the current page.
- *
- * See {@see PerfLocale\Helper::switcher_links()} for the entry shape.
  *
  * @return array<int, array{slug:string,locale:string,name:string,native_name:string,flag:string,text_direction:string,url:string,is_current:bool,is_translated:bool}>
  */
@@ -515,4 +423,35 @@ function perflocale_hreflang_tags(): void {
 	}
 
 	$plugin->get( 'hreflang' )->output_hreflang();
+}
+
+/**
+ * The copy groups whose stock differs across language copies. Reads only.
+ *
+ * Same as perflocale()->woocommerce()->stock_drift(): a WP_Error when WooCommerce, the add-on or Inventory Sync is off.
+ *
+ * @since 1.0.7.4
+ *
+ * @param array{product_ids?: list<int>, limit?: int} $args `product_ids`: only these products (any
+ *        language; empty: every product). `limit`: stop after this many groups (0: all).
+ * @return list<array{group: int, parent_id: int, members: list<array{product_id: int, parent_id: int, language: string, stock: float}>}>|WP_Error
+ */
+function perflocale_stock_drift( array $args = [] ): array|WP_Error {
+	return perflocale()->woocommerce()->stock_drift( $args );
+}
+
+/**
+ * Set the stock of each differing language copy to the reference value. Dry run by default.
+ *
+ * Same as perflocale()->woocommerce()->align_stock(): checks no user capability, like WooCommerce's own stock functions.
+ * In this version it always returns a WP_Error (`perflocale_stock_align_off`).
+ *
+ * @since 1.0.7.4
+ *
+ * @param array{from?: string|callable, product_ids?: list<int>, dry_run?: bool} $args `from`: 'default', an
+ *        active language slug, or a callable returning the value for a group (null skips it).
+ * @return array<string, list<array<string, mixed>>>|WP_Error
+ */
+function perflocale_align_stock( array $args = [] ): array|WP_Error {
+	return perflocale()->woocommerce()->align_stock( $args );
 }

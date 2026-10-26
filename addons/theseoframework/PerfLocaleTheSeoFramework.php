@@ -12,13 +12,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The SEO Framework (TSF) integration for PerfLocale.
+ * The SEO Framework (TSF) integration: translatable SEO meta, all-language sitemaps and schema.
  *
- * Registers SEO meta keys as translatable, ensures schema language
- * properties reflect the current language, and unlocks TSF's own
- * "optimized sitemap" queries so every language's posts are listed.
- * TSF delegates hreflang to multilingual plugins, which PerfLocale
- * already handles natively.
+ * No hreflang suppression: TSF leaves hreflang to multilingual plugins.
  */
 final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterface {
 
@@ -69,9 +65,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	/**
 	 * Lazily resolve PerfLocale's hreflang service.
 	 *
-	 * Frontend-only container service, so this is null in admin (non-AJAX)
-	 * context - where TSF's meta render data is still assembled for its SEO
-	 * bar but there is no fallback render to pin.
+	 * Null in admin (non-AJAX): the service is front-end only.
 	 *
 	 * @return \PerfLocale\Frontend\HreflangTags|null
 	 */
@@ -96,32 +90,23 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
 
-		// A field a person empties stays empty: its clear is recorded in the
-		// post's seed-cleared marker, which machine translation and the seed
-		// honour.
+		// A field a person empties stays empty: the clear is recorded in the
+		// post's seed-cleared marker, which machine translation and the seed honour.
 		\PerfLocale\Translation\SyncMeta::track_seed_clears( $this->add_meta_keys( [], '' ) );
 
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so TSF's own og:locale already reflects the current language.
 
-		// Missing-translation canonical guard. PerfLocale registers it on
-		// core's `get_canonical_url`, but TSF removes core's rel_canonical and
-		// emits its own, so that filter never fires and the guard is inert
-		// whenever this plugin is active. TSF 5.x exposes no canonical-specific
-		// filter - every head tag is assembled into one render-data map keyed
-		// by tag id - so the guard rides that map's `canonical` entry.
+		// TSF removes core's rel_canonical and has no canonical filter, so the missing-translation
+		// canonical guard rides the `canonical` entry of its head render-data map.
 		add_filter( 'the_seo_framework_meta_render_data', [ $this, 'pin_fallback_canonical' ] );
 
-		// TSF's "optimized sitemap" (on by default, replaces core sitemaps)
-		// builds its entries with plain WP_Query calls - without this unlock
-		// PerfLocale's language filter stamps the default language onto those
-		// queries and every translated post vanishes from the sitemap. hpt =
-		// hierarchical post types, nhpt = non-hierarchical; TSF filters both.
+		// TSF's optimized sitemap (default, replaces core's) uses plain WP_Query calls, which
+		// PerfLocale would limit to one language. hpt/nhpt: (non-)hierarchical post types.
 		add_filter( 'the_seo_framework_sitemap_hpt_query_args', [ $this, 'include_all_languages' ] );
 		add_filter( 'the_seo_framework_sitemap_nhpt_query_args', [ $this, 'include_all_languages' ] );
 
-		// Ensure schema graph reflects the current language. Gated on the
-		// setting so no callback runs when enrichment is disabled.
+		// Schema inLanguage and translation siblings, registered only when enrichment is on.
 		if ( $plugin->has( 'settings' ) && $plugin->get( 'settings' )->seo_schema_enrichment_enabled() ) {
 			add_filter( 'the_seo_framework_schema_graph_data', [ $this, 'filter_schema_language' ] );
 		}
@@ -130,10 +115,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	/**
 	 * Pin TSF's canonical on a missing-translation fallback render.
 	 *
-	 * TSF's own custom-canonical setting (`_genesis_canonical_uri`) is already
-	 * resolved into this href by the time the map is filtered, and
-	 * HreflangTags leaves an owner-set value alone - it only acts when the
-	 * href is the post's own permalink.
+	 * The href already holds `_genesis_canonical_uri`, which HreflangTags leaves alone.
 	 *
 	 * @param array<string, mixed>|mixed $data Meta render data keyed by tag id.
 	 * @return array<string, mixed>|mixed
@@ -178,10 +160,7 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	}
 
 	/**
-	 * Add TSF meta keys as translatable.
-	 *
-	 * TSF stores SEO meta using _genesis_* prefixed keys (shared with
-	 * Genesis theme) and its own custom meta keys.
+	 * Add TSF meta keys as translatable (`_genesis_*` keys are shared with the Genesis theme).
 	 *
 	 * @param array<int, string> $keys      Meta keys.
 	 * @param string             $post_type Post type.
@@ -199,18 +178,14 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 	}
 
 	/**
-	 * Machine-translatable SEO meta: titles/descriptions/social text ONLY.
-	 * The focus keyword is deliberately excluded - keyword targeting in the
-	 * target language is a human decision (add it back via this same filter
-	 * if a site wants it). Gated by the mt_meta_seo setting.
+	 * Machine-translatable SEO meta (titles, descriptions, social), gated by mt_meta_seo.
 	 *
 	 * @param array<int, string> $keys      Meta keys.
 	 * @param string             $post_type Post type.
 	 * @return array<int, string>
 	 */
 	/**
-	 * The SEO Framework meta keys this addon machine-translates - all plain-text
-	 * SEO fields, so all route to the provider's text mode via mt_meta_key_format().
+	 * TSF meta keys this addon machine-translates, all plain text (text mode).
 	 */
 	private const MT_TEXT_KEYS = [
 		'_genesis_title',
@@ -246,28 +221,13 @@ final class PerfLocaleTheSeoFramework implements \PerfLocale\Addon\AddonInterfac
 
 
 	/**
-	 * Enrich TSF's schema graph with inLanguage + translation siblings.
+	 * Enrich TSF's schema graph with inLanguage and translation siblings.
 	 *
-	 * TSF passes a SEQUENTIAL LIST of graph entities, which is the shape
-	 * SchemaEnricher::enrich_graph() handles directly - unlike the Rank Math,
-	 * SEOPress and Slim SEO addons, whose hosts pass a keyed map and which
-	 * therefore enrich entity by entity.
-	 *
-	 * Untyped parameter: TSF survives a non-array return from this filter and
-	 * keeps rendering - `$graph = apply_filters( 'the_seo_framework_schema_graph_data', … );`
-	 * is followed immediately by `if ( empty( $graph ) ) return [];`
-	 * (inc/classes/meta/schema.class.php:142-148), so a null from an earlier
-	 * callback drops the graph rather than fataling. An `array` declaration
-	 * would turn that survivable case into a TypeError raised at ARGUMENT
-	 * BINDING, before this body could return - the shape that took down
-	 * wpseo_sitemap_entry and wpseo_breadcrumb_links. The other five SEO
-	 * addons already hand an unrecognised payload straight back; this is the
-	 * last one that did not.
+	 * A list, so enrich_graph() handles it. Untyped on purpose: TSF drops an empty graph,
+	 * so an earlier callback may return null, and a typed parameter would fatal.
 	 *
 	 * @param array<int, array<string, mixed>>|mixed $data TSF schema graph (a list of entities).
-	 * @return array<int, array<string, mixed>>|mixed Enriched graph, or the
-	 *                                                value unchanged when it is
-	 *                                                not a graph array.
+	 * @return array<int, array<string, mixed>>|mixed Enriched graph; anything else unchanged.
 	 */
 	public function filter_schema_language( $data ) {
 		if ( ! is_array( $data ) ) {

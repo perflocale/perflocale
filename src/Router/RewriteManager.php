@@ -19,10 +19,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Manages WordPress rewrite rules for language-prefixed URLs.
- *
- * Prepends language-prefixed variants of all existing rewrite rules
- * so that /de/about/ resolves to the same handler as /about/ but
- * with the 'lang' query var set.
  */
 final class RewriteManager {
 
@@ -39,9 +35,7 @@ final class RewriteManager {
 	private const VERIFIED_KEY = 'rewrites_verified';
 
 	/**
-	 * Autoloaded option name for the "verified" flag. Stored as a plain
-	 * wp_option (autoload=on) so reads in `is_verified()` are alloptions
-	 * hits (~1 µs) instead of 3-layer cache lookups.
+	 * Autoloaded option holding the "verified" flag, so the hot-path read is an alloptions hit.
 	 */
 	private const VERIFIED_OPTION = 'perflocale_rewrites_verified';
 
@@ -62,10 +56,7 @@ final class RewriteManager {
 	/**
 	 * Resolve the CacheManager lazily from the plugin container.
 	 *
-	 * This class is instantiated very early (on `init`:5); the container
-	 * may not yet hold the cache service in some edge paths, so we tolerate
-	 * a missing instance by falling back to the original direct-transient
-	 * behaviour for that one request.
+	 * Null when the container does not hold the cache service yet (early `init` paths).
 	 *
 	 * @return CacheManager|null
 	 */
@@ -89,11 +80,7 @@ final class RewriteManager {
 	 * @return bool
 	 */
 	private function is_verified(): bool {
-		// Hot-path: autoloaded option is an alloptions-cached read (~1 µs)
-		// vs the 3-layer cache->get() path it replaces (~100-200 µs L3
-		// transient roundtrip when L1+L2 are cold). `clear_verified()` is
-		// called explicitly whenever rewrite rules regenerate, so the
-		// transient's auto-expiration safety net isn't needed.
+		// Autoloaded option: clear_verified() runs whenever the rules regenerate, so no expiry is needed.
 		CacheManager::before_autoloaded_read( self::VERIFIED_OPTION );
 
 		return get_option( self::VERIFIED_OPTION, '' ) === '1';
@@ -105,8 +92,6 @@ final class RewriteManager {
 	 * @return void
 	 */
 	private function mark_verified(): void {
-		// Autoload=true so the value loads with alloptions and `is_verified()`
-		// reads it for free thereafter.
 		update_option( self::VERIFIED_OPTION, '1', true );
 	}
 
@@ -120,8 +105,7 @@ final class RewriteManager {
 		// which would otherwise keep the rules scan off until a cache flush.
 		CacheManager::delete_autoloaded_options( [ self::VERIFIED_OPTION ] );
 
-		// Belt-and-suspenders: clear the older cache- and transient-backed
-		// storage too in case an upgrade left a stale TRUE there.
+		// Also clear the cache and transient copies an upgrade may have left set.
 		$cache = $this->cache();
 		if ( $cache instanceof CacheManager ) {
 			$cache->delete( self::VERIFIED_KEY, self::CACHE_GROUP );
@@ -207,10 +191,6 @@ final class RewriteManager {
 	/**
 	 * Frontend self-healing: flush rewrite rules if language patterns are missing.
 	 *
-	 * Uses a transient flag to avoid scanning rewrite rules on every request.
-	 * The flag is cleared when rewrite rules are flushed (via option update),
-	 * so the next request after a flush verifies the rules are correct.
-	 *
 	 * @return void
 	 */
 	public function maybe_flush_if_missing_frontend(): void {
@@ -223,18 +203,8 @@ final class RewriteManager {
 			return;
 		}
 
-		// Nothing to flush TOWARD. With an empty language regex,
-		// filter_rewrite_rules() prepends no rules, so a rebuild cannot
-		// produce `lang=$matches[1]` and the scan below will fail again on
-		// the very next request. That would not be one wasted flush: the
-		// plugin's own flush fires `rewrite_rules_array`, whose priority-999
-		// closure clears the verified flag, so the site would flush the
-		// entire rule set on EVERY frontend request and rewrite the
-		// `rewrite_rules` option each time, busting alloptions for every
-		// other process. Reachable on a brand-new install (no languages
-		// added yet) and on a blog whose tables are missing or unreadable.
-		// build_language_regex() reads through the language cache, so this
-		// costs far less than the rules scan it short-circuits.
+		// No language regex: a flush cannot add language rules and its `rewrite_rules_array` clears
+		// the flag again, so every request would flush (fresh install, unreadable tables).
 		if ( $this->build_language_regex() === '' ) {
 			return;
 		}
@@ -255,18 +225,9 @@ final class RewriteManager {
 			}
 		}
 
-		// Mark BEFORE flushing so a request that arrives while the (slow)
-		// rule regeneration is still running sees the flag and skips its own
-		// flush. The window is short and NOT request-long: flush_rewrite_rules()
-		// → WP_Rewrite::flush_rules() → refresh_rewrite_rules() → rewrite_rules()
-		// fires `rewrite_rules_array`, and the priority-999 closure registered
-		// in register_hooks() clears the flag again from inside that dispatch.
-		// So the request ends with the flag CLEARED and the next frontend hit
-		// re-scans get_option( 'rewrite_rules' ), finds the language patterns
-		// the flush just wrote, and re-marks. That is the intended settling
-		// path - one extra scan, never a flush loop - but it does mean two
-		// requests landing on a cold site can both flush. Both flushes produce
-		// identical rules, so the outcome is the same either way.
+		// Mark before flushing so concurrent requests skip their own flush. The flush's
+		// `rewrite_rules_array` closure clears the flag again; the next request re-scans and
+		// re-marks (one extra scan, never a loop).
 		$this->mark_verified();
 		flush_rewrite_rules( false );
 	}
@@ -286,14 +247,6 @@ final class RewriteManager {
 
 	/**
 	 * Prepend language-prefixed rewrite rules before all existing rules.
-	 *
-	 * For each existing rule like:
-	 * 'about/?$' => 'index.php?pagename=about'
-	 *
-	 * This creates:
-	 * 'fr/about/?$' => 'index.php?lang=fr&pagename=about'
-	 *
-	 * The language-prefixed rules are prepended so they match first.
 	 *
 	 * @param array<string, string> $rules Existing rewrite rules.
 	 * @return array<string, string> Modified rules with language prefixes.
@@ -347,12 +300,8 @@ final class RewriteManager {
 			// Add the language parameter.
 			$new_rewrite = str_replace( 'index.php?', 'index.php?' . $lang_qv . '&', $new_rewrite );
 
-			// Some third-party rules (WooCommerce wc-auth/wc-api among them)
-			// anchor their pattern with a leading ^. Prepending the language
-			// group would leave that ^ mid-regex, and since WP matches rules
-			// as #^pattern#, a mid-pattern anchor can never match - the rule
-			// becomes dead weight in every match loop. Strip it: our prefix
-			// re-anchors the pattern at the start anyway.
+			// Strip a leading ^ (WooCommerce wc-auth/wc-api): WP matches #^pattern#, so a
+			// mid-pattern anchor never matches. Our prefix re-anchors the pattern.
 			$new_rules[ $lang_regex . '/' . ltrim( $pattern, '^' ) ] = $new_rewrite;
 		}
 
@@ -363,10 +312,7 @@ final class RewriteManager {
 	/**
 	 * Build a regex that matches only configured language URL prefixes.
 	 *
-	 * Returns a capturing group like `(en|fr|de|ar)` instead of a
-	 * generic `([a-z]{2,3})` pattern. This prevents false matches
-	 * where taxonomy bases like 'tag' or 'cat' are interpreted as
-	 * language codes.
+	 * Only configured prefixes, never `[a-z]{2,3}`, which would match bases like 'tag' or 'cat'.
 	 *
 	 * @return string Regex capturing group, or empty string if no languages.
 	 */

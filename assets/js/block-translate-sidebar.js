@@ -235,7 +235,7 @@
 
 			window.perflocaleBlockTranslate.translate( leaves, targetSlug, function () {
 				setBusy( null );
-			} );
+			}, { scope: 'post' } );
 		}
 
 		return el( PluginDocumentSettingPanel, {

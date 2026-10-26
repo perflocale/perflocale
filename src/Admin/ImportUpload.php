@@ -14,33 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Receives an export file for the Settings → Export & Import form in pieces,
- * so a file larger than PHP's own upload limits (upload_max_filesize,
- * post_max_size) can still be imported through the screen.
- *
- * The browser script (assets/js/import-upload.js) sends a file the server
- * would refuse in one request as a series of pieces to the admin-ajax action
- * `perflocale_import_upload`, then submits the import form with the upload's
- * token instead of the file. The form handler takes the assembled file from
- * here (complete_path()) and imports it exactly as an uploaded one.
- *
- * Each request needs the import form's nonce and the capabilities the import
- * needs (manage_options and perflocale_import_export). The file is assembled
- * in uploads/perflocale/temp/ (hardened, no public access) under a name that
- * holds the user's ID, the announced size and 24 random characters; only that
- * user can add to it or import it, pieces are accepted strictly in order, and
- * the file can never grow past the size announced at the start. An upload
- * that is abandoned is deleted by the cleanup event scheduled at its start
- * (one day) and by the daily sweep of the temp directory; a failed one is
- * deleted at once.
- *
- * Uploads in progress are limited per user and per site, by number and by
- * announced bytes (quota()). Each upload holds a reservation in
- * QUOTA_OPTION from its start until it is imported (claim()), cancelled,
- * fails or is cleaned up; a reservation that gets no piece for an hour
- * expires, and every piece checks it first. Reservations change only under
- * one lock, so two uploads that start at once cannot both take the last
- * place.
+ * Receives a Settings > Export & Import file in pieces (assets/js/admin-settings.js), so a file over PHP's upload
+ * limits can be imported: staged per user in the hardened temp directory, in order, never past the announced size,
+ * under per-user and per-site quotas. Docs: docs-ai/11-code-rationale.md, "ImportUpload: staged pieces and quotas".
  */
 final class ImportUpload {
 
@@ -65,8 +41,7 @@ final class ImportUpload {
 	private const MAX_PIECE = 8388608;
 
 	/**
-	 * Option holding the uploads in progress: token => user ID, announced
-	 * bytes and the time the reservation expires.
+	 * Option of the uploads in progress: token => user id, announced bytes, reservation expiry.
 	 */
 	public const QUOTA_OPTION = 'perflocale_import_uploads';
 
@@ -81,8 +56,7 @@ final class ImportUpload {
 	private const IDLE_SECONDS = 3600;
 
 	/**
-	 * Smallest piece, in bytes. The browser script halves a piece that the
-	 * server or a proxy refuses as too large, down to this size.
+	 * Smallest piece, in bytes; the browser halves a piece refused as too large down to this.
 	 */
 	public const MIN_PIECE = 262144;
 
@@ -95,28 +69,21 @@ final class ImportUpload {
 	private const WRITE_FAILED = 3;
 
 	/**
-	 * Bytes per piece for this server: a safe share of the smaller of PHP's
-	 * upload limits, between 256 KB and 8 MB, or the filtered size within
-	 * the same bounds.
+	 * Bytes per piece: three quarters of the smaller PHP upload limit, or the filtered size, within 256 KB to 8 MB.
 	 *
 	 * @return int
 	 */
 	public static function piece_bytes(): int {
 		$limit = AdminController::max_upload_bytes();
 
-		// Room for the multipart envelope and the other fields of the
-		// request. Without a known PHP limit, the smallest piece.
+		// Room for the multipart envelope and other fields; without a known PHP limit, the smallest piece.
 		$cap   = $limit > 0 ? (int) floor( $limit * 0.75 ) : self::MIN_PIECE;
 		$bytes = max( self::MIN_PIECE, min( self::MAX_PIECE, $cap ) );
 
 		/**
-		 * Filters the size of each piece in which the Export & Import screen
-		 * sends an import file larger than PHP accepts in one request. Lower
-		 * it when a proxy or firewall in front of the site refuses requests
-		 * smaller than PHP's own limits (the screen also halves a piece the
-		 * server refuses as too large, down to 256 KB). The result is kept
-		 * between 256 KB and 8 MB and at most three quarters of the smaller
-		 * of PHP's upload_max_filesize and post_max_size.
+		 * Filters the piece size in which the Export & Import screen sends an import file too large for one request: lower
+		 * it when a proxy or firewall refuses smaller requests than PHP does. Kept within 256 KB to 8 MB and at most three
+		 * quarters of the smaller of upload_max_filesize and post_max_size.
 		 *
 		 * @hook  perflocale/import/upload_piece_bytes
 		 * @since 1.0.7.3
@@ -159,8 +126,7 @@ final class ImportUpload {
 	}
 
 	/**
-	 * Start an upload: check the announced size, create the empty file and
-	 * schedule its cleanup.
+	 * Start an upload: check the announced size, create the empty file, schedule its cleanup.
 	 *
 	 * @return void
 	 */
@@ -177,6 +143,13 @@ final class ImportUpload {
 			wp_send_json_error( [ 'message' => self::too_large_message() ], 413 );
 		}
 
+		// Before any piece: a file the import request cannot finish is refused now, not after the upload.
+		$too_slow = \PerfLocale\Background\WebLimit::units_refusal( 'data_import', intdiv( $size, 200 ), 'wp perflocale import <file>' );
+
+		if ( '' !== $too_slow ) {
+			wp_send_json_error( [ 'message' => $too_slow ], 413 );
+		}
+
 		$dir = \PerfLocale\Helper::uploads_temp_dir();
 
 		if ( '' === $dir || ! wp_mkdir_p( $dir ) ) {
@@ -185,9 +158,8 @@ final class ImportUpload {
 
 		\PerfLocale\Helper::harden_directory( $dir );
 
-		// Room for the file and its import: refuse up front rather than fail
-		// on the last piece. disk_free_space() can be disabled; then the
-		// pieces' own write checks report a full disk.
+		// Refuse up front when the disk cannot hold the file and its import; with disk_free_space() disabled the pieces'
+		// write checks report a full disk.
 		$free = function_exists( 'disk_free_space' ) ? @disk_free_space( $dir ) : false; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Disabled or failing on some hosts; false is handled.
 
 		if ( is_numeric( $free ) && (float) $free < $size * 1.1 ) {
@@ -214,8 +186,7 @@ final class ImportUpload {
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Paired with the fopen above.
 		fclose( $handle );
 
-		// An upload that is never finished is deleted by this event, the
-		// same safety net a one-request upload gets.
+		// A never-finished upload is deleted by this event, as a one-request upload is.
 		\PerfLocale\Background\BackgroundEvents::enqueue( 'perflocale_cleanup_temp_import', [ $path ], DAY_IN_SECONDS );
 
 		wp_send_json_success(
@@ -227,8 +198,7 @@ final class ImportUpload {
 	}
 
 	/**
-	 * Append one piece. It must start where the file ends now and must not
-	 * take the file past its announced size.
+	 * Receive one piece (append_piece() has the offset and size rules).
 	 *
 	 * @return void
 	 */
@@ -249,9 +219,7 @@ final class ImportUpload {
 			return;
 		}
 
-		// The reservation must still hold; each piece extends it. A busy
-		// quota lock is not an expired upload: the piece is refused as
-		// retryable and the file is kept.
+		// Each piece needs and extends the reservation; a busy quota lock is not an expiry: retryable, file kept.
 		$renewed = self::renew( $token );
 
 		if ( null === $renewed ) {
@@ -293,11 +261,8 @@ final class ImportUpload {
 	}
 
 	/**
-	 * Append a piece to the staged file, under an exclusive lock on it: the
-	 * piece must start where the file ends and must not take it past its
-	 * announced size, and the size is read after the lock is held, so two
-	 * requests for one upload can never both pass the check. A filesystem
-	 * that does not lock still gets the check.
+	 * Write a piece at its offset, at or before the file's end and never past the announced size; staged bytes are
+	 * kept, so a retry must repeat them. The size is read under the lock, so two requests never both append.
 	 *
 	 * @param string $path   Staged file.
 	 * @param string $tmp    The piece.
@@ -318,17 +283,30 @@ final class ImportUpload {
 
 		flock( $out, LOCK_EX );
 
-		$stat   = fstat( $out );
-		$have   = is_array( $stat ) ? (int) $stat['size'] : -1;
+		$stat = fstat( $out );
+		$have = is_array( $stat ) ? (int) $stat['size'] : -1;
+
+		// The path must still name the opened file: claim() may have moved it while this piece waited.
+		clearstatcache( true, $path );
+		$now    = @stat( $path );
 		$status = self::APPENDED;
 
-		if ( $offset !== $have ) {
+		if ( ! is_array( $stat ) || ! is_array( $now ) || $now['ino'] !== $stat['ino'] || $now['dev'] !== $stat['dev'] ) {
+			$status = self::WRITE_FAILED;
+		} elseif ( $offset < 0 || $offset > $have ) {
 			$status = self::OUT_OF_ORDER;
-		} elseif ( $bytes <= 0 || $bytes > self::MAX_PIECE || $have + $bytes > $size ) {
+		} elseif ( $bytes <= 0 || $bytes > self::MAX_PIECE || $offset + $bytes > $size ) {
 			$status = self::BAD_SIZE;
 		}
 
 		$in = self::APPENDED === $status ? @fopen( $tmp, 'rb' ) : false;
+
+		// A retry (cut off mid-append, or its answer lost): only the bytes past the file's end are written.
+		if ( false !== $in && $offset < $have && ! self::repeats( $out, $in, $offset, min( $bytes, $have - $offset ) ) ) {
+			fclose( $in );
+			$in     = false;
+			$status = self::OUT_OF_ORDER;
+		}
 
 		if ( false !== $in ) {
 			$ok = 0 === fseek( $out, 0, SEEK_END );
@@ -359,6 +337,36 @@ final class ImportUpload {
 	}
 
 	/**
+	 * Whether the next $len bytes of the piece equal the staged bytes at $offset.
+	 *
+	 * @param resource $out    Staged file, locked.
+	 * @param resource $in     The piece, at its start; left after the compared bytes.
+	 * @param int      $offset Where the piece starts.
+	 * @param int      $len    Bytes to compare.
+	 * @return bool
+	 */
+	private static function repeats( $out, $in, int $offset, int $len ): bool {
+		// phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fread -- Locked staged file; see append_piece().
+		if ( 0 !== fseek( $out, $offset ) ) {
+			return false;
+		}
+
+		while ( $len > 0 ) {
+			$n     = min( 65536, $len );
+			$piece = fread( $in, $n );
+
+			if ( false === $piece || strlen( $piece ) !== $n || fread( $out, $n ) !== $piece ) {
+				return false;
+			}
+
+			$len -= $n;
+		}
+		// phpcs:enable WordPress.WP.AlternativeFunctions.file_system_operations_fread
+
+		return true;
+	}
+
+	/**
 	 * Delete an unfinished upload.
 	 *
 	 * @return void
@@ -375,9 +383,8 @@ final class ImportUpload {
 	}
 
 	/**
-	 * The assembled file for a finished upload of the current user, for the
-	 * import form handler; '' when the token is not the current user's, the
-	 * file is gone, or it does not have the announced size yet.
+	 * The assembled file of the current user's finished upload, for the import form; '' when the token is not theirs,
+	 * the file is gone or it is short of the announced size.
 	 *
 	 * @param string $token Upload token from the form.
 	 * @return string Absolute path.
@@ -397,9 +404,8 @@ final class ImportUpload {
 	}
 
 	/**
-	 * The assembled file of a finished upload, taken for an import: as
-	 * complete_path(), and the upload's reservation is released, since the
-	 * import owns the file from here. '' when the reservation has expired.
+	 * Take a finished upload's file for an import: as complete_path(), with the reservation released and the file moved
+	 * off the upload's path (take()); '' when the reservation has expired.
 	 *
 	 * @param string $token Upload token from the form.
 	 * @return string|null Absolute path; null when the quota lock stayed busy
@@ -418,12 +424,51 @@ final class ImportUpload {
 			return null;
 		}
 
-		return $released ? $path : '';
+		return $released ? self::take( $path, self::announced_size( $token ) ) : '';
 	}
 
 	/**
-	 * Release the reservation of the upload a staged file belongs to (the
-	 * cleanup event's file). Any other path is ignored.
+	 * Move a finished upload's file to its claimed name, so no delayed piece reaches it, and check its size under
+	 * the pieces' lock (a piece writing at the move finishes first); '' and the file deleted when the size is wrong.
+	 *
+	 * @param string $path Staged file.
+	 * @param int    $size Announced size.
+	 * @return string Claimed file, or ''.
+	 */
+	private static function take( string $path, int $size ): string {
+		// phpcs:disable WordPress.WP.AlternativeFunctions.rename_rename, WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.WP.AlternativeFunctions.file_system_operations_fclose, WordPress.PHP.NoSilencedErrors.Discouraged -- Atomic move in the hardened temp directory and the pieces' flock; WP_Filesystem has neither. Failures are handled.
+		$claimed = substr( $path, 0, -5 ) . '-claimed.json';
+
+		if ( ! @rename( $path, $claimed ) ) {
+			return '';
+		}
+
+		$handle = @fopen( $claimed, 'r+b' );
+		$whole  = false;
+
+		if ( $handle ) {
+			flock( $handle, LOCK_EX );
+			$stat  = fstat( $handle );
+			$whole = is_array( $stat ) && (int) $stat['size'] === $size;
+			flock( $handle, LOCK_UN );
+			fclose( $handle );
+		}
+		// phpcs:enable WordPress.WP.AlternativeFunctions.rename_rename, WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.WP.AlternativeFunctions.file_system_operations_fclose, WordPress.PHP.NoSilencedErrors.Discouraged
+
+		// The upload's cleanup event names the old path; the import schedules its own.
+		\PerfLocale\Background\BackgroundEvents::unschedule( 'perflocale_cleanup_temp_import', [ $path ] );
+
+		if ( ! $whole ) {
+			wp_delete_file( $claimed );
+
+			return '';
+		}
+
+		return $claimed;
+	}
+
+	/**
+	 * Release the reservation of the upload a staged file belongs to (the cleanup event's file); other paths are ignored.
 	 *
 	 * @param string $path Staged file.
 	 * @return void
@@ -456,12 +501,9 @@ final class ImportUpload {
 		];
 
 		/**
-		 * Filters the limits on uploads of import files in progress. The
-		 * Export & Import screen sends a file larger than PHP accepts in one
-		 * request in pieces, staged on the server until it is imported. An
-		 * upload counts from its start until it is imported, cancelled or
-		 * fails, or until an hour passes without a piece; bytes are the sizes
-		 * announced at the start. A start that would pass a limit is refused.
+		 * Filters the limits on import file uploads in progress (files the Export & Import screen sends in pieces). An
+		 * upload counts its announced size from its start until it is imported, cancelled, fails or idles an hour; a start
+		 * past a limit is refused.
 		 *
 		 * @hook  perflocale/import/upload_quota
 		 * @since 1.0.7.3
@@ -482,8 +524,7 @@ final class ImportUpload {
 	}
 
 	/**
-	 * Reserve a place for a new upload, after dropping the reservations that
-	 * expired (their files too).
+	 * Reserve a place for a new upload, after dropping expired reservations and their files.
 	 *
 	 * @param string $token Upload token.
 	 * @param int    $user  User ID.
@@ -599,9 +640,8 @@ final class ImportUpload {
 	}
 
 	/**
-	 * Change the reservations under the lock. The callback receives the live
-	 * reservations (expired ones are dropped, with their files, before it
-	 * runs) and returns them as they should be stored, with its result.
+	 * Change the reservations under the lock: the callback gets the live ones (expired ones and their files dropped
+	 * first) and returns them as stored, with its result.
 	 *
 	 * @param callable(array<string, array{user: int, bytes: int, expires: int}>): array{0: array<string, array{user: int, bytes: int, expires: int}>, 1: mixed} $change Change.
 	 * @return mixed The callback's result, or null when the lock stayed busy.
@@ -618,10 +658,9 @@ final class ImportUpload {
 		}
 
 		try {
-			// The stored row, not a copy this request may hold: another
-			// request may have changed it since.
+			// The stored row, not this request's copy: another request may have changed it.
 			wp_cache_delete( self::QUOTA_OPTION, 'options' );
-			wp_cache_delete( 'notoptions', 'options' );
+			\PerfLocale\Database\NotOptions::unlist( [ self::QUOTA_OPTION ] );
 
 			$stored = get_option( self::QUOTA_OPTION, [] );
 			$held   = [];
@@ -663,8 +702,7 @@ final class ImportUpload {
 	}
 
 	/**
-	 * The size a token announces, when it is well formed and the current
-	 * user's; 0 otherwise.
+	 * The size a well-formed token of the current user announces; 0 otherwise.
 	 *
 	 * @param string $token Token.
 	 * @return int
@@ -682,8 +720,7 @@ final class ImportUpload {
 	}
 
 	/**
-	 * Where a token's file is assembled. The name has the shape of every
-	 * staged import (`import-<token>.json`), so the temp directory's cleanup
+	 * Where a token's file is assembled, named like every staged import (`import-<token>.json`) so the temp cleanup
 	 * covers it.
 	 *
 	 * @param string $token Token.
@@ -730,8 +767,7 @@ final class ImportUpload {
 	}
 
 	/**
-	 * The message for a file larger than this site imports through the
-	 * screen; WP-CLI is the way left.
+	 * The message for a file larger than this site imports through the screen (WP-CLI is left).
 	 *
 	 * @return string
 	 */

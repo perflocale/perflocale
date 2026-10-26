@@ -17,14 +17,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Data access for the `perflocale_string_translations` table.
- *
- * Introduced in DB version 2. Replaces the prior pattern of storing each
- * translation as an individual `perflocale_str_<string_id>_<lang_id>` row
- * in wp_options, which required CONCAT() joins that couldn't use indexes.
- *
- * All lookups here use the composite PRIMARY KEY on (string_id, language_id)
- * or the secondary index on language_id - index seeks, not table scans.
+ * Data access for `perflocale_string_translations`: every lookup is an index seek on the (string_id, language_id)
+ * primary key or the language_id index.
  */
 final class StringTranslationRepository {
 
@@ -36,10 +30,7 @@ final class StringTranslationRepository {
 	/**
 	 * Constructor.
 	 *
-	 * @param CacheManager $cache Cache manager - accepted for DI consistency
-	 *                           with sibling repos; this class currently
-	 *                           caches only via wpdb's query cache, so the
-	 *                           manager isn't referenced.
+	 * @param CacheManager $cache Cache manager, accepted for DI consistency with sibling repositories (unused).
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- DI signature parity with sibling repositories.
 	public function __construct( CacheManager $cache ) {
@@ -49,11 +40,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Resolve the full table name for the current blog.
-	 *
-	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly - capturing the name in the constructor would otherwise
-	 * pin this instance to whichever blog was active at construction.
+	 * The full table name for the current blog, computed per call so switch_to_blog() is followed.
 	 *
 	 * @return string
 	 */
@@ -62,7 +49,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Get the translation for a single (string, language) pair.
+	 * The translation of one (string, language) pair.
 	 *
 	 * @param int $string_id String ID.
 	 * @param int $language_id Language ID.
@@ -88,13 +75,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Batched fetch of translations for many strings in one language - one
-	 * IN() query instead of get() per string (the bulk-MT skip-existing hot
-	 * path called it once per string per chunk).
-	 *
-	 * Only NON-EMPTY translations are returned, so a caller can treat a
-	 * missing key exactly like get()==='' (translatable). Empty rows never
-	 * exist anyway - set('') deletes the row - but the WHERE guards it.
+	 * Translations of many strings in one language in one IN() query (the bulk skip-existing path). Only non-empty ones,
+	 * so a missing key reads as get() === ''.
 	 *
 	 * @param int[] $string_ids  String IDs.
 	 * @param int   $language_id  Language ID.
@@ -128,9 +110,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Upsert a single translation. Empty value deletes the row so the
-	 * absence semantic ("no translation") matches the pre-v2 behavior
-	 * where an empty option was indistinguishable from a missing one.
+	 * Upsert one translation; an empty value deletes the row (no row is "no translation").
 	 *
 	 * @param int    $string_id String ID.
 	 * @param int    $language_id Language ID.
@@ -146,21 +126,8 @@ final class StringTranslationRepository {
 			return $this->delete( $string_id, $language_id );
 		}
 
-		// INSERT … ON DUPLICATE KEY UPDATE on the (string_id, language_id)
-		// PRIMARY KEY - atomic insert-or-update, deliberately NOT REPLACE
-		// INTO. REPLACE is a DELETE+INSERT that silently resets every column
-		// it doesn't name: it would blow away extra_forms (plural forms 2..N)
-		// whenever ANY caller - admin save, the MT bulk job, migrations, or
-		// an addon bridging a value-matched string - rewrites the base
-		// translation. This upsert preserves extra_forms unconditionally
-		// (only set_extra_forms() and authoritative plural imports touch it)
-		// and resets the MT review columns ONLY when the text really changed
-		// (a quality score belongs to the text it scored; a no-op rewrite
-		// keeps it, so the sampler isn't forced to re-score). Assignment
-		// ORDER is load-bearing: the review IF()s must run before
-		// `translation = VALUES(translation)` - ON DUPLICATE KEY UPDATE
-		// assigns left-to-right, and afterwards `translation` already holds
-		// the new value, making the comparison a tautology.
+		// Atomic upsert on the (string_id, language_id) primary key, not REPLACE INTO: REPLACE is DELETE+INSERT and
+		// would reset extra_forms (plural forms 2..N), which only set_extra_forms() and plural imports may change.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared
 		$result = $this->wpdb->query(
 			$this->wpdb->prepare(
@@ -180,13 +147,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Set (or clear) the JSON plural extra_forms on an EXISTING row.
-	 *
-	 * Uses UPDATE - the row must already exist, so callers create it via
-	 * set() first. set() itself never touches this column (its upsert
-	 * preserves extra_forms), making this method the single write path for
-	 * plural forms 2..N outside authoritative plural imports.
-	 * A null or empty list stores NULL, clearing any stale value.
+	 * Set or clear the plural extra_forms of an existing row (an UPDATE: set() creates the row and never touches this
+	 * column). Null or [] stores NULL.
 	 *
 	 * @param int                        $string_id   String ID.
 	 * @param int                        $language_id Language ID.
@@ -200,10 +162,7 @@ final class StringTranslationRepository {
 
 		$json = self::normalize_extra_forms( $forms );
 
-		// A clear must store SQL NULL, not '' - wpdb::prepare() binds a null
-		// %s argument as the empty string, which would satisfy the
-		// `IS NOT NULL` guards (batch map load, counts) with a junk value.
-		// NULL is the column's only "no extra forms" state, so branch the SQL.
+		// A clear stores SQL NULL, not '': prepare() binds a null %s as '', which would pass the IS NOT NULL guards.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- The replacements arrive as one array (a second binding on SQLite only).
 		if ( $json === null ) {
 			$result = $this->wpdb->query(
@@ -215,9 +174,7 @@ final class StringTranslationRepository {
 				)
 			);
 		} else {
-			// On SQLite the write-time fragment compares with the new value, a
-			// second binding of the same JSON (never NULL here; a stored NULL
-			// compares unequal, so that change moves the write time too).
+			// On SQLite the write-time fragment compares with a second binding of the new JSON (a stored NULL compares unequal).
 			$touch  = Schema::touch_write_time( [ [ 'extra_forms', '%s', 'text' ] ] );
 			$result = $this->wpdb->query(
 				$this->wpdb->prepare(
@@ -232,16 +189,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Canonicalise a positional extra-forms list to the exact string this
-	 * repository stores (a JSON array, or NULL for "no extra forms"). Shared
-	 * by set_extra_forms() and callers that need to DIFF a posted value
-	 * against the stored column without re-writing it.
-	 *
-	 * Forms are POSITIONAL (form 2 at index 0, form 3 at index 1, …). Only
-	 * TRAILING empties are truly absent - a middle empty must be kept as ''
-	 * so a later form keeps its CLDR index (dropping it would shift, say,
-	 * "many" into the "few" slot). Empty forms fall back to form 1 at serve
-	 * time.
+	 * The stored form of an extra-forms list (a JSON array, or null for none), shared with callers that compare a posted
+	 * value. Positional (form 2 at index 0): only trailing empties are dropped, a middle '' keeps later CLDR indexes.
 	 *
 	 * @param array<int, string>|null $forms Forms 2..N, or null.
 	 * @return string|null Stored JSON, or null when there are no forms.
@@ -261,7 +210,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Read the decoded plural extra_forms for one row.
+	 * The decoded plural extra_forms of one row.
 	 *
 	 * @param int $string_id   String ID.
 	 * @param int $language_id Language ID.
@@ -315,16 +264,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Defensive orphan-sweep: delete any string_translations rows whose
-	 * referenced strings.id no longer exists.
-	 *
-	 * The primary cleanup path is StringRepository::gc_stale_strings(),
-	 * which cascades to string_translations via an explicit IN-list before
-	 * deleting the parent strings row. This method is a safety net for
-	 * any path that bypasses that cascade (manual SQL, partial-failure
-	 * recovery, a future code path that forgets the cascade).
-	 *
-	 * Single-statement LEFT JOIN; cheap when there's nothing to delete.
+	 * Delete translation rows whose string is gone: a safety net behind StringRepository::gc_stale_strings()'s cascade.
+	 * One table per statement (the SQLite integration's 2.2.x legacy driver mishandles a DELETE with a JOIN).
 	 *
 	 * @return int Number of orphan rows deleted.
 	 */
@@ -335,9 +276,7 @@ final class StringTranslationRepository {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$deleted = (int) $this->wpdb->query(
 			$this->wpdb->prepare(
-				'DELETE tr FROM %i tr
-				LEFT JOIN %i s ON s.id = tr.string_id
-				WHERE s.id IS NULL',
+				'DELETE FROM %i WHERE string_id NOT IN ( SELECT id FROM %i )',
 				$translations_table,
 				$strings_table
 			)
@@ -345,8 +284,7 @@ final class StringTranslationRepository {
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		if ( $deleted > 0 ) {
-			// Generation bump - reliable on object caches whose
-			// wp_cache_flush_group() no-ops (e.g. Redis Object Cache + Predis).
+			// A generation bump: wp_cache_flush_group() is a no-op on some object caches (Redis Object Cache with Predis).
 			CacheManager::bump_group_generation( 'perflocale_trans' );
 			/** @hook perflocale/string_translations/orphans_swept Fires when the orphan-sweep deletes rows. */
 			do_action( 'perflocale/string_translations/orphans_swept', $deleted );
@@ -356,16 +294,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Delete every translation row for a given language.
-	 *
-	 * Used when a language is removed from PerfLocale - replaces the old
-	 * REGEXP-against-wp_options cleanup.
-	 *
-	 * Throws on DB failure so callers running this inside a transaction
-	 * (LanguageRepository::delete wraps the full FK-cascade in one) see
-	 * the failure and ROLLBACK. Returning silent 0 on failure would let
-	 * the outer transaction COMMIT with this table's DELETE not applied,
-	 * defeating the all-or-nothing guarantee.
+	 * Delete every translation of a language. Throws on failure, so LanguageRepository::delete()'s transaction rolls
+	 * back instead of committing without this table.
 	 *
 	 * @param int $language_id Language ID.
 	 * @return int Number of rows deleted.
@@ -392,9 +322,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Delete every translation row for a given string.
-	 *
-	 * Used when a string is removed (e.g. during stale-string migration).
+	 * Delete every translation of a string.
 	 *
 	 * @param int $string_id String ID.
 	 * @return int Number of rows deleted.
@@ -416,14 +344,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Move every translation row from one string to another.
-	 *
-	 * Used by the stale-string migration path when a source text changes
-	 * but the translations should be reused (marked as needs_update later).
-	 *
-	 * Never deletes the source rows unless the UPDATE that copies them
-	 * reported success, so a database failure cannot leave the translations
-	 * with no home.
+	 * Move every translation of one string to another (stale-string migration); the source rows are deleted only after
+	 * the UPDATE reported success.
 	 *
 	 * @param int $from_id Source string ID.
 	 * @param int $to_id Destination string ID.
@@ -446,21 +368,13 @@ final class StringTranslationRepository {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
-		// A failed UPDATE moved NOTHING - every row is still attached to
-		// $from_id, and the DELETE below is the destination-wins cleanup for
-		// rows the UNIQUE key refused to move. Running it after a failure
-		// deletes the only remaining copy of those translations. A transaction
-		// is not the answer here: START TRANSACTION silently no-ops on a
-		// MyISAM-default host (which is exactly why ENGINE=InnoDB is written
-		// out on all nine tables), so ORDER is the mechanism - never delete a
-		// source the move did not confirm it copied. Report the failure and
-		// leave the rows alone; the caller aborts its cascade on a negative.
+		// A failed UPDATE moved nothing: the DELETE below would remove the only copy. Order is the safeguard, not a
+		// transaction (a no-op on MyISAM-default hosts).
 		if ( $result === false ) {
 			return -1;
 		}
 
-		// Clean up any rows that couldn't move due to a pre-existing
-		// row at the target (unique conflict from IGNORE).
+		// Rows the unique key kept from moving (the target had one): the destination wins.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->delete( $this->table(), [ 'string_id' => $from_id ], [ '%d' ] );
 
@@ -468,9 +382,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Bulk-load translations for a set of string IDs into a lookup map
-	 * keyed by string_id. Used by TranslationFileGenerator and lookups
-	 * that would otherwise issue one query per row.
+	 * Translations of many strings in one language, string_id => translation, in one query.
 	 *
 	 * @param array<int, int> $string_ids String IDs.
 	 * @param int             $language_id Language ID.
@@ -512,11 +424,7 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Batch-fetch decoded plural extra_forms for a set of string IDs.
-	 *
-	 * Returns only string_ids that actually have extra forms (the JSON
-	 * column is NULL for every 2-form language and every non-plural
-	 * string), so the map is usually empty.
+	 * Decoded plural extra_forms of many strings, only those that have some (usually none).
 	 *
 	 * @param array<int, int> $string_ids  Source string IDs.
 	 * @param int             $language_id Language ID.
@@ -562,13 +470,8 @@ final class StringTranslationRepository {
 	}
 
 	/**
-	 * Upsert many translations with one statement per 200 rows.
-	 *
-	 * The same write as set() for each row (INSERT … ON DUPLICATE KEY UPDATE
-	 * of `translation` only, so extra_forms and the review columns are kept),
-	 * for bulk writers such as the WPML import. Rows with an empty
-	 * translation or a non-positive id are skipped; set() deletes on empty,
-	 * which a bulk writer never asks for.
+	 * Upsert many translations, one statement per 200 rows, as set() writes each (`translation` only, extra_forms kept);
+	 * empty translations and non-positive ids are skipped (bulk writers never delete).
 	 *
 	 * @param array<int, array{0: int, 1: int, 2: string}> $rows string_id, language_id, translation.
 	 * @return bool False when a statement failed (earlier chunks stay written).

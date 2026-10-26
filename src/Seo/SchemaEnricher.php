@@ -16,23 +16,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Adds `inLanguage` + translation cross-links to any schema graph handed in.
+ * Adds `inLanguage` and `workTranslation` links to the schema graphs of the SEO addons.
  *
- * Shared by every built-in SEO addon so enrichment logic lives in exactly
- * one place. Each addon keeps its own filter hook wiring (so it can be
- * disabled per-addon) but delegates the actual graph walk here.
- *
- * Completely side-effect-free - the input graph is copied, enriched, and
- * returned. No DB writes. No remote calls. One call to the per-request
- * cached `UrlConverter::get_translations_for_current_page()` per page load
- * regardless of how many addons invoke us.
+ * No side effects; one memoised get_translations_for_current_page() call per request.
  */
 final class SchemaEnricher {
 
 	/**
-	 * Schema.org `@type` values we should add `inLanguage` to. Types that
-	 * describe a specific page or work - not organisation-wide entities
-	 * like `Organization`, `Person`, `WebSite` which are language-neutral.
+	 * Page- and work-level `@type`s to enrich; Organization, Person and WebSite are language-neutral.
 	 *
 	 * @var array<int, string>
 	 */
@@ -57,16 +48,16 @@ final class SchemaEnricher {
 	];
 
 	/**
-	 * Per-request memo so repeat calls across multiple addon hooks don't
-	 * re-dereference the container or rebuild the sibling URL map.
+	 * Per-request context shared by every addon hook; reset() clears it.
 	 *
 	 * @var array{in_language: string, siblings: array<string, string>, current_url: string}|null
 	 */
 	private static ?array $memo = null;
 
 	/**
-	 * Enrich a full schema graph ({"@context": "...", "@graph": [...]}) OR
-	 * a flat list of entity arrays. Both shapes are preserved on return.
+	 * Enrich an `@graph` envelope, a list of entities or one entity, keeping its shape.
+	 *
+	 * A keyed map counts as one entity and comes back unchanged: enrich its values with enrich_single().
 	 *
 	 * @param array<mixed> $graph Schema graph or entity list.
 	 * @param int|null     $post_id Override post context (defaults to current).
@@ -83,7 +74,7 @@ final class SchemaEnricher {
 			return $graph;
 		}
 
-		// Handle the JSON-LD envelope form with an inner @graph list.
+		// JSON-LD envelope with an inner @graph list.
 		if ( isset( $graph['@graph'] ) && is_array( $graph['@graph'] ) ) {
 			$graph['@graph'] = array_map(
 				static fn( $entity ) => is_array( $entity ) ? self::enrich_single( $entity, $post_id ) : $entity,
@@ -93,10 +84,7 @@ final class SchemaEnricher {
 			return $graph;
 		}
 
-		// Handle a bare list of entities. ($graph === array_values($graph) is
-		// the idiomatic list check, equivalent to array_is_list() - which
-		// Plugin Check maps to WP 6.5 although it's a PHP 8.1 native the
-		// plugin's PHP floor already guarantees.)
+		// A bare list. Not array_is_list(): Plugin Check flags it as WordPress 6.5.
 		if ( $graph === array_values( $graph ) ) {
 			return array_map(
 				static fn( $entity ) => is_array( $entity ) ? self::enrich_single( $entity, $post_id ) : $entity,
@@ -104,13 +92,12 @@ final class SchemaEnricher {
 			);
 		}
 
-		// Single entity passed as the top-level payload.
+		// One entity as the whole payload.
 		return self::enrich_single( $graph, $post_id );
 	}
 
 	/**
-	 * Enrich a single schema entity. Returns the entity unchanged when
-	 * its `@type` isn't a page-level or work-level type we care about.
+	 * Enrich one schema entity; one that is not a page or work type comes back unchanged.
 	 *
 	 * @param array<string, mixed> $entity Schema entity.
 	 * @param int|null             $post_id Override post context.
@@ -131,14 +118,12 @@ final class SchemaEnricher {
 			return $entity;
 		}
 
-		// Always add inLanguage - universally supported across validators.
+		// inLanguage and workTranslation never overwrite a value the SEO plugin set.
 		if ( $ctx['in_language'] !== '' && ! isset( $entity['inLanguage'] ) ) {
 			$entity['inLanguage'] = $ctx['in_language'];
 		}
 
-		// Cross-link translations via workTranslation. Points the canonical
-		// entity (this page) at its siblings. Schema.org validators + SERP
-		// features (Google's "see this in X language") read this property.
+		// workTranslation points this page at its translations.
 		if ( ! empty( $ctx['siblings'] ) && ! isset( $entity['workTranslation'] ) ) {
 			$entity['workTranslation'] = array_values(
 				array_map(
@@ -155,8 +140,7 @@ final class SchemaEnricher {
 	}
 
 	/**
-	 * Reset the per-request memo. Called on `switch_blog` so sibling URLs
-	 * from one site don't leak into another.
+	 * Reset the per-request memo, so one site's sibling URLs never reach another after switch_blog.
 	 *
 	 * @return void
 	 */
@@ -180,8 +164,7 @@ final class SchemaEnricher {
 	}
 
 	/**
-	 * Whether the given schema `@type` (string or array of strings) is one
-	 * we should enrich.
+	 * Whether a schema `@type` (a string or a list of strings) is one to enrich.
 	 *
 	 * @param mixed $type Raw `@type` value.
 	 * @return bool
@@ -205,7 +188,7 @@ final class SchemaEnricher {
 	/**
 	 * Resolve per-request context (current hreflang + translation siblings).
 	 *
-	 * @param int|null $post_id Unused currently - reserved for context binding.
+	 * @param int|null $post_id Reserved for a per-post context; unused.
 	 * @return array{in_language: string, siblings: array<string, string>, current_url: string}|null
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- Reserved for future per-post context binding; kept in signature to avoid call-site churn.
@@ -217,22 +200,19 @@ final class SchemaEnricher {
 		$plugin = Plugin::get_instance();
 
 		if ( ! $plugin->has( 'router' ) ) {
-			// Do NOT cache a null here - the router may become available
-			// later in the request (e.g. an SEO addon asking for schema
-			// before parse_request has fired on a preview endpoint).
+			// Never memoise a null: the router may become available later in the request.
 			return null;
 		}
 
 		$lang = $plugin->get( 'router' )->get_current_language();
 
 		if ( ! is_object( $lang ) ) {
-			// Same reasoning: don't lock in a null for the whole request.
+			// Never memoise a null: the language may resolve later in the request.
 			return null;
 		}
 
 		$locale = (string) ( $lang->locale ?? '' );
-		// Canonical BCP 47 form for `inLanguage` (`en-US` not `en_US` or
-		// `en-us`) - search engines and rich-results validators expect it.
+		// Canonical BCP 47 (`en-US`), the form rich-results validators expect.
 		$in_language = $locale !== '' ? \PerfLocale\Helper::format_locale_as_bcp47( $locale ) : (string) ( $lang->slug ?? '' );
 
 		$siblings    = [];

@@ -14,22 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Tracks where a `translation_links.source` row originated.
+ * Provenance of a translation link, stored verbatim in `translation_links.source`.
  *
- * Stored as the literal string value in `translation_links.source`
- * (VARCHAR(20)). Drives:
- *
- *   - the Source column / filter on the Translations admin page,
- *   - per-source bulk operations (e.g. re-run MT only on MT-sourced rows),
- *   - migration provenance reporting after Polylang/WPML/TranslatePress
- *     imports.
- *
- * Do NOT rename existing case values without a migration - the strings
- * appear verbatim in the DB.
- *
- * Adding a new case: add the case here, expose a label via
- * {@see self::label()}, and update the filter dropdown in
- * `TranslationsPage::render_source_filter()`.
+ * Renaming or removing a value needs a migration: rows hold the strings. A new case needs a label() arm; the
+ * Translations page source filter lists every case.
  */
 enum SourceType: string {
 
@@ -55,8 +43,7 @@ enum SourceType: string {
 	case Api = 'api';
 
 	/**
-	 * Coerce a raw DB value into a SourceType, falling back to Manual on
-	 * unknown values (forwards-compat with future-added cases).
+	 * Coerce a raw DB value into a SourceType; an unknown value reads as Manual.
 	 *
 	 * @param string $value Stored column value.
 	 * @return self

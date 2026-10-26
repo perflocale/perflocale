@@ -12,11 +12,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Oxygen 6.0 (Breakdance in Oxygen mode) integration for PerfLocale.
+ * Oxygen 6.0 (Breakdance in Oxygen mode) integration: the builder's content tree meta keys.
  *
- * Registers the builder's content tree meta keys as translatable.
- * Handles the dynamic meta prefix - Oxygen mode uses `_oxygen_*`
- * while Breakdance mode uses `_breakdance_*`.
+ * The meta prefix depends on BREAKDANCE_MODE: `_oxygen_*` or `_breakdance_*`.
  */
 final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 
@@ -59,21 +57,14 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function boot( \PerfLocale\Plugin $plugin ): void {
-		// Oxygen 6.0 / Breakdance uses `_oxygen_*` or `_breakdance_*` meta
-		// keys depending on BREAKDANCE_MODE. These are distinct from the
-		// `ct_*` keys that Oxygen Classic registers, so running both
-		// addons concurrently is safe (no key collisions).
+		// Distinct from Oxygen Classic's `ct_*` keys, so both add-ons can run together.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		// ⚠️ Only the TEXT-FREE keys mirror - see add_mirror_keys() for what is on
-		// that list and why the builder document is not. A mirror is
-		// bidirectional, so mirroring a document that carries the user's words
-		// destroys translated text in both directions.
+		// Machine translation reports this layout as not translated (BuilderLayout).
+		add_filter( 'perflocale/mt/builder_documents', static fn( array $b ): array => [ ...$b, [ 'name' => 'Oxygen', 'keys' => [ '_oxygen_data' ], 'always' => true ], [ 'name' => 'Breakdance', 'keys' => [ '_breakdance_data' ], 'always' => true ] ] );
+		// Only text-free keys mirror: a mirror is bidirectional and the builder document holds the user's words.
 		add_filter( 'perflocale/sync/mirror_meta_keys', [ $this, 'add_mirror_keys' ], 10, 2 );
 
-		// A raw meta mirror of the layout leaves the sibling's GENERATED
-		// per-post cache meta (css_file_paths_cache / dependency_cache)
-		// describing the pre-sync layout; drop them so the builder
-		// regenerates on next view.
+		// A layout mirror leaves the sibling's generated cache meta describing the old layout.
 		add_action( 'perflocale/sync/after_mirror', [ $this, 'invalidate_generated_caches' ], 10, 3 );
 	}
 
@@ -85,42 +76,23 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Layout keys that keep FULL MIRROR semantics.
+	 * Layout keys that keep full mirror semantics: the text-free ones only.
 	 *
-	 * ⚠️ The document that holds the user's TEXT is deliberately absent from this
-	 * list. It is seeded into a new translation by
-	 * {@see self::add_meta_keys()} and is owned by that translation from then on.
-	 *
-	 * A continuous mirror is bidirectional in ContentSync ("any group member's
-	 * save propagates group-wide"), so mirroring a builder document that carries
-	 * headings, paragraphs and button labels destroys translated text in BOTH
-	 * directions - a translator's save overwrites the source, and the next source
-	 * save overwrites the translation. That was reproduced end to end for
-	 * Elementor on 4.2.1 and 4.1.3, and observed for Beaver Builder on a replica;
-	 * every builder here stores text the same way, so all of them were moved.
-	 *
-	 * What stays below is the part that carries no user-visible text and genuinely
-	 * should track the source.
-	 *
-	 * The accepted cost: a structural edit to the source no longer propagates.
-	 * Propagating layout without destroying translated text needs a
-	 * builder-aware merge that can tell a layout node from a localisable value; a
-	 * raw whole-document mirror cannot give you both.
+	 * See docs-ai/11-code-rationale.md, "PerfLocaleOxygen6: text-free mirror keys".
 	 *
 	 * @param array<int, string> $keys      Meta keys.
 	 * @param string             $post_type Post type.
 	 * @return array<int, string>
 	 */
 	public function add_mirror_keys( array $keys, string $post_type ): array {
-		// Same prefix resolution as add_meta_keys(): Oxygen 6 and Breakdance are
-		// the same builder under two names.
+		// Oxygen 6 and Breakdance are the same builder under two names.
 		$prefix = '_oxygen_';
 
 		if ( defined( 'BREAKDANCE_MODE' ) && BREAKDANCE_MODE === 'breakdance' ) {
 			$prefix = '_breakdance_';
 		}
 
-		// NOT `{$prefix}data` - that is the document holding the user's text.
+		// Not `{$prefix}data`: that is the document holding the user's text.
 		$keys[] = $prefix . 'template_settings';
 
 		return $keys;
@@ -129,9 +101,7 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Add Oxygen 6.0 / Breakdance meta keys as translatable.
 	 *
-	 * The meta prefix is dynamic: `_oxygen_` in Oxygen mode,
-	 * `_breakdance_` in Breakdance mode. We register both to
-	 * ensure compatibility regardless of the active mode.
+	 * Registers the active mode's prefix only: `_oxygen_` or `_breakdance_`.
 	 *
 	 * @param array<int, string> $keys Meta keys.
 	 * @param string             $post_type Post type.
@@ -147,10 +117,7 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 
 		$keys[] = $prefix . 'data';
 		$keys[] = $prefix . 'template_settings';
-		// Deliberately NOT *_dependency_cache / *_css_file_paths_cache: these
-		// are generated per-post caches that reference the source post, so
-		// copying them to a translation sibling yields stale/wrong-post caches.
-		// The builder rebuilds each post's own.
+		// Not *_dependency_cache / *_css_file_paths_cache: generated per-post caches of the source post.
 
 		return $keys;
 	}
@@ -158,11 +125,8 @@ final class PerfLocaleOxygen6 implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Drop the sibling's generated cache meta after a layout mirror.
 	 *
-	 * The builder's getPostCache() regenerates the per-post CSS whenever
-	 * EITHER the `*_css_file_paths_cache` or `*_dependency_cache` meta row
-	 * is missing, and the generated CSS files are overwritten in place
-	 * (deterministic per-post filenames), so deleting the two rows is the
-	 * complete invalidation.
+	 * The builder's getPostCache() regenerates the CSS when either row is missing and overwrites its
+	 * per-post files, so deleting the two rows is the complete invalidation.
 	 *
 	 * @param int                $source_id   Source post ID.
 	 * @param int                $target_id   Sibling post ID whose layout meta was overwritten.

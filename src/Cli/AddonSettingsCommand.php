@@ -77,9 +77,7 @@ final class AddonSettingsCommand {
 			\WP_CLI::error( 'Setting key required.' );
 		}
 
-		// Global-storage fields live in `perflocale_settings`, not in
-		// `perflocale_addon_settings`. Read from the live option so the
-		// operator sees the value that the addon's runtime actually uses.
+		// Global-storage fields live in `perflocale_settings`: read the value the addon's runtime uses.
 		$field = $this->get_field_def( $addon_id, $key );
 		if ( $field !== null && AddonSettings::is_global_storage( $field ) ) {
 			$value = $this->read_global_setting( $key, $default );
@@ -184,12 +182,8 @@ final class AddonSettingsCommand {
 				break;
 		}
 
-		// Fields declared `'storage' => 'global'` live in the shared
-		// `perflocale_settings` option, not in addon storage - the addon's
-		// runtime reads them via Settings. Write through Settings::update()
-		// so the full invalidation chain runs (config-cache flush, cron
-		// reschedules, settings-updated listeners); a raw `wp option patch`
-		// would change the stored value while leaving all of that stale.
+		// Global-storage fields are written through Settings::update(), so its invalidation (config cache, cron
+		// reschedules, settings listeners) runs; a raw option write would leave all of that stale.
 		$field = $this->get_field_def( $addon_id, $key );
 		if ( $field !== null && AddonSettings::is_global_storage( $field ) ) {
 			$plugin = \PerfLocale\Plugin::get_instance();
@@ -263,10 +257,7 @@ final class AddonSettingsCommand {
 
 		$entry = AddonSettings::get_addon( $addon_id );
 
-		// Collect global-storage fields too - they're declared by the
-		// addon but live in `perflocale_settings`. Operator running
-		// `settings list woocommerce` expects to see WC's settings even
-		// though they're not in the addon-settings option.
+		// Global-storage fields too: declared by the addon, stored in `perflocale_settings`.
 		$reg    = Plugin::get_instance()->has( 'addon_registry' )
 			? Plugin::get_instance()->get( 'addon_registry' )
 			: null;
@@ -316,10 +307,7 @@ final class AddonSettingsCommand {
 	}
 
 	/**
-	 * Look up the get_settings_fields() definition for one key on one
-	 * addon. Returns null if the addon isn't registered, doesn't declare
-	 * that key, or its get_settings_fields() throws. Used by get/set/list
-	 * to honour `'storage' => 'global'`.
+	 * The get_settings_fields() definition of one key of one addon, or null (not registered, not declared, or it throws).
 	 *
 	 * @return array<string, mixed>|null
 	 */
@@ -344,10 +332,7 @@ final class AddonSettingsCommand {
 	}
 
 	/**
-	 * Read a single key from the main `perflocale_settings` option,
-	 * falling through the same env-var → wp-config-constant → DB
-	 * resolution that the runtime uses. Used by `get` to surface the
-	 * live value for `'storage' => 'global'` fields.
+	 * One key of `perflocale_settings`, through the runtime's environment, constant and database resolution.
 	 *
 	 * @param mixed $default
 	 * @return mixed

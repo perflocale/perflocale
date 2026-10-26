@@ -1,6 +1,6 @@
 <?php
 /**
- * Admin controller - registers menus and pages.
+ * Admin controller: menus, pages and admin form handlers.
  *
  * @package PerfLocale
  */
@@ -17,8 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Registers the PerfLocale admin menu and delegates page rendering
- * to specific page controller classes.
+ * Registers the PerfLocale admin menu, delegates rendering to the page classes and handles the admin forms.
  */
 final class AdminController {
 
@@ -28,12 +27,8 @@ final class AdminController {
 	private readonly Settings $settings;
 
 	/**
-	 * Admin page hooks (used for conditional script loading).
-	 *
-	 * add_menu_page / add_submenu_page return string|false - the value can
-	 * be `false` when the current user lacks the menu capability. We store
-	 * both shapes here and gate consumers (load-XXX action, screen-id
-	 * comparisons) with is_string() before use.
+	 * Admin page hooks, for conditional script loading; false where the user lacks the menu capability, so consumers
+	 * check is_string() first.
 	 *
 	 * @var array<string, string|false>
 	 */
@@ -56,20 +51,16 @@ final class AdminController {
 	public function register_hooks(): void {
 		add_action( 'admin_menu', [ $this, 'register_menus' ] );
 		add_action( 'admin_menu', [ $this, 'register_screen_options' ], 99 );
-		// Network-admin Jobs overview on multisite: shows active job
-		// counts + recurring-task last-run timestamps across every
-		// subsite in a single table, with click-through to per-site
-		// Jobs page. Only registered on multisite installs.
+		// Multisite: the network admin Jobs overview (active jobs and recurring task runs of every site).
 		if ( is_multisite() ) {
 			add_action( 'network_admin_menu', [ $this, 'register_network_menu' ] );
 		}
 
-		// Note: The AJAX handler for column visibility (perflocale_save_hidden_columns)
-		// is registered in Bootstrap.php since AdminController is not loaded during AJAX.
+		// The column visibility AJAX handler is registered in Bootstrap: this class is not loaded on AJAX.
 
-		// Screen option save filters are in perflocale.php (earliest possible).
+		// Screen option save filters are in perflocale.php (earliest).
 
-		// Process forms early, before output.
+		// Forms are processed early, before output.
 		add_action( 'admin_init', [ $this, 'process_settings_form' ] );
 		add_action( 'admin_init', [ $this, 'process_export_import' ] );
 		add_action( 'admin_init', [ $this, 'process_export_download' ] );
@@ -80,47 +71,38 @@ final class AdminController {
 		add_action( 'admin_init', [ $this, 'process_translations_bulk' ] );
 		add_action( 'admin_init', [ $this, 'process_dashboard_actions' ] );
 
-		// A POST body PHP discarded for exceeding post_max_size reaches every
-		// handler above as an empty $_POST, so none of them can report it -
-		// their route guards and nonce checks are the first things it breaks.
-		// This notice is the only surface left that can say what happened.
+		// A POST PHP discarded for exceeding post_max_size reaches every handler as an empty $_POST; only this notice can
+		// say what happened.
 		add_action( 'admin_notices', [ $this, 'render_discarded_post_notice' ] );
 
-		// Why a translation the Create action meant to machine-translate is an
-		// untranslated copy (classic editor, Translations screen).
+		// Why a translation the Create action meant to machine-translate is an untranslated copy.
 		add_action( 'admin_notices', [ $this, 'render_mt_create_notice' ] );
 
 
-		// Handle admin-post.php actions.
+		// admin-post.php actions.
 		add_action( 'admin_post_perflocale_create_translation', [ $this, 'handle_create_translation' ] );
 		add_action( 'admin_post_perflocale_create_term_translation', [ $this, 'handle_create_term_translation' ] );
 		add_action( 'admin_post_perflocale_reset_breaker', [ $this, 'handle_reset_breaker_action' ] );
 		add_action( 'admin_post_perflocale_save_addon_settings', [ $this, 'handle_save_addon_settings' ] );
 		add_action( 'admin_post_perflocale_toggle_addon', [ $this, 'handle_toggle_addon' ] );
 
-		// Attach page-specific inline CSS/JS through WordPress' standard
-		// enqueue pipeline (wp_add_inline_style / wp_add_inline_script on
-		// the already-enqueued `perflocale-admin` handle). Keeping the
-		// hookup here means page classes never echo raw markup from
-		// render() - the WordPress.org plugin reviewers require all
-		// stylesheet and script output to go through Core's enqueue API.
+		// Page-specific inline CSS and JS go through the enqueue API on the `perflocale-admin` handle, never echoed from
+		// render() (WordPress.org review rule).
 		add_action( 'admin_enqueue_scripts', [ Pages\SettingsPage::class, 'enqueue_assets' ] );
 		add_action( 'admin_enqueue_scripts', [ Pages\JobsPage::class, 'enqueue_assets' ] );
 
-		// Plugins-list action links (only fires on wp-admin/plugins.php).
+		// Plugins list action links.
 		add_filter(
 			'plugin_action_links_' . plugin_basename( PERFLOCALE_FILE ),
 			[ $this, 'filter_plugin_action_links' ]
 		);
 
-		// Right-column meta links on wp-admin/plugins.php.
+		// Plugins list row meta links.
 		add_filter( 'plugin_row_meta', [ $this, 'filter_plugin_row_meta' ], 10, 2 );
 	}
 
 	/**
-	 * Add Settings + Languages links to the plugins-list row (left column,
-	 * next to "Deactivate"). Cost: one filter call on wp-admin/plugins.php
-	 * only; no effect on any other admin page or on the frontend.
+	 * Add Settings and Languages links to the plugins list row (only filters on plugins.php).
 	 *
 	 * @param array<string, string> $links Existing action links.
 	 * @return array<string, string>
@@ -144,12 +126,12 @@ final class AdminController {
 			);
 		}
 
-		// Prepend our links so they appear before Deactivate.
+		// Before Deactivate.
 		return array_merge( $prefixed, $links );
 	}
 
 	/**
-	 * Add Documentation + Support links to the plugins-list row (right column).
+	 * Add Documentation and Support links to the plugins list row meta.
 	 *
 	 * @param array<int, string> $links Existing row meta links.
 	 * @param string             $file Plugin file being filtered.
@@ -176,40 +158,33 @@ final class AdminController {
 	}
 
 	/**
-	 * Process settings form submission early, before output.
+	 * Process the settings forms early, before output.
 	 *
 	 * @return void
 	 */
 	public function process_settings_form(): void {
-		// Route guard - this is not a security check, it's "is this our page?".
-		// Capability and nonce checks happen below before any side effect.
+		// Route guard ("is this our page?"), not a security check: capability and nonce come before any side effect.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( ! isset( $_GET['page'] ) || $_GET['page'] !== 'perflocale-settings' ) {
 			return;
 		}
 
-		// Handle regenerate translation files action (GET link with nonce).
-		// Canonical WP order: nonce first (CSRF), then capability.
-		// `check_admin_referer()` itself dies on failure, so we explicitly
-		// re-check the cap immediately after to keep the gate symmetric.
+		// Regenerate translation files (a nonce'd GET link): nonce first, then capability.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( ! empty( $_GET['perflocale_regenerate'] ) ) {
 			check_admin_referer( 'perflocale_regenerate_translations' );
 
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			$plugin    = \PerfLocale\Plugin::get_instance();
 			$cache     = $plugin->get( 'cache' );
 			$generator = new \PerfLocale\Strings\TranslationFileGenerator( $cache );
 			$count     = $generator->generate_all();
-			// generate_all() repairs orphaned translation rows first; the
-			// notice reports how many so the user sees that stranded
-			// translations were reconnected during the run.
+			// generate_all() repairs orphaned rows first; the notice says how many were reconnected.
 			$repaired = $generator->get_repaired_count();
-			// Languages whose translations could not be read kept their
-			// existing files; the notice reports them instead of a plain count.
+			// Languages whose translations could not be read kept their files; the notice names them.
 			$read_failed = count( $generator->get_read_failed_locales() );
 
 			wp_safe_redirect(
@@ -227,7 +202,7 @@ final class AdminController {
 			exit;
 		}
 
-		// Settings POST save path - same nonce-first-then-capability ordering.
+		// Settings save: nonce first, then capability.
 		if ( empty( $_POST['perflocale_settings_tab'] ) ) {
 			return;
 		}
@@ -235,27 +210,22 @@ final class AdminController {
 		$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
 
 		if ( ! wp_verify_nonce( $nonce, 'perflocale_save_settings' ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$tab    = sanitize_key( wp_unslash( $_POST['perflocale_settings_tab'] ) );
 		$page   = new Pages\SettingsPage( $this->settings );
 		$values = $page->extract_tab_values( $tab );
 
-		// The boolean matters. wpdb refuses a write whose value is too long for
-		// its column or carries invalid UTF-8 - it does not truncate or repair -
-		// so update() can fail with nothing stored while the redirect below
-		// reports success. Carry the real result through to the notice.
-		// update() returns false for a refused write AND for a save that changed
-		// nothing, so the no-op signal is consulted alongside it. Without that,
-		// re-saving a tab unchanged - the common case - would show an error.
+		// wpdb refuses a too-long or invalid-UTF-8 value instead of storing it, so the notice carries the real result;
+		// update() also returns false for a save that changed nothing, hence the no-op signal.
 		$settings_saved = $this->settings->update( $values ) || \PerfLocale\Settings::last_update_was_noop();
 
-		// When performance tab is saved, handle string translation mode changes.
+		// The performance tab may change the string translation mode.
 		if ( $tab === 'performance' ) {
 			$plugin = \PerfLocale\Plugin::get_instance();
 			$cache  = $plugin->get( 'cache' );
@@ -264,14 +234,13 @@ final class AdminController {
 				$generator = new \PerfLocale\Strings\TranslationFileGenerator( $cache );
 				$generator->generate_all();
 			} else {
-				// Clean up files when switching to database mode.
+				// Database mode: remove the generated files.
 				$generator = new \PerfLocale\Strings\TranslationFileGenerator( $cache );
 				$generator->clean_all();
 			}
 		}
 
-		// Addon subtab keys redirect back to the Addons parent tab.
-		// Check both built-in subtabs and any external ones registered via filter.
+		// Add-on sub-tabs (built-in and filtered) redirect back to the Addons tab.
 		$addon_subtabs = array_keys(
 			(array) apply_filters(
 				'perflocale/settings/addon_subtabs',
@@ -306,31 +275,12 @@ final class AdminController {
 		exit;
 	}
 
-	// ------------------------------------------------------------------
-	// Upload limits
-	//
-	// Both import forms on this plugin's screens gate uploads in application
-	// code at 50 MB - 25x a stock host's `upload_max_filesize`. On a stock
-	// host PHP therefore refuses the file first and the application gate is
-	// never what the operator hits; only a generously configured host reaches
-	// it. The helpers below turn the two ways PHP can refuse an upload into
-	// something the operator can act on.
-	// ------------------------------------------------------------------
+	// Upload limits: both import forms gate uploads in code above PHP's own limits; the helpers below turn PHP's two
+	// kinds of refusal into something the operator can act on.
 
 	/**
-	 * Ceiling the PO importer applies on top of PHP's own upload limits.
-	 *
-	 * Deliberately kept as a SECOND ceiling rather than lowered to
-	 * `wp_max_upload_size()`. PHP refuses anything above its own limit before
-	 * this code runs, so the only uploads this gate ever sees are ones a
-	 * generous host already accepted - which is exactly the case it exists
-	 * for, because core's \PO parser holds every entry of the file in memory
-	 * at once. Lowering it to `wp_max_upload_size()` would make it dead code
-	 * on a stock host and weaker on the hosts that need it, and would tie an
-	 * out-of-memory guard to a number any other plugin can move through the
-	 * `upload_size_limit` filter.
-	 *
-	 * Exposed so StringsPage can name the same number the gate used.
+	 * The PO importer's own ceiling above PHP's upload limits: core's \PO parser holds the whole file in memory, so it
+	 * guards generous hosts. Not wp_max_upload_size(), which any plugin can move. StringsPage names the same number.
 	 *
 	 * @return int Maximum accepted PO upload size, in bytes.
 	 */
@@ -344,24 +294,15 @@ final class AdminController {
 	}
 
 	/**
-	 * Ceiling the JSON data importer applies on top of PHP's own upload limits.
-	 *
-	 * The importer reads the file in pieces, and the screen sends a file larger
-	 * than PHP's upload limits in pieces too, so this ceiling bounds the disk
-	 * space a staged upload takes and the length of the import, not memory.
-	 * Applying the filter in one place is what keeps the gate, the number
-	 * shown on the import form and the export screen's size warning from
-	 * drifting apart.
+	 * The JSON importer's ceiling above PHP's upload limits (it reads in pieces, so this bounds staged disk and import
+	 * length, not memory); one place, so the gate, the form and the export warning agree.
 	 *
 	 * @return int Maximum accepted import size, in bytes.
 	 */
 	public static function import_max_bytes(): int {
 		/**
-		 * Filters the largest data-export JSON the importer will accept through
-		 * the Export & Import screen, in bytes. A file larger than PHP's own
-		 * upload limits (upload_max_filesize, post_max_size) is sent from the
-		 * screen in pieces, so this filter is the screen's only size cap.
-		 * WP-CLI (`wp perflocale import`) does not apply it.
+		 * Filters the largest data export JSON the Export & Import screen imports, in bytes; a file over PHP's upload
+		 * limits is sent in pieces, so this is the screen's only size cap. WP-CLI does not apply it.
 		 *
 		 * @hook perflocale/import/max_file_bytes
 		 *
@@ -371,9 +312,8 @@ final class AdminController {
 	}
 
 	/**
-	 * The sentence the WPML import notice adds when the filters for accounts
-	 * without `unfiltered_html` changed stored string translations, with a
-	 * leading space; empty for a count of 0. Same copy as the JSON import's.
+	 * The WPML import notice's sentence (with a leading space) when the untrusted-user filters changed stored string
+	 * translations; '' for 0. As the JSON import's.
 	 *
 	 * @param int $count Rows the filters changed.
 	 * @return string
@@ -396,17 +336,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Import an uploaded PO file at the trust level of the user uploading it.
-	 *
-	 * A user without `unfiltered_html` is held to the markup rules the Strings
-	 * screen applies to their saves (see
-	 * Helper::sanitize_untrusted_string_translation()). Users with it keep a
-	 * byte-exact import.
-	 *
-	 * The decision is made here, from the current user, and passed to
-	 * PoSync::import_from_file() explicitly, so WP-CLI and other trusted callers
-	 * of that method are unaffected. The upload handler calls this after its
-	 * nonce, capability and upload checks.
+	 * Import an uploaded PO file at the uploading user's trust level: without `unfiltered_html` the Strings screen's
+	 * markup rules apply (Helper::sanitize_untrusted_string_translation()). Decided here, so WP-CLI is unaffected.
 	 *
 	 * @internal
 	 *
@@ -436,29 +367,17 @@ final class AdminController {
 	}
 
 	/**
-	 * `size_format()` for a byte count that has to render no matter what.
-	 *
-	 * Core's size_format() returns false for a negative input - which only a
-	 * third-party `upload_size_limit` filter could produce - and a message
-	 * reading "limit: " helps nobody. Clamping at zero keeps the sentence
-	 * whole.
+	 * A size_format() that always renders: a negative value (only a third-party `upload_size_limit` filter makes one)
+	 * is clamped to zero instead of false.
 	 *
 	 * @param mixed $bytes Byte count, or anything the `upload_size_limit` filter returned
 	 *                      (float, numeric string, or an ini string like '64M').
 	 * @return string Formatted size, e.g. "2 MB".
 	 */
 	public static function format_bytes( mixed $bytes ): string {
-		// Deliberately NOT typed `int`. Every caller feeds this
-		// `wp_max_upload_size()`, whose return passes through the third-party
-		// `upload_size_limit` filter - and a plugin may return a float, a
-		// numeric string, or an ini-shaped string like '64M'. This file declares
-		// strict_types, so a narrow parameter would throw at ARGUMENT BINDING,
-		// before any guard in the body could run: a white screen on the Strings
-		// admin page on every load, caused by another plugin's filter. WordPress
-		// core tolerates exactly this - `size_format( wp_max_upload_size() )` in
-		// wp-includes/media.php is untyped and survives. Normalise here instead,
-		// and route the ini-shaped case through wp_convert_hr_to_bytes() so a
-		// '64M' answer renders as 64 MB rather than 64 bytes.
+		// Not typed int (04-do-not-fix): wp_max_upload_size() passes through the `upload_size_limit` filter, which can
+		// return a float, a numeric string or '64M'; under strict_types a narrow type would white-screen the Strings page.
+		// An ini-shaped value goes through wp_convert_hr_to_bytes().
 		$normalised = is_numeric( $bytes )
 			? (int) $bytes
 			: (int) wp_convert_hr_to_bytes( (string) $bytes );
@@ -467,12 +386,7 @@ final class AdminController {
 	}
 
 	/**
-	 * The upload ceiling in bytes, normalised the same way {@see format_bytes()} does.
-	 *
-	 * `min()` on a raw `wp_max_upload_size()` has the same exposure as the
-	 * signature above did - a filter returning '64M' makes `min()` compare a
-	 * string against an int and pick the wrong one, silently. Callers that need
-	 * the NUMBER rather than the label go through here.
+	 * The upload ceiling in bytes, normalised as format_bytes() does (min() on a raw '64M' compares a string with an int).
 	 *
 	 * @return int Bytes, never negative.
 	 */
@@ -487,16 +401,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Human-readable reason for a PHP upload error code.
-	 *
-	 * `$_FILES[…]['error']` is the only record of WHY an upload arrived with
-	 * an empty `tmp_name`. Ignore it and a file the server refused looks
-	 * exactly like no file at all - and the two need opposite responses, so
-	 * each code gets its own sentence. An over-limit file is the operator's
-	 * to shrink or the host's limit to raise; a missing or unwritable
-	 * temporary directory is a host fault that no smaller file will fix.
-	 *
-	 * Shared by both import forms so the wording cannot drift apart.
+	 * The reason for a PHP upload error code, one sentence per code: an over-limit file needs a smaller file or a higher
+	 * limit, a missing or unwritable temp directory is a host fault. Shared by both import forms.
 	 *
 	 * @param int $code One of PHP's UPLOAD_ERR_* constants.
 	 * @return string Translated sentence; empty string when the upload succeeded.
@@ -539,21 +445,9 @@ final class AdminController {
 	}
 
 	/**
-	 * Whether PHP threw this request's POST body away for exceeding post_max_size.
-	 *
-	 * Above that limit PHP discards the whole body before any script runs:
-	 * `$_POST`, `$_FILES` and therefore `_wpnonce` all arrive empty. Every
-	 * handler in this class then bails at its own route guard without a word;
-	 * a handler ordered nonce-first instead - as several of WordPress core's
-	 * admin forms are - reports a security failure for a request nobody
-	 * forged. The signature is a POST that declared more bytes than
-	 * post_max_size allows and arrived with both superglobals empty.
-	 *
-	 * `post_max_size = 0` disables the limit and PHP then never discards, so
-	 * an empty `$_POST` there is a genuinely empty body, not a truncated one.
-	 * A SAPI that does not publish CONTENT_LENGTH falls back to false - no
-	 * notice, i.e. the behaviour that shipped before this - rather than to a
-	 * false alarm.
+	 * Whether PHP discarded this request's POST body for exceeding post_max_size: a POST that declared more than the
+	 * limit and arrived with $_POST and $_FILES empty (nonce included). post_max_size 0 never discards; without
+	 * CONTENT_LENGTH the answer is false.
 	 *
 	 * @return bool True when the body was discarded.
 	 */
@@ -566,8 +460,7 @@ final class AdminController {
 			return false;
 		}
 
-		// Emptiness only - no value is read out of either superglobal. A body
-		// PHP parsed leaves at least one of them populated.
+		// Emptiness only: nothing is read from either.
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- No nonce can exist: this is the branch where the body carrying it was discarded.
 		if ( ! empty( $_POST ) || ! empty( $_FILES ) ) {
 			return false;
@@ -580,21 +473,30 @@ final class AdminController {
 	}
 
 	/**
-	 * `admin_notices`: the Create action's machine translation notice
-	 * (MtCreateNotice::render_admin_notice()). It can show only on post.php
-	 * with a post, or on a screen whose URL carries `perflocale_created`;
-	 * every other admin screen returns here, before MtCreateNotice is
-	 * loaded. MtCreateNotice makes the exact checks.
+	 * `admin_notices`: the Create action's machine translation notice (MtCreateNotice::render_admin_notice()), only on
+	 * a classic-editor post.php or a URL with `perflocale_created`, and only when one waits for the user; other
+	 * screens return before MtCreateNotice loads.
 	 *
 	 * @return void
 	 */
 	public function render_mt_create_notice(): void {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Presence check only; the value is read nowhere here.
-		$on_post_screen = 'post.php' === ( $GLOBALS['pagenow'] ?? '' ) && isset( $_GET['post'] );
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Presence check only, as above.
-		$after_create = isset( $_GET['perflocale_created'] );
+		$post_id = 0;
 
-		if ( ! $on_post_screen && ! $after_create ) {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Display only: the id selects the current user's own record, which MtCreateNotice checks against edit_post.
+		if ( 'post.php' === ( $GLOBALS['pagenow'] ?? '' ) && isset( $_GET['post'] ) && is_numeric( $_GET['post'] ) ) {
+			$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+
+			if ( $screen instanceof \WP_Screen && $screen->is_block_editor() ) {
+				return;
+			}
+
+			$post_id = absint( $_GET['post'] );
+		} elseif ( isset( $_GET['perflocale_created'] ) && is_numeric( $_GET['perflocale_created'] ) ) {
+			$post_id = absint( $_GET['perflocale_created'] );
+		}
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		if ( ! self::mt_create_notice_waiting( $post_id ) ) {
 			return;
 		}
 
@@ -602,25 +504,34 @@ final class AdminController {
 	}
 
 	/**
-	 * Tell the operator when PHP discarded their upload before WordPress saw it.
+	 * Whether a machine translation notice waits for the current user on this post: the user meta
+	 * `perflocale_mt_notice_<blog>_<post>` (MtCreateNotice::WAITING_META_PREFIX, written out so that class stays
+	 * unloaded), from the user's meta cache, so a screen without one runs no query.
 	 *
-	 * Renders on this plugin's own admin screens only, and only for the
-	 * signature above. It exists because nothing else can report this: the
-	 * body is gone, so no form handler runs.
+	 * @param int $post_id Post.
+	 * @return bool
+	 */
+	public static function mt_create_notice_waiting( int $post_id ): bool {
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		$user_id = get_current_user_id();
+
+		if ( $user_id <= 0 ) {
+			return false;
+		}
+
+		$until = get_user_meta( $user_id, 'perflocale_mt_notice_' . get_current_blog_id() . '_' . $post_id, true );
+
+		return is_numeric( $until ) && (int) $until >= time();
+	}
+
+	/**
+	 * Tell the operator when PHP discarded their upload before WordPress saw it, on this plugin's screens only.
 	 *
-	 * SECURITY. This is the one branch in the plugin that runs where a nonce
-	 * cannot be verified - the nonce was inside the discarded body - so it is
-	 * inert by construction. It reads no value out of `$_POST` or `$_FILES`
-	 * (only whether they are empty), echoes nothing from the request, writes
-	 * no option, transient, post or row, and performs no action. A forged
-	 * signature (an over-long POST to one of these screens, from the sender's
-	 * own browser) yields only a fixed sentence that already ships in this
-	 * plugin's translation files. The screen gate reads
-	 * `$_GET['page']`, which survives the discard because it travels in the
-	 * URL rather than the body, and is compared, never printed.
-	 *
-	 * Cost: one `REQUEST_METHOD` comparison per admin page load, which is
-	 * where it returns on every GET. Nothing on the front end.
+	 * Runs where no nonce can be checked (it was in the discarded body), so it is inert: it reads only emptiness,
+	 * echoes a fixed sentence, writes nothing; `$_GET['page']` is compared, never printed. One comparison per load.
 	 *
 	 * @return void
 	 */
@@ -652,12 +563,9 @@ final class AdminController {
 	}
 
 	/**
-	 * The add-on data choices a form posted, kept only when this site
-	 * declares them: group parts (DataExporter::addon_groups() keys) and,
-	 * when `$with_shared`, the shared `addon_data` choice. The form that
-	 * shows the checkboxes also posts `<field>_shown`, so nothing ticked is
-	 * an empty list; a post without it (a form or script from before the
-	 * checkboxes) gets null, which means every choice.
+	 * The add-on data choices a form posted that this site declares (DataExporter::addon_groups() keys, plus the
+	 * shared `addon_data` with `$with_shared`). The form also posts `<field>_shown`; without it the answer is null
+	 * (every choice).
 	 *
 	 * @param string $field       POST field (a checkbox list).
 	 * @param bool   $with_shared Whether the shared Add-on data choice is one of them.
@@ -678,17 +586,13 @@ final class AdminController {
 			$allowed[] = 'addon_data';
 		}
 
-		// Only exact matches of the allowed keys are kept, so nothing posted
-		// reaches the exporter or importer unchecked.
+		// Exact allowed keys only: nothing posted reaches the exporter or importer unchecked.
 		return array_values( array_intersect( $posted, $allowed ) );
 	}
 
 	/**
-	 * Why an admin-started migration did not run, or '' when it ran.
-	 *
-	 * The inline run reports an exception (another import holds the lock) as
-	 * `error`; an import the language check refused comes back `blocked`
-	 * with its reasons first in `errors`. Nothing was written in either case.
+	 * Why an admin-started migration did not run ('' when it ran): `error` for an exception (another import holds the
+	 * lock), `blocked` with reasons first in `errors`. Nothing was written either way.
 	 *
 	 * @param array<string, mixed> $dispatched Dispatcher::dispatch() result.
 	 * @return string
@@ -708,13 +612,12 @@ final class AdminController {
 	}
 
 	/**
-	 * Handle export, import, and migration actions.
+	 * Handle the export, import and migration actions.
 	 *
 	 * @return void
 	 */
 	public function process_export_import(): void {
-		// Route guard - is this our action submission? Cap and nonce checks
-		// happen per-action below in canonical nonce-first-then-cap order.
+		// Route guard; capability and nonce per action below, nonce first.
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing
 		if ( empty( $_POST['perflocale_action'] ) ) {
 			return;
@@ -724,35 +627,26 @@ final class AdminController {
 		$action       = sanitize_key( wp_unslash( $_POST['perflocale_action'] ) );
 		$redirect_url = admin_url( 'admin.php?page=perflocale-settings&tab=export-import' );
 
-		// ---- Export ----
+		// Export.
 		if ( $action === 'export' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_export_data' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
-			// The same two capabilities the background export, the export
-			// download and every import require: a site that took
-			// perflocale_import_export away from a role keeps that role from
-			// the streamed export too.
+			// The two capabilities the background export, the download and every import require.
 			if ( ! current_user_can( 'manage_options' ) || ! current_user_can( 'perflocale_import_export' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			$sections = isset( $_POST['export_sections'] )
 				? array_map( 'sanitize_key', wp_unslash( (array) $_POST['export_sections'] ) )
 				: [];
 
-			// The add-on groups ticked on the form, kept only when this site
-			// declares them; null (every group with Add-on data) for a post
-			// that does not come from a form showing them.
+			// The ticked add-on groups this site declares; null (every group) for a post not from such a form.
 			$groups = self::posted_addon_choices( 'export_addon_groups', false );
 
-			// Decide sync vs async manually here rather than via
-			// Dispatcher::dispatch - the sync path needs to STREAM the
-			// export to the browser (admin clicked "Export", expects a
-			// download), and Dispatcher's inline path would write to disk
-			// first, costing double I/O on small sites. Async path goes
-			// through Dispatcher normally so JobState gets recorded.
+			// Sync or async decided here, not by Dispatcher::dispatch(): the sync path streams the download, where Dispatcher
+			// would write to disk first. The async path goes through Dispatcher so JobState records it.
 			$plugin   = \PerfLocale\Plugin::get_instance();
 			$settings = $plugin->get( 'settings' );
 			$job      = new \PerfLocale\Background\Jobs\DataExportJob();
@@ -762,6 +656,13 @@ final class AdminController {
 				'path'         => '',
 			];
 
+			$refused = \PerfLocale\Background\WebLimit::refusal( $job, $job_args, 'wp perflocale export <file>' );
+
+			if ( '' !== $refused ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
+				exit;
+			}
+
 			if ( $job->should_run_async( $job_args, $settings ) ) {
 				$result = \PerfLocale\Background\Dispatcher::dispatch( $job, $job_args );
 
@@ -770,29 +671,25 @@ final class AdminController {
 					exit;
 				}
 
-				// Dispatcher returned inline anyway (e.g. denied/never) -
-				// fall through to the streaming path below.
+				// Dispatcher ran inline anyway (denied, never): stream below.
 			}
 
 			$exporter = new \PerfLocale\Admin\DataExporter();
-			$exporter->download( $sections, $groups ); // Dies after sending file.
+			$exporter->download( $sections, $groups ); // Dies after sending the file.
 		}
 
-		// ---- Import ----
+		// Import.
 		if ( $action === 'import' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_import_data' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
-			// A file the screen sent in pieces (ImportUpload, for a file
-			// larger than PHP accepts in one request): the form carries the
-			// upload's token instead of the file, and the assembled copy is
-			// already staged in the temp directory. Taking it ends the upload
-			// and frees its place in the upload quota.
+			// A file sent in pieces (ImportUpload): the form carries the token, the assembled copy is staged; taking it ends the
+			// upload and frees its quota place.
 			$upload_token   = isset( $_POST['perflocale_import_upload'] ) && is_string( $_POST['perflocale_import_upload'] ) ? sanitize_text_field( wp_unslash( $_POST['perflocale_import_upload'] ) ) : '';
 			$persisted_path = '' !== $upload_token ? \PerfLocale\Admin\ImportUpload::claim( $upload_token ) : '';
 
@@ -807,11 +704,8 @@ final class AdminController {
 			}
 
 			if ( '' === $persisted_path ) {
-				// PHP records why an upload produced no tmp_name in the entry's
-				// `error` slot and nowhere else. Read it BEFORE the emptiness
-				// gate below: a file the server refused for being too big arrives
-				// here as a populated $_FILES entry with an empty tmp_name, which
-				// that gate would otherwise report as "No file uploaded".
+				// PHP's `error` slot is the only record of why there is no tmp_name: read it before the emptiness check, or a file
+				// refused as too big would be "No file uploaded".
 				$upload_error = isset( $_FILES['perflocale_import_file']['error'] ) && is_scalar( $_FILES['perflocale_import_file']['error'] )
 					? (int) $_FILES['perflocale_import_file']['error']
 					: UPLOAD_ERR_NO_FILE;
@@ -826,9 +720,7 @@ final class AdminController {
 					exit;
 				}
 
-				// tmp_name is a server-controlled path - do NOT sanitize_text_field()
-				// which can strip valid path characters. is_uploaded_file() is the
-				// correct security check for uploaded file paths.
+				// tmp_name is a server path: is_uploaded_file() is the check, sanitize_text_field() could break it.
 				$tmp_path = $_FILES['perflocale_import_file']['tmp_name']; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
 
 				if ( ! is_uploaded_file( $tmp_path ) ) {
@@ -836,11 +728,7 @@ final class AdminController {
 					exit;
 				}
 
-				// Fail-fast size check before the chunked copy stages a multi-GB
-				// file (wasted I/O + disk-fill risk). $_FILES size is PHP's own
-				// measurement, not client-forgeable. The ceiling comes from
-				// import_max_bytes() so this gate and the number the import form
-				// advertises can never disagree.
+				// Size check before staging (PHP's own measurement), against import_max_bytes() as the form shows it.
 				$max_import_bytes = self::import_max_bytes();
 				$upload_size      = isset( $_FILES['perflocale_import_file']['size'] )
 					? (int) $_FILES['perflocale_import_file']['size']
@@ -861,11 +749,8 @@ final class AdminController {
 					exit;
 				}
 
-				// Move PHP's tmp upload into wp-content/uploads/perflocale/temp/
-				// so the async worker can still see the file when WP-Cron /
-				// Action Scheduler runs on a later request. Mirrors the
-				// chunked-stream pattern used by the CSV importer
-				// below - Plugin Check rejects move_uploaded_file/rename/copy.
+				// Copy PHP's temp upload into uploads/perflocale/temp/ in chunks (Plugin Check refuses move_uploaded_file(), rename()
+				// and copy()), so a later background run still finds it.
 				$temp_dir = \PerfLocale\Helper::uploads_temp_dir();
 
 				if ( $temp_dir === '' || ! wp_mkdir_p( $temp_dir ) ) {
@@ -892,9 +777,7 @@ final class AdminController {
 					exit;
 				}
 
-				// Every read and write is checked: a full disk would otherwise
-				// leave a truncated copy that the importer then reports as
-				// invalid JSON instead of as the real cause.
+				// Every read and write checked: a full disk would leave a truncated copy reported as invalid JSON.
 				$staged = true;
 
 				while ( ! feof( $source ) ) {
@@ -924,9 +807,7 @@ final class AdminController {
 				}
 			}
 
-			// Safety-net cleanup: if async never runs (cron stalled) or
-			// the worker crashes, the file is reaped by the same hook
-			// the importer uses.
+			// Safety-net cleanup through the importer's own hook, in case the background run never comes.
 			\PerfLocale\Background\BackgroundEvents::enqueue(
 				'perflocale_cleanup_temp_import',
 				[ $persisted_path ],
@@ -935,31 +816,30 @@ final class AdminController {
 
 			$replace = ( sanitize_key( $_POST['perflocale_import_mode'] ?? 'merge' ) === 'replace' );
 
-			// The import form's confirmation checkbox: the operator stating
-			// that this site is a copy of the one the file came from, so its
-			// post and term IDs mean the same thing here. Read unconditionally
-			// because the form renders it unconditionally, and carried in the
-			// job args so an async replay keeps the same answer.
+			// The "this site is a copy of the source" checkbox (same post and term ids); in the job args so an async run keeps it.
 			$same_ids = ! empty( $_POST['perflocale_import_same_ids'] );
 
-			// The add-on data to import: the shared Add-on data checkbox and
-			// each group's own; null (everything the file carries) for a post
-			// that does not come from a form showing them.
+			// The add-on data to import (shared and per group); null (all the file has) for a post not from such a form.
 			$addon_choices = self::posted_addon_choices( 'perflocale_import_addon', true );
 
-			// Route through Dispatcher. Sync below the threshold (admin
-			// sees counts on the redirect); async above (admin redirects
-			// to PerfLocale → Jobs to watch progress). DataImportJob
-			// estimates row count from filesize.
-			$result = \PerfLocale\Background\Dispatcher::dispatch(
-				new \PerfLocale\Background\Jobs\DataImportJob(),
-				[
-					'file_path'         => $persisted_path,
-					'replace'           => $replace,
-					'allow_foreign_ids' => $same_ids,
-					'addon_choices'     => $addon_choices,
-				]
-			);
+			// Through Dispatcher: inline below the threshold (counts on the redirect), else a job (estimated from file size).
+			$import_job  = new \PerfLocale\Background\Jobs\DataImportJob();
+			$import_args = [
+				'file_path'         => $persisted_path,
+				'replace'           => $replace,
+				'allow_foreign_ids' => $same_ids,
+				'addon_choices'     => $addon_choices,
+			];
+			$refused     = \PerfLocale\Background\WebLimit::refusal( $import_job, $import_args, 'wp perflocale import <file>' );
+
+			if ( '' !== $refused ) {
+				wp_delete_file( $persisted_path );
+				\PerfLocale\Background\BackgroundEvents::unschedule( 'perflocale_cleanup_temp_import', [ $persisted_path ] );
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
+				exit;
+			}
+
+			$result = \PerfLocale\Background\Dispatcher::dispatch( $import_job, $import_args );
 
 			if ( $result['mode'] === 'async' ) {
 				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'import_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
@@ -968,8 +848,7 @@ final class AdminController {
 
 			$r = is_array( $result['result'] ?? null ) ? $result['result'] : [];
 
-			// Sync path completed - delete now and drop the scheduled
-			// safety-net cleanup so it doesn't fire against a stale path.
+			// Inline run done: delete the file and its safety-net event.
 			if ( file_exists( $persisted_path ) ) {
 				wp_delete_file( $persisted_path );
 			}
@@ -978,25 +857,14 @@ final class AdminController {
 				[ $persisted_path ]
 			);
 
-			// Only `async` was handled above, so every other Dispatcher
-			// outcome lands here - and three of them report the failure in
-			// `error` while carrying no `result` at all: a sync run that
-			// threw, `denied` (the user lacks the cap), and `error` (job-id
-			// allocation and the like). With $r empty the `errors` branch
-			// below cannot fire, so all three used to end at the success
-			// notice: "Import complete. 0 items imported, 0 skipped." over a
-			// transaction that was rolled back, or never started.
-			//
-			// Checked here rather than earlier so a failed import still
-			// releases the uploaded file and its scheduled safety-net
-			// cleanup, exactly as a successful one does.
+			// Every outcome but async lands here; a thrown inline run, `denied` and `error` report only `error`, with no result,
+			// which must not end at the success notice. After the file cleanup, as on success.
 			if ( ! empty( $result['error'] ) ) {
 				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', (string) $result['error'] ) );
 				exit;
 			}
 
-			// Said whether or not the import also reported errors: the rows
-			// were stored either way.
+			// Said whether or not errors were reported: the rows were stored.
 			$sanitized_note = '';
 
 			if ( (int) ( $r['sanitized'] ?? 0 ) > 0 ) {
@@ -1012,8 +880,7 @@ final class AdminController {
 				);
 			}
 
-			// A merge import leaves the file's configuration unapplied; the
-			// importer's notice says so and points to Replace.
+			// A merge import leaves the file's configuration unapplied; the importer's notice says so and points to Replace.
 			$not_applied_note = isset( $r['notice'] ) && is_string( $r['notice'] ) && '' !== $r['notice'] ? ' ' . $r['notice'] : '';
 
 			// A provider address the settings update refused is named too.
@@ -1021,21 +888,17 @@ final class AdminController {
 				$not_applied_note .= ' ' . $r['address_notice'];
 			}
 
-			// What the import left out, kept or changed on purpose, one
-			// sentence each.
+			// What the import left out, kept or changed on purpose, one sentence each.
 			foreach ( (array) ( $r['notes'] ?? [] ) as $note ) {
 				if ( is_string( $note ) && '' !== $note ) {
 					$not_applied_note .= ' ' . $note;
 				}
 			}
 
-			// rawurlencode(): the message is translated text and may carry the
-			// file's own error text, and an unencoded `&`, `#` or `+` would cut
-			// or alter it in the query string.
+			// rawurlencode(): translated text that may carry the file's own error text; a raw `&`, `#` or `+` would cut it.
 			if ( ! empty( $r['errors'] ) ) {
-				// A merge that wrote rows and hit errors says how far it got:
-				// the notice shows only the first three errors. A refusal or a
-				// file that was rejected whole wrote nothing, and says only why.
+				// A merge that wrote rows and hit errors says how far it got (the notice shows three errors); a refused file only
+				// says why.
 				$errors   = Typed::strs( $r['errors'] );
 				$imported = Typed::int( $r['imported'] ?? 0 );
 				$skipped  = Typed::int( $r['skipped'] ?? 0 );
@@ -1059,24 +922,26 @@ final class AdminController {
 			exit;
 		}
 
-		// ---- Migrate from WPML ----
+		// Migrate from WPML.
 		if ( $action === 'migrate_wpml' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_migrate_wpml' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
-			// Route through Dispatcher: small WPML installs run inline
-			// (admin sees results immediately); large installs go async
-			// to dodge PHP-FPM timeouts, redirect to *PerfLocale → Jobs*
-			// where the operator watches progress.
-			$result = \PerfLocale\Background\Dispatcher::dispatch(
-				new \PerfLocale\Background\Jobs\WpmlMigrationJob(),
-				[]
-			);
+			// Through Dispatcher: small sites inline (results at once), large ones as a job on the Jobs screen.
+			$migration = new \PerfLocale\Background\Jobs\WpmlMigrationJob();
+			$refused   = \PerfLocale\Background\WebLimit::refusal( $migration, [], 'wp perflocale migrate wpml' );
+
+			if ( '' !== $refused ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
+				exit;
+			}
+
+			$result = \PerfLocale\Background\Dispatcher::dispatch( $migration, [] );
 
 			if ( $result['mode'] === 'async' ) {
 				$last_progress = (int) ( $result['updated_at'] ?? 0 );
@@ -1144,20 +1009,25 @@ final class AdminController {
 			exit;
 		}
 
-		// ---- Migrate from Polylang ----
+		// Migrate from Polylang.
 		if ( $action === 'migrate_polylang' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_migrate_polylang' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
-			$result = \PerfLocale\Background\Dispatcher::dispatch(
-				new \PerfLocale\Background\Jobs\PolylangMigrationJob(),
-				[]
-			);
+			$migration = new \PerfLocale\Background\Jobs\PolylangMigrationJob();
+			$refused   = \PerfLocale\Background\WebLimit::refusal( $migration, [], 'wp perflocale migrate polylang' );
+
+			if ( '' !== $refused ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
+				exit;
+			}
+
+			$result = \PerfLocale\Background\Dispatcher::dispatch( $migration, [] );
 
 			if ( $result['mode'] === 'async' ) {
 				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'polylang_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
@@ -1173,8 +1043,7 @@ final class AdminController {
 
 			$r = $result['result'] ?? [];
 
-			// An import that did not finish is reported as the failure the job
-			// and the CLI report, with the notice that says to run it again.
+			// An unfinished import is reported as the job and CLI report it, with the notice to run it again.
 			if ( ! empty( $r['run_failed'] ) ) {
 				$reason = $r['first_error'] ?? '';
 
@@ -1206,8 +1075,7 @@ final class AdminController {
 				$msg .= ' ' . implode( ' ', $notices );
 			}
 
-			// Items read and not imported: the run finished, and the notice
-			// asks for attention instead of reporting a plain success.
+			// Items read and not imported: an attention notice instead of a plain success.
 			$skipped_lines = \PerfLocale\Migration\MigrationRunner::skipped_lines( 'polylang', $r );
 
 			if ( $skipped_lines !== [] ) {
@@ -1215,26 +1083,30 @@ final class AdminController {
 				exit;
 			}
 
-			// Encoded as the attention notice is: wp_sanitize_redirect() drops
-			// an apostrophe a notice line may hold.
+			// Encoded as the attention notice is: wp_sanitize_redirect() drops an apostrophe.
 			wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
 			exit;
 		}
 
-		// ---- Migrate from TranslatePress ----
+		// Migrate from TranslatePress.
 		if ( $action === 'migrate_translatepress' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_migrate_translatepress' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'manage_options' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
-			$result = \PerfLocale\Background\Dispatcher::dispatch(
-				new \PerfLocale\Background\Jobs\TranslatePressMigrationJob(),
-				[]
-			);
+			$migration = new \PerfLocale\Background\Jobs\TranslatePressMigrationJob();
+			$refused   = \PerfLocale\Background\WebLimit::refusal( $migration, [], 'wp perflocale migrate translatepress' );
+
+			if ( '' !== $refused ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $refused ) );
+				exit;
+			}
+
+			$result = \PerfLocale\Background\Dispatcher::dispatch( $migration, [] );
 
 			if ( $result['mode'] === 'async' ) {
 				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'translatepress_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
@@ -1250,8 +1122,7 @@ final class AdminController {
 
 			$r = $result['result'] ?? [];
 
-			// An import that did not finish is reported as the failure the job
-			// and the CLI report, with the notice that says to run it again.
+			// An unfinished import is reported as the job and CLI report it, with the notice to run it again.
 			if ( ! empty( $r['run_failed'] ) ) {
 				$reason = $r['first_error'] ?? '';
 
@@ -1281,29 +1152,28 @@ final class AdminController {
 	}
 
 	/**
-	 * Process language form submissions early, before any output.
+	 * Process the language forms early, before output.
 	 *
 	 * @return void
 	 */
 	public function process_language_forms(): void {
-		// Route guard - is this our page? Cap and nonce checks happen
-		// per-branch below in canonical nonce-first-then-cap order.
+		// Route guard; capability and nonce per branch below, nonce first.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( ! isset( $_GET['page'] ) || $_GET['page'] !== 'perflocale-languages' ) {
 			return;
 		}
 
-		// Handle set_default via GET.
+		// set_default via GET.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( isset( $_GET['action'] ) && $_GET['action'] === 'set_default' && isset( $_GET['language_id'] ) ) {
 			$nonce = isset( $_GET['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) ) : '';
 
 			if ( ! wp_verify_nonce( $nonce, 'perflocale_set_default_language' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			$plugin  = \PerfLocale\Plugin::get_instance();
@@ -1313,14 +1183,8 @@ final class AdminController {
 
 			$new_lang = $repo->find( $lang_id );
 
-			// set_default() refuses a target that is missing or inactive:
-			// get_default() reads the active-only bootstrap, so an inactive
-			// default resolves to NULL and takes filter_locale(),
-			// is_default_language() and the switcher down with it. Ignoring
-			// that refusal repointed core's `page_on_front` at a translation,
-			// dropped the visitor cookie and reported success - a destructive
-			// write for a default change that never happened. Everything below
-			// is conditional on the promotion actually landing.
+			// set_default() refuses a missing or inactive target (an inactive default would resolve to null everywhere):
+			// everything below runs only when the promotion landed.
 			if ( ! $new_lang || ! $repo->set_default( $lang_id ) ) {
 				wp_safe_redirect(
 					add_query_arg(
@@ -1334,13 +1198,13 @@ final class AdminController {
 				exit;
 			}
 
-			// Swap the WordPress front page to the new default language version.
+			// The front page follows to the new default's version.
 			$this->swap_front_page_to_language( $new_lang );
 
-			// Flush rewrite rules since URL prefixes change with default language.
+			// URL prefixes change with the default: flush rewrite rules.
 			update_option( 'perflocale_flush_rules', 1, false );
 
-			// Clear the language cookie so visitors re-detect the new default.
+			// Clear the language cookie so visitors detect the new default.
 			if ( ! headers_sent() ) {
 				setcookie(
 					'perflocale_lang',
@@ -1368,20 +1232,18 @@ final class AdminController {
 			exit;
 		}
 
-		// Handle delete via GET. The destructive verb is 'confirm-delete' -
-		// 'delete' now renders the read-only cascade-preview screen
-		// (LanguagesPage::render_delete_preview), so a stale bookmark of
-		// the old delete URL shows the preview instead of deleting.
+		// Delete via GET is 'confirm-delete'; 'delete' renders the read-only preview (LanguagesPage::render_delete_preview()),
+		// so an old bookmark shows the preview.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( isset( $_GET['action'] ) && $_GET['action'] === 'confirm-delete' && isset( $_GET['language_id'] ) ) {
 			$nonce = isset( $_GET['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) ) : '';
 
 			if ( ! wp_verify_nonce( $nonce, 'perflocale_delete_language' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			$plugin   = \PerfLocale\Plugin::get_instance();
@@ -1390,19 +1252,12 @@ final class AdminController {
 			$lang_id  = absint( $_GET['language_id'] );
 			$language = $repo->find( $lang_id );
 
-			// delete() wraps every cascade DELETE in one transaction and returns
-			// false after a ROLLBACK, precisely so the operator sees the failed
-			// action and can retry - discarding that return reported "Language
-			// deleted successfully" over a language that is still there. The
-			// missing-row / is-default cases used to fall through to the POST
-			// handler below and re-render the screen with nothing removed and
-			// nothing said; a stale bookmark of a delete URL reaches both.
+			// delete() returns false after its ROLLBACK and that is reported; a missing or default language is refused with a
+			// message too, not a silent re-render.
 			$deletable = $language && ! $language->is_default;
 
-			// A language that still has posts is refused (LanguageRepository::
-			// delete_blockers() explains why). Checked again here, not only on
-			// the preview screen: content can be added between the two requests.
-			// A failed count refuses too, as a failed delete.
+			// A language with posts is refused (LanguageRepository::delete_blockers()), checked again here since content can be
+			// added after the preview; a failed count refuses too.
 			$blockers = $deletable ? $repo->delete_blockers( $lang_id ) : null;
 
 			if ( $deletable && is_array( $blockers ) && $blockers['posts'] !== [] ) {
@@ -1435,7 +1290,7 @@ final class AdminController {
 			exit;
 		}
 
-		// Handle add/edit via POST.
+		// Add or edit via POST.
 		if ( empty( $_POST['perflocale_language_action'] ) ) {
 			return;
 		}
@@ -1443,11 +1298,11 @@ final class AdminController {
 		$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
 
 		if ( ! wp_verify_nonce( $nonce, 'perflocale_save_language' ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'perflocale_manage_languages' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$data = [
@@ -1456,9 +1311,7 @@ final class AdminController {
 			'name'           => isset( $_POST['name'] ) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '',
 			'native_name'    => isset( $_POST['native_name'] ) ? sanitize_text_field( wp_unslash( $_POST['native_name'] ) ) : '',
 			'flag'           => isset( $_POST['flag'] ) ? sanitize_text_field( wp_unslash( $_POST['flag'] ) ) : '',
-			// Use an explicit rtl/ltr from the form when present; otherwise
-			// auto-derive from the locale (matching the REST/CLI paths) so an
-			// RTL language added without the JS preset still gets dir=rtl.
+			// The form's rtl/ltr when given, else derived from the locale (as REST and CLI), so RTL works without the preset JS.
 			'text_direction' => ( isset( $_POST['text_direction'] ) && in_array( $_POST['text_direction'], [ 'rtl', 'ltr' ], true ) )
 				? sanitize_key( wp_unslash( $_POST['text_direction'] ) )
 				: \PerfLocale\Helper::default_text_direction( isset( $_POST['locale'] ) ? sanitize_text_field( wp_unslash( $_POST['locale'] ) ) : '' ),
@@ -1473,19 +1326,8 @@ final class AdminController {
 		$action_type = sanitize_text_field( wp_unslash( $_POST['perflocale_language_action'] ) );
 
 		if ( $action_type === 'add' ) {
-			// Pre-flight: the slug survived sanitisation. sanitize_key() carries
-			// no /u modifier, so it deletes every byte of a non-ASCII slug and
-			// hands back ''. That row inserts once (the UNIQUE key allows a
-			// single empty slug), the screen says "Language added", and the
-			// language can never match a rewrite rule. The repository refuses it
-			// now; this turns that refusal into a message that names the value
-			// the operator actually typed, rather than a silently re-rendered
-			// form. Reuses the invalid_slug notice the edit branch already has.
-			// Checked against the repository's own constant, and checked HERE -
-			// before the rename-checkbox loop further down commits rename_slug()
-			// calls and records 301s. A refused insert after those renames would
-			// leave every renamed language's prefix moved with nothing put in its
-			// place, and only a silently re-rendered form to show for it.
+			// The slug must survive sanitize_key() (no /u: a non-ASCII slug becomes ''), checked against the repository's own
+			// pattern before the rename loop below commits renames and 301s; the notice names what was typed.
 			if ( $data['slug'] === '' || ! preg_match( \PerfLocale\Database\Repository\LanguageRepository::SLUG_PATTERN, $data['slug'] ) ) {
 				wp_safe_redirect(
 					add_query_arg(
@@ -1501,12 +1343,7 @@ final class AdminController {
 				exit;
 			}
 
-			// Pre-flight: friendly duplicate check. Both `slug` and
-			// `locale` columns carry UNIQUE indexes. Without this, the
-			// admin sees a raw `Duplicate entry 'de' for key
-			// 'wp_perflocale_languages.slug'` SQL error printed at the
-			// top of the page when they retype an existing slug. Detect
-			// + redirect to a humane admin notice instead.
+			// Slug and locale are UNIQUE: a friendly notice instead of the raw "Duplicate entry" SQL error.
 			if ( $data['slug'] !== '' && $repo->find_by_slug( $data['slug'] ) ) {
 				wp_safe_redirect(
 					add_query_arg(
@@ -1537,18 +1374,13 @@ final class AdminController {
 				exit;
 			}
 
-			// Optional pre-flight: handle ticked rename checkboxes. POST shape
-			// is `perflocale_rename[old_slug] = new_slug`. Keys and values are
-			// sanitised at the boundary (wp_unslash + sanitize_key) so no
-			// SQL/XSS/path-traversal payload survives; empty/no-op entries are
-			// dropped. Nonce was verified earlier in this branch.
+			// Ticked rename boxes, `perflocale_rename[old_slug] = new_slug`, unslashed and sanitize_key()'d; empty and no-op
+			// pairs dropped (nonce verified above).
 			$rename_payload = [];
 
 			// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified earlier in this branch.
 			if ( isset( $_POST['perflocale_rename'] ) && is_array( $_POST['perflocale_rename'] ) ) {
-				// wp_unslash recurses into arrays, so a single call un-slashes
-				// every key + value below; the foreach then sanitises each
-				// pair to lowercase alnum/dash/underscore via sanitize_key.
+				// wp_unslash() recurses, so one call covers every key and value; each pair is sanitize_key()'d below.
 				// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitized per-element via sanitize_key() in the foreach below.
 				$rename_raw = wp_unslash( (array) $_POST['perflocale_rename'] );
 
@@ -1578,11 +1410,7 @@ final class AdminController {
 				}
 			}
 
-			// Default new languages to the bottom of the list. The schema's
-			// `sort_order DEFAULT 0` would land every new row above all
-			// existing rows because the list query is `ORDER BY sort_order
-			// ASC, id ASC` - visually jarring when admins add a language
-			// expecting it to append, not jump to the top.
+			// New languages go to the end of the list: the column default 0 would sort them first.
 			global $wpdb;
 			$lt = $wpdb->prefix . 'perflocale_languages';
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $lt is `$wpdb->prefix . 'perflocale_languages'`, plugin-controlled, never user input.
@@ -1613,11 +1441,8 @@ final class AdminController {
 		if ( $action_type === 'edit' && isset( $_POST['language_id'] ) ) {
 			$lang_id = absint( $_POST['language_id'] );
 
-			// Pre-flight duplicate check mirroring the add branch, excluding the
-			// row being edited. Both `slug` and `locale` carry UNIQUE indexes;
-			// without this the update() below fails with a raw SQL error, returns
-			// false, and the is_default side effects would still fire on a save
-			// that never happened.
+			// The add branch's duplicate check, excluding this row: otherwise update() fails with a raw SQL error and the
+			// default side effects would still run.
 			if ( $data['slug'] !== '' ) {
 				$slug_match = $repo->find_by_slug( $data['slug'] );
 
@@ -1661,24 +1486,13 @@ final class AdminController {
 			$result = $repo->update( $lang_id, $data );
 
 			if ( $result !== false ) {
-				// Handle "set as default" checkbox. Only after a confirmed save
-				// so a failed rename can't swap the site default / front page.
+				// "Set as default" only after a confirmed save, so a failed rename cannot swap the default and front page.
 				if ( ! empty( $_POST['is_default'] ) ) {
 					$current_default = $repo->get_default();
 
 					if ( ! $current_default || (int) $current_default->id !== $lang_id ) {
-						// set_default() refuses a missing or INACTIVE target, and
-						// this form can produce one in a single submit: unticking
-						// "Active" while ticking "Set as default" saves is_active=0
-						// first, so the promotion is then rejected. Ignoring that
-						// return repointed core's `page_on_front` at the language's
-						// translation, dropped the visitor cookie and scheduled a
-						// rewrite flush - a destructive write for a default change
-						// that never happened, reported as "Language updated
-						// successfully". Honour the refusal exactly as the GET
-						// set_default branch above does; the row edit itself has
-						// already been written, so only the promotion is reported
-						// as failed.
+						// set_default() refuses an inactive target, which one submit can create (Active unticked, default ticked): the
+						// promotion is reported as failed like the GET branch, and its side effects skipped; the row edit stays.
 						if ( ! $repo->set_default( $lang_id ) ) {
 							wp_safe_redirect(
 								add_query_arg(
@@ -1698,7 +1512,7 @@ final class AdminController {
 							$this->swap_front_page_to_language( $new_default );
 						}
 
-						// Clear language cookie so visitors get the new default.
+						// Clear the language cookie so visitors get the new default.
 						if ( ! headers_sent() ) {
 							setcookie(
 								'perflocale_lang',
@@ -1731,13 +1545,8 @@ final class AdminController {
 				exit;
 			}
 
-			// update() refuses a slug the routing layer cannot express, and the
-			// refusal happens BEFORE the row is written - so a name, flag or
-			// is_active change posted alongside a bad slug is discarded with it.
-			// Without this branch the screen simply re-renders with nothing
-			// saved and nothing said, which is the silent-failure shape the two
-			// duplicate checks above already avoid. Mirror them: send the
-			// offending value back so the notice can name it.
+			// update() refuses a slug routing cannot express before writing anything (the other changes go with it): name it,
+			// as the duplicate checks do.
 			wp_safe_redirect(
 				add_query_arg(
 					[
@@ -1755,7 +1564,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Register Screen Options for the Strings page.
+	 * Register the Screen Options of the Strings and Translations screens.
 	 *
 	 * @return void
 	 */
@@ -1798,21 +1607,21 @@ final class AdminController {
 			);
 		}
 
-		// Add column visibility checkboxes to the Strings page Screen Options.
+		// Language column checkboxes on the Strings screen.
 		if ( isset( $this->page_hooks['strings'] ) ) {
 			add_filter( 'screen_settings', [ $this, 'render_strings_column_options' ], 10, 2 );
 		}
 
-		// Same column-visibility helper for the Translations page.
+		// The same on the Translations screen.
 		if ( isset( $this->page_hooks['translations'] ) ) {
 			add_filter( 'screen_settings', [ $this, 'render_translations_column_options' ], 10, 2 );
 		}
 
-		// Save filters are registered in register_hooks() to run before set_screen_options().
+		// The save filters are registered in register_hooks(), before set_screen_options().
 	}
 
 	/**
-	 * Render language column visibility checkboxes in Screen Options.
+	 * The Strings screen's language column checkboxes in Screen Options.
 	 *
 	 * @param string     $settings Screen settings HTML.
 	 * @param \WP_Screen $screen Current screen.
@@ -1845,17 +1654,14 @@ final class AdminController {
 			$settings .= '</label>';
 		}
 
+		// Wired by admin-actions.js (on every PerfLocale screen).
 		$settings .= '</fieldset>';
-
-		Assets::enqueue_script( 'perflocale-column-toggles', 'column-toggles.js' );
 
 		return $settings;
 	}
 
 	/**
-	 * Render Language Columns checkboxes for the Translations page.
-	 * Mirrors render_strings_column_options - same UI, different user-meta
-	 * key so the two pages can have independent column preferences.
+	 * The Translations screen's language column checkboxes, stored under their own user meta key.
 	 *
 	 * @param string     $settings Screen settings HTML.
 	 * @param \WP_Screen $screen Current screen.
@@ -1874,9 +1680,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Shared implementation for the two new pages' Language Columns
-	 * checkbox fieldset. Uses a distinct nonce-slug per page so sessions
-	 * can't cross-submit.
+	 * The language column fieldset of both screens, each with its own nonce action so they cannot cross-submit.
 	 *
 	 * @param string $settings Existing screen settings HTML to append to.
 	 * @param string $meta_key User-meta key that stores hidden slugs.
@@ -1906,17 +1710,14 @@ final class AdminController {
 			$settings .= '</label>';
 		}
 
+		// admin-actions.js sends each box's data-meta-key, so ajax_save_hidden_columns_generic() stores into this screen's key.
 		$settings .= '</fieldset>';
-
-		// column-toggles.js sends each checkbox's data-meta-key, so
-		// ajax_save_hidden_columns_generic stores into this page's bucket.
-		Assets::enqueue_script( 'perflocale-column-toggles', 'column-toggles.js' );
 
 		return $settings;
 	}
 
 	/**
-	 * Process inline string translation saves.
+	 * Process the Strings grid's inline translation saves.
 	 *
 	 * @return void
 	 */
@@ -1926,27 +1727,22 @@ final class AdminController {
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_string_translations' ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// Sanitize with wp_kses_post, NOT sanitize_textarea_field. Gettext
-		// originals are stored verbatim and routinely carry markup - a link
-		// `<a href="%s">`, `<strong>`, an entity - and sanitize_textarea_field
-		// strips EVERY tag (taking the %s placeholder inside the attribute with
-		// it) and deletes %xx sequences, silently corrupting any HTML-bearing
-		// translation on save. wp_kses_post preserves post-safe markup and the
-		// placeholders while still stripping <script>/on*.
+		// wp_kses_post, not sanitize_textarea_field(): originals carry markup (`<a href="%s">`, entities), which that
+		// would strip with the placeholder inside, and %xx; kses keeps post-safe markup and drops <script> and on*.
 		$translations = isset( $_POST['perflocale_str_trans'] ) ? map_deep( wp_unslash( $_POST['perflocale_str_trans'] ), 'wp_kses_post' ) : []; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
 		if ( ! is_array( $translations ) ) {
 			return;
 		}
 
-		// Extra plural forms 2..N for 3+ form languages: [string_id][lang_id] = [form2, form3, …]. Same markup fidelity as the base translation above.
+		// Extra plural forms 2..N, [string_id][lang_id] = [form2, ...], with the same markup handling.
 		$extra_forms_post = isset( $_POST['perflocale_str_extra'] ) ? map_deep( wp_unslash( $_POST['perflocale_str_extra'] ), 'wp_kses_post' ) : []; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 		$extra_forms_post = is_array( $extra_forms_post ) ? $extra_forms_post : [];
 
@@ -1963,17 +1759,10 @@ final class AdminController {
 
 		$saved   = 0;
 		$deleted = 0;
-		// Cells whose write could not be attempted at all (group INSERT or link
-		// upsert failed). Reported on the redirect so a save that silently
-		// dropped a translator's text is never indistinguishable from a save
-		// where nothing needed writing.
+		// Cells whose write could not be attempted (group INSERT or link upsert failed), reported on the redirect.
 		$link_failures = 0;
 
-		// Pre-fetch every string's group_id in ONE query. The old loop
-		// issued a SELECT per string - fine for the typical admin-form
-		// save of 20–50 entries, but linear waste on 200+ bulk imports
-		// (CLI, REST). Building the {string_id => group_id} map upfront
-		// also dedups repeated string_ids in the input for free.
+		// Every string's group_id in one query (also dedups repeated ids).
 		$string_ids = array_values( array_filter( array_map( 'absint', array_keys( $translations ) ) ) );
 		$group_map  = [];
 
@@ -1993,14 +1782,8 @@ final class AdminController {
 			}
 		}
 
-		// Current stored translations for every posted string, in ONE query,
-		// keyed [string_id][language_id] => translation. The grid re-posts
-		// EVERY cell on the page, so without this an edit to one cell would
-		// re-write (and re-link, clearing needs_update on) every other cell.
-		// Diffing against the stored value lets the loop skip untouched cells
-		// entirely: no needless write, no status reset, and the rare
-		// wp_kses '<'-in-prose normalisation only ever touches a cell the
-		// translator actually edited.
+		// Stored translations in one query, [string_id][language_id]: the grid posts every cell, so unchanged cells are
+		// skipped (no write, no needs_update reset, no kses normalisation of untouched text).
 		$current_map       = [];
 		$current_extra_map = [];
 
@@ -2022,8 +1805,7 @@ final class AdminController {
 			}
 		}
 
-		// Languages actually written/deleted this save - scopes the cache
-		// flush + file regeneration below to what changed.
+		// Languages written or deleted, to scope the cache flush and file regeneration.
 		$touched_lang_ids = [];
 
 		foreach ( $translations as $string_id => $lang_translations ) {
@@ -2033,51 +1815,25 @@ final class AdminController {
 				continue;
 			}
 
-			// A string_id absent from the map has no `strings` row at all (a
-			// stale form, or the row was deleted between render and save):
-			// there is nothing to write against and nothing to repair.
+			// No `strings` row (stale form, deleted since render): nothing to write or repair.
 			if ( ! array_key_exists( $string_id, $group_map ) ) {
 				continue;
 			}
 
 			$group_id = $group_map[ $string_id ];
 
-			// strings.group_id is an unenforced FK, and three shapes fail it:
-			// 0 (never grouped), an id whose group row is gone, and an id that
-			// collides with a live post/term group. Writing links under any of
-			// them either orphans the row or repoints the colliding group's
-			// link via upsert_link()'s ON DUPLICATE KEY UPDATE, so none of them
-			// may reach the writes below as-is.
-			//
-			// Skipping the string outright is not an option either: the
-			// redirect carries saved=0 and StringsPage gates its notice on
-			// saved > 0, so the operator's typed translation would vanish with
-			// no message at all - and stay untranslatable forever, since
-			// nothing else repairs a string that has no translation row yet.
-			// Self-heal instead, onto a fresh string-type group, with the same
-			// two statements TranslationFileGenerator::
-			// repair_orphaned_translations() shape (2) uses.
-			//
-			// Deferred to the first cell that actually writes (below): the grid
-			// re-posts EVERY cell on the page, so healing here would mint a
-			// group for every untouched string in view.
+			// group_id can be 0, gone, or a post or term group's; links under any of them would orphan or repoint that group,
+			// and skipping would lose the typed text without a message. So the group is healed at the first write below.
 			$needs_group = ! $group_repo->is_string_group( $group_id );
 
 			foreach ( $lang_translations as $lang_id => $value ) {
 				$lang_id = absint( $lang_id );
-				// Value was already wp_unslash'd + sanitized by map_deep()
-				// at the top of this method. Re-applying wp_unslash here
-				// would eat legitimate backslashes in the translation.
+				// Already unslashed and sanitized by map_deep() above: another wp_unslash() would eat real backslashes.
 				$value = (string) $value;
 
 				if ( $value === '' ) {
-					// Remove the translation link if empty. Not while the
-					// string still needs a group: it owns no link of its own,
-					// and its unusable group_id may belong to a live post/term
-					// group whose link this would delete. Clearing an already
-					// blank cell has nothing to heal for, so no group is minted
-					// here - the string_translations delete below is keyed on
-					// string_id and stays correct either way.
+					// Empty: remove the link, unless the string still needs a group (its unusable group_id may be a live post or term
+					// group whose link this would delete). Clearing a blank cell mints no group.
 					if ( ! $needs_group ) {
 						// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 						$wpdb->delete(
@@ -2090,23 +1846,8 @@ final class AdminController {
 						);
 					}
 
-					// Drop the stored translation text too so subsequent
-					// reads correctly return "no translation" - but only when
-					// there is a row to drop. The grid re-posts EVERY cell on
-					// the page and most of them are blank, so an unconditional
-					// DELETE here costs one write per empty cell on a save
-					// that changed nothing, and - worse - leaves $deleted
-					// non-zero, firing the whole cache-flush + .l10n.php
-					// regeneration + `perflocale/strings/changed` block below
-					// over a no-op. $current_map already holds every stored
-					// (string_id, language_id) pair from the single SELECT at
-					// the top of this method, so the guard is free.
-					//
-					// Gating the flush on it is also exactly right: the
-					// all_string_translations_{lang} map is driven FROM
-					// string_translations (StringTranslation::preload_
-					// translations), so a language with no row here had
-					// nothing cached to invalidate.
+					// Drop the stored text only when there is a row: most posted cells are blank, and an unconditional DELETE would
+					// cost a write each and trigger the cache flush and regeneration below for nothing.
 					if ( isset( $current_map[ $string_id ][ $lang_id ] ) ) {
 						$st_repo->delete( $string_id, $lang_id );
 
@@ -2121,11 +1862,7 @@ final class AdminController {
 				$text_change = ! isset( $current_map[ $string_id ][ $lang_id ] )
 					|| $current_map[ $string_id ][ $lang_id ] !== $value;
 
-				// A cell is "touched" iff its base text OR its stored plural
-				// forms differ from what's on disk. Compare the posted forms
-				// against the stored column in canonical form so a 3+ form
-				// cell that re-posts its unchanged forms is NOT treated as an
-				// edit (which would reset needs_update and re-write markup).
+				// Touched when the text or the stored plural forms differ (compared in canonical form), so unchanged forms are no edit.
 				$extra_change = false;
 
 				if ( is_array( $row_extra ) ) {
@@ -2136,23 +1873,13 @@ final class AdminController {
 					$extra_change      = $posted_extra_json !== $stored_extra_json;
 				}
 
-				// Untouched cell (base text unchanged AND plural forms
-				// unchanged): leave it entirely alone. The grid re-posts every
-				// cell, so writing here would reset a needs_update flag the
-				// source-change tracker set on a translation the operator never
-				// edited - and re-run wp_kses over already-stored markup.
+				// Untouched cell: left alone, or the write would reset a needs_update the source tracker set and re-run wp_kses.
 				if ( ! $text_change && ! $extra_change ) {
 					continue;
 				}
 
-				// The cell is about to be written, so the string needs a group
-				// it can legally own. Mint one and repoint `strings.group_id`
-				// at it - the same INSERT-then-UPDATE pair, in the same order,
-				// that repair_orphaned_translations() shape (2) runs, so the
-				// two self-heal paths cannot drift. Only the first written cell
-				// pays for this; the remaining languages reuse the new group.
-				// A failed INSERT leaves the string exactly as it was, so the
-				// next save retries rather than writing under a bad id.
+				// About to write: mint a string group and point the string at it, with repair_orphaned_translations() step 2's
+				// statements; only the first written cell pays, and a failed INSERT leaves the string for the next save.
 				if ( $needs_group ) {
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$inserted = $wpdb->insert(
@@ -2162,9 +1889,7 @@ final class AdminController {
 					);
 
 					if ( ! $inserted ) {
-						// No group id to write under, so every cell of this
-						// string is skipped. Counted, not silent - see the
-						// upsert failure branch below.
+						// No group to write under: every cell of this string is skipped, and counted.
 						++$link_failures;
 						continue 2;
 					}
@@ -2183,48 +1908,23 @@ final class AdminController {
 					$needs_group = false;
 				}
 
-				// Link this string-group to the target language. For string
-				// translations object_id = string_id (each language-link points
-				// back to the string row).
-				//
-				// translation_links carries TWO unique keys - group_lang
-				// (group_id, language_id) and object_lang (type, object_id,
-				// language_id) - and upsert_link()'s INSERT … ON DUPLICATE KEY
-				// UPDATE can land on either. Sibling-language links for this
-				// string are preserved because they differ in language_id on
-				// both keys; the object_lang case (this string already holding a
-				// row for this language under a DIFFERENT, usually dead, group -
-				// the shape the $needs_group heal above mints a new group for)
-				// is resolved inside upsert_link(), which drops the stale row and
-				// retries rather than leaving the link on the dead group.
+				// Link the string group to the language (object_id = string id). translation_links has two unique keys; a row of
+				// this string under another (dead) group is resolved inside upsert_link(), which drops it and retries.
 				$link_result = $group_repo->upsert_link( $group_id, $string_id, $lang_id, 'translated', \PerfLocale\Enum\SourceType::Manual );
 
 				if ( $link_result === false ) {
-					// Only a hard DB error reaches here. Dropping the cell
-					// silently is the very failure the $needs_group comment
-					// above refuses to accept: `saved` would stay 0, StringsPage
-					// gates its notice on saved > 0, and the operator's typed
-					// translation would disappear with no message. Count it so
-					// the redirect can say something happened.
+					// A hard database error: counted, so the redirect says something happened instead of losing the typed text.
 					++$link_failures;
 					continue;
 				}
 
-				// Store the translation text in the dedicated table (upsert
-				// on the (string_id, language_id) PRIMARY KEY; extra_forms
-				// is preserved by set() itself). Skip the write when only the
-				// plural forms changed - set() would be a no-op but still
-				// costs a query.
+				// The text in its table (upsert on the primary key; set() keeps extra_forms), skipped when only plural forms changed.
 				if ( $text_change ) {
 					$st_repo->set( $string_id, $lang_id, (string) $value );
 				}
 
-				// Extra plural forms 2..N: runs after set() because the row
-				// must exist (set_extra_forms is an UPDATE). Only 3+ form
-				// languages post these inputs - they always submit (empty
-				// strings included), so an operator clearing every field
-				// still reaches set_extra_forms, which normalises to NULL.
-				// Only write when the forms actually changed.
+				// Extra forms 2..N after set() (set_extra_forms() is an UPDATE); 3+ form languages always post them, so clearing
+				// every field reaches it (normalised to NULL). Only when they changed.
 				if ( $extra_change && is_array( $row_extra ) ) {
 					$st_repo->set_extra_forms( $string_id, $lang_id, array_map( 'strval', $row_extra ) );
 				}
@@ -2236,10 +1936,7 @@ final class AdminController {
 
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// Flush string translation cache and regenerate files. A delete-only
-		// save ($saved === 0 but $deleted > 0) still removed rows, so the
-		// cached all_string_translations_{lang} map + .l10n.php files would
-		// otherwise keep serving the just-removed translation until TTL.
+		// Flush the string cache and regenerate files, also for a delete-only save, or removed translations stay served.
 		if ( ( $saved > 0 || $deleted > 0 ) && $cache instanceof \PerfLocale\Cache\CacheManager ) {
 			$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository( $cache );
 			$all_langs = $lang_repo->get_active();
@@ -2248,22 +1945,16 @@ final class AdminController {
 				$cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
 			}
 
-			// Regenerate .l10n.php files if using file mode - scoped to the
-			// languages this save actually touched (a one-string save was
-			// re-fetching EVERY language's full translation set). The
-			// all-language cache-delete loop above deliberately stays broad:
-			// an add-on's gettext bridge depends on it (do not narrow).
+			// Files mode: regenerate only the touched languages. The all-language cache delete above stays broad: an add-on's
+			// gettext bridge depends on it.
 			if ( $this->settings->get( 'string_translation_mode' ) === 'files' ) {
 				$generator = new \PerfLocale\Strings\TranslationFileGenerator( $cache );
 				$generator->generate_all( $touched_lang_ids === [] ? null : array_keys( $touched_lang_ids ) );
 			}
 
 			/**
-			 * Fires after string translations are saved from the admin
-			 * Strings screen. Lets addons that derive state from the
-			 * `strings`/`string_translations` tables (per-language string
-			 * bundles, for example) invalidate it - core itself only knows
-			 * about its own gettext caches.
+			 * Fires after the Strings screen saved string translations, so add-ons deriving state from the string tables can
+			 * refresh it.
 			 *
 			 * @hook perflocale/strings/changed
 			 *
@@ -2272,7 +1963,7 @@ final class AdminController {
 			do_action( 'perflocale/strings/changed', 'admin_save' );
 		}
 
-		// Redirect back with count.
+		// Back with the count.
 		$redirect_args = [
 			'page'  => 'perflocale-strings',
 			'saved' => $saved,
@@ -2282,7 +1973,7 @@ final class AdminController {
 			$redirect_args['save_failed'] = $link_failures;
 		}
 
-		// Preserve filters.
+		// Keep the filters.
 		if ( ! empty( $_POST['domain_filter'] ) ) {
 			$redirect_args['domain_filter'] = sanitize_text_field( wp_unslash( $_POST['domain_filter'] ) );
 		}
@@ -2301,14 +1992,16 @@ final class AdminController {
 
 
 	/**
-	 * Whether the Translations page should expose the "MT-translate" bulk
-	 * action. True only when the active provider is fully configured
-	 * (API key set, etc.). When false, the option is hidden - better than
-	 * a greyed-out "why doesn't this work?" entry.
+	 * Whether the current user may run bulk machine translation now: they manage
+	 * translations (as the bulk handlers require) and the active provider is configured.
 	 *
 	 * @return bool
 	 */
 	public static function bulk_mt_translate_available(): bool {
+		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
+			return false;
+		}
+
 		$plugin = \PerfLocale\Plugin::get_instance();
 
 		if ( ! $plugin->has( 'settings' ) || ! $plugin->has( 'cache' ) ) {
@@ -2317,9 +2010,7 @@ final class AdminController {
 
 		$settings = $plugin->get( 'settings' );
 
-		// Master switch first: with MT disabled the REST endpoints already
-		// refuse (mt_disabled 403), so admin bulk surfaces must not offer the
-		// action either - a configured provider alone is not enough.
+		// The master switch first: with machine translation off the REST routes refuse, so the admin must not offer it.
 		if ( ! $settings->mt_enabled() ) {
 			return false;
 		}
@@ -2340,8 +2031,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Handle the "Translate the entire site" panel submit (nonce + cap
-	 * already verified by process_translations_bulk before delegating).
+	 * Handle the "Translate the entire site" submit (nonce and capability checked by process_translations_bulk()).
 	 *
 	 * @return void
 	 */
@@ -2363,11 +2053,7 @@ final class AdminController {
 		$include_meta = ! empty( $_POST['include_meta'] );
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
 
-		// ⭐ Only types this site is configured to translate may be targeted -
-		// anything else in the POST is dropped (crafted type names included).
-		// This used to be `public + show_ui`, which silently discarded every
-		// addon-registered type (CF7, WPForms, product_variation) the
-		// Translations page had just listed as translatable.
+		// Only types this site translates may be targeted; anything else posted is dropped.
 		$settings_for_types = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 		$allowed_types      = $settings_for_types->get_site_translate_post_types();
 		$requested_types    = $site_post_types;
@@ -2375,16 +2061,10 @@ final class AdminController {
 		$site_post_types    = array_values( array_intersect( $site_post_types, $allowed_types ) );
 
 		if ( $site_lang_ids === [] || $site_post_types === [] ) {
-			// Say WHY the selection was empty rather than redirecting to a bare
-			// "nothing to do". A type that is translatable in the settings but
-			// whose plugin is deactivated looks identical to a run that found no
-			// content, and the operator has no way to tell them apart.
+			// Say why the selection was empty: a configured type whose plugin is off looks like a run with no content.
 			$message = 'site_translate_empty';
 
-			// ⚠️ Only the types THIS REQUEST asked for. Listing every
-			// unregistered configured type told an operator who selected
-			// "Posts" that their run failed because of `elementor_library` -
-			// a diagnostic that points at the wrong thing is worse than none.
+			// Only the types this request asked for, so the reason points at the right type.
 			$dropped = $requested_count > 0
 				? array_values( array_intersect( $requested_types, $settings_for_types->get_unregistered_translatable_post_types() ) )
 				: [];
@@ -2428,22 +2108,9 @@ final class AdminController {
 	}
 
 	/**
-	 * Process the Translations-page bulk-actions POST. Two actions:
-	 *
-	 *   - mt_translate     - MT-translate selected source posts into the
-	 *                        chosen target language (or all). Skips pairs
-	 *                        that already have a translation. Routed
-	 *                        through the Dispatcher: small selections run
-	 *                        inline (admin sees counts on the redirect);
-	 *                        larger selections go async (admin redirects
-	 *                        to PerfLocale → Jobs to watch progress).
-	 *                        The sync/async cutoff is configurable per
-	 *                        site under Settings → Performance → Background
-	 *                        Thresholds → "Bulk machine translation".
-	 *   - mark_needs_update - Flip status='needs_update' on existing
-	 *                        translation_links rows, scoped to the chosen
-	 *                        target language (or all), for the selected
-	 *                        posts the user may edit.
+	 * Process the Translations screen's bulk actions: mt_translate (selected posts into a language or all, existing
+	 * pairs skipped; inline below the Settings > Performance threshold, else a job) and mark_needs_update (the selected
+	 * editable posts' links in the target languages).
 	 *
 	 * @return void
 	 */
@@ -2453,31 +2120,16 @@ final class AdminController {
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_translations_bulk' ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// ⚠️ COMPLETENESS BEFORE BRANCHING. This used to sit inside the subset
-		// branch only, so `site_translate` returned above it and was never
-		// checked at all - a truncated site-wide POST dispatched a job for a
-		// SUBSET of the requested languages with no warning.
-		//
-		// And it used to infer truncation from `count( $_POST, COUNT_RECURSIVE )`,
-		// which ALSO counts array containers: an intact 63-field submission was
-		// refused as truncated at a limit of 64. A recursive element count can
-		// neither prove a request arrived intact nor prove it did not.
-		//
-		// The form now ends with `perflocale_form_end`. PHP discards input past
-		// `max_input_vars` in order, so if that field arrived, everything before
-		// it did too.
-		//
-		// A MISSING marker is not proof of truncation either - it may simply be
-		// a programmatic or pre-upgrade caller that never sent one. Refuse only
-		// when the marker is absent AND the request reached the server's
-		// ceiling, which is the one combination that really does indicate loss.
+		// Completeness before branching, for site_translate too: the form ends with `perflocale_form_end`, and PHP drops
+		// input past max_input_vars in order. Refused only when the marker is missing and the request reached the limit
+		// (a caller may simply not send it).
 		$max_input_vars = (int) ini_get( 'max_input_vars' );
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
 		$form_complete  = isset( $_POST['perflocale_form_end'] );
@@ -2501,9 +2153,7 @@ final class AdminController {
 			}
 		}
 
-		// Site-wide MT: the "Translate the entire site" panel posts the same
-		// nonce with action=site_translate. Dispatches the chunked background
-		// chain (SiteTranslateJob) - never an inline loop.
+		// "Translate the entire site" posts the same nonce with action=site_translate: the SiteTranslateJob chain, never inline.
 		if ( sanitize_key( wp_unslash( $_POST['perflocale_translations_action'] ) ) === 'site_translate' ) {
 			$this->process_site_translate();
 			return;
@@ -2515,7 +2165,7 @@ final class AdminController {
 		$ids_raw = isset( $_POST['ids'] ) && is_array( $_POST['ids'] ) ? wp_unslash( $_POST['ids'] ) : [];
 		$ids     = array_values( array_filter( array_map( 'absint', (array) $ids_raw ), fn( $i ) => $i > 0 ) );
 
-		// Preserve filters so the redirect lands back on the same view.
+		// Keep the filters so the redirect returns to the same view.
 		$preserve = [];
 		foreach ( [ 'post_type_filter', 'status_filter', 'source_filter', 's', 'perflocale_lang', 'paged', 'orderby', 'order' ] as $arg ) {
 			if ( isset( $_POST[ $arg ] ) && $_POST[ $arg ] !== '' ) {
@@ -2549,9 +2199,7 @@ final class AdminController {
 		$settings  = $plugin->get( 'settings' );
 		$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository( $cache );
 
-		// Resolve target languages from the secondary value.
-		// "all" means every active language EXCEPT the default (you can't
-		// translate a post into its source language).
+		// Target languages: "all" is every active language but the default.
 		$default    = $lang_repo->get_default();
 		$default_id = $default ? (int) $default->id : 0;
 		$active     = $lang_repo->get_active();
@@ -2586,17 +2234,8 @@ final class AdminController {
 					$redirect( 'bulk_mt_unavailable' );
 				}
 
-				// Route through the Dispatcher. BulkTranslateJob runs the
-				// same inline TranslationService loop when the request is
-				// below the configured threshold; bigger dispatches return
-				// immediately and the worker grinds through the matrix in
-				// the background, visible under PerfLocale → Jobs.
-				//
-				// Batch size driven by the threshold setting (default 25
-				// pairs, configurable per site).
-				// Meta-field MT opt-in from the confirm dialog. The curated key
-				// registry is additionally setting-gated, so this is safe to
-				// pass even when both meta settings are off (no-op).
+				// Through Dispatcher: BulkTranslateJob inline below the threshold, else a job on the Jobs screen. The meta opt-in
+				// is also gated by the settings, so passing it is safe.
 				// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified at the top of process_translations_bulk().
 				$bulk_include_meta = ! empty( $_POST['include_meta'] );
 
@@ -2614,9 +2253,7 @@ final class AdminController {
 					exit;
 				}
 
-				// Refused (permission, monthly budget, a should_dispatch veto),
-				// not enqueued, or stopped by an error before any row: say why,
-				// as the site-wide panel does, instead of reporting "0 created".
+				// Refused (permission, budget, a veto) or stopped before any row: say why instead of "0 created".
 				if ( in_array( $result['mode'], [ 'denied', 'error' ], true ) || isset( $result['error'] ) ) {
 					set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), (string) ( $result['error'] ?? __( 'Dispatch failed.', 'perflocale' ) ), 5 * MINUTE_IN_SECONDS );
 					$redirect( 'bulk_mt_denied' );
@@ -2630,10 +2267,7 @@ final class AdminController {
 				$no_access   = min( $skipped, max( 0, (int) ( $r['skipped_permission'] ?? 0 ) ) );
 				$kept        = min( $created, max( 0, (int) ( $r['kept'] ?? 0 ) ) );
 
-				// Stash the first error message in a per-user transient so
-				// the redirect URL stays clean (error text can contain odd
-				// characters, and embedding it in a query string creates
-				// invalid URLs and CSRF-prone reflections).
+				// The first error goes in a per-user transient, not the URL (odd characters, reflection).
 				if ( $first_error !== '' ) {
 					set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), $first_error, 5 * MINUTE_IN_SECONDS );
 				}
@@ -2648,6 +2282,9 @@ final class AdminController {
 				$redirect(
 					'bulk_mt_done',
 					[
+						// Selection and target ('all' or a slug), reported by the perflocale.translations.bulkFinished hook.
+						'posts'     => count( $ids ),
+						'target'    => sanitize_key( $bulk_value ),
 						'created'   => $created,
 						'skipped'   => $skipped - $no_access,
 						'no_access' => $no_access,
@@ -2660,16 +2297,13 @@ final class AdminController {
 			case 'mark_needs_update':
 				global $wpdb;
 
-				// Only the groups of the selected posts this user may edit: the
-				// capability check above covers the screen, and a selected post
-				// can be of a type the user has no rights on.
+				// Only the groups of selected posts this user may edit (a selected post can be of a type they cannot edit).
 				_prime_post_caches( $ids, false, false );
 				$ids = array_values( array_filter( $ids, static fn( int $id ): bool => \PerfLocale\Helper::user_can_edit_object( $id ) ) );
 
 				if ( $ids === [] ) {
 					/**
-					 * No selected post is one this user may edit, so no row is
-					 * flagged; listeners still see the action, with a count of zero.
+					 * No selected post is editable by this user: nothing flagged, the action still fires with a count of zero.
 					 *
 					 * @hook perflocale/translations/bulk_marked_needs_update
 					 */
@@ -2685,60 +2319,9 @@ final class AdminController {
 				$lang_placeholders = implode( ',', array_fill( 0, count( $target_lang_ids ), '%d' ) );
 				$post_type         = \PerfLocale\Enum\ObjectType::Post->value;
 
-				// Join through group_id, do NOT match object_id against the
-				// target languages. The checkboxes on the Translations screen
-				// carry SOURCE post ids, and a source post's own link row is
-				// its DEFAULT-language row - the one language $target_lang_ids
-				// deliberately excludes (see the "all" branch above). Filtering
-				// `object_id IN (selection) AND language_id IN (targets)` on a
-				// single row therefore asks for two disjoint sets and matches
-				// nothing. The sibling rows we actually want share the group:
-				// resolve each selected post's group from its own row (s) and
-				// flip that group's rows in the target languages (t).
-				//
-				// object_id is polymorphic - a term with the same numeric id
-				// owns its own row here - so the scope has to say "posts".
-				// It says so the way the rest of the plugin says it: through
-				// translation_groups.type, exactly like TranslationsPage::
-				// register_source_only_filter(), which decides the very same
-				// question for the checkboxes feeding this handler. The group
-				// row is the authority on what a group holds;
-				// translation_links.type is a denormalised copy that rows
-				// written before that column existed carry EMPTY (the three
-				// subsites of a multisite test network held 15 such rows, every
-				// one of them inside a post/term group), and a `links.type` predicate
-				// silently matches none of them.
-				//
-				// COUNT(DISTINCT t.id), not COUNT(*): the s-side join yields
-				// one row per (source row, target row) pair, so a group with
-				// more than one matching s row would multiply its own targets
-				// in the count. The UPDATE is unaffected either way - it flips
-				// each t row at most once - but the operator-facing number and
-				// the hook payload must be target rows, not join pairs.
-				//
-				// Resolve the scope before writing, in one indexed query, for
-				// two reasons. It yields the group ids whose 3-layer
-				// get_translations cache the UPDATE below invalidates (the
-				// UPDATE bypasses the repository, so reads would keep serving
-				// the pre-update status until the TTL). And it yields a row
-				// count that survives a re-run: $wpdb->query() reports MySQL's
-				// *changed* rows, so flagging an already-flagged translation
-				// would report "0 translations flagged" - the same green
-				// message over a no-op that this branch exists to fix. The
-				// notice says "%d translations flagged as needing update", so
-				// the honest number is the rows the scope matched, all of which
-				// carry needs_update by the time the redirect lands.
-				//
-				// Every table is index-driven (verified with EXPLAIN on a
-				// test site's 6,815 links): s resolves through the
-				// object_lookup (object_id, language_id) KEY, g is a PRIMARY
-				// KEY lookup, t rides the group_lang (group_id, language_id)
-				// UNIQUE key.
-				//
-				// The table names lead each arg list: the %i identifier
-				// placeholders come first, then the %s values and the %d id
-				// lists, in the order they appear in the statement. prepare()
-				// consumes args strictly in order.
+				// Join through group_id (the checkboxes carry source ids, whose own row is the default language the targets
+				// exclude), posts only through translation_groups.type; the scope is read first for the cache invalidation and a
+				// re-run-proof count. Docs: docs-ai/11-code-rationale.md, "AdminController: bulk needs_update scope".
 				$scope_args = array_merge(
 					[ $tl, $tg, $tl, $post_type ],
 					$ids,
@@ -2769,11 +2352,7 @@ final class AdminController {
 				}
 
 				if ( $count > 0 ) {
-					// Same three-table scope as the SELECT above, in the same
-					// order, so the rows counted and the rows written cannot
-					// diverge. A multi-table UPDATE assigns each matched t row
-					// once however many s rows join to it, so the duplicate
-					// pairs that made COUNT(*) wrong never mattered here.
+					// The SELECT's scope in the same order, so rows counted and rows written match; each t row is assigned once.
 					$update_args = array_merge(
 						[ $tl, $tg, $tl, \PerfLocale\Enum\TranslationStatus::NeedsUpdate->value, $post_type ],
 						$ids,
@@ -2796,10 +2375,7 @@ final class AdminController {
 							) ?? ''
 						);
 					} else {
-						// SQLite: the same write with the write time the
-						// column's ON UPDATE CURRENT_TIMESTAMP gives on MySQL,
-						// the assignment Schema::touch_write_time() returns for
-						// t.status written out.
+						// SQLite: with the write time MySQL's ON UPDATE CURRENT_TIMESTAMP gives (Schema::touch_write_time() written out).
 						$updated = $wpdb->query(
 							$wpdb->prepare(
 								"UPDATE %i AS t
@@ -2815,16 +2391,10 @@ final class AdminController {
 					// phpcs:enable
 
 					if ( $updated === false ) {
-						// The scope matched but the write did not land. Skip the
-						// cache invalidation - the cached statuses are still the
-						// stored ones - and redirect to a DIFFERENT message.
-						// Reporting count=0 through `bulk_marked_needs_update`
-						// rendered a GREEN "0 translations flagged as needing
-						// update": the identical success notice an empty
-						// selection gets, over a database write that failed.
+						// The scope matched but the write failed: no cache invalidation, and its own error message instead of the green
+						// "0 flagged" an empty selection gets.
 						/**
-						 * Bulk flip ran but wrote no rows; listeners still see
-						 * the action, with a count of zero.
+						 * The bulk flip wrote no rows; the action still fires with a count of zero.
 						 *
 						 * @hook perflocale/translations/bulk_marked_needs_update
 						 */
@@ -2860,11 +2430,11 @@ final class AdminController {
 
 		if ( $action === 'po_export' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_strings_po_export' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'perflocale_import_export' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			$lang = sanitize_key( wp_unslash( $_POST['lang'] ?? '' ) );
@@ -2874,11 +2444,7 @@ final class AdminController {
 				exit;
 			}
 
-			// Capture the build phase in an output buffer so any stray PHP
-			// notice/deprecation/warning emitted during PO serialisation
-			// can't leak into the response stream BEFORE our Content-Type
-			// header - which would otherwise produce a corrupt .po file
-			// with HTML noise at the top.
+			// Buffer the build so a stray notice cannot land before the Content-Type header and corrupt the .po file.
 			ob_start();
 			$tmp   = wp_tempnam( 'perflocale-po-' );
 			$bytes = \PerfLocale\Admin\PoSync::export_to_file( $tmp, $lang );
@@ -2902,11 +2468,11 @@ final class AdminController {
 
 		if ( $action === 'po_import' ) {
 			if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_strings_po_import' ) ) {
-				wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			if ( ! current_user_can( 'perflocale_import_export' ) ) {
-				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			$lang = sanitize_key( wp_unslash( $_POST['lang'] ?? '' ) );
@@ -2916,11 +2482,8 @@ final class AdminController {
 				exit;
 			}
 
-			// Same reason as the JSON importer above: an over-limit PO arrives
-			// as a populated $_FILES entry with an empty tmp_name, and only
-			// the `error` slot says so. Only the numeric code travels in the
-			// redirect - the sentence is built on the page from
-			// upload_error_message(), so nothing from the request is echoed.
+			// As for the JSON import: only the `error` slot says an over-limit file was refused. Only the numeric code travels in
+			// the redirect; the page builds the sentence, so nothing from the request is echoed.
 			$upload_error = isset( $_FILES['po_file']['error'] ) && is_scalar( $_FILES['po_file']['error'] )
 				? (int) $_FILES['po_file']['error']
 				: UPLOAD_ERR_NO_FILE;
@@ -2945,9 +2508,7 @@ final class AdminController {
 			}
 
 			$replace = ! empty( $_POST['replace_mode'] );
-			// $_FILES['x']['tmp_name'] is a server-PHP-controlled path; do
-			// NOT sanitize_text_field() it (could strip valid path chars).
-			// is_uploaded_file() is the canonical guard for upload paths.
+			// tmp_name is a server path: is_uploaded_file() is the check, sanitize_text_field() could break it.
 			// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- guarded by is_uploaded_file() below.
 			$tmp_path = wp_unslash( $_FILES['po_file']['tmp_name'] );
 
@@ -2956,9 +2517,7 @@ final class AdminController {
 				exit;
 			}
 
-			// Reject oversized uploads BEFORE parsing - core \PO accumulates every
-			// entry in memory, so a huge PO would OOM/timeout the request. Mirrors
-			// the JSON-import (perflocale/import/max_file_bytes) size gate.
+			// Size check before parsing: core's \PO holds every entry in memory (as the JSON import's gate).
 			$max_po_bytes = self::po_max_bytes();
 			$po_size      = isset( $_FILES['po_file']['size'] )
 				? (int) $_FILES['po_file']['size']
@@ -2975,11 +2534,7 @@ final class AdminController {
 
 			$result = self::import_po_upload( $tmp_path, $lang, $replace );
 
-			// Pass the full breakdown via a per-user transient (not URL
-			// params) so the post-import page is clean - same flash
-			// pattern as the string scanner. Transient is deleted on
-			// first read. Inserted/updated/unchanged/no_translation give
-			// the user an honest per-row breakdown.
+			// The full breakdown in a per-user transient (deleted on first read), not URL params, as the string scanner does.
 			set_transient(
 				'perflocale_po_import_result_' . get_current_user_id(),
 				[
@@ -2994,9 +2549,7 @@ final class AdminController {
 					'total_entries'   => (int) $result['total_entries'],
 					'sanitized'       => (int) $result['sanitized'],
 					'sanitized_empty' => (int) $result['sanitized_empty'],
-					// The first few messages, so the notice can say WHICH
-					// entries failed or were only partly imported rather
-					// than just how many.
+					// The first messages, so the notice says which entries failed or were partly imported.
 					'error_messages'  => array_slice( array_map( 'strval', $result['errors'] ), 0, 3 ),
 					'lang'            => $lang,
 				],
@@ -3009,27 +2562,10 @@ final class AdminController {
 	}
 
 	/**
-	 * Stream a finished `data_export` job's file as a download attachment.
+	 * Stream a finished `data_export` job's file as a download (admin_init, `perflocale_export_download=<JOB_ID>`).
 	 *
-	 * Bound to `admin_init`. Listens for the canonical URL
-	 *   /wp-admin/admin.php?page=perflocale-jobs&perflocale_export_download=<JOB_ID>&_wpnonce=<NONCE>
-	 *
-	 * All five gates have to pass before a byte goes out:
-	 *
-	 *   1. Query arg present (otherwise no-op so this handler doesn't
-	 *      touch any other admin pageload).
-	 *   2. Nonce verifies the per-job download intent (`perflocale_export_download_<JOB_ID>`).
-	 *   3. Caller has the same capability the export-data form required
-	 *      (`perflocale_import_export`, as
-	 *      DataExportJob::get_required_capability() does) - handlers off
-	 *      the Jobs page are reachable by lower-tier translator roles,
-	 *      who must not pull a full database export.
-	 *   4. Job is real, type `data_export`, status `complete`, and
-	 *      stores a `path` in its result.
-	 *   5. Realpath of that file is INSIDE wp-content/uploads/perflocale/exports/.
-	 *      Anything pointing outside is treated as malicious and
-	 *      hard-rejected. After streaming, the file is unlinked so
-	 *      the same URL can't replay.
+	 * Gates: the per-job nonce, `perflocale_import_export` (as DataExportJob requires; Jobs screen users may lack it),
+	 * a complete data_export job with a `path`, and its realpath inside uploads/perflocale/exports/. Deleted after.
 	 *
 	 * @return void
 	 */
@@ -3050,11 +2586,8 @@ final class AdminController {
 			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// Match the cap required by DataExportJob::get_required_capability()
-		// so the dispatch + download lifecycle uses the same capability.
-		// A site owner who delegates perflocale_import_export via the
-		// `perflocale/roles/cap_roles` filter therefore gets a complete
-		// dispatch-to-retrieval flow instead of a UX dead-end.
+		// DataExportJob's own capability, so dispatch and download use the same one (also when delegated through
+		// perflocale/roles/cap_roles).
 		if ( ! current_user_can( 'perflocale_import_export' ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
@@ -3074,8 +2607,7 @@ final class AdminController {
 			wp_die( esc_html__( 'Export file is no longer available.', 'perflocale' ), '', [ 'response' => 410 ] );
 		}
 
-		// Hard requirement: the file must live inside
-		// `uploads/perflocale/exports/`. Anything outside is rejected.
+		// The file must be inside uploads/perflocale/exports/.
 		$exports_dir = \PerfLocale\Helper::uploads_exports_dir();
 		$real_dir    = $exports_dir !== '' ? realpath( $exports_dir ) : false;
 		$real_path   = realpath( $file_path );
@@ -3087,15 +2619,8 @@ final class AdminController {
 		}
 
 		/**
-		 * Fires after every gate (nonce, cap, job-status, realpath) has
-		 * passed and the export file is about to be streamed to the
-		 * operator's browser, BEFORE any HTTP header is sent.
-		 *
-		 * Use for audit-log entries ("user X downloaded export Y at Z"),
-		 * monitoring-pipeline events, or compliance-driven hooks that
-		 * need to record every export-egress event. Anything `do_action`
-		 * callbacks `echo` from here would land in the response body
-		 * before the JSON download - don't.
+		 * Fires after every gate passed and before any header is sent, as the export file is about to be streamed (audit
+		 * logs, monitoring). Do not echo: it would land in the download.
 		 *
 		 * @hook  perflocale/export/download/before_serve
 		 * @since 1.0.0
@@ -3110,11 +2635,7 @@ final class AdminController {
 
 		nocache_headers();
 		header( 'Content-Type: application/json; charset=utf-8' );
-		// sanitize_file_name() strips quotes, control chars, slashes etc. so
-		// the filename cannot inject additional Content-Disposition fields.
-		// The current happy-path filename (perflocale-export-{date}.json) is
-		// already safe - this is defense-in-depth for any future caller that
-		// dispatches DataExportJob with a custom `path` argument.
+		// sanitize_file_name() keeps the name from injecting Content-Disposition fields (a custom `path` could carry one).
 		$safe_filename = sanitize_file_name( basename( $real_path ) );
 		header( 'Content-Disposition: attachment; filename="' . $safe_filename . '"' );
 
@@ -3127,16 +2648,8 @@ final class AdminController {
 		readfile( $real_path );
 
 		/**
-		 * Fires AFTER the export file has been streamed to the browser and
-		 * BEFORE the single-use deletion takes effect. The file is still
-		 * readable at $real_path at this point - your callback is the last
-		 * chance to act on it before it disappears.
-		 *
-		 * Useful for offsite-backup logic ("ship a copy to S3 every time
-		 * an admin downloads"), or for chaining a post-download step
-		 * (e.g. queue an Integrity-check job that re-reads the file).
-		 *
-		 * Don't `echo` from here - the HTTP body is already being sent.
+		 * Fires after the export file was streamed and before it is deleted: the last chance to read it (an offsite copy,
+		 * a follow-up check). Do not echo: the body is being sent.
 		 *
 		 * @hook  perflocale/export/download/after_serve
 		 * @since 1.0.0
@@ -3157,10 +2670,7 @@ final class AdminController {
 			(int) ( $size !== false ? $size : 0 )
 		);
 
-		// Single-use: drop the file so the same URL can't replay. The
-		// JobState row stays so the operator can still see the job in
-		// the Jobs admin page; a subsequent click on the download link
-		// just gets a 410-Gone via the realpath / is_readable gate above.
+		// One use: the file goes, the job row stays; the link then answers 410 Gone through the gates above.
 		wp_delete_file( $real_path );
 
 		exit;
@@ -3172,29 +2682,29 @@ final class AdminController {
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_scan_strings' ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// Route through Dispatcher: small sites (few plugins / small theme)
-		// run inline so the operator gets immediate feedback. Anything
-		// matching StringScanJob's `args_size` threshold (mode='all' is
-		// always Big) goes async to dodge PHP-FPM timeouts on bloated
-		// installs. Sync path is small by definition; async path runs
-		// inside its own WP-Cron / Action Scheduler context.
-		$result = \PerfLocale\Background\Dispatcher::dispatch(
-			new \PerfLocale\Background\Jobs\StringScanJob(),
-			[ 'mode' => 'all' ]
-		);
+		// mode='all' always runs as a background job (StringScanJob::should_run_async()).
+		$scan    = new \PerfLocale\Background\Jobs\StringScanJob();
+		$refused = \PerfLocale\Background\WebLimit::refusal( $scan, [ 'mode' => 'all' ], 'wp perflocale strings scan --dir=<theme or plugin directory>' );
+
+		if ( '' !== $refused ) {
+			wp_die( esc_html( $refused ) );
+		}
+
+		$result = \PerfLocale\Background\Dispatcher::dispatch( $scan, [ 'mode' => 'all' ] );
+
+		if ( in_array( $result['mode'], [ 'denied', 'error' ], true ) ) {
+			wp_die( esc_html( (string) ( $result['error'] ?? __( 'Dispatch failed.', 'perflocale' ) ) ) );
+		}
 
 		if ( $result['mode'] === 'async' ) {
-			// Stash the confirmation message in a user-scoped transient so
-			// the Jobs page can render it via admin_notices on the next
-			// pageload. Keeps the URL clean; same pattern as the sync path
-			// below uses for its result message.
+			// The confirmation in a user transient, shown on the Jobs page's next load (clean URL).
 			set_transient(
 				'perflocale_scan_queued_notice_' . get_current_user_id(),
 				(string) __( 'String scan queued. Track progress below.', 'perflocale' ),
@@ -3206,7 +2716,7 @@ final class AdminController {
 
 		$r = $result['result'] ?? [];
 
-		// Store scan results in a transient (not URL params) to keep URLs clean.
+		// Scan results in a transient, not URL params.
 		set_transient(
 			'perflocale_scan_result_' . get_current_user_id(),
 			[
@@ -3221,8 +2731,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Handle the "Create translation" action from the Translations panel (the
-	 * classic metabox and the panels host plugins mount on their own screens).
+	 * Handle "Create translation" from the Translations panel (the classic metabox and host plugins' panels).
+	 * Docs: docs-ai/11-code-rationale.md, "AdminController: Create translation".
 	 *
 	 * @return void
 	 */
@@ -3231,23 +2741,18 @@ final class AdminController {
 		$target_lang = sanitize_key( $_GET['target_lang'] ?? '' );
 
 		if ( $source_id === 0 || $target_lang === '' ) {
-			wp_die( esc_html__( 'Invalid request.', 'perflocale' ) );
+			wp_die( esc_html__( 'Invalid request.', 'perflocale' ), '', [ 'response' => 400 ] );
 		}
 
-		// Verify nonce.
+		// Nonce.
 		if ( ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ?? '' ), 'perflocale_create_' . $source_id ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// The same two checks as the REST create route. Edit rights through the
-		// Helper, not a bare `edit_post`: a host type registered with
-		// `map_meta_cap => false` (WPForms) answers `edit_post` false for
-		// everyone, so a bare check refuses the Create link the panel shows on
-		// that host's screen. The capability comes first because the Helper
-		// lets a host widen edit rights, which must never stand in for
-		// translation rights.
+		// As the REST create route: the capability first, then edit rights through the Helper (a `map_meta_cap => false`
+		// host type answers a bare edit_post false); a host may widen edit rights, never translation rights.
 		if ( ! current_user_can( 'perflocale_translate' ) || ! \PerfLocale\Helper::user_can_edit_object( $source_id ) ) {
-			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ) );
+			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$plugin   = \PerfLocale\Plugin::get_instance();
@@ -3256,59 +2761,36 @@ final class AdminController {
 		$manager  = new \PerfLocale\Translation\PostTranslationManager( $cache, $settings );
 		$new_id   = false;
 
-		// A live translation in the target language is opened, never created
-		// again or re-translated by the machine-translation branch below.
+		// A live translation is opened, never created again or machine-translated.
 		$existing = $manager->get_translation_id( $source_id, $target_lang );
 
 		if ( $existing !== null && get_post( $existing ) ) {
 			$new_id = (int) $existing;
 		}
 
-		// Both branches below create the translation through
-		// create_translation(), which copies from the post get_copy_source_id()
-		// names, so that post is checked as well. Checked before the MT branch
-		// so a refusal spends no provider call. 0 when nothing would be
-		// created: a live translation, or an unknown language.
+		// create_translation() copies from get_copy_source_id()'s post: checked too, before any provider call (0: nothing
+		// would be created).
 		$copy_from = $manager->get_copy_source_id( $source_id, $target_lang );
 
 		if ( $copy_from > 0 && $copy_from !== $source_id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
 			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// The new post is of the copy source's type, so that type's own create
-		// capability applies.
+		// The new post takes the copy source's type: that type's create capability.
 		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_like( $copy_from ) ) {
 			wp_die( esc_html__( 'You do not have permission to create translations of this content.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// Auto-translate via MT if enabled - and only for languages inside the
-		// mt_auto_translate_languages scope (empty = all). An out-of-scope
-		// language falls through to the clean-stub branch below, which is the
-		// whole point: a translator working from scratch gets an empty stub
-		// instead of MT pre-fill they would have to discard.
+		// Machine translation only for languages in mt_auto_translate_languages (empty: all); others get a clean stub.
 		$auto_scope  = (array) $settings->get( 'mt_auto_translate_languages', [] );
 		$mt_in_scope = ( $auto_scope === [] || in_array( $target_lang, $auto_scope, true ) );
 
-		// MT runs only when a translation is about to be created ($copy_from),
-		// so an unknown language spends nothing, and only when no link row
-		// exists at all: a link left pointing at a deleted post would make
-		// translate_post() translate and then fail writing to it, and
-		// create_translation() below clears that row instead. It spends
-		// provider quota, so it takes the machine-translation capability and
-		// the shared rate limit the REST route applies. It sends the source's
-		// whole post_content to the provider, so it also takes core edit_post
-		// on the source, which every machine-translation route checks before
-		// translating a post: a host type core cannot answer for (WPForms,
-		// whose post_content is the form definition as JSON) gets the copied
-		// stub instead, the same result REST create gives. A password-protected
-		// source is sent only when the perflocale/mt/send_password_protected
-		// filter allows it. admit() counts the request when it allows it, so
-		// it is asked last, only when MT would otherwise run. A refusal falls
-		// through to the stub, as a provider failure does, and its reason is
-		// shown on the screen the user lands on.
+		// Only when a translation is about to be created and no link row exists; needs the MT capability, the REST rate
+		// limit, core edit_post on the source and the password filter. admit() last (it counts). A refusal gives the stub.
 		$source_post   = get_post( $source_id );
 		$mt_reason     = '';
 		$mt_reason_own = false;
+		$mt_warning    = '';
 
 		if (
 			$copy_from > 0
@@ -3335,14 +2817,13 @@ final class AdminController {
 					$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $cache );
 					$result     = $mt_service->translate_post( $source_id, $target_lang );
 					$new_id     = $result['post_id'] ?? false;
+					$mt_warning = is_string( $result['builder_warning'] ?? null ) ? $result['builder_warning'] : '';
 
 					if ( ! $new_id ) {
 						$mt_reason = __( 'The machine translation returned no translation.', 'perflocale' );
 					}
 				} catch ( \Throwable $e ) {
-					// MT failed (the save guard's refusal, a provider error):
-					// the stub below is created and the reason shown. A save
-					// guard's refusal already says it was not saved.
+					// MT failed (save guard refusal, provider error): the stub below, with the reason shown.
 					$new_id        = false;
 					$mt_reason     = $e->getMessage();
 					$mt_reason_own = $e instanceof \PerfLocale\MachineTranslation\NotSavedException;
@@ -3350,13 +2831,7 @@ final class AdminController {
 			}
 		}
 
-		// Fall back to creating a stub. An OUT-OF-SCOPE language gets a clean
-		// stub with no source copy: the translator works from scratch, and an
-		// empty stub stays fillable by auto-MT if the language is added to
-		// the scope later (the skip-existing guard treats non-empty content
-		// as human-owned). MT-disabled / MT-failure fallbacks keep copying
-		// the source - long-standing behavior that gives editors a working
-		// starting point.
+		// The stub: out-of-scope languages get it empty (auto-MT can fill it later), other fallbacks copy the source.
 		if ( ! $new_id ) {
 			$new_id = $manager->create_translation( $source_id, $target_lang, $mt_in_scope );
 		}
@@ -3367,20 +2842,19 @@ final class AdminController {
 
 		if ( '' !== $mt_reason ) {
 			MtCreateNotice::remember( is_numeric( $new_id ) ? (int) $new_id : 0, $mt_reason, $mt_reason_own );
+		} elseif ( '' !== $mt_warning ) {
+			MtCreateNotice::remember_warning( is_numeric( $new_id ) ? (int) $new_id : 0, $mt_warning );
 		}
 
-		// Redirect to the translation's edit screen (the new post, or the live
-		// one found above).
-		//
-		// ⚠️ The translation is ALREADY WRITTEN at this point. A post type with
-		// no editor of its own (every addon-contributed type is non-public)
-		// yields no edit URL, and the previous code called wp_die( 'Failed to
-		// create translation.' ) - reporting a failure for work that succeeded,
-		// and stranding the user on a dead page. With Classic Editor active it
-		// was worse: the relative '?classic-editor' passed the truthiness check
-		// and wp_validate_redirect() returned it verbatim, so the browser
-		// resolved it against admin-post.php and rendered blank.
-		// Fall back to the Translations screen instead: the row is there.
+		// A translation the user may not view is never named: back to the source, whose panel shows "Translated".
+		$named = is_numeric( $new_id ) ? (int) $new_id : 0;
+
+		if ( $named !== $source_id && ! \PerfLocale\Helper::user_can_view_object( $named ) ) {
+			$new_id = $source_id;
+		}
+
+		// The translation is already written: a type without its own editor has no edit URL, so fall back to the
+		// Translations screen (also for a relative '?classic-editor' URL) instead of reporting a failure.
 		$edit_url = ObjectLinks::edit_url( (int) $new_id );
 
 		if ( $edit_url === '' ) {
@@ -3398,7 +2872,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Handle the "Create term translation" action.
+	 * Handle "Create term translation".
 	 *
 	 * @return void
 	 */
@@ -3408,34 +2882,30 @@ final class AdminController {
 		$target_lang = sanitize_key( $_GET['target_lang'] ?? '' );
 
 		if ( $source_id === 0 || $taxonomy === '' || $target_lang === '' ) {
-			wp_die( esc_html__( 'Invalid request.', 'perflocale' ) );
+			wp_die( esc_html__( 'Invalid request.', 'perflocale' ), '', [ 'response' => 400 ] );
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ?? '' ), 'perflocale_create_term_' . $source_id ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// Creating translations takes perflocale_translate, as it does for posts;
-		// edit rights on the term alone are not translation rights.
+		// perflocale_translate, as for posts: edit rights on the term are not translation rights.
 		if ( ! current_user_can( 'perflocale_translate' ) || ! current_user_can( 'edit_term', $source_id ) ) {
-			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ) );
+			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$plugin  = \PerfLocale\Plugin::get_instance();
 		$cache   = $plugin->get( 'cache' );
 		$manager = new \PerfLocale\Translation\TermTranslationManager( $cache );
 
-		// The new term is seeded from the term get_copy_source_id() names, so
-		// that term is checked as well.
+		// The new term is seeded from get_copy_source_id()'s term: checked too.
 		$copy_from = $manager->get_copy_source_id( $source_id, $taxonomy, $target_lang );
 
 		if ( $copy_from > 0 && $copy_from !== $source_id && ! current_user_can( 'edit_term', $copy_from ) ) {
 			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// The new term goes into the copy source's taxonomy, and
-		// wp_insert_term() checks no capability, so apply the taxonomy's own
-		// create rule here.
+		// wp_insert_term() checks no capability: the copy source taxonomy's own create rule.
 		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_create_term_like( $copy_from ) ) {
 			wp_die( esc_html__( 'You do not have permission to create translations of this content.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
@@ -3458,22 +2928,14 @@ final class AdminController {
 
 
 	/**
-	 * Handle the "Reset breaker" admin link from the Site Health
-	 * circuit-breakers card. Force-closes one breaker so an operator
-	 * who has manually verified the downstream is healthy can resume
-	 * traffic immediately rather than waiting for the cooldown to
-	 * elapse and a probe to land.
-	 *
-	 * Capability: `manage_options` - same gate Site Health itself uses.
-	 * CSRF: per-key nonce so a stolen nonce for one breaker can't reset
-	 * a different one.
+	 * Handle Site Health's "Reset breaker" link: force-close one breaker after the operator checked the service, instead
+	 * of waiting for the cooldown. manage_options, as Site Health; a nonce per key.
 	 *
 	 * @return void
 	 */
 	public function handle_reset_breaker_action(): void {
 		$key = isset( $_GET['key'] ) ? sanitize_text_field( wp_unslash( $_GET['key'] ) ) : '';
-		// Match the sanitisation Breaker::sanitize_key() applies internally
-		// so the nonce + the underlying reset both target the same key.
+		// Breaker::sanitize_key()'s rule, so nonce and reset target the same key.
 		$key = strtolower( $key );
 		$key = (string) preg_replace( '/[^a-z0-9_-]+/', '_', $key );
 
@@ -3482,18 +2944,16 @@ final class AdminController {
 		}
 
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'You do not have permission to reset circuit breakers.', 'perflocale' ) );
+			wp_die( esc_html__( 'You do not have permission to reset circuit breakers.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ?? '' ), 'perflocale_reset_breaker_' . $key ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		\PerfLocale\Concurrency\Breaker::reset( $key );
 
-		// Bounce back to Site Health so the operator sees the updated
-		// breaker state immediately. Fall back to dashboard if the
-		// referrer isn't an admin page (e.g. direct URL hit).
+		// Back to Site Health to show the new state; the dashboard when the referrer is not an admin page.
 		$back = wp_get_referer();
 		if ( ! is_string( $back ) || $back === '' ) {
 			$back = admin_url( 'site-health.php' );
@@ -3512,14 +2972,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Persist the inline addon-settings form from the Addons admin page.
-	 *
-	 * Form layout: each addon card POSTs its own form to admin-post.php
-	 * with action=perflocale_save_addon_settings and a single hidden
-	 * addon_id. The submitted `settings[$key]` array carries one entry
-	 * per user-editable field declared in `get_settings_fields()`. Hidden
-	 * + addon-managed fields are intentionally skipped so we don't clobber
-	 * state the addon writes itself (e.g. WooCommerce wc_currencies).
+	 * Save an add-on card's inline settings form (action=perflocale_save_addon_settings, one addon_id,
+	 * `settings[$key]` per editable field of get_settings_fields()); hidden and add-on-managed fields are left alone.
 	 *
 	 * @return void
 	 */
@@ -3532,11 +2986,11 @@ final class AdminController {
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_save_addon_settings_' . $addon_id ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'perflocale_manage_addons' ) ) {
-			wp_die( esc_html__( 'You do not have permission to update addon settings.', 'perflocale' ) );
+			wp_die( esc_html__( 'You do not have permission to update addon settings.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$plugin = \PerfLocale\Plugin::get_instance();
@@ -3553,10 +3007,7 @@ final class AdminController {
 		}
 
 		$addon = $addons[ $addon_id ];
-		// Third-party addons may throw from get_settings_fields() (constructor
-		// errors, lazy-loaded data sources). Catch + treat as "no fields"
-		// so the save handler degrades gracefully instead of fataling.
-		// The render path applies the same guard for consistency.
+		// A third-party get_settings_fields() may throw: treated as no fields, as on render.
 		try {
 			$fields = (array) $addon->get_settings_fields();
 		} catch ( \Throwable $e ) {
@@ -3570,9 +3021,7 @@ final class AdminController {
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- nonce verified above; each value is sanitised per-field by AddonSettings::sanitize_field() below
 		$raw_settings = isset( $_POST['settings'] ) && is_array( $_POST['settings'] ) ? wp_unslash( $_POST['settings'] ) : [];
 
-		// Preserve existing addon-managed state (hidden fields and anything
-		// not declared as user-editable) so a generic save pass doesn't wipe
-		// values the addon wrote outside the form.
+		// Keep add-on-managed state (hidden and undeclared fields) the form does not carry.
 		$values = \PerfLocale\Addon\AddonSettings::get_addon( $addon_id );
 
 		foreach ( $fields as $key => $field ) {
@@ -3587,9 +3036,7 @@ final class AdminController {
 			$raw       = $raw_settings[ $key ] ?? null;
 			$sanitized = \PerfLocale\Addon\AddonSettings::sanitize_field( $field, $raw, $addon_id, $key );
 
-			// 'custom' type without a sanitize_callback signals "leave the
-			// stored value alone" so addon-managed state under the same
-			// key isn't wiped by a generic save.
+			// A 'custom' field without sanitize_callback means "leave the stored value".
 			if ( $sanitized !== \PerfLocale\Addon\AddonSettings::CUSTOM_NO_SANITIZE ) {
 				$values[ $key ] = $sanitized;
 			}
@@ -3605,9 +3052,7 @@ final class AdminController {
 		wp_safe_redirect(
 			add_query_arg(
 				[
-					// `addon_save_failed` covers the size-cap reject + lock-contention
-					// paths from AddonSettings::set_addon(); the page renders an
-					// error notice instead of the success one.
+					// addon_save_failed covers AddonSettings::set_addon()'s size cap and lock contention.
 					'perflocale_msg'   => $saved ? 'addon_saved' : 'addon_save_failed',
 					'perflocale_addon' => rawurlencode( $addon_id ),
 				],
@@ -3618,10 +3063,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Map of built-in feature ids (shown as cards on the Addons admin
-	 * page but NOT registered through AddonRegistry) to their underlying
-	 * Settings flag. Toggling the card sets the flag, which is the
-	 * canonical on/off for these features.
+	 * Built-in features shown as Addons cards but not registered through AddonRegistry => their Settings flag.
 	 *
 	 * @var array<string, string>
 	 */
@@ -3630,23 +3072,13 @@ final class AdminController {
 	];
 
 	/**
-	 * Toggle an addon's (or built-in feature's) enabled/disabled state.
-	 *
-	 * Two paths:
-	 *   1. Built-in feature (machine-translation) → flip the underlying
-	 *      Settings flag (mt_enabled). The Addons listing card's "Active"
-	 *      status is computed from these flags, so the visible state follows.
-	 *   2. Anything else → write to perflocale_disabled_addons via
-	 *      AddonRegistry::set_disabled(), the canonical path for
-	 *      registry-registered addons (including bundled ones like
-	 *      WooCommerce - disabling means disabling, no safeguard).
+	 * Toggle an add-on or built-in feature: a built-in flips its Settings flag (mt_enabled), anything else goes through
+	 * AddonRegistry::set_disabled(), bundled add-ons included.
 	 *
 	 * @return void
 	 */
 	public function handle_toggle_addon(): void {
-		// Read ONLY the addon id first: it scopes the nonce action, so it must
-		// be known before the nonce can be verified. Nothing is acted upon
-		// until BOTH the nonce and the capability check below pass.
+		// Only the addon id first: it scopes the nonce action. Nothing is acted on before nonce and capability pass.
 		$addon_id = isset( $_POST['addon_id'] ) ? sanitize_key( wp_unslash( $_POST['addon_id'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing -- id only scopes the nonce action verified immediately below; not acted upon.
 
 		if ( $addon_id === '' ) {
@@ -3654,24 +3086,21 @@ final class AdminController {
 		}
 
 		if ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ?? '' ), 'perflocale_toggle_addon_' . $addon_id ) ) {
-			wp_die( esc_html__( 'Security check failed.', 'perflocale' ) );
+			wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		if ( ! current_user_can( 'perflocale_manage_addons' ) ) {
-			wp_die( esc_html__( 'You do not have permission to toggle addons.', 'perflocale' ) );
+			wp_die( esc_html__( 'You do not have permission to toggle addons.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
-		// CSRF + capability confirmed - only now read the rest of the request.
+		// Nonce and capability passed: read the rest.
 		$desired  = isset( $_POST['disable'] ) ? (string) wp_unslash( $_POST['disable'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- compared as string === '1' only; never output, stored raw, or used in SQL.
 		$want_off = ( $desired === '1' );
 
 		if ( isset( self::BUILTIN_FEATURE_TOGGLES[ $addon_id ] ) ) {
-			// Built-in feature - flip the underlying settings flag.
-			// Settings::update() takes a key-value map and runs the
-			// write under its own lock; the bool return reflects
-			// whether the option was committed.
+			// A built-in: flip its flag (Settings::update() writes under its own lock and says whether it committed).
 			$flag    = self::BUILTIN_FEATURE_TOGGLES[ $addon_id ];
-			$new_val = ! $want_off; // want_off=true → flag false (disabled)
+			$new_val = ! $want_off; // want_off => flag false.
 			$toggled = $this->settings->update( [ $flag => $new_val ] );
 		} else {
 			$toggled = \PerfLocale\Addon\AddonRegistry::set_disabled( $addon_id, $want_off );
@@ -3701,7 +3130,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Swap WordPress front page and blog page to the new default language version.
+	 * Point the front page and the posts page at the new default language's versions.
 	 *
 	 * @param object $new_lang New default language object.
 	 * @return void
@@ -3711,38 +3140,26 @@ final class AdminController {
 		$cache   = $plugin->get( 'cache' );
 		$manager = new \PerfLocale\Translation\PostTranslationManager( $cache, $this->settings );
 
-		// Swap page_on_front.
+		// page_on_front.
 		$front_page_id = (int) get_option( 'page_on_front' );
 
 		if ( $front_page_id > 0 ) {
 			$translated = $manager->get_translation_id( $front_page_id, $new_lang->slug );
 
-			// ⚠️ ONLY A PUBLISHED TRANSLATION MAY BECOME THE FRONT PAGE.
-			//
-			// "A translation exists" is not "a translation is reachable".
-			// Generate Missing Translations creates every translation as a
-			// DRAFT, so on a site where that has been run - which the Settings
-			// screen tells operators to do - the new default language's
-			// homepage was very likely a draft, and this pointed
-			// `page_on_front` straight at it. A draft cannot be served, so the
-			// site's front page would break for everyone.
-			//
-			// Leaving the option on the old page is the safe failure: the front
-			// page keeps working, and the operator can point it at the
-			// translation once they publish it.
+			// Only a published translation may become the front page: Generate Missing Translations creates drafts, and a draft
+			// front page breaks the site. Otherwise the option stays on the old page.
 			if ( $translated && $translated !== $front_page_id && get_post_status( $translated ) === 'publish' ) {
 				update_option( 'page_on_front', $translated );
 			}
 		}
 
-		// Swap page_for_posts.
+		// page_for_posts.
 		$blog_page_id = (int) get_option( 'page_for_posts' );
 
 		if ( $blog_page_id > 0 ) {
 			$translated = $manager->get_translation_id( $blog_page_id, $new_lang->slug );
 
-			// Same rule as the front page above: a draft posts page is not a
-			// posts page.
+			// Same rule: a draft posts page is no posts page.
 			if ( $translated && $translated !== $blog_page_id && get_post_status( $translated ) === 'publish' ) {
 				update_option( 'page_for_posts', $translated );
 			}
@@ -3750,26 +3167,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Build a base64 data URI for the top-level menu icon.
-	 *
-	 * Why a data URI: WordPress core's admin CSS recolors menu icons via
-	 * the `filter` property to match the user's selected admin colour
-	 * scheme (and applies hover / current-page variants automatically),
-	 * but only when the icon is delivered as an inline data URI from
-	 * `add_menu_page()`. A plain plugin URL (e.g. via plugins_url())
-	 * skips that pipeline and renders unstyled, so hover / active states
-	 * are flat. The source SVG must be solid white (#fff) for the
-	 * filter to produce the correct contrast across schemes - see
-	 * assets/images/icon.svg.
-	 *
-	 * Caching: the file is only ~7 KB but `register_menus()` runs on
-	 * every admin pageload. A static memo keeps the read + base64 encode
-	 * to once per request without leaking across requests (which would
-	 * mask edits to icon.svg during development).
-	 *
-	 * Fallback: if the file can't be read for any reason (permissions,
-	 * partial install) we fall back to a Dashicon so the menu is never
-	 * broken - just visually generic.
+	 * The top-level menu icon as a base64 data URI: only then does core's admin CSS recolour it per colour scheme (the
+	 * SVG is solid white). Read once per request; a Dashicon when the file cannot be read.
 	 *
 	 * @return string Data URI, or 'dashicons-translation' fallback.
 	 */
@@ -3787,8 +3186,7 @@ final class AdminController {
 			$svg = file_get_contents( $path );
 
 			if ( is_string( $svg ) && $svg !== '' ) {
-				// base64 here builds a standard image data: URI for a bundled
-				// SVG icon - not code obfuscation.
+				// A standard image data: URI for a bundled icon, not obfuscation.
 				$memo = 'data:image/svg+xml;base64,' . base64_encode( $svg ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
 				return $memo;
 			}
@@ -3804,7 +3202,7 @@ final class AdminController {
 	 * @return void
 	 */
 	public function register_menus(): void {
-		// Top-level menu - visible to anyone who can translate.
+		// Top level: anyone who can translate.
 		$this->page_hooks['dashboard'] = add_menu_page(
 			__( 'PerfLocale', 'perflocale' ),
 			__( 'PerfLocale', 'perflocale' ),
@@ -3825,7 +3223,7 @@ final class AdminController {
 			[ $this, 'render_dashboard' ]
 		);
 
-		// Languages - admin only.
+		// Languages: admins.
 		$this->page_hooks['languages'] = add_submenu_page(
 			'perflocale',
 			__( 'Languages', 'perflocale' ),
@@ -3835,7 +3233,7 @@ final class AdminController {
 			[ $this, 'render_languages' ]
 		);
 
-		// String Translation - editors and above.
+		// String Translation: editors and above.
 		$this->page_hooks['strings'] = add_submenu_page(
 			'perflocale',
 			__( 'Strings', 'perflocale' ),
@@ -3845,7 +3243,7 @@ final class AdminController {
 			[ $this, 'render_strings' ]
 		);
 
-		// Translations - filterable content list with per-language status.
+		// Translations: the content list with per-language status.
 		$this->page_hooks['translations'] = add_submenu_page(
 			'perflocale',
 			__( 'Translations', 'perflocale' ),
@@ -3855,7 +3253,7 @@ final class AdminController {
 			[ $this, 'render_translations' ]
 		);
 
-		// Addons - admin only.
+		// Addons: admins.
 		$this->page_hooks['addons'] = add_submenu_page(
 			'perflocale',
 			__( 'Addons', 'perflocale' ),
@@ -3865,9 +3263,7 @@ final class AdminController {
 			[ $this, 'render_addons' ]
 		);
 
-		// Background Jobs - anyone with translate cap can view their own
-		// jobs; supervisors can manage everyone's. JobsController enforces
-		// per-row permissions on cancel/retry/delete.
+		// Jobs: translators see their own, supervisors everyone's; JobsController checks each row's actions.
 		$this->page_hooks['jobs'] = add_submenu_page(
 			'perflocale',
 			__( 'Background Jobs', 'perflocale' ),
@@ -3877,7 +3273,7 @@ final class AdminController {
 			[ $this, 'render_jobs' ]
 		);
 
-		// Settings - admin only (last item).
+		// Settings: admins, last.
 		$this->page_hooks['settings'] = add_submenu_page(
 			'perflocale',
 			__( 'Settings', 'perflocale' ),
@@ -3929,7 +3325,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Render an admin page.
+	 * Render the Addons page.
 	 *
 	 * @return void
 	 */
@@ -3939,7 +3335,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Render the Background Jobs page.
+	 * Render the Jobs page.
 	 *
 	 * @return void
 	 */
@@ -3949,13 +3345,8 @@ final class AdminController {
 	}
 
 	/**
-	 * Register the network-admin "PerfLocale" menu on multisite.
-	 *
-	 * Only the Jobs overview is exposed here - the rest of PerfLocale
-	 * (settings, languages, translations) is per-site by design and
-	 * has nothing to aggregate at the network level. Capability is
-	 * `manage_network_options` so super-admins (and anything granted
-	 * that cap explicitly) see it; regular Site Admins do not.
+	 * Register the network admin PerfLocale menu (multisite): the Jobs overview only, the rest is per site.
+	 * `manage_network_options`, so super admins see it.
 	 *
 	 * @return void
 	 */
@@ -3972,37 +3363,21 @@ final class AdminController {
 	}
 
 	/**
-	 * Render the network-admin Jobs overview.
-	 *
-	 * Aggregates per-site state in one pass: switches to each blog,
-	 * counts its queued, running and failed rows in the jobs table, reads
-	 * the last-run timestamps recorded by `BackgroundEvents::record_run()`,
-	 * and tabulates them with direct links to the per-site Jobs page.
-	 * A site whose jobs table is missing or cannot be read shows "unknown"
-	 * in its Active and Failed cells, never 0. A site without a stamped
-	 * `perflocale_db_version` shows "unknown" without a table lookup.
-	 *
-	 * Scoped to the network being administered, and capped at the
-	 * first 100 of its sites to keep the load manageable on very large
-	 * networks - super-admins on bigger networks should use the
-	 * per-site Jobs page directly.
+	 * Render the network Jobs overview: per site the queued, running and failed counts and the recurring runs
+	 * (BackgroundEvents::record_run()), linked to its Jobs page; "unknown", never 0, without a readable table. This
+	 * network's first 100 sites.
 	 *
 	 * @return void
 	 */
 	public function render_network_jobs(): void {
 		if ( ! current_user_can( 'manage_network_options' ) ) {
-			wp_die( esc_html__( 'You do not have permission to view this page.', 'perflocale' ) );
+			wp_die( esc_html__( 'You do not have permission to view this page.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$limit = 100;
 
-		// `network_id` is not optional here. WP_Site_Query defaults it to 0,
-		// which emits NO `site_id` predicate at all - on a multi-network
-		// install this page would list, switch_to_blog() into, and link to
-		// sites belonging to networks the current Network Admin screen has
-		// nothing to do with. Every other lookup on this screen (options,
-		// jobs, admin URLs) is per-blog, so the only thing that scopes the
-		// page is the query itself.
+		// `network_id` is required: WP_Site_Query's default 0 adds no site_id predicate, so a multi-network install would
+		// list other networks' sites.
 		$sites = get_sites(
 			[
 				'network_id' => get_current_network_id(),
@@ -4012,9 +3387,7 @@ final class AdminController {
 			]
 		);
 
-		// Only when the cap was actually hit: one extra COUNT so the notice
-		// below can say "100 of N" instead of leaving the super-admin to
-		// guess how much of their network is missing from the table.
+		// Only when the cap was hit: one COUNT, so the notice can say "100 of N".
 		$total_sites = count( $sites ) >= $limit
 			? (int) get_sites(
 				[
@@ -4035,16 +3408,14 @@ final class AdminController {
 				$last_runs    = (array) get_option( \PerfLocale\Background\BackgroundEvents::LAST_RUN_OPTION, [] );
 				$engine_label = (string) get_option( 'perflocale_active_engine', '' );
 
-				// A blog without a stamped schema version never ran the plugin and
-				// has no jobs table: its row is "unknown" without a catalog query.
-				// A stamped version does not prove the tables exist, so
-				// tables_exist() still asks before the count is read.
+				// No stamped schema version: the plugin never ran there, "unknown" without a catalog query. A stamp does not prove the
+				// tables exist, so tables_exist() still asks.
 				$db_version = get_option( 'perflocale_db_version', 0 );
 				$job_counts = is_numeric( $db_version ) && (int) $db_version > 0 && \PerfLocale\Database\Schema::tables_exist()
 					? \PerfLocale\Background\JobState::count_by_status( [ 'queued', 'running', 'failed' ] )
 					: null;
 
-				// Null when the table is missing or the read failed; the row then shows "unknown".
+				// Null when the table is missing or the read failed: "unknown".
 				$pending_count = null === $job_counts ? null : (int) ( $job_counts['queued'] ?? 0 ) + (int) ( $job_counts['running'] ?? 0 );
 				$failed_count  = null === $job_counts ? null : (int) ( $job_counts['failed'] ?? 0 );
 
@@ -4178,7 +3549,7 @@ final class AdminController {
 	}
 
 	/**
-	 * Process dashboard quick actions (clear cache, refresh permalinks).
+	 * Process the dashboard's quick actions (clear cache, refresh permalinks).
 	 *
 	 * @return void
 	 */
@@ -4195,13 +3566,11 @@ final class AdminController {
 			return;
 		}
 
-		// Canonical WP order: nonce (CSRF) first, then capability.
-		// `check_admin_referer()` itself dies on failure, so we explicitly
-		// re-check the cap immediately after to keep the gate symmetric.
+		// Nonce first (check_admin_referer() dies on failure), then capability.
 		check_admin_referer( 'perflocale_dashboard_action' );
 
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ) );
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 		}
 
 		$redirect = admin_url( 'admin.php?page=perflocale' );
@@ -4210,9 +3579,7 @@ final class AdminController {
 			$plugin = \PerfLocale\Plugin::get_instance();
 			$cache  = $plugin->get( 'cache' );
 
-			// PerfLocale's caches only: a persistent object cache keeps other
-			// plugins' data, WordPress's own and the state records
-			// flush_all() leaves in place.
+			// PerfLocale's caches only: other plugins' and WordPress's data and flush_all()'s kept state records stay.
 			if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
 				$cache->flush_all();
 			}

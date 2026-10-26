@@ -12,21 +12,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Gravity Forms integration for PerfLocale.
+ * Gravity Forms integration: translates field texts and confirmations at render time.
  *
- * Translates form field labels, descriptions, placeholders, choices, and
- * confirmations at render time. Gravity Forms keeps forms in its own
- * gf_form* tables - a GF form id is NOT a wp_posts id - so per-form
- * translations live in a per-form option keyed by the GF form id, with one
- * entry per language slug. Translations are written programmatically via
- * save_translations() or supplied at render time through the
- * `perflocale/gravity_forms/form_translations` filter.
+ * A GF form id is not a post id, so translations live in one option per form, keyed by language slug.
  */
 final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 
 	/**
-	 * Option-name prefix for per-form translation storage. The GF form id is
-	 * appended; the option value is an array keyed by language slug.
+	 * Option-name prefix for per-form translations; the GF form id is appended.
 	 */
 	private const OPTION_PREFIX = 'perflocale_gf_translations_';
 
@@ -73,8 +66,7 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 		add_filter( 'gform_pre_validation', [ $this, 'translate_form' ] );
 		add_filter( 'gform_pre_submission_filter', [ $this, 'translate_form' ] );
 
-		// GF deletes forms from its own tables (no WP post lifecycle fires),
-		// so drop the per-form translations option on GF's own delete hook.
+		// GF deletes forms in its own tables with no post lifecycle: drop the option on GF's hook.
 		add_action( 'gform_after_delete_form', [ $this, 'on_form_deleted' ] );
 	}
 
@@ -87,9 +79,6 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 
 	/**
 	 * Translate form field labels, descriptions, and confirmations.
-	 *
-	 * Reads stored translations for the current language from the per-form
-	 * option and applies them to form fields before rendering.
 	 *
 	 * @param array<string, mixed> $form Gravity Forms form array.
 	 * @return array<string, mixed> Translated form array.
@@ -163,23 +152,8 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Store translations for a form in one language.
 	 *
-	 * Expected shape (every branch optional):
-	 *
-	 *   [
-	 *     'fields'        => [ (string) field_id => [
-	 *       'label'       => string,
-	 *       'description' => string,
-	 *       'placeholder' => string,
-	 *       'choices'     => [ (int) choice_index => string ],
-	 *     ] ],
-	 *     'confirmations' => [ (string) confirmation_id => [
-	 *       'message' => string,
-	 *       'url'     => string,
-	 *     ] ],
-	 *   ]
-	 *
-	 * Unknown keys are discarded. An empty (post-sanitization) payload clears
-	 * the language instead of storing an empty entry.
+	 * Shape: `fields` => [ field_id => label, description, placeholder, choices[ index ] ], `confirmations` =>
+	 * [ id => message, url ]. Unknown keys are dropped; an empty payload clears the language.
 	 *
 	 * @param int                  $form_id       Gravity Forms form id.
 	 * @param string               $language_slug PerfLocale language slug.
@@ -245,8 +219,7 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Drop the per-form translations option when GF deletes the form.
 	 *
-	 * Untyped parameter: invoked by Gravity Forms' `gform_after_delete_form`
-	 * action, so the id shape is outside this plugin's control.
+	 * Untyped: Gravity Forms decides the id's type.
 	 *
 	 * @param int|string $form_id Deleted Gravity Forms form id.
 	 * @return void
@@ -258,8 +231,7 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 	/**
 	 * Whitelist a translations payload down to the applied shape.
 	 *
-	 * Mirrors the sanitization the apply path performs, so stored data is
-	 * bounded and safe even if the apply-side filters change.
+	 * Same sanitizing as the apply path, so stored data stays safe if the apply side changes.
 	 *
 	 * @param array<string, mixed> $translations Raw translations payload.
 	 * @return array<string, mixed> Sanitized payload.
@@ -347,8 +319,7 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 		}
 
 		foreach ( $form['fields'] as &$field ) {
-			// GF fields are GF_Field objects; skip anything malformed so a
-			// bad field definition (e.g. from a broken add-on) can't fatal.
+			// Skip malformed fields so a broken add-on's field cannot fatal.
 			if ( ! is_object( $field ) || ! isset( $field->id ) ) {
 				continue;
 			}
@@ -372,9 +343,7 @@ final class PerfLocaleGravityForms implements \PerfLocale\Addon\AddonInterface {
 				$field->placeholder = sanitize_text_field( $field_translations['placeholder'] );
 			}
 
-			// Translate choices (dropdowns, radio buttons, checkboxes).
-			// GF_Field->choices can be null, false, or a non-array for
-			// field types without choices - guard before iterating.
+			// GF_Field->choices may be null, false or a non-array for types without choices.
 			if ( ! empty( $field_translations['choices'] ) && is_array( $field->choices ?? null ) ) {
 				foreach ( $field->choices as $index => &$choice ) {
 					if ( ! is_array( $choice ) || ! isset( $field_translations['choices'][ $index ] ) ) {

@@ -14,22 +14,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Renders the underline tab strip shared by every PerfLocale admin page
- * (the Settings page keeps its own, tab-per-settings-section strip).
+ * Renders the tab strip shared by every PerfLocale admin page except Settings.
  *
- * Tabs are derived from the actually-registered PerfLocale submenu, so
- * conditional pages (addon-registered ones) appear and disappear with
- * their features, and capability filtering matches the sidebar menu
- * exactly. Known slugs render in a curated order;
- * unknown ones (future addons) slot in before Jobs; Settings is always
- * last.
+ * Tabs come from the registered submenu, so add-on pages and capability checks match the sidebar.
  */
 final class PluginNav {
 
 	/**
-	 * Curated tab order. Slugs missing from the registered submenu are
-	 * skipped; registered slugs missing from this list are appended
-	 * before Jobs (with Settings pinned last).
+	 * Tab order; registered slugs missing here go before Jobs, and Settings stays last.
 	 */
 	private const ORDER = [
 		'perflocale',
@@ -42,9 +34,7 @@ final class PluginNav {
 	];
 
 	/**
-	 * Per-page documentation URLs for the right-aligned Help tab -
-	 * the same targets the pages' individual "Documentation" header
-	 * buttons pointed at before the shared strip replaced them.
+	 * Documentation URL per page for the Help tab.
 	 */
 	private const HELP = [
 		'perflocale'              => 'https://perflocale.com/docs/',
@@ -56,12 +46,10 @@ final class PluginNav {
 	];
 
 	/**
-	 * Render the strip. Page order: h1 and its header-row buttons, exactly
-	 * one `<hr class="wp-header-end">`, the page's own notices, then this
-	 * strip. WordPress's admin script moves every notice that is not
-	 * `.inline` to directly after the first marker, so a notice printed
-	 * below the strip would jump above it after first paint, and a second
-	 * marker would show every notice twice.
+	 * Renders the strip.
+	 *
+	 * Print it after the one `<hr class="wp-header-end">` and the page's notices: core moves
+	 * non-inline notices to after the first marker, and a second marker shows them twice.
 	 *
 	 * @return void
 	 */
@@ -95,8 +83,7 @@ final class PluginNav {
 			}
 		}
 
-		// Unknown (future addon) slugs: keep them visible, ahead of the
-		// trailing Jobs/Settings pair when those exist.
+		// Unknown add-on slugs go before the trailing Jobs and Settings tabs.
 		if ( $registered !== [] ) {
 			$tail = [];
 

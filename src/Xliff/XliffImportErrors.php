@@ -14,11 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Collects the units an XLIFF import could not apply and turns them into one
- * message per post and cause, naming the post ID and the file's unit ids.
+ * Collects the units an XLIFF import could not apply, as one message per post and cause.
  *
- * A title is shown only where the caller supplies one; the importer supplies
- * it only for a post the current user can edit.
+ * The importer supplies a title only for a post the current user can edit.
  */
 final class XliffImportErrors {
 
@@ -173,8 +171,7 @@ final class XliffImportErrors {
 	}
 
 	/**
-	 * Unit ids joined with commas; a list longer than UNIT_LIST_MAX names the
-	 * first UNIT_LIST_SHOWN and counts the rest.
+	 * Unit ids joined with commas; a list longer than UNIT_LIST_MAX names the first UNIT_LIST_SHOWN.
 	 *
 	 * @param array<int, string> $units Unit ids.
 	 * @return string

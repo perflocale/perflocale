@@ -18,10 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Direct access layer for translation links table.
- *
- * Provides low-level link operations used by PostTranslationManager
- * and TermTranslationManager.
+ * Low-level access to the translation links table for the post and term managers, and the status counts.
  */
 final class TranslationLinkRepository implements RepositoryInterface {
 
@@ -42,11 +39,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Resolve the full table name for the current blog.
-	 *
-	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly - capturing the name in the constructor would otherwise
-	 * pin this instance to whichever blog was active at construction.
+	 * The full table name for the current blog, computed per call so switch_to_blog() is followed.
 	 *
 	 * @return string
 	 */
@@ -71,13 +64,8 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * SQL expression for the effective status of a link joined to its post.
-	 *
-	 * The SQL twin of {@see \PerfLocale\Enum\TranslationStatus::effective()}:
-	 * the same arms in the same order, so a filter, a count and a table cell
-	 * agree on every (stored status, post status) pair. A NULL post (no row
-	 * joined: a term or string link, or a missing post) matches none of the
-	 * post arms and keeps the stored value.
+	 * SQL for a link's effective status joined to its post: TranslationStatus::effective()'s arms in its order, so a
+	 * filter, a count and a cell agree. A NULL post (term or string link, missing post) keeps the stored value.
 	 *
 	 * @param literal-string $link_alias Alias of the translation_links table (a literal in the caller's SQL).
 	 * @param literal-string $post_alias Alias of the posts table, LEFT JOINed on object_id (a literal in the caller's SQL).
@@ -95,7 +83,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Count translations by status for a given language.
+	 * Count a language's translations by status.
 	 *
 	 * @param int    $language_id Language ID.
 	 * @param string $type Object type filter (optional).
@@ -110,19 +98,13 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		$args  = [ $language_id ];
 		$join  = 'INNER JOIN %i g ON l.group_id = g.id';
 
-		// Post links count by their effective status (effective_status_sql()),
-		// the same value the Translations screen and the Dashboard show. The
-		// posts table is LEFT JOINed only for post-type links: object_id is
-		// polymorphic and holds a term_id for term links, which collides
-		// freely with a post ID, so without the `g.type = 'post'` gate a term
-		// would borrow a same-numbered post's status. Term and string links
-		// join no post row and keep their stored status.
+		// Post links count by effective status, as the Translations screen and Dashboard show it. Posts join only for post
+		// groups: object_id is polymorphic, and a term would borrow a same-numbered post's status.
 		$join       .= " LEFT JOIN {$posts_table} p ON l.object_id = p.ID AND g.type = 'post'";
 		$status_expr = self::effective_status_sql( 'l', 'p' );
 
 		if ( $type !== '' ) {
-			// Narrow to one post type. p is NULL for term links, so the
-			// post_type predicate also excludes them (INNER semantics).
+			// One post type; p is NULL for term links, so they drop out too.
 			$where .= " AND g.type = 'post' AND p.post_type = %s";
 			$args[] = $type;
 		}
@@ -130,13 +112,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$results = $this->wpdb->get_results(
 			$this->wpdb->prepare(
-				// Alias deliberately NOT `status`: for GROUP BY, MySQL resolves an
-				// unqualified name against the FROM columns FIRST and only then
-				// against SELECT aliases, and `l.status` is a real column - so
-				// `GROUP BY status` grouped by the STORED status and silently
-				// merged an 'empty'/publish row with an 'empty'/draft row while
-				// emitting two rows keyed 'published'. `effective_status` exists on
-				// no joined table, so it can only bind to the CASE expression.
+				// Not aliased `status`: GROUP BY resolves a bare name against the FROM columns first, so it would group by l.status.
 				"SELECT {$status_expr} AS effective_status, COUNT(*) as count
 				FROM %i l
 				{$join}
@@ -159,12 +135,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Batch-count status counts across (language × post_type × status) in
-	 * a single query - replaces an O(P×L) loop of per-cell
-	 * `count_by_status()` calls on the dashboard.
-	 *
-	 * Counts by effective status (effective_status_sql()), like
-	 * `count_by_status()` and the Translations screen.
+	 * Status counts per (language, post type, status) in one query for the Dashboard, by effective status.
 	 *
 	 * @param int[]    $language_ids Languages to count for.
 	 * @param string[] $post_types   Post types to count for.
@@ -174,13 +145,12 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	public function count_status_matrix( array $language_ids, array $post_types ): array {
 		$matrix = [];
 
-		// Empty inputs: nothing to count. Don't issue a query that would
-		// IN-list zero values (MySQL syntax error on `IN ()`).
+		// Nothing to count: no query (IN () is a SQL error).
 		if ( empty( $language_ids ) || empty( $post_types ) ) {
 			return $matrix;
 		}
 
-		// Sanitize to integers / non-empty strings before placeholder build.
+		// Integers and non-empty strings before building placeholders.
 		$lang_ids = array_values( array_unique( array_map( 'intval', $language_ids ) ) );
 		$lang_ids = array_filter( $lang_ids, static fn( $i ) => $i > 0 );
 
@@ -204,13 +174,8 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		$lang_ph = implode( ',', array_fill( 0, count( $lang_ids ), '%d' ) );
 		$pt_ph   = implode( ',', array_fill( 0, count( $pt_safe ), '%s' ) );
 
-		// The stored status is written when the link is created and is not
-		// maintained afterwards, so each link counts by its effective status:
-		// reconciled against the post's real status in both directions (a
-		// live post is published whatever the row says; a trashed or
-		// auto-draft post is not a translation, so it lands in 'empty', the
-		// bucket that means "still needs a translation"), with a stored
-		// 'needs_update' kept as the workflow flag.
+		// The stored status is not kept current, so links count by their effective status: a live post is published, a
+		// trashed or auto-draft one is 'empty' (still needs a translation), a stored needs_update is kept.
 		$status_expr = self::effective_status_sql( 'l', 'p' );
 
 		$sql = "SELECT l.language_id AS lid, p.post_type AS pt,
@@ -244,11 +209,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Count published source posts for a given language and post type.
-	 *
-	 * Counts WP posts with status 'publish' that have a translation link
-	 * for the specified language. Used to calculate the denominator for
-	 * translation progress - only source-language posts should count.
+	 * Published source posts of a language and post type with a link: the denominator of translation progress.
 	 *
 	 * @param int    $language_id Default language ID.
 	 * @param string $post_type Post type slug.
@@ -259,9 +220,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 		$groups_table = Schema::table( 'translation_groups' );
 		$posts_table  = $this->wpdb->posts;
 
-		// translation_groups.type stores the ObjectType enum value ('post' for
-		// all post types), not the WP post_type slug. Filter the actual post
-		// type via wp_posts.post_type instead.
+		// translation_groups.type is 'post' for every post type: filter by wp_posts.post_type.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$count = $this->wpdb->get_var(
 			$this->wpdb->prepare(
@@ -309,9 +268,7 @@ final class TranslationLinkRepository implements RepositoryInterface {
 	 * {@inheritDoc}
 	 */
 	public function insert( array $data ): int|false {
-		// $data['source'] may be a SourceType enum case or a raw string
-		// (REST input arrives as a string) - normalise via SourceType::from_db
-		// which falls back to Manual on unknown values.
+		// An enum case or a raw string (REST); SourceType::from_db() falls back to Manual.
 		$source_raw = $data['source'] ?? \PerfLocale\Enum\SourceType::Manual;
 		if ( $source_raw instanceof \PerfLocale\Enum\SourceType ) {
 			$source = $source_raw->value;
@@ -319,10 +276,8 @@ final class TranslationLinkRepository implements RepositoryInterface {
 			$source = \PerfLocale\Enum\SourceType::from_db( (string) $source_raw )->value;
 		}
 
-		// Polymorphic object type (DB v3). This method predates the column;
-		// omitting it would insert the schema default '' - a row invisible to
-		// every type-qualified lookup. Accept an ObjectType case or its string
-		// value; default to 'post', the overwhelming common case.
+		// The object type column: omitted, the default '' is invisible to every typed lookup. A case or its value; 'post'
+		// by default.
 		$type_raw = $data['type'] ?? \PerfLocale\Enum\ObjectType::Post;
 		if ( $type_raw instanceof \PerfLocale\Enum\ObjectType ) {
 			$type = $type_raw->value;

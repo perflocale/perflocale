@@ -1,6 +1,6 @@
 <?php
 /**
- * Post-migration cache flush helper.
+ * Cache flush after an import.
  *
  * @package PerfLocale
  */
@@ -16,37 +16,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Shared cache-invalidation sequence called by every importer-driven
- * BG job (WPML / Polylang / TranslatePress migration + data import).
- *
- * Owns the canonical sequence so a future cache layer doesn't need
- * four parallel updates across four jobs to stay in sync. Lives on
- * its own class because the prior home (a static method on
- * `WpmlMigrationJob`) misleadingly implied WPML ownership to the
- * three other callers that already reached across the namespace to
- * invoke it.
- *
- * Flushes:
- *   - L1 static memos on TranslationGroupRepository
- *     ($find_cache, $has_any_groups_memo, $eager_link_map_memo).
- *   - Autoloaded eager-link option rows that survive cross-process
- *     imports (perflocale_eager_links_post / _term / _has_any_groups).
- *   - The has_any_groups object-cache key (no expiry, outside the
- *     cache generations).
- *   - L2 cache groups via CacheManager::flush_all.
- *
- * Without this sequence, long-running CLI / cron workers continue to
- * serve pre-import group memos for the rest of their process
- * lifetime, and operators who restored from backup before re-running
- * the importer see stale eager-link rows that pre-date the restore.
+ * The cache flush every importer job runs (WPML, Polylang, TranslatePress migrations and data import): group memos,
+ * the eager-link options, the has_any_groups key, the L2 groups and, in files mode, the generated string files.
+ * Otherwise long-running workers keep serving pre-import data.
  */
 final class MigrationCacheHelper {
 
 	/**
-	 * Flush every cache that could be holding pre-import state.
-	 *
-	 * Safe to call when no migration ran (e.g. dry-run paths) - every
-	 * flush is idempotent on already-empty state.
+	 * Flush every cache that could hold pre-import state; idempotent, safe after a dry run.
 	 *
 	 * @return void
 	 */
@@ -55,13 +32,8 @@ final class MigrationCacheHelper {
 
 		$cache = Plugin::get_instance()->has( 'cache' ) ? Plugin::get_instance()->get( 'cache' ) : null;
 
-		// Eager-link maps are autoloaded and may contain links from BEFORE the
-		// import. Route through invalidate_eager_link_map(null) so ALL FIVE
-		// object-type variants (post/term/string/post_type/taxonomy) are purged
-		// - not just post/term - and each single-option cache key is cleared
-		// unconditionally (delete_option() returns early without touching the
-		// cache when the DB row is already gone, so a stale autoloaded value
-		// restored from backup would otherwise survive inside alloptions).
+		// invalidate_eager_link_map( null ) purges all five object types and clears each option's cache key even when the
+		// row is gone (delete_option() skips the cache then, so a value restored from a backup would survive in alloptions).
 		if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
 			$groups = new \PerfLocale\Database\Repository\TranslationGroupRepository( $cache );
 			$groups->invalidate_eager_link_map();
@@ -76,12 +48,7 @@ final class MigrationCacheHelper {
 		if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
 			$cache->flush_all();
 
-			// Files mode serves string translations from generated .l10n.php
-			// files, which no cache flush can refresh - without a full
-			// regeneration the just-imported string translations exist in
-			// the DB while the frontend keeps serving the pre-migration
-			// files. Migrations are rare one-shots; one full pass is the
-			// correct price.
+			// Files mode serves strings from generated .l10n.php files, which no cache flush refreshes: regenerate them all.
 			if ( Plugin::get_instance()->has( 'settings' )
 				&& Plugin::get_instance()->get( 'settings' )->get( 'string_translation_mode' ) === 'files'
 			) {
@@ -91,22 +58,9 @@ final class MigrationCacheHelper {
 	}
 
 	/**
-	 * Bound per-process memory between import batches on huge migrations.
+	 * Bound process memory between import batches: drop the runtime object cache copies and the SAVEQUERIES log.
 	 *
-	 * The same pattern WooCommerce's batch processors and WP-CLI's own
-	 * long-command helper use: a legacy-site import touches tens of
-	 * thousands of posts/terms, and every get_post()/get_term() copy
-	 * accumulates in the RUNTIME object cache for the life of the request
-	 * - unbounded growth on WPML-scale imports. Dropping the runtime
-	 * copies between batches caps that; the next read simply re-fetches
-	 * (from the persistent cache when one is configured, else the DB), so
-	 * correctness is unaffected.
-	 *
-	 * Also empties $wpdb->queries, which grows one entry per query for the
-	 * whole request when SAVEQUERIES is on (the actual culprit in a past
-	 * WPML-import OOM diagnosed on a dev site).
-	 *
-	 * Cheap and idempotent - callers invoke it once per committed batch.
+	 * Runtime copies of every imported post and term otherwise grow without limit; the next read re-fetches them.
 	 *
 	 * @return bool Whether another process changed cached data since the
 	 *              process's last checkpoint (CacheManager::refresh_if_changed()).
@@ -116,13 +70,10 @@ final class MigrationCacheHelper {
 
 		$wpdb->queries = [];
 
-		// A batch boundary of a long-running process is a checkpoint: what
-		// another process changed meanwhile is read again from here on.
+		// A batch boundary is a checkpoint: what another process changed meanwhile is read again from here on.
 		$changed = \PerfLocale\Cache\CacheManager::refresh_if_changed();
 
-		// WP 6.1+ (plugin floor 6.4). Clears ONLY in-memory runtime copies;
-		// a persistent backend (Redis/Memcached) is untouched. Drop-ins
-		// lacking flush_runtime() make this a silent no-op.
+		// Clears only in-memory copies, never a persistent backend; a drop-in without flush_runtime() makes it a no-op.
 		\PerfLocale\Cache\CacheManager::flush_runtime();
 
 		return $changed;

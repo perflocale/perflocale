@@ -14,25 +14,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The admin_init dispatch of a job that runs once per blog
- * ({@see Jobs\TemplateRefsBackfillJob}, {@see Jobs\StringGroupRepairJob}),
- * decided from the job's autoloaded state option alone.
+ * The admin_init dispatch of a once-per-blog job (TemplateRefsBackfillJob, StringGroupRepairJob), decided from its
+ * autoloaded state option alone.
  *
- * States: absent (never dispatched), `claim:<unix time>` (a request is
- * dispatching), `queued:<job id>:<unix time of the last check>` (queued or
- * running), `done:<unix time>`, `failed:<unix time>`, `canceled:<unix time>`.
- * The job records done itself; failed and canceled are recorded by
- * {@see job_ended()}: failed by the worker once a failure is final (no
- * automatic retry follows it), canceled from the worker's
- * `perflocale/jobs/canceled` action and from the REST and WP-CLI cancel.
- * While the worker retries a failed run, the state stays queued.
- *
- * An admin page reads the option and nothing else in every state. The one
- * jobs-table read: a `queued:` state whose last check is CHECK_EVERY
- * seconds old or more is checked against its job row by the one request that
- * moves the check time forward (compare-and-set), so a job that failed, was
- * canceled or is gone without a recorded end is found within CHECK_EVERY
- * seconds of the next admin page view, at most once per CHECK_EVERY seconds.
+ * States: absent, `claim:<time>`, `queued:<job id>:<time of the last check>`, `done:<time>`, `failed:<time>`,
+ * `canceled:<time>`. The job records done; job_ended() records a final failure (worker) and a cancel (worker action,
+ * REST, WP-CLI); while the worker retries the state stays queued. A queued state whose check is CHECK_EVERY old is
+ * checked against its job row by the one request that moves the check time (compare-and-set).
  */
 final class OneTimeDispatch {
 
@@ -47,9 +35,7 @@ final class OneTimeDispatch {
 	public const CLAIM_TTL = 5 * MINUTE_IN_SECONDS;
 
 	/**
-	 * State option of each one-time job type: the jobs' OPTION constants,
-	 * written out so that a job of any other type that ends loads neither
-	 * class.
+	 * State option of each one-time job type, written out so that ending a job of another type loads neither class.
 	 */
 	private const OPTIONS = [
 		'template_refs_backfill' => 'perflocale_template_refs_backfill',
@@ -57,8 +43,7 @@ final class OneTimeDispatch {
 	];
 
 	/**
-	 * What a state asks of an admin page view: 'skip', 'dispatch' or
-	 * 'check' (read the queued job's row first). Reads nothing.
+	 * What a state asks of an admin page view: 'skip', 'dispatch' or 'check' (read the job row first). Reads nothing.
 	 *
 	 * @param string $state              Stored state ('' for none).
 	 * @param int    $now                Unix time.
@@ -93,9 +78,7 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Dispatch the job when its state asks for it. The capability is checked
-	 * before anything is read beyond the option, and only the request that
-	 * wins the claim enqueues.
+	 * Dispatch the job when its state asks for it: the capability is checked first, and only the claim's winner enqueues.
 	 *
 	 * @param string   $option             State option.
 	 * @param string   $state              State read from it.
@@ -132,13 +115,9 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Record what the request that won the claim queued, over its own claim
-	 * only: `queued:<job id>:<unix time>`, or no state when nothing was queued
-	 * (the next admin request dispatches again). A state the claim no longer
-	 * holds is left as it is: the worker may have run the job to the end and
-	 * recorded done while the request was still enqueueing it (an Action
-	 * Scheduler queue runner takes an async action as soon as it is stored),
-	 * or another request took the claim after CLAIM_TTL.
+	 * Record over this request's own claim what it queued (`queued:<job id>:<time>`, or no state when nothing was).
+	 * A state other than this claim is left alone: the worker may already have recorded done (Action Scheduler can
+	 * run the action as soon as it is stored), or another request took the claim after CLAIM_TTL.
 	 *
 	 * @param string $option State option.
 	 * @param string $claim  The claim this request holds (`claim:<unix time>`).
@@ -169,12 +148,8 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Check a queued job's row, once per CHECK_EVERY seconds across all
-	 * requests: the request that moves the check time forward reads the row.
-	 * A row that is gone or canceled, or failed at least $retry_after_failed
-	 * seconds ago, is dispatched again; a failure within that time is
-	 * recorded as `failed:<its time>`. A queued row whose worker event is
-	 * gone gets the event again ({@see schedule_if_lost()}).
+	 * Check a queued job's row once per CHECK_EVERY across requests: gone or canceled, or failed $retry_after_failed ago,
+	 * dispatches again; a newer failure is recorded as `failed:<time>`; a queued row without its event gets it again.
 	 *
 	 * @param string $option             State option.
 	 * @param string $state              Stored `queued:` state.
@@ -203,18 +178,13 @@ final class OneTimeDispatch {
 			return null;
 		}
 
-		// A failed row whose worker still holds the job's lock is a run the
-		// worker is still deciding on (an automatic retry may follow): only a
-		// failure without that lock is final.
+		// While the worker holds the lock it may still retry: only a failure without the lock is final.
 		if ( 'failed' !== $status || self::worker_holds( $job_id ) ) {
 			return null;
 		}
 
-		// The worker releases the lock only after its retry decision, so the
-		// failure is final when the row read again after the lock was found
-		// free is the same row (same version, still failed). A row that
-		// changed in between (reset for a retry, a new run) is decided by a
-		// later check; a row that is gone or canceled by now is dispatched.
+		// The lock is released after the retry decision: the failure is final when the row read again is the same row
+		// (same version, still failed). A changed row waits for a later check; a gone or canceled one is dispatched.
 		$fresh = JobState::get( $job_id );
 
 		if ( null === $fresh || 'canceled' === ( $fresh['status'] ?? null ) ) {
@@ -237,9 +207,8 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Store a queued job's lost worker event again, same job id and args: a
-	 * wp-cron.php run that read the cron array before the dispatch saves it
-	 * back without it. Probed in the worker's order: event, lock, row.
+	 * Store a queued job's lost worker event again (a wp-cron.php run that read the cron array before the dispatch saves
+	 * it back without it). Probed in the worker's order: event, lock, row.
 	 *
 	 * @param string               $job_id Job id.
 	 * @param array<string, mixed> $row    Its jobs row ({@see JobState::get()}).
@@ -278,9 +247,8 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Whether a worker holds the job's lock ({@see JobLock}): the lock row,
-	 * read from the database, has not expired. The worker holds it from
-	 * before the run until after its retry decision.
+	 * Whether a worker holds the job's lock (unexpired, read from the database): from before the run until after its
+	 * retry decision.
 	 *
 	 * @param string $job_id Job id.
 	 * @return bool
@@ -312,10 +280,8 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Record that a one-time job failed or was canceled, as
-	 * `<status>:<unix time>`, when its state still names that job as queued.
-	 * One UPDATE, only for the one-time job types; any other type, a state
-	 * that names another job, or one already done is left as it is.
+	 * Record `<status>:<time>` for a one-time job that failed or was canceled, when its state still names it as queued
+	 * (one UPDATE); other types and states are left alone.
 	 *
 	 * @param string $job_id Job id.
 	 * @param string $type   Job type.
@@ -353,12 +319,8 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Take the state from $from to $to in one statement that only one
-	 * request can win: an INSERT IGNORE when there is no row ($from empty),
-	 * a compare-and-set UPDATE otherwise. add_option() is not enough: when
-	 * the options cache lists the option as missing it skips its existence
-	 * check and its INSERT ... ON DUPLICATE KEY UPDATE overwrites a row
-	 * another request just added, and still reports success.
+	 * Move the state from $from to $to in one statement only one request wins: INSERT IGNORE without a row, else a
+	 * compare-and-set UPDATE. Not add_option(): with the option in `notoptions` it overwrites a row another request added.
 	 *
 	 * @param string $option State option.
 	 * @param string $from   State read ('' for no row).
@@ -385,11 +347,8 @@ final class OneTimeDispatch {
 	}
 
 	/**
-	 * Drop the option from the options caches after a direct write, so that
-	 * the next read loads the stored value: the request's copy of the
-	 * autoloaded options is not written back, since another process may have
-	 * changed other options in the persistent cache since this request read
-	 * them.
+	 * Drop the option from the options caches after a direct write. The request's alloptions copy is not written back:
+	 * another process may have changed other options since it was read.
 	 *
 	 * @param string $option Option name.
 	 * @return void

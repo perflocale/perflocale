@@ -14,10 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Listens to WordPress hooks and surgically invalidates relevant cache entries.
- *
- * Does NOT flush all caches on every save - only the specific keys affected
- * by the change are invalidated.
+ * Listens to WordPress hooks and invalidates only the cache entries a change affects.
  */
 final class CacheInvalidator {
 
@@ -60,62 +57,36 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Skip content-change hooks on read-only frontend GET requests.
-		// No posts/terms/options are modified during a normal page view,
-		// so these hooks would just sit in memory doing nothing. WP-CLI
-		// is always treated as a write context - `wp post delete`,
-		// `wp term delete`, migration scripts, etc. need the same
-		// invalidation + orphan-cleanup the admin path gets.
+		// The gated hooks below need a write context (WP-CLI included); a front-end GET changes no content.
 		$is_write_context = is_admin() || wp_doing_ajax() || wp_doing_cron()
 			|| ( isset( $_SERVER['REQUEST_METHOD'] ) && 'GET' !== $_SERVER['REQUEST_METHOD'] )
 			|| defined( 'REST_REQUEST' )
 			|| ( defined( 'WP_CLI' ) && WP_CLI );
 
-		// Deletion orphan-cleanup must run in EVERY context. A translated post
-		// or term can be deleted during a plain frontend GET (bbPress tag
-		// pruning, directory "delete my listing" links, membership-expiry term
-		// pruning on init), and the slug_translations / translation_links /
-		// hreflang cleanup has to happen - otherwise those rows orphan,
-		// reserving the translated slug so the next term that wants it gets a
-		// silently degraded "-2" suffix. These only do work when a delete
-		// actually fires, so leaving them ungated costs nothing on a read GET.
+		// Delete cleanup runs in every context: a post or term can be deleted inside a front-end GET, and a
+		// missed cleanup orphans rows that reserve the translated slug. Idle unless a delete fires.
 		add_action( 'delete_post', [ $this, 'on_delete_post' ] );
 		add_action( 'delete_term', [ $this, 'on_delete_term' ], 10, 4 );
 
-		// Term edits, in every context for the same reason: a cron event run
-		// inside a visitor's GET (ALTERNATE_WP_CRON) or code on `init` can
-		// rename a term, and a missed clear leaves every sibling archive
-		// advertising the old URL until the hreflang TTL expires. Priority 999:
-		// after other plugins, so the cache reflects the final term.
+		// Term edits in every context too: a cron event inside a GET can rename a term. Priority 999: after
+		// other plugins, so the cache reflects the final term.
 		add_action( 'edited_term', [ $this, 'on_edited_term' ], 999, 3 );
 
-		// Machine-translated meta lands after the translation's own save, so
-		// the purge that save sent went out before the values were final.
-		// Ungated because translation jobs also run from WP-Cron, which can
-		// execute inside a visitor's GET.
+		// Machine-translated meta lands after the translation's own save. Ungated: jobs also run from WP-Cron
+		// inside a visitor's GET.
 		add_action( 'perflocale/mt/meta_translated', [ $this, 'on_meta_translated' ], 10, 2 );
 
-		// A post link written outside a post save (WP-CLI, a cron job inside
-		// a visitor's GET; a migration import leaves it to the flush that
-		// ends the import) changes the alternates of the pages in the groups
-		// it touches. Ungated for the same reason; the handler does work only
-		// for a link that link_object() reported.
+		// A post link written outside a post save changes its groups' alternates. Ungated for the same reason;
+		// a migration import leaves it to the flush that ends the import.
 		add_action( 'perflocale/translation/linked', [ $this, 'on_translation_linked' ] );
 
-		// Full-page-cache invalidation on a visibility change. Registered in
-		// every context: the handler is a cheap early-return unless public
-		// readability actually changed, and a transition can arrive from a
-		// front-end GET (scheduled-post publication on a visitor's request)
-		// that the write-context gate below deliberately excludes.
+		// Ungated: a publication can happen in a front-end GET (a scheduled post on a visitor's request). The
+		// handler returns early unless public readability changed.
 		add_action( 'transition_post_status', [ $this, 'on_visibility_transition' ], 20, 3 );
 
 		if ( $is_write_context ) {
-			// Post saves stay gated. The one front-end save that changes what a
-			// visitor sees, a publication inside the request, is covered by
-			// on_visibility_transition(), which clears hreflang itself whenever
-			// this handler is absent.
-			// Priority 999: run AFTER all other plugins (e.g. WooCommerce at
-			// 100) so the cache reflects the final post state.
+			// Gated: a publication inside a front-end request is covered by on_visibility_transition(), which
+			// clears hreflang itself when this handler is absent. Priority 999: after other plugins.
 			add_action( 'save_post', [ $this, 'on_save_post' ], 999, 2 );
 
 			// The post a save_post run is for, until on_save_post() takes it:
@@ -127,17 +98,10 @@ final class CacheInvalidator {
 		add_action( 'perflocale/language/added', [ $this, 'on_language_changed' ] );
 		add_action( 'perflocale/language/updated', [ $this, 'on_language_changed' ] );
 		add_action( 'perflocale/language/deleted', [ $this, 'on_language_changed' ] );
-		// 2 accepted args: Settings::update() fires this with (new, old) and
-		// on_settings_changed() needs BOTH to tell which keys changed. Registered
-		// with the default 1, WordPress sliced the old settings off before the
-		// call, so every save took the "can't tell what changed" fallback and the
-		// selective branches below it never executed once.
+		// 2 accepted args: on_settings_changed() needs the new and the old settings to tell which keys changed.
 		add_action( 'perflocale/settings/updated', [ $this, 'on_settings_changed' ], 10, 2 );
 
-		// Multisite: flush on blog switch. Gated - switch_to_blog() fires
-		// the action on single-site too (as a no-op), so registering this
-		// handler unconditionally would invite spurious cache flushes from
-		// plugins that call switch_to_blog(get_current_blog_id()).
+		// Multisite only: switch_to_blog() fires switch_blog on single-site too, so a same-blog switch would flush.
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ $this, 'on_switch_blog' ] );
 		}
@@ -153,10 +117,7 @@ final class CacheInvalidator {
 	public function on_save_post( int $post_id, ?\WP_Post $post = null ): void {
 		$this->close_save( $post_id );
 
-		// WordPress re-reads the row after the write and hands the hook
-		// whatever it got, which is null when the post was deleted in the
-		// interim; some plugins also fire save_post with one argument. A
-		// non-nullable hint turned either into an uncaught TypeError.
+			// WordPress passes null when the post was deleted meanwhile, and some plugins pass one argument.
 		if ( ! $post instanceof \WP_Post ) {
 			return;
 		}
@@ -168,37 +129,14 @@ final class CacheInvalidator {
 
 		$this->cache->flush_object( $post_id, 'post' );
 
-		// ⭐ BLOCK TEMPLATES HAVE NO SINGULAR HREFLANG BUCKET TO CLEAR, so the
-		// sweep below is guaranteed-miss work for them - and it is not small.
-		//
-		// `HreflangTags::build_cache_key()` only mints the singular bucket
-		// `perflocale_hreflang_s_<id>_<lang>` inside `if ( is_singular() )`, from
-		// `get_queried_object_id()` (src/Frontend/HreflangTags.php:499-506). Core
-		// registers wp_template and wp_template_part with `public => false` and
-		// `publicly_queryable => false`, so neither can ever BE that queried
-		// object. No bucket is ever written; every delete is a miss.
-		//
-		// The sweep below names two entries per sibling and language. It
-		// deletes the L2 key of each and, without a persistent object cache,
-		// reads their L3 rows with one SELECT. For a template none of them
-		// exists, so this gate skips that work.
-		//
-		// ⚠️ PLACEMENT IS LOAD-BEARING: this returns AFTER flush_object() above,
-		// never before it. The Site Editor's Translations panel and
-		// detect_post_language() read `translations_post_*`, so that flush
-		// must still happen.
-		//
-		// Deliberately the narrow `is_template_type()` rather than a broad
-		// `! is_post_type_viewable()`: the narrow test covers exactly the types
-		// this release changed and cannot regress anything else.
+		// Block templates are never a queried object, so they have no singular hreflang entry: skip the sweep.
+		// Must stay after flush_object(): the Site Editor's Translations panel reads `translations_post_*`.
+		// Narrow on purpose (is_template_type(), not ! is_post_type_viewable()): no other type changes.
 		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( (string) get_post_type( $post_id ) ) ) {
 			return;
 		}
 
-		// Clear hreflang transients for this post AND its translation siblings.
-		// Hreflang links are bidirectional - when Post 10 (EN) changes,
-		// Post 20 (FR) also needs its hreflang cache cleared because it
-		// contains a link pointing back to Post 10.
+		// Hreflang is bidirectional: the siblings' cached alternates link back to this post.
 		$this->clear_hreflang_for_post_and_siblings( $post_id );
 	}
 
@@ -258,9 +196,9 @@ final class CacheInvalidator {
 	}
 
 	/**
-	 * Take note of the post a save_post run is for, when the run carries the
-	 * post object: on_save_post() clears only such a run, and a run fired
-	 * with the post ID alone is not noted.
+	 * Note the post a save_post run is for, when the run carries the post object.
+	 *
+	 * Only such a run is cleared by on_save_post(); a run fired with the post ID alone is not noted.
 	 *
 	 * @param mixed $post_id Post ID.
 	 * @param mixed $post    Post object.
@@ -316,20 +254,10 @@ final class CacheInvalidator {
 	}
 
 	/**
-	 * Clear the cached hreflang of the pages whose alternates changed when a
-	 * post joined a translation group, or changed its language in one.
+	 * Clear the cached hreflang of the pages whose alternates changed when a post joined a group or changed its language in one.
 	 *
-	 * A page lists the members of its group whose status is publish. The
-	 * group's pages and the post's own page change when the post is published
-	 * or when a member left the group to make room for it; that member's page
-	 * changes too; the pages of a group the post left change when the post is
-	 * published. A draft linked into a free language changes no published
-	 * page: its own page is cleared by the save that publishes it. Block
-	 * templates have no singular entry. Inside the post's own save, a change
-	 * that moved no other post and touches no home object is left to
-	 * on_save_post(), which clears the post and its group later in that save.
-	 * A group change made while this process runs a migration import on the
-	 * blog is left to the flush that ends the import.
+	 * Pages list their group's published members; inside the post's own save a change that moved no other post
+	 * is left to on_save_post(). See docs-ai/11-code-rationale.md, "CacheInvalidator: hreflang after a group change".
 	 *
 	 * @internal Called by on_translation_linked() and, through the plugin container, by PostTranslationManager::set_post_language().
 	 *
@@ -340,10 +268,8 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function clear_hreflang_after_member_change( int $object_id, array $member_ids, int $displaced_id = 0, array $left_member_ids = [] ): void {
-		// A migration import ends with a flush of every PerfLocale cache of the
-		// blog, hreflang included, so its group changes leave the clear to that
-		// flush. class_exists() does not autoload: a process that has not loaded
-		// the runner is running no import.
+		// A migration import ends with a flush that clears hreflang. class_exists() does not autoload: a process
+		// that has not loaded the runner runs no import.
 		if ( class_exists( \PerfLocale\Migration\MigrationRunner::class, false ) && \PerfLocale\Migration\MigrationRunner::importing() ) {
 			return;
 		}
@@ -369,11 +295,8 @@ final class CacheInvalidator {
 			return;
 		}
 
-		// As on a save (clear_hreflang_for_post_and_siblings()), a group with
-		// the static front page or the posts page retires the whole hreflang
-		// group: the posts page renders under a language-keyed bucket that no
-		// post id addresses. $post_ids holds whole groups, so a translation of
-		// the posts page comes with the posts page.
+		// A group with the static front page or the posts page retires the whole hreflang group: the posts page
+		// renders under a language-keyed bucket no post id addresses.
 		$home = $this->has_home_object( $post_ids );
 
 		// The post's own save clears the post and the group it is in when it
@@ -391,44 +314,28 @@ final class CacheInvalidator {
 	}
 
 	/**
-	 * Clear hreflang transients for a post and all its translation siblings.
-	 *
-	 * Hreflang tags are bidirectional: each translation lists all others.
-	 * When one post changes, ALL siblings' hreflang caches become stale.
+	 * Clear hreflang transients for a post and all its translation siblings (each translation lists all others).
 	 *
 	 * @param int $post_id Post ID.
 	 * @return void
 	 */
 	private function clear_hreflang_for_post_and_siblings( int $post_id ): void {
-		// A post's hreflang block lives only under the singular bucket
-		// (perflocale_hreflang_s_<post_id>_<lang>). Archive/home/author/date
-		// hreflang is keyed off the ARCHIVE URL's own alternates, not any
-		// individual post, so a post edit can't stale them. Clear the post +
-		// its translation siblings precisely through CacheManager so the
-		// generation-prefixed L2 key AND the correctly derived L3 transient
-		// are both hit (a hand-built delete_transient() key matches neither).
+		// A post's hreflang lives only under the singular bucket; archive buckets do not depend on one post. Keys
+		// go through CacheManager, so the generation-prefixed L2 key and the derived L3 name both match.
 		$this->clear_singular_hreflang( $post_id, \PerfLocale\Enum\ObjectType::Post, 's' );
 
-		// EXCEPTION: the static front page and the posts page render under the
-		// home/blog-index ('h' / 'hp') buckets, which are keyed by
-		// language+paged (not the object id) and so aren't precisely
-		// addressable. When one of those objects or a translation of the posts
-		// page is edited (its translation set can change the per-language
-		// alternates), flush the whole hreflang group. A normal post save runs
-		// only the autoloaded-option reads and, on a site with a posts page,
-		// one cached translation lookup in is_home_object() and never bumps.
-		// This path is the save hook, not a frontend render, so it adds no
-		// visitor-facing overhead.
+		// The static front page, the posts page and its translations render under language-keyed home buckets no
+		// object id addresses, so their edit flushes the whole hreflang group.
 		if ( $this->is_home_object( $post_id ) ) {
 			$this->cache->invalidate_group( 'perflocale_hreflang' );
 		}
 	}
 
 	/**
-	 * Whether a post is the static front page, the posts page or a translation
-	 * of the posts page - the objects whose edit affects the language-keyed
-	 * home/blog-index hreflang block. The posts page advertises the languages
-	 * it has a published sibling in, so a sibling's save changes its block.
+	 * Whether a post is the static front page, the posts page or a translation of the posts page.
+	 *
+	 * Their edits change the language-keyed home hreflang: the posts page lists the languages it has a
+	 * published sibling in.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return bool
@@ -483,16 +390,10 @@ final class CacheInvalidator {
 	}
 
 	/**
-	 * Clear hreflang for a term and all its translation siblings.
+	 * Clear hreflang for a term and all its translation siblings by flushing the whole hreflang group.
 	 *
-	 * A term's hreflang lives under the archive bucket
-	 * (`perflocale_hreflang_t_<id>_<lang>_<paged>`) whose unbounded pagination
-	 * isn't enumerable, and a `%category%` rename invalidates the permalink of
-	 * every post beneath it (their singular hreflang too). Neither set is
-	 * precisely addressable, so flush the whole hreflang group - O(1) via the
-	 * generation bump (reliable on every backend, incl. Redis Object Cache +
-	 * Predis where wp_cache_flush_group() no-ops). Term edits are rare, so the
-	 * coarse flush is an acceptable trade for correctness.
+	 * Paged archive buckets are not enumerable, and a `%category%` rename changes the permalink of every post
+	 * beneath it.
 	 *
 	 * @param int    $term_id  Term ID (passed to the extension hook).
 	 * @param string $taxonomy Taxonomy slug (unused; kept for the hook signature).
@@ -512,11 +413,9 @@ final class CacheInvalidator {
 	}
 
 	/**
-	 * Precisely clear the singular hreflang cache for an object and all its
-	 * translation siblings, across every active language. Routes through
-	 * CacheManager::delete_existing() so L1 + the generation-prefixed L2 +
-	 * the derived L3 transient are all invalidated with the exact keys
-	 * CacheManager wrote.
+	 * Clear the singular hreflang of an object and its translation siblings in every active language.
+	 *
+	 * Uses CacheManager::delete_existing(), so every layer is cleared with the exact keys CacheManager wrote.
 	 *
 	 * @param int                         $object_id   Object id.
 	 * @param \PerfLocale\Enum\ObjectType $object_type Post / Term / etc.
@@ -532,16 +431,13 @@ final class CacheInvalidator {
 	): void {
 		$repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $this->cache );
 
-		// Zero-state short-circuit: no groups => no siblings and no hreflang
-		// rows can exist. has_any_groups() is sub-µs warm.
+		// No groups: no siblings and no hreflang rows can exist.
 		if ( ! $repo->has_any_groups() ) {
 			return;
 		}
 
-		// Collect this object + its siblings BEFORE any caller-side unlink:
-		// on_delete_post must invoke us before unlink_by_object_id or the
-		// sibling list is already empty. A caller that holds the objects
-		// passes them, and nothing is read.
+		// Collect the siblings before any caller-side unlink (on_delete_post() calls this first), unless the
+		// caller passes the objects.
 		$links      = null === $object_ids ? $repo->get_translations( $object_id, $object_type ) : [];
 		$object_ids = $object_ids ?? [ $object_id ];
 
@@ -555,10 +451,8 @@ final class CacheInvalidator {
 
 		$languages = ( new \PerfLocale\Database\Repository\LanguageRepository( $this->cache ) )->get_active();
 
-		// HreflangTags caches two entries per page in this group: the HTML
-		// block under $key and the tag array of the Link-header path under
-		// 'tags_' . $key. Both go, or the header path and the HTML rebuild
-		// keep reading the old alternate set.
+		// HreflangTags caches two entries per page: the HTML block under $key and the Link-header tag array under
+		// 'tags_' . $key. Both go, or one path keeps the old alternates.
 		$keys = [];
 
 		foreach ( $object_ids as $oid ) {
@@ -588,18 +482,12 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function on_delete_post( int $post_id ): void {
-		// Skip revisions and autosaves - they can never hold translation
-		// links, slug rows, or hreflang entries, yet wp_delete_post() fires
-		// 'delete_post' once per stored revision before the parent's own fire.
+			// Revisions hold no links, slugs or hreflang, yet wp_delete_post() fires delete_post for each one.
 		if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
 			return;
 		}
 
-		// Clear hreflang FIRST: the helper enumerates siblings via the
-		// translation_links row, which the unlink below removes. If we
-		// unlinked first the sibling list would be empty and every other
-		// translation of this post would keep a 12h-stale hreflang block
-		// pointing at the about-to-404 deleted URL.
+		// Clear hreflang first: it finds the siblings through the translation link the unlink below removes.
 		$this->clear_hreflang_for_post_and_siblings( $post_id );
 
 		// Remove the translation link so deleted posts don't leave stale references.
@@ -618,10 +506,7 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function on_edited_term( int $term_id, int $tt_id, string $taxonomy ): void {
-		// Sibling-aware hreflang clear (per-term keys for this term + its
-		// translation siblings, plus the taxonomy-archive bucket). Without
-		// this a renamed-slug term leaves up-to-12h-stale hreflang on every
-		// sibling term archive, which Google reports as missing return tags.
+		// Flushes the hreflang group, so the sibling archives of a renamed term drop the old URL.
 		$this->clear_hreflang_for_term_and_siblings( $term_id, $taxonomy );
 
 		$this->cache->flush_object( $term_id, 'term' );
@@ -630,10 +515,7 @@ final class CacheInvalidator {
 	/**
 	 * Purge a translation after machine translation wrote its meta.
 	 *
-	 * One flush_object() sends the purge signal again now that the field
-	 * values are final. Hreflang is left alone: it is built from post rows and
-	 * translation links, never from meta. A run that wrote nothing changed
-	 * nothing, so it purges nothing.
+	 * Sends the purge signal again once the field values are final. Hreflang stays: it never reads meta.
 	 *
 	 * @param mixed $translation_id Translation post id.
 	 * @param mixed $written_keys   Meta keys written by the run.
@@ -659,19 +541,15 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function on_delete_term( int $term_id, int $tt_id, string $taxonomy, mixed $deleted_term ): void {
-		// Sibling-aware hreflang clear runs BEFORE the unlink for the same
-		// reason as on_delete_post - once the translation_links row is gone
-		// the helper can no longer enumerate siblings.
+		// Clear hreflang before the unlink, as in on_delete_post().
 		$this->clear_hreflang_for_term_and_siblings( $term_id, $taxonomy );
 
 		// Remove the translation link so deleted terms don't leave stale references.
 		$repo = new \PerfLocale\Database\Repository\TranslationGroupRepository( $this->cache );
 		$repo->unlink_by_object_id( $term_id, 'term' );
 
-		// Also drop slug_translations for this term. Without this, every
-		// deleted translated term leaves N orphan rows (one per language)
-		// pointing at a term_id that no longer exists. Tables-exist guard
-		// covers the early-deactivation / uninstall ordering window.
+		// Drop the term's slug_translations rows, which would otherwise orphan. The tables guard covers the
+		// deactivation and uninstall ordering window.
 		if ( \PerfLocale\Database\Schema::tables_exist() ) {
 			global $wpdb;
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -684,11 +562,8 @@ final class CacheInvalidator {
 				[ '%d', '%s' ]
 			);
 
-			// Also drop the content-hash row. ContentChangeDetector only boots
-			// in admin/REST/CLI, so a term deleted in any other context leaves
-			// an orphan content_hashes row (the term analog of the post cleanup
-			// in Bootstrap::cleanup_translation_link_on_delete). No-op when the
-			// detector never hashed this term.
+			// And its content_hashes row: ContentChangeDetector boots only in admin, REST and CLI, so its own
+			// cleanup misses a term deleted elsewhere.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$wpdb->delete(
 				\PerfLocale\Database\Schema::table( 'content_hashes' ),
@@ -706,79 +581,57 @@ final class CacheInvalidator {
 	/**
 	 * Flush all language caches when languages are modified.
 	 *
-	 * @param mixed ...$args Hook arguments (ignored). Variadic because the
-	 *                      fires-from hooks (created/updated/deleted/activated/
-	 *                      deactivated/default-changed) have heterogeneous
-	 *                      signatures; we don't read any of them.
+	 * @param mixed ...$args Hook arguments (ignored; the firing hooks have different signatures).
 	 * @return void
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- variadic captures heterogeneous hook signatures we deliberately ignore.
 	public function on_language_changed( mixed ...$args ): void {
 		$this->cache->flush_languages();
 
-		// Rewrite rules use an explicit regex of language slugs (e.g. (en|fr|de)).
-		// When languages change, the regex is stale and rules must be regenerated.
+		// Rewrite rules embed a regex of the language slugs, so they must be regenerated.
 		update_option( 'perflocale_flush_rules', 1, false );
 		delete_transient( 'perflocale_rewrites_verified' );
 	}
 
 	/**
-	 * Invalidate the caches a settings save can stale.
+	 * Invalidate the caches a settings save can stale. The per-key blocks
+	 * are not exclusive: one save can change several kinds of keys.
 	 *
-	 * `flush_languages()` runs on every save (it also bumps + sweeps the
-	 * hreflang group); the per-category blocks below add the invalidations
-	 * that only specific keys require, and are deliberately NOT mutually
-	 * exclusive - one save can change a URL key AND the string-translation
-	 * mode, and an early return after the first match skipped the rest.
-	 *
-	 * Both hook arguments are required. `Settings::update()` fires
-	 * `perflocale/settings/updated` with (new, old); the registration in
-	 * register_hooks() must therefore ask for 2 accepted args or WordPress
-	 * slices `$old_settings` off and every branch below is dead.
-	 *
-	 * @param mixed ...$args Hook arguments (new_settings, old_settings).
+	 * @param mixed ...$args Hook arguments (new_settings, old_settings); both needed (2 accepted args).
 	 * @return void
 	 */
 	public function on_settings_changed( mixed ...$args ): void {
 		$new_settings = $args[0] ?? [];
 		$old_settings = $args[1] ?? [];
 
-		// Unconditional, as on every save before the per-key blocks existed:
-		// language data underpins slug/hreflang derivation, and this call also
-		// bumps the hreflang generation and sweeps its L3 rows.
+		// A save of operational keys only (jobs, MT, ...) keeps the warmed hreflang entries.
+		if ( is_array( $new_settings ) && is_array( $old_settings ) && $old_settings !== [] && OperationalSettings::only_these_changed( $new_settings, $old_settings ) ) {
+			return;
+		}
+
+		// Language data underpins slug/hreflang derivation; this also bumps
+		// the hreflang generation and sweeps its L3 rows.
 		$this->cache->flush_languages();
 
-		// Without both payloads there is nothing to diff - the blanket flush
-		// above is all we can honestly do.
+		// Without both payloads there is nothing to diff: the flush above is all.
 		if ( ! is_array( $new_settings ) || ! is_array( $old_settings ) || $old_settings === [] ) {
 			return;
 		}
 
-		// URL-related settings: the cached hreflang alternate sets and
-		// found-rows counts both embed URLs/values shaped by the URL mode, and
-		// hreflang entries live 12h. Without this, switching e.g.
-		// subdirectory -> query serves alternates pointing at the OLD mode's
-		// URLs until the TTL expires.
+		// URL settings shape the URLs in cached hreflang alternates and found-rows counts.
 		$url_keys = [ 'url_mode', 'url_prefix_type', 'hide_default_prefix', 'excluded_paths', 'translate_slugs', 'language_domains' ];
 
 		foreach ( $url_keys as $key ) {
 			if ( ( $new_settings[ $key ] ?? null ) !== ( $old_settings[ $key ] ?? null ) ) {
-				// invalidate_group() covers all three layers - the generation
-				// bump alone leaves 12h L3 transients alive on hosts without a
-				// persistent object cache (derive_transient_key is not
-				// generation-aware).
+				// invalidate_group(), not a bare bump: L3 transient names are not generation-aware.
 				$this->cache->invalidate_group( 'perflocale_hreflang' );
 				$this->cache->invalidate_group( 'perflocale_found_rows' );
 				break;
 			}
 		}
 
-		// Translatable-type/taxonomy changes: the persistent caches genuinely
-		// derived from type-translatability are the 12h hreflang alternate sets
-		// (no serve-time translatability re-check - a de-translated type would
-		// keep emitting alternates until TTL) and the found-rows counts (their
-		// md5-of-SQL keys self-correct, but the superseded L3 transients would
-		// linger). Mirror the URL-keys branch above.
+		// Type translatability: cached hreflang alternates are not re-checked at serve time, and superseded
+		// found-rows transients would linger.
 		$trans_keys = [ 'translatable_post_types', 'translatable_taxonomies' ];
 
 		foreach ( $trans_keys as $key ) {
@@ -789,9 +642,8 @@ final class CacheInvalidator {
 			}
 		}
 
-		// String translation mode change: flush string caches and, when
-		// switching to files mode, trigger file regeneration so the new
-		// .l10n.php files exist before the next frontend request arrives.
+		// String mode change: every active language's string cache goes (do not narrow it to one), and files
+		// mode regenerates the .l10n.php files before the next front-end request.
 		if ( ( $new_settings['string_translation_mode'] ?? null ) !== ( $old_settings['string_translation_mode'] ?? null ) ) {
 			$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository( $this->cache );
 			$languages = $lang_repo->get_active();
@@ -801,9 +653,7 @@ final class CacheInvalidator {
 			}
 
 			if ( ( $new_settings['string_translation_mode'] ?? '' ) === 'files' ) {
-				// Signal to TranslationFileLoader that files are being regenerated
-				// so it doesn't permanently mark itself as "loaded" on the first
-				// miss and give up retrying.
+					// Tells TranslationFileLoader the files are regenerating, so a first miss does not end its retries.
 				if ( false === set_transient( 'perflocale_strings_regenerating', 1, 5 * MINUTE_IN_SECONDS ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic; without this flag files-mode strings may read untranslated until the next regen.
 					error_log( 'PerfLocale: failed to set the strings-regenerating flag; files-mode strings may read untranslated until regeneration completes.' );
@@ -824,44 +674,21 @@ final class CacheInvalidator {
 	/**
 	 * Flush static caches on multisite blog switch.
 	 *
-	 * @param int $new_blog_id New blog ID. Required by the WP `switch_blog`
-	 *                        hook signature; we reset all per-request static
-	 *                        caches unconditionally so the ID isn't read.
+	 * @param int $new_blog_id New blog ID (unused: the reset is blog-agnostic).
 	 * @return void
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- WP switch_blog hook signature; reset_static() is blog-agnostic.
 	public function on_switch_blog( int $new_blog_id ): void {
-		// Only reset the request-scoped static caches on blog switch - they're
-		// keyed by the old blog and must not leak. The persistent layers
-		// (wp_cache group + L3 transients) are already per-blog in WP, so
-		// touching them is pointless AND would fatal on a fresh subsite whose
-		// tables don't exist yet (switch_blog fires before our activator runs).
+		// Only the request-scoped static caches: the persistent layers are per-blog already, and touching them
+		// would fatal on a fresh subsite whose tables do not exist yet (switch_blog fires before the activator).
 		$this->cache->reset_static();
 	}
 
 	/**
 	 * Purge full-page caches for a post whose PUBLIC visibility changed.
 	 *
-	 * WHY THIS EXISTS
-	 *   A translated page is a separate post with its own language-prefixed
-	 *   URL, and a full-page cache must drop its copy when the page stops (or
-	 *   starts) being publicly readable.
-	 *
-	 *   Two things combine. A page cache purges what it believes the post's URL
-	 *   to be, and it computes that during an admin/CLI request - where this
-	 *   plugin deliberately does NOT add the language prefix, so the URL it
-	 *   purges is not the URL it stored. And the whole translation GROUP is
-	 *   affected: hiding one language changes sibling pages that link to it.
-	 *
-	 *   So this resolves the real front-end URLs itself and hands them to the
-	 *   page cache, rather than assuming the cache can work them out.
-	 *
-	 * DELIBERATELY NARROW. Only a transition that changes whether the post is
-	 * publicly readable does anything, and only that post and its translation
-	 * siblings are purged. There is no global page-cache flush, no object-cache
-	 * flush and no database flush - a visibility change on one post must not
-	 * cost the whole site its cache. Nothing here runs on an ordinary
-	 * front-end read.
+	 * Resolves the group's front-end URLs itself: a page cache computes them in an admin request, without the
+	 * language prefix. Narrow on purpose: only this post's group, never a global flush.
 	 *
 	 * @param string    $new_status New post status.
 	 * @param string    $old_status Previous post status.
@@ -881,11 +708,8 @@ final class CacheInvalidator {
 			return;
 		}
 
-		// A member becoming or ceasing to be public changes every sibling's
-		// alternate set. Where on_save_post() is hooked it clears the same
-		// entries once the save completes, so this covers only the requests
-		// without it (a publication during a front-end GET). Block templates
-		// have no singular bucket; see on_save_post().
+		// A public change alters every sibling's alternates. Where on_save_post() is hooked it clears them, so this
+		// covers only requests without it (a publication in a front-end GET). Block templates have no singular entry.
 		if ( false === has_action( 'save_post', [ $this, 'on_save_post' ] )
 			&& ! \PerfLocale\Translation\BlockTemplateSupport::is_template_type( (string) $post->post_type ) ) {
 			$this->clear_hreflang_for_post_and_siblings( (int) $post->ID );
@@ -906,28 +730,8 @@ final class CacheInvalidator {
 		 */
 		do_action( 'perflocale/cache/purge_urls', $urls, (int) $post->ID );
 
-		// DELIBERATELY NO DIRECT CALLS INTO PAGE-CACHE PLUGINS.
-		//
-		// The obvious implementation - calling each cache's per-post purge
-		// (Breeze's `purge_post_cache`, `w3tc_flush_post`, `rocket_clean_post`,
-		// `wpsc_delete_post_cache`) - was written, tested and removed. Those
-		// entry points do more than clear a local file: Breeze's, for one, goes
-		// on to purge CloudFlare and Varnish over the network, so every
-		// publish/private toggle would have made PerfLocale the origin of
-		// outbound HTTP inside the request that saved the post. The
-		// cov-never-loaded suite caught exactly that (90 blocked requests
-		// carrying a PerfLocale frame), and it is right to: a translation plugin
-		// should not silently add network calls to someone else's save.
-		//
-		// So this publishes the facts only the translation layer knows - the
-		// exact public URLs - and leaves the purge to the site. One filter wires
-		// it to any cache:
-		//
-		//     add_action( 'perflocale/cache/purge_urls', function ( $urls ) {
-		//         foreach ( $urls as $url ) { my_cache_purge( $url ); }
-		//     } );
-		//
-		// With no listener this costs nothing and reaches nothing.
+		// No direct calls into page-cache plugins: their per-post purges (Breeze's, for one) also purge CDNs over
+		// the network inside the save request. Sites hook `perflocale/cache/purge_urls` to their cache instead.
 	}
 
 	/**
@@ -973,10 +777,8 @@ final class CacheInvalidator {
 	/**
 	 * Front-end URLs for every post in this post's translation group.
 	 *
-	 * get_permalink() is used deliberately: this runs during a status change,
-	 * which is an admin/CLI/REST request, and the URL that matters is the one a
-	 * visitor would have requested. Anything that cannot be resolved is skipped
-	 * rather than guessed.
+	 * Uses get_permalink() on purpose: it gives the URL a visitor requests, even in this admin request. URLs that
+	 * cannot be resolved are skipped, never guessed.
 	 *
 	 * @param int $post_id Post id.
 	 * @return array<int, string>

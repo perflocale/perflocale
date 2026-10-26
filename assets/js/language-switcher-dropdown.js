@@ -2,15 +2,9 @@
  * PerfLocale Language Switcher - dropdown keyboard, click, and event
  * handling.
  *
- * Public events fired on the switcher `<nav>` (all bubble):
- *   - `perflocale:switcher:open`     (after open, not cancelable)
- *   - `perflocale:switcher:close`    (after close, not cancelable). Also fires
- *     when the trigger of an open dropdown stops being displayed (a responsive
- *     header hides it, or it is removed); the script moves no focus then. A
- *     listener that wants to move focus reads, at dispatch time,
- *     `! e.detail.trigger.getClientRects().length` (the trigger is hidden) and
- *     `e.detail.nav.contains( document.activeElement )` (focus is inside).
- *   - `perflocale:switcher:navigate` (before option-click navigation, cancelable)
+ * Events bubble from the switcher `<nav>`, each documented above its
+ * dispatch call. A trigger that stops being displayed closes the panel
+ * (source 'hidden') and moves no focus.
  *
  * The server renders the language links without a tabindex, so with scripting
  * off (the `scripting: none` block in frontend.css shows them as a plain list)
@@ -28,6 +22,7 @@
 
 	var setupRegistry  = new WeakMap();
 	var liveReposition = new WeakMap();
+	var setupCount     = 0;
 
 	function positionPanel( btn, panel ) {
 		panel.style.top    = '';
@@ -108,7 +103,7 @@
 	// visible control stands in for this switcher is the theme's knowledge.
 	function closeHidden( nav, btn, panel ) {
 		if ( panel.classList.contains( OPEN_CLASS ) ) {
-			close( nav, btn, panel, false );
+			close( nav, btn, panel, false, 'hidden' );
 		}
 	}
 
@@ -139,16 +134,78 @@
 			return true;
 		}
 
-		var event = new CustomEvent( 'perflocale:switcher:' + name, {
+		return nav.dispatchEvent( new CustomEvent( name, {
 			bubbles:    true,
 			cancelable: !! cancelable,
 			detail:     detail
-		} );
-
-		return nav.dispatchEvent( event );
+		} ) );
 	}
 
-	function closeAllExcept( exceptNav ) {
+	// A Language read from an option's or the trigger's data-pl-* attributes.
+	function readLanguage( el ) {
+		return {
+			slug:       el.getAttribute( 'data-pl-slug' ) || '',
+			locale:     el.getAttribute( 'data-pl-locale' ) || '',
+			name:       el.getAttribute( 'data-pl-name' ) || '',
+			nativeName: el.getAttribute( 'data-pl-native' ) || '',
+			isDefault:  el.getAttribute( 'data-pl-default' ) === '1'
+		};
+	}
+
+	function readOption( el ) {
+		var o = readLanguage( el );
+
+		o.url       = el.tagName === 'A' ? el.getAttribute( 'href' ) || '' : '';
+		o.available = el.getAttribute( 'data-pl-missing' ) !== '1';
+		o.option    = el;
+
+		return Object.freeze( o );
+	}
+
+	/**
+	 * @typedef {Object} SwitcherDetail
+	 * @property {number} version 1.
+	 * @property {HTMLElement} nav The nav root.
+	 * @property {HTMLElement} trigger The button.
+	 * @property {HTMLElement} panel The options list.
+	 * @property {string} instance The nav's id, else 'perflocale-switcher-<n>'.
+	 * @property {Language} current The page's language.
+	 * @property {Option[]} languages The options in display order.
+	 * @property {string} source What caused the event.
+	 */
+	/**
+	 * @typedef {Language} Option
+	 * @property {string} url The link; '' without one.
+	 * @property {boolean} available The page has a translation there.
+	 * @property {HTMLElement} option The option element.
+	 */
+	/**
+	 * current and languages are read on first use, then kept.
+	 *
+	 * @returns {SwitcherDetail}
+	 */
+	function detail( nav, source ) {
+		var st = setupRegistry.get( nav );
+
+		return {
+			version:  1,
+			nav:      nav,
+			trigger:  st.btn,
+			panel:    st.panel,
+			instance: st.instance,
+			get current() {
+				return st.current || ( st.current = Object.freeze( readLanguage( st.btn ) ) );
+			},
+			get languages() {
+				return st.languages || ( st.languages = Object.freeze(
+					Array.prototype.map.call( st.panel.querySelectorAll( '[role=option]' ), readOption )
+				) );
+			},
+			source:   source
+		};
+	}
+
+	function closeAllExcept( exceptNav, source ) {
 		var openPanels = document.querySelectorAll( PANEL_SELECTOR + '.' + OPEN_CLASS );
 
 		for ( var i = 0; i < openPanels.length; i++ ) {
@@ -165,32 +222,71 @@
 				continue;
 			}
 
-			close( nav, btn, panel, false );
+			close( nav, btn, panel, false, source );
 		}
 	}
 
-	function open( nav, btn, panel, focusFirstOption ) {
+	function open( nav, btn, panel, focusFirstOption, source ) {
+		/**
+		 * @hook perflocale:switcher:beforeopen
+		 * @kind event
+		 * @since 1.0.7.4
+		 * @cardinality transition
+		 * @cancelable true
+		 * @fires Before the panel opens, before any change. preventDefault() leaves every switcher and the focus as they were.
+		 * @context {SwitcherDetail} detail
+		 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen) or 'keyboard' (Enter, Space or an arrow key).
+		 * @example document.addEventListener( 'perflocale:switcher:beforeopen', ( e ) => e.preventDefault() );
+		 */
+		if ( ! dispatch( nav, 'perflocale:switcher:beforeopen', detail( nav, source ), true ) ) {
+			return false;
+		}
+
 		removeOptionsFromTabOrder( panel );
-		closeAllExcept( nav );
+		closeAllExcept( nav, 'other-switcher' );
 		panel.classList.add( OPEN_CLASS );
 		btn.setAttribute( 'aria-expanded', 'true' );
 		positionPanel( btn, panel );
 		startLivePositioning( nav, btn, panel );
 
-		dispatch( nav, 'open', { nav: nav, trigger: btn, panel: panel }, false );
+		/**
+		 * @hook perflocale:switcher:open
+		 * @kind event
+		 * @since 1.0.0
+		 * @cardinality transition
+		 * @cancelable false
+		 * @fires After the panel opened.
+		 * @context {SwitcherDetail} detail
+		 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen) or 'keyboard' (Enter, Space or an arrow key).
+		 * @example document.addEventListener( 'perflocale:switcher:open', ( e ) => console.log( e.detail.current.slug ) );
+		 */
+		dispatch( nav, 'perflocale:switcher:open', detail( nav, source ), false );
 
 		if ( focusFirstOption ) {
 			var first = panel.querySelector( OPTION_SELECTOR );
 			if ( first ) { first.focus(); }
 		}
+
+		return true;
 	}
 
-	function close( nav, btn, panel, returnFocusToTrigger ) {
+	function close( nav, btn, panel, returnFocusToTrigger, source ) {
 		panel.classList.remove( OPEN_CLASS );
 		btn.setAttribute( 'aria-expanded', 'false' );
 		stopLivePositioning( nav );
 
-		dispatch( nav, 'close', { nav: nav, trigger: btn, panel: panel }, false );
+		/**
+		 * @hook perflocale:switcher:close
+		 * @kind event
+		 * @since 1.0.0
+		 * @cardinality transition
+		 * @cancelable false
+		 * @fires After the panel closed, on every path.
+		 * @context {SwitcherDetail} detail
+		 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen), 'escape', 'outside', 'focusout', 'other-switcher' or 'hidden'.
+		 * @example document.addEventListener( 'perflocale:switcher:close', ( e ) => console.log( e.detail.source ) );
+		 */
+		dispatch( nav, 'perflocale:switcher:close', detail( nav, source ), false );
 
 		if ( returnFocusToTrigger ) {
 			btn.focus();
@@ -209,7 +305,11 @@
 			return;
 		}
 
-		setupRegistry.set( nav, true );
+		setupCount++;
+
+		var st = { btn: btn, panel: panel, instance: nav.id || 'perflocale-switcher-' + setupCount };
+
+		setupRegistry.set( nav, st );
 		removeOptionsFromTabOrder( panel );
 
 		panel.addEventListener( 'click', function ( e ) {
@@ -219,13 +319,29 @@
 				return;
 			}
 
-			var allowed = dispatch( nav, 'navigate', {
-				nav:     nav,
-				option:  option,
-				slug:    option.getAttribute( 'hreflang' ) || option.getAttribute( 'lang' ) || '',
-				url:     option.getAttribute( 'href' ) || '',
-				trigger: btn
-			}, true );
+			/**
+			 * @hook perflocale:switcher:navigate
+			 * @kind event
+			 * @since 1.0.0
+			 * @cardinality transition
+			 * @cancelable true
+			 * @fires Before the browser follows a chosen option. preventDefault() stays on the page.
+			 * @context {SwitcherDetail} detail
+			 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen) or 'keyboard' (Enter).
+			 * @property {Option} detail.target The chosen option.
+			 * @property {Language} detail.from = current.
+			 * @property {HTMLElement} detail.option The option element.
+			 * @property {string} detail.url Its link.
+			 * @property {string} detail.slug Its hreflang (BCP 47, e.g. pt-BR).
+			 * @example document.addEventListener( 'perflocale:switcher:navigate', ( e ) => gtag( 'event', 'lang', { to: e.detail.target.slug } ) );
+			 */
+			var allowed = dispatch( nav, 'perflocale:switcher:navigate', Object.defineProperties( detail( nav, e.detail === 0 ? 'keyboard' : 'click' ), {
+				target: { enumerable: true, get: function () { return readOption( option ); } },
+				from:   { enumerable: true, get: function () { return this.current; } },
+				option: { enumerable: true, value: option },
+				url:    { enumerable: true, value: option.getAttribute( 'href' ) || '' },
+				slug:   { enumerable: true, value: option.getAttribute( 'hreflang' ) || option.getAttribute( 'lang' ) || '' }
+			} ), true );
 
 			if ( ! allowed ) {
 				e.preventDefault();
@@ -236,16 +352,24 @@
 			var isOpen = panel.classList.contains( OPEN_CLASS );
 
 			if ( isOpen ) {
-				close( nav, btn, panel, false );
-			} else {
-				// e.detail === 0 distinguishes keyboard activation
-				// (Enter/Space) from a mouse click; we auto-focus the
-				// first option only on keyboard.
-				open( nav, btn, panel, e.detail === 0 );
+				close( nav, btn, panel, false, 'click' );
+			} else if ( open( nav, btn, panel, e.detail === 0, e.detail === 0 ? 'keyboard' : 'click' ) && e.detail ) {
+				// e.detail === 0 is keyboard activation (Enter/Space): open()
+				// focuses the first option. A pointer click focuses the trigger
+				// here, the focus change its mousedown held back.
+				btn.focus();
 			}
 
 			e.preventDefault();
 			e.stopPropagation();
+		} );
+
+		// A press on the closed trigger moves no focus yet, so no other
+		// switcher closes on focusout before beforeopen can cancel the open.
+		btn.addEventListener( 'mousedown', function ( e ) {
+			if ( ! panel.classList.contains( OPEN_CLASS ) ) {
+				e.preventDefault();
+			}
 		} );
 
 		nav.addEventListener( 'keydown', function ( e ) {
@@ -254,16 +378,15 @@
 			var opts   = panel.querySelectorAll( OPTION_SELECTOR );
 
 			if ( t === btn ) {
+				// A cancelled beforeopen moves no focus.
 				if ( e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ' ) {
-					if ( ! isOpen ) { open( nav, btn, panel, false ); }
-					if ( opts.length ) { opts[ 0 ].focus(); }
+					if ( ( isOpen || open( nav, btn, panel, false, 'keyboard' ) ) && opts.length ) { opts[ 0 ].focus(); }
 					e.preventDefault();
 				} else if ( e.key === 'ArrowUp' ) {
-					if ( ! isOpen ) { open( nav, btn, panel, false ); }
-					if ( opts.length ) { opts[ opts.length - 1 ].focus(); }
+					if ( ( isOpen || open( nav, btn, panel, false, 'keyboard' ) ) && opts.length ) { opts[ opts.length - 1 ].focus(); }
 					e.preventDefault();
 				} else if ( e.key === 'Escape' && isOpen ) {
-					close( nav, btn, panel, false );
+					close( nav, btn, panel, false, 'escape' );
 					e.preventDefault();
 				}
 
@@ -300,7 +423,7 @@
 				opts[ opts.length - 1 ].focus();
 				e.preventDefault();
 			} else if ( e.key === 'Escape' ) {
-				close( nav, btn, panel, true );
+				close( nav, btn, panel, true, 'escape' );
 				e.preventDefault();
 			} else if ( e.key.length === 1 && ! e.ctrlKey && ! e.metaKey && ! e.altKey && /\S/.test( e.key ) ) {
 				// First-letter type-ahead, mirrors native <select>. Match the
@@ -336,17 +459,33 @@
 
 			if ( to ) {
 				if ( ! nav.contains( to ) ) {
-					close( nav, btn, panel, false );
+					close( nav, btn, panel, false, 'focusout' );
 				}
 				return;
 			}
 
 			( window.requestAnimationFrame || function ( cb ) { return setTimeout( cb, 0 ); } )( function () {
 				if ( panel.classList.contains( OPEN_CLASS ) && ! nav.contains( document.activeElement ) ) {
-					close( nav, btn, panel, false );
+					close( nav, btn, panel, false, 'focusout' );
 				}
 			} );
 		} );
+
+		// For scripts that load after set-up.
+		nav.setAttribute( 'data-perflocale-ready', '1' );
+
+		/**
+		 * @hook perflocale:switcher:ready
+		 * @kind event
+		 * @since 1.0.7.4
+		 * @cardinality transition
+		 * @cancelable false
+		 * @fires Once per switcher after set-up; the nav has data-perflocale-ready="1".
+		 * @context {SwitcherDetail} detail
+		 * @property {string} detail.source 'setup'.
+		 * @example document.addEventListener( 'perflocale:switcher:ready', ( e ) => console.log( e.detail.instance ) );
+		 */
+		dispatch( nav, 'perflocale:switcher:ready', detail( nav, 'setup' ), false );
 	}
 
 	function setupAllInDocument() {
@@ -389,7 +528,7 @@
 		if ( e.target.closest( ROOT_SELECTOR ) ) {
 			return;
 		}
-		closeAllExcept( null );
+		closeAllExcept( null, 'outside' );
 	} );
 
 	// Native <select> dropdown used by the switcher-dropdown.php template.

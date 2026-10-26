@@ -16,86 +16,52 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Persistent settings storage for addons.
+ * Settings storage for addons: the fields of get_settings_fields(), keyed by addon id in one option.
  *
- * Each addon's `get_settings_fields()` defines the fields it wants
- * configurable from the PerfLocale Addons admin page. The values are
- * persisted in a single `perflocale_addon_settings` option (one DB row,
- * autoloaded) keyed by addon ID:
- *
- *   [
- *     'woocommerce' => [ 'wc_email_translation' => true, 'wc_sync_stock' => false ],
- *     'acf'         => [ 'acf_auto_detect' => true ],
- *   ]
- *
- * Addons read their own settings via {@see get()} from anywhere in the
- * codebase:
- *
- *   AddonSettings::get( 'woocommerce', 'wc_email_translation', true );
+ * Read with AddonSettings::get( 'woocommerce', 'wc_email_translation', true ).
  *
  * @api  Stable addon-facing API surface - semver-bound; safe for 3rd-party addons to depend on.
  */
 final class AddonSettings {
 
 	/**
-	 * Option name. Single autoloaded option keyed by addon ID so addons
-	 * reading their own setting incur exactly one cache lookup, not one
-	 * per addon-setting pair.
+	 * Option name: one row for every addon, read once per request.
 	 */
 	private const OPTION = 'perflocale_addon_settings';
 
 	/**
-	 * Maximum serialised size per addon entry. Bounds the worst case so a
-	 * single buggy addon can't grow the autoloaded option to multi-megabyte
-	 * sizes that slow every request's bootstrap deserialise.
-	 *
-	 * 16 KiB comfortably fits ~300 typical text-field settings. Addons that
-	 * need to store more should keep that state in their own option/table
-	 * and use AddonSettings only for the user-editable configuration.
+	 * Serialised size cap per addon entry; an addon with more state keeps it in its own option or table.
 	 */
 	private const MAX_ADDON_BYTES = 16384;
 
 	/**
-	 * Lock name for serialised writes. Wraps every persist() so two
-	 * concurrent saves to different addon entries can't race on the shared
-	 * option - without it the second write would clobber the first.
+	 * Lock around every write: two saves to different addons share one option, so the second would drop the first.
 	 */
 	private const LOCK_NAME = 'addon_settings_write';
 
 	/**
-	 * Lock TTL - short because persist() is essentially a single
-	 * update_option call. 10 s leaves headroom for slow DBs but won't
-	 * deadlock a misbehaving caller for long.
+	 * Lock lifetime in seconds; the work inside is one update_option().
 	 */
 	private const LOCK_TTL = 10;
 
 	/**
-	 * Sentinel returned by sanitize_field() for a 'custom' field with no
-	 * sanitize_callback declared, so the caller can preserve the existing
-	 * stored value instead of overwriting it with null/default. A class
-	 * constant string is safe to compare with === without colliding with
-	 * any legitimate user-supplied value.
+	 * Returned by sanitize_field() for a 'custom' field without sanitize_callback: the caller keeps the stored value.
 	 */
 	public const CUSTOM_NO_SANITIZE = "\0perflocale_custom_no_sanitize\0";
 
 	/**
-	 * In-memory cache of the full option value. Populated lazily on first
-	 * read so the option only deserialises once per request.
+	 * Request memo of the whole option.
 	 *
 	 * @var array<string, array<string, mixed>>|null
 	 */
 	private static ?array $cache = null;
 
 	/**
-	 * Read a single setting for an addon.
-	 *
-	 * Returns `$default` when the addon id is malformed - same return path
-	 * as "not stored", so callers don't have to special-case invalid ids.
+	 * Read a single setting for an addon; a malformed id returns $default.
 	 *
 	 * @param string $addon_id The addon's get_id() value.
 	 * @param string $key      The settings field key declared in get_settings_fields().
-	 * @param mixed  $default  Fallback if the value isn't stored. Should match
-	 *                         the field's `default` from get_settings_fields().
+	 * @param mixed  $default  Fallback when nothing is stored; match the field's `default`.
 	 * @return mixed
 	 */
 	public static function get( string $addon_id, string $key, $default = null ) {
@@ -106,8 +72,7 @@ final class AddonSettings {
 		$all   = self::all();
 		$entry = $all[ $addon_id ] ?? null;
 
-		// array_key_exists (not ??) so a stored null value round-trips
-		// instead of being shadowed by $default. Matches get_many().
+		// Not ??: a stored null is returned, not $default.
 		if ( is_array( $entry ) && array_key_exists( $key, $entry ) ) {
 			return $entry[ $key ];
 		}
@@ -116,9 +81,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Read every stored setting for one addon.
-	 *
-	 * Returns an empty array for malformed addon ids.
+	 * Read every stored setting for one addon; [] for a malformed id.
 	 *
 	 * @param string $addon_id The addon's get_id() value.
 	 * @return array<string, mixed>
@@ -131,34 +94,14 @@ final class AddonSettings {
 		$all   = self::all();
 		$entry = $all[ $addon_id ] ?? null;
 
-		// (array) coerces 'string' → [0 => 'string'], which would expose
-		// corrupted DB state as a partial-looking array. Explicit guard:
-		// only an actual array shape is a legitimate entry; everything
-		// else (scalar, object, null) is treated as "no entry".
+		// A non-array entry is corrupt and reads as none; (array) would turn 'x' into [0 => 'x'].
 		return is_array( $entry ) ? $entry : [];
 	}
 
 	/**
-	 * Read multiple settings for one addon in a single call.
+	 * Read several settings of one addon; a key without a stored value or a default reads null.
 	 *
-	 * Cleaner than chained {@see get()} calls when an addon needs
-	 * several of its own settings at once - and slightly cheaper because
-	 * the in-memory cache is looked up once instead of once per key.
-	 *
-	 * Defaults are matched per-key from the supplied `$defaults` map; if
-	 * a key is in `$keys` but not in `$defaults`, the returned value is
-	 * the stored value or `null` when nothing is stored.
-	 *
-	 * Example:
-	 *
-	 *   $settings = AddonSettings::get_many(
-	 *       'my-addon',
-	 *       [ 'enable_sync', 'endpoint', 'cache_ttl' ],
-	 *       [ 'enable_sync' => true, 'cache_ttl' => 3600 ]
-	 *   );
-	 *   // $settings === [ 'enable_sync' => …, 'endpoint' => …, 'cache_ttl' => … ]
-	 *
-	 * @param string               $addon_id
+	 * @param string               $addon_id The addon's get_id() value.
 	 * @param array<int, string>   $keys     List of setting keys to read.
 	 * @param array<string, mixed> $defaults Optional per-key fallbacks.
 	 * @return array<string, mixed> Map keyed by `$keys` (in input order).
@@ -189,16 +132,12 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Write a single setting for an addon. Use sparingly - the admin form
-	 * handler writes the whole addon group at once via {@see set_addon()},
-	 * which is cheaper.
+	 * Write a single setting for an addon; set_addon() writes several in one write.
 	 *
-	 * @param string $addon_id
-	 * @param string $key
-	 * @param mixed  $value
-	 * @return bool True on success (including an unchanged value); false if
-	 *              rejected (bad id, too large, write refused, lock
-	 *              contention).
+	 * @param string $addon_id The addon's get_id() value.
+	 * @param string $key      Setting key.
+	 * @param mixed  $value    Value to store.
+	 * @return bool True when stored or unchanged; false for a bad id, too large, a refused write or a held lock.
 	 */
 	public static function set( string $addon_id, string $key, $value ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -219,15 +158,11 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Overwrite all settings for a single addon. Used by the admin form
-	 * handler so a single save call updates every checkbox/text field at
-	 * once, in one DB write.
+	 * Overwrite all settings of one addon in one write.
 	 *
-	 * @param string               $addon_id
-	 * @param array<string, mixed> $values
-	 * @return bool True on success (including unchanged values); false if
-	 *              rejected (bad id, too large, write refused, lock
-	 *              contention).
+	 * @param string               $addon_id The addon's get_id() value.
+	 * @param array<string, mixed> $values   Every setting of the addon.
+	 * @return bool True when stored or unchanged; false for a bad id, too large, a refused write or a held lock.
 	 */
 	public static function set_addon( string $addon_id, array $values ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -245,13 +180,10 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Drop everything stored for an addon. Called by the uninstall path
-	 * when an addon's parent plugin is removed.
+	 * Drop everything stored for an addon.
 	 *
-	 * @param string $addon_id
-	 * @return bool True on success (including the no-op case); false if
-	 *              the id is malformed, the write was refused, or the lock
-	 *              was held.
+	 * @param string $addon_id The addon's get_id() value.
+	 * @return bool True when gone (or never stored); false for a bad id, a refused write or a held lock.
 	 */
 	public static function forget( string $addon_id ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -269,8 +201,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Coerce a raw POST value into the type declared by the field. Centralised
-	 * so the admin form handler doesn't have to special-case each type.
+	 * Coerce a raw POST value into the type declared by the field.
 	 *
 	 * @param array<string, mixed> $field     Field definition from get_settings_fields().
 	 * @param mixed                $raw       Raw POST value (always string or array of strings).
@@ -306,21 +237,11 @@ final class AddonSettings {
 			case 'select':
 				$options = (array) ( $field['options'] ?? [] );
 				$value   = is_string( $raw ) ? sanitize_text_field( wp_unslash( $raw ) ) : '';
-				// Only allow values declared in the options list to defend
-				// against tampering with hidden form fields.
+				// Only a declared option: the POST value is untrusted.
 				return array_key_exists( $value, $options ) ? $value : ( $field['default'] ?? '' );
 
 			case 'custom':
-				// Custom fields delegate sanitization to the addon's own
-				// callback because their POST data can span multiple keys
-				// (e.g. a per-language matrix uses nested input names).
-				// Callback signature mirrors render_callback:
-				// ($addon_id, $field_key, $field_def, $raw)
-				// - the callback is responsible for reading from $_POST
-				// itself when its POST shape doesn't fit the canonical
-				// settings[$field_key] slot. Missing callback → signal
-				// "no sanitize" so the caller can preserve existing
-				// addon-managed state instead of overwriting it.
+				// The addon's callback reads its own POST keys (a field can span several); without one the stored value stays.
 				$cb = $field['sanitize_callback'] ?? null;
 				if ( is_callable( $cb ) ) {
 					return $cb( $addon_id, $field_key, $field, $raw );
@@ -334,33 +255,21 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Field types that the generic admin form renders + writes. Anything
-	 * else (currently 'hidden', but the list is forward-compatible) is
-	 * addon-managed state and the generic save handler leaves it alone.
+	 * Field types the generic admin form renders and saves; any other type is addon-managed state it leaves alone.
 	 *
 	 * @return array<int, string>
 	 */
 	public static function user_editable_types(): array {
-		// `custom` is included so the save handler iterates over the
-		// field and gives it a chance to extract its own POST values
-		// via the field's sanitize_callback. Render is delegated to
-		// the field's render_callback so the addon emits its own rows.
+		// `custom` fields render and sanitize through their own callbacks.
 		return [ 'checkbox', 'text', 'textarea', 'number', 'select', 'password', 'custom' ];
 	}
 
 	/**
-	 * True if the field is user-editable from the generic Addons-page form.
-	 * The handler skips fields that fail this check so addons can store
-	 * arbitrary state (e.g. WooCommerce wc_currencies) without losing it on
-	 * a form save.
+	 * True if the generic Addons form edits the field; it skips the rest, so addon state survives a form save.
 	 *
-	 * Fields tagged with `'storage' => 'global'` are NEVER user-editable
-	 * via the auto-form: their storage is the main `perflocale_settings`
-	 * option, not `perflocale_addon_settings`, and the addon's
-	 * {@see AddonInterface::render_settings_subtab()} takeover renders
-	 * and saves them itself.
+	 * A `'storage' => 'global'` field is never one: the addon's render_settings_subtab() owns it.
 	 *
-	 * @param array<string, mixed> $field
+	 * @param array<string, mixed> $field Field definition.
 	 * @return bool
 	 */
 	public static function is_user_editable_field( array $field ): bool {
@@ -372,15 +281,12 @@ final class AddonSettings {
 	}
 
 	/**
-	 * True if a field declares `'storage' => 'global'` - its value is
-	 * stored in the main `perflocale_settings` option, not in
-	 * `perflocale_addon_settings`. The framework MUST NOT seed defaults
-	 * for, render via auto-form, save through the auto-form handler, or
-	 * accept `wp perflocale addon settings set` writes for global-storage
-	 * fields. `settings get` / `settings list` redirect their reads to
-	 * the main settings option.
+	 * True if a field is stored in the main `perflocale_settings` option (`'storage' => 'global'`).
 	 *
-	 * @param array<string, mixed> $field
+	 * Such a field gets no seeded add-on default or auto-form; WP-CLI reads the main option and writes it
+	 * through Settings::update().
+	 *
+	 * @param array<string, mixed> $field Field definition.
 	 * @return bool
 	 */
 	public static function is_global_storage( array $field ): bool {
@@ -388,27 +294,9 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Evaluate a field's `show_if` against the current values map.
+	 * Evaluate a field's `show_if` against the current values; an empty spec is visible.
 	 *
-	 * Supported spec shapes:
-	 *
-	 *   1. Simple equality (implicit AND across keys):
-	 *        'show_if' => [ 'wc_currency_per_lang' => true ]
-	 *        'show_if' => [ 'mode' => 'advanced', 'logging' => true ]
-	 *
-	 *   2. Nested with operator:
-	 *        'show_if' => [
-	 *            'op'    => 'OR' | 'AND',
-	 *            'rules' => [
-	 *                [ 'wc_currency_per_lang' => true ],
-	 *                [ 'op' => 'AND', 'rules' => [
-	 *                    [ 'mode' => 'pro' ],
-	 *                    [ 'beta' => true ],
-	 *                ]],
-	 *            ],
-	 *        ]
-	 *
-	 * Empty / missing show_if returns true (field always visible).
+	 * A spec is `[ key => expected, ... ]` (all must match) or `[ 'op' => 'OR'|'AND', 'rules' => [ spec, ... ] ]`.
 	 *
 	 * @param mixed                $show_if   The show_if spec.
 	 * @param array<string, mixed> $values    Current addon values.
@@ -419,7 +307,7 @@ final class AddonSettings {
 			return true;
 		}
 
-		// Nested operator form
+		// Nested operator form.
 		if ( isset( $show_if['op'], $show_if['rules'] ) && is_array( $show_if['rules'] ) ) {
 			$op    = strtoupper( (string) $show_if['op'] );
 			$rules = $show_if['rules'];
@@ -433,7 +321,7 @@ final class AddonSettings {
 				return false;
 			}
 
-			// Default AND
+			// Any other operator means all rules must match.
 			foreach ( $rules as $rule ) {
 				if ( ! self::evaluate_show_if( $rule, $values ) ) {
 					return false;
@@ -442,15 +330,14 @@ final class AddonSettings {
 			return true;
 		}
 
-		// Simple form: keys are field names, values are expected values.
-		// Implicit AND across all keys.
+		// Simple form: field name => expected value, all must match.
 		foreach ( $show_if as $field_key => $expected ) {
 			if ( ! is_string( $field_key ) ) {
 				continue;
 			}
 			$actual = $values[ $field_key ] ?? null;
 
-			// Loose comparison so '1' == true for checkbox-ish values.
+			// Loose, so '1' matches true for checkbox values.
 			// phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
 			if ( $actual != $expected ) {
 				return false;
@@ -460,29 +347,18 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Render the auto-generated settings form for one addon. Used by the
-	 * per-addon subtab on PerfLocale → Settings → Addons. Supports the
-	 * `show_if` conditional-display spec on individual fields, evaluated
-	 * server-side for the initial render AND client-side as the user
-	 * checks/unchecks driver fields (via the enqueued
-	 * `perflocale-addon-conditional-fields` script).
+	 * Render the auto-generated settings form of one addon; `show_if` is evaluated here and again by the enqueued script.
 	 *
-	 * A `password` field never prints its stored value: it renders empty, with
-	 * a masked placeholder when a value is stored, and an empty submission keeps
-	 * that value ({@see sanitize_field()}).
+	 * A `password` field never prints its stored value: it renders empty, masked when set, and an empty submission keeps it.
 	 *
-	 * @param string                              $addon_id
-	 * @param array<string, array<string, mixed>> $editable_fields
+	 * @param string                              $addon_id        Addon id.
+	 * @param array<string, array<string, mixed>> $editable_fields Fields to render.
 	 * @param array<string, mixed>                $values     Currently stored values.
 	 * @param string                              $form_action URL to post to (admin-post.php).
 	 * @return void
 	 */
 	public static function render_form( string $addon_id, array $editable_fields, array $values, string $form_action ): void {
-		// Pre-build the value map used for show_if evaluation. Stored
-		// values win, but any field with a declared `default` falls back
-		// to that default when no stored value exists - otherwise a
-		// freshly-installed addon with no auto-seed yet would evaluate
-		// every show_if against null and hide every dependent row.
+		// Defaults fill unstored values, or a new addon would judge every show_if against null and hide each dependent row.
 		$eval_values = $values;
 		foreach ( $editable_fields as $key => $field ) {
 			if ( ! array_key_exists( $key, $eval_values )
@@ -502,10 +378,7 @@ final class AddonSettings {
 				<tbody>
 				<?php
 				foreach ( $editable_fields as $field_key => $field_def ) :
-					// Defensive: callers are expected to pre-filter via
-					// is_user_editable_field(), but skipping here avoids
-					// rendering a stray 'hidden' (or future non-editable)
-					// field as a text input if the filter is bypassed.
+					// Callers pre-filter, but a non-editable field must never render as a text input.
 					if ( ! is_array( $field_def ) || ! self::is_user_editable_field( $field_def ) ) {
 						continue;
 					}
@@ -518,18 +391,10 @@ final class AddonSettings {
 					$input_id      = 'perflocale-addon-' . $addon_id . '-' . $field_key;
 					$input_name    = 'settings[' . $field_key . ']';
 
-					// Server-side show_if evaluation. JS keeps the
-					// initial state in sync as the user toggles fields.
+					// Initial visibility; the script updates it as fields change.
 					$visible = self::evaluate_show_if( $field_def['show_if'] ?? null, $eval_values );
 
-					// Custom-type fields delegate the entire row(s) to
-					// the addon's render_callback. The callback owns the
-					// full markup including any <tr> / <td> structure,
-					// any custom input naming (e.g. nested arrays for a
-					// matrix), and any show_if attrs it wants on its
-					// rows. The framework just provides initial show_if
-					// visibility metadata via the call args so the
-					// callback can mirror it.
+					// A custom field's render_callback prints its whole row markup.
 					if ( $field_type === 'custom' ) {
 						$render = $field_def['render_callback'] ?? null;
 						if ( is_callable( $render ) ) {
@@ -580,8 +445,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Reset the in-memory cache. Called from invalidate-on-write paths and
-	 * the test suite's reset_static_caches sweep.
+	 * Reset the request memo; the blog-switch reset list calls it, since the option is per blog.
 	 *
 	 * @return void
 	 */
@@ -590,8 +454,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Load the full settings array, populating the in-memory cache on
-	 * first read.
+	 * Load the full settings array, memoised.
 	 *
 	 * @return array<string, array<string, mixed>>
 	 */
@@ -604,44 +467,27 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Apply a mutator to the latest stored value and persist the result -
-	 * the WHOLE thing under a Lock::with() so two concurrent writes to
-	 * different addons can't race on the shared option (the second one
-	 * would otherwise read a stale snapshot from cache and clobber the
-	 * first one's commit). Inside the lock we re-read the option from the
-	 * database (bypassing the in-memory cache and WP's object cache) so
-	 * the mutator works on a guaranteed-fresh snapshot.
+	 * Apply a mutator to the stored value and persist it, read and write under one lock.
+	 *
+	 * The read inside the lock bypasses the memo and the object cache, or a stale copy would drop another request's write.
 	 *
 	 * @param callable $mutator   Takes the current array, returns the new one.
-	 * @param string   $addon_id  The addon whose entry is being mutated; used
-	 *                            for the size-cap check + the rejection log line.
-	 * @return bool True if the write committed or the stored value already
-	 *              matched; false if rejected (size cap, refused write, lock
-	 *              contention).
+	 * @param string   $addon_id  The addon whose entry is mutated (size cap, log line).
+	 * @return bool True when written or unchanged; false for the size cap, a refused write or a held lock.
 	 */
 	private static function persist_with_mutator( callable $mutator, string $addon_id ): bool {
 		$result = Lock::with(
 			self::LOCK_NAME,
 			self::LOCK_TTL,
 			static function () use ( $mutator, $addon_id ): bool {
-				// Re-read from the DB inside the lock. The in-memory cache
-				// could be stale from a snapshot taken before another worker
-				// committed; WP's object cache could be too. Re-querying the
-				// raw option is the only way to guarantee we mutate the
-				// latest-committed state.
+				// Read the committed row, not a cached copy.
 				wp_cache_delete( self::OPTION, 'options' );
 
-				// The lock leaves this request's `notoptions` as it is. When
-				// it lists the option (this request read it before the row
-				// existed), the read below would return that absence even
-				// after another request has created the row, and the write
-				// would replace that request's entries. Dropping `notoptions`
-				// then sends the read to the database; when it does not list
-				// the option, nothing is dropped.
+				// A `notoptions` entry from before another request created the row would hide it; unlist it.
 				$notoptions = wp_cache_get( 'notoptions', 'options' );
 
 				if ( is_array( $notoptions ) && isset( $notoptions[ self::OPTION ] ) ) {
-					wp_cache_delete( 'notoptions', 'options' );
+					\PerfLocale\Database\NotOptions::unlist( [ self::OPTION ] );
 				}
 
 				$current   = (array) get_option( self::OPTION, [] );
@@ -650,10 +496,7 @@ final class AddonSettings {
 				$next      = (array) $mutator( $current );
 				$new_entry = (array) ( $next[ $addon_id ] ?? [] );
 
-				// Cap PER-ADDON to bound worst-case autoloaded-option growth.
-				// Reject the write entirely on overflow - better to drop the
-				// commit (and surface it to the operator via log) than to
-				// silently grow an option that slows every request forever.
+				// Per-addon cap: an oversized entry is refused whole, not truncated.
 				if ( isset( $next[ $addon_id ] ) ) {
 					$serialised = (string) maybe_serialize( $next[ $addon_id ] );
 
@@ -672,17 +515,9 @@ final class AddonSettings {
 				}
 
 				/**
-				 * Fires inside the storage lock, immediately before the
-				 * autoloaded option commits. Use to react to (or audit) a
-				 * pending save with both old and proposed values in hand.
+				 * Fires inside the storage lock, right before the option is written.
 				 *
-				 * IMPORTANT: do NOT call AddonSettings::set / set_addon /
-				 * forget from this listener - the write lock is non-
-				 * reentrant and your write will time out at 10 s. For
-				 * cross-addon write reactions, hook the after-save action
-				 * (which still fires inside the lock but represents work
-				 * that should also bypass the writer path) OR defer with
-				 * wp_schedule_single_event.
+				 * Listeners must not call the AddonSettings writers: the lock is held, so that write fails; defer it instead.
 				 *
 				 * @hook perflocale/addon/settings/before_save
 				 * @param string               $addon_id  Addon id being saved.
@@ -691,18 +526,8 @@ final class AddonSettings {
 				 */
 				do_action( 'perflocale/addon/settings/before_save', $addon_id, $new_entry, $old_entry );
 
-				// autoload=false: per-addon entries can accumulate (16 KiB cap
-				// × N addons), so paying a single SELECT on first read is
-				// cheaper than carrying the full option in alloptions on every
-				// request whether read or not. AddonSettings::all() memoises
-				// the result statically, so reads after the first are free.
-				//
-				// update_option() returns false both for a value that is
-				// already stored and for a refused write (a pre_update_option
-				// filter handed back the stored value, or the query failed).
-				// An unchanged array is a no-op and counts as saved; a changed
-				// one that did not commit is a refusal. The memo is dropped
-				// then, so this request's reads come from the stored row.
+				// Not autoloaded: entries of many addons can add up, and all() memoises the one read.
+				// update_option() is false for an unchanged value too: only a changed one that did not commit is a refusal.
 				if ( ! update_option( self::OPTION, $next, false ) && maybe_serialize( $next ) !== maybe_serialize( $current ) ) {
 					self::$cache = null;
 					self::log_rejection( 'persist', $addon_id, 'write_refused' );
@@ -711,11 +536,9 @@ final class AddonSettings {
 				self::$cache = $next;
 
 				/**
-				 * Fires inside the storage lock, immediately after the
-				 * option commits, or after a save that changed nothing.
-				 * Not fired when the write was refused. Same reentrancy
-				 * caveat as before_save - listeners must not call
-				 * AddonSettings writers synchronously.
+				 * Fires inside the storage lock after the option is written or found unchanged; not after a refused write.
+				 *
+				 * Listeners must not call the AddonSettings writers: the lock is held, so that write fails.
 				 *
 				 * @hook perflocale/addon/settings/after_save
 				 * @param string               $addon_id  Addon id that was saved.
@@ -728,9 +551,7 @@ final class AddonSettings {
 			}
 		);
 
-		// Lock::with() returns null when the lock couldn't be acquired
-		// within the TTL - treat that as a transient failure so the
-		// caller can decide to retry / report.
+		// Null: the lock was held (Lock::with() does not wait).
 		if ( $result === null ) {
 			self::log_rejection( 'persist', $addon_id, 'lock_contention' );
 			return false;
@@ -740,8 +561,7 @@ final class AddonSettings {
 	}
 
 	/**
-	 * Log a rejected write to the PHP error log when WP_DEBUG is on.
-	 * Quiet in production so a misbehaving addon can't fill the log.
+	 * Log a rejected write under WP_DEBUG only, so a misbehaving addon cannot fill the log.
 	 *
 	 * @param string $op       Method name that rejected the write.
 	 * @param string $addon_id Addon id involved (may be malformed).

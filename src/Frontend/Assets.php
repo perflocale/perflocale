@@ -14,10 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Conditionally enqueues minimal frontend CSS for the language switcher.
- *
- * Only loads when a language switcher widget or shortcode is active
- * on the current page. Absolute minimal footprint.
+ * Enqueues the front-end switcher stylesheet only on pages that use a switcher.
  */
 final class Assets {
 
@@ -29,18 +26,8 @@ final class Assets {
 	public function register_hooks(): void {
 		add_action( 'wp_enqueue_scripts', [ $this, 'enqueue' ] );
 
-		// FSE / block-theme safety net: when a perflocale switcher block
-		// renders from a wp_template part (header.html, footer.html, etc.)
-		// - i.e. not from $post->post_content - the wp_enqueue_scripts
-		// pass at the top of enqueue() can't see it (page_has_block() only
-		// inspects the global $post). The block-SPECIFIC render filter
-		// fires only when our block actually renders - unlike the generic
-		// `render_block`, which would call this callback for every block
-		// on the page (thousands on FSE templates) just to compare names.
-		// Calling wp_enqueue_style this late still works because WP prints
-		// newly-enqueued styles via the late-style hooks (wp_footer).
-		// Without this hook the switcher renders unstyled on every
-		// block-theme site that puts the switcher in a template part.
+		// A switcher in a template part is invisible to enqueue(); the block-specific filter
+		// avoids a callback per block, and WP prints late-enqueued styles in the footer.
 		add_filter( 'render_block_perflocale/language-switcher', [ $this, 'maybe_enqueue_for_block' ], 10, 2 );
 	}
 
@@ -56,12 +43,7 @@ final class Assets {
 	}
 
 	/**
-	 * Render-time enqueue: ensure the frontend stylesheet is queued when a
-	 * perflocale block renders from anywhere - including template parts
-	 * which the early wp_enqueue_scripts pass cannot inspect.
-	 *
-	 * Safe to call repeatedly: wp_enqueue_style is idempotent on the same
-	 * handle.
+	 * Enqueues the stylesheet when the switcher block renders, template parts included.
 	 *
 	 * @param string $block_content Rendered block HTML (returned unchanged).
 	 * @param array  $block         Parsed block array.
@@ -70,8 +52,7 @@ final class Assets {
 	public function maybe_enqueue_for_block( string $block_content, array $block ): string {
 		$name = isset( $block['blockName'] ) ? (string) $block['blockName'] : '';
 
-		// Only act on the language-switcher block. Other perflocale blocks
-		// (e.g. if-language) don't need the switcher stylesheet.
+		// Other perflocale blocks need no switcher stylesheet.
 		if ( $name === 'perflocale/language-switcher' ) {
 			$this->enqueue_frontend_style();
 		}
@@ -80,16 +61,12 @@ final class Assets {
 	}
 
 	/**
-	 * Enqueue the frontend stylesheet exactly once per request. Centralised
-	 * so the wp_enqueue_scripts path and the render_block safety-net path
-	 * stay in sync on handle/url/version.
+	 * Enqueue the frontend stylesheet once per request.
 	 *
 	 * @return void
 	 */
 	private function enqueue_frontend_style(): void {
-		// wp_enqueue_style is itself idempotent on (handle, src, deps,
-		// ver), but a tiny is-enqueued guard avoids the duplicate string
-		// hashing inside WP's enqueue API on the hot per-block path.
+		// Cheap guard on the per-block path; wp_enqueue_style() alone would also be idempotent.
 		if ( wp_style_is( 'perflocale-frontend', 'enqueued' ) ) {
 			return;
 		}
@@ -103,14 +80,7 @@ final class Assets {
 	}
 
 	/**
-	 * Whether the current page uses the language switcher (widget,
-	 * shortcode, or block). Per-request memoized so any future caller
-	 * that asks the same question doesn't re-scan post_content.
-	 *
-	 * `is_active_widget()` already short-circuits the more-expensive
-	 * `has_shortcode()` / `has_block()` scans, but caching the boolean
-	 * itself makes the whole check a single bit-flag lookup on second
-	 * and subsequent calls within the same request.
+	 * Whether the current page uses the switcher (widget, shortcode or block), memoized per request.
 	 *
 	 * @return bool
 	 */
@@ -129,7 +99,7 @@ final class Assets {
 	}
 
 	/**
-	 * Check if the current page content contains the shortcode.
+	 * Whether the post has the switcher shortcode ([perflocale_language] uses no frontend.css rule).
 	 *
 	 * @return bool
 	 */
@@ -140,8 +110,7 @@ final class Assets {
 			return false;
 		}
 
-		return has_shortcode( $post->post_content, 'perflocale_switcher' )
-			|| has_shortcode( $post->post_content, 'perflocale_language' );
+		return has_shortcode( $post->post_content, 'perflocale_switcher' );
 	}
 
 	/**

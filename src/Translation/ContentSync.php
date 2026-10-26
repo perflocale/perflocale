@@ -18,15 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Synchronizes configured fields across all language versions of a post
- * when the original is updated.
+ * Keeps the configured Sync Fields equal across the language versions of a post.
  *
- * Fields like featured image, menu order, and custom meta keys can be
- * configured to stay in sync across translations. The featured image and
- * custom meta keys also follow writes made without a post save, except
- * writes made during a front-end page view. A blog whose Sync Fields list is
- * empty syncs none of them. The post password is not a Sync Field: it
- * follows the default-language member on every blog (sync_password()).
+ * The featured image and Sync Fields meta keys also follow writes made without a post save, except during a
+ * front-end page view. The post password is not a Sync Field: it follows the default-language member (sync_password()).
  */
 final class ContentSync {
 
@@ -41,19 +36,16 @@ final class ContentSync {
 	private readonly PostTranslationManager $manager;
 
 	/**
-	 * Cache manager. Held so a sibling whose row needed no write still gets
-	 * its object caches flushed - that is where the public
-	 * `perflocale/cache/flush_object` purge signal comes from.
+	 * Cache manager: a sibling whose row needed no write still gets the `perflocale/cache/flush_object` purge.
 	 *
 	 * @var CacheManager
 	 */
 	private readonly CacheManager $cache;
 
 	/**
-	 * Short TTL for the cross-request sync lock (seconds).
+	 * Cross-request sync lock TTL (seconds).
 	 *
-	 * Long enough to outlive a normal sync; short enough that a crashed
-	 * request doesn't block subsequent saves indefinitely.
+	 * Outlives a normal sync; a crashed request blocks later saves only this long.
 	 */
 	private const LOCK_TTL = 15;
 
@@ -70,42 +62,34 @@ final class ContentSync {
 	];
 
 	/**
-	 * Most posts this request tracks as "being saved" or as holding deferred
-	 * meta-write syncs. Past it the oldest entry is dropped (open saves) or
-	 * synced at once (deferred writes).
+	 * Most posts one per-request state array tracks; past it the oldest entry is dropped, or synced at once (deferred writes).
 	 */
 	private const DEFERRED_CAP = 200;
 
 	/**
-	 * Most rounds of one change or delete of a post's stale mark
-	 * (change_stale_mark(), delete_stale_mark()). A round is lost only when
-	 * another request changed the mark meanwhile, so reaching it takes that
-	 * many changes of one post's mark during one call.
+	 * Most rounds of one change or delete of a post's stale mark.
+	 *
+	 * A round is lost only when another request changed the mark meanwhile.
 	 */
 	private const STALE_MARK_ROUNDS = 50;
 
 	/**
-	 * Depth of sibling writes ContentSync itself is making. Meta writes seen
-	 * while it is above zero are the sync's own and start nothing.
+	 * Depth of sibling writes the sync itself makes; meta writes seen above zero start nothing.
 	 *
 	 * @var int
 	 */
 	private static int $writing = 0;
 
 	/**
-	 * Depth of meta writes that start no sync (suspend_meta_write_sync()):
-	 * a data import writes the file's values, and each post gets the value
-	 * the file holds for it.
+	 * Depth of meta writes that start no sync (suspend_meta_write_sync()): an import gives each post the file's own value.
 	 *
 	 * @var int
 	 */
 	private static int $suspended = 0;
 
 	/**
-	 * Posts inside a save right now ("{blog_id}:{post_id}" => true): from
-	 * `pre_post_update`, the start of `save_post` or the edit-screen referer
-	 * check, until `wp_after_insert_post`. A synced meta write on such a post
-	 * waits for the save instead of syncing on its own.
+	 * Posts inside a save ("{blog_id}:{post_id}" => true), from `pre_post_update`, `save_post` or the edit-screen
+	 * referer check until `wp_after_insert_post`; a synced meta write on one waits for the save.
 	 *
 	 * @var array<string, true>
 	 */
@@ -120,10 +104,9 @@ final class ContentSync {
 	private array $deferred = [];
 
 	/**
-	 * Posts being permanently deleted right now ("{blog_id}:{post_id}" =>
-	 * true), from `before_delete_post` / `delete_attachment` until
-	 * `deleted_post`. Core removes their meta rows one by one on the way out;
-	 * those removals are not edits and reach no sibling.
+	 * Posts being permanently deleted ("{blog_id}:{post_id}" => true), until `deleted_post`.
+	 *
+	 * Core removes their meta rows one by one on the way out; those removals reach no sibling.
 	 *
 	 * @var array<string, true>
 	 */
@@ -137,99 +120,74 @@ final class ContentSync {
 	private bool $shutdown_hooked = false;
 
 	/**
-	 * Posts a person is editing in this request ("{blog_id}:{post_id}" =>
-	 * true): the post's edit screen passed its nonce check, a cookie-signed
-	 * REST write names the post, or a host plugin's own form (ACF, Meta Box)
-	 * passed its nonce check for it. Only a clear made while its post is
-	 * listed here is recorded in the seed-cleared marker.
+	 * Posts a person edits in this request ("{blog_id}:{post_id}" => true): an edit screen's or host form's nonce check
+	 * passed, or a cookie-signed REST write names the post. Only a clear made on a listed post enters the seed-cleared marker.
 	 *
 	 * @var array<string, true>
 	 */
 	private static array $person_edits = [];
 
 	/**
-	 * Siblings a save in this request did not write because the saver may
-	 * not edit them, and that the write would have given a value they do not
-	 * hold ("{blog_id}:{post_id}" of the saved post => sibling id => true);
-	 * see sync_siblings() and skipped_siblings().
+	 * Siblings a save skipped because the saver may not edit them, where the write would have changed a value
+	 * ("{blog_id}:{post_id}" of the saved post => sibling id => true).
 	 *
 	 * @var array<string, array<int, true>>
 	 */
 	private static array $skipped = [];
 
 	/**
-	 * Siblings skipped by a save that is not complete yet, compared once it
-	 * is ("{blog_id}:{post_id}" of the saved post => the instance, the
-	 * comparison's arguments and sibling id => language slug). A save
-	 * through the REST API writes the featured image and meta after
-	 * save_post, so the saved post's values are final only then. See
-	 * note_skip() and run_skip_check().
+	 * Siblings skipped by a save that is not complete yet, compared once it is (run_skip_check()).
+	 *
+	 * A REST save writes the featured image and meta after save_post, so the saved values are final only then.
 	 *
 	 * @var array<string, array{sync: self, fields: array<string>, default: bool, seed: array<string>, siblings: array<int, string>, mark: array<int, true>, saved: array<int, true>}>
 	 */
 	private static array $skip_checks = [];
 
 	/**
-	 * Translations the saves of a post-list bulk action in this request (a
-	 * Bulk Edit) did not write although a value would have changed there
-	 * ("{blog_id}:{sibling_id}" => true, each counted once however many
-	 * edited posts share it); null when no bulk action ran. Its size is
-	 * bounded by the posts of one list screen and their translations. See
-	 * bulk_skipped().
+	 * Translations a Bulk Edit in this request skipped although a value would have changed
+	 * ("{blog_id}:{sibling_id}" => true, each once); null when no bulk action ran. Bounded by one list screen.
 	 *
 	 * @var array<string, true>|null
 	 */
 	private static ?array $bulk_skipped = null;
 
 	/**
-	 * Scheduled posts WordPress is publishing in this request without a
-	 * person ("{blog_id}:{post_id}" => the author id, and the user whose
-	 * rights gate the publish once resolved, 0 for none), from
-	 * `future_to_publish` to the end of that save. See
-	 * note_scheduled_publish() and scheduled_publish_user().
+	 * Scheduled posts WordPress publishes in this request without a person, from `future_to_publish` to the end of
+	 * that save ("{blog_id}:{post_id}" => author id and the resolved gating user, 0 for none).
 	 *
 	 * @var array<string, array{author: int, user: int|null}>
 	 */
 	private static array $scheduled_publishes = [];
 
 	/**
-	 * Posts whose save in this request syncs once it is complete, under the
-	 * rule of a save that clears a stale mark ("{blog_id}:{post_id}" =>
-	 * true): a person's save that clears the post's mark, or a block editor
-	 * meta-box request whose form names a cleared mark; until that save is
-	 * complete and its sync has run (close_save(), sync_cleared()).
+	 * Posts whose save syncs once complete under the clearing rule (close_save(), sync_cleared()): a person's save that
+	 * clears the post's stale mark, or a block editor meta-box request whose form names a cleared mark.
 	 *
 	 * @var array<string, true>
 	 */
 	private static array $clearing = [];
 
 	/**
-	 * The stale mark a person's save in this request clears, as it read at
-	 * the save's `save_post` ("{blog_id}:{post_id}" => mark), until that
-	 * save's sync has run. That sync clears it (settle_stale_mark()), adds
-	 * the pending Sync Fields its row held when deleted, and names it in the
-	 * held-values row it writes (held_mark_id()).
+	 * The stale mark a person's save clears, as read at its `save_post`, until its sync has run.
+	 *
+	 * That sync clears it (settle_stale_mark()), adds its pending fields and names it in the held-values row (held_mark_id()).
 	 *
 	 * @var array<string, array{status: string, at: string, pending: list<string>}>
 	 */
 	private static array $cleared_marks = [];
 
 	/**
-	 * Posts whose stale mark a person's save in this request clears and
-	 * whose content that same save changed while the mark still held its
-	 * "needs update" (keeps_needs_update()), "{blog_id}:{post_id}" => true,
-	 * until that save's sync has run. The changed content then settles the
-	 * link once the mark is cleared (settle_stale_mark()).
+	 * Posts whose clearing save also changed their content while the mark kept "needs update" (keeps_needs_update()).
+	 *
+	 * That content change settles the link once the mark is cleared (settle_stale_mark()).
 	 *
 	 * @var array<string, true>
 	 */
 	private static array $settled_content = [];
 
 	/**
-	 * Held values a block editor meta-box request names
-	 * ("{blog_id}:{post_id}" => field => hash of the value, as in
-	 * SYNC_HELD_META), until that save's sync has run (held_form_save(),
-	 * sync_cleared()).
+	 * Held values a block editor meta-box request names (field => value hash, as in SYNC_HELD_META), until its sync has run.
 	 *
 	 * @var array<string, array<string, string>>
 	 */
@@ -245,26 +203,18 @@ final class ContentSync {
 	private static array $person_rows = [];
 
 	/**
-	 * Meta keys a person's save of a post wrote before it was complete
-	 * ("{blog_id}:{post_id}" => meta key => the key's rows before the first
-	 * write, read from the filled meta cache; true when the rows could not be
-	 * read without a query and a write changed the key; false while such a
-	 * write is not confirmed). False for a post whose filled meta cache shows
-	 * no stale mark: nothing more is noted for it. See
-	 * note_person_write_before().
+	 * Meta keys a person's save wrote before it completed: key => rows before the first write; true when unreadable
+	 * without a query and a write changed it; false until such a write is confirmed (note_person_write_before()).
+	 * False for the whole post when its filled meta cache shows no stale mark.
 	 *
 	 * @var array<string, array<string, array<int|string, mixed>|bool>|false>
 	 */
 	private static array $person_writes = [];
 
 	/**
-	 * Stale marks (SYNC_STALE_META) read in this request, "{blog_id}:{post_id}"
-	 * => the mark as stale_mark() returns it, null for a post with no mark.
-	 * A post's entry is dropped by every write of its mark in this process
-	 * (forget_stale_mark()) and by `clean_post_cache`; a change or delete of
-	 * the mark reads its rows from the table itself (change_stale_mark(),
-	 * delete_stale_mark()).
-	 * Past DEFERRED_CAP posts the oldest entry is dropped.
+	 * Stale marks read in this request (as stale_mark() returns them, null for none).
+	 *
+	 * Dropped on every write of the mark in this process and on `clean_post_cache`; a change or delete reads the table.
 	 *
 	 * @var array<string, array{status: string, at: string, pending: list<string>}|null>
 	 */
@@ -291,15 +241,11 @@ final class ContentSync {
 		// Run after other save_post handlers (priority 20).
 		add_action( 'save_post', [ $this, 'sync_on_save' ], 20, 2 );
 
-		// Sync term-level changes to sibling translations too - without this
-		// only post translations stay in sync while taxonomy term edits
-		// diverge silently.
+		// Term edits sync to the sibling terms too.
 		add_action( 'edited_term', [ $this, 'sync_on_term_edit' ], 20, 3 );
 
-		// The featured image and the site's own Sync Fields meta keys also
-		// change without a post save, or after the save has already run:
-		// set_post_thumbnail(), update_post_meta(), a WooCommerce CRUD save,
-		// REST `featured_media` / `meta`. Each such write syncs that one field.
+		// The featured image and Sync Fields meta also change without a post save or after it (set_post_thumbnail(),
+		// WooCommerce CRUD, REST `featured_media` / `meta`): each such write syncs that one field.
 		add_action( 'added_post_meta', [ $this, 'on_meta_write' ], 10, 3 );
 		add_action( 'updated_post_meta', [ $this, 'on_meta_write' ], 10, 3 );
 		add_action( 'deleted_post_meta', [ $this, 'on_meta_write' ], 10, 3 );
@@ -384,14 +330,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Add one key to a post's seed-cleared marker, or remove it. A key is
-	 * added only while a person is editing the post (is_person_editing());
-	 * an empty written by code, an import, WP-CLI or a background job is not
-	 * recorded, so the seed and machine translation still fill it. A key is
-	 * removed whoever writes a value. Each key is its own row, so writers
-	 * that record different keys at the same time cannot overwrite each
-	 * other; a duplicate row left by two writers of the same key is removed
-	 * with it. Writes only on change.
+	 * Add one key to a post's seed-cleared marker, or remove it; writes only on change.
+	 *
+	 * Added only while a person edits the post, so an empty from code, imports or jobs is still filled by the seed and
+	 * machine translation. One row per key, so concurrent writers of different keys cannot overwrite each other.
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $key     Meta key.
@@ -422,12 +364,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * `add_post_meta`: a tracked key that gets a value is no longer cleared.
-	 * Checked only while the post's meta is cached (an editor or REST save
-	 * reads it first), so a bulk insert pays no marker read per row. An entry
-	 * left on a field that holds a value changes nothing: the seed and machine
-	 * translation leave a value alone. A write on a post a person is editing
-	 * is also noted (note_person_write_before()).
+	 * `add_post_meta`: a tracked key that gets a value leaves the seed-cleared marker.
+	 *
+	 * Checked only while the post's meta is cached, so a bulk insert pays no marker read per row; an entry left on a
+	 * field that holds a value is harmless, as the seed and machine translation leave a value alone.
 	 *
 	 * @param int|mixed    $object_id  Post ID.
 	 * @param string|mixed $meta_key   Meta key.
@@ -445,9 +385,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * `update_post_meta`: a tracked key saved empty after holding a value is
-	 * cleared; saved with a value, it is not. A write on a post a person is
-	 * editing is also noted (note_person_write_before()).
+	 * `update_post_meta`: a tracked key saved empty after holding a value is cleared; saved with a value, it is not.
 	 *
 	 * @param int|mixed    $meta_id    Meta ID (unused).
 	 * @param int|mixed    $object_id  Post ID.
@@ -472,9 +410,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * `delete_post_meta`: a tracked key whose every row is removed while one
-	 * held a value is cleared. A write on a post a person is editing is also
-	 * noted (note_person_write_before()).
+	 * `delete_post_meta`: a tracked key whose every row is removed while one held a value is cleared.
 	 *
 	 * @param int|int[]|mixed $meta_ids  Meta ID(s) being deleted.
 	 * @param int|mixed       $object_id Post ID.
@@ -551,17 +487,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Before a meta write on a post a person is editing (open_person_edit()):
-	 * note the key and its rows as they were before this save first wrote
-	 * it, so that the save of a post marked stale can tell which Sync Fields
-	 * the person changed (changed_in_save()). The rows are read from the
-	 * post's meta cache only while it is filled, which core does before
-	 * update_post_meta() writes; nothing is read when it is empty, and the
-	 * key then counts as changed once a write lands (note_person_write_after()).
-	 * A post whose filled meta cache shows no stale mark, and whose mark this
-	 * request did not clear, is not followed further until it is marked
-	 * (mark_stale()). The sync's own writes, the writes of the mark and the
-	 * held-values row, and every other post read one static array.
+	 * Before a meta write on a post a person edits, note the key's rows from before this save first wrote it (changed_in_save()).
+	 *
+	 * Rows come only from a filled meta cache, never a query; otherwise the key counts as changed once a write lands.
+	 * A post with no stale mark in its filled cache, whose mark this request did not clear, is not followed further.
 	 *
 	 * @param int|mixed    $object_id Post ID.
 	 * @param string|mixed $meta_key  Meta key about to be written.
@@ -603,9 +532,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * After a meta write on a post a person is editing: a key whose earlier
-	 * rows could not be read (note_person_write_before()) counts as changed,
-	 * as core reports a write only when it changed a row.
+	 * After a meta write on a post a person edits: a key whose earlier rows were unread counts as changed.
+	 *
+	 * Core reports a write only when it changed a row.
 	 *
 	 * @param int|mixed    $object_id Post ID.
 	 * @param string|mixed $meta_key  Meta key written.
@@ -624,9 +553,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * `post_updated`: keep the Sync Fields columns of a post a person is
-	 * saving as they were before the save (see changed_in_save()). Every
-	 * other save reads one static array.
+	 * `post_updated`: keep the Sync Fields columns of a post a person saves as they were before the save.
 	 *
 	 * @param int|mixed           $post_id     Post ID (unused).
 	 * @param \WP_Post|mixed|null $post_after  Post after the update (unused).
@@ -654,11 +581,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * Keep the Sync Fields columns of a post as they are now, as the row
-	 * before a save that is about to update it (see changed_in_save()). For
-	 * an editing form whose own nonce check, and so open_person_edit(), comes
-	 * after core's `post_updated` (Meta Box's front-end form): called before
-	 * the form updates the post. The first row kept for a save wins.
+	 * Keep a post's current Sync Fields columns as the row before a save about to update it; the first row kept wins.
+	 *
+	 * For forms whose nonce check, and so open_person_edit(), comes after core's `post_updated` (Meta Box front end).
 	 *
 	 * @param int|string|mixed $post_id Post about to be updated.
 	 * @return void
@@ -702,12 +627,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * The Sync Fields among $fields that a person's save of a post changed:
-	 * a column whose value differs from the one before the save
-	 * (note_person_row()), or a meta key the save wrote whose rows differ
-	 * from those before its first write (note_person_write_before()). Meta
-	 * written by the save itself before `save_post` (`meta_input`, the
-	 * featured image argument) counts as the person's change.
+	 * The Sync Fields among $fields that a person's save of a post changed (columns and meta rows against before the save).
+	 *
+	 * Meta the save writes before `save_post` (`meta_input`, the featured image argument) counts as the person's change.
 	 *
 	 * @param string        $key     State key of the post.
 	 * @param int           $post_id Post ID.
@@ -786,20 +708,16 @@ final class ContentSync {
 	}
 
 	/**
-	 * Mark a post as being saved from its edit screen. The classic editor
-	 * writes custom fields before wp_update_post(), right after this check.
-	 * The block editor's meta-box save passes the same check. A passed check
-	 * also means a person is editing the post. A passed check of the post
-	 * list's bulk actions starts the Bulk Edit count (bulk_skipped()).
+	 * Mark a post as being saved from its edit screen; a passed check also marks a person editing it.
+	 *
+	 * The classic editor writes custom fields right after this check, before wp_update_post().
 	 *
 	 * @param int|string|mixed $action Nonce action being checked.
 	 * @param int|false|mixed  $result Nonce check result: 1 or 2 when valid.
 	 * @return void
 	 */
 	public function open_edit_screen_save( mixed $action = '', mixed $result = false ): void {
-		// The post list's bulk actions pass this check before Bulk Edit saves
-		// its posts: from here on the request counts the translations those
-		// saves skip.
+		// Bulk actions pass this check before Bulk Edit saves its posts: start the skip count (bulk_skipped()).
 		if ( 'bulk-posts' === $action && ( 1 === $result || 2 === $result ) ) {
 			self::$bulk_skipped ??= [];
 			return;
@@ -815,11 +733,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * `rest_request_before_callbacks`: a write request signed by the
-	 * logged-in cookie and its REST nonce (the block editor, and the editor
-	 * panels of SEO and field plugins) marks the post it names as edited by
-	 * a person. Requests authenticated any other way (application passwords
-	 * and other API clients) mark nothing.
+	 * `rest_request_before_callbacks`: a write signed by the login cookie and REST nonce marks the post it names as edited by a person.
+	 *
+	 * Application passwords and other API clients mark nothing.
 	 *
 	 * @param mixed $response Response so far, returned unchanged.
 	 * @param mixed $handler  Route handler (unused).
@@ -841,8 +757,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Mark a post as edited by a person in this request. Called when an
-	 * editing form's own nonce check for the post has passed.
+	 * Mark a post as edited by a person in this request, once an editing form's nonce check for it passed.
 	 *
 	 * @param int|string|mixed $post_id Post ID.
 	 * @return void
@@ -862,11 +777,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * Whether a logged-in person is editing this post right now: an editing
-	 * context marked the post (open_person_edit()), the current user may edit
-	 * it, and this is not a cron run. WP-CLI, imports, background jobs and
-	 * plain code never pass an editing form's nonce check or a cookie-signed
-	 * REST write, so they never mark a post.
+	 * Whether a logged-in person is editing this post: marked by open_person_edit(), editable by them, not cron.
+	 *
+	 * WP-CLI, imports, jobs and plain code never pass an editing nonce or a cookie-signed REST write.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return bool
@@ -880,8 +793,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Record a sibling that a save of $post_id did not write although the
-	 * write would have changed one of its values.
+	 * Record a sibling a save of $post_id skipped although the write would have changed one of its values.
 	 *
 	 * @param int $post_id    Saved post.
 	 * @param int $sibling_id Sibling left as it was.
@@ -902,15 +814,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * A sibling that a save of $post_id did not write because the saver may
-	 * not edit it. It is counted (record_skip()) when the write would have
-	 * changed one of its values, judged against the saved post's values once
-	 * its save is complete. While the save is open, or while a check of that
-	 * post is waiting, the sibling joins that check (run_skip_check(), run
-	 * when the save completes or when the count is read); otherwise it is
-	 * compared now. With $mark, a counted sibling is also marked stale
-	 * (mark_stale()). With $mark_saved, the sibling is the group's original
-	 * and, when it is counted, the saved post is marked stale instead.
+	 * Note a sibling a save of $post_id skipped because the saver may not edit it.
+	 *
+	 * It counts only when the write would have changed one of its values, judged against the saved post's final
+	 * values: while that save is open the sibling waits in its check (run_skip_check()).
 	 *
 	 * @param int           $post_id           Saved post.
 	 * @param int           $sibling_id        Sibling left as it was.
@@ -982,12 +889,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * Compare the siblings a save of a post skipped with that post's values
-	 * as they are now, on the blog of the save, and count each one a write
-	 * would have changed (record_skip()); one the save marks is also marked
-	 * stale (mark_stale()), and a counted original the save did not reach
-	 * marks the saved post stale. One comparison per sibling, from the post
-	 * and meta caches.
+	 * Count each sibling a save skipped that a write would have changed, compared on the save's blog.
+	 *
+	 * Marks counted siblings, or the saved post for an unreached original, stale as noted; reads only the post and meta caches.
 	 *
 	 * @param string $key State key of the saved post.
 	 * @return void
@@ -1038,10 +942,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * How many siblings the saves of a post in this request did not write
-	 * because the saver may not edit them, counting only those that would
-	 * have received a value they do not hold. Read by the save notices. A
-	 * save that has not reported completion is judged as it stands now.
+	 * How many siblings the saves of a post in this request skipped where a write would have changed a value.
+	 *
+	 * Read by the save notices; a save that has not completed is judged as it stands.
 	 *
 	 * @param int $post_id Saved post.
 	 * @return int
@@ -1057,10 +960,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * How many translations the posts saved by a post-list bulk action (a
-	 * Bulk Edit) in this request did not reach, counted as
-	 * skipped_siblings() counts them and each translation once. Null when no
-	 * bulk action ran in this request. Read by the post list's notice.
+	 * How many translations a Bulk Edit in this request did not reach, each once; null when no bulk action ran.
 	 *
 	 * @return int|null
 	 */
@@ -1073,12 +973,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * `rest_request_after_callbacks`: a post write through the core posts
-	 * endpoints (the block editor's save) answers with
-	 * `perflocale_sync_skipped`, the number of translations its Sync Fields
-	 * did not reach although a value would have changed there (0 when none;
-	 * see skipped_siblings()), for a translatable post type. The editor
-	 * keeps the last answer on the post record, so every save answers.
+	 * `rest_request_after_callbacks`: a core posts-endpoint write answers with `perflocale_sync_skipped` (skipped_siblings()).
+	 *
+	 * The editor keeps the last answer on the post record, so every save answers, 0 included.
 	 *
 	 * @param mixed $response Response so far.
 	 * @param mixed $handler  Route handler.
@@ -1112,18 +1009,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * `future_to_publish`: WordPress publishes a scheduled post without a
-	 * person doing it, in a cron run (WP-Cron, a server cron calling
-	 * wp-cron.php, `wp cron event run`) or, outside WP-CLI, in a request of
-	 * nobody logged in or of a user who may not edit the post (a plugin that
-	 * publishes missed schedules during a visitor's page view or a background
-	 * request). That save counts as its author's for the Sync Fields gate,
-	 * exactly as if the author had saved the post, when the author may edit
-	 * it: the author scheduled it, and a save with no user, or by a user who
-	 * may not edit the saved post, is otherwise not gated. See
-	 * scheduled_publish_user(). A person who may edit the post publishing it
-	 * is gated as that person, and a WP-CLI command run outside a cron run
-	 * keeps the operator's ungated write.
+	 * `future_to_publish`: note a scheduled post WordPress publishes without a person (cron, or a visitor's request).
+	 *
+	 * Its Sync Fields are then gated as its author's save (scheduled_publish_user()); a save with no editing user is
+	 * otherwise ungated. A person who may edit the post is gated as that person; WP-CLI outside cron stays ungated.
 	 *
 	 * @param \WP_Post|mixed $post Post being published.
 	 * @return void
@@ -1152,13 +1041,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * The user whose rights gate the Sync Fields of a scheduled post that
-	 * WordPress is publishing without a person (note_scheduled_publish()), 0
-	 * for none; null when this save of the post is not such a publish. By
-	 * default the author, when the author may edit the post, and otherwise
-	 * none: a post a Contributor wrote and an Editor scheduled still mirrors
-	 * to the whole group when it goes live. Resolved once per publish, the
-	 * first time the publish syncs.
+	 * The user gating a scheduled publish without a person, 0 for none; null when this save is not one.
+	 *
+	 * Default: the author when the author may edit the post, else 0, so a Contributor's post an Editor scheduled still
+	 * mirrors to the whole group. Resolved once per publish.
 	 *
 	 * @param int $post_id Post being published.
 	 * @return int|null
@@ -1179,22 +1065,16 @@ final class ContentSync {
 		$default = $author > 0 && \PerfLocale\Helper::user_can_edit_object( $post_id, $author ) ? $author : 0;
 
 		/**
-		 * Filters the user whose rights gate the Sync Fields of a scheduled
-		 * post that WordPress publishes without a person: in a cron run, or
-		 * outside WP-CLI in a request of nobody logged in or of a user who
-		 * may not edit the post. The publish then writes Sync Fields, and a
-		 * changed post password, only to the translations this user may edit,
-		 * as a save by that user would; 0 writes them to every translation. Runs once per such publish that syncs Sync Fields or
-		 * copies a changed password: not for a post without translations or
-		 * opted out of sync, and for Sync Fields not for a post marked stale.
-		 * A return that is not an integer of 0 or more leaves the default.
+		 * Filters the user whose rights gate the Sync Fields of a scheduled post WordPress publishes without a person.
+		 *
+		 * Sync Fields and a changed password then reach only the translations this user may edit; 0 reaches every one.
+		 * Runs once per such publish that syncs; a return that is not an integer of 0 or more keeps the default.
 		 *
 		 * @hook  perflocale/sync/scheduled_publish_user
 		 * @since 1.0.7.1
 		 *
 		 * @param int $user_id User whose rights gate the publish, 0 for none.
-		 *                     Default: the post author when the author may
-		 *                     edit the post, otherwise 0.
+		 *                     Default: the author when the author may edit the post, otherwise 0.
 		 * @param int $post_id Post being published.
 		 */
 		$user = self::user_id_or( apply_filters( 'perflocale/sync/scheduled_publish_user', $default, $post_id ), $default );
@@ -1232,10 +1112,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * A post's save is complete: run the sync of a save that cleared the
-	 * post's stale mark (sync_cleared()), or sync the writes that waited for
-	 * it, then compare the siblings the save skipped with the post's final
-	 * values.
+	 * A post's save is complete: run its clearing sync or the writes that waited for it, then its skip check.
 	 *
 	 * @param int|mixed           $post_id Post ID.
 	 * @param \WP_Post|mixed|null $post    Post object.
@@ -1284,43 +1161,11 @@ final class ContentSync {
 	}
 
 	/**
-	 * `wp_after_insert_post`: when the post password of a group's
-	 * default-language member is set, changed or removed, each translation
-	 * that held the previous password gets the new one.
+	 * `wp_after_insert_post`: a changed password of a group's default-language member reaches each translation holding the old one.
 	 *
-	 * A translation is the same page in another language, so the password
-	 * that protects the source protects it too: a new translation copies the
-	 * source's password (PostTranslationManager::create_translation()), and
-	 * this keeps it in step afterwards, whatever the Sync Fields list holds.
-	 * Like Page Parent and the seed-only keys it travels only from the
-	 * default-language member, and like the seed-only keys a translation
-	 * keeps a value of its own: a translation whose password differs from
-	 * the source's previous one is left alone, and so is a private one (core
-	 * stores no password for a private post). A source that is now private is
-	 * skipped for the same reason: its password was emptied by its status,
-	 * not removed. The sync opt-out applies on both sides. A save that keeps
-	 * the password returns after one string comparison.
-	 *
-	 * The Sync Fields rule on who may write a translation applies
-	 * (write_gate()): a save by a logged-in user who may edit the source
-	 * writes only the translations that user may edit, and a scheduled post
-	 * WordPress publishes without a person is judged by the user
-	 * scheduled_publish_user() names. A translation skipped this way keeps
-	 * its password, which then differs from the source's, so later changes of
-	 * the source's password leave it alone too, until its password is the
-	 * source's again. It is not marked stale (SYNC_STALE_META) and not
-	 * counted for the save notice: both concern Sync Fields, which a
-	 * translation's save can copy to its group, while a translation's
-	 * password never leaves it. The rights are checked only when the
-	 * password changed: once for the source and once per translation that
-	 * held the previous password.
-	 *
-	 * The translation is written with wp_update_post(), so its save hooks
-	 * (cache purges included) run, and only its password and its modified
-	 * dates change. Its
-	 * lock is taken when free, so that save starts no sync of its own; a
-	 * translation another request is syncing is still written, as that sync
-	 * does not carry the password.
+	 * A translation with its own password or a private one is left alone, as is a private source (core empties its
+	 * password); the write gate applies. A skipped translation is neither marked stale nor counted: its password never
+	 * leaves it. See docs-ai/11-code-rationale.md, "ContentSync: post password".
 	 *
 	 * @param int|mixed           $post_id     Post ID.
 	 * @param \WP_Post|mixed|null $post        Post object after the save.
@@ -1385,9 +1230,7 @@ final class ContentSync {
 			try {
 				++self::$writing;
 
-				// wp_update_post() expects slashed input. An empty page_template
-				// leaves the stored template alone: one the theme no longer has
-				// would stop the save before its hooks.
+				// Slashed input. An empty page_template keeps the stored one: a template missing from the theme stops the save.
 				$result = wp_update_post(
 					[
 						'ID'            => $translated_id,
@@ -1413,21 +1256,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Keep every column of a post but the given ones and its modified dates
-	 * as stored in its next wp_update_post() call.
+	 * Keep every column of a post but $columns and its modified dates as stored in its next wp_update_post() call.
 	 *
-	 * The update merges the stored row and runs it through the saving user's
-	 * filters (KSES rewrites the content, title and excerpt for a user
-	 * without unfiltered_html), resets a draft's date and publishes a
-	 * scheduled post whose date has passed. For the first update of this
-	 * post after this call, every column outside $columns is written back as
-	 * stored, except post_modified and post_modified_gmt: the write moves
-	 * them as any save does, so sitemaps, caches and REST modified_after
-	 * queries see the change. The save and its hooks run as usual, so cache
-	 * purges run. The caller passes an empty page_template with the update,
-	 * so a stored template the theme no longer has does not stop the save
-	 * before its hooks, and removes the filter with the returned callable in
-	 * `finally`.
+	 * The update would otherwise run the row through the saver's filters (KSES), reset a draft's date and publish a
+	 * past-due scheduled post. The modified dates move so sitemaps, caches and REST modified_after see the change.
 	 *
 	 * @param \WP_Post           $post    The post as stored.
 	 * @param array<int, string> $columns Columns the update writes.
@@ -1469,9 +1301,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Mark a post as being permanently deleted. Writes that were waiting for
-	 * its save, and the check of the siblings it skipped, are dropped with
-	 * it.
+	 * Mark a post as being permanently deleted; its waiting writes and skip check are dropped.
 	 *
 	 * @param int|mixed $post_id Post ID.
 	 * @return void
@@ -1518,10 +1348,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Run the deferred syncs whose save never reported completion (a caller
-	 * that inserted with `$fire_after_hooks = false` and did not fire
-	 * wp_after_insert_post itself), the sync of a save that cleared a stale
-	 * mark included.
+	 * Run the deferred and clearing syncs whose save never completed (an insert with `$fire_after_hooks = false`).
 	 *
 	 * @return void
 	 */
@@ -1576,9 +1403,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * The sync field a post-meta key stands for when the site's Sync Fields
-	 * setting lists it: `featured_image` for `_thumbnail_id`, or the key
-	 * itself for a custom meta key. Null for every other key.
+	 * The Sync Field a meta key stands for when Sync Fields lists it (`featured_image` for `_thumbnail_id`), else null.
 	 *
 	 * @param string $meta_key Meta key written.
 	 * @return string|null
@@ -1603,10 +1428,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Meta writes made until resume_meta_write_sync() start no sync: each
-	 * post keeps the value written to it, and no sibling is written or
-	 * marked stale. Calls nest. Used by the data import, whose own writes
-	 * carry the file's values (DataImporter).
+	 * Meta writes until resume_meta_write_sync() reach no sibling and mark nothing stale; calls nest (DataImporter).
 	 *
 	 * @return void
 	 */
@@ -1626,13 +1448,8 @@ final class ContentSync {
 	/**
 	 * Sync one field after a post-meta write that no post save covers.
 	 *
-	 * Only the featured image and the custom meta keys in the site's Sync
-	 * Fields setting are followed, with full mirror semantics, exactly as a
-	 * save of that post would write them. Seed-only keys are left to the
-	 * next save. The sync's own writes to siblings, everything written
-	 * while a translation is being created, the meta removed with a
-	 * deleted post and writes made during a page view start nothing. Any
-	 * write of a stale mark drops that post's read mark (forget_stale_mark()).
+	 * Only the featured image and Sync Fields meta keys, mirrored as a save would write them; seed-only keys wait for
+	 * the next save. The sync's own writes, translation creation, a post's delete and page views start nothing.
 	 *
 	 * @param int|int[]|mixed $meta_ids  Meta ID(s) written (unused).
 	 * @param int|mixed       $object_id Post ID.
@@ -1759,12 +1576,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * A post's stale mark (SYNC_STALE_META): the link status it restores,
-	 * the link's write time it was set at ('' when not known) and the Sync
-	 * Fields a person's save changed while it could not clear the mark
-	 * (keep_pending_changes()), or null when the post is not marked. Read
-	 * once per request from the post's meta cache, then from the marks read
-	 * in this request ($stale_marks).
+	 * A post's stale mark (status to restore, link write time at marking, pending fields), or null when unmarked.
+	 *
+	 * Read once per request from the post's meta cache, then from $stale_marks.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return array{status: string, at: string, pending: list<string>}|null
@@ -1786,9 +1600,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Drop a post's read stale mark (stale_mark()) on the current blog, or
-	 * every read mark when no post is given: its next read reads the meta
-	 * cache.
+	 * Drop a post's read stale mark on the current blog, or every read mark for post 0.
 	 *
 	 * @param int $post_id Post ID, 0 for every post.
 	 * @return void
@@ -1802,8 +1614,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * `clean_post_cache`: a post whose caches core drops reads its stale mark
-	 * again.
+	 * `clean_post_cache`: a post whose caches core drops reads its stale mark again.
 	 *
 	 * @param int|mixed $post_id Post ID.
 	 * @return void
@@ -1815,10 +1626,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * A post's stale mark as the post's meta cache holds it (stale_mark()).
-	 * Read straight from that cache when core has loaded it (the edit screen
-	 * and a save load it first): the key is private, so no `get_post_metadata`
-	 * filter runs for it. Otherwise read with get_post_meta(), which loads it.
+	 * A post's stale mark as its meta cache holds it.
+	 *
+	 * A loaded cache is read directly: the key is private, so no `get_post_metadata` filter needs to run for it.
 	 *
 	 * @param int $post_id Post ID.
 	 * @return array{status: string, at: string, pending: list<string>}|null
@@ -1859,9 +1669,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Set the link status and write time a post's stale mark stores, keeping
-	 * the Sync Fields it holds as pending (change_stale_mark()). A post with
-	 * no mark is left unmarked.
+	 * Set the link status and write time a post's stale mark stores, keeping its pending fields; never adds a mark.
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $status  Link status the mark restores.
@@ -1887,27 +1695,15 @@ final class ContentSync {
 	/**
 	 * Change a post's stale mark with a compare-and-set on its row.
 	 *
-	 * The mark's row is read from the table, $transform gives the mark after
-	 * the change, and the UPDATE matches only while the row (its meta_id)
-	 * still holds exactly the value read. So a change another request made
-	 * in between, such as a Sync Field it kept as pending
-	 * (keep_pending_changes()), is not overwritten: the row is read again and
-	 * $transform applied to it again, for as long as each missed write is
-	 * explained by a row that changed (up to STALE_MARK_ROUNDS). A row read
-	 * again unchanged after a missed write is one the compare-and-set cannot
-	 * match (its stored bytes differ from the value read), so the change
-	 * stops there. Nothing is ever inserted: once the mark's row is gone (the
-	 * mark was cleared), the post stays unmarked. The post's meta cache is
-	 * dropped, and after a write the posts last_changed stamp is renewed, as
-	 * update_post_meta() does.
+	 * A change another request made in between (a pending field) is never overwritten: the row is read and transformed
+	 * again. Nothing is inserted, so a cleared mark stays cleared.
+	 * See docs-ai/11-code-rationale.md, "ContentSync: stale mark compare-and-set".
 	 *
 	 * @param int      $post_id   Post ID.
 	 * @param callable $transform Given the mark as read, returns the mark after the change, or null
 	 *                            when nothing is to change.
 	 * @phpstan-param callable(array{status: string, at: string, pending: list<string>}): (array{status: string, at: string, pending: list<string>}|null) $transform
-	 * @return bool True once the row holds the changed mark, or nothing had
-	 *              to change; false when the post has no mark, the row cannot
-	 *              be matched, the write failed or the rounds ran out.
+	 * @return bool True once the row holds the changed mark or nothing had to change; false otherwise.
 	 */
 	private static function change_stale_mark( int $post_id, callable $transform ): bool {
 		global $wpdb;
@@ -2016,15 +1812,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Mark a translation as stale (SYNC_STALE_META) and set its translation
-	 * link to "needs update". The mark stores the status the link read and
-	 * the link's write time after the mark. The link is written with a
-	 * compare-and-set on the status read from the cached links; when another
-	 * write reached the link first, its stored status is read again: a link
-	 * that now reads "needs update" (a content flag) is left as it is and the
-	 * mark stores that, any other status is stored and the link set to
-	 * "needs update" over it. A link that keeps changing under the mark is
-	 * set to "needs update" and the mark restores nothing.
+	 * Mark a translation stale and set its link to "needs update"; the mark stores the status read and the new write time.
+	 *
+	 * The link write is a compare-and-set on the cached status: a content flag that landed first stays and the mark
+	 * stores it; a link that keeps changing gets "needs update" and the mark restores nothing.
 	 *
 	 * @param int $post_id Translation whose Sync Fields differ from its group's.
 	 * @return void
@@ -2122,19 +1913,14 @@ final class ContentSync {
 	}
 
 	/**
-	 * Clear a post's stale mark and give its translation link back the status
-	 * the mark stored, while the link still reads "needs update" and was not
-	 * written since the mark (its write time is still the mark's). A link
-	 * written since, as a content change of the group's original does, keeps
-	 * "needs update"; so does one whose mark has no known write time. The
-	 * mark's rows are deleted with a compare-and-set (delete_stale_mark()), and
-	 * the link is given its status back only when this call deleted a row: a
-	 * mark another request cleared first had its link restored there.
+	 * Clear a post's stale mark and restore its link's stored status while the link still holds the mark's write time.
+	 *
+	 * A link written since (a content change of the original) keeps "needs update". The status is restored only when
+	 * this call deleted a row: a request that cleared the mark first restored it there.
 	 *
 	 * @param int                                                      $post_id Post ID.
 	 * @param array{status: string, at: string, pending: list<string>} $mark    The post's stale mark.
-	 * @return list<string> The Sync Fields the deleted rows kept as pending
-	 *                      changes, as they held them when deleted.
+	 * @return list<string> The Sync Fields the deleted rows kept as pending.
 	 */
 	private static function clear_stale( int $post_id, array $mark ): array {
 		$pending = self::delete_stale_mark( $post_id );
@@ -2162,23 +1948,12 @@ final class ContentSync {
 	/**
 	 * Delete a post's stale mark rows with a compare-and-set on each row.
 	 *
-	 * The rows are read from the table and each is deleted only while it
-	 * (its meta_id) still holds exactly the value read. A row another request
-	 * changed in between, such as one a save refused the post's lock added a
-	 * pending Sync Field to (keep_pending_changes()), is read again and its
-	 * pending fields are returned too, for as long as each missed delete is
-	 * explained by a row that changed (up to STALE_MARK_ROUNDS). A row read
-	 * again unchanged after a missed delete is one the compare-and-set cannot
-	 * match (its stored bytes differ from the value read): it is deleted by
-	 * meta_id, holding what was read. A row still changing when the rounds
-	 * run out is left with the mark, for the next clearing save. The post's
-	 * meta cache is dropped, and after a delete the posts last_changed stamp
-	 * is renewed, as delete_post_meta() does.
+	 * A row changed in between (a pending field) is read again so its pending fields are returned too; a row still
+	 * changing when the rounds run out stays for the next clearing save.
+	 * See docs-ai/11-code-rationale.md, "ContentSync: stale mark compare-and-set".
 	 *
 	 * @param int $post_id Post ID.
-	 * @return list<string>|null The Sync Fields the deleted rows kept as
-	 *                           pending, or null when no row was deleted
-	 *                           (the post had no mark).
+	 * @return list<string>|null The pending Sync Fields of the deleted rows, or null when none was deleted.
 	 */
 	private static function delete_stale_mark( int $post_id ): ?array {
 		global $wpdb;
@@ -2242,15 +2017,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Clear the stale mark a person's save clears (person_save_clears_stale()),
-	 * as it read at that save's `save_post`, and give the translation link
-	 * back the status the mark stored (clear_stale()). The pending Sync
-	 * Fields the deleted rows held are added to the mark this save clears,
-	 * so its sync copies them too (sync_cleared()). When the same save
-	 * changed the post's content while the mark held its "needs update"
-	 * (keeps_needs_update()), that change then settles the link as it does
-	 * on any translation whose content changed: a link that still reads
-	 * "needs update" becomes published (ContentChangeDetector).
+	 * Clear the stale mark a person's save clears and restore the link's stored status (clear_stale()).
+	 *
+	 * Pending fields of the deleted rows join this save's sync. A content change by the same save then settles the
+	 * link as on any changed translation: "needs update" becomes published (ContentChangeDetector).
 	 *
 	 * @param int $post_id Post saved.
 	 * @return void
@@ -2263,11 +2033,8 @@ final class ContentSync {
 			return;
 		}
 
-		// A Sync Field a save refused the post's lock kept with the mark after
-		// this save read it (keep_pending_changes()) is read from the row it
-		// deletes and counts as changed by this save too (sync_cleared()).
-		// That save wrote the post after this one loaded it, so the post's
-		// caches are dropped and its values are copied as the row holds them.
+		// A field a lock-refused save added to the mark after this save read it counts as changed here too.
+		// That save wrote the post after this one loaded it, so the post's caches are dropped.
 		$pending = array_values( array_unique( array_merge( $mark['pending'], self::clear_stale( $post_id, $mark ) ) ) );
 
 		if ( $pending !== $mark['pending'] ) {
@@ -2289,14 +2056,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * Whether the save of a post marked stale (SYNC_STALE_META) must copy
-	 * none of its Sync Fields, as its values are older than its group's: a
-	 * save from cron, WP-CLI, an import or a background job, from code
-	 * acting for a logged-in user, or from a person who may not edit the
-	 * group's original. A person's save that clears the mark
-	 * (person_save_clears_stale()) syncs once it is complete and is not held
-	 * back: its sync clears the mark (sync_cleared(), settle_stale_mark()).
-	 * The mark is read once per request (stale_mark()).
+	 * Whether the save of a post marked stale must copy none of its Sync Fields, its values being older than the group's.
+	 *
+	 * A person's clearing save (person_save_clears_stale()) is not held back: it syncs once complete.
 	 *
 	 * @param int $post_id Post being saved.
 	 * @return bool
@@ -2306,20 +2068,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Whether a person's save of a post clears its stale mark
-	 * (SYNC_STALE_META): a person saves it from an editing screen
-	 * (is_person_editing()) and may also edit the group's original, and the
-	 * post's row as it was before the save is known (note_person_row(),
-	 * note_pre_save_row()). In a group without a default-language member,
-	 * the person must be able to edit every other member. Otherwise the mark
-	 * stays and the save copies none of the post's Sync Fields. The mark is
-	 * not cleared here: the
-	 * save's sync clears it once nothing can stop that sync, after it took
-	 * the post's lock (run_sync(), settle_stale_mark()), so a sync that
-	 * cannot run leaves the mark and the link status as they are. The save
-	 * of an opted-out post, of a post alone in its group, of a type no longer
-	 * translatable or with an empty Sync Fields list clears the mark too. Any
-	 * other save reads one static array.
+	 * Whether a person's save of a post clears its stale mark.
+	 *
+	 * The person saves from an editing screen, may edit the group's original and the pre-save row is known. The save's
+	 * sync clears the mark only once nothing can stop it (settle_stale_mark()), so a sync that cannot run leaves both.
 	 *
 	 * @param int $post_id Post being saved.
 	 * @return bool Whether the save clears the mark; its sync then runs once
@@ -2368,10 +2120,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * `block_editor_meta_box_hidden_fields`: the block editor's meta-box form
-	 * of a translation marked stale names the mark. Its meta boxes show the
-	 * translation's values from before the save that will clear the mark,
-	 * and core posts that form after each save from the page.
+	 * `block_editor_meta_box_hidden_fields`: the meta-box form of a translation marked stale names the mark.
+	 *
+	 * Core posts that form after each save, with the values from before the save that clears the mark.
 	 *
 	 * @param \WP_Post|mixed $post Post being edited.
 	 * @return void
@@ -2389,14 +2140,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * Whether a person's save of a post is a block editor meta-box request
-	 * whose form was rendered under the stale mark that an earlier save
-	 * cleared: the form names the mark (render_held_field()) and the post's
-	 * held-values row (SYNC_HELD_META) was written when that mark was
-	 * cleared. Its values are kept for the save's sync (sync_cleared()), in
-	 * which a Sync Field the form sends back with the value the row holds
-	 * counts as unchanged. Any other save reads one static array, and a
-	 * person's save whose form names no mark reads no more.
+	 * Whether a person's save is a block editor meta-box request rendered under a mark an earlier save cleared.
+	 *
+	 * Its held values go to the save's sync, where a field sent back with its held value counts as unchanged.
 	 *
 	 * @param int $post_id Post being saved.
 	 * @return bool
@@ -2443,10 +2189,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * A Sync Field's value on a post, as the held-values row stores it: a
-	 * hash of the value, labelled with its algorithm (HELD_HASH), of a post
-	 * column as a string or a meta key (the featured image as
-	 * `_thumbnail_id`) as its rows, serialized. Only equality is asked of it.
+	 * A Sync Field's value on a post as the held-values row stores it: a labelled hash of the column or serialized rows.
+	 *
+	 * Only equality is asked of it.
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $field   Sync Field.
@@ -2490,20 +2235,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Whether a translation keeps its "needs update" status because it is
-	 * marked stale (SYNC_STALE_META). Asked by ContentChangeDetector before it
-	 * clears that status after the translation's content changed: the mark
-	 * keeps it until a person's save clears the mark
-	 * (person_save_clears_stale()). The changed content settles every
-	 * content flag up to the link's last write: a mark that stored "needs
-	 * update" now restores the published status, and the mark takes the
-	 * link's write time, so the person's save restores its status unless a
-	 * content change of the original flags the translation again. When the
-	 * save that changed the content is itself a person's save that clears
-	 * the mark, its sync settles the link once the mark is cleared
-	 * (settle_stale_mark()).
+	 * Whether a translation keeps "needs update" because it is marked stale; asked by ContentChangeDetector.
 	 *
-	 * The link's write time is read from the table, for a marked post only.
+	 * The content change still settles every flag up to the link's last write: the mark's stored "needs update" becomes
+	 * published and it takes the link's write time, so only a later content change of the original keeps the flag.
 	 *
 	 * @param int $post_id Translation whose content changed.
 	 * @return bool
@@ -2556,25 +2291,12 @@ final class ContentSync {
 	/**
 	 * Whether a post is the DEFAULT-language member of its translation group.
 	 *
-	 * Hierarchy is authored in the default language and mirrored outward:
-	 * `post_parent` may only travel from the group's default-language member
-	 * to its translations, never back. A translation is created parentless
-	 * whenever its parent has no translation yet, so letting one push its own
-	 * `post_parent` up the group would move the published SOURCE to the site
-	 * root on the translation's first save - silently changing the source's
-	 * live URL. Nothing records a redirect for a re-parented post (the
-	 * slug-redirect map holds renamed LANGUAGE slugs only), so every inbound
-	 * link and search result for the old URL dies. The term side takes the
-	 * same decision in sync_on_term_edit(). Seed-only meta keys and the
-	 * publish date travel the same one way.
+	 * Only that member moves `post_parent`, the publish date and seed-only keys: a parentless translation would move
+	 * the source to the root and change its live URL with no redirect (docs-ai/04-do-not-fix.md 2.16).
 	 *
 	 * @param int                $post_id      Post being saved.
 	 * @param array<string, int> $translations language_slug => post_id map for the group.
-	 * @return bool True when the post is the group's default-language member,
-	 *              or when no default language is configured - on a
-	 *              half-set-up site there is nothing to compare against, so
-	 *              the previous behaviour is kept rather than silently
-	 *              freezing the feature.
+	 * @return bool True when the post is the group's default-language member, or when no default language is set.
 	 */
 	private function is_default_language_post( int $post_id, array $translations ): bool {
 		$plugin = \PerfLocale\Plugin::get_instance();
@@ -2590,19 +2312,12 @@ final class ContentSync {
 			return true;
 		}
 
-		// A group whose default-language member is missing entirely (source
-		// hard-deleted, translations still linked) has no authority to copy
-		// hierarchy from, so nothing moves - the same conclusion as "this
-		// post is a translation".
+		// A group without its default-language member (source deleted) has no hierarchy to copy: nothing moves.
 		return ( $translations[ $default_slug ] ?? 0 ) === $post_id;
 	}
 
 	/**
-	 * Whether a post's date floats: a status core gives no fixed date (a
-	 * draft, a pending post) and no GMT date stored. Core sets such a post's
-	 * date to the current time on each save until a date is given. Also
-	 * read when a translation is created
-	 * (PostTranslationManager::do_create_translation()).
+	 * Whether a post's date floats: a date_floating status (draft, pending) and no GMT date, so core restamps each save.
 	 *
 	 * @param \WP_Post $post Post.
 	 * @return bool
@@ -2616,16 +2331,11 @@ final class ContentSync {
 	 * Synchronize configured fields when a post is saved.
 	 *
 	 * @param int           $post_id Post ID.
-	 * @param \WP_Post|null $post    Post object; null when core re-read the row after
-	 *                               the write and found it gone, or when a third
-	 *                               party re-fires save_post with one argument.
+	 * @param \WP_Post|null $post    Post object; null when the row is gone or save_post fired with one argument.
 	 * @return void
 	 */
 	public function sync_on_save( int $post_id, ?\WP_Post $post = null ): void {
-		// WordPress re-reads the row after the write and hands the hook
-		// whatever it got, which is null when the post was deleted in the
-		// interim; some plugins also fire save_post with one argument. A
-		// non-nullable hint turned either into an uncaught TypeError.
+		// Core hands over its re-read row, null when the post was deleted meanwhile; some plugins pass one argument.
 		if ( ! $post instanceof \WP_Post ) {
 			return;
 		}
@@ -2635,11 +2345,8 @@ final class ContentSync {
 		$key = $this->state_key( $post_id );
 		unset( $this->deferred[ $key ] );
 
-		// A person's save that clears the post's stale mark syncs once the
-		// save is complete, when every write it makes has landed (the REST
-		// API writes the featured image and meta after save_post); that sync
-		// clears the mark. So does a block editor meta-box request whose form
-		// shows the values such a save replaced (held_form_save()).
+		// A clearing save, or a meta-box request showing held values, syncs once the save is complete: REST writes
+		// the featured image and meta after save_post.
 		if ( $this->person_save_clears_stale( $post_id ) || $this->held_form_save( $post_id ) ) {
 			if ( ! isset( self::$clearing[ $key ] ) && count( self::$clearing ) >= self::DEFERRED_CAP ) {
 				$this->run_deferred( (string) array_key_first( self::$clearing ) );
@@ -2668,18 +2375,11 @@ final class ContentSync {
 	 * @return void
 	 */
 	private function run_sync( int $post_id, \WP_Post $post, ?array $only, bool $clearing = false ): void {
-		// The sync of a person's save that clears the post's stale mark
-		// (person_save_clears_stale()) clears it once nothing can stop that
-		// sync: when a check below ends it before any write, or once the
-		// post's lock is taken. While another request holds the lock, the
-		// mark and the link status stay as they are, so the post's older
-		// values stay held back from the group, and the Sync Fields the save
-		// changed are kept with the mark (keep_pending_changes()).
+		// A clearing sync clears the mark once nothing can stop it: a check below ends it, or the lock is taken.
+		// While another request holds the lock the mark stays and the changed fields join it (keep_pending_changes()).
 		$settle = $clearing && isset( self::$cleared_marks[ $this->state_key( $post_id ) ] );
 
-		// The service is registered on every blog so a request that switches
-		// blogs syncs there; a blog with an empty Sync Fields list syncs
-		// nothing.
+		// Registered on every blog so a request that switches blogs syncs there; empty Sync Fields sync nothing.
 		if ( empty( (array) $this->settings->get( 'sync_fields', [] ) ) || ! $this->may_sync( $post_id, $post, $only, $settle ) ) {
 			if ( $settle ) {
 				self::settle_stale_mark( $post_id );
@@ -2705,9 +2405,7 @@ final class ContentSync {
 				self::settle_stale_mark( $post_id );
 			}
 
-			// Merge addon-contributed meta keys so builder layouts
-			// (Elementor/Bricks/Oxygen/etc.) propagate across siblings
-			// without the user having to add each key manually in settings.
+			// Addon translatable keys (builder layouts among them) join the site's Sync Fields.
 			$addon_keys  = $this->settings->get_translatable_meta_keys( $post->post_type );
 			$sync_fields = array_values( array_unique( array_merge( $user_fields, $addon_keys ) ) );
 
@@ -2722,11 +2420,9 @@ final class ContentSync {
 			$before_for_post = $sync_fields;
 
 			/**
-			 * Expand per-post dynamic meta keys the post-type-scoped list above
-			 * can't enumerate - e.g. ACF repeater / flexible-content rows, whose
-			 * key set depends on each post's actual row count (the static field
-			 * list only knows row 0). Addons receive the SOURCE post id so they
-			 * can read its real row structure and add the remaining rows' keys.
+			 * Expand per-post meta keys the post-type list cannot enumerate, such as ACF repeater rows past row 0.
+			 *
+			 * Receives the source post id so an addon can read its real row structure.
 			 *
 			 * @hook perflocale/sync_fields/for_post
 			 * @param array<int, string> $sync_fields Meta keys to sync.
@@ -2739,28 +2435,11 @@ final class ContentSync {
 			}
 
 			/**
-			 * Meta keys that keep FULL MIRROR semantics: every source save
-			 * overwrites the sibling's rows, and a delete on the source clears
-			 * the siblings. Defaults to the user-configured `sync_fields` list.
+			 * Meta keys that keep FULL MIRROR semantics: a save overwrites the siblings' rows and a delete clears them.
 			 *
-			 * ⚠️ NOTHING THAT CARRIES TRANSLATABLE TEXT BELONGS ON THIS LIST.
-			 * The mirror below is BIDIRECTIONAL - any group member's save
-			 * propagates to the rest - so a key holding words is destroyed in
-			 * both directions: the translator saves and overwrites the source,
-			 * then the next source save overwrites the translation.
-			 *
-			 * Page-builder layout documents hold their text inside them, so they
-			 * are seed-only; only text-free builder keys (Beaver's
-			 * `_fl_builder_enabled`, Oxygen's `_ct_page_settings` and its
-			 * legacy `ct_page_settings`) mirror.
-			 * Pinned by builder-layout-ownership.php.
-			 *
-			 * Every other addon-contributed "translatable" key (SEO titles/
-			 * descriptions, ACF/Meta Box/Pods field values, WooCommerce
-			 * purchase notes) is SEED-ONLY: copied to a sibling that does not
-			 * have the key yet, then owned by the sibling's translator - a
-			 * source save never overwrites or deletes a per-language value the
-			 * translator typed on the translation.
+			 * ⚠️ Never list a key that holds translatable text: the mirror is bidirectional, so a translator's save
+			 * overwrites the source. Other addon translatable keys are seed-only.
+			 * See docs-ai/11-code-rationale.md, "ContentSync: mirror and seed-only keys".
 			 *
 			 * @hook  perflocale/sync/mirror_meta_keys
 			 * @since 1.0.0
@@ -2770,11 +2449,8 @@ final class ContentSync {
 			 */
 			$mirror_keys = (array) apply_filters( 'perflocale/sync/mirror_meta_keys', $user_fields, $post->post_type );
 
-			// Seed-only = addon translatable keys + per-post expansions (ACF
-			// repeater rows derive from translatable parents), minus anything
-			// explicitly declared mirror. Keys added via the public
-			// `perflocale/sync_fields` filter stay mirror (documented as
-			// "fields synced across translations").
+			// Seed-only: addon translatable keys plus per-post expansions, minus mirror keys.
+			// Keys added through `perflocale/sync_fields` stay mirror.
 			$seed_only = array_values(
 				array_diff(
 					array_unique( array_merge( $addon_keys, array_diff( $sync_fields, $before_for_post ) ) ),
@@ -2788,11 +2464,8 @@ final class ContentSync {
 				return;
 			}
 
-			// Seed-only keys whose name marks a credential never travel, by the
-			// same patterns that keep them out of a new translation's copy. They
-			// leave the synced set entirely: dropped from $seed_only alone they
-			// would fall through to the bidirectional mirror. Mirror keys are
-			// the site's explicit choice and are not gated.
+			// Seed-only keys named like credentials never travel; they leave the whole synced set, since dropped from
+			// $seed_only alone they would fall through to the mirror. Mirror keys are the site's choice and not gated.
 			if ( $seed_only !== [] ) {
 				$patterns = PostTranslationManager::sensitive_meta_patterns();
 				$denied   = [];
@@ -2813,9 +2486,7 @@ final class ContentSync {
 				}
 			}
 
-			// Resolved once per save (not once per sibling) and honoured by
-			// the post_parent and seed-only branches of sync_fields_to_post();
-			// every other synced field is bidirectional.
+			// Once per save: post_parent, the publish date and seed-only keys honour it; other fields are bidirectional.
 			$is_default_source = $this->is_default_language_post( $post_id, $translations );
 
 			if ( $clearing ) {
@@ -2846,10 +2517,7 @@ final class ContentSync {
 			return false;
 		}
 
-		// ⚠️ Templates are not content. sync_fields (post_parent, menu_order,
-		// featured image) are meaningless for them, and this fires on EVERY
-		// Site Editor save - acquiring two locks and walking the group - which
-		// is pure overhead on the hottest editing path in a block theme.
+		// Templates are not content, and this runs on every Site Editor save: stop before any lock.
 		if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $post->post_type ) ) {
 			return false;
 		}
@@ -2867,19 +2535,13 @@ final class ContentSync {
 			return false;
 		}
 
-		// Symmetric opt-out: a flagged post pushes nothing. The mirror is
-		// bidirectional (any group member's save propagates group-wide), so
-		// a one-sided target check would let a deliberately diverged
-		// translation clobber its siblings on its own next save.
+		// Symmetric opt-out: the mirror is bidirectional, so an opted-out translation must not push to its group either.
 		if ( $this->is_sync_opted_out( $post_id ) ) {
 			return false;
 		}
 
-		// A save of a post with no translations has nothing to reach either:
-		// answered from the same cached group, after the opt-out so that an
-		// opted-out post reads nothing. A save the sync makes itself (a
-		// sibling write, a password copy) skips this read: the lock run_sync()
-		// takes is already held for that post, so the save stops there.
+		// A save of a post with no translations reaches nothing; read after the opt-out so an opted-out post reads
+		// nothing. The sync's own saves skip it: the post's lock is already held, so they stop there.
 		if ( $only === null && self::$writing === 0 && count( $this->manager->get_translations( $post_id ) ) < 2 ) {
 			return false;
 		}
@@ -2895,15 +2557,9 @@ final class ContentSync {
 	}
 
 	/**
-	 * A person's save that clears a post's stale mark could not take the
-	 * post's lock, as another request holds it: its sync did not run and the
-	 * mark stays. The Sync Fields that save changed (changed_in_save()) are
-	 * kept with the mark (`pending`), so the save that clears it copies them
-	 * to the group as well (sync_cleared()) and the person's change is not
-	 * replaced by the group's value. The fields are added to the mark as its
-	 * row holds it, with a compare-and-set (change_stale_mark()): a field
-	 * another such save added meanwhile stays, and a mark another request
-	 * cleared meanwhile is not written back.
+	 * A clearing save could not take the post's lock: keep the fields it changed with the mark (`pending`).
+	 *
+	 * The save that clears the mark copies them too, so the person's change is not replaced by the group's value.
 	 *
 	 * @param int      $post_id Post saved.
 	 * @param \WP_Post $post    Post object.
@@ -2988,20 +2644,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * The sync of a person's save that clears the post's stale mark
-	 * (person_save_clears_stale(); run_sync() cleared the mark just before),
-	 * or of a block editor meta-box request whose form shows the values such
-	 * a save replaced (held_form_save()), run once the save is complete and
-	 * under the saved post's lock. The
-	 * Sync Fields the person changed are written to the group, gated as any
-	 * save of that person: in a clearing save those the save changed
-	 * (changed_in_save()); in a meta-box request every field but those the
-	 * form sent back with the value the post held before the clearing save.
-	 * For every other Sync Field the post takes the group's current values
-	 * from the member that holds them (group_values_member()), as a save of
-	 * that member would give them, so the values the mark held back never
-	 * reach the group. A clearing save keeps the values it replaced in the
-	 * post's held-values row (SYNC_HELD_META).
+	 * The sync of a clearing save or held-values meta-box request, once the save is complete, under the post's lock.
+	 *
+	 * The fields the person changed go to the group, gated as their save; the post takes the group's values for the
+	 * rest (group_values_member()), so held-back values never reach the group. Replaced values go to SYNC_HELD_META.
 	 *
 	 * @param int                $post_id           Post saved.
 	 * @param array<string, int> $translations      language_slug => post_id map for the group.
@@ -3067,10 +2713,7 @@ final class ContentSync {
 	}
 
 	/**
-	 * Keep, in the post's held-values row (SYNC_HELD_META), the Sync Fields
-	 * values a clearing save replaced: those whose value before the copy
-	 * ($before) differs from the post's value now. A clearing save that
-	 * replaced none removes the post's row.
+	 * Keep the Sync Fields values a clearing save replaced in the post's held-values row; none replaced removes the row.
 	 *
 	 * @param int                   $post_id Post saved.
 	 * @param string                $mark    Name of the mark the save cleared.
@@ -3107,11 +2750,8 @@ final class ContentSync {
 	}
 
 	/**
-	 * The group member whose Sync Fields values are the group's current
-	 * ones, for a post whose stale mark was just cleared: the
-	 * default-language member, or, when there is none or it is opted out of
-	 * sync or marked stale itself, the first other member that is neither.
-	 * 0 when no member qualifies.
+	 * The member holding the group's current Sync Fields values: the default-language member, else the first other
+	 * member neither opted out nor marked stale; 0 when none qualifies.
 	 *
 	 * @param int                $post_id      Post whose mark was cleared.
 	 * @param array<string, int> $translations language_slug => post_id map for the group.
@@ -3131,15 +2771,10 @@ final class ContentSync {
 	}
 
 	/**
-	 * Whether a save of a post writes to the other members of its group
-	 * only where a user may edit them, and that user (null for the current
-	 * user). Gated: a scheduled post WordPress publishes without a person,
-	 * when scheduled_publish_user() names a user, and a save outside a cron
-	 * run by a logged-in user who may edit the saved post. Not gated: any
-	 * other save with no user (WP-CLI, an import, a background job), a save
-	 * in a cron run, and a save by a user who may not edit the saved post.
-	 * The Sync Fields mirror (sync_siblings()) and the password copy
-	 * (sync_password()) both follow it.
+	 * Whether a save writes only to the group members a user may edit, and that user (null: the current user).
+	 *
+	 * Gated: a non-cron save by a logged-in user who may edit the post, and a scheduled publish whose gating user is
+	 * set. Any other save is the site's own write (WP-CLI, imports, cron, a checkout updating a product).
 	 *
 	 * @param int $post_id Saved post.
 	 * @return array{0: bool, 1: int|null} Whether the save is gated, and the user whose rights gate it.
@@ -3164,53 +2799,9 @@ final class ContentSync {
 	 * @return void
 	 */
 	private function sync_siblings( int $post_id, array $translations, array $fields, bool $is_default_source, array $seed_only ): void {
-		// ⚠️ Sync fields are one value shared by the whole group, Page
-		// Parent, Publish Date and seed-only keys aside: a save of any member
-		// writes them to the other members. Page Parent and Publish Date
-		// move only from the default-language member (Page Parent mapped to
-		// each sibling's own-language parent), and seed-only keys are copied
-		// only from the default-language member, and only to a sibling that
-		// lacks them.
-		// A logged-in saver who may edit the saved post writes only to the
-		// siblings they may edit as well. The others are skipped and keep
-		// their values. One is counted for the save notice
-		// (skipped_siblings()) when the write would have changed a value it
-		// holds: the same decisions are made against its stored values
-		// without writing (sync_fields_to_post() with $dry_run), from the
-		// post and meta caches, once the save is complete (note_skip()), so
-		// a sibling that already agrees costs no write and no notice. When
-		// the group's original holds the saved post's values after the save
-		// (it is the saved post, or the saver may edit it), each counted
-		// translation is also marked stale (mark_stale(), SYNC_STALE_META):
-		// its translation link reads "needs update", and its own saves copy
-		// nothing back until a person who may edit it and the original saves
-		// it (person_save_clears_stale()); that save copies only the Sync
-		// Fields the person changed, and the translation takes the group's
-		// values for the rest (sync_cleared()).
-		// In a group without a default-language member, or whose
-		// default-language member is opted out of sync, the saved post holds
-		// the group's values, so its counted skips are marked too.
-		// When the original was skipped too, the original's values stand and
-		// the skipped translations are not marked. The saved post is marked
-		// instead when the write would have changed the original (note_skip()):
-		// its own later saves, ungated ones included (WP-CLI, an import, a
-		// cron run), then copy none of its values to the group until a person
-		// who may edit it and the original saves it, and that save copies the
-		// Sync Fields the person changed. The mirror copies the saved post's
-		// current values, not only what changed, so the next save by someone
-		// who may edit the whole group makes it agree again on the values of
-		// the post they save: an editor's save of the original wins. A
-		// scheduled post WordPress publishes without a person
-		// (note_scheduled_publish()) is gated by the rights of the user
-		// scheduled_publish_user() names: by default its author when the
-		// author may edit it, as if the author had saved it, and otherwise
-		// not gated. Any other save with no user (WP-CLI, an import, a
-		// background job) or in a cron run is not gated, and neither is a
-		// save by a user who may not edit the saved post: that write is the
-		// site's own (a checkout updating a product), not the user's. The
-		// sync opt-out keeps a post out of the group, and setting it needs
-		// edit_post on that post. The rule is write_gate(), which the
-		// password copy (sync_password()) applies too.
+		// ⚠️ A gated saver writes only the siblings they may edit. A skipped sibling a write would change is counted and,
+		// when the original holds the saved values, marked stale; a skipped original marks the saved post instead.
+		// See docs-ai/11-code-rationale.md, "ContentSync: write gate and stale marks".
 		[ $gated, $gate_user ] = $this->write_gate( $post_id );
 
 		$original = ( $gated && ! $is_default_source ) ? $this->default_member( $translations ) : 0;
@@ -3265,11 +2856,8 @@ final class ContentSync {
 	/**
 	 * Synchronize configured term fields when a taxonomy term is edited.
 	 *
-	 * Keeps the PARENT in sync across linked translations (mapped to each
-	 * language's own translated parent) so hierarchies don't diverge silently.
-	 * One-way: only an edit of the group's DEFAULT-language term propagates,
-	 * because the hierarchy is authored there - see the guard below.
-	 * Name, slug, and description are translator-owned and never synced.
+	 * Only the parent, mapped to each language's own parent, and only from the default-language term; name, slug and
+	 * description are translator-owned.
 	 *
 	 * @param int    $term_id Edited term ID.
 	 * @param int    $tt_id Term-taxonomy ID (unused).
@@ -3318,17 +2906,8 @@ final class ContentSync {
 				return;
 			}
 
-			// Hierarchy travels one way: default language -> translations. A
-			// fresh term translation sits at parent 0 whenever the source's
-			// parent has no translation yet, and the bulk term pass
-			// (Bootstrap::ajax_create_taxonomy_translations) renames it with
-			// wp_update_term() in the SAME request as create_translation() -
-			// so without this guard translating one category writes that 0
-			// back onto the source-language term, flattening the tree the
-			// site is authored in and changing its live permalink. Sites that
-			// genuinely want per-language trees still have the
-			// `perflocale/sync/term_parent` filter and the
-			// `sync_term_hierarchy` setting checked above.
+			// Hierarchy travels one way (docs-ai/04-do-not-fix.md 2.16): a new term translation sits at parent 0, and the
+			// bulk term pass renames it in the same request, which would write that 0 back onto the source term.
 			$default_lang = $plugin->has( 'lang_repo' ) ? $plugin->lang_repo()->get_default() : null;
 			$default_id   = ( $default_lang && isset( $default_lang->id ) && is_numeric( $default_lang->id ) ) ? (int) $default_lang->id : 0;
 
@@ -3358,11 +2937,7 @@ final class ContentSync {
 				}
 
 				try {
-					// Only sync parent (description/name stay translator-owned).
-					// Point the sibling at the parent's translation in the
-					// sibling's OWN language (a DE child → the DE parent, not the
-					// EN parent's term_id, which would orphan it cross-language).
-					// If the parent isn't translated yet, leave it unchanged.
+					// Point the sibling at the parent's translation in its OWN language; an untranslated parent stays.
 					$source_parent_id  = (int) $source_term->parent;
 					$translated_parent = 0;
 					$update_parent     = true;
@@ -3378,20 +2953,16 @@ final class ContentSync {
 							}
 						}
 
-						// Parent has no translation in the sibling's language.
-						// Skip the parent update entirely so we don't orphan
-						// it with a cross-language reference. The finally
-						// below still releases the sibling lock cleanly.
+						// No parent translation in the sibling's language: keep its parent, never a cross-language one.
 						if ( $translated_parent === 0 ) {
 							$update_parent = false;
 						}
 					}
 
 					/**
-					 * Whether to sync this term's parent onto a specific
-					 * translation sibling. Return false to keep the sibling's
-					 * own hierarchy (per-language category trees) while name,
-					 * slug, and description stay translator-owned as always.
+					 * Whether to sync this term's parent onto a specific translation sibling.
+					 *
+					 * Return false to keep the sibling's own hierarchy (per-language category trees).
 					 *
 					 * @hook perflocale/sync/term_parent
 					 * @param bool     $sync              Default true (mirror the hierarchy).
@@ -3443,30 +3014,17 @@ final class ContentSync {
 	 * @param int           $source_id Source post ID.
 	 * @param int           $target_id Target post ID.
 	 * @param array<string> $fields Fields to sync.
-	 * @param string        $target_lang_slug Target post's language slug - used to
-	 *            translate post_parent into the same language so the sibling
-	 *            doesn't end up with a cross-language parent reference.
-	 * @param bool          $source_is_default_lang Whether the saved post is its
-	 *            group's default-language member. Only that member may move the
-	 *            group's hierarchy or publish date, or seed seed-only keys - see
-	 *            is_default_language_post().
-	 * @param array<string> $seed_only Meta keys with seed-only semantics: copied
-	 *            from the default-language member when the sibling has NO rows
-	 *            for the key and has not recorded it as deliberately cleared
-	 *            (SEED_CLEARED_META), otherwise left untouched (never
-	 *            overwritten, never deleted) - the sibling's translator owns the
-	 *            per-language value.
-	 * @param bool          $dry_run When true, nothing is written or flushed: the
-	 *            same decisions are made against the sibling's stored values,
-	 *            and the first field the write would change returns true.
-	 * @return bool With $dry_run, whether the write would give the sibling a
-	 *              value it does not hold; false otherwise.
+	 * @param string        $target_lang_slug Target post's language slug, to map post_parent into that language.
+	 * @param bool          $source_is_default_lang Whether the saved post is its group's default-language member,
+	 *            the only one that moves hierarchy and publish date or seeds.
+	 * @param array<string> $seed_only Seed-only meta keys: copied only to a sibling with no rows and no recorded
+	 *            clear (SEED_CLEARED_META); never overwritten or deleted.
+	 * @param bool          $dry_run Decide against the sibling's stored values without writing; true at the
+	 *            first field a write would change.
+	 * @return bool With $dry_run, whether the write would change a value of the sibling; false otherwise.
 	 */
 	private function sync_fields_to_post( int $source_id, int $target_id, array $fields, string $target_lang_slug, bool $source_is_default_lang, array $seed_only = [], bool $dry_run = false ): bool {
-		// The plugin's own meta keys are never mirrored or seeded, whatever
-		// listed them: a stored Sync Fields value, an import, WP-CLI or the
-		// perflocale/sync_fields filters (SyncMeta::is_never_synced()). Every
-		// sibling write passes here, so this one check covers them all.
+		// The plugin's own meta keys are never mirrored or seeded, whatever listed them; every sibling write passes here.
 		$internal  = static function ( mixed $field ): bool {
 			return ! ( is_string( $field ) && SyncMeta::is_never_synced( $field ) );
 		};
@@ -3504,18 +3062,11 @@ final class ContentSync {
 
 				$prop = $post_field_map[ $field ];
 
-				// post_parent points at the parent's translation in the
-				// sibling's OWN language (a DE child → the DE parent, not the
-				// EN parent's post_id, which would orphan it cross-language).
-				// If the parent isn't translated yet, leave it unchanged.
-				// Mirrors the term-side guard in sync_on_term_edit, including
-				// its default-language-only direction.
+				// post_parent points at the parent's translation in the sibling's OWN language; an untranslated parent
+				// stays. Same rule and direction as sync_on_term_edit().
 				if ( $field === 'post_parent' ) {
-					// Only the default-language member may move the group. A
-					// translation saving its own parent - 0 whenever its parent
-					// has no translation yet - would otherwise flatten every
-					// sibling, the published source included. Skip just this
-					// field so the sibling's other synced fields still travel.
+					// Only the default-language member moves the group (docs-ai/04-do-not-fix.md 2.16); skip just
+					// this field so the other synced fields still travel.
 					if ( ! $source_is_default_lang ) {
 						continue;
 					}
@@ -3538,22 +3089,14 @@ final class ContentSync {
 					continue;
 				}
 
-				// The group's publish date is the default-language member's.
-				// A translation's own date never moves it: core gives a
-				// translation the current time when it is published or
-				// created, and that would move the original's date and, with
-				// a date-based permalink structure, its URL. A draft whose
-				// date floats moves nothing either: core rewrites that date
-				// to the current time on every save until one is set.
+				// The publish date is the default-language member's: a translation's date (stamped when published or
+				// created) would move the original's date and, with date permalinks, its URL. A floating date moves nothing.
 				if ( $field === 'post_date' ) {
 					if ( ! $source_is_default_lang || self::date_floats( $source ) ) {
 						continue;
 					}
 
-					// post_date needs post_date_gmt as well, plus edit_date=true:
-					// wp_update_post() ignores an explicit date on an existing
-					// post unless edit_date is set, so without it the sibling
-					// silently keeps its own publish date.
+					// With post_date_gmt and edit_date: wp_update_post() ignores an existing post's date without edit_date.
 					$update['post_date']     = $source->post_date;
 					$update['post_date_gmt'] = $source->post_date_gmt;
 					$update['edit_date']     = true;
@@ -3563,16 +3106,9 @@ final class ContentSync {
 				$update[ $prop ] = $source->$prop;
 			}
 
-			// Drop every field the sibling already holds. wp_update_post()
-			// rewrites the row and fires save_post / post_updated /
-			// transition_post_status even when all values are identical, so a
-			// source save that touched none of the synced fields still cost one
-			// full post write per translation. $current is read under the same
-			// sibling lock the write is made under, so it is the row
-			// wp_update_post() goes on to merge into.
-			//
-			// This decides only WHETHER to write. wp_insert_post() still
-			// reconciles the columns it owns on any write that does happen.
+			// Drop every field the sibling already holds: wp_update_post() rewrites the row and fires the save hooks
+			// even when nothing differs. $current is read under the sibling's lock, so it is the row the write merges
+			// into. This decides only whether to write.
 			if ( count( $update ) > 1 ) {
 				$current = get_post( $target_id );
 
@@ -3587,13 +3123,8 @@ final class ContentSync {
 						'ping_status'    => (string) $current->ping_status,
 					];
 
-					// Fields wp_insert_post() replaces when the incoming value is
-					// empty: comment_status becomes 'closed' on an update,
-					// ping_status the post type's default, post_author the current
-					// user. An empty value is therefore never "already held" - the
-					// row would end up holding what core substitutes, not what we
-					// compared. menu_order and post_parent are plain int casts and
-					// need no such exception, so a legitimate 0 still compares.
+					// wp_insert_post() replaces an empty value of these with its own default (closed, the type's
+					// default, the current user), so an empty value is never "already held".
 					$normalised_when_empty = [
 						'post_author'    => true,
 						'comment_status' => true,
@@ -3614,14 +3145,8 @@ final class ContentSync {
 						}
 					}
 
-					// post_date, post_date_gmt and edit_date are one package, not
-					// three values. edit_date is a control flag: without it
-					// wp_update_post() sets $clear_date on a sibling that is a
-					// draft/pending/auto-draft with a zero post_date_gmt and
-					// rewrites its post_date to the current time
-					// (wp-includes/post.php). The trio may only be dropped when
-					// doing so leaves nothing to write at all; any write that still
-					// happens carries all three exactly as built above.
+					// The date trio is one package: without edit_date wp_update_post() restamps a floating sibling's
+					// post_date (wp-includes/post.php). It is dropped only when nothing else is written.
 					$other_fields = array_diff_key(
 						$update,
 						[
@@ -3642,11 +3167,8 @@ final class ContentSync {
 				}
 			}
 
-			// Only call wp_update_post if there are actual fields to update.
-			// The sibling's other columns stay as stored; an empty
-			// page_template leaves its stored template alone. A write that
-			// carries post_parent carries post_name too: core makes the slug
-			// unique among the new parent's children.
+			// Write only differing fields; an empty page_template keeps the stored one. A post_parent write carries
+			// post_name too: core makes the slug unique among the new parent's children.
 			if ( count( $update ) > 1 ) {
 				if ( $dry_run ) {
 					return true;
@@ -3671,21 +3193,14 @@ final class ContentSync {
 					}
 				}
 
-				// A filter vetoing wp_update_post (e.g. WooCommerce stock or
-				// order-status guards) must not block the independent thumbnail
-				// and meta syncs below - those use their own APIs and have
-				// nothing to do with the post-field update path.
+				// A vetoed update (WooCommerce stock or order-status guards) must not block the thumbnail and meta syncs.
 				if ( is_wp_error( $result ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic; one line per vetoed sibling update.
 					error_log( sprintf( 'PerfLocale ContentSync: wp_update_post failed for sibling %d: %s', $target_id, $result->get_error_message() ) );
 				}
 			} elseif ( $identical_fields_dropped && ! $dry_run ) {
-				// The row already held every value, so no write and therefore
-				// no save_post -> CacheInvalidator::on_save_post for this
-				// sibling. Flush its object caches here instead: integrations
-				// purge their CDN from `perflocale/cache/flush_object`, and
-				// that signal has to keep arriving for a sibling whenever the
-				// write it used to ride on would have happened.
+				// No write means no save_post purge for this sibling: flush its caches so the
+				// `perflocale/cache/flush_object` signal (CDN purges) still arrives.
 				$this->cache->flush_object( $target_id, 'post' );
 			}
 		}
@@ -3724,16 +3239,9 @@ final class ContentSync {
 					continue;
 				}
 
-				// SEED-ONLY keys (SEO titles, ACF/Meta Box/Pods values, WC purchase
-				// notes): the sibling's translator owns the per-language value.
-				// Copy only when the sibling has NO rows for the key (a fresh
-				// translation) and never delete - a source save must not clobber
-				// a value typed on the translation.
+				// SEED-ONLY keys: the translator owns the value. Copy only to a sibling with NO rows for the key; never delete.
 				if ( isset( $seed_set[ $field ] ) ) {
-					// Seeds flow outward from the default-language member only,
-					// like Page Parent. A value first typed on a translation is in
-					// that translation's language, and must not be copied onto the
-					// original or into the other languages.
+					// Only from the default-language member: a value first typed on a translation is in its language.
 					if ( ! $source_is_default_lang ) {
 						continue;
 					}
@@ -3763,11 +3271,9 @@ final class ContentSync {
 
 					foreach ( $seed_values as $meta_value ) {
 						/**
-						 * Filters one seeded row before it is copied to a sibling
-						 * that has no rows for the key. Runs only when a seed is
-						 * written. The Meta Box add-on takes a group's password
-						 * sub-fields out here, as it does when a translation is
-						 * created.
+						 * Filters one seeded row before it is copied to a sibling that has no rows for the key.
+						 *
+						 * The Meta Box add-on takes a group's password sub-fields out here.
 						 *
 						 * @hook  perflocale/sync/seed_meta_value
 						 * @since 1.0.7
@@ -3784,24 +3290,12 @@ final class ContentSync {
 					continue;
 				}
 
-				// MIRROR keys keep full overwrite + delete-clears semantics:
-				// Replicate EVERY row, not just the first - multi-value meta
-				// (add_post_meta(..., false)) was being collapsed to a single
-				// value on the sibling, permanently dropping the rest. Mirror
-				// copy_post_meta(): clear the target, then re-add each source
-				// row. An absent or single empty-string source clears the
-				// target (preserving the prior single-value behaviour).
+				// MIRROR keys: clear the target and re-add every source row. An absent or single empty-string source
+				// deletes the target's rows by design (docs-ai/04-do-not-fix.md 2.15).
 				$values = get_post_meta( $source_id, $field, false );
 
-				// Change detection: skip the delete/re-add (and the
-				// after_mirror cache purge this key would trigger) when the
-				// sibling already holds identical rows - a title typo fix
-				// must not rewrite multi-hundred-KB builder JSON on every
-				// sibling and throw away their compiled CSS. Compare
-				// SERIALIZED forms: get_post_meta() unserializes, and builder
-				// meta can contain objects (Beaver Builder nodes) where a
-				// strict array compare would test instance identity and never
-				// match.
+				// Skip identical rows so a title fix rewrites no builder JSON. Compare SERIALIZED forms: builder meta can
+				// hold objects (Beaver nodes), which a strict array compare never matches.
 				$target_values = get_post_meta( $target_id, $field, false );
 
 				if ( array_map( 'maybe_serialize', $target_values ) === array_map( 'maybe_serialize', $values )
@@ -3811,10 +3305,8 @@ final class ContentSync {
 
 				$source_lacks = $values === [] || ( count( $values ) === 1 && $values[0] === '' );
 
-				// A credential-named key is never deleted from a member because
-				// the saved post lacks it. A new translation never receives
-				// such a key, so its first save would otherwise delete the
-				// original's credential.
+				// A credential-named key is never deleted because the saved post lacks it: a new translation never
+				// receives one, so its first save would delete the original's credential.
 				if ( $source_lacks ) {
 					$sensitive_patterns ??= PostTranslationManager::sensitive_meta_patterns();
 
@@ -3849,18 +3341,12 @@ final class ContentSync {
 			}
 		}
 
-		// A raw meta mirror overwrites a builder layout key (Elementor/Bricks/
-		// Oxygen/Beaver) but leaves the sibling's GENERATED CSS/asset caches -
-		// keyed to the pre-sync layout - untouched, so the translated page keeps
-		// enqueueing a stylesheet built from the old layout until a manual editor
-		// save or a site-wide regenerate. Signal the mirror so a builder addon
-		// can drop the sibling's stale generated cache.
+		// A raw mirror leaves the sibling's generated builder CSS built from the old layout: signal it so an addon drops it.
 		if ( $mirrored_meta_keys !== [] ) {
 			/**
-			 * Fires after full-mirror meta keys have been written to a sibling
-			 * translation. Builder addons hook this to invalidate the sibling's
-			 * generated CSS/asset caches (e.g. Elementor's `_elementor_css` /
-			 * `_elementor_page_assets` meta) that a raw meta mirror can't touch.
+			 * Fires after full-mirror meta keys have been written to a sibling translation.
+			 *
+			 * Builder addons drop the sibling's generated CSS/asset caches here (Elementor's `_elementor_css`).
 			 *
 			 * @hook  perflocale/sync/after_mirror
 			 * @since 1.0.0

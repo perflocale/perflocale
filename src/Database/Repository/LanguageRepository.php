@@ -18,31 +18,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Data access layer for the perflocale_languages table.
- *
- * All read methods use the 3-layer cache. Write methods invalidate
- * relevant cache entries and fire hooks.
+ * Data access for perflocale_languages: reads through the 3-layer cache, writes invalidate it and fire hooks.
  */
 final class LanguageRepository implements RepositoryInterface {
 
 	/**
-	 * The slug shape the routing layer can actually express.
-	 *
-	 * This is not a house style rule - it is the grammar three other
-	 * surfaces already hard-code, so a slug outside it is a language the
-	 * plugin cannot fully address:
-	 *
-	 *   - `LanguagesController` registers its item routes as
-	 *     `/languages/(?P<slug>[a-z]{2,3}(?:-[a-z]{2,3})?)` and
-	 *     `/translations/…/(?P<lang>[a-z]{2,3}(?:-[a-z]{2,3})?)`, so
-	 *     GET/PATCH/DELETE-by-slug and the machine-translate write route
-	 *     404 for anything else;
-	 *   - `LanguagesController::create_item` rejects it at validation;
-	 *   - `SlugRedirector` only recognises this shape as a candidate URL
-	 *     prefix, so the 301 a rename records can never fire for it.
-	 *
-	 * All 194 entries in `data/languages.php` match, so nothing the plugin
-	 * itself offers is excluded.
+	 * The slug shape the routing layer can express (the REST item routes, create_item() and SlugRedirector hard-code
+	 * it); every entry of data/languages.php matches. Docs: docs-ai/11-code-rationale.md, "LanguageRepository: the slug
+	 * shape and the bootstrap".
 	 */
 	public const SLUG_PATTERN = '/^[a-z]{2,3}(?:-[a-z]{2,3})?$/';
 
@@ -69,11 +52,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Resolve the full table name for the current blog.
-	 *
-	 * Computed on every call so that switch_to_blog() flips the prefix
-	 * correctly - capturing the name in the constructor would otherwise
-	 * pin this instance to whichever blog was active at construction.
+	 * The full table name for the current blog, computed per call so switch_to_blog() is followed.
 	 *
 	 * @return string
 	 */
@@ -82,17 +61,14 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Find a language by ID.
+	 * A language by id.
 	 *
 	 * @param int $id Language ID.
 	 * @return object|null
 	 */
 	public function find( int $id ): ?object {
-		// Serve from the bundled bootstrap cache when the ID belongs to an
-		// active language - it's already in memory after the first request-
-		// scoped access. Avoids a separate per-ID transient read (two DB
-		// queries) for the common case where UrlConverter et al. ask for the
-		// current language by id on every frontend request.
+		// An active language comes from the bootstrap already in memory, not a per-id transient (two queries): the front
+		// end asks for the current language by id on every request.
 		$bootstrap = $this->get_bootstrap();
 
 		foreach ( $bootstrap['active'] as $row ) {
@@ -101,10 +77,7 @@ final class LanguageRepository implements RepositoryInterface {
 			}
 		}
 
-		// Fallback - an inactive language, or a transient cache miss. Use the
-		// individual per-id cache for these so they don't hammer the DB when
-		// legitimately needed (e.g. admin editor showing a dropdown of every
-		// language including inactive ones).
+		// Inactive languages or a bootstrap miss: the per-id cache (admin dropdowns list every language).
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$cached = $this->cache->get(
 			"language_{$id}",
@@ -121,91 +94,22 @@ final class LanguageRepository implements RepositoryInterface {
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// Defensive: see find_by_slug() - non-object cache payloads from
-		// corrupted persistent-cache layers are treated as misses so the
-		// strict ?object return type can't trip a TypeError fatal.
+		// A non-object payload from a corrupted persistent cache is a miss (see find_by_slug()).
 		return is_object( $cached ) ? $cached : null;
 	}
 
 	/**
-	 * Batch-fetch languages by IDs with a single SQL query + cache priming.
-	 *
-	 * Intended for hot paths (sitemap rendering, hreflang output, URL
-	 * preloading) that would otherwise call find() in a loop. Cache-aware:
-	 * cached IDs are served from memory, uncached IDs are pulled in ONE
-	 * query and cached individually so subsequent find() calls hit L1.
+	 * Batch-fetch languages by IDs: one query for the uncached ones, which it caches for find().
 	 *
 	 * @param array<int, int> $ids Language IDs.
 	 * @return array<int, object> Map of id => language object. Missing IDs are absent.
 	 */
 	public function find_many( array $ids ): array {
-		$ids = array_values( array_unique( array_map( 'intval', $ids ) ) );
-		$ids = array_filter( $ids, static fn( int $id ): bool => $id > 0 );
-
-		if ( $ids === [] ) {
-			return [];
-		}
-
-		$result  = [];
-		$missing = [];
-
-		// First pass: satisfy from the bundled bootstrap (covers every active
-		// language in one in-memory lookup), then the per-id L1 cache (covers
-		// inactive languages, which find() stores individually).
-		$bootstrap_by_id = [];
-
-		foreach ( $this->get_bootstrap()['active'] as $row ) {
-			$bootstrap_by_id[ (int) $row->id ] = $row;
-		}
-
-		foreach ( $ids as $id ) {
-			if ( isset( $bootstrap_by_id[ $id ] ) ) {
-				$result[ $id ] = $bootstrap_by_id[ $id ];
-				continue;
-			}
-
-			$cached = $this->cache->get_static( "language_{$id}", 'perflocale_langs' );
-
-			if ( is_object( $cached ) ) {
-				$result[ $id ] = $cached;
-			} else {
-				$missing[] = $id;
-			}
-		}
-
-		if ( $missing === [] ) {
-			return $result;
-		}
-
-		// One prepared IN() query for everything not already cached.
-		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		$placeholders = implode( ',', array_fill( 0, count( $missing ), '%d' ) );
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$rows = $this->wpdb->get_results(
-			$this->wpdb->prepare(
-				"SELECT * FROM %i WHERE id IN ({$placeholders})",
-				array_merge( [ $this->table() ], $missing )
-			)
-		);
-		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-		if ( ! is_array( $rows ) ) {
-			return $result;
-		}
-
-		// Prime the cache per row so subsequent find() calls are free.
-		foreach ( $rows as $row ) {
-			$id = (int) $row->id;
-			$this->cache->set( "language_{$id}", $row, DAY_IN_SECONDS, 'perflocale_langs' );
-			$result[ $id ] = $row;
-		}
-
-		return $result;
+		return LanguageFindMany::find( $ids, fn(): array => $this->get_bootstrap()['active'], $this->cache, $this->wpdb );
 	}
 
 	/**
-	 * Find a language by its URL slug.
+	 * A language by URL slug.
 	 *
 	 * @param string $slug Language slug (e.g. 'en', 'fr').
 	 * @return object|null
@@ -213,20 +117,13 @@ final class LanguageRepository implements RepositoryInterface {
 	public function find_by_slug( string $slug ): ?object {
 		$slug = sanitize_key( $slug );
 
-		// Bootstrap bundle already has an O(1) slug → object hash for every
-		// active language. Short-circuit to it before falling through to the
-		// transient/DB path.
+		// The bootstrap's slug map first (every active language).
 		$map = $this->get_bootstrap()['slug_map'];
 
 		if ( isset( $map[ $slug ] ) ) {
 			$bootstrap_hit = $map[ $slug ];
-			// Defensive: the persistent cache layer (Redis Object Cache
-			// drop-in) has been observed to return malformed payloads
-			// (empty string instead of stdClass) from older serialiser
-			// generations. The slug_map should ALWAYS contain stdClass
-			// objects; if it doesn't, treat the entry as a cache miss
-			// and re-query rather than satisfying the strict ?object
-			// return type with a string and triggering a TypeError fatal.
+			// A persistent cache can return a malformed payload ('' from an older serialiser): a miss, re-queried, so the
+			// ?object return type never fatals.
 			if ( is_object( $bootstrap_hit ) ) {
 				return $bootstrap_hit;
 			}
@@ -249,16 +146,12 @@ final class LanguageRepository implements RepositoryInterface {
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// Same defensive check as the bootstrap path: a non-object cached
-		// payload is corruption, not a hit. Fall through to null so the
-		// strict return type holds and the caller can re-resolve cleanly
-		// on the next request (the cache delete on rename / language CRUD
-		// will eventually replace the bad entry).
+		// A non-object cached payload is corruption: null now, replaced on the next rename or language change.
 		return is_object( $cached ) ? $cached : null;
 	}
 
 	/**
-	 * Find a language by its WordPress locale.
+	 * A language by WordPress locale.
 	 *
 	 * @param string $locale Locale string (e.g. 'en_US').
 	 * @return object|null
@@ -266,8 +159,7 @@ final class LanguageRepository implements RepositoryInterface {
 	public function find_by_locale( string $locale ): ?object {
 		$locale = sanitize_text_field( $locale );
 
-		// Scan the bootstrap bundle first - active languages only, which is
-		// what the public filters (locale swap, hreflang) ever care about.
+		// The bootstrap first: active languages, what the public filters need.
 		foreach ( $this->get_bootstrap()['active'] as $row ) {
 			if ( isset( $row->locale ) && (string) $row->locale === $locale ) {
 				return $row;
@@ -291,23 +183,13 @@ final class LanguageRepository implements RepositoryInterface {
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// Defensive: see find_by_slug() - non-object cache payloads from
-		// corrupted persistent-cache layers are treated as misses.
+		// A non-object cached payload is a miss (see find_by_slug()).
 		return is_object( $cached ) ? $cached : null;
 	}
 
 	/**
-	 * Bundled language bootstrap: active list + default + slug map.
-	 *
-	 * Frontend requests invariably need all three - language detection needs
-	 * the slug map, the front-page router needs the default, and hreflang
-	 * output iterates the active list - so storing them as three separate
-	 * transients cost 6 DB lookups per request on sites without a persistent
-	 * object cache (each transient read is value + timeout = 2 queries).
-	 *
-	 * Consolidating into one transient cuts that to 2 queries and guarantees
-	 * a coherent snapshot: you can never see "active_languages" updated but
-	 * "default_language" stale against the same underlying row set.
+	 * The bootstrap bundle: active list, default and slug map in one transient (2 queries instead of 6 without a
+	 * persistent cache) and one coherent snapshot.
 	 *
 	 * @return array{active: array<int, object>, default: ?object, slug_map: array<string, object>}
 	 */
@@ -319,21 +201,13 @@ final class LanguageRepository implements RepositoryInterface {
 			function () use ( &$had_db_error ): array {
 				// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-				// Multisite safety: probe that the languages table exists on
-				// this blog before querying. wp_initialize_site fires
-				// switch_blog BEFORE activation runs on a new blog, so the
-				// SELECT below would error ("Table doesn't exist") and pollute
-				// debug.log on every subsite provisioning. SHOW TABLES LIKE is
-				// a cheap non-throwing probe.
+				// Probe the table first: wp_initialize_site fires switch_blog before activation runs on a new blog.
 				$table_escaped = $this->wpdb->esc_like( $this->table() );
 				$exists        = (string) $this->wpdb->get_var(
 					$this->wpdb->prepare( 'SHOW TABLES LIKE %s', $table_escaped )
 				);
 
-				// wpdb resets last_error at the start of every query, so it now
-				// reflects this probe. A transient error (deadlock, "server gone
-				// away") also yields '' for $exists - flag it so the empty
-				// bootstrap below is not cached for a day (see the delete below).
+				// A failed probe (deadlock, "server gone away") also answers '': flag it so the empty bootstrap is not cached.
 				if ( $this->wpdb->last_error !== '' ) {
 					$had_db_error = true;
 				}
@@ -346,10 +220,7 @@ final class LanguageRepository implements RepositoryInterface {
 					];
 				}
 
-				// One SELECT serves all three accessors. The rows are tiny
-				// (5 or so per site typically) so fetching even inactive
-				// languages here would be cheap, but sticking to is_active=1
-				// keeps behaviour identical to the old get_active().
+				// One SELECT of the active languages for all three parts.
 				$rows = $this->wpdb->get_results(
 					$this->wpdb->prepare(
 						'SELECT * FROM %i WHERE is_active = 1 ORDER BY sort_order ASC, id ASC',
@@ -358,11 +229,8 @@ final class LanguageRepository implements RepositoryInterface {
 				);
 				// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-				// A query error must not be cached - only a genuinely empty (but
-				// successful) table should be. wpdb->last_error is the reliable
-				// signal: get_results() returns null OR an empty array on error
-				// depending on the driver, so checking the return type alone is
-				// not enough; a non-empty last_error means the query failed.
+				// A query error is never cached, only a successful empty table; last_error decides (get_results() returns null or
+				// [] on error by driver).
 				if ( $this->wpdb->last_error !== '' ) {
 					$had_db_error = true;
 				}
@@ -392,13 +260,8 @@ final class LanguageRepository implements RepositoryInterface {
 			'perflocale_langs'
 		);
 
-		// A transient DB error on the cold load collapses to an empty bootstrap
-		// that cache->get() just persisted for a full day - which would silently
-		// turn the whole site monolingual (no languages → no hreflang, empty
-		// switcher) until a manual flush. Drop it so the NEXT request retries
-		// the DB. The genuinely-empty (successful, no active languages) case has
-		// $had_db_error === false and stays cached. No stored data changed, so
-		// the eviction announces nothing to other processes.
+		// A cold-load error would persist an empty bootstrap for a day and make the site monolingual: drop it so the next
+		// request retries. A real empty table stays cached; nothing is announced (no data changed).
 		if ( $had_db_error ) {
 			$this->cache->evict( 'bootstrap', 'perflocale_langs' );
 		}
@@ -407,10 +270,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Get all active languages, sorted by sort_order.
-	 *
-	 * This is the most frequently called method - served from the bundled
-	 * bootstrap cache.
+	 * Every active language by sort_order, from the bootstrap (the most called method).
 	 *
 	 * @return array<int, object>
 	 */
@@ -419,7 +279,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Get the default language.
+	 * The default language.
 	 *
 	 * @return object|null
 	 */
@@ -428,7 +288,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Get a slug → language object hash map for O(1) lookups.
+	 * Slug => language map.
 	 *
 	 * @return array<string, object>
 	 */
@@ -437,17 +297,14 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Find all languages matching criteria.
+	 * Languages matching the arguments.
 	 *
 	 * @param array<string, mixed> $args Query arguments.
 	 * @return array<int, object>
 	 */
 	public function find_all( array $args = [] ): array {
-		// Fast-path: the no-args / canonical-defaults call returns "every
-		// language, sorted by sort_order ASC." That's the dominant pattern
-		// across admin pages and the Languages REST list endpoint. Cache it
-		// under the same `perflocale_langs` group as the bootstrap bundle
-		// so flush_languages() invalidates both in one call.
+		// The no-argument call (every language by sort_order: admin screens, the REST list) is cached in the bootstrap's
+		// group, so flush_languages() clears both.
 		$is_canonical_default = empty( $args ) || (
 			array_key_exists( 'is_active', $args ) && $args['is_active'] === null
 			&& ( ( $args['orderby'] ?? 'sort_order' ) === 'sort_order' )
@@ -509,7 +366,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Insert a new language.
+	 * Insert a language.
 	 *
 	 * @param array<string, mixed> $data Language data.
 	 * @return int|false Inserted ID or false.
@@ -517,18 +374,8 @@ final class LanguageRepository implements RepositoryInterface {
 	public function insert( array $data ): int|false {
 		$sanitized = self::sanitize_data( $data );
 
-		// A language with no slug can never match a rewrite rule, so the row is
-		// dead on arrival. It was reachable: the Add Language screen sanitises
-		// with sanitize_key(), which has no /u modifier and therefore deletes
-		// every byte of a non-ASCII slug, and update() and rename_slug() both
-		// validate their slug while this did not. The column's UNIQUE key let
-		// exactly one such row exist, and the screen reported success.
-		// 1.0.3 widened this from "not empty" to the full shape. update() (which
-		// rejects on SLUG_PATTERN) and rename_slug() have always enforced it, and
-		// the constant's own docblock calls the shape a system-wide contract, so
-		// a slug this accepted but update() would reject produced a language that
-		// could be created and then never edited again. '' still fails, so the
-		// empty-slug behaviour above is preserved exactly.
+		// The full slug shape, as update() and rename_slug() check it: an empty or odd slug matches no rewrite rule and could
+		// never be edited (sanitize_key() empties a non-ASCII slug).
 		if ( ! isset( $sanitized['slug'] ) || ! is_string( $sanitized['slug'] ) || ! preg_match( self::SLUG_PATTERN, $sanitized['slug'] ) ) {
 			return false;
 		}
@@ -544,13 +391,8 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$this->cache->flush_languages();
 
-		// Adding a language makes its slug live, so the same rule as in
-		// apply_slug_rename() applies: it must not remain a redirect SOURCE.
-		// This is the Add Language screen's own designed flow - the rename
-		// checkboxes move an existing language out of the way (recording
-		// `old => new`) and the new language is then inserted under the freed
-		// slug, so without this prune the language the admin just added has
-		// its entire URL prefix 301'd into the renamed one.
+		// A slug made live must not stay a redirect source (as apply_slug_rename()): the Add Language flow renames a language
+		// out of the way and inserts the new one under the freed slug.
 		$this->drop_stale_slug_redirect(
 			isset( $sanitized['slug'] ) && is_string( $sanitized['slug'] ) ? $sanitized['slug'] : ''
 		);
@@ -564,15 +406,8 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Remove a now-live slug from the 301 redirect map.
-	 *
-	 * {@see apply_slug_rename()} prunes inside its own write of the map; this
-	 * is the path for writers that only make a slug live ({@see insert()} and
-	 * {@see update()}). The write is the compare-and-set of
-	 * {@see write_slug_redirects()}, and nothing is written while the map
-	 * read first has no entry for the slug, so the common case - adding a
-	 * language on a site that has never renamed one - costs a single
-	 * autoloaded array lookup and no write at all.
+	 * Remove a now-live slug from the 301 redirect map, for insert() and update() (apply_slug_rename() prunes in its own
+	 * write); a compare-and-set write, and none when the map has no entry for the slug.
 	 *
 	 * @param string $slug Slug that just became live.
 	 * @return void
@@ -600,14 +435,8 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Rename a language's slug, persisting an old→new redirect record so
-	 * the existing URL prefix `/old-slug/...` 301s to `/new-slug/...` for
-	 * SEO + bookmark continuity.
-	 *
-	 * Translation links and every other table use language_id (not slug)
-	 * as the FK, so the rename is data-cheap. The expensive parts are
-	 * (a) flushing the URL rewrite rules so the new prefix takes over and
-	 * (b) the redirect entry the frontend handler reads on every request.
+	 * Rename a language's slug and record an old => new 301 so `/old-slug/...` URLs keep working. Data-cheap (tables use
+	 * the id); the cost is the rewrite flush and the redirect the front end reads.
 	 *
 	 * @param int    $id       Language ID.
 	 * @param string $new_slug Proposed new slug (lowercase, alpha + hyphens).
@@ -616,9 +445,7 @@ final class LanguageRepository implements RepositoryInterface {
 	public function rename_slug( int $id, string $new_slug ): bool {
 		$new_slug = strtolower( trim( $new_slug ) );
 
-		// Strict shape check: lowercase letters + optional hyphen-region.
-		// Shared with update(), whose Slug field is editable too - see
-		// {@see self::SLUG_PATTERN} for the surfaces that hard-code it.
+		// The shared SLUG_PATTERN, as update().
 		if ( ! preg_match( self::SLUG_PATTERN, $new_slug ) ) {
 			return false;
 		}
@@ -629,9 +456,7 @@ final class LanguageRepository implements RepositoryInterface {
 			return false;
 		}
 
-		// Bail out if another language already owns the target slug -
-		// uniqueness is enforced by the column type, but a clean false here
-		// gives a better error than a wpdb-level constraint error.
+		// Another language owns the slug: a clean false instead of a constraint error.
 		if ( $this->find_by_slug( $new_slug ) ) {
 			return false;
 		}
@@ -651,28 +476,16 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$old_slug = (string) $old->slug;
 
-		// Everything a slug change implies beyond the row write itself -
-		// the 301 record, the reference migration, cache invalidation and
-		// the rewrite flush - lives in apply_slug_rename() so update(),
-		// whose Slug field is editable too, cannot drift from this path.
+		// Everything beyond the row write lives in apply_slug_rename(), shared with update().
 		$this->apply_slug_rename( $id, $old_slug, $new_slug );
 
 		return true;
 	}
 
 	/**
-	 * Apply everything a slug change implies beyond the languages-row
-	 * UPDATE itself: the 301 redirect record, the slug-reference
-	 * migration, cache invalidation and the rewrite-rule flush flag.
-	 *
-	 * Shared by {@see rename_slug()} and {@see update()} - the Edit
-	 * Language form renders an editable Slug field, so update() writes the
-	 * column too and a slug changed through that path needs the identical
-	 * follow-through. Keeping the follow-through here rather than routing
-	 * update() into rename_slug() avoids a second write of the same row;
-	 * the shape contract itself is shared instead, as
-	 * {@see self::SLUG_PATTERN}, so neither entry point can mint a slug the
-	 * REST item routes and SlugRedirector cannot address.
+	 * Everything a slug change implies beyond the row UPDATE: the 301 record, the reference migration, cache
+	 * invalidation and the rewrite flush flag; shared by rename_slug() and update() (the Edit form's slug field).
+	 * Docs: docs-ai/11-code-rationale.md, "LanguageRepository: slug renames and deletes".
 	 *
 	 * @param int    $id       Language ID whose slug just changed.
 	 * @param string $old_slug Pre-rename slug.
@@ -680,28 +493,14 @@ final class LanguageRepository implements RepositoryInterface {
 	 * @return void
 	 */
 	private function apply_slug_rename( int $id, string $old_slug, string $new_slug ): void {
-		// Persist a redirect record. Stored in a single option (not a
-		// table) because the typical site renames at most a handful of
-		// slugs over its lifetime; an option array stays well under the
-		// autoload size budget.
+		// The redirect record, in one option (a site renames a handful of slugs).
 		$recorded = $this->record_slug_redirect( $old_slug, $new_slug );
 
-		// Migrate every slug-as-value/slug-as-key reference scattered
-		// outside the language_id FK graph. Without this, renaming `en`
-		// → `en-us` silently drops alt-text/caption/description on
-		// attachments, breaks linked nav menus, leaves stale entries in
-		// the geo + fallbacks + domains settings, and decimates user
-		// per-screen lang-hide preferences. All migrations run inside
-		// this method so the rename is atomic from the caller's view.
+		// Every slug held as a key or value outside the id graph (attachments, menus, settings, user preferences).
 		$this->migrate_slug_references( $old_slug, $new_slug );
 
-		// The language may have been deleted while this rename recorded and
-		// migrated: a delete that read the redirects and the options before
-		// these writes left them in place, pointing at a prefix that no
-		// longer routes. Read after the writes: when the row is still there,
-		// a delete commits after this read and its clean-up (by the slug the
-		// row holds, read under a row lock) sees these writes; when it is
-		// gone, the same clean-up runs here for the new slug.
+		// Read the row after these writes: a delete that read before them would leave redirects and options for a dead
+		// prefix. Still there: a later delete's clean-up sees the writes; gone: that clean-up runs here.
 		$wpdb = $this->wpdb;
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->get_var( $wpdb->prepare( 'SELECT id FROM %i WHERE id = %d', $this->table(), $id ) );
@@ -712,32 +511,21 @@ final class LanguageRepository implements RepositoryInterface {
 			$this->drop_slug_options( $new_slug );
 		}
 
-		// The cached copies of the map go once its row holds it. Dropping
-		// them after the reference migration lets that migration's option
-		// reads use the options list this request already loaded, instead
-		// of loading the whole list once more.
+		// The cached map copies go once the row holds it, after the migration so its option reads reuse this request's list.
 		if ( $recorded ) {
 			$this->forget_cached_slug_redirects();
 		}
 
-		// Cache invalidation: belt-and-brace the group flush with explicit key
-		// deletes because some persistent backends (older Redis Object Cache
-		// on certain PHP/Redis pairings) don't fully honour flush_group() for
-		// compound key prefixes, leaving stale `language_slug_<old>` entries
-		// that resolve to the renamed language until TTL.
+		// The group flush plus explicit key deletes: some persistent backends do not fully honour flush_group().
 		$this->cache->flush_languages();
 		$this->cache->delete( "language_{$id}", 'perflocale_langs' );
 		$this->cache->delete( "language_slug_{$old_slug}", 'perflocale_langs' );
 		$this->cache->delete( "language_slug_{$new_slug}", 'perflocale_langs' );
 
-		// The language-scoped caches above are not the whole picture: the
-		// eager link map has the OLD slug baked into every link row of this
-		// language, and it outlives any TTL. Same remedy the language-delete
-		// cascade uses.
+		// The eager link map has the old slug in every link row of this language and outlives any TTL.
 		$this->flush_translation_link_caches();
 
-		// Mark rewrite rules for flushing on next request (the rule regex
-		// is built from active language slugs).
+		// Rewrite rules are built from the active slugs: flush them on the next request.
 		update_option( 'perflocale_flush_rules', 1, false );
 
 		/** @hook perflocale/language/slug_renamed Fires after a language slug rename succeeds. */
@@ -745,8 +533,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Write old => new into the redirect map with a compare-and-set on its
-	 * row ({@see write_slug_redirects()}).
+	 * Write old => new into the redirect map with a compare-and-set (write_slug_redirects()).
 	 *
 	 * @param string $old_slug Pre-rename slug.
 	 * @param string $new_slug Post-rename slug.
@@ -761,26 +548,9 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Change the redirect map with a compare-and-set on its row.
-	 *
-	 * The map is autoloaded, and with a persistent object cache the cached
-	 * options list can hold an older copy than the row: a map built from
-	 * that copy and written unconditionally can lose a redirect another
-	 * request recorded or write back entries the row no longer has. Each
-	 * write therefore names the serialized value it was derived from: the
-	 * UPDATE, or the DELETE when the change empties the map, matches only
-	 * while the row still holds exactly that value, and with no row the
-	 * INSERT fails once another request has added one. The first attempt
-	 * takes the value from get_option(), which costs no statement when the
-	 * cached copy is current; after a lost comparison the row is read
-	 * directly and $transform applied to it again, a bounded number of times.
-	 *
-	 * When $transform leaves the map it was given as it is, nothing is
-	 * written. With $confirm_unchanged that is settled only on a value read
-	 * from the row itself, so a cached copy that already holds the change
-	 * still costs one read of the row; without it the cached copy's answer
-	 * stands, which costs nothing (the prune of a slug that becomes live,
-	 * drop_stale_slug_redirect()).
+	 * Change the autoloaded redirect map with a compare-and-set on its row (a cached copy can be older): the UPDATE or
+	 * DELETE matches only the value it was derived from, and a lost comparison re-reads the row and retries, bounded. An
+	 * unchanged map writes nothing, confirmed against the row with $confirm_unchanged.
 	 *
 	 * @param callable $transform         Returns the map after the change, given the map as read.
 	 * @param bool     $confirm_unchanged Whether an unchanged map read from the cached copy is confirmed
@@ -805,16 +575,13 @@ final class LanguageRepository implements RepositoryInterface {
 			$value = [] === $after ? null : maybe_serialize( $after );
 
 			if ( $value === $expected ) {
-				// Nothing to write. A value read from the row itself proves
-				// the row already holds this map; a cached copy proves it only
-				// when the caller accepts its answer.
+				// Nothing to write: proven by a row read, or by the cached copy when the caller accepts it.
 				if ( $from_row || ! $confirm_unchanged ) {
 					$settled = true;
 					break;
 				}
 			} elseif ( null === $value ) {
-				// The change empties the map: the row goes, while it still
-				// holds the value the change was derived from.
+				// The change empties the map: the row goes, while it holds the value the change came from.
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set delete of an autoloaded option; the caller purges the options cache.
 				$affected = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE option_name = %s AND CAST(option_value AS BINARY) = CAST(%s AS BINARY)', $wpdb->options, self::REDIRECTS_OPTION, $expected ) ?? '' );
 
@@ -824,9 +591,7 @@ final class LanguageRepository implements RepositoryInterface {
 					break;
 				}
 			} elseif ( null === $expected ) {
-				// Autoloaded: SlugRedirector reads this on every front-end
-				// request, so keeping it in the bulk options load avoids a
-				// per-request query. The 50-entry cap keeps it small.
+				// Autoloaded: SlugRedirector reads it on every front-end request; the 50-entry cap keeps it small.
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-set write of an autoloaded option; the caller purges the options cache.
 				$affected = $wpdb->query( $wpdb->prepare( 'INSERT IGNORE INTO %i (option_name, option_value, autoload) VALUES (%s, %s, %s)', $wpdb->options, self::REDIRECTS_OPTION, $value, function_exists( 'wp_determine_option_autoload_value' ) ? 'on' : 'yes' ) ?? '' );
 
@@ -860,8 +625,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * The settings blob with a renamed language's slug moved from the old
-	 * slug to the new one wherever it is a key or a value.
+	 * The settings with a renamed slug moved from old to new wherever it is a key or a value.
 	 *
 	 * @param array<mixed> $settings Settings as stored.
 	 * @param string       $old_slug Pre-rename slug.
@@ -869,8 +633,7 @@ final class LanguageRepository implements RepositoryInterface {
 	 * @return array<mixed>
 	 */
 	private static function settings_after_rename( array $settings, string $old_slug, string $new_slug ): array {
-		// geo_country_map: [slug => "CC,CC,…"]. Slug is the KEY (the form field
-		// is geo_country_map[<slug>]).
+		// geo_country_map: [slug => "CC,CC"], the slug as key (form field geo_country_map[<slug>]).
 		if ( ! empty( $settings['geo_country_map'] )
 			&& is_array( $settings['geo_country_map'] )
 			&& isset( $settings['geo_country_map'][ $old_slug ] )
@@ -879,8 +642,7 @@ final class LanguageRepository implements RepositoryInterface {
 			unset( $settings['geo_country_map'][ $old_slug ] );
 		}
 
-		// language_fallbacks: [slug => [fallback_slug, fallback_slug, ...]]
-		// Slug appears as both KEY and VALUE inside the nested arrays.
+		// language_fallbacks: [slug => [fallback slugs]], the slug as key and as value.
 		if ( ! empty( $settings['language_fallbacks'] ) && is_array( $settings['language_fallbacks'] ) ) {
 			$rekeyed = [];
 
@@ -900,10 +662,8 @@ final class LanguageRepository implements RepositoryInterface {
 			$settings['language_fallbacks'] = $rekeyed;
 		}
 
-		// language_domains: [slug => domain] and wc_currencies: [slug =>
-		// ['currency_code'=>..., 'exchange_rate'=>..., 'manual_rate'=>...]].
-		// Slug as KEY. Without the wc_currencies move, the per-language
-		// currency override silently stops applying after a rename.
+		// language_domains [slug => domain] and wc_currencies [slug => rates], the slug as key; without the move the
+		// currency override stops applying.
 		foreach ( [ 'language_domains', 'wc_currencies' ] as $map ) {
 			if ( ! empty( $settings[ $map ] ) && is_array( $settings[ $map ] ) && array_key_exists( $old_slug, $settings[ $map ] ) ) {
 				$settings[ $map ][ $new_slug ] = $settings[ $map ][ $old_slug ];
@@ -915,26 +675,20 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * The settings blob without the references a deleted language's slug
-	 * holds as a key or a value. Without this, the inverse of every
-	 * migration in migrate_slug_references() becomes stale state - the most
-	 * user-visible offender being `wc_currencies[$slug]` (per-language
-	 * currency override silently stops applying because the slug no longer
-	 * resolves) and `language_domains[$slug]` (URL routing reference to
-	 * nothing).
+	 * The settings without a deleted slug's keys and values, the inverse of migrate_slug_references() (a stale
+	 * wc_currencies or language_domains entry silently stops applying or routes nowhere).
 	 *
 	 * @param array<mixed> $settings Settings as stored.
 	 * @param string       $slug     Deleted language's slug.
 	 * @return array<mixed>
 	 */
 	private static function settings_without_language( array $settings, string $slug ): array {
-		// geo_country_map: [slug => "CC,CC,…"]. Slug is the KEY.
+		// geo_country_map: the slug as key.
 		if ( ! empty( $settings['geo_country_map'] ) && is_array( $settings['geo_country_map'] ) ) {
 			unset( $settings['geo_country_map'][ $slug ] );
 		}
 
-		// language_fallbacks: [slug => [fallback_slug, ...]]. Slug appears
-		// as both the outer KEY and inside the nested arrays as VALUES.
+		// language_fallbacks: the slug as key and as value.
 		if ( ! empty( $settings['language_fallbacks'] ) && is_array( $settings['language_fallbacks'] ) ) {
 			unset( $settings['language_fallbacks'][ $slug ] );
 
@@ -954,8 +708,7 @@ final class LanguageRepository implements RepositoryInterface {
 			}
 		}
 
-		// language_domains: [slug => domain] and wc_currencies: [slug => {…}].
-		// Slug as KEY only.
+		// language_domains and wc_currencies: the slug as key.
 		foreach ( [ 'language_domains', 'wc_currencies' ] as $map ) {
 			if ( ! empty( $settings[ $map ] ) && is_array( $settings[ $map ] ) ) {
 				unset( $settings[ $map ][ $slug ] );
@@ -966,24 +719,9 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Change an option that holds an array with a compare-and-set on its
-	 * row, the way write_slug_redirects() changes the redirect map.
-	 *
-	 * The first attempt takes the value from get_option(), which costs no
-	 * statement when the cached copy is current. When $transform leaves the
-	 * array as it is, nothing is written. Otherwise the UPDATE matches only
-	 * while the row still holds exactly the value the change was derived
-	 * from; after a lost comparison the row is read directly and $transform
-	 * applied to it again, a bounded number of times. An option without a
-	 * row, or one that holds no array, is left alone.
-	 *
-	 * Each attempt writes through OptionWriter::compare_and_set(), so the
-	 * option's listeners see what update_option() shows them: the
-	 * pre_update_option filters (whose result is written; a filter that
-	 * gives back the value as read leaves the row alone), the update_option
-	 * action before the write, the options cache updated as update_option()
-	 * updates it, and the update_option_{$option} and updated_option actions
-	 * after it.
+	 * Change an array option with a compare-and-set on its row, as write_slug_redirects() does; through
+	 * OptionWriter::compare_and_set(), so listeners see update_option()'s filters and actions. A missing row or a
+	 * non-array value is left alone.
 	 *
 	 * @param string    $option    Option name.
 	 * @param callable  $transform Returns the array after the change, given the array as read.
@@ -1014,9 +752,7 @@ final class LanguageRepository implements RepositoryInterface {
 				return false;
 			}
 
-			// Written as update_option() writes it, with its filters and
-			// actions (a filter may change or veto the value), but only while
-			// the row still holds what was read.
+			// As update_option() writes it (filters may change or veto), only while the row holds what was read.
 			$written = \PerfLocale\Database\OptionWriter::compare_and_set( $option, $after, $current, $expected, $autoload );
 
 			if ( null !== $written ) {
@@ -1031,9 +767,7 @@ final class LanguageRepository implements RepositoryInterface {
 			$row      = $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, $option ) );
 			$expected = null === $row ? null : (string) $row;
 
-			// The hooks get the old value as get_option() gives it (through
-			// the `option_{$option}` filters), as update_option() passes it;
-			// the change itself is made on the row as stored.
+			// The hooks get the old value through `option_{$option}`, as update_option() passes it; the change is on the row.
 			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound, WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- core's own filter for this option.
 			$current = null === $row ? null : apply_filters( "option_{$option}", maybe_unserialize( (string) $row ), $option );
 		}
@@ -1042,44 +776,29 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Drop what a gone language's slug leaves in options: its entries in
-	 * perflocale_settings and perflocale_exchange_rates, and every slug
-	 * redirect whose key or value it is. Run by delete(), and by
-	 * apply_slug_rename() when the renamed language was deleted meanwhile.
+	 * Drop a gone language's slug from options: perflocale_settings, perflocale_exchange_rates and every redirect naming
+	 * it. Run by delete(), and by apply_slug_rename() when the language was deleted meanwhile.
 	 *
 	 * @param string $slug The slug.
 	 * @return void
 	 */
 	private function drop_slug_options( string $slug ): void {
-		// Strip every settings/option/transient reference that holds the
-		// deleted slug as either a key or a value. Without this, the
-		// inverse of every migration in `migrate_slug_references()` becomes
-		// stale state - the most user-visible offender being
-		// `wc_currencies[$slug]` (per-language currency override silently
-		// stops applying because the slug no longer resolves) and
-		// `language_domains[$slug]` (URL routing reference to nothing).
-		// Both options are written with the compare-and-set of
-		// change_option(): the copy read can be older than the row (the
-		// options list this request loaded, or a settings save, WP-CLI
-		// command or rate sync committed since), and a plain write back would
-		// undo that other write.
+		// Every settings reference holding the slug as key or value, written with change_option()'s compare-and-set: the
+		// copy read can be older than the row, and a plain write would undo another save.
 		$settings_written = $this->change_option(
 			'perflocale_settings',
 			static fn( array $settings ): array => self::settings_without_language( $settings, $slug )
 		);
 
 		if ( $settings_written ) {
-			// Force the in-memory Settings singleton to reload from DB
-			// before any later code in this request reads it.
+			// Reload the Settings singleton before anything later in this request reads it.
 			$plugin = \PerfLocale\Plugin::get_instance();
 			if ( $plugin->has( 'settings' ) ) {
 				$plugin->get( 'settings' )->reset_cache();
 			}
 		}
 
-		// WC auto-fetched exchange rates live in their own option, keyed by
-		// slug. ExchangeRateSync would eventually drop the dead key on its
-		// next sync, but the row sits with a stale slug until then.
+		// WooCommerce's fetched exchange rates, keyed by slug (ExchangeRateSync would drop it only at its next sync).
 		$this->change_option(
 			'perflocale_exchange_rates',
 			static function ( array $rates ) use ( $slug ): array {
@@ -1090,20 +809,8 @@ final class LanguageRepository implements RepositoryInterface {
 			false
 		);
 
-		// Slug 301-redirect map (written by apply_slug_rename(), i.e. both the
-		// rename_slug() path and an Edit-form slug change through update()):
-		// drop every entry
-		// whose key OR value is the deleted slug. An entry pointing AT the slug
-		// would 301 old URLs into a prefix that no longer routes (a permanent
-		// 301→404, worse for SEO than a plain 404), and a stale key adds dead
-		// autoload weight. There is no successor language to remap onto, so the
-		// entries are dropped - old URLs then fall through to normal routing.
-		// The write is the compare-and-set of write_slug_redirects(), so a
-		// cached copy older than the row cannot write back entries the row
-		// no longer has or drop redirects recorded since. A cached copy with
-		// no entry naming the slug is confirmed against the row (one read of
-		// it), as a redirect to the slug recorded since that copy was loaded
-		// is in the row only.
+		// Drop every redirect whose key or value is the slug: one into a dead prefix is a permanent 301 to 404. With the
+		// compare-and-set of write_slug_redirects(), confirmed against the row (a redirect recorded since is only there).
 		$wrote = false;
 
 		$this->write_slug_redirects(
@@ -1129,9 +836,8 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Drop every cached copy of the redirect map: the options list, the
-	 * option's own key, and its entry in the list of missing options, so
-	 * the next read loads the row.
+	 * Drop every cached copy of the redirect map (alloptions, its key, its `notoptions` entry) so the next read loads
+	 * the row.
 	 *
 	 * @return void
 	 */
@@ -1156,11 +862,7 @@ final class LanguageRepository implements RepositoryInterface {
 	 * @return array<mixed>
 	 */
 	private static function redirect_map_after_rename( array $redirects, string $old_slug, string $new_slug ): array {
-		// Compress redirect chains: any existing entry that pointed at the
-		// OLD slug must now point at the NEW slug, so a single 301 lands
-		// the visitor at the final destination instead of chaining
-		// `/old1/ → /old2/ → /new/`. Search engines (notably Google)
-		// devalue chained redirects; SEO-sensitive sites care here.
+		// Compress chains: entries pointing at the old slug point at the new one, so one 301 lands at the end.
 		foreach ( $redirects as $existing_old => $existing_new ) {
 			if ( $existing_new === $old_slug ) {
 				$redirects[ $existing_old ] = $new_slug;
@@ -1169,22 +871,17 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$redirects[ $old_slug ] = $new_slug;
 
-		// The new slug is LIVE from here on, so it must not stay a redirect
-		// SOURCE (an entry left by an earlier rename away from this slug, or
-		// by two languages swapping slugs). Both readers skip an entry whose
-		// source is an active language's slug; the prune keeps it out of the
-		// stored map whether or not this language is active.
+		// The new slug is live: never a redirect source (left by an earlier rename or a slug swap).
 		unset( $redirects[ $new_slug ] );
 
-		// Drop self-mappings (`x => x`) that compression could leave
-		// behind when a slug is renamed back to itself transitively.
+		// Drop self-mappings compression can leave.
 		$redirects = array_filter(
 			$redirects,
 			static fn( $v, $k ) => $v !== $k,
 			ARRAY_FILTER_USE_BOTH
 		);
 
-		// Keep the last 50 redirects to bound the option size.
+		// The last 50 only, to bound the option.
 		if ( count( $redirects ) > 50 ) {
 			$redirects = array_slice( $redirects, -50, null, true );
 		}
@@ -1193,23 +890,9 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Drop every cache layer that denormalises language columns into
-	 * translation-link rows.
-	 *
-	 * The autoloaded eager link map (`perflocale_eager_links_{type}`) caches
-	 * `language_slug` / `language_name` / `language_native_name` alongside
-	 * each link, and get_translations() consults it BEFORE the TTL'd cache -
-	 * so on a site under the map's size caps that option IS the source of
-	 * truth for those columns, and it carries no TTL - only an explicit
-	 * invalidation clears it. CacheManager::flush_all() (the admin
-	 * Clear-cache button and `wp perflocale cache flush`) deletes the five
-	 * options too, but that is an operator's last resort; the write that
-	 * changed the column has to invalidate at the write site or the map stays
-	 * wrong until somebody thinks to clear the cache. A stale slug there is
-	 * user-visible: SitemapIntegration and UrlConverter both gate on
-	 * slug-map membership, so the language silently drops out of hreflang,
-	 * sitemap alternates and the switcher, and its permalinks lose the
-	 * language prefix entirely.
+	 * Drop every cache that copies language columns into link rows: the autoloaded eager map has no TTL and is read
+	 * first, so a stale slug there drops the language from hreflang, sitemap alternates and the switcher until
+	 * invalidated at the write site.
 	 *
 	 * @return void
 	 */
@@ -1221,43 +904,9 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Migrate every slug-as-value / slug-as-key reference outside the
-	 * languages table itself. Called from {@see rename_slug()} so the
-	 * rename atomically updates every place a slug is stored. Coverage:
-	 *
-	 *   KEY-suffix migrations (rename meta_key, value untouched):
-	 *     - `_perflocale_alt_<slug>` post meta          - per-language alt
-	 *     - `_perflocale_caption_<slug>` post meta     - per-language caption
-	 *     - `_perflocale_description_<slug>` post meta - per-language desc
-	 *     - `_perflocale_menu_<slug>` term meta        - linked-menu pointers
-	 *
-	 *   VALUE migrations (rename meta_value, key untouched):
-	 *     - `_perflocale_language` term meta - nav-menu language tag
-	 *     - `_perflocale_language` post meta - WC order language tag
-	 *       (see WooCommerce\EmailTranslation::ORDER_LANG_META)
-	 *     - `_perflocale_language` in `{prefix}wc_orders_meta` - the same tag
-	 *       where WooCommerce actually stores it under High Performance Order
-	 *       Storage, which is the default for new stores
-	 *
-	 *   Option / settings array migrations (KEY and/or VALUE inside arrays):
-	 *     - perflocale_settings.geo_country_map      - slug as VALUE
-	 *     - perflocale_settings.language_fallbacks   - slug as KEY and VALUE
-	 *     - perflocale_settings.language_domains     - slug as KEY
-	 *     - perflocale_settings.wc_currencies        - slug as KEY
-	 *     - perflocale_exchange_rates                - slug as KEY
-	 *
-	 *   User-meta migrations (slug as VALUE inside serialised array):
-	 *     - perflocale_strings_hidden_langs
-	 *     - perflocale_translations_hidden_langs
-	 *
-	 *   Cache invalidation: term-meta and post-meta caches are busted for
-	 *   every term / post whose VALUE row was rewritten - direct
-	 *   $wpdb->update doesn't fire the meta hooks, so without the explicit
-	 *   wp_cache_delete_multiple a persistent-cache backend would keep
-	 *   serving the OLD slug until the natural cache TTL expires.
-	 *
-	 * Translation links / groups / slug_translations
-	 * all reference languages by `language_id` (FK) and do NOT need migrating.
+	 * Move a renamed slug wherever it is stored outside the languages table: per-language meta key suffixes, the
+	 * `_perflocale_language` values (menus, orders incl. HPOS), the settings arrays, exchange rates and user preferences,
+	 * with the caches the direct writes skip. Docs: docs-ai/11-code-rationale.md, "LanguageRepository: what a slug rename migrates".
 	 *
 	 * @param string $old_slug Pre-rename slug.
 	 * @param string $new_slug Post-rename slug.
@@ -1266,11 +915,8 @@ final class LanguageRepository implements RepositoryInterface {
 	private function migrate_slug_references( string $old_slug, string $new_slug ): void {
 		global $wpdb;
 
-		// 1. Attachment meta keys interpolated with slug. A direct UPDATE of
-		// the meta_key column is far cheaper than load-modify-save via
-		// update_post_meta per attachment. The slow-meta-query sniff is a
-		// false positive here: meta_key indexes the WHERE (EXPLAIN: range),
-		// rows are per-language (single digits), admin-only rename path.
+		// 1. Attachment meta keys with the slug: a direct UPDATE of meta_key (indexed range, few rows, admin only), so the
+		// slow-query sniff is a false positive.
 		$post_meta_prefixes = [
 			'_perflocale_alt_',
 			'_perflocale_caption_',
@@ -1288,9 +934,7 @@ final class LanguageRepository implements RepositoryInterface {
 			);
 		}
 
-		// 2. Nav-menu linked-menu term meta. Same pattern; same justification
-		// as above - wp_termmeta.meta_key is indexed, EXPLAIN is a range
-		// seek, row count is one per language, admin-only path.
+		// 2. Linked-menu term meta, the same way.
 		$wpdb->update(
 			$wpdb->termmeta,
 			[ 'meta_key' => '_perflocale_menu_' . $new_slug ],
@@ -1299,11 +943,7 @@ final class LanguageRepository implements RepositoryInterface {
 			[ '%s' ]
 		);
 
-		// 2b. Term meta `_perflocale_language` - VALUE is the slug. A nav menu
-		// tagged with a language stores the slug as the value; without the
-		// rename MenuManager can't match the menu to any active language
-		// (the linked-menus UI shows "None"). SELECT first so we know which
-		// terms to bust in the cache.
+		// 2b. Term meta `_perflocale_language` (a nav menu's language) holds the slug as value; SELECT first for the cache.
 		$affected_term_ids = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT term_id FROM {$wpdb->termmeta} WHERE meta_key = %s AND meta_value = %s",
@@ -1313,10 +953,7 @@ final class LanguageRepository implements RepositoryInterface {
 		);
 
 		if ( ! empty( $affected_term_ids ) ) {
-			// One-shot slug-rename migration; not a hot path. Plugin Check
-			// warns on `meta_value` filtering, but the alternative would
-			// require denormalising into a dedicated table just for this
-			// rare admin operation.
+			// A one-off admin migration: the meta_value warning does not justify a dedicated table.
 			// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 			$wpdb->update(
 				$wpdb->termmeta,
@@ -1330,12 +967,7 @@ final class LanguageRepository implements RepositoryInterface {
 			);
 			// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 
-			// Bust term-meta cache for every touched term - direct
-			// $wpdb->update doesn't fire the meta hooks that invalidate
-			// it. Without this, the rest of this request (and any
-			// persistent-cache backend) would still serve the OLD slug
-			// from get_term_meta(). wp_cache_delete_multiple is WP 6.0+;
-			// fall back to a per-id loop for older versions.
+			// Direct updates fire no meta hooks: delete the term meta caches (wp_cache_delete_multiple() on WP 6.0+).
 			$ids_int = array_map( 'intval', (array) $affected_term_ids );
 
 			if ( function_exists( 'wp_cache_delete_multiple' ) ) {
@@ -1347,11 +979,7 @@ final class LanguageRepository implements RepositoryInterface {
 			}
 		}
 
-		// 2c. Post meta `_perflocale_language` - VALUE is the slug. Currently
-		// only WooCommerce orders carry it (EmailTranslation::ORDER_LANG_META)
-		// so order emails go out in the order's language; without the rename
-		// the match drops and the next status email renders in the site
-		// default. The query is generic, covering any future consumer.
+		// 2c. Post meta `_perflocale_language` (WooCommerce orders, for the order email language); generic for any consumer.
 		$affected_post_ids = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %s",
@@ -1361,8 +989,7 @@ final class LanguageRepository implements RepositoryInterface {
 		);
 
 		if ( ! empty( $affected_post_ids ) ) {
-			// One-shot slug-rename migration; not a hot path (see termmeta
-			// note above).
+			// A one-off admin migration (as the term meta above).
 			// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 			$wpdb->update(
 				$wpdb->postmeta,
@@ -1387,19 +1014,8 @@ final class LanguageRepository implements RepositoryInterface {
 			}
 		}
 
-		// 2d. The SAME tag, in WooCommerce's own order tables. With High
-		// Performance Order Storage an order's meta lives in
-		// `{prefix}wc_orders_meta`, not in postmeta - so 2c above, and the
-		// docblock's claim to cover the WC order language tag, missed every
-		// order on an HPOS store. Measured on a development store: 11 rows in
-		// wc_orders_meta against 1 in postmeta. The consequence of missing them
-		// is silent: the rename succeeds, the tag still holds the OLD slug,
-		// detect_order_language() stops matching, and every later status email
-		// for those orders goes out in the site default language.
-		//
-		// Runs whenever the table exists rather than gating on the HPOS toggle,
-		// because in compatibility mode both tables hold the value and both have
-		// to move together.
+		// 2d. The same tag in `{prefix}wc_orders_meta`, where HPOS stores it; whenever the table exists, as compatibility
+		// mode keeps both copies. Missed, later status emails go out in the default language.
 		$orders_meta = $wpdb->prefix . 'wc_orders_meta';
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value
@@ -1427,30 +1043,15 @@ final class LanguageRepository implements RepositoryInterface {
 					[ '%s', '%s' ]
 				);
 
-				// Mirror WooCommerce's own invalidation for a direct meta write
-				// (OrdersTableDataStore::update_order_meta_data), plus the cached
-				// order object itself - a direct UPDATE fires none of the hooks
-				// that would otherwise clear either.
-				//
-				// The order OBJECT is not cached under its bare id. WooCommerce's
-				// ObjectCache namespaces the key (wc_cache_<prefix>_<id>), so
-				// wp_cache_delete( $oid, 'orders' ) deletes a key nothing ever
-				// wrote. On a store with a persistent object cache and HPOS -
-				// where order caching is on by default - WC_Order_Factory::get_order()
-				// then keeps returning an order whose meta still carries the OLD
-				// slug for up to an hour, and every status email for those orders
-				// goes out in the site default language: exactly the failure this
-				// rename exists to prevent, arriving via the cache instead of the
-				// table. Go through WooCommerce's own OrderCache so the key is
-				// built the same way it was written. Resolved once, outside the
-				// loop - the container lookup is the cost, not remove().
+				// As WooCommerce invalidates a direct meta write, plus the cached order object through its own OrderCache (the keys
+				// are namespaced: deleting the bare id deletes nothing and the old slug stays served for an hour).
 				$order_cache = null;
 
 				if ( function_exists( 'wc_get_container' ) && class_exists( \Automattic\WooCommerce\Caches\OrderCache::class ) ) {
 					try {
 						$order_cache = wc_get_container()->get( \Automattic\WooCommerce\Caches\OrderCache::class );
 					} catch ( \Throwable $e ) {
-						$order_cache = null;   // container not booted, or the class is not registered
+						$order_cache = null;   // Container not booted, or the class not registered.
 					}
 				}
 
@@ -1463,28 +1064,22 @@ final class LanguageRepository implements RepositoryInterface {
 						$order_cache->remove( $oid );
 					}
 
-					// Kept as the documented fallback for a WooCommerce old enough
-					// to lack OrderCache, and harmless otherwise.
+					// For a WooCommerce without OrderCache; harmless otherwise.
 					wp_cache_delete( $oid, 'orders' );
 				}
 			}
 		}
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 
-		// 3. Plugin settings and 4b. WooCommerce auto-fetched exchange rates
-		// (a dedicated option keyed by slug: without it the renamed language
-		// gets no rate until the next ExchangeRateSync run, so prices fall
-		// back to 1:1 conversion). Both are written with the compare-and-set
-		// of change_option(), so a settings save, WP-CLI command or rate sync
-		// committed after the option was read is not undone.
+		// 3. Settings and 4b. WooCommerce's fetched exchange rates (else 1:1 until the next sync), both with the
+		// compare-and-set of change_option(), so a save committed since the read is not undone.
 		$settings_written = $this->change_option(
 			'perflocale_settings',
 			static fn( array $settings ): array => self::settings_after_rename( $settings, $old_slug, $new_slug )
 		);
 
 		if ( $settings_written ) {
-			// Force the in-memory Settings singleton to reload from DB
-			// before any code reads it again in this request.
+			// Reload the Settings singleton before anything reads it again in this request.
 			$plugin = \PerfLocale\Plugin::get_instance();
 			if ( $plugin->has( 'settings' ) ) {
 				$plugin->get( 'settings' )->reset_cache();
@@ -1504,18 +1099,15 @@ final class LanguageRepository implements RepositoryInterface {
 			false
 		);
 
-		// 4. Per-user hidden-langs arrays (Strings + Translations admin
-		// column visibility). Stored as `[slug, slug, ...]` in user
-		// meta. Walk via direct query so we touch only the rows that
-		// contain the old slug; full users-table scan would be wasteful.
-		// Network-wide per user, like the delete-time sweep: see delete().
+		// 4. Per-user hidden-language arrays (Strings and Translations columns): only the rows holding the slug; network-wide
+		// per user, as delete()'s sweep.
 		$user_meta_keys = [
 			'perflocale_strings_hidden_langs',
 			'perflocale_translations_hidden_langs',
 		];
 
 		foreach ( $user_meta_keys as $meta_key ) {
-			// One-shot per-meta-key scan during slug-rename migration.
+			// One-off per-key scan.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			$rows = $wpdb->get_results(
 				$wpdb->prepare(
@@ -1558,9 +1150,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Read the persisted slug-redirect map. Frontend redirect handler
-	 * consumes this on every request; kept O(1) by storing in a single
-	 * option row (not a custom table).
+	 * The slug redirect map, read by the front-end redirect on every request (one autoloaded option).
 	 *
 	 * @return array<string, string> [old_slug => new_slug]
 	 */
@@ -1569,26 +1159,22 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Option key for the slug-redirect map. Public-ish constant so
-	 * uninstall code can clean it up by name without depending on the
-	 * full repository class loading.
+	 * Option of the slug redirect map, public so uninstall can delete it without loading this class.
 	 */
 	public const REDIRECTS_OPTION = 'perflocale_slug_redirects';
 
 	/**
-	 * Writes of the redirect map tried before a rename gives up, each after
-	 * a lost compare-and-set re-reads the row.
+	 * Redirect map writes a rename tries, each after a lost compare-and-set re-reads the row.
 	 */
 	private const REDIRECT_WRITE_ATTEMPTS = 5;
 
 	/**
-	 * Writes of an option tried by change_option() before it gives up, each
-	 * after a lost compare-and-set re-reads the row.
+	 * Option writes change_option() tries, each after a lost compare-and-set re-reads the row.
 	 */
 	private const OPTION_CAS_ATTEMPTS = 5;
 
 	/**
-	 * Update an existing language.
+	 * Update a language.
 	 *
 	 * @param int $id Language ID.
 	 * @param array<string, mixed> $data Data to update.
@@ -1603,61 +1189,29 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$sanitized = self::sanitize_data( $data );
 
-		// sanitize_data() whitelists `slug`, and the Edit Language form
-		// renders the Slug field editable - so a rename can arrive here and
-		// not only through rename_slug(). Both sides have to be read before
-		// the write, while $old is still the pre-write row.
+		// The Edit form's slug field is editable, so a rename can arrive here: read both sides before the write.
 		$before   = (array) $old;
 		$old_slug = isset( $before['slug'] ) && is_string( $before['slug'] ) ? $before['slug'] : '';
 		$new_slug = isset( $sanitized['slug'] ) && is_string( $sanitized['slug'] ) ? $sanitized['slug'] : '';
 
-		// Any change to the stored slug invalidates the eager link map, which
-		// denormalises language_slug into every link row of this language.
+		// Any slug change invalidates the eager map (it holds language_slug in every link row of this language).
 		$slug_differs = isset( $sanitized['slug'] ) && $new_slug !== $old_slug;
 
-		// Only a move BETWEEN two real slugs is a rename, though. The Edit
-		// Language form posts an absent Slug field as '' and sanitize_data()
-		// keeps the key, so a row can legitimately hold slug='' - and without
-		// the $old_slug guard the next ordinary edit would treat that as a
-		// rename: it would record a 301 keyed by the empty string, permanently
-		// occupying a slot in the autoloaded 50-entry map that SlugRedirector
-		// can never fire (its candidate regex demands 2-3 letters), and run
-		// migrate_slug_references('', …), whose usermeta needle degenerates to
-		// LIKE '%%' and reads every row of both hidden-langs meta keys. The
-		// empty-slug cases still fall through to the cache flush below.
+		// Only a move between two real slugs is a rename: an empty side would record a 301 keyed by '' that never fires
+		// and run the migration with a LIKE '%%'.
 		$slug_changed = $slug_differs && $old_slug !== '' && $new_slug !== '';
 
-		// A slug MOVE has to clear the same routing-shape bar rename_slug()
-		// enforces, or the Edit form becomes a back door to a language the
-		// plugin cannot address: `/wp-json/perflocale/v1/languages/<slug>`
-		// and the machine-translate route only match SLUG_PATTERN, and
-		// SlugRedirector never fires the 301 recorded below for a prefix
-		// outside it. Deliberately narrower than rename_slug()'s guard on
-		// two counts, so no site can be locked out of its own Edit screen:
-		// the check only fires on a CHANGE (re-posting a legacy slug the
-		// form already shows keeps saving), and it leaves the
-		// slug-blanked-to-'' direction to the $slug_changed guard above,
-		// which has always tolerated it.
+		// A changed slug must match SLUG_PATTERN, as rename_slug() demands; an unchanged legacy slug keeps saving, so no
+		// site is locked out of its Edit screen.
 		if ( $slug_differs && $new_slug !== '' && ! preg_match( self::SLUG_PATTERN, $new_slug ) ) {
 			return false;
 		}
 
-		// The slug is not the only column the eager link map denormalises: the
-		// display name and the native name ride along on every cached link
-		// row, so editing either one leaves the language switcher labelling
-		// links from a stale alloptions snapshot.
+		// Name and native name ride on every cached link row too.
 		$labels_changed = ( isset( $sanitized['name'] ) && $sanitized['name'] !== ( $before['name'] ?? null ) )
 			|| ( isset( $sanitized['native_name'] ) && $sanitized['native_name'] !== ( $before['native_name'] ?? null ) );
 
-		// Activating or deactivating a language changes which languages the
-		// front end may route to, and update() is the only write path that
-		// can do it - the REST PATCH sends `is_active` on its own, with no
-		// slug or label alongside, so neither guard above sees it. Every
-		// other language-mutating write in this class (rename, delete) drops
-		// the eager link map; without this one an activity toggle leaves the
-		// map - the single denormalised copy of the languages table that
-		// carries NO TTL - as the last writer built it, and only a manual
-		// Clear-cache ever rebuilds it.
+		// An is_active toggle (the REST PATCH sends it alone) changes routing: drop the eager map too, which has no TTL.
 		$active_changed = isset( $sanitized['is_active'] )
 			&& (int) $sanitized['is_active'] !== (int) ( $before['is_active'] ?? 0 );
 
@@ -1673,21 +1227,13 @@ final class LanguageRepository implements RepositoryInterface {
 		$this->cache->flush_languages();
 		$this->cache->delete( "language_{$id}", 'perflocale_langs' );
 
-		// Gated on $result so a UNIQUE-index collision on slug/locale - the
-		// update returns false and nothing was written - can't record a 301
-		// for a rename that never landed.
+		// Only after a successful update, so a UNIQUE collision records no 301 for a rename that did not land.
 		if ( $result !== false ) {
 			if ( $slug_changed ) {
 				$this->apply_slug_rename( $id, $old_slug, $new_slug );
 			} elseif ( $labels_changed || $active_changed || $slug_differs ) {
-				// $slug_differs without $slug_changed is an empty slug on one
-				// side: no 301 to record and nothing to migrate, but the eager
-				// map still has the previous value baked into this language's
-				// link rows and has to go. A slug filled in from empty is also
-				// newly live, so it gets the same redirect-source prune as
-				// insert() (a no-op for the blanking direction). An is_active
-				// flip reaches the same flush with $new_slug === '' (the REST
-				// PATCH carries no slug), so the prune is a no-op there.
+				// An empty slug on one side: no 301 or migration, but the eager map goes; a slug filled in from empty is newly live
+				// and pruned as a redirect source (a no-op otherwise).
 				$this->drop_stale_slug_redirect( $new_slug );
 				$this->flush_translation_link_caches();
 			}
@@ -1702,15 +1248,8 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Bulk-rewrite the `sort_order` column for the given list of IDs in
-	 * positional order. Returns the number of rows actually updated.
-	 *
-	 * Driven by the drag-handle reorder UI on the Languages list. The
-	 * `$offset` parameter lets the caller renumber a paginated slice without
-	 * disturbing rows on other pages - page 2 (offset=20) reordering its
-	 * 20 rows assigns sort_orders 21..40 instead of clobbering page 1's
-	 * range. Validates every supplied ID exists before issuing any write
-	 * so a stray request with one bogus ID can't half-apply.
+	 * Rewrite sort_order for these ids in their order, starting at `$offset + 1` (a paginated slice keeps other pages'
+	 * range). Every id is validated before any write, so a bogus one cannot half-apply.
 	 *
 	 * @param array<int, int> $ordered_ids Language IDs in their new visual order.
 	 * @param int             $offset      Starting position (0-based). Sort orders begin at `offset + 1`.
@@ -1723,13 +1262,12 @@ final class LanguageRepository implements RepositoryInterface {
 			return 0;
 		}
 
-		// Validate: every ID must exist. Drop duplicates while we're at it.
+		// Every id must exist; duplicates dropped.
 		$ordered_ids  = array_values( array_unique( $ordered_ids ) );
 		$placeholders = implode( ',', array_fill( 0, count( $ordered_ids ), '%d' ) );
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		// $this->table() is class-owned; $placeholders is built by array_fill
-		// from validated int IDs.
+		// Class-owned table, placeholders from validated int ids.
 		$existing = (array) $this->wpdb->get_col(
 			$this->wpdb->prepare( "SELECT id FROM %i WHERE id IN ($placeholders)", array_merge( [ $this->table() ], $ordered_ids ) )
 		);
@@ -1741,8 +1279,7 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$offset = max( 0, $offset );
 
-		// Single UPDATE … CASE id WHEN … END collapses the per-row update
-		// loop (one query per language) into a single round-trip.
+		// One UPDATE ... CASE id WHEN ... END instead of one query per language.
 		$cases = [];
 		$args  = [];
 
@@ -1754,11 +1291,7 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$args = array_merge( $args, $ordered_ids );
 
-		// $cases is built from the literal string 'WHEN %d THEN %d' (lines
-		// above), $placeholders from array_fill('%d', N), $this->table() is
-		// class-owned. All parts are plugin-controlled, never user input;
-		// $args carries the int values prepare() substitutes into the
-		// placeholders.
+		// Every part is plugin-built ('WHEN %d THEN %d', array_fill('%d')); $args carries the ints.
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$result = $this->wpdb->query(
 			$this->wpdb->prepare(
@@ -1768,9 +1301,7 @@ final class LanguageRepository implements RepositoryInterface {
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// `flush_languages()` group-flushes `perflocale_langs`, which already
-		// nukes every per-id `language_<id>` entry. No need to delete them
-		// individually first.
+		// flush_languages() clears the whole group, per-id entries included.
 		$updated = $result === false ? 0 : count( $ordered_ids );
 
 		$this->cache->flush_languages();
@@ -1782,12 +1313,8 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Count the rows that delete() would cascade-remove for a language.
-	 *
-	 * Read-only mirror of the delete() cascade WHEREs - used by the
-	 * Languages page delete-preview screen so the operator sees exactly
-	 * what one click destroys BEFORE confirming. Each key matches one
-	 * cascade step in delete(); keep the two in sync when adding steps.
+	 * Count what delete() would remove for a language, for the delete preview: each key mirrors one cascade step of
+	 * delete(); keep the two in step.
 	 *
 	 * @param int $id Language ID.
 	 * @return array<string, int> Table-ish label => row count.
@@ -1801,9 +1328,7 @@ final class LanguageRepository implements RepositoryInterface {
 			'translation_links'   => (int) $this->wpdb->get_var(
 				$this->wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE language_id = %d', $links_table, $id )
 			),
-			// Groups that would become empty once this language's links go -
-			// the same set delete()'s orphan-group GC removes (it sweeps
-			// groups left with zero links, excluding 'string' groups).
+			// Groups left empty once this language's links go, as delete()'s group GC removes them (string groups excluded).
 			'translation_groups'  => (int) $this->wpdb->get_var(
 				$this->wpdb->prepare(
 					"SELECT COUNT(*) FROM %i g
@@ -1830,35 +1355,9 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Count the content that blocks deleting a language.
-	 *
-	 * Deleting a language removes its translation links but keeps the linked
-	 * objects. Everything WooCommerce shares across a translation group (one
-	 * stock, the SKU / GTIN exemption between siblings) is keyed on those links,
-	 * and an unlinked post is served as default-language content, so the
-	 * language's posts would turn into default-language duplicates with split
-	 * stock. The admin, REST and CLI delete entry points therefore refuse while
-	 * this reports any post: the operator moves those posts to the Trash (a
-	 * trashed product holds no SKU and cannot be bought) or deactivates the
-	 * language instead (an inactive language keeps every link).
-	 *
-	 * Not called inside delete(): fixtures and scenarios use delete() to remove
-	 * languages that still have links.
-	 *
-	 * One grouped COUNT over the language's links. translation_groups.type is
-	 * the authority on what a link points at (links written before
-	 * translation_links.type existed carry it empty). Posts in the Trash or
-	 * auto-drafts do not block, and neither does a link whose post is gone.
-	 * Attachments and terms are reported for information only: terms have no
-	 * Trash, and an unlinked media copy serves nothing on its own.
-	 *
-	 * Block theme templates and template parts are reported for information
-	 * only too. Every template save seeds a draft copy in each active language
-	 * (BlockTemplateSupport::ensure_translations_exist()), so counting them
-	 * would block the delete of any language on a site that translates its
-	 * templates. Core finds a template by its slug, and a copy's slug carries
-	 * the language suffix (BlockTemplateSupport::translation_slug()), so an
-	 * unlinked copy never takes the place of the original.
+	 * Count the content that blocks deleting a language: its posts, which would become default-language duplicates with
+	 * split WooCommerce stock (trash them or deactivate the language). Attachments, terms and templates are reported
+	 * only. Docs: docs-ai/11-code-rationale.md, "LanguageRepository: deleting a language".
 	 *
 	 * @param int $id Language ID.
 	 * @return array{posts: array<string, int>, attachments: int, terms: int, templates: int}|null
@@ -1916,7 +1415,7 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Delete a language.
+	 * Delete a language and everything that references it.
 	 *
 	 * @param int $id Language ID.
 	 * @return bool
@@ -1928,14 +1427,8 @@ final class LanguageRepository implements RepositoryInterface {
 			return false;
 		}
 
-		// Wrap every FK-cascade DELETE in one transaction so a script
-		// timeout / OOM / dropped connection mid-cleanup can't leave the
-		// site in the orphan state (languages row gone, but tens of
-		// thousands of translation_links / slug_translations rows still
-		// referencing its language_id). Same shape as set_default()'s transactional
-		// pattern. On any DELETE failure or exception we ROLLBACK and
-		// return false - the operator sees the failed action and can
-		// retry; nothing is half-applied.
+		// Every cascade DELETE in one transaction, so a timeout or lost connection cannot leave links pointing at a removed
+		// language; any failure rolls back and returns false (as set_default()).
 		$links_table  = Schema::table( 'translation_links' );
 		$groups_table = Schema::table( 'translation_groups' );
 		$slug_table   = Schema::table( 'slug_translations' );
@@ -1945,19 +1438,13 @@ final class LanguageRepository implements RepositoryInterface {
 		$this->wpdb->query( 'START TRANSACTION' );
 
 		try {
-			// The slug the row holds now, read under a row lock: a slug
-			// rename committed since find() read the language is seen here,
-			// and one that has not reached the row waits for this
-			// transaction, then matches no row and cleans up after itself
-			// (apply_slug_rename()). The clean-up below goes by this slug.
+			// The slug as the row holds it, under a row lock: a concurrent rename is seen here or waits and cleans up after itself.
 			$wpdb = $this->wpdb;
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$slug_now = $wpdb->get_var( $wpdb->prepare( 'SELECT slug FROM %i WHERE id = %d FOR UPDATE', $this->table(), $id ) );
+			// Row lock on MySQL only (see ConnectionGuard::lock_suffix()).
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table bound with %i; the lock suffix is a literal.
+			$slug_now = $wpdb->get_var( $wpdb->prepare( 'SELECT slug FROM %i WHERE id = %d' . \PerfLocale\Database\ConnectionGuard::lock_suffix(), $this->table(), $id ) );
 
-			// Nothing is deleted after a failed read: on the SQLite Database
-			// Integration a failed statement has already ended the
-			// transaction, and every statement after it would commit on its
-			// own. A row that is gone was deleted by another request.
+			// Nothing deleted after a failed read (SQLite ended the transaction); a gone row was deleted by another request.
 			if ( '' !== $wpdb->last_error ) {
 				throw new \RuntimeException( 'delete_language: failed to read the languages row' );
 			}
@@ -1982,16 +1469,13 @@ final class LanguageRepository implements RepositoryInterface {
 				throw new \RuntimeException( 'delete_language: failed to delete translation_links' );
 			}
 
-			// Garbage-collect now-empty non-string groups (single-language
-			// groups, or groups where every sibling-language link was also
-			// deleted earlier). One pass, no widow rows.
+			// Remove the non-string groups left empty, in one pass. One table per DELETE: the SQLite integration's 2.2.x legacy
+			// driver rejects `DELETE g FROM` and mishandles a JOIN.
 			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			if ( false === $this->wpdb->query(
 				$this->wpdb->prepare(
-					"DELETE g FROM %i g
-					LEFT JOIN %i l ON l.group_id = g.id
-					WHERE l.id IS NULL AND g.type != 'string'",
+					"DELETE FROM %i WHERE type != 'string' AND id NOT IN ( SELECT group_id FROM %i )",
 					$groups_table,
 					$links_table
 				)
@@ -1999,16 +1483,10 @@ final class LanguageRepository implements RepositoryInterface {
 				throw new \RuntimeException( 'delete_language: failed to garbage-collect orphan translation_groups' );
 			}
 
-			// String translations table - uses the same $wpdb connection,
-			// so its DELETE participates in our transaction.
+			// Same connection, so part of the transaction.
 			( new StringTranslationRepository( $this->cache ) )->delete_for_language( $id );
 
-			// Capture per-row identifiers BEFORE the slug DELETE so we can
-			// targeted-invalidate the L2 persistent cache after commit.
-			// get_results returns null on "no rows", false on SQL error - we
-			// need to distinguish so a failed SELECT doesn't silently produce
-			// a bogus [false] from `(array) false` and crash the post-commit
-			// invalidation loop.
+			// The slug rows' identifiers before their DELETE, for the cache invalidation after the commit.
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 			$slug_rows_raw = $this->wpdb->get_results(
 				$this->wpdb->prepare(
@@ -2017,8 +1495,7 @@ final class LanguageRepository implements RepositoryInterface {
 					$id
 				)
 			);
-			// get_results() answers a failed read with an empty result, not false;
-			// last_error tells them apart (wpdb clears it at the start of every query).
+			// A failed read answers []: last_error decides.
 			if ( $slug_rows_raw === false || '' !== $this->wpdb->last_error ) {
 				throw new \RuntimeException( 'delete_language: failed to capture slug rows for cache invalidation' );
 			}
@@ -2032,8 +1509,7 @@ final class LanguageRepository implements RepositoryInterface {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			if ( false === $this->wpdb->query( 'COMMIT' ) ) {
-				// COMMIT failed (server already rolled back) - report failure
-				// rather than flushing caches and returning success below.
+				// A failed COMMIT means the server rolled back: report failure.
 				return false;
 			}
 		} catch ( \Throwable $e ) {
@@ -2042,63 +1518,36 @@ final class LanguageRepository implements RepositoryInterface {
 			return false;
 		}
 
-		// Cascade migration-source-map rows whose group was just GC'd (the
-		// group-delete path does this via TGR; this inline GC would otherwise
-		// strand source_map rows pointing at deleted group_ids). Best-effort:
-		// orphan map rows are already neutralised at read by the importer's
-		// dead-group guard, so a failure here must NOT abort the language
-		// delete. Self-heals any pre-existing dangling rows too. Run after the
-		// commit, outside the transaction: inside it a failed statement would
-		// end the transaction on the SQLite Database Integration.
+		// Source-map rows of the removed groups, best effort and after the commit (inside, a failure ends the transaction on
+		// SQLite); the importer's dead-group guard covers any left.
 		$source_map_table = Schema::table( 'migration_source_map' );
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->query(
 			$this->wpdb->prepare(
-				'DELETE m FROM %i m
-				LEFT JOIN %i g ON g.id = m.group_id
-				WHERE g.id IS NULL',
+				'DELETE FROM %i WHERE group_id NOT IN ( SELECT id FROM %i )',
 				$source_map_table,
 				$groups_table
 			)
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		// Per-row L2 invalidation. The cache key shape mirrors
-		// SlugTranslationRepository::get_slug(): "slug_{type}_{id}_{lang}",
-		// group 'perflocale_slugs'.
+		// Per-row L2 keys as SlugTranslationRepository::get_slug() builds them: "slug_{type}_{id}_{lang}" in 'perflocale_slugs'.
 		foreach ( (array) $slug_rows as $slug_row ) {
 			$cache_key = sprintf( 'slug_%s_%d_%d', (string) $slug_row->object_type, (int) $slug_row->object_id, $id );
 			$this->cache->delete( $cache_key, 'perflocale_slugs' );
 		}
 
-		// L1 / L3 / zero-state cleanup. The persistent L2 was just handled
-		// per-row above; flush_slugs() still cleans the static memo and
-		// the L3 transient envelopes which were never per-row tracked.
+		// L1, L3 and the zero-state flag (L2 was done per row).
 		$this->cache->flush_slugs();
 		SlugTranslationRepository::reset_static_caches();
 
-		// Translation-link caches. The language's link rows + any now-empty
-		// groups were removed inside the transaction, but the autoloaded eager
-		// link map (perflocale_eager_links_*) and the per-object translations_*
-		// caches still reference the dead links - so get_translations(), the
-		// hreflang block and the language switcher would keep advertising a URL
-		// for the removed language until an unrelated link write rebuilt the
-		// map. Mirror the slug cleanup above for the translation-link layer.
+		// The eager map and translations_* caches still hold the removed links (hreflang, the switcher).
 		$this->flush_translation_link_caches();
 
-		// Everything in this block is keyed by the language slug. For a code
-		// of '' the meta keys collapse to their bare prefixes and core reads a
-		// '' meta value as "any value", so the `_perflocale_language` sweep
-		// would untag every nav menu and the hidden-langs scan would read every
-		// user's row. Skip the block for an empty code.
+		// Everything here is keyed by the slug; with '' the meta sweeps would match every row: skipped.
 		if ( '' !== (string) $language->slug ) {
-			// Per-language attachment + nav-menu meta is keyed by the language
-			// slug, not its id, so it isn't caught by the FK cascades above and
-			// would linger as dead data (and auto-re-link if the slug is re-added).
-			// Use delete_metadata( $type, 0, $key, '', true ) - the "delete every
-			// row matching $key" core API - not a raw $wpdb->delete(), so the
-			// per-object meta cache is busted alongside the row.
+			// Slug-keyed attachment and menu meta, through delete_metadata( $type, 0, $key, '', true ) so the meta caches go too.
 			$post_meta_prefixes = [
 				'_perflocale_alt_',
 				'_perflocale_caption_',
@@ -2111,39 +1560,18 @@ final class LanguageRepository implements RepositoryInterface {
 
 			delete_metadata( 'term', 0, '_perflocale_menu_' . $language->slug, '', true );
 
-			// `_perflocale_language` term meta stores the slug as the VALUE (one
-			// row per nav-menu term). On delete the rows must go entirely, else
-			// menus stay tagged with a slug that no longer resolves. Passing the
-			// slug as $meta_value + $delete_all=true removes every matching
-			// termmeta row (and busts cache per affected term).
+			// `_perflocale_language` term meta holds the slug as value: remove every row with it.
 			delete_metadata( 'term', 0, '_perflocale_language', $language->slug, true );
 
-			// Per-user `hidden_langs` arrays (Strings + Translations admin
-			// column visibility) may still list the deleted slug. Mirror the
-			// rename-time logic in `migrate_slug_references()` but REMOVE the
-			// entry instead of replacing it. Targeted SELECT on `meta_value
-			// LIKE '%slug%'` keeps the row scan small (only users who have
-			// hidden some column) and avoids a full users-table walk.
-			//
-			// These keys are unprefixed user meta, so on a network one array per
-			// user serves every site, as core's own column preferences do:
-			// removing the slug here also un-hides its column on other sites that
-			// still have that slug. Every Screen Options save already rewrites the
-			// whole array from the current site's languages, so a per-site scope
-			// would need blog-prefixed keys (update_user_option()), not a
-			// narrower sweep.
+			// Hidden-language user meta, as the rename does but removing the slug, only rows containing it. Unprefixed, so on a
+			// network one array per user serves every site (as core's column preferences).
 			$user_meta_keys = [
 				'perflocale_strings_hidden_langs',
 				'perflocale_translations_hidden_langs',
 			];
 
 			foreach ( $user_meta_keys as $meta_key ) {
-				// $this->wpdb->usermeta is the WordPress core usermeta table name,
-				// supplied by wpdb itself. The $meta_key and language slug are
-				// passed through prepare()'s %s placeholders below. Plugin Check
-				// can't trace the wpdb-supplied table name through dynamic
-				// property access, so we wrap the whole prepare() in a block-
-				// scoped disable.
+				// usermeta is core's own table; the key and slug go through %s.
 				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 				$rows = $this->wpdb->get_results(
 					$this->wpdb->prepare(
@@ -2183,10 +1611,7 @@ final class LanguageRepository implements RepositoryInterface {
 		// The settings, exchange rates and slug redirects that name the slug.
 		$this->drop_slug_options( is_string( $language->slug ) ? $language->slug : '' );
 
-		// Generated .l10n.php translation files for this language's locale
-		// stay on disk indefinitely otherwise. Filename pattern is
-		// `<domain>-<locale>.l10n.php` (matches what TranslationFileGenerator
-		// writes), so glob by locale strips every domain in one pass.
+		// The generated `<domain>-<locale>.l10n.php` files of this locale.
 		$locale = isset( $language->locale ) ? (string) $language->locale : '';
 
 		if ( $locale !== '' ) {
@@ -2212,20 +1637,15 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Set a language as the default (unsets the current default).
+	 * Make a language the default (unsetting the current one).
 	 *
 	 * @param int $id Language ID to make default.
 	 * @return bool
 	 * @throws \RuntimeException When the unset-default or set-default UPDATE fails inside the transaction.
 	 */
 	public function set_default( int $id ): bool {
-		// Reject a nonexistent OR inactive target BEFORE mutating. $wpdb->update()
-		// returns 0 (not false) when the WHERE matches no row, so the "set new
-		// default" UPDATE wouldn't throw - it would just unset the old default and
-		// set nothing, leaving the site with ZERO default languages. An inactive
-		// target is just as bad: get_default() reads the active-only bootstrap, so
-		// a default that isn't active resolves to NULL (breaking filter_locale /
-		// is_default_language / the switcher). All callers promote active langs.
+		// Refuse a missing or inactive target first: update() answers 0 for no match, which would leave no default, and an
+		// inactive default reads as null.
 		$target = $this->find( $id );
 
 		if ( $target === null || empty( $target->is_active ) ) {
@@ -2235,16 +1655,12 @@ final class LanguageRepository implements RepositoryInterface {
 		$old_default    = $this->get_default();
 		$old_default_id = $old_default ? (int) $old_default->id : 0;
 
-		// Wrap both UPDATEs in a transaction so a DB hiccup between them
-		// can't leave the site with zero default languages (which would
-		// break filter_locale, is_default_language, and the language
-		// switcher until manually fixed).
+		// Both UPDATEs in one transaction, so a failure between them cannot leave the site without a default.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$this->wpdb->query( 'START TRANSACTION' );
 
 		try {
-			// Unset every current default: any non-zero value is one, as the
-			// readers count it.
+			// Unset every default (any non-zero value, as readers count it).
 			$unset_sql = $this->wpdb->prepare( 'UPDATE %i SET is_default = 0 WHERE is_default <> 0', $this->table() );
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Prepared on the line above.
 			$unset_ok = is_string( $unset_sql ) ? $this->wpdb->query( $unset_sql ) : false;
@@ -2253,7 +1669,7 @@ final class LanguageRepository implements RepositoryInterface {
 				throw new \RuntimeException( 'set_default: failed to unset current default' );
 			}
 
-			// Set new default.
+			// The new default.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$set_ok = $this->wpdb->update(
 				$this->table(),
@@ -2263,19 +1679,14 @@ final class LanguageRepository implements RepositoryInterface {
 				[ '%d' ]
 			);
 
-			// Reject false (DB error) AND 0 rows affected: if the target row was
-			// deleted between the guard above and this UPDATE (a concurrent
-			// delete), `is_default=1 WHERE id=$id` matches nothing, the old
-			// default was already unset, and committing would leave ZERO
-			// defaults. A legitimate promotion always changes exactly one row.
+			// False or 0 rows: the target went meanwhile (a concurrent delete), and committing would leave no default.
 			if ( $set_ok === false || (int) $set_ok < 1 ) {
 				throw new \RuntimeException( 'set_default: failed to set new default' );
 			}
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			if ( false === $this->wpdb->query( 'COMMIT' ) ) {
-				// COMMIT failed (server already rolled back) - report failure
-				// rather than flushing caches and returning success below.
+				// A failed COMMIT means the server rolled back: report failure.
 				return false;
 			}
 		} catch ( \Throwable $e ) {
@@ -2286,7 +1697,7 @@ final class LanguageRepository implements RepositoryInterface {
 
 		$this->cache->flush_languages();
 
-		// Flush individual language caches so the is_default flag is refreshed.
+		// Flush the per-language caches so is_default is fresh.
 		if ( $old_default_id > 0 ) {
 			$this->cache->delete( "language_{$old_default_id}", 'perflocale_langs' );
 		}
@@ -2302,12 +1713,8 @@ final class LanguageRepository implements RepositoryInterface {
 	}
 
 	/**
-	 * Sanitize language data for insert/update.
-	 *
-	 * Public so the JSON data import can store a language row from a user
-	 * without `unfiltered_html` exactly as this repository would, rather than
-	 * through a copy of these rules. It sanitizes only; the slug-shape check
-	 * stays in insert() and update().
+	 * Sanitize language data for insert and update; public so the data import stores an untrusted user's language row
+	 * by these rules. Sanitizes only: the slug shape is checked by insert() and update().
 	 *
 	 * @internal
 	 *
@@ -2332,10 +1739,7 @@ final class LanguageRepository implements RepositoryInterface {
 			}
 		}
 
-		// Ensure slug is lowercase and enforce the schema column length
-		// (VARCHAR(10)) so callers see an explicit value rather than a
-		// silent MySQL truncation. Long unicode slugs are trimmed, not
-		// rejected - mirrors the existing forgiving sanitisation style.
+		// Lowercase, trimmed to the VARCHAR(10) column, so callers see the stored value, not a silent truncation.
 		if ( isset( $sanitized['slug'] ) ) {
 			$sanitized['slug'] = mb_substr( sanitize_key( $sanitized['slug'] ), 0, 10 );
 		}
@@ -2348,7 +1752,7 @@ final class LanguageRepository implements RepositoryInterface {
 			$sanitized['flag'] = mb_substr( $sanitized['flag'], 0, 10 );
 		}
 
-		// Validate text direction.
+		// Text direction.
 		if ( isset( $sanitized['text_direction'] ) && ! in_array( $sanitized['text_direction'], [ 'ltr', 'rtl' ], true ) ) {
 			$sanitized['text_direction'] = 'ltr';
 		}
