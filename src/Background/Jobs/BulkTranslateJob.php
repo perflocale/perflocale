@@ -12,6 +12,7 @@ namespace PerfLocale\Background\Jobs;
 use PerfLocale\Background\AbstractJob;
 use PerfLocale\MachineTranslation\CallDeadline;
 use PerfLocale\MachineTranslation\DeadlineReachedException;
+use PerfLocale\MachineTranslation\NotSavedException;
 use PerfLocale\MachineTranslation\TargetLanguageGuard;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
@@ -74,9 +75,9 @@ final class BulkTranslateJob extends AbstractJob {
 	private int $cut = -1;
 
 	/**
-	 * Translations marked pending (TranslationService::PENDING_META_KEY), read once per run.
+	 * Translations marked pending (TranslationService::PENDING_META_KEY), read once per run: pending_translations().
 	 *
-	 * @var array<int, bool>|null
+	 * @var array<int, bool|null>|null
 	 */
 	private ?array $pending = null;
 
@@ -566,9 +567,10 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param int         $source_id Source post id.
 	 * @param object|null $language  Language row.
 	 * @param bool        $own       The pair is the one a deadline stopped this job inside.
+	 * @param int|null    $found     Set to the translation's id when a pending mark was read for it.
 	 * @return bool
 	 */
-	private function has_translation( object $manager, int $source_id, ?object $language, bool $own = false ): bool {
+	private function has_translation( object $manager, int $source_id, ?object $language, bool $own = false, ?int &$found = null ): bool {
 		$vars = null !== $language ? get_object_vars( $language ) : [];
 		$id   = $vars['id'] ?? null;
 
@@ -583,8 +585,39 @@ final class BulkTranslateJob extends AbstractJob {
 		}
 
 		$translation = method_exists( $manager, 'get_translation_id' ) ? $manager->get_translation_id( $source_id, $vars['slug'] ) : null;
+		$found       = is_numeric( $translation ) ? (int) $translation : null;
 
 		return ! $this->unfinished( $translation, $own );
+	}
+
+	/**
+	 * For a skipped translation a stopped run left unfinished and a person edited since: report it once and drop its
+	 * mark, as it is theirs now.
+	 *
+	 * @param int|null $translation   Translation post id.
+	 * @param int      $source_id     Source post id.
+	 * @param string   $first_warning First warning (by ref).
+	 * @return void
+	 */
+	private function kept_edit( ?int $translation, int $source_id, string &$first_warning ): void {
+		if ( null === $translation || ! is_array( $this->pending ) || ! array_key_exists( $translation, $this->pending ) || null !== $this->pending[ $translation ] ) {
+			return;
+		}
+
+		unset( $this->pending[ $translation ] );
+
+		if ( current_user_can( 'edit_post', $translation ) ) {
+			delete_post_meta( $translation, TranslationService::PENDING_META_KEY );
+		}
+
+		if ( '' === $first_warning ) {
+			$first_warning = sprintf(
+				/* translators: 1: ID of the translation post, 2: ID of the source post. */
+				__( 'The translation (post %1$d) of post %2$d was edited after an earlier run stopped while writing it, so it was kept as it is; its custom fields may not be translated. Check it in its editor.', 'perflocale' ),
+				$translation,
+				$source_id
+			);
+		}
 	}
 
 	/**
@@ -603,11 +636,11 @@ final class BulkTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Marked translations not saved a minute after the mark (later: a person finished it), by id: true when marked a
-	 * lease ago or more (a stopped worker's), false when younger (a live call's, or a deadline-stopped pair's). One
-	 * read.
+	 * Marked translations by id: true when the stored row equals the mark's fingerprint and the mark is a lease old or
+	 * more (a stopped worker's), false when younger (a live call's, or a deadline-stopped pair's); null when old and
+	 * changed or without a fingerprint (a person's now: kept). One read.
 	 *
-	 * @return array<int, bool>
+	 * @return array<int, bool|null>
 	 */
 	private static function pending_translations(): array {
 		global $wpdb;
@@ -618,15 +651,28 @@ final class BulkTranslateJob extends AbstractJob {
 
 		$pending = [];
 
+		// The whole posts row after the mark, as TranslationService::stored_text() reads it for the fingerprint.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One indexed read per run, only when a translation exists.
-		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT m.post_id, m.meta_value, p.post_modified_gmt FROM %i m INNER JOIN %i p ON p.ID = m.post_id WHERE m.meta_key = %s', $wpdb->postmeta, $wpdb->posts, TranslationService::PENDING_META_KEY ), ARRAY_A );
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT m.post_id, m.meta_value, p.* FROM %i m INNER JOIN %i p ON p.ID = m.post_id WHERE m.meta_key = %s', $wpdb->postmeta, $wpdb->posts, TranslationService::PENDING_META_KEY ), ARRAY_A );
 
 		foreach ( is_array( $rows ) ? $rows : [] as $row ) {
-			$mark  = TranslationService::pending_time( $row['meta_value'] ?? null );
-			$saved = is_string( $row['post_modified_gmt'] ?? null ) ? strtotime( $row['post_modified_gmt'] . ' UTC' ) : false;
+			$value = $row['meta_value'] ?? null;
+			$mark  = TranslationService::pending_time( $value );
+			$seal  = TranslationService::pending_seal( $value );
 
-			if ( $mark > 0 && is_numeric( $row['post_id'] ?? null ) && false !== $saved && $saved <= $mark + MINUTE_IN_SECONDS ) {
-				$pending[ (int) $row['post_id'] ] = time() - $mark >= \PerfLocale\Background\JobResume::LEASE;
+			// The posts table has no such columns: what is left is the row.
+			unset( $row['post_id'], $row['meta_value'] );
+
+			if ( $mark <= 0 || ! is_numeric( $row['ID'] ?? null ) ) {
+				continue;
+			}
+
+			$stale = time() - $mark >= \PerfLocale\Background\JobResume::LEASE;
+
+			if ( '' !== $seal && hash_equals( $seal, TranslationService::row_fingerprint( $row ) ) ) {
+				$pending[ (int) $row['ID'] ] = $stale;
+			} elseif ( $stale ) {
+				$pending[ (int) $row['ID'] ] = null;
 			}
 		}
 
@@ -726,7 +772,10 @@ final class BulkTranslateJob extends AbstractJob {
 
 				// Never overwrite an existing translation; checked by the target's id before the checkpoint, so a skip
 				// costs no query.
-				if ( ! isset( $gone_ids[ (int) $target_lang_id ] ) && $this->has_translation( $manager, (int) $source_id, $lang_by_id[ $target_lang_id ] ?? null, $processed === $this->cut ) ) {
+				$found = null;
+
+				if ( ! isset( $gone_ids[ (int) $target_lang_id ] ) && $this->has_translation( $manager, (int) $source_id, $lang_by_id[ $target_lang_id ] ?? null, $processed === $this->cut, $found ) ) {
+					$this->kept_edit( $found, (int) $source_id, $first_warning );
 					++$skipped;
 					++$processed;
 					$tick( $processed );
@@ -793,6 +842,7 @@ final class BulkTranslateJob extends AbstractJob {
 				$now = $refreshed ? $manager->get_translation_id( $source_id, $target_lang->slug ) : null;
 
 				if ( null !== $now && ! $this->unfinished( $now, $processed === $this->cut ) ) {
+					$this->kept_edit( is_numeric( $now ) ? (int) $now : null, (int) $source_id, $first_warning );
 					++$skipped;
 					++$processed;
 					$tick( $processed );
@@ -902,6 +952,9 @@ final class BulkTranslateJob extends AbstractJob {
 				$row_result = [];
 				$row_error  = '';
 
+				// The translation found unfinished: written only while its row is the one its mark fingerprints.
+				$redo = $refreshed ? ( is_numeric( $now ) ? (int) $now : null ) : $found;
+
 				if ( null !== $checkpoint ) {
 					$checkpoint( (int) $source_id, TargetLanguageGuard::slug_of( $target_lang ) );
 				}
@@ -909,7 +962,7 @@ final class BulkTranslateJob extends AbstractJob {
 				try {
 					// fast_fail=false lets the provider's retry loop catch transient errors (rate limit, network blip).
 					$inserted   = false;
-					$row_result = $service->translate_post( $source_id, TargetLanguageGuard::slug_of( $target_lang ), '', false, $include_meta, $inserted );
+					$row_result = $service->translate_post( $source_id, TargetLanguageGuard::slug_of( $target_lang ), '', false, $include_meta, $inserted, null !== $redo );
 
 					if ( ! empty( $row_result['post_id'] ) ) {
 						++$created;
@@ -929,7 +982,15 @@ final class BulkTranslateJob extends AbstractJob {
 
 							if ( $first_warning === '' && $row_warnings !== [] ) {
 								$first_warning = (string) end( $row_warnings );
+								$length        = $row_result['length_warning'] ?? '';
+
+								// A kept row's shortened title or excerpt is reported too.
+								if ( is_string( $length ) && '' !== $length && $length !== $first_warning ) {
+									$first_warning .= ' ' . $length;
+								}
 							}
+						} elseif ( $first_warning === '' && is_string( $row_result['length_warning'] ?? null ) ) {
+							$first_warning = $row_result['length_warning'];
 						}
 					} else {
 						++$failed;
@@ -951,11 +1012,25 @@ final class BulkTranslateJob extends AbstractJob {
 
 					return true;
 				} catch ( \Throwable $e ) {
-					++$failed;
 					$row_error = $e->getMessage();
 
-					if ( $first_error === '' ) {
-						$first_error = $row_error;
+					// Edited or finished since this run read its mark: skipped. Kept and reported only for a mark no live call
+					// holds: a stopped worker's, this job's own stopped pair's, or one never redone (no fingerprint).
+					if ( null !== $redo && $e instanceof NotSavedException && TranslationService::KEPT_ON_REDO === $e->getCode() ) {
+						++$skipped;
+
+						$mark = TranslationService::stored_mark( $redo );
+
+						if ( null !== $mark && '' !== $mark && ( '' === TranslationService::pending_seal( $mark ) || time() - TranslationService::pending_time( $mark ) >= \PerfLocale\Background\JobResume::LEASE || $processed === $this->cut ) ) {
+							$this->pending[ $redo ] = null;
+							$this->kept_edit( $redo, (int) $source_id, $first_warning );
+						}
+					} else {
+						++$failed;
+
+						if ( $first_error === '' ) {
+							$first_error = $row_error;
+						}
 					}
 				}
 

@@ -1409,22 +1409,15 @@ final class ContentSync {
 	 * @return string|null
 	 */
 	private function configured_field_for_meta_key( string $meta_key ): ?string {
-		// The plugin's own keys are never synced, whatever lists them.
-		if ( SyncMeta::is_never_synced( $meta_key ) ) {
+		if ( ! SyncMeta::may_sync_meta_key( $meta_key, (array) $this->settings->get( 'sync_fields', [] ) ) ) {
 			return null;
 		}
-
-		$user_fields = (array) $this->settings->get( 'sync_fields', [] );
 
 		if ( $meta_key === '_thumbnail_id' ) {
-			return in_array( 'featured_image', $user_fields, true ) ? 'featured_image' : null;
+			return 'featured_image';
 		}
 
-		if ( $meta_key === 'featured_image' || isset( self::POST_FIELD_MAP[ $meta_key ] ) ) {
-			return null;
-		}
-
-		return in_array( $meta_key, $user_fields, true ) ? $meta_key : null;
+		return $meta_key === 'featured_image' || isset( self::POST_FIELD_MAP[ $meta_key ] ) ? null : $meta_key;
 	}
 
 	/**

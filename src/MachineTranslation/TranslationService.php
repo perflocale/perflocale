@@ -134,21 +134,109 @@ final class TranslationService {
 
 	/**
 	 * Mark on a machine translation this service created until its content and meta are written ("<time>", or
-	 * "<time>:c" until create_translation() returned): a bulk run redoes a translation that still has it.
+	 * "<time>:c" until create_translation() returned), each with ":<row fingerprint>" after the service's last write to
+	 * the post: a bulk run redoes a translation that still has it and an unchanged row.
 	 */
 	public const PENDING_META_KEY = '_perflocale_mt_pending';
 
+	/** NotSavedException code: a redo found the translation changed, or finished, since its pending mark. */
+	public const KEPT_ON_REDO = 2;
+
 	/**
-	 * The time in a pending mark ("<time>" or "<time>:c"); 0 for any other value.
+	 * The time in a pending mark ("<time>" or "<time>:c", either with ":<fingerprint>"); 0 for any other value.
 	 *
 	 * @param mixed $value Meta value.
 	 * @return int
 	 */
 	public static function pending_time( mixed $value ): int {
-		$value = is_int( $value ) ? (string) $value : ( is_string( $value ) ? $value : '' );
+		$value = self::unsealed( $value );
 		$value = str_ends_with( $value, ':c' ) ? substr( $value, 0, -2 ) : $value;
 
 		return '' !== $value && \PerfLocale\Helper::is_ascii_digits( $value ) ? (int) $value : 0;
+	}
+
+	/**
+	 * The row fingerprint a pending mark carries, or ''.
+	 *
+	 * @param mixed $value Meta value.
+	 * @return string
+	 */
+	public static function pending_seal( mixed $value ): string {
+		return is_string( $value ) && 1 === preg_match( '/:([0-9a-f]{32})$/D', $value, $m ) ? $m[1] : '';
+	}
+
+	/**
+	 * A fingerprint of a posts row (every column, as stored_text() or a SELECT p.* reads it), values taken as strings.
+	 *
+	 * @param array<mixed> $row Row.
+	 * @return string
+	 */
+	public static function row_fingerprint( array $row ): string {
+		$out = [];
+
+		foreach ( $row as $column => $value ) {
+			$out[ (string) $column ] = is_scalar( $value ) ? (string) $value : '';
+		}
+
+		return md5( (string) wp_json_encode( $out ) );
+	}
+
+	/**
+	 * A pending mark without its fingerprint.
+	 *
+	 * @param mixed $value Meta value.
+	 * @return string
+	 */
+	private static function unsealed( mixed $value ): string {
+		$value = is_int( $value ) ? (string) $value : ( is_string( $value ) ? $value : '' );
+
+		return '' === self::pending_seal( $value ) ? $value : substr( $value, 0, -33 );
+	}
+
+	/**
+	 * Write the pending mark "<time><stage>:<fingerprint of the stored row>" ("<time><stage>" when the row cannot be
+	 * read or differs from $expected: a mark without a fingerprint is never redone, so another save is never sealed).
+	 *
+	 * @param int                        $post_id  Translation.
+	 * @param string                     $stage    '' or ':c'.
+	 * @param array<string, string>|null $expected Columns the row must hold to be sealed; null: any row.
+	 * @param bool                       $keep     Leave the mark as it is when the row cannot be read.
+	 * @return void
+	 */
+	private static function seal_pending( int $post_id, string $stage = '', ?array $expected = null, bool $keep = false ): void {
+		$row = self::stored_text( $post_id, true );
+
+		if ( null === $row && $keep ) {
+			return;
+		}
+
+		$sealed = null !== $row;
+
+		foreach ( $sealed ? (array) $expected : [] as $column => $value ) {
+			$sealed = $sealed && ( $row[ $column ] ?? null ) === $value;
+		}
+
+		update_post_meta( $post_id, self::PENDING_META_KEY, time() . $stage . ( $sealed && null !== $row ? ':' . self::row_fingerprint( $row ) : '' ) );
+	}
+
+	/**
+	 * A translation's pending mark as the database holds it, not as a cache saw it.
+	 *
+	 * @param int $post_id Translation.
+	 * @return string|null '' when it has none; null when the read failed.
+	 */
+	public static function stored_mark( int $post_id ): ?string {
+		/**
+		 * WordPress database.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Another request may have written it.
+		$value = $wpdb->get_var( $wpdb->prepare( 'SELECT meta_value FROM %i WHERE post_id = %d AND meta_key = %s ORDER BY meta_id LIMIT 1', $wpdb->postmeta, $post_id, self::PENDING_META_KEY ) );
+
+		return '' !== $wpdb->last_error ? null : ( is_scalar( $value ) ? (string) $value : '' );
 	}
 
 	/**
@@ -766,11 +854,13 @@ final class TranslationService {
 	 * @param bool     $fast_fail   Skip provider-internal retries.
 	 * @param string   $format      'html' (HTML mode, allowlist sanitiser) or 'text' (text mode, text sanitiser); one
 	 *   format per call.
-	 * @return string[] Translated strings, parallel-indexed to $texts.
+	 * @param string[] $labels      Names of the texts by position in $texts, for a failure message, such as "meta key
+	 *   price" ("text k of n" for a missing one); since 1.0.7.5.
+	 * @return string[] Translated strings, parallel-indexed to $texts; a blank text comes back as given.
 	 *
 	 * @throws \RuntimeException On provider failure or misconfiguration.
 	 */
-	public function translate_batch_texts( array $texts, string $source_lang, string $target_lang, string $provider_id = '', bool $fast_fail = false, string $format = 'html' ): array {
+	public function translate_batch_texts( array $texts, string $source_lang, string $target_lang, string $provider_id = '', bool $fast_fail = false, string $format = 'html', array $labels = [] ): array {
 		if ( empty( $texts ) ) {
 			return [];
 		}
@@ -783,8 +873,12 @@ final class TranslationService {
 		$non_empty    = [];      // subset_index → text
 		$position_map = [];   // subset_index → original_index
 
+		// The result starts as the input: a blank slot is not sent and comes back as it was given.
+		$result = [];
+
 		foreach ( $texts as $orig_idx => $t ) {
-			$t_str = (string) $t;
+			$t_str    = (string) $t;
+			$result[] = $t_str;
 			if ( trim( $t_str ) === '' ) {
 				continue;
 			}
@@ -793,8 +887,7 @@ final class TranslationService {
 		}
 
 		if ( empty( $non_empty ) ) {
-			// All empty: parallel empty strings.
-			return array_fill( 0, $original_count, '' );
+			return $result;
 		}
 
 		$provider = $this->get_provider( $provider_id );
@@ -846,7 +939,18 @@ final class TranslationService {
 			}
 		}
 
-		$translated = $provider->translate_batch( $sent, $source_lang, $target_lang, $fast_fail, $format );
+		try {
+			$translated = $provider->translate_batch( $sent, $source_lang, $target_lang, $fast_fail, $format );
+		} catch ( \RuntimeException $e ) {
+			$label = static function ( int $i ) use ( $labels, $position_map, $original_count ): string {
+				$at = $position_map[ $i ];
+
+				/* translators: 1: position of the text, 2: number of texts */
+				return (string) ( $labels[ $at ] ?? sprintf( __( 'text %1$d of %2$d', 'perflocale' ), $at + 1, $original_count ) );
+			};
+
+			throw ItemsFailedException::named( $e, $sent, $label ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Escaped in named().
+		}
 
 		// A shorter or longer answer (truncated response, partial timeout) fails the call: a missing slot would blank
 		// the block text it is written back to.
@@ -887,14 +991,39 @@ final class TranslationService {
 			);
 		}
 
-		// Back to the caller's indexing; empty inputs give empty outputs.
-		$result = array_fill( 0, $original_count, '' );
-
+		// Back to the caller's indexing.
 		foreach ( $position_map as $subset_i => $orig_i ) {
 			$result[ $orig_i ] = isset( $translated[ $subset_i ] ) ? (string) $translated[ $subset_i ] : '';
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Translate a term's text fields in one call; a failure names the field ("term name", "term description", else its key).
+	 *
+	 * @since 1.0.7.5
+	 * @param array<string, string> $fields      Field key => source text.
+	 * @param string                $source_lang Source language slug.
+	 * @param string                $target_lang Target language slug.
+	 * @param string                $provider_id Provider ID ('' = configured default).
+	 * @param bool                  $fast_fail   Skip provider-internal retries.
+	 * @return array<string, string> Field key => translation ('' for an empty source).
+	 * @throws \RuntimeException On provider failure or misconfiguration.
+	 */
+	public function translate_term_fields( array $fields, string $source_lang, string $target_lang, string $provider_id = '', bool $fast_fail = false ): array {
+		$keys   = array_map( 'strval', array_keys( $fields ) );
+		$labels = array_map(
+			static fn( string $key ): string => match ( $key ) {
+				'name'        => __( 'term name', 'perflocale' ),
+				'description' => __( 'term description', 'perflocale' ),
+				default       => $key,
+			},
+			$keys
+		);
+		$out    = $this->translate_batch_texts( array_values( $fields ), $source_lang, $target_lang, $provider_id, $fast_fail, 'html', $labels );
+
+		return array_combine( $keys, array_map( 'strval', $out ) );
 	}
 
 	/**
@@ -907,11 +1036,13 @@ final class TranslationService {
 	 * @param bool      $include_meta Translate the registered meta fields too.
 	 * @param bool      $inserted     Set to true when this call inserted the translation post,
 	 *                                false when it updated one that existed.
-	 * @return array<string, mixed> post_id, title, content, excerpt, and warnings, kept, builder_warning, meta when they apply.
+	 * @param bool      $redo         The caller redoes the pair for its pending mark: an existing translation is written
+	 *                                only while its row is the one the mark fingerprints.
+	 * @return array<string, mixed> post_id, title, content, excerpt, and warnings, kept, builder_warning, length_warning, meta when they apply.
 	 *
 	 * @throws \RuntimeException On translation failure.
 	 */
-	public function translate_post( int $post_id, string $target_lang, string $provider_id = '', bool $fast_fail = false, bool $include_meta = false, bool &$inserted = false ): array {
+	public function translate_post( int $post_id, string $target_lang, string $provider_id = '', bool $fast_fail = false, bool $include_meta = false, bool &$inserted = false, bool $redo = false ): array {
 		$inserted = false;
 		$post     = get_post( $post_id );
 
@@ -956,12 +1087,16 @@ final class TranslationService {
 			$pending_mark  = $translated_id ? get_post_meta( (int) $translated_id, self::PENDING_META_KEY, true ) : '';
 			$was_pending   = ! empty( $pending_mark );
 
-			// A creation a stopped worker left inside its copy steps gets them before the text.
-			if ( $was_pending ) {
-				self::redo_stopped_creation( (int) $translated_id, $pending_mark, static fn() => $manager->complete_imported_translation( (int) $translated_id, $post_id, $target_lang ) );
-			}
+			// A creation a stopped worker left inside its copy steps gets them before the text, unless it was edited since.
+			$redo_note = $was_pending ? self::redo_stopped_creation( (int) $translated_id, $pending_mark, static fn() => $manager->complete_imported_translation( (int) $translated_id, $post_id, $target_lang ) ) : '';
 
-			$target_before = $translated_id ? self::stored_text( (int) $translated_id ) : null;
+			// A redo's baseline is the row its mark was checked against, so the write guard holds that row.
+			$target_before = $translated_id ? ( $redo ? self::redo_baseline( (int) $translated_id ) : self::stored_text( (int) $translated_id ) ) : null;
+
+			// No baseline to hold the write to (a read error): failed before the provider is paid, as redo_baseline() does.
+			if ( $translated_id && null === $target_before ) {
+				throw new \RuntimeException( esc_html__( 'Not saved: the translation could not be read, so it was kept as it is. A later run tries it again.', 'perflocale' ) );
+			}
 
 			// A page builder layout this translation leaves out is reported with the result.
 			$builder = BuilderLayout::pending( $post_id, (string) $post->post_content );
@@ -982,36 +1117,61 @@ final class TranslationService {
 			 */
 			$texts = apply_filters( 'perflocale/mt/pre_translate', $texts, $source_lang, $target_lang, $provider->get_id() );
 
-			// Title and excerpt in text mode (HTML mode entity-escapes & and '), content in HTML mode: two calls. Empty slots
-			// are not sent (DeepL rejects empty strings).
+			// Title and excerpt in text mode (HTML mode entity-escapes & and '), content in HTML mode: two calls. Empty and
+			// whitespace-only slots are not sent (DeepL rejects empty strings) and stay as they are.
 			$plain_inputs = [];
 			$plain_slots  = [];
+			$slot_texts   = [];
 
 			foreach ( [ 0, 2 ] as $slot ) {
-				$value = (string) ( $texts[ $slot ] ?? '' );
+				$value               = (string) ( $texts[ $slot ] ?? '' );
+				$slot_texts[ $slot ] = $value;
 
-				if ( '' !== $value ) {
+				if ( '' !== trim( $value ) ) {
 					$plain_slots[]  = $slot;
 					$plain_inputs[] = $value;
 				}
 			}
 
-			$plain_out = [] === $plain_inputs
-				? []
-				: $provider->translate_batch( $plain_inputs, $source_lang, $target_lang, $fast_fail, 'text' );
+			try {
+				$plain_out = [] === $plain_inputs
+					? []
+					: $provider->translate_batch( $plain_inputs, $source_lang, $target_lang, $fast_fail, 'text' );
+			} catch ( \RuntimeException $e ) {
+				$label = static fn( int $i ): string => 2 === ( $plain_slots[ $i ] ?? 0 ) ? __( 'excerpt', 'perflocale' ) : __( 'title', 'perflocale' );
+
+				throw ItemsFailedException::named( $e, $plain_inputs, $label ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Escaped in named().
+			}
 
 			// Shortcode tags and block delimiters become placeholders the provider cannot change; text kept only in block
 			// attributes travels as extra segments after the content.
 			$elements    = $provider instanceof AbstractProvider && $provider->placeholders_as_elements();
 			$content_src = (string) ( $texts[1] ?? '' );
-			$shortcodes  = '' === $content_src ? null : ShortcodeMask::mask( $content_src, $elements );
+			$blank       = '' === trim( $content_src );
+			$shortcodes  = $blank ? null : ShortcodeMask::mask( $content_src, $elements );
 			$content_in  = null === $shortcodes ? $content_src : $shortcodes->text();
 			$content_in  = $elements ? \PerfLocale\Translation\BlockSkipFilter::placeholders_as_elements( $content_in ) : $content_in;
-			$mask        = '' === $content_in ? null : BlockDelimiterMask::mask( $content_in, $elements );
+			$mask        = $blank ? null : BlockDelimiterMask::mask( $content_in, $elements );
 			$html_in     = null === $mask ? [ $content_in ] : array_merge( [ $mask->text() ], $mask->segment_texts() );
-			$html_out    = '' === $content_src
-				? [ '' ]
-				: $provider->translate_batch( $html_in, $source_lang, $target_lang, $fast_fail, 'html' );
+
+			try {
+				$html_out = $blank
+					? [ $content_src ]
+					: $provider->translate_batch( $html_in, $source_lang, $target_lang, $fast_fail, 'html' );
+			} catch ( \RuntimeException $e ) {
+				// Block texts are the attribute texts sent after the content.
+				$segments = count( $html_in ) - 1;
+				$label    = static function ( int $i ) use ( $segments ): string {
+					if ( 0 === $i ) {
+						return __( 'content', 'perflocale' );
+					}
+
+					/* translators: 1: position of the block text, 2: number of block texts */
+					return sprintf( __( 'block text %1$d of %2$d', 'perflocale' ), $i, $segments );
+				};
+
+				throw ItemsFailedException::named( $e, $html_in, $label ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Escaped in named().
+			}
 
 			// One answer per input, in order: a mismatch would scramble [title, content, excerpt], so it fails the item.
 			if ( count( $plain_out ) !== count( $plain_inputs ) || count( $html_out ) !== count( $html_in ) ) {
@@ -1034,6 +1194,8 @@ final class TranslationService {
 			if ( '' !== $cut ) {
 				throw new NotSavedException( esc_html( $cut ) );
 			}
+
+			$length_warning = CutText::warning( $plain_inputs, $plain_out, $plain_slots );
 
 			// A placeholder lost, repeated or invented fails the item; an empty answer goes to the empty-field handling.
 			$content_out = (string) $html_out[0];
@@ -1080,8 +1242,8 @@ final class TranslationService {
 				);
 			}
 
-			// The positional [title, content, excerpt] triple the filters expect.
-			$translated = [ '', $content_out, '' ];
+			// The positional [title, content, excerpt] triple the filters expect; a slot not sent keeps its text.
+			$translated = [ $slot_texts[0], $content_out, $slot_texts[2] ];
 
 			foreach ( $plain_slots as $i => $slot ) {
 				$translated[ $slot ] = (string) ( $plain_out[ $i ] ?? '' );
@@ -1138,6 +1300,16 @@ final class TranslationService {
 				'content' => is_string( $translated[1] ?? null ) ? $translated[1] : '',
 				'excerpt' => \PerfLocale\Helper::sanitize_plain_textarea_field( $translated[2] ?? '' ),
 			];
+
+			if ( '' !== $redo_note ) {
+				$result['warnings'][] = $redo_note;
+			}
+
+			// Before the kept-content warnings: a bulk job reports the last warning of a kept row.
+			if ( '' !== $length_warning ) {
+				$result['warnings'][]     = $length_warning;
+				$result['length_warning'] = $length_warning;
+			}
 
 			// Block content must keep the source's block structure, or the item fails and nothing is written; empty content
 			// goes to the empty-field handling below.
@@ -1224,9 +1396,9 @@ final class TranslationService {
 					throw $conflict();
 				}
 
-				// The redo's own save must read as "not saved after the mark" if this run stops before the meta too.
+				// A fresh mark for the redo: a live call's again until it is a lease old.
 				if ( $was_pending ) {
-					update_post_meta( (int) $translated_id, self::PENDING_META_KEY, time() );
+					self::seal_pending( (int) $translated_id, '', $target_before );
 				}
 
 				// "Do not translate" blocks pass the content filters as placeholders and are put back, checked against the stored
@@ -1240,7 +1412,8 @@ final class TranslationService {
 					$update_fields['post_content'] = $keep->content();
 				}
 
-				$guard = self::guard_text( (int) $translated_id, $target_before );
+				$written = null;
+				$guard   = self::guard_text( (int) $translated_id, $target_before, $written, $keep );
 
 				// A save that writes the content is the machine translation's: the general save rule leaves it to
 				// ProtectedBlockSave. A kept content is saved again as stored, so that rule keeps its blocks.
@@ -1249,6 +1422,9 @@ final class TranslationService {
 				if ( $claimed ) {
 					\PerfLocale\Translation\SaveScope::claim( (int) $translated_id );
 				}
+
+				// wp_update_post() merges the cached row: a status, password or slug another request saved meanwhile is kept.
+				wp_cache_delete( (int) $translated_id, 'posts' );
 
 				try {
 					$keep?->arm();
@@ -1265,15 +1441,23 @@ final class TranslationService {
 						\PerfLocale\Translation\SaveScope::release( (int) $translated_id );
 					}
 
-					$stopped = $guard();
+					$outcome = $guard();
 				}
 
-				if ( ! is_wp_error( $update_result ) || ! $stopped ) {
+				if ( ! is_wp_error( $update_result ) || '' === $outcome || 'unguarded' === $outcome ) {
 					$keep?->settle();
 				}
 
-				if ( $stopped && is_wp_error( $update_result ) ) {
+				if ( 'conflict' === $outcome ) {
 					throw $conflict();
+				}
+
+				if ( 'refused' === $outcome ) {
+					throw new NotSavedException(
+						ExpectedWrite::charset_known()
+							? esc_html__( 'Not saved: another plugin changed the database query, so the translation was kept as it is.', 'perflocale' )
+							: esc_html__( 'Not saved: the database server did not report its connection charset, so the translation was kept as it is. Set DB_CHARSET to utf8mb4 in wp-config.php.', 'perflocale' )
+					);
 				}
 
 				// A protected block did not match the stored source at write time: the save stopped, the translation keeps what it
@@ -1293,6 +1477,20 @@ final class TranslationService {
 				}
 
 				self::content_replaced( $post->post_type, (int) $translated_id, $update_fields, $update_result, $keep );
+
+				// The redo's own save is sealed, only while the row holds what it wrote: a stop before the meta leaves it to the
+				// next run. A template's content may be rewritten by content_replaced(): only its title and excerpt are checked.
+				// A refused or unread save keeps the mark sealed before the write.
+				$own = null === $written || is_wp_error( $update_result ) || ( null !== $keep && $keep->refused() ) ? null : $written;
+
+				if ( null !== $own && null !== $keep ) {
+					// The query filter wrote the kept bytes in place of the placeholder content the data hook saw.
+					$own['post_content'] = $keep->kept() ?? '';
+				}
+
+				if ( $was_pending && null !== $own ) {
+					self::seal_pending( (int) $translated_id, '', ! BlockTemplateSupport::is_template_type( $post->post_type ) ? $own : array_diff_key( $own, [ 'post_content' => true ] ) );
+				}
 			} else {
 				$created = false;
 
@@ -1305,12 +1503,21 @@ final class TranslationService {
 					}
 				};
 
+				// Sealed with the row the insert left once its last hook ran.
+				$seal = static function ( $new_id, $new_post = null, $update = false ) use ( &$marked ): void {
+					if ( ! $update && $marked > 0 && is_numeric( $new_id ) && (int) $new_id === $marked ) {
+						self::seal_pending( $marked, ':c' );
+					}
+				};
+
 				add_action( 'wp_insert_post', $mark, 1, 3 );
+				add_action( 'wp_after_insert_post', $seal, PHP_INT_MAX, 3 );
 
 				try {
 					$translated_id = $manager->create_translation( $post_id, $target_lang, false, \PerfLocale\Enum\SourceType::MachineTranslation, $created );
 				} finally {
 					remove_action( 'wp_insert_post', $mark, 1 );
+					remove_action( 'wp_after_insert_post', $seal, PHP_INT_MAX );
 				}
 
 				if ( $marked > 0 && ( true !== $created || $marked !== (int) $translated_id ) ) {
@@ -1319,7 +1526,7 @@ final class TranslationService {
 
 				// create_translation() returned, so its copy steps ran: the mark keeps no creation stage.
 				if ( true === $created && $translated_id ) {
-					update_post_meta( (int) $translated_id, self::PENDING_META_KEY, time() );
+					self::seal_pending( (int) $translated_id );
 				}
 
 				if ( ! $translated_id ) {
@@ -1348,6 +1555,7 @@ final class TranslationService {
 					: null;
 
 				\PerfLocale\Translation\SaveScope::claim( (int) $translated_id );
+				wp_cache_delete( (int) $translated_id, 'posts' );
 
 				try {
 					$keep?->arm();
@@ -1375,7 +1583,7 @@ final class TranslationService {
 				// A protected block did not match the stored source: nothing was written, the inserted translation is removed
 				// below, and the run fails with the lost section reason.
 				if ( null !== $keep && $keep->refused() ) {
-					if ( null !== $new_row && self::stored_text( (int) $translated_id, true ) === $new_row ) {
+					if ( null !== $new_row && self::as_inserted( $new_row, $keep->sent_fields(), self::stored_text( (int) $translated_id, true ) ) ) {
 						wp_delete_post( (int) $translated_id, true );
 						$inserted = false;
 					}
@@ -1397,6 +1605,9 @@ final class TranslationService {
 				if ( BlockTemplateSupport::is_template_type( $post->post_type ) ) {
 					TemplateBlockRefs::content_replaced( (int) $translated_id );
 				}
+
+				// The text save is sealed: a stop before the meta leaves it to the next run.
+				self::seal_pending( (int) $translated_id );
 			}
 
 			if ( '' !== $builder ) {
@@ -1463,44 +1674,123 @@ final class TranslationService {
 	}
 
 	/**
-	 * Complete a creation a stopped worker left: a "<time>:c" mark older than a lease (younger: a live call's), the post
-	 * not saved more than a minute after it (later: a person finished it; the rule of BulkTranslateJob's redo).
+	 * Complete a creation a stopped worker left: a "<time>:c" mark older than a lease (younger: a live call's) and the
+	 * stored row equal to the one it fingerprints; any change, no fingerprint or a failed read keeps the post as it is.
 	 *
 	 * @param int      $translated_id Translation post.
 	 * @param mixed    $mark          Its pending mark.
 	 * @param callable $complete      The copy steps.
-	 * @return void
+	 * @return string Why the copy steps were not run again for a stopped creation, or ''.
 	 */
-	private static function redo_stopped_creation( int $translated_id, mixed $mark, callable $complete ): void {
-		$time = is_string( $mark ) && str_ends_with( $mark, ':c' ) ? self::pending_time( $mark ) : 0;
+	private static function redo_stopped_creation( int $translated_id, mixed $mark, callable $complete ): string {
+		$time = str_ends_with( self::unsealed( $mark ), ':c' ) ? self::pending_time( $mark ) : 0;
 
 		// The age is checked before the row is read.
 		if ( $time <= 0 || time() - $time < \PerfLocale\Background\JobResume::LEASE ) {
-			return;
+			return '';
 		}
 
-		$row   = self::stored_text( $translated_id, true );
-		$saved = is_string( $row['post_modified_gmt'] ?? null ) ? strtotime( $row['post_modified_gmt'] . ' UTC' ) : false;
+		$row  = self::stored_text( $translated_id, true );
+		$seal = self::pending_seal( $mark );
 
-		if ( false !== $saved && $saved <= $time + MINUTE_IN_SECONDS ) {
-			self::complete_creation( $translated_id, $complete );
+		if ( null !== $row && '' !== $seal && hash_equals( $seal, self::row_fingerprint( $row ) ) ) {
+			self::complete_creation( $translated_id, $complete, $row );
+
+			return '';
 		}
+
+		return sprintf(
+			/* translators: %d: ID of the translation post. */
+			__( 'The translation (post %d) was edited after an earlier run stopped while creating it, so the original\'s custom fields, image and terms were not copied to it again. Add them in its editor if it needs them.', 'perflocale' ),
+			$translated_id
+		);
 	}
 
 	/**
-	 * Run a stopped creation's copy steps again, adding no meta row under a key the translation holds; then drop the
-	 * creation stage from its pending mark. `translation/created` listeners run again.
+	 * The text a redo may overwrite: the stored row while its pending mark fingerprints it.
 	 *
-	 * @param int      $translated_id Translation post.
-	 * @param callable $complete      The copy steps (PostTranslationManager::complete_imported_translation()).
+	 * @param int $translated_id Translation post.
+	 * @return array<string, string> As stored_text().
+	 * @throws NotSavedException KEPT_ON_REDO when the mark is gone or the row changed since: the translation is kept.
+	 * @throws \RuntimeException When the row cannot be read: the pair fails and keeps its mark for the next run.
+	 */
+	private static function redo_baseline( int $translated_id ): array {
+		$row  = self::stored_text( $translated_id, true );
+		$mark = null === $row ? null : self::stored_mark( $translated_id );
+
+		if ( null === $row || null === $mark ) {
+			throw new \RuntimeException( esc_html__( 'Not saved: the translation could not be read, so it was kept as it is. A later run tries it again.', 'perflocale' ) );
+		}
+
+		$seal = self::pending_seal( $mark );
+
+		if ( '' === $seal || ! hash_equals( $seal, self::row_fingerprint( $row ) ) ) {
+			throw new NotSavedException(
+				esc_html__( 'Not saved: the translation changed after an earlier run stopped while writing it, so it was kept as it is.', 'perflocale' ),
+				self::KEPT_ON_REDO // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int constant.
+			);
+		}
+
+		$text = [];
+
+		// stored_text()'s column order: the guard compares the arrays strictly.
+		foreach ( [ 'post_title', 'post_content', 'post_excerpt' ] as $column ) {
+			$text[ $column ] = $row[ $column ] ?? '';
+		}
+
+		return $text;
+	}
+
+	/**
+	 * Run a stopped creation's copy steps again; then drop the creation stage from its pending mark. A key the translation
+	 * already holds gets the original's further rows only once every row it holds was matched in order (the stop came
+	 * inside that key); a held row the original does not offer first is a person's edit, and the key is kept.
+	 * `translation/created` listeners run again.
+	 *
+	 * @param int                   $translated_id Translation post.
+	 * @param callable              $complete      The copy steps (PostTranslationManager::complete_imported_translation()).
+	 * @param array<string, string> $checked       The row the mark was checked against (whole).
 	 * @return void
 	 */
-	private static function complete_creation( int $translated_id, callable $complete ): void {
-		$held = get_post_meta( $translated_id );
-		$held = is_array( $held ) ? array_map( 'strval', array_keys( $held ) ) : [];
-		$skip = static fn( $check, $object_id, $meta_key ) => is_numeric( $object_id ) && (int) $object_id === $translated_id && is_string( $meta_key ) && in_array( $meta_key, $held, true ) ? false : $check;
+	private static function complete_creation( int $translated_id, callable $complete, array $checked ): void {
+		$held = [];
 
-		add_filter( 'add_post_metadata', $skip, 1, 3 );
+		// Without a key get_post_meta() answers the stored strings, as maybe_serialize() writes them.
+		foreach ( (array) get_post_meta( $translated_id ) as $key => $values ) {
+			foreach ( (array) $values as $value ) {
+				$held[ (string) $key ][] = is_scalar( $value ) ? (string) $value : '';
+			}
+		}
+
+		$kept = [];
+
+		// The copy steps offer a key's rows in the original's order, which the stopped creation copied from its start.
+		$skip = static function ( $check, $object_id, $meta_key, $meta_value = null ) use ( $translated_id, &$held, &$kept ) {
+			if ( ! is_numeric( $object_id ) || (int) $object_id !== $translated_id || ! is_string( $meta_key ) || ! isset( $held[ $meta_key ] ) ) {
+				return $check;
+			}
+
+			if ( isset( $kept[ $meta_key ] ) ) {
+				return false;
+			}
+
+			if ( [] === $held[ $meta_key ] ) {
+				return $check;
+			}
+
+			$stored = maybe_serialize( $meta_value );
+
+			// A held row the original does not offer next is a person's edit: the key gets no further row.
+			if ( ( is_scalar( $stored ) ? (string) $stored : '' ) === reset( $held[ $meta_key ] ) ) {
+				array_shift( $held[ $meta_key ] );
+			} else {
+				$kept[ $meta_key ] = true;
+			}
+
+			return false;
+		};
+
+		add_filter( 'add_post_metadata', $skip, 1, 4 );
 
 		try {
 			$complete();
@@ -1508,7 +1798,37 @@ final class TranslationService {
 			remove_filter( 'add_post_metadata', $skip, 1 );
 		}
 
-		update_post_meta( $translated_id, self::PENDING_META_KEY, time() );
+		// Sealed only on the checked text: an edit during the copy steps is never sealed. A template's content may be
+		// rewritten by its created listener, so only its title and excerpt are checked.
+		$text = [];
+
+		foreach ( BlockTemplateSupport::is_template_type( $checked['post_type'] ?? '' ) ? [ 'post_title', 'post_excerpt' ] : [ 'post_title', 'post_content', 'post_excerpt' ] as $column ) {
+			$text[ $column ] = $checked[ $column ] ?? '';
+		}
+
+		self::seal_pending( $translated_id, '', $text, true );
+	}
+
+	/**
+	 * Whether the stored row is the inserted one, alone or with exactly the refused save's own title, excerpt and dates
+	 * (its content kept as inserted); a value written by anything else keeps the post.
+	 *
+	 * @param array<string, string>      $new_row Row as inserted (stored_text(), whole row).
+	 * @param array<string, mixed>|null  $sent    ProtectedBlockSave::sent_fields().
+	 * @param array<string, string>|null $stored  Row as stored now.
+	 * @return bool
+	 */
+	private static function as_inserted( array $new_row, ?array $sent, ?array $stored ): bool {
+		$own = $new_row;
+
+		// Not every sent column: WordPress also sends the ones it inherited from the row, which another save may have changed.
+		foreach ( [ 'post_title', 'post_excerpt', 'post_date', 'post_date_gmt', 'post_modified', 'post_modified_gmt' ] as $column ) {
+			if ( array_key_exists( $column, $own ) && is_scalar( $sent[ $column ] ?? null ) ) {
+				$own[ $column ] = (string) $sent[ $column ];
+			}
+		}
+
+		return null !== $stored && ( $stored === $new_row || ( null !== $sent && $stored === $own ) );
 	}
 
 	/**
@@ -1547,23 +1867,39 @@ final class TranslationService {
 	}
 
 	/**
-	 * Hold a post's text to $expected during wp_update_post(): right before the main posts UPDATE (after the
-	 * wp_insert_post_data filters and pre_post_update) the text is read again, and when it changed the UPDATE is not sent
-	 * (wp_update_post() returns 'db_update_error' before any after-save hook).
+	 * Hold a post's text to $expected during wp_update_post(): re-read before the posts UPDATE (a change stops it before any
+	 * after-save hook), and the UPDATE only matches the row while it holds $expected. The bound is added last, after
+	 * ProtectedBlockSave and SourceBoundWrite matched the plain tail. Docs: docs-ai/11-code-rationale.md, "ExpectedWrite".
 	 *
 	 * @param int                        $post_id  Post being saved.
 	 * @param array<string, string>|null $expected stored_text() before the save.
-	 * @return \Closure(): bool Removes the guard; true when it stopped the UPDATE.
+	 * @param array<string, string>|null $written  Set to the title, content and excerpt the UPDATE was sent with.
+	 * @param ProtectedBlockSave|null    $keep     The save's kept blocks, whose bytes replace its token in the content.
+	 * @return \Closure(): string Removes the guard; 'conflict' (kept from the row), 'refused' (not sent), 'unguarded' (sent
+	 *                          unbound after the re-read: ExpectedWrite::unbound_charset() or converts()) or ''.
 	 */
-	private static function guard_text( int $post_id, ?array $expected ): \Closure {
-		$armed   = false;
-		$stopped = false;
-		$arm     = static function ( $id ) use ( $post_id, &$armed ): void {
-			if ( is_numeric( $id ) && (int) $id === $post_id ) {
-				$armed = true;
-			}
-		};
-		$check   = static function ( $query ) use ( $post_id, $expected, &$armed, &$stopped ) {
+	private static function guard_text( int $post_id, ?array $expected, ?array &$written = null, ?ProtectedBlockSave $keep = null ): \Closure {
+		/**
+		 * WordPress database.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		$open      = null !== ExpectedWrite::unbound_charset() || ExpectedWrite::converts( $wpdb->posts, [ 'post_title', 'post_content', 'post_excerpt' ] );
+		$level     = ExpectedWrite::level();
+		$hook      = ExpectedWrite::level( 'pre_post_update' );
+		$head      = 'UPDATE `' . $wpdb->posts . '` SET ';
+		$tails     = [ ' WHERE `ID` = ' . $post_id, " WHERE `ID` = '" . $post_id . "'" ];
+		$condition = null === $expected ? '' : implode( ' AND ', array_map( static fn( string $column ): string => ExpectedWrite::holds( $column, $expected[ $column ] ?? '' ), [ 'post_title', 'post_content', 'post_excerpt' ] ) );
+		$outcome   = '';
+		/** @var string $state idle, armed, checked, sent, held or done; the closures share it by reference. */
+		$state = 'idle';
+		/** @var array<string, string>|null $written */
+		$written = null;
+
+		// Whether the row holds $expected now, by the same condition.
+		$holds = static function () use ( $post_id, $condition ): bool {
 			/**
 			 * WordPress database.
 			 *
@@ -1571,29 +1907,136 @@ final class TranslationService {
 			 */
 			global $wpdb;
 
-			if ( ! $armed || ! is_string( $query ) || ! str_starts_with( $query, 'UPDATE `' . $wpdb->posts . '` SET ' ) || 1 !== preg_match( "/ WHERE `ID` = '?" . $post_id . "'?\\z/", $query ) ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- The stored row; $condition is built from md5() hex only.
+			return '1' === (string) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE ID = %d', $wpdb->posts, $post_id ) . ' AND ' . $condition );
+		};
+		// What the save would write, with its kept blocks' bytes in place of their token.
+		$own = static function () use ( $keep, &$written ): ?array {
+			$kept = $keep?->kept();
+
+			return null === $written || null === $kept ? $written : array_merge( $written, [ 'post_content' => $kept ] );
+		};
+		// After the bound UPDATE ran: 0 rows (none matched, or MySQL counted none changed) is a conflict unless the save
+		// would change nothing. Not inside log_query_custom_data: wpdb sets rows_affected after it.
+		$settle = static function () use ( $expected, $condition, $holds, $own, $keep, &$state, &$outcome, &$written ): void {
+			/**
+			 * WordPress database.
+			 *
+			 * @var \wpdb $wpdb
+			 */
+			global $wpdb;
+
+			if ( 'sent' !== $state || ! str_contains( (string) $wpdb->last_query, $condition ) || in_array( 'log_query_custom_data', (array) ( $GLOBALS['wp_current_filter'] ?? [] ), true ) ) {
+				return;
+			}
+
+			$state = 'done';
+
+			if ( '' !== $wpdb->last_error || (int) $wpdb->rows_affected > 0 ) {
+				return;
+			}
+
+			// A kept-block save the database kept as stored (its CASE took ELSE) wrote the stored content.
+			$sent = $own();
+			$same = $sent === $expected || ( null !== $keep && null !== $sent && null !== $expected && array_merge( $sent, [ 'post_content' => $expected['post_content'] ?? '' ] ) === $expected );
+
+			if ( ! $same || ! $holds() ) {
+				$state   = 'held';
+				$outcome = 'conflict';
+				$written = null;
+			}
+		};
+		$check  = static function ( $query ) use ( $post_id, $expected, $open, $level, $head, $tails, $settle, &$state, &$outcome ) {
+			$settle();
+
+			if ( ! is_string( $query ) || '' === $query || ! in_array( $state, [ 'armed', 'held' ], true ) || ! ExpectedWrite::at( $level ) || ! ExpectedWrite::writes( $query ) ) {
 				return $query;
 			}
 
-			$armed = false;
+			// After a conflict, the rest of the save (terms, slug) is not written over the person's row either.
+			if ( 'held' === $state ) {
+				return '';
+			}
 
-			if ( self::stored_text( $post_id ) === $expected ) {
+			$state = 'done';
+
+			if ( null === $expected || ( ! $open && null === ExpectedWrite::bind( $query, $head, $tails, '1' ) ) ) {
+				$outcome = 'refused';
+				ExpectedWrite::refused( sprintf( 'the machine translation of post %d', $post_id ) );
+
+				return '';
+			}
+
+			if ( $open ) {
+				$outcome = 'unguarded';
+
 				return $query;
 			}
 
-			$stopped = true;
+			$state = 'checked';
 
-			return '';
+			return $query;
+		};
+		$bind   = static function ( $query ) use ( $post_id, $level, $head, $tails, $condition, $settle, &$state, &$outcome ) {
+			$settle();
+
+			if ( 'checked' !== $state || ! is_string( $query ) || '' === $query || ! ExpectedWrite::at( $level ) || ! ExpectedWrite::writes( $query ) ) {
+				return $query;
+			}
+
+			$bound = ExpectedWrite::bind( $query, $head, $tails, $condition );
+			$state = null === $bound ? 'done' : 'sent';
+
+			if ( null === $bound ) {
+				$outcome = 'refused';
+				ExpectedWrite::refused( sprintf( 'the machine translation of post %d', $post_id ) );
+			}
+
+			return $bound ?? '';
+		};
+		$arm    = static function ( $id, $data = null ) use ( $post_id, $expected, $hook, $bind, &$state, &$outcome, &$written ): void {
+			if ( 'idle' !== $state || ! is_numeric( $id ) || (int) $id !== $post_id || ! ExpectedWrite::at( $hook ) ) {
+				return;
+			}
+
+			$state = 'armed';
+
+			// Re-read here, not in the query filter: a query there turns wpdb's invalid-text check back on for the UPDATE.
+			if ( null !== $expected && self::stored_text( $post_id ) !== $expected ) {
+				$state   = 'held';
+				$outcome = 'conflict';
+
+				return;
+			}
+
+			// pre_post_update's data is the unslashed row the UPDATE writes.
+			if ( is_array( $data ) && is_scalar( $data['post_title'] ?? null ) && is_scalar( $data['post_content'] ?? null ) && is_scalar( $data['post_excerpt'] ?? null ) ) {
+				$written = [
+					'post_title'   => (string) $data['post_title'],
+					'post_content' => (string) $data['post_content'],
+					'post_excerpt' => (string) $data['post_excerpt'],
+				];
+			}
+
+			add_filter( 'query', $bind, PHP_INT_MAX, 1 );
 		};
 
-		add_action( 'pre_post_update', $arm, PHP_INT_MAX, 1 );
+		add_action( 'pre_post_update', $arm, PHP_INT_MAX, 2 );
 		add_filter( 'query', $check, PHP_INT_MAX, 1 );
 
-		return static function () use ( $arm, $check, &$stopped ): bool {
+		return static function () use ( $post_id, $arm, $check, $bind, $settle, $holds, $own, $expected, &$state, &$outcome, &$written ): string {
 			remove_action( 'pre_post_update', $arm, PHP_INT_MAX );
 			remove_filter( 'query', $check, PHP_INT_MAX );
+			remove_filter( 'query', $bind, PHP_INT_MAX );
+			$settle();
 
-			return $stopped;
+			// Sent but not seen run (a later filter changed it): unchanged row = not written, the save's text = written.
+			if ( 'sent' === $state ) {
+				$outcome = $holds() ? ( $own() === $expected ? '' : 'refused' ) : ( null !== $own() && self::stored_text( $post_id ) === $own() ? '' : 'conflict' );
+				$written = '' === $outcome ? $written : null;
+			}
+
+			return $outcome;
 		};
 	}
 

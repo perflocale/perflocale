@@ -539,7 +539,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 						if ( $per_string ) {
 							foreach ( $items as $item ) {
 								try {
-									$outputs = $service->translate_batch_texts( $item['texts'], $source_lang_slug, $target_lang_slug, $provider_id, false, $item['format'] );
+									$outputs = $service->translate_batch_texts( $item['texts'], $source_lang_slug, $target_lang_slug, $provider_id, false, $item['format'], array_fill( 0, count( $item['texts'] ), self::item_label( $item ) ) );
 								} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
 									// Provider breaker tripped: every further call would throw at once. The job pauses
 									// at this unit.
@@ -584,16 +584,18 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 						foreach ( $keys_by_format as $format => $keys ) {
 							$flat   = [];
+							$labels = [];
 							$slices = [];
 							foreach ( $keys as $k ) {
 								$slices[ $k ] = [ count( $flat ), count( $items[ $k ]['texts'] ) ];
 								foreach ( $items[ $k ]['texts'] as $text ) {
-									$flat[] = $text;
+									$flat[]   = $text;
+									$labels[] = self::item_label( $items[ $k ] );
 								}
 							}
 
 							try {
-								$results = $service->translate_batch_texts( $flat, $source_lang_slug, $target_lang_slug, $provider_id, false, (string) $format );
+								$results = $service->translate_batch_texts( $flat, $source_lang_slug, $target_lang_slug, $provider_id, false, (string) $format, $labels );
 							} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
 								// The chunk runs again on Retry, its settled format groups named, so its counts go back
 								// too.
@@ -1172,8 +1174,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * Whether the provider translates a list in one request: AbstractProvider::translate_batch() loops translate(), so
-	 * an heir gains nothing from a chunk call and loses the already-paid texts when one fails.
+	 * Whether the provider translates a list in one request: a per-text provider gains nothing from a chunk call and
+	 * loses the already-paid texts when one fails.
 	 *
 	 * @param TranslationService $service     Service.
 	 * @param string             $provider_id Provider id ('' = configured).
@@ -1182,14 +1184,25 @@ final class BulkStringTranslateJob extends AbstractJob {
 	private function provider_batches_natively( TranslationService $service, string $provider_id ): bool {
 		try {
 			$provider = $service->get_provider( $provider_id );
-			$method   = new \ReflectionMethod( $provider, 'translate_batch' );
 		} catch ( \Throwable $e ) {
 			unset( $e );
 			// The chunk call reports the provider error for every row.
 			return true;
 		}
 
-		return $method->getDeclaringClass()->getName() !== \PerfLocale\MachineTranslation\AbstractProvider::class;
+		return ! $provider instanceof \PerfLocale\MachineTranslation\AbstractProvider || $provider->batches_natively();
+	}
+
+	/**
+	 * A string's name in a failure message.
+	 *
+	 * @param array<string, mixed> $item Provider input of a string row.
+	 * @phpstan-param StringItem $item
+	 * @return string
+	 */
+	private static function item_label( array $item ): string {
+		/* translators: %d: string ID */
+		return sprintf( __( 'string #%d', 'perflocale' ), $item['id'] );
 	}
 
 	/**
@@ -1507,8 +1520,6 @@ final class BulkStringTranslateJob extends AbstractJob {
 			$forms[] = $text;
 		}
 
-		// save_translation() repairs an unusable group first and writes the link before the value, so a row counted as
-		// translated can be served; a failure comes back as the reason and the row counts failed.
 		// As stored now: a person may have saved a value while the provider worked.
 		$now = self::stored_now( $string_id, $language_id );
 
@@ -1530,6 +1541,28 @@ final class BulkStringTranslateJob extends AbstractJob {
 				'error'       => '',
 				'translation' => '',
 				'kept'        => true,
+			];
+		}
+
+		if ( $skip_existing ) {
+			$extra = is_array( $item['numbers'] ) && $forms_error === '' && count( $forms ) > 1
+				? StringTranslationRepository::normalize_extra_forms( array_slice( $forms, 1 ) )
+				: null;
+			$saved = $this->save_if_empty( $group_repo, $item['row'], $string_id, $language_id, $forms[0], $extra, $now );
+
+			if ( false === $saved ) {
+				return [
+					'saved'       => false,
+					'error'       => '',
+					'translation' => '',
+					'kept'        => true,
+				];
+			}
+
+			return [
+				'saved'       => true === $saved,
+				'error'       => true === $saved ? $forms_error : $saved,
+				'translation' => true === $saved ? $forms[0] : '',
 			];
 		}
 
@@ -1699,28 +1732,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 		}
 
 		if ( $linked === false ) {
-			// A group this call minted is reclaimed by primary key and the row put back, so a failed save leaves no
-			// orphan.
 			if ( $minted_group_id > 0 ) {
-				global $wpdb;
-
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Rollback of a write this method just made.
-				$wpdb->delete(
-					Schema::table( 'translation_groups' ),
-					[ 'id' => $minted_group_id ],
-					[ '%d' ]
-				);
-
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Rollback of a write this method just made.
-				$wpdb->update(
-					Schema::table( 'strings' ),
-					[ 'group_id' => $original_group_id ],
-					[ 'id' => $string_id ],
-					[ '%d' ],
-					[ '%d' ]
-				);
-
-				$row->group_id = $original_group_id;
+				self::undo_group_repair( $row, $string_id, $minted_group_id, $original_group_id );
 			}
 
 			return sprintf(
@@ -1738,7 +1751,328 @@ final class BulkStringTranslateJob extends AbstractJob {
 			);
 		}
 
+		// A person's save between the link and value writes would leave its label over this text: the label follows the value.
+		if ( null === self::claim_mt( $group_repo, $group_id, $string_id, $language_id, $translated_text ) ) {
+			return self::not_labelled( $string_id );
+		}
+
 		return '';
+	}
+
+	/**
+	 * Skip-existing save: the value statement itself writes only into an empty slot, so a value another request
+	 * committed after the last read is kept, at any isolation level. Without a link the link goes first (a stopped run
+	 * leaves a slot the next run fills); an existing one is relabelled after the value, only while it is as read.
+	 *
+	 * @param \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo  Group/link repository.
+	 * @param object                                                     $row         Source `strings` row; `group_id` follows a repair.
+	 * @param int                                                        $string_id   Its id.
+	 * @param int                                                        $language_id Target language id.
+	 * @param string                                                     $text        Form 1.
+	 * @param string|null                                                $extra       Forms 2..N JSON; null leaves them.
+	 * @param array<string, mixed>                                       $now         From stored_now().
+	 * @phpstan-param array{group_id: int, translation: string, link: array{source: string, status: string, object_id: int}|null} $now
+	 * @return bool|string True saved, false kept (another writer's value), else why nothing was saved.
+	 */
+	private function save_if_empty(
+		\PerfLocale\Database\Repository\TranslationGroupRepository $group_repo,
+		object $row,
+		int $string_id,
+		int $language_id,
+		string $text,
+		?string $extra,
+		array $now
+	): bool|string {
+		$group_id = $now['group_id'];
+		$link     = $now['link'];
+		$minted   = 0;
+
+		if ( ! $group_repo->is_string_group( $group_id ) ) {
+			$minted = $this->mint_string_group( $string_id );
+
+			if ( $minted === 0 ) {
+				return sprintf(
+					/* translators: %d: id of the row in the plugin's strings table. */
+					__( 'Could not create a translation group for string #%d; its translation was not saved. Re-run to retry.', 'perflocale' ),
+					$string_id
+				);
+			}
+
+			if ( $row instanceof \stdClass ) {
+				$row->group_id = $minted;
+			}
+
+			$group_id = $minted;
+			$link     = null;
+		}
+
+		if ( null === $link ) {
+			if ( ! self::link_if_free( $group_repo, $group_id, $string_id, $language_id ) ) {
+				if ( $minted > 0 ) {
+					self::undo_group_repair( $row, $string_id, $minted, $now['group_id'] );
+				}
+
+				return self::not_linked( $string_id );
+			}
+
+			return self::fill_empty( $string_id, $language_id, $text, $extra ) ?? self::not_saved( $string_id );
+		}
+
+		$as_mt = \PerfLocale\Enum\SourceType::MachineTranslation->value === $link['source'] && 'translated' === $link['status'] && $string_id === $link['object_id'];
+
+		$filled     = null;
+		$relabelled = false;
+
+		// Fill and relabel as one unit (once more when it could not run): a person's save between them would find the
+		// value but not yet the mt label.
+		for ( $try = 0; $try < 2 && null === $filled; $try++ ) {
+			[ $filled, $relabelled ] = \PerfLocale\Strings\StringLinkLabel::fill_and_claim(
+				$group_repo,
+				$group_id,
+				$string_id,
+				$language_id,
+				\PerfLocale\Enum\SourceType::MachineTranslation,
+				$text,
+				$as_mt ? null : $link,
+				static fn( string $marker ): ?bool => self::fill_empty( $string_id, $language_id, $text, $extra, $marker ),
+				$extra
+			);
+		}
+
+		if ( true !== $filled ) {
+			return $filled ?? self::not_saved( $string_id );
+		}
+
+		if ( null === $relabelled ) {
+			return self::not_labelled( $string_id );
+		}
+
+		// A value replaced meanwhile is another writer's: kept, with its link's label.
+		if ( ! $as_mt && ! $relabelled && ! self::holds( $string_id, $language_id, $text ) ) {
+			return false;
+		}
+
+		// A link changed meanwhile keeps its label; one removed meanwhile is written again, so the value is served.
+		if ( ! $relabelled && ! self::link_if_free( $group_repo, $group_id, $string_id, $language_id ) ) {
+			return self::not_linked( $string_id );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Why a saved string's link could not be labelled.
+	 *
+	 * @param int $string_id String.
+	 * @return string
+	 */
+	private static function not_labelled( int $string_id ): string {
+		return sprintf(
+			/* translators: %d: id of the row in the plugin's strings table. */
+			__( 'String #%d: the translation was saved, but it could not be marked as a machine translation (a database error). Run the job again.', 'perflocale' ),
+			$string_id
+		);
+	}
+
+	/**
+	 * Label the link machine translation (StringLinkLabel::claim()), once more when the relabel could not run.
+	 *
+	 * @param \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo  Group/link repository.
+	 * @param int                                                        $group_id    String group.
+	 * @param int                                                        $string_id   String.
+	 * @param int                                                        $language_id Language.
+	 * @param string                                                     $text        Form 1 the run wrote.
+	 * @param array{source: string, status: string, object_id: int}|null $read        The link as read.
+	 * @return bool|null Relabelled; null when it could not run twice.
+	 */
+	private static function claim_mt( \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo, int $group_id, int $string_id, int $language_id, string $text, ?array $read = null ): ?bool {
+		return \PerfLocale\Strings\StringLinkLabel::claim( $group_repo, $group_id, $string_id, $language_id, \PerfLocale\Enum\SourceType::MachineTranslation, $text, $read )
+			?? \PerfLocale\Strings\StringLinkLabel::claim( $group_repo, $group_id, $string_id, $language_id, \PerfLocale\Enum\SourceType::MachineTranslation, $text, $read );
+	}
+
+	/**
+	 * The reason a string's link could not be written.
+	 *
+	 * @param int $string_id String.
+	 * @return string
+	 */
+	private static function not_linked( int $string_id ): string {
+		return sprintf(
+			/* translators: %d: id of the row in the plugin's strings table. */
+			__( 'Could not link string #%d to the target language; its translation was not saved. Re-run to retry.', 'perflocale' ),
+			$string_id
+		);
+	}
+
+	/**
+	 * The reason a string's value could not be written.
+	 *
+	 * @param int $string_id String.
+	 * @return string
+	 */
+	private static function not_saved( int $string_id ): string {
+		return sprintf(
+			/* translators: %d: string ID. */
+			__( 'Failed to persist translation for string #%d.', 'perflocale' ),
+			$string_id
+		);
+	}
+
+	/**
+	 * Form 1, and forms 2..N when given, only into an empty slot: INSERT IGNORE where no row is, else an UPDATE whose
+	 * WHERE needs the stored value empty. The database decides both on the row as stored at the write.
+	 *
+	 * @param int         $string_id   String.
+	 * @param int         $language_id Language.
+	 * @param string      $text        Form 1.
+	 * @param string|null $extra       Forms 2..N JSON; null leaves the stored ones.
+	 * @param string      $marker      A ConnectionGuard condition (" AND ..."), appended after prepare(); '' for none.
+	 * @return bool|null True written, false a stored value kept, null a database error.
+	 */
+	private static function fill_empty( int $string_id, int $language_id, string $text, ?string $extra, string $marker = '' ): ?bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return null;
+		}
+
+		$table = Schema::table( 'string_translations' );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Conditional writes, prepared here; the UPDATE's replacements arrive as one array; the marker is the guard's hex-token condition.
+		// With a marker the INSERT selects its values, so it can carry the condition.
+		$values = '' === $marker ? ' VALUES (%d, %d, %s' : ' SELECT %d, %d, %s';
+		$sql    = null === $extra
+			? $wpdb->prepare( 'INSERT IGNORE INTO %i (string_id, language_id, translation)' . $values . ( '' === $marker ? ')' : ' FROM DUAL WHERE 1 = 1' ), $table, $string_id, $language_id, $text )
+			: $wpdb->prepare( 'INSERT IGNORE INTO %i (string_id, language_id, translation, extra_forms)' . $values . ', %s' . ( '' === $marker ? ')' : ' FROM DUAL WHERE 1 = 1' ), $table, $string_id, $language_id, $text, $extra );
+
+		$inserted = is_string( $sql ) ? $wpdb->query( $sql . $marker ) : false;
+
+		if ( ! is_int( $inserted ) ) {
+			return null;
+		}
+
+		if ( $inserted > 0 ) {
+			return true;
+		}
+
+		// On SQLite the write-time fragment compares with a second binding of the text.
+		$touch = Schema::touch_write_time( [ [ 'translation', '%s', 'text' ] ] );
+		$sql   = $wpdb->prepare(
+			'UPDATE %i SET translation = %s' . ( null === $extra ? '' : ', extra_forms = %s' ) . $touch . ' WHERE string_id = %d AND language_id = %d AND LENGTH(translation) = 0',
+			array_merge( [ $table, $text ], null === $extra ? [] : [ $extra ], '' === $touch ? [] : [ $text ], [ $string_id, $language_id ] )
+		);
+
+		$updated = is_string( $sql ) ? $wpdb->query( $sql . $marker ) : false;
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return is_int( $updated ) ? $updated > 0 : null;
+	}
+
+	/**
+	 * Link a group to a language as MT unless a link already holds the key, which then stays as it is. A stale link of
+	 * this string in another group (object_lang) is dropped and the insert retried once, as upsert_link() does.
+	 *
+	 * @param \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo  Group/link repository.
+	 * @param int                                                        $group_id    String group.
+	 * @param int                                                        $string_id   String.
+	 * @param int                                                        $language_id Language.
+	 * @return bool Whether the group has a link in the language now.
+	 */
+	private static function link_if_free( \PerfLocale\Database\Repository\TranslationGroupRepository $group_repo, int $group_id, int $string_id, int $language_id ): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		$links = Schema::table( 'translation_links' );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Insert-only link write and its debris removal, prepared here.
+		for ( $try = 0; $try < 2; $try++ ) {
+			$sql      = $wpdb->prepare( "INSERT IGNORE INTO %i (group_id, object_id, language_id, type, status, source) VALUES (%d, %d, %d, 'string', 'translated', %s)", $links, $group_id, $string_id, $language_id, \PerfLocale\Enum\SourceType::MachineTranslation->value );
+			$inserted = is_string( $sql ) ? $wpdb->query( $sql ) : false;
+
+			if ( is_int( $inserted ) && $inserted > 0 ) {
+				$group_repo->invalidate_group_cache( $group_id );
+
+				/** @hook perflocale/translation/linked Fires after an object is linked to a group. */
+				do_action( 'perflocale/translation/linked', $group_id, $string_id, $language_id );
+
+				return true;
+			}
+
+			if ( 0 === $inserted && is_numeric( $wpdb->get_var( $wpdb->prepare( 'SELECT id FROM %i WHERE group_id = %d AND language_id = %d LIMIT 1', $links, $group_id, $language_id ) ) ) ) {
+				return true;
+			}
+
+			// Never this group's link: after a failed write it still serves the stored translation.
+			$sql = $wpdb->prepare( 'DELETE FROM %i WHERE type = %s AND object_id = %d AND language_id = %d AND group_id != %d', $links, \PerfLocale\Enum\ObjectType::String->value, $string_id, $language_id, $group_id );
+
+			if ( is_string( $sql ) ) {
+				$wpdb->query( $sql );
+			}
+		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+		return false;
+	}
+
+	/**
+	 * Whether form 1 is still this run's text; a failed read answers yes, so the save is reported.
+	 *
+	 * @param int    $string_id   String.
+	 * @param int    $language_id Language.
+	 * @param string $text        Form 1 this run wrote.
+	 * @return bool
+	 */
+	private static function holds( int $string_id, int $language_id, string $text ): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return true;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Read after a refused compare-and-set; never cached.
+		$stored = $wpdb->get_var( $wpdb->prepare( 'SELECT translation FROM %i WHERE string_id = %d AND language_id = %d', Schema::table( 'string_translations' ), $string_id, $language_id ) );
+
+		return ! is_string( $stored ) || $stored === $text;
+	}
+
+	/**
+	 * Take back a group this run minted after its link failed, only while no link uses it (another request may have
+	 * adopted it), and point the string back only while it still names that group.
+	 *
+	 * @param object $row       Source `strings` row.
+	 * @param int    $string_id Its id.
+	 * @param int    $minted    Group this run created.
+	 * @param int    $original  The string's group before the repair.
+	 * @return void
+	 */
+	private static function undo_group_repair( object $row, int $string_id, int $minted, int $original ): void {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return;
+		}
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Conditional take-back of this run's own repair, prepared here.
+		$sql     = $wpdb->prepare( 'DELETE FROM %i WHERE id = %d AND NOT EXISTS ( SELECT 1 FROM %i WHERE group_id = %d )', Schema::table( 'translation_groups' ), $minted, Schema::table( 'translation_links' ), $minted );
+		$deleted = is_string( $sql ) ? $wpdb->query( $sql ) : false;
+
+		if ( 1 !== $deleted ) {
+			return;
+		}
+
+		$sql = $wpdb->prepare( 'UPDATE %i SET group_id = %d WHERE id = %d AND group_id = %d', Schema::table( 'strings' ), $original, $string_id, $minted );
+
+		if ( is_string( $sql ) ) {
+			$wpdb->query( $sql );
+		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+		if ( $row instanceof \stdClass ) {
+			$row->group_id = $original;
+		}
 	}
 
 	/**
@@ -1845,11 +2179,12 @@ final class BulkStringTranslateJob extends AbstractJob {
 	}
 
 	/**
-	 * A string's group and its value in one language as stored now; null when the string is gone or the read failed.
+	 * A string's group, its value and its group's link in one language as stored now (one read); null when the string
+	 * is gone or the read failed. A string-type group is remembered, so the save needs no type read.
 	 *
 	 * @param int $string_id   String.
 	 * @param int $language_id Language.
-	 * @return array{group_id: int, translation: string}|null
+	 * @return array{group_id: int, translation: string, link: array{source: string, status: string, object_id: int}|null}|null
 	 */
 	private static function stored_now( int $string_id, int $language_id ): ?array {
 		$wpdb = $GLOBALS['wpdb'] ?? null;
@@ -1859,15 +2194,26 @@ final class BulkStringTranslateJob extends AbstractJob {
 		}
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The stored row right before the write.
-		$row = $wpdb->get_row( $wpdb->prepare( 'SELECT s.group_id, t.translation FROM %i s LEFT JOIN %i t ON t.string_id = s.id AND t.language_id = %d WHERE s.id = %d', Schema::table( 'strings' ), Schema::table( 'string_translations' ), $language_id, $string_id ) );
+		$row = $wpdb->get_row( $wpdb->prepare( 'SELECT s.group_id, g.type AS group_type, t.translation, l.source AS link_source, l.status AS link_status, l.object_id AS link_object FROM %i s LEFT JOIN %i g ON g.id = s.group_id LEFT JOIN %i t ON t.string_id = s.id AND t.language_id = %d LEFT JOIN %i l ON l.group_id = s.group_id AND l.language_id = %d WHERE s.id = %d', Schema::table( 'strings' ), Schema::table( 'translation_groups' ), Schema::table( 'string_translations' ), $language_id, Schema::table( 'translation_links' ), $language_id, $string_id ) );
 
 		if ( ! is_object( $row ) || '' !== $wpdb->last_error ) {
 			return null;
 		}
 
+		$group_id = is_numeric( $row->group_id ?? null ) ? (int) $row->group_id : 0;
+
+		if ( 'string' === ( $row->group_type ?? null ) ) {
+			\PerfLocale\Database\Repository\TranslationGroupRepository::remember_string_group( $group_id );
+		}
+
 		return [
-			'group_id'    => is_numeric( $row->group_id ?? null ) ? (int) $row->group_id : 0,
+			'group_id'    => $group_id,
 			'translation' => is_scalar( $row->translation ?? null ) ? (string) $row->translation : '',
+			'link'        => is_scalar( $row->link_source ?? null ) ? [
+				'source'    => (string) $row->link_source,
+				'status'    => is_scalar( $row->link_status ?? null ) ? (string) $row->link_status : '',
+				'object_id' => is_numeric( $row->link_object ?? null ) ? (int) $row->link_object : 0,
+			] : null,
 		];
 	}
 

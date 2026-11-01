@@ -49,6 +49,11 @@ final class WpAiClientProvider extends AbstractProvider {
 	private const READY_TRANSIENT = 'perflocale_mt_wp_ai_ready';
 
 	/**
+	 * Exception code of this class's own fixed messages, which are shown as they are (upstream text never is).
+	 */
+	private const OWN_MESSAGE = -1;
+
+	/**
 	 * Routes (route_key()) whose model refused the temperature in this request.
 	 *
 	 * Later calls on the route send none instead of paying for a rejected request first.
@@ -189,50 +194,6 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Replace every connector API key, as stored, trimmed or URL-encoded, with `[REDACTED]`.
-	 *
-	 * A key of 1-3 characters only as a whole token, so the words around it stay readable; a longer one anywhere.
-	 *
-	 * @param string $text Error text.
-	 * @return string
-	 */
-	private static function mask_connector_keys( string $text ): string {
-		$forms = [];
-		$short = [];
-
-		foreach ( self::connector_keys() as $keys ) {
-			foreach ( $keys as $key ) {
-				$trimmed = is_string( $key ) ? trim( $key ) : '';
-
-				if ( '' === $trimmed ) {
-					continue;
-				}
-
-				if ( mb_strlen( $trimmed ) <= 3 ) {
-					array_push( $short, $trimmed, rawurlencode( $trimmed ) );
-				} else {
-					array_push( $forms, $key, $trimmed, rawurlencode( $trimmed ) );
-				}
-			}
-		}
-
-		// Longest first, so a form that contains another is replaced whole.
-		$forms = array_unique( $forms );
-		usort( $forms, static fn( string $a, string $b ): int => strlen( $b ) <=> strlen( $a ) );
-		$text = str_replace( $forms, '[REDACTED]', $text );
-
-		if ( [] === $short ) {
-			return $text;
-		}
-
-		$quoted = array_map( static fn( string $f ): string => preg_quote( $f, '/' ), array_unique( $short ) );
-		$masked = preg_replace( '/(?<![\p{L}\p{N}_])(?:' . implode( '|', $quoted ) . ')(?![\p{L}\p{N}_])/u', '[REDACTED]', $text );
-
-		// Text that is not UTF-8 fails the match: masked everywhere instead.
-		return null !== $masked ? $masked : str_replace( $short, '[REDACTED]', $text );
-	}
-
-	/**
 	 * {@inheritDoc}
 	 *
 	 * @param string $format Destination format hint ('html'|'text'), sent to the model as a prompt rule.
@@ -340,12 +301,17 @@ final class WpAiClientProvider extends AbstractProvider {
 			delete_transient( self::READY_TRANSIENT );
 		}
 
-		// No model: say what to do. Otherwise mask credentials before the message is shown or stored on a job row:
-		// make_request() masks only the HTTP providers' errors, and upstreams echo keys (OpenAI's 401 shows `sk-...`).
-		// classify_error() ran on the raw message, so masking cannot change the category.
-		$safe_message = self::is_no_model_error( $e )
-			? __( 'No AI provider is connected. Connect one under Settings → Connectors.', 'perflocale' )
-			: self::mask_credentials( self::mask_connector_keys( $e->getMessage() ) );
+		// No model: say what to do. Upstream text goes nowhere (it can echo the prompt or keys): its category, status and a
+		// fixed hint do. classify_error() read the raw text. Own messages only when thrown in this file.
+		if ( self::is_no_model_error( $e ) ) {
+			$safe_message = __( 'No AI provider is connected. Connect one under Settings → Connectors.', 'perflocale' );
+		} elseif ( self::OWN_MESSAGE === $e->getCode() && __FILE__ === $e->getFile() ) {
+			$safe_message = $e->getMessage();
+		} else {
+			$code = $e->getCode();
+			$this->log_error( is_int( $code ) && $code >= 400 && $code < 600 ? 'error HTTP ' . $code : 'error', $reason );
+			$safe_message = self::shown_error( $reason, $code );
+		}
 
 		throw new \RuntimeException(
 			esc_html(
@@ -357,6 +323,26 @@ final class WpAiClientProvider extends AbstractProvider {
 				)
 			)
 		);
+	}
+
+	/**
+	 * The shown text of an upstream error: its HTTP status, if known, and a fixed hint for its category.
+	 *
+	 * @param string $reason Category from classify_error().
+	 * @param mixed  $code   Exception code (core puts the HTTP status there).
+	 * @return string
+	 */
+	private static function shown_error( string $reason, mixed $code ): string {
+		$hint = match ( $reason ) {
+			'auth' => __( 'The AI provider refused the key or access: check it under Settings → Connectors.', 'perflocale' ),
+			'rate_limit' => __( 'The AI provider is limiting requests: try again later.', 'perflocale' ),
+			'transient' => __( 'The AI provider could not be reached or had a server error: try again later.', 'perflocale' ),
+			'invalid_request' => __( 'The AI provider refused this request.', 'perflocale' ),
+			default => __( 'The AI provider returned an error.', 'perflocale' ),
+		};
+
+		/* translators: 1: HTTP status, 2: what happened and what to do */
+		return is_int( $code ) && $code >= 400 && $code < 600 ? sprintf( __( 'HTTP %1$d. %2$s', 'perflocale' ), $code, $hint ) : $hint;
 	}
 
 	/**
@@ -772,7 +758,8 @@ final class WpAiClientProvider extends AbstractProvider {
 				// Any non-object is malformed: fail rather than call methods on it.
 				if ( ! is_object( $builder ) ) {
 					throw new \RuntimeException(
-						esc_html__( 'wp_ai_client_prompt() did not return a builder object.', 'perflocale' )
+						esc_html__( 'wp_ai_client_prompt() did not return a builder object.', 'perflocale' ),
+						self::OWN_MESSAGE // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int constant.
 					);
 				}
 
@@ -845,7 +832,8 @@ final class WpAiClientProvider extends AbstractProvider {
 				}
 
 				throw new \RuntimeException(
-					esc_html__( 'WordPress AI Client returned no text - likely no AI provider configured, or the prompt was blocked by a wp_ai_client_prevent_prompt filter.', 'perflocale' )
+					esc_html__( 'WordPress AI Client returned no text - likely no AI provider configured, or the prompt was blocked by a wp_ai_client_prevent_prompt filter.', 'perflocale' ),
+					self::OWN_MESSAGE // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int constant.
 				);
 			};
 		}

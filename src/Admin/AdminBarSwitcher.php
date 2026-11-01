@@ -54,6 +54,19 @@ final class AdminBarSwitcher {
 	}
 
 	/**
+	 * `admin_bar_init` callback: attaches the service's hooks once core has set up a showing toolbar.
+	 *
+	 * @return void
+	 */
+	public static function on_admin_bar_init(): void {
+		$switcher = Plugin::get_instance()->get( 'admin_bar_switcher' );
+
+		if ( $switcher instanceof self ) {
+			$switcher->register_hooks();
+		}
+	}
+
+	/**
 	 * Register hooks.
 	 *
 	 * @return void

@@ -59,9 +59,10 @@ final class ImportedOptionStrings {
 	 * @param int        $language_id Target language ID.
 	 * @param string     $value       Translation, plain text.
 	 * @param SourceType $source      Import source for the translation link.
-	 * @return bool True when a translation was stored and linked.
+	 * @return bool|null True when stored and linked; false when nothing was stored (the language already has one);
+	 *                   null when a write failed.
 	 */
-	public static function save( string $option, string $raw, int $language_id, string $value, SourceType $source ): bool {
+	public static function save( string $option, string $raw, int $language_id, string $value, SourceType $source ): ?bool {
 		$value = sanitize_textarea_field( $value );
 
 		if ( $value === '' || $language_id <= 0 ) {
@@ -73,8 +74,9 @@ final class ImportedOptionStrings {
 		$translations = new StringTranslationRepository( $plugin->get( 'cache' ) );
 		$row          = $strings->find_by_hash( OptionStrings::DOMAIN, $option, $raw );
 
+		// sources() registered the option's string, so a missing row is a failed write or read.
 		if ( $row === null ) {
-			return false;
+			return null;
 		}
 
 		$string_id = (int) $row->id;
@@ -83,7 +85,7 @@ final class ImportedOptionStrings {
 
 		if ( $translations->get( $string_id, $language_id ) === '' ) {
 			if ( ! $translations->set( $string_id, $language_id, $value ) ) {
-				return false;
+				return null;
 			}
 
 			$stored = true;
@@ -107,6 +109,10 @@ final class ImportedOptionStrings {
 
 		$linked = $group_id > 0 && false !== $groups->upsert_link( $group_id, $string_id, $language_id, 'translated', $source );
 
-		return $stored && $linked;
+		if ( ! $linked ) {
+			return null;
+		}
+
+		return $stored;
 	}
 }

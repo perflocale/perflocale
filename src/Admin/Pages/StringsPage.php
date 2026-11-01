@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Admin\Pages;
 
 use PerfLocale\Admin\AdminController;
+use PerfLocale\Admin\Typed;
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Database\Repository\TranslationLinkRepository;
@@ -26,7 +27,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class StringsPage {
 
 	/**
-	 * Inputs the save form posts besides the per-cell ones (seven), plus slack.
+	 * Nonce action of the save form; a page that sends perflocale_str_shown.
+	 *
+	 * @var string
+	 */
+	public const SAVE_NONCE = 'perflocale_string_translations_recorded';
+
+	/**
+	 * Inputs the save form posts besides the per-cell ones (eight), plus slack.
 	 *
 	 * PHP's own cut-off is not exact: see docs-ai/11-code-rationale.md, "StringsPage: save form input budget".
 	 *
@@ -91,6 +99,13 @@ final class StringsPage {
 		$saved = isset( $_GET['saved'] ) ? absint( $_GET['saved'] ) : 0;
 		// Cells the save handler could not write; without the notice the typed text would vanish silently.
 		$save_failed = isset( $_GET['save_failed'] ) ? absint( $_GET['save_failed'] ) : 0;
+		// Edited cells not written because they changed after render: "<string_id>_<lang_id>" list and total.
+		$save_stale   = isset( $_GET['save_stale'] ) && is_string( $_GET['save_stale'] ) ? sanitize_text_field( wp_unslash( $_GET['save_stale'] ) ) : '';
+		$save_stale_n = isset( $_GET['save_stale_n'] ) && is_string( $_GET['save_stale_n'] ) ? absint( $_GET['save_stale_n'] ) : 0;
+		// A save refused because its record of what the page showed was missing or unreadable.
+		$save_unchecked = ! empty( $_GET['save_unchecked'] );
+		// Edited cells the database could not compare byte for byte.
+		$save_mismatch = isset( $_GET['save_mismatch'] ) ? absint( $_GET['save_mismatch'] ) : 0;
 
 		$allowed_modes = [ 'contains', 'not_contains', 'exact', 'starts_with', 'not_starts_with', 'ends_with', 'not_ends_with' ];
 		if ( ! in_array( $search_mode, $allowed_modes, true ) ) {
@@ -264,6 +279,24 @@ final class StringsPage {
 			<?php if ( $saved > 0 ) : ?>
 				<div class="notice notice-success is-dismissible">
 					<p><?php /* translators: %d: number of saved translations */ printf( esc_html( _n( '%d translation saved.', '%d translations saved.', $saved, 'perflocale' ) ), esc_html( $saved ) ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $save_stale_n > 0 ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p><?php echo esc_html( self::stale_message( $save_stale, $save_stale_n, Typed::arr( $languages ), $string_repo ) ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $save_mismatch > 0 ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p><?php echo esc_html( self::mismatch_message( $save_mismatch ) ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $save_unchecked ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p><?php echo esc_html__( 'Translations not saved: the form lacked the data needed to check for changes others made since you opened it (for example a page opened before an update). Reload the page, then edit and save again.', 'perflocale' ); ?></p>
 				</div>
 			<?php endif; ?>
 
@@ -648,11 +681,12 @@ final class StringsPage {
 
 				<?php $save_form_id = 'perflocale-str-save-form'; ?>
 				<form id="<?php echo esc_attr( $save_form_id ); ?>" method="post" action="<?php echo esc_url( $base_url ); ?>">
-					<?php wp_nonce_field( 'perflocale_string_translations' ); ?>
+					<?php wp_nonce_field( self::SAVE_NONCE ); ?>
 					<input type="hidden" name="perflocale_save_string_translations" value="1">
 					<input type="hidden" name="domain_filter" value="<?php echo esc_attr( $domain ); ?>">
 					<input type="hidden" name="search" value="<?php echo esc_attr( $search ); ?>">
 					<input type="hidden" name="paged" value="<?php echo esc_attr( (string) $page_num ); ?>">
+					<?php $this->render_shown_field( $strings, Typed::arr( $languages ), $text_map ); ?>
 
 					<div class="perflocale-table-responsive">
 					<table class="wp-list-table widefat fixed striped perflocale-str-edit-table">
@@ -792,16 +826,14 @@ final class StringsPage {
 											<?php
 											// Plural forms 2..N for a language with more than two CLDR forms; form 0 is the
 											// singular-context sibling row, form 1 the input above.
-											$is_plural_row = $string->context === 'plural'
-												|| ( is_string( $string->context ) && str_ends_with( $string->context, ' (plural)' ) );
-											$nplurals      = \PerfLocale\Strings\PluralRules::nplurals( (string) $lang->locale );
+											$extra_count = self::extra_form_count( $string, $lang );
 
-											if ( $is_plural_row && $nplurals > 2 ) :
+											if ( $extra_count > 0 ) :
 												$existing_extra = $this->extra_map[ $text_key ] ?? [];
 												?>
 												<div class="perflocale-str-extra-forms">
 													<span class="perflocale-str-extra-forms__label"><?php echo esc_html__( 'Plural forms', 'perflocale' ); ?></span>
-													<?php for ( $form_i = 2; $form_i < $nplurals; $form_i++ ) : ?>
+													<?php for ( $form_i = 2; $form_i < $extra_count + 2; $form_i++ ) : ?>
 														<input type="text"
 															name="perflocale_str_extra[<?php echo absint( $string->id ); ?>][<?php echo absint( $lang->id ); ?>][]"
 															value="<?php echo esc_attr( $existing_extra[ $form_i - 2 ] ?? '' ); ?>"
@@ -902,7 +934,7 @@ final class StringsPage {
 	 */
 	private function render_tablenav( int $current, int $total_pages, int $total_items, array $base_args ): void {
 		// Ensure transient scan params never leak into pagination links.
-		unset( $base_args['scan_new'], $base_args['scan_total'], $base_args['saved'], $base_args['save_failed'] );
+		unset( $base_args['scan_new'], $base_args['scan_total'], $base_args['saved'], $base_args['save_failed'], $base_args['save_stale'], $base_args['save_stale_n'], $base_args['save_unchecked'], $base_args['save_mismatch'] );
 
 		$page_links = paginate_links(
 			[
@@ -938,6 +970,156 @@ final class StringsPage {
 		// Clamped on read too: a stored value may exceed the save-time ceiling. The stored
 		// preference is not rewritten.
 		return \PerfLocale\Helper::normalize_per_page( (int) $val, 20, (string) $option );
+	}
+
+	/**
+	 * A row's field as a string; '' when missing or not scalar.
+	 *
+	 * @param mixed  $row  Row object.
+	 * @param string $name Field.
+	 * @return string
+	 */
+	private static function field( $row, string $name ): string {
+		return is_object( $row ) ? Typed::str( get_object_vars( $row )[ $name ] ?? '' ) : '';
+	}
+
+	/**
+	 * Plural forms 2..N the grid shows for a cell: plural rows of a language with more than two CLDR forms.
+	 *
+	 * @param mixed $row  Strings row.
+	 * @param mixed $lang Language; carries `locale`.
+	 * @return int
+	 */
+	private static function extra_form_count( $row, $lang ): int {
+		$context = self::field( $row, 'context' );
+
+		if ( 'plural' !== $context && ! str_ends_with( $context, ' (plural)' ) ) {
+			return 0;
+		}
+
+		return max( 0, \PerfLocale\Strings\PluralRules::nplurals( self::field( $lang, 'locale' ) ) - 2 );
+	}
+
+	/**
+	 * Fingerprint of a grid cell (form 1, then the plural forms shown) as the browser posts it back.
+	 *
+	 * Stored text goes through the input's esc_attr() and the browser's decoding; a text input drops line breaks.
+	 *
+	 * @param string        $text   Form 1.
+	 * @param array<string> $extras Forms 2..N.
+	 * @param bool          $stored True for stored text, false for posted text.
+	 * @return string
+	 */
+	public static function cell_fingerprint( string $text, array $extras, bool $stored ): string {
+		$forms = [];
+
+		foreach ( array_merge( [ $text ], array_values( $extras ) ) as $form ) {
+			$form    = $stored ? html_entity_decode( esc_attr( (string) $form ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) : (string) $form;
+			$forms[] = str_replace( [ "\r", "\n" ], '', $form );
+		}
+
+		// Blank trailing plural fields equal no stored forms.
+		for ( $last = count( $forms ) - 1; $last > 0 && '' === $forms[ $last ]; --$last ) {
+			unset( $forms[ $last ] );
+		}
+
+		return md5( implode( "\x1e", $forms ) );
+	}
+
+	/**
+	 * The save form's record of what each cell showed: one hidden input (one input var for any grid size), JSON
+	 * "<string_id>_<lang_id>" => cell_fingerprint(), cells that showed blank left out.
+	 *
+	 * @param array<mixed>         $strings   Strings on this page.
+	 * @param array<mixed>         $languages Languages.
+	 * @param array<string,string> $text_map  Form 1 per "<string_id>_<lang_id>".
+	 * @return void
+	 */
+	private function render_shown_field( array $strings, array $languages, array $text_map ): void {
+		$blank = self::cell_fingerprint( '', [], true );
+		$shown = [];
+
+		foreach ( $strings as $string ) {
+			foreach ( $languages as $lang ) {
+				$key    = (int) self::field( $string, 'id' ) . '_' . (int) self::field( $lang, 'id' );
+				$extras = array_slice( $this->extra_map[ $key ] ?? [], 0, self::extra_form_count( $string, $lang ) );
+				$print  = self::cell_fingerprint( $text_map[ $key ] ?? '', $extras, true );
+
+				if ( $print !== $blank ) {
+					$shown[ $key ] = $print;
+				}
+			}
+		}
+
+		echo '<input type="hidden" name="perflocale_str_shown" value="' . esc_attr( (string) wp_json_encode( (object) $shown ) ) . '">';
+	}
+
+	/**
+	 * Notice for cells the database could not compare bytewise (table and connection character sets differ).
+	 *
+	 * @param int $count Cells not written.
+	 * @return string
+	 */
+	private static function mismatch_message( int $count ): string {
+		return sprintf(
+			/* translators: %s: number of translations not saved, formatted for the site's locale */
+			_n(
+				'%s translation was not saved: the database stores the text in another character set than it compares it in, so the save could not check whether someone else changed it. Ask your host to convert the PerfLocale tables to utf8mb4, then save again.',
+				'%s translations were not saved: the database stores the text in another character set than it compares it in, so the save could not check whether someone else changed them. Ask your host to convert the PerfLocale tables to utf8mb4, then save again.',
+				$count,
+				'perflocale'
+			),
+			number_format_i18n( $count )
+		);
+	}
+
+	/**
+	 * Notice for edited cells the save did not write because they changed after the page was loaded.
+	 *
+	 * @param string           $cells       Up to ten "<string_id>_<lang_id>" pairs, comma-separated.
+	 * @param int              $total       Cells not written.
+	 * @param array<mixed>     $languages   Active languages.
+	 * @param StringRepository $string_repo Strings.
+	 * @return string
+	 */
+	private static function stale_message( string $cells, int $total, array $languages, StringRepository $string_repo ): string {
+		$names = [];
+
+		foreach ( $languages as $lang ) {
+			$names[ (int) self::field( $lang, 'id' ) ] = self::field( $lang, 'name' );
+		}
+
+		$items = [];
+
+		foreach ( array_slice( explode( ',', $cells ), 0, 10 ) as $cell ) {
+			if ( 1 !== preg_match( '/^(\d+)_(\d+)$/', $cell, $m ) ) {
+				continue;
+			}
+
+			$string = $string_repo->find( (int) $m[1] );
+
+			/* translators: 1: original string (shortened), 2: language name. */
+			$items[] = sprintf( __( '"%1$s" (%2$s)', 'perflocale' ), null === $string ? '#' . (int) $m[1] : self::truncate( self::field( $string, 'original' ), 60 ), $names[ (int) $m[2] ] ?? '#' . (int) $m[2] );
+		}
+
+		$more = $total - count( $items );
+
+		if ( $more > 0 && [] !== $items ) {
+			/* translators: %d: number of further translations not saved. */
+			$items[] = sprintf( _n( 'and %d more', 'and %d more', $more, 'perflocale' ), $more );
+		}
+
+		return sprintf(
+			/* translators: 1: number of translations not saved, 2: list of strings with their language. */
+			_n(
+				'%1$d translation was not saved because someone else changed it after you opened this page: %2$s. Your edit was discarded: check the current text, then edit it again.',
+				'%1$d translations were not saved because someone else changed them after you opened this page: %2$s. Your edits were discarded: check the current text, then edit them again.',
+				$total,
+				'perflocale'
+			),
+			$total,
+			implode( ', ', $items )
+		);
 	}
 
 	/**
@@ -1069,7 +1251,7 @@ final class StringsPage {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT string_id, language_id, translation, extra_forms FROM %i WHERE string_id IN ({$s_placeholders}) AND language_id IN ({$l_placeholders}) AND translation != ''",
+				"SELECT string_id, language_id, translation, extra_forms FROM %i WHERE string_id IN ({$s_placeholders}) AND language_id IN ({$l_placeholders})",
 				$st_table,
 				...$args
 			)
@@ -1081,8 +1263,16 @@ final class StringsPage {
 
 		if ( is_array( $rows ) ) {
 			foreach ( $rows as $row ) {
-				$key         = (int) $row->string_id . '_' . (int) $row->language_id;
-				$map[ $key ] = (string) $row->translation;
+				$key  = (int) $row->string_id . '_' . (int) $row->language_id;
+				$text = (string) $row->translation;
+
+				// Empty rows skipped here, not in SQL: under a PAD SPACE collation "translation != ''" also drops whitespace-only
+				// text, which the save's stale check reads byte for byte.
+				if ( '' === $text ) {
+					continue;
+				}
+
+				$map[ $key ] = $text;
 
 				if ( isset( $row->extra_forms ) && $row->extra_forms !== null && $row->extra_forms !== '' ) {
 					$decoded = json_decode( (string) $row->extra_forms, true );

@@ -30,23 +30,6 @@ final class EmailTranslation {
 	private const ORDER_LANG_META = '_perflocale_language';
 
 	/**
-	 * WooCommerce order-related email IDs.
-	 *
-	 * @var array<int, string>
-	 */
-	private const ORDER_EMAIL_IDS = [
-		'new_order',
-		'cancelled_order',
-		'failed_order',
-		'customer_on_hold_order',
-		'customer_processing_order',
-		'customer_completed_order',
-		'customer_refunded_order',
-		'customer_invoice',
-		'customer_note',
-	];
-
-	/**
 	 * Whether the locale has been switched for the current email.
 	 *
 	 * @var bool
@@ -123,46 +106,12 @@ final class EmailTranslation {
 	private array $lang_id_cache = [];
 
 	/**
-	 * Register WooCommerce hooks.
+	 * Register the email hooks, calling this instance (WcLazyHooks::emails()).
 	 *
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		if ( ! class_exists( 'WooCommerce' ) ) {
-			return;
-		}
-
-		// Register subject, heading, and additional_content filters for each order email.
-		$email_ids = apply_filters( 'perflocale/woocommerce/translatable_email_ids', self::ORDER_EMAIL_IDS );
-
-		foreach ( $email_ids as $id ) {
-			add_filter( "woocommerce_email_subject_{$id}", [ $this, 'translate_email_subject' ], 10, 3 );
-			add_filter( "woocommerce_email_heading_{$id}", [ $this, 'translate_email_heading' ], 10, 3 );
-			add_filter( "woocommerce_email_additional_content_{$id}", [ $this, 'translate_email_additional_content' ], 10, 3 );
-		}
-
-		// For third-party emails outside ORDER_EMAIL_IDS; the primary switch is in
-		// translate_email_field(), as plain-text templates never fire woocommerce_email_header.
-		add_action( 'woocommerce_email_header', [ $this, 'switch_locale_for_email' ], 5, 2 );
-
-		// Do not restore here: the footer fires inside get_content(), before get_headers(),
-		// get_attachments() and wp_mail(), which must also run in the order's language.
-		add_action( 'woocommerce_email_footer', [ $this, 'mark_restore_pending' ], 99 );
-
-		// Restore after the send, so each email of a status cascade switches fresh.
-		add_action( 'woocommerce_email_sent', [ $this, 'restore_locale' ], 99, 0 );
-
-		// Stock notifications go to the shop but are sent from the request that changed
-		// the stock, usually a customer's checkout: render them in the shop's language.
-		foreach ( [ 'woocommerce_low_stock_notification', 'woocommerce_no_stock_notification', 'woocommerce_product_on_backorder_notification' ] as $stock_hook ) {
-			add_action( $stock_hook, [ $this, 'switch_locale_for_shop' ], 1, 0 );
-			add_action( $stock_hook, [ $this, 'restore_locale' ], PHP_INT_MAX, 0 );
-		}
-
-		// The slug-to-ID map and preloaded translations are per blog.
-		if ( is_multisite() ) {
-			add_action( 'switch_blog', [ $this, 'reset_caches' ] );
-		}
+		WcLazyHooks::emails( $this );
 	}
 
 	/**
@@ -173,17 +122,7 @@ final class EmailTranslation {
 	 * @return void
 	 */
 	public function register_order_language_hooks(): void {
-		if ( ! class_exists( 'WooCommerce' ) ) {
-			return;
-		}
-
-		// Save the current language when an order is created.
-		add_action( 'woocommerce_new_order', [ $this, 'save_order_language' ], 10, 2 );
-
-		// Pay-for-order: an order without a language takes the one it is paid in, before
-		// the payment sends any email.
-		add_action( 'woocommerce_before_pay_action', [ $this, 'save_pay_page_order_language' ], 10, 1 );
-		add_action( 'woocommerce_store_api_checkout_order_processed', [ $this, 'save_store_api_paid_order_language' ], 10, 1 );
+		WcLazyHooks::order_language( $this );
 	}
 
 	/**

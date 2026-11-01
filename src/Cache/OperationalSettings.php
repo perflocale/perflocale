@@ -41,6 +41,7 @@ final class OperationalSettings {
 		'mt_libre_api_key',
 		'mt_agency_url',
 		'mt_agency_api_key',
+		'mt_agency_batch',
 		'mt_auto_translate_on_publish',
 		'mt_auto_translate_languages',
 		'mt_auto_translate_on_create',

@@ -43,6 +43,13 @@ final class HreflangTags {
 	private readonly Settings $settings;
 
 	/**
+	 * Whether the head tags were printed: wp_head and perflocale_hreflang_tags() print them once per request.
+	 *
+	 * @var bool
+	 */
+	private bool $printed = false;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param LanguageRouter $router Language router.
@@ -328,8 +335,8 @@ final class HreflangTags {
 	 * @return void
 	 */
 	public function output_hreflang(): void {
-		// 404 and search have no meaningful alternates.
-		if ( is_404() || is_search() ) {
+		// Printed already; 404 and search have no meaningful alternates.
+		if ( $this->printed || is_404() || is_search() ) {
 			return;
 		}
 
@@ -391,6 +398,8 @@ final class HreflangTags {
 		}
 
 		if ( $html !== '' ) {
+			$this->printed = true;
+
 			// Escape late: whatever the cache returns, only hreflang `<link>` tags reach the head.
 			echo wp_kses(
 				$html,
@@ -706,6 +715,8 @@ final class HreflangTags {
 			/**
 			 * Filter the URL used for the <code>x-default</code> hreflang entry.
 			 *
+			 * Runs when the set is built and cached (perflocale/seo/hreflang_cache_ttl): never return a per-visitor value.
+			 *
 			 * @hook perflocale/seo/x_default_url
 			 * @param string $default_url URL currently slated for x-default.
 			 * @param object $default Default-language object.
@@ -726,7 +737,7 @@ final class HreflangTags {
 			}
 		}
 
-		/** @hook perflocale/seo/hreflang_tags Filter hreflang tags before output. */
+		/** @hook perflocale/seo/hreflang_tags Filter the hreflang set as it is built; the result is cached for every visitor. */
 		$filtered = apply_filters( 'perflocale/seo/hreflang_tags', $cached );
 
 		if ( ! is_array( $filtered ) ) {

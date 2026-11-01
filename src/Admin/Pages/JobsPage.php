@@ -750,7 +750,7 @@ final class JobsPage {
 		$first_warning = '';
 		if ( self::shows_kept( $status, $type ) ) {
 			$kept          = max( 0, (int) ( $result['kept'] ?? 0 ) );
-			$first_warning = $kept > 0 ? trim( (string) ( $result['first_warning'] ?? '' ) ) : '';
+			$first_warning = trim( (string) ( $result['first_warning'] ?? '' ) );
 		}
 
 		// A finished or canceled job whose items failed names the first error.
@@ -814,16 +814,18 @@ final class JobsPage {
 						?>
 					</div>
 				<?php endif; ?>
-				<?php self::render_result_notes( $policy_line, $attention, $first_error ); if ( $kept > 0 ) : ?>
+				<?php self::render_result_notes( $policy_line, $attention, $first_error ); if ( $kept > 0 || $first_warning !== '' ) : ?>
 					<div class="perflocale-jobs-warning">
 						<?php
-						echo esc_html(
-							sprintf(
-								/* translators: %d: number of created translations whose content stayed in the source language. */
-								_n( '%d created translation kept the source-language content.', '%d created translations kept the source-language content.', $kept, 'perflocale' ),
-								$kept
-							)
-						);
+						if ( $kept > 0 ) {
+							echo esc_html(
+								sprintf(
+									/* translators: %d: number of created translations whose content stayed in the source language. */
+									_n( '%d created translation kept the source-language content.', '%d created translations kept the source-language content.', $kept, 'perflocale' ),
+									$kept
+								)
+							);
+						}
 						?>
 						<?php if ( $first_warning !== '' ) : ?>
 							<strong><?php esc_html_e( 'First warning:', 'perflocale' ); ?></strong>

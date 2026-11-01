@@ -215,6 +215,12 @@ final class AddonMigrationErrors {
 			return;
 		}
 
+		// An add-on step the upgrade notice reports (attempts, Retry now) is listed there only.
+		$records = \PerfLocale\Admin\UpgradeNotice::without_addon_steps( $records );
+		if ( [] === $records ) {
+			return;
+		}
+
 		$latest = array_slice( $records, -5, null, true );
 		printf(
 			'<div class="notice notice-error"><p><strong>%s</strong></p><ul>',

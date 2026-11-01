@@ -27,22 +27,22 @@ final class AddonSettings {
 	/**
 	 * Option name: one row for every addon, read once per request.
 	 */
-	private const OPTION = 'perflocale_addon_settings';
+	public const OPTION = 'perflocale_addon_settings';
 
 	/**
 	 * Serialised size cap per addon entry; an addon with more state keeps it in its own option or table.
 	 */
-	private const MAX_ADDON_BYTES = 16384;
+	public const MAX_ADDON_BYTES = 16384;
 
 	/**
 	 * Lock around every write: two saves to different addons share one option, so the second would drop the first.
 	 */
-	private const LOCK_NAME = 'addon_settings_write';
+	public const LOCK_NAME = 'addon_settings_write';
 
 	/**
 	 * Lock lifetime in seconds; the work inside is one update_option().
 	 */
-	private const LOCK_TTL = 10;
+	public const LOCK_TTL = 10;
 
 	/**
 	 * Returned by sanitize_field() for a 'custom' field without sanitize_callback: the caller keeps the stored value.
@@ -55,6 +55,13 @@ final class AddonSettings {
 	 * @var array<string, array<string, mixed>>|null
 	 */
 	private static ?array $cache = null;
+
+	/**
+	 * Why the last write stored nothing (see last_failure()).
+	 *
+	 * @var string
+	 */
+	private static string $last_failure = '';
 
 	/**
 	 * Read a single setting for an addon; a malformed id returns $default.
@@ -141,6 +148,7 @@ final class AddonSettings {
 	 */
 	public static function set( string $addon_id, string $key, $value ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
+			self::$last_failure = '';
 			self::log_rejection( 'set', $addon_id, 'invalid_addon_id' );
 			return false;
 		}
@@ -166,6 +174,7 @@ final class AddonSettings {
 	 */
 	public static function set_addon( string $addon_id, array $values ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
+			self::$last_failure = '';
 			self::log_rejection( 'set_addon', $addon_id, 'invalid_addon_id' );
 			return false;
 		}
@@ -187,6 +196,7 @@ final class AddonSettings {
 	 */
 	public static function forget( string $addon_id ): bool {
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
+			self::$last_failure = '';
 			self::log_rejection( 'forget', $addon_id, 'invalid_addon_id' );
 			return false;
 		}
@@ -454,6 +464,15 @@ final class AddonSettings {
 	}
 
 	/**
+	 * Why the last write stored nothing: 'busy', 'too_large', 'database', 'unchanged', or '' (written, or a bad id).
+	 *
+	 * @since 1.0.7.5
+	 */
+	public static function last_failure(): string {
+		return self::$last_failure;
+	}
+
+	/**
 	 * Load the full settings array, memoised.
 	 *
 	 * @return array<string, array<string, mixed>>
@@ -476,6 +495,8 @@ final class AddonSettings {
 	 * @return bool True when written or unchanged; false for the size cap, a refused write or a held lock.
 	 */
 	private static function persist_with_mutator( callable $mutator, string $addon_id ): bool {
+		self::$last_failure = '';
+
 		$result = Lock::with(
 			self::LOCK_NAME,
 			self::LOCK_TTL,
@@ -501,6 +522,7 @@ final class AddonSettings {
 					$serialised = (string) maybe_serialize( $next[ $addon_id ] );
 
 					if ( strlen( $serialised ) > self::MAX_ADDON_BYTES ) {
+						self::$last_failure = 'too_large';
 						self::log_rejection(
 							'persist',
 							$addon_id,
@@ -529,8 +551,13 @@ final class AddonSettings {
 				// Not autoloaded: entries of many addons can add up, and all() memoises the one read.
 				// update_option() is false for an unchanged value too: only a changed one that did not commit is a refusal.
 				if ( ! update_option( self::OPTION, $next, false ) && maybe_serialize( $next ) !== maybe_serialize( $current ) ) {
-					self::$cache = null;
-					self::log_rejection( 'persist', $addon_id, 'write_refused' );
+					global $wpdb;
+
+					// No database error: a pre_update_option filter kept the stored value.
+					$error              = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
+					self::$cache        = null;
+					self::$last_failure = '' !== $error ? 'database' : 'unchanged';
+					self::log_rejection( 'persist', $addon_id, 'write_refused' . ( '' !== $error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? ' - ' . $error : '' ) );
 					return false;
 				}
 				self::$cache = $next;
@@ -553,6 +580,7 @@ final class AddonSettings {
 
 		// Null: the lock was held (Lock::with() does not wait).
 		if ( $result === null ) {
+			self::$last_failure = 'busy';
 			self::log_rejection( 'persist', $addon_id, 'lock_contention' );
 			return false;
 		}

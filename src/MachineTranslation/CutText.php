@@ -67,6 +67,17 @@ final class CutText {
 	];
 
 	/**
+	 * CJK, kana, Hangul and fullwidth characters: each weighs two.
+	 */
+	private const WIDE = '/[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}\x{3001}-\x{303F}\x{FF01}-\x{FF60}\x{FFE0}-\x{FFE6}]/u';
+
+	/**
+	 * A CJK, kana or Hangul letter: only these excuse a length-only finding. \p{L} keeps out the CJK punctuation that
+	 * PCRE2 10.40+ puts in these scripts' extensions; fullwidth Latin is not in them.
+	 */
+	private const SCRIPT = '/(?=[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}])\p{L}/u';
+
+	/**
 	 * Languages written without a sentence-final mark.
 	 */
 	private const NO_STOP = [ 'th', 'lo' ];
@@ -100,6 +111,41 @@ final class CutText {
 	}
 
 	/**
+	 * The warning sentence for the first short answer (see short()), or ''. Call it when refusal() is ''.
+	 *
+	 * @param array<int, string> $inputs  Texts sent.
+	 * @param array<int, mixed>  $outputs Provider answers, parallel to $inputs.
+	 * @param array<int, int>    $slots   Post field of each input: 0 title, 2 excerpt.
+	 * @return string
+	 */
+	public static function warning( array $inputs, array $outputs, array $slots ): string {
+		foreach ( $inputs as $i => $source ) {
+			$answer = $outputs[ $i ] ?? '';
+
+			if ( self::short( (string) $source, is_string( $answer ) ? $answer : '' ) ) {
+				return 0 === ( $slots[ $i ] ?? 0 )
+					? __( 'The title looks much shorter than the original; check it.', 'perflocale' )
+					: __( 'The excerpt looks much shorter than the original; check it.', 'perflocale' );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Below the length floor with CJK, kana or Hangul: saved with a warning, since these can be far shorter than the source.
+	 *
+	 * @param string $source Text sent.
+	 * @param string $answer Provider answer.
+	 * @return bool
+	 */
+	public static function short( string $source, string $answer ): bool {
+		$weight = self::weight( $source );
+
+		return $weight >= self::MIN_WEIGHT && self::weight( $answer ) / $weight < self::FLOOR && 1 === preg_match( self::SCRIPT, $answer );
+	}
+
+	/**
 	 * Why an answer looks cut off, or '' when it is plausible. An empty answer is left to the caller.
 	 *
 	 * @param string $source      Text sent.
@@ -125,7 +171,8 @@ final class CutText {
 		$weight = self::weight( $source );
 		$ratio  = $weight > 0 ? self::weight( $answer ) / $weight : 1.0;
 
-		if ( $weight >= self::MIN_WEIGHT && $ratio < self::FLOOR ) {
+		// A CJK, kana or Hangul answer under the floor goes on to the other signals; with none it is short(), not cut.
+		if ( $weight >= self::MIN_WEIGHT && $ratio < self::FLOOR && 1 !== preg_match( self::SCRIPT, $answer ) ) {
 			return __( 'it is much shorter than the original', 'perflocale' );
 		}
 
@@ -154,7 +201,7 @@ final class CutText {
 	 */
 	public static function weight( string $text ): int {
 		$base = preg_match_all( '/[^\s\p{Z}\p{Mn}\p{Me}\p{Cf}]/u', $text );
-		$wide = preg_match_all( '/[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}\x{3001}-\x{303F}\x{FF01}-\x{FF60}\x{FFE0}-\x{FFE6}]/u', $text );
+		$wide = preg_match_all( self::WIDE, $text );
 
 		return (int) $base + (int) $wide;
 	}

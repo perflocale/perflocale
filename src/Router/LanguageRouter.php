@@ -1287,7 +1287,7 @@ final class LanguageRouter {
 			$method = isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
 
 			if ( ( 'GET' === $method || 'HEAD' === $method ) && ! $this->slug_is_default( $cookie_slug ) ) {
-				add_filter( 'rest_send_nocache_headers', '__return_true' );
+				StoreApiNoStore::mark();
 			}
 
 			return $cookie_slug;
@@ -1300,7 +1300,7 @@ final class LanguageRouter {
 	 * Send `Vary: Cookie` on a Store API response that may follow the language cookie (opt-in).
 	 *
 	 * Priority 20: after WooCommerce's CORS callback, which replaces `Vary`; it appends so `Vary: Origin`
-	 * survives. Responses with `no-store` (cart, checkout) are skipped.
+	 * survives. Responses already `no-store` (cart, checkout, a cookie-language GET) are skipped.
 	 *
 	 * @param mixed $served  Whether the request has already been served.
 	 * @param mixed $result  Response about to be sent.
@@ -1308,16 +1308,8 @@ final class LanguageRouter {
 	 * @return mixed $served, unchanged.
 	 */
 	public function vary_store_api_response_on_cookie( mixed $served, mixed $result = null, mixed $request = null ): mixed {
-		if ( $served || ! $request instanceof \WP_REST_Request || ! str_starts_with( $request->get_route(), '/wc/store/' ) ) {
+		if ( $served || ! $request instanceof \WP_REST_Request || ! str_starts_with( $request->get_route(), '/wc/store/' ) || StoreApiNoStore::already_no_store( $result ) ) {
 			return $served;
-		}
-
-		if ( $result instanceof \WP_HTTP_Response ) {
-			foreach ( $result->get_headers() as $name => $value ) {
-				if ( is_string( $value ) && 'cache-control' === strtolower( (string) $name ) && str_contains( strtolower( $value ), 'no-store' ) ) {
-					return $served;
-				}
-			}
 		}
 
 		/**

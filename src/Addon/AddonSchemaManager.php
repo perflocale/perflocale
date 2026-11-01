@@ -23,25 +23,41 @@ final class AddonSchemaManager {
 	/** Option name for per-addon schema versions. */
 	public const VERSIONS_OPTION = 'perflocale_addon_schema_versions';
 
-	/**
-	 * Regex for addon id - enforced by validate_addon_id().
-	 *
-	 * Hyphens are allowed for the bundled `contact-form-7`, `beaver-builder` and `gravity-forms`; table_name() strips them.
-	 */
-	public const ADDON_ID_PATTERN = '/^[a-z0-9_-]{2,16}$/';
+	/** Regex for addon id; table_name() strips its hyphens. */
+	public const ADDON_ID_PATTERN = AddonId::ADDON_ID_PATTERN;
 
 	/** Regex for short table names - enforced in apply_schema(). */
 	public const SHORT_NAME_PATTERN = '/^[a-z0-9_]{1,16}$/';
 
 	/**
-	 * Apply schema for an addon and run its pending migrations.
+	 * Apply schema for an addon and run its pending migrations, under the upgrade lock with backoff.
 	 *
 	 * Failures are recorded to AddonMigrationErrors; the stored version advances after each successful step.
 	 *
 	 * @param HasSchema&AddonInterface $addon The addon to migrate.
+	 * @param bool                     $force Ignore the retry backoff (WP-CLI, Retry now).
+	 * @return bool True if fully migrated to target, false if halted or waiting.
+	 */
+	public static function migrate( HasSchema&AddonInterface $addon, bool $force = false ): bool {
+		$addon_id = $addon->get_id();
+		$target   = (int) $addon->get_schema_version();
+
+		// Schema version 0 means "no schema managed"; never downgrade.
+		if ( self::validate_addon_id( $addon_id ) && ( $target < 1 || self::get_stored_version( $addon_id ) >= $target ) ) {
+			return true;
+		}
+
+		return ( new \PerfLocale\Database\UpgradeRunner() )->addon( $addon, $addon_id, $force );
+	}
+
+	/**
+	 * The pending steps of migrate(); UpgradeRunner calls it holding the upgrade lock.
+	 *
+	 * @internal
+	 * @param HasSchema&AddonInterface $addon The addon to migrate.
 	 * @return bool True if fully migrated to target, false if halted.
 	 */
-	public static function migrate( HasSchema&AddonInterface $addon ): bool {
+	public static function run_pending( HasSchema&AddonInterface $addon ): bool {
 		$addon_id = $addon->get_id();
 
 		if ( ! self::validate_addon_id( $addon_id ) ) {
@@ -74,7 +90,7 @@ final class AddonSchemaManager {
 			self::apply_schema( $addon_id, $schema );
 			$missing = self::missing_tables( $addon_id, $schema, $read_error );
 		} catch ( \Throwable $e ) {
-			AddonMigrationErrors::record( $addon_id, 'schema', $target, $e->getMessage() );
+			AddonMigrationErrors::record( $addon_id, 'schema', $target, \PerfLocale\Database\UpgradeRunner::describe( $e ) );
 			return false;
 		}
 
@@ -114,7 +130,7 @@ final class AddonSchemaManager {
 			try {
 				$ok = $addon->migrate_to( $v );
 			} catch ( \Throwable $e ) {
-				AddonMigrationErrors::record( $addon_id, 'migrate', $v, $e->getMessage() );
+				AddonMigrationErrors::record( $addon_id, 'migrate', $v, \PerfLocale\Database\UpgradeRunner::describe( $e ) );
 				/** @hook perflocale/addon/migration_failed */
 				do_action( 'perflocale/addon/migration_failed', $addon, $v, $e );
 				return false;
@@ -137,7 +153,22 @@ final class AddonSchemaManager {
 				return false;
 			}
 
+			// Another runner took the upgrade lock over after its TTL: it owns the version now.
+			if ( ! \PerfLocale\Database\UpgradeRunner::owns() ) {
+				return false;
+			}
+
 			self::set_stored_version( $addon_id, $v );
+
+			$unsaved = \PerfLocale\Database\UpgradeRunner::addon_saved( $addon_id, $v );
+
+			if ( '' !== $unsaved ) {
+				AddonMigrationErrors::record( $addon_id, 'migrate', $v, $unsaved );
+				/** @hook perflocale/addon/migration_failed */
+				do_action( 'perflocale/addon/migration_failed', $addon, $v, new \RuntimeException( $unsaved ) );
+				return false;
+			}
+
 			$stored = $v;
 
 			/** @hook perflocale/addon/migrated Fires after each successful addon migration step. */
@@ -304,6 +335,6 @@ final class AddonSchemaManager {
 	 * @return bool
 	 */
 	public static function validate_addon_id( string $addon_id ): bool {
-		return 1 === preg_match( self::ADDON_ID_PATTERN, $addon_id );
+		return AddonId::validate_addon_id( $addon_id );
 	}
 }

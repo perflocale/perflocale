@@ -699,14 +699,14 @@ final class BlockTranslateController extends RestController {
 			$formats = array_map( static fn( string $name ): string => (string) ( $read['formats'][ $name ] ?? BlockAttributeSource::FORMAT_HTML ), $names );
 
 			try {
-				$results = $this->translate_by_format( $service, array_values( $pending ), $formats, $source_lang, $target_lang, $provider_id );
+				$results = $this->translate_by_format( $service, array_values( $pending ), $formats, $source_lang, $target_lang, $provider_id, $names );
 			} catch ( \Throwable $e ) {
 				return $this->error( 'translation_failed', $e->getMessage(), 500 );
 			}
 
 			foreach ( $names as $i => $name ) {
 				// An empty result is a provider failure: never hand the editor an empty string to write over its text.
-				if ( isset( $results[ $i ] ) && $results[ $i ] !== '' ) {
+				if ( isset( $results[ $i ] ) && '' !== trim( $results[ $i ] ) ) {
 					$translated[ $name ] = $results[ $i ];
 				}
 			}
@@ -740,9 +740,10 @@ final class BlockTranslateController extends RestController {
 	 * @param string             $source_lang Source language.
 	 * @param string             $target_lang Target language.
 	 * @param string             $provider_id Provider id or '' for the configured one.
+	 * @param string[]           $names       Parallel block attribute names, for a failure message; [] when unknown.
 	 * @return string[] Translations, 0..n-1.
 	 */
-	private function translate_by_format( TranslationService $service, array $texts, array $formats, string $source_lang, string $target_lang, string $provider_id ): array {
+	private function translate_by_format( TranslationService $service, array $texts, array $formats, string $source_lang, string $target_lang, string $provider_id, array $names = [] ): array {
 		$groups = [];
 
 		foreach ( $texts as $i => $text ) {
@@ -753,7 +754,17 @@ final class BlockTranslateController extends RestController {
 		$out = array_fill( 0, count( $texts ), '' );
 
 		foreach ( $groups as $format => $entries ) {
-			$result = $service->translate_batch_texts( array_values( $entries ), $source_lang, $target_lang, $provider_id, true, $format );
+			// Keyed by position in this call: a text without a name keeps the default label.
+			$labels = [];
+
+			foreach ( array_keys( $entries ) as $j => $i ) {
+				if ( isset( $names[ $i ] ) ) {
+					/* translators: %s: block attribute name, such as "alt" */
+					$labels[ $j ] = sprintf( __( 'block attribute %s', 'perflocale' ), $names[ $i ] );
+				}
+			}
+
+			$result = $service->translate_batch_texts( array_values( $entries ), $source_lang, $target_lang, $provider_id, true, $format, $labels );
 			$j      = 0;
 
 			foreach ( array_keys( $entries ) as $i ) {

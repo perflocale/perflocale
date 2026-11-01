@@ -48,6 +48,13 @@ final class WorkerRunner {
 	private static bool $shutdown_registered = false;
 
 	/**
+	 * Job id => when this process last planned the job's next run; CliLane runs the job then.
+	 *
+	 * @var array<string, int>
+	 */
+	private static array $next_at = [];
+
+	/**
 	 * Hook callback: both runners (WpCronRunner, ActionSchedulerRunner) pass `(string $job_id, array $args)`, the shape
 	 * serialized into their queues.
 	 *
@@ -107,6 +114,14 @@ final class WorkerRunner {
 			return;
 		}
 
+		// A job another process holds for `wp perflocale jobs run` runs there; this event waits until the hold lapses.
+		$held = JobLock::cli_lane_elsewhere( $job_id );
+
+		if ( $held > 0 ) {
+			self::schedule_recording_engine( $held + 1, Dispatcher::worker_hook( is_string( $state['type'] ?? null ) ? $state['type'] : '' ), WorkerRegistry::with_blog_sentinel( $args, $target_blog ), $job_id );
+			return;
+		}
+
 		// Pause gate ("Pause queue" in the admin): the accepted job is scheduled for a later tick instead of running,
 		// and resumes when the queue is unpaused.
 		if ( WorkerRegistry::queue_is_paused() ) {
@@ -120,6 +135,18 @@ final class WorkerRunner {
 				WorkerRegistry::with_blog_sentinel( $args, $target_blog ),
 				$job_id
 			);
+			return;
+		}
+
+		// Bulk writes against a schema the code does not expect would half-apply: run the upgrade (cron-only sites never
+		// load Migrator), and wait while it is not finished.
+		if ( \PerfLocale\Database\SchemaWrites::upgrade_pending() ) {
+			\PerfLocale\Database\UpgradeRunner::pending( 'schema' );
+		}
+
+		if ( \PerfLocale\Database\SchemaWrites::upgrade_pending() ) {
+			JobState::append_log( $job_id, __( 'Waiting for the PerfLocale database upgrade to finish; re-queued.', 'perflocale' ) );
+			self::schedule_recording_engine( time() + 300, Dispatcher::worker_hook( (string) $state['type'] ), WorkerRegistry::with_blog_sentinel( $args, $target_blog ), $job_id );
 			return;
 		}
 
@@ -295,6 +322,9 @@ final class WorkerRunner {
 			return;
 		}
 
+		// A `wp perflocale jobs run` hold lasts as long as the job lock, so a slice without a progress tick keeps it.
+		JobLock::extend_cli_lane( $job_id, $lock_ttl );
+
 		$resume_meta   = [];
 		$worker_args   = $args;
 		$prev_user     = (int) get_current_user_id();
@@ -438,7 +468,8 @@ final class WorkerRunner {
 				// time.
 				if ( $wait > 0 ) {
 					JobResume::reschedule( $job_id, Dispatcher::worker_hook( $type ), $worker_args, $wait, $engine );
-					$waiting = true;
+					self::$next_at[ $job_id ] = $wait;
+					$waiting                  = true;
 					return;
 				}
 
@@ -571,6 +602,7 @@ final class WorkerRunner {
 					$wall = time();
 					if ( $wall - $last_lock_refresh >= $lock_refresh_window ) {
 						JobLock::refresh( $job_id, $lock_ttl );
+						JobLock::extend_cli_lane( $job_id, $lock_ttl );
 						if ( $type_locked ) {
 							JobLock::refresh_type( $type, $lock_ttl );
 						}
@@ -725,6 +757,7 @@ final class WorkerRunner {
 						self::log_taken_over( $job_id, $now );
 					} else {
 						JobResume::reschedule( $job_id, Dispatcher::worker_hook( $type ), $worker_args, $recheck );
+						self::$next_at[ $job_id ] = $recheck;
 					}
 				} else {
 					self::schedule_recording_engine(
@@ -793,6 +826,7 @@ final class WorkerRunner {
 		if ( $continue_job ) {
 			if ( $resumes ) {
 				JobResume::reschedule( $job_id, Dispatcher::worker_hook( $type ), $worker_args, $continue_at );
+				self::$next_at[ $job_id ] = $continue_at;
 			} else {
 				self::schedule_continuation( $job_id, $type, $args, $target_blog, $continue_at );
 			}
@@ -1063,6 +1097,8 @@ final class WorkerRunner {
 				}
 			} finally {
 				JobLock::release( $record['job_id'] );
+				// A dead `wp perflocale jobs run` must not defer the job's next event for the job lock's TTL.
+				JobLock::release_cli_lane( $record['job_id'] );
 
 				if ( $record['type_locked'] ) {
 					JobLock::release_type( $record['type'] );
@@ -1288,6 +1324,23 @@ final class WorkerRunner {
 		$runner = JobRunnerFactory::pick();
 		$runner->schedule( $timestamp, $hook, $args, $job_id );
 		JobState::set_engine( $job_id, $runner->get_engine_name() );
+
+		self::$next_at[ $job_id ] = $timestamp;
+	}
+
+	/**
+	 * When this process last planned the job's next run (0: not since the last call), for CliLane.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string $job_id Job identifier.
+	 * @return int
+	 */
+	public static function take_next_at( string $job_id ): int {
+		$at = self::$next_at[ $job_id ] ?? 0;
+		unset( self::$next_at[ $job_id ] );
+
+		return $at;
 	}
 
 	/**

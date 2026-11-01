@@ -107,6 +107,22 @@ final class TranslatePressImporter {
 	private const EXISTING_TARGETS_CAP = 100;
 
 	/**
+	 * Most failed writes named in the write-failure error; all are counted.
+	 */
+	private const FAILED_EXAMPLES = 5;
+
+	/**
+	 * Gettext and slug writes that failed this run ({@see add_failure()}).
+	 *
+	 * @var array{count: int, items: list<string>, db_error: string}
+	 */
+	private array $failed = [
+		'count'    => 0,
+		'items'    => [],
+		'db_error' => '',
+	];
+
+	/**
 	 * @var \wpdb
 	 */
 	private readonly \wpdb $wpdb;
@@ -363,6 +379,8 @@ final class TranslatePressImporter {
 			$this->mark_incomplete();
 		}
 
+		$this->report_write_failures();
+
 		// Flush caches.
 		$this->cache->flush_all();
 
@@ -388,6 +406,92 @@ final class TranslatePressImporter {
 	 */
 	private function mark_incomplete(): void {
 		$this->result['incomplete'] = true;
+	}
+
+	/**
+	 * Count a failed write into a failure record, naming the first FAILED_EXAMPLES items.
+	 *
+	 * @internal Shared with TranslatePressDictionary.
+	 *
+	 * @param array{count: int, items: list<string>, db_error: string} $failed   Failure record.
+	 * @param string                                                   $item     The item, e.g. "Site Title (fi)".
+	 * @param string                                                   $db_error The write's database error, or ''.
+	 * @return void
+	 */
+	public static function add_failure( array &$failed, string $item, string $db_error ): void {
+		++$failed['count'];
+
+		if ( count( $failed['items'] ) < self::FAILED_EXAMPLES ) {
+			$failed['items'][] = $item;
+		}
+
+		if ( $db_error !== '' ) {
+			$failed['db_error'] = $db_error;
+		}
+	}
+
+	/**
+	 * Record a failed write.
+	 *
+	 * @param string $db_error The write's last_error: the first argument, so it is read before the item's name is built.
+	 * @param string $item     The item, e.g. "slug of post 12 (fi)".
+	 * @return void
+	 */
+	private function write_failed( string $db_error, string $item ): void {
+		self::add_failure( $this->failed, $item, $db_error );
+	}
+
+	/**
+	 * A gettext string as a failed item: its original, shortened, and the language slug.
+	 *
+	 * @param string $original    Original text.
+	 * @param int    $language_id PerfLocale language ID.
+	 * @return string
+	 */
+	private function string_item( string $original, int $language_id ): string {
+		return sprintf( '"%1$s" (%2$s)', wp_html_excerpt( $original, 40, '...' ), $this->language_slug( $language_id ) );
+	}
+
+	/**
+	 * A language's slug for a failed item's name, or its ID when it is gone.
+	 *
+	 * @param int $language_id PerfLocale language ID.
+	 * @return string
+	 */
+	private function language_slug( int $language_id ): string {
+		$language = $this->languages->find( $language_id );
+
+		return $language !== null ? (string) $language->slug : (string) $language_id;
+	}
+
+	/**
+	 * One error for every write that failed this run, which leaves it incomplete: a re-run writes them.
+	 *
+	 * @return void
+	 */
+	private function report_write_failures(): void {
+		$dict  = $this->dictionary?->failed() ?? [
+			'count'    => 0,
+			'items'    => [],
+			'db_error' => '',
+		];
+		$count = $dict['count'] + $this->failed['count'];
+
+		if ( $count === 0 ) {
+			return;
+		}
+
+		$items = array_merge( $dict['items'], $this->failed['items'] );
+
+		self::log_db_error( 'saving translations', $this->failed['db_error'] !== '' ? $this->failed['db_error'] : $dict['db_error'] );
+
+		$this->result['errors'][] = sprintf(
+			/* translators: 1: number of translations, 2: comma-separated items, e.g. "Site Title (fi)" */
+			_n( '%1$d TranslatePress translation could not be saved because of a database error: %2$s. Re-run the import.', '%1$d TranslatePress translations could not be saved because of a database error: %2$s. Re-run the import.', $count, 'perflocale' ),
+			$count,
+			implode( ', ', array_slice( $items, 0, self::FAILED_EXAMPLES ) )
+		);
+		$this->mark_incomplete();
 	}
 
 	/**
@@ -639,8 +743,8 @@ final class TranslatePressImporter {
 
 		$stored = 0;
 
-		foreach ( $this->dictionary_tables() as $pl_lang_id => [ $table ] ) {
-			$stored += $dictionary->import_option_strings( $table, (int) $pl_lang_id );
+		foreach ( $this->dictionary_tables() as $pl_lang_id => [ $table, $slug ] ) {
+			$stored += $dictionary->import_option_strings( $table, (int) $pl_lang_id, $slug );
 			$this->beat();
 		}
 
@@ -1626,6 +1730,8 @@ final class TranslatePressImporter {
 							if ( $saved ) {
 								++$imported;
 								$has_translation = true;
+							} else {
+								$this->write_failed( $this->wpdb->last_error, $this->string_item( $original, (int) $pl_lang_id ) );
 							}
 						}
 
@@ -1654,6 +1760,8 @@ final class TranslatePressImporter {
 								++$link_failures;
 							}
 						}
+					} else {
+						$this->write_failed( $this->wpdb->last_error, $this->string_item( $original, (int) $pl_lang_id ) );
 					}
 				}
 
@@ -1698,7 +1806,9 @@ final class TranslatePressImporter {
 					$positional[] = (string) ( $forms[ $i ] ?? '' );
 				}
 
-				$string_translations->set_extra_forms( (int) $plural_row->id, (int) $pl_lang_id, $positional );
+				if ( ! $string_translations->set_extra_forms( (int) $plural_row->id, (int) $pl_lang_id, $positional ) ) {
+					$this->write_failed( $this->wpdb->last_error, $this->string_item( $original, (int) $pl_lang_id ) );
+				}
 			}
 		}
 
@@ -1861,17 +1971,22 @@ final class TranslatePressImporter {
 
 						$slug_manager = new \PerfLocale\Router\SlugManager( $this->cache );
 
-						// Count only stored slugs; a failed write reports itself through perflocale/slug/write_failed.
-						$stored = $slug_manager->set_slug(
-							'post',
-							$post_type,
-							(int) $row->post_id,
-							$pl_lang_id,
-							sanitize_title( $row->translated_slug )
-						);
+						$slug   = sanitize_title( $row->translated_slug );
+						$stored = $slug_manager->set_slug( 'post', $post_type, (int) $row->post_id, $pl_lang_id, $slug );
 
+						// A slug that sanitizes to nothing has nothing to store; any other false is a failed write.
 						if ( $stored ) {
 							++$imported;
+						} elseif ( $slug !== '' ) {
+							$this->write_failed(
+								$this->wpdb->last_error,
+								sprintf(
+									/* translators: 1: post ID, 2: language slug */
+									__( 'slug of post %1$d (%2$s)', 'perflocale' ),
+									(int) $row->post_id,
+									$this->language_slug( (int) $pl_lang_id )
+								)
+							);
 						}
 					}
 				}

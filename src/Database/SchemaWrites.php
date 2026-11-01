@@ -32,12 +32,28 @@ final class SchemaWrites {
 	 * @return void
 	 */
 	public static function create_tables(): void {
+		if ( ! function_exists( 'dbDelta' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		}
+
+		foreach ( self::definitions() as $sql ) {
+			dbDelta( $sql );
+		}
+
+		// Clear the cached tables_exist() verdict (activation and upgrade both end here).
+		Schema::flush_tables_exist_cache();
+	}
+
+	/**
+	 * The CREATE TABLE statement of every plugin table, by short name: what dbDelta applies and missing_parts() checks.
+	 *
+	 * @return array<string, string>
+	 */
+	public static function definitions(): array {
 		global $wpdb;
 
 		$charset_collate = $wpdb->get_charset_collate();
 		$prefix          = $wpdb->prefix . 'perflocale_';
-
-		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		// Table 1: Languages.
 		$sql_languages = "CREATE TABLE {$prefix}languages (
@@ -201,18 +217,17 @@ final class SchemaWrites {
 			KEY group_id (group_id)
 		) ENGINE=InnoDB {$charset_collate};";
 
-		dbDelta( $sql_languages );
-		dbDelta( $sql_groups );
-		dbDelta( $sql_links );
-		dbDelta( $sql_strings );
-		dbDelta( $sql_slugs );
-		dbDelta( $sql_hashes );
-		dbDelta( $sql_string_translations );
-		dbDelta( $sql_jobs );
-		dbDelta( $sql_migration_map );
-
-		// Clear the cached tables_exist() verdict (activation and upgrade both end here).
-		Schema::flush_tables_exist_cache();
+		return [
+			'languages'            => $sql_languages,
+			'translation_groups'   => $sql_groups,
+			'translation_links'    => $sql_links,
+			'strings'              => $sql_strings,
+			'slug_translations'    => $sql_slugs,
+			'content_hashes'       => $sql_hashes,
+			'string_translations'  => $sql_string_translations,
+			'jobs'                 => $sql_jobs,
+			'migration_source_map' => $sql_migration_map,
+		];
 	}
 
 	/**
@@ -398,5 +413,27 @@ final class SchemaWrites {
 		}
 
 		return $missing;
+	}
+
+	/**
+	 * Whether the schema is the one this code expects: tables installed and no schema upgrade pending.
+	 *
+	 * No query when current: both reads are autoloaded options. Cold paths only (jobs, maintenance), so not in Schema.
+	 *
+	 * @return bool
+	 */
+	public static function ready(): bool {
+		return ! self::upgrade_pending() && Schema::tables_exist();
+	}
+
+	/**
+	 * Whether a stored DB version is below the code's (an upgrade not finished yet); false before the first activation.
+	 *
+	 * @return bool
+	 */
+	public static function upgrade_pending(): bool {
+		$stored = get_option( 'perflocale_db_version' );
+
+		return false !== $stored && (int) $stored < PERFLOCALE_DB_VERSION;
 	}
 }

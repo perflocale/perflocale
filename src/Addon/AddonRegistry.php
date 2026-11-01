@@ -21,16 +21,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class AddonRegistry {
 
 	/**
-	 * Registered addons.
+	 * Registered addons; null holds the slot of a bundled addon whose file is not loaded yet (AddonSlotLoader).
 	 *
-	 * @var array<string, AddonInterface>
+	 * @var array<string, AddonInterface|null>
 	 */
 	private array $addons = [];
 
 	/**
 	 * Bundled addons (from the addons/ directory) - protected from override.
 	 *
-	 * @var array<string, AddonInterface>
+	 * @var array<string, AddonInterface|null>
 	 */
 	private array $bundled = [];
 
@@ -260,8 +260,17 @@ final class AddonRegistry {
 			return;
 		}
 
+		// An emptied or removed settings entry, or a changed add-on set, is checked again.
+		foreach ( [ 'perflocale_addon_settings', self::DISABLED_OPTION ] as $option ) {
+			foreach ( [ 'add_option_', 'update_option_', 'delete_option_' ] as $hook ) {
+				add_action( $hook . $option, [ self::class, 'forget_seeded' ] );
+			}
+		}
+
 		$manifest     = self::bundled_manifest();
 		$bootable_ids = self::resolve_bootable_ids( $manifest );
+		$disabled     = self::get_disabled();
+		$failures     = (array) get_option( self::FAILURE_OPTION, [] );
 
 		foreach ( $bootable_ids as $id ) {
 			if ( ! isset( $manifest[ $id ] ) ) {
@@ -269,7 +278,7 @@ final class AddonRegistry {
 				continue;
 			}
 
-			if ( isset( $this->addons[ $id ] ) ) {
+			if ( array_key_exists( $id, $this->addons ) ) {
 				// Theme addons register their own instance at plugins_loaded:15; a second one would trip guard #4.
 				continue;
 			}
@@ -278,6 +287,12 @@ final class AddonRegistry {
 			$class_name = (string) $manifest[ $id ]['class'];
 
 			if ( $main_file === '' || ! file_exists( $main_file ) ) {
+				continue;
+			}
+
+			// Disabled, filtered off or failing: its slot only; boot_addons() loads it if it boots after all.
+			if ( isset( $this->filter_off[ $id ] ) || in_array( $id, $disabled, true ) || ! empty( $failures[ $id ] ) ) {
+				$this->addons[ $id ] = null;
 				continue;
 			}
 
@@ -299,11 +314,20 @@ final class AddonRegistry {
 		// Snapshot bundled addon IDs - these cannot be overridden by external plugins.
 		$this->bundled = $this->addons;
 
+		// Read before the action: a register callback may remove itself.
+		$listeners = has_action( 'perflocale/addons/register' );
+
 		// External plugins call $registry->register( new MyAddon() ) here.
 		/** @hook perflocale/addons/register Fires before addons boot. Pass your AddonInterface instance to $registry->register(). */
 		do_action( 'perflocale/addons/register', $this );
 
-		$this->boot_addons();
+		// A register or registered callback may change either list: the first pass then reads them again.
+		if ( $listeners || has_filter( 'perflocale/addons/registered' ) ) {
+			$disabled = null;
+			$failures = null;
+		}
+
+		$this->boot_addons( $disabled, $failures );
 	}
 
 	/**
@@ -387,7 +411,7 @@ final class AddonRegistry {
 		$id = $addon->get_id();
 
 		// (1) ADDON_ID_PATTERN gates settings, the disabled list, schemas and uninstall: fail fast here.
-		if ( ! AddonSchemaManager::validate_addon_id( $id ) ) {
+		if ( ! AddonId::validate_addon_id( $id ) ) {
 			_doing_it_wrong(
 				__METHOD__,
 				esc_html(
@@ -420,7 +444,7 @@ final class AddonRegistry {
 		}
 
 		// (3) Bundled addons cannot be overridden by external plugins.
-		if ( isset( $this->bundled[ $id ] ) ) {
+		if ( array_key_exists( $id, $this->bundled ) ) {
 			_doing_it_wrong(
 				__METHOD__,
 				esc_html(
@@ -436,7 +460,7 @@ final class AddonRegistry {
 		}
 
 		// (4) A second registration is ignored: overwriting would drop the first instance's state.
-		if ( isset( $this->addons[ $id ] ) ) {
+		if ( array_key_exists( $id, $this->addons ) ) {
 			_doing_it_wrong(
 				__METHOD__,
 				esc_html(
@@ -532,9 +556,13 @@ final class AddonRegistry {
 	/**
 	 * Boot all compatible addons.
 	 *
+	 * The first pass takes the lists discover_and_boot() read, so a visit reads each option once.
+	 *
+	 * @param array<int, string>|null $disabled Disabled-addon list, or null to read it.
+	 * @param array<mixed>|null       $failures Failure counters, or null to read them.
 	 * @return void
 	 */
-	private function boot_addons(): void {
+	private function boot_addons( ?array $disabled = null, ?array $failures = null ): void {
 		$plugin = Plugin::get_instance();
 
 		/**
@@ -542,6 +570,11 @@ final class AddonRegistry {
 		 *
 		 * @param array<string, AddonInterface> $addons Registered addons.
 		 */
+		// A filter sees every addon object, as without the deferred slots.
+		if ( has_filter( 'perflocale/addons/registered' ) ) {
+			AddonSlotLoader::fill_all( $this->addons, $this->bundled, self::bundled_manifest() );
+		}
+
 		$pre_filter = $this->addons;
 		$filtered   = apply_filters( 'perflocale/addons/registered', $this->addons );
 
@@ -568,10 +601,12 @@ final class AddonRegistry {
 		}
 
 		// Addons that keep throwing are quarantined, so one broken addon cannot degrade every request.
-		$failures        = (array) get_option( self::FAILURE_OPTION, [] );
+		$failures      ??= (array) get_option( self::FAILURE_OPTION, [] );
 		$failure_changed = false;
 
-		$disabled = self::get_disabled();
+		$disabled ??= self::get_disabled();
+		$seeded     = null;
+		$checked    = [];
 
 		foreach ( $this->addons as $id => $addon ) {
 			if ( isset( $this->booted[ $id ] ) || isset( $this->filter_off[ $id ] ) ) {
@@ -604,6 +639,13 @@ final class AddonRegistry {
 
 			if ( ! $enabled ) {
 				$this->filter_off[ $id ] = $default_on;
+				continue;
+			}
+
+			// A deferred slot the filter turned on.
+			$addon ??= AddonSlotLoader::fill( $id, $this->addons, $this->bundled, self::bundled_manifest() );
+
+			if ( null === $addon ) {
 				continue;
 			}
 
@@ -648,8 +690,20 @@ final class AddonRegistry {
 					AddonMigrationErrors::clear_stage( $id, 'boot' );
 				}
 
-				// After boot(), so a failed boot leaves no half-seeded entry.
-				$this->maybe_seed_defaults( $addon, $id );
+				// After boot(), so a failed boot leaves no half-seeded entry; skipped while the marker holds this version.
+				try {
+					$version = $addon->get_version();
+				} catch ( \Throwable $e ) {
+					$version = '';
+				}
+
+				$seeded ??= self::seeded();
+
+				if ( '' === $version || ( $seeded[ $id ] ?? null ) !== $version ) {
+					if ( $this->maybe_seed_defaults( $addon, $id ) && '' !== $version ) {
+						$checked[ $id ] = $version;
+					}
+				}
 
 				/** @hook perflocale/addon/activated Fires after an addon is booted. */
 				do_action( 'perflocale/addon/activated', $id );
@@ -676,6 +730,11 @@ final class AddonRegistry {
 			update_option( self::FAILURE_OPTION, $failures, true );
 		}
 
+		// Under the settings-write lock, so a settings reset since the check is not undone.
+		if ( $checked && defined( 'PERFLOCALE_VERSION' ) ) {
+			AddonSeedMarker::publish( $checked );
+		}
+
 		/** @hook perflocale/addons/loaded Fires after all addons are booted. */
 		do_action( 'perflocale/addons/loaded' );
 	}
@@ -684,6 +743,32 @@ final class AddonRegistry {
 	 * Option key storing per-addon failure counters.
 	 */
 	private const FAILURE_OPTION = 'perflocale_addon_failures';
+
+	/**
+	 * Add-ons whose default seeding check passed: [ 'v' => PerfLocale version, 'a' => [ id => add-on version ] ].
+	 * Autoloaded, so a current site reads it from the loaded options with no query.
+	 */
+	public const SEEDED_OPTION = 'perflocale_addon_seeded';
+
+	/**
+	 * The seeded add-on versions, or none when the marker is missing or from another PerfLocale version.
+	 *
+	 * @return array<mixed>
+	 */
+	private static function seeded(): array {
+		$marker = get_option( self::SEEDED_OPTION );
+
+		return is_array( $marker ) && defined( 'PERFLOCALE_VERSION' ) && PERFLOCALE_VERSION === ( $marker['v'] ?? null ) ? (array) ( $marker['a'] ?? [] ) : [];
+	}
+
+	/**
+	 * Forget every seeded add-on: on any write of the add-on settings or the disabled list.
+	 *
+	 * @return void
+	 */
+	public static function forget_seeded(): void {
+		delete_option( self::SEEDED_OPTION );
+	}
 
 	// The bundled add-on whose settings fields are all stored globally.
 	private const GLOBAL_SETTINGS_ONLY = 'woocommerce';
@@ -774,7 +859,36 @@ final class AddonRegistry {
 	 * @return array<string, AddonInterface>
 	 */
 	public function get_addons(): array {
-		return $this->addons;
+		if ( in_array( null, $this->addons, true ) ) {
+			AddonSlotLoader::fill_all( $this->addons, $this->bundled, self::bundled_manifest() );
+		}
+
+		return array_filter( $this->addons );
+	}
+
+	/**
+	 * Registered addons whose file is loaded: unlike get_addons(), a deferred slot (disabled, quarantined) stays unloaded.
+	 *
+	 * @internal
+	 *
+	 * @return array<string, AddonInterface>
+	 */
+	public function get_loaded_addons(): array {
+		return array_filter( $this->addons );
+	}
+
+	/**
+	 * Hold a bundled addon's slot without loading its file: the early theme path decided it does not boot.
+	 *
+	 * @internal
+	 *
+	 * @param string $id Addon ID.
+	 * @return void
+	 */
+	public function defer( string $id ): void {
+		if ( ! array_key_exists( $id, $this->addons ) ) {
+			$this->addons[ $id ] = null;
+		}
 	}
 
 	/**
@@ -804,7 +918,7 @@ final class AddonRegistry {
 	 * @return bool
 	 */
 	public function is_bundled( string $id ): bool {
-		return isset( $this->bundled[ $id ] );
+		return array_key_exists( $id, $this->bundled );
 	}
 
 	/**
@@ -856,7 +970,7 @@ final class AddonRegistry {
 		$valid = [];
 		foreach ( $raw as $value ) {
 			$candidate = is_scalar( $value ) ? (string) $value : '';
-			if ( $candidate !== '' && AddonSchemaManager::validate_addon_id( $candidate ) ) {
+			if ( $candidate !== '' && AddonId::validate_addon_id( $candidate ) ) {
 				$valid[] = $candidate;
 			}
 		}
@@ -913,12 +1027,12 @@ final class AddonRegistry {
 	 *
 	 * @param AddonInterface $addon Addon instance.
 	 * @param string         $id    Addon ID.
-	 * @return void
+	 * @return bool False when get_settings_fields() threw or the seed write failed (retried on the next boot).
 	 */
-	private function maybe_seed_defaults( AddonInterface $addon, string $id ): void {
+	private function maybe_seed_defaults( AddonInterface $addon, string $id ): bool {
 		// The bundled add-on GLOBAL_SETTINGS_ONLY names has nothing to seed.
 		if ( self::GLOBAL_SETTINGS_ONLY === $id && ( $this->bundled[ $id ] ?? null ) === $addon ) {
-			return;
+			return true;
 		}
 
 		try {
@@ -935,11 +1049,11 @@ final class AddonRegistry {
 					)
 				);
 			}
-			return;
+			return false;
 		}
 
 		if ( ! is_array( $fields ) || empty( $fields ) ) {
-			return;
+			return true;
 		}
 
 		// Compute the seedable set before any I/O: all-global addons then never read the non-autoloaded option.
@@ -961,14 +1075,16 @@ final class AddonRegistry {
 		}
 
 		if ( empty( $defaults ) ) {
-			return;
+			return true;
 		}
+
+		AddonSeedMarker::$entries[ $id ] = true;
 
 		// get_addon() returns [] for a missing and an empty entry alike; both seed.
 		$existing = AddonSettings::get_addon( $id );
 
 		if ( ! empty( $existing ) ) {
-			return;
+			return true;
 		}
 
 		$seeded = AddonSettings::set_addon( $id, $defaults );
@@ -985,6 +1101,8 @@ final class AddonRegistry {
 			 */
 			do_action( 'perflocale/addon/seeded', $id, $defaults );
 		}
+
+		return $seeded;
 	}
 
 }

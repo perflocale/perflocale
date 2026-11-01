@@ -40,6 +40,11 @@ final class PoSync {
 	private const HELD_BATCH = 250;
 
 	/**
+	 * Most values in one pairing read of an export: under SQLite's old 999-variable limit.
+	 */
+	private const PAIR_READ_VALUES = 500;
+
+	/**
 	 * Fold a non-default text domain into msgctxt (PO keys entries by (context, msgid) only); the default domain keeps
 	 * its bare context or null.
 	 *
@@ -90,11 +95,14 @@ final class PoSync {
 
 		// Set on every exit path, so a caller can read it without checking the return value.
 		$report = [
-			'emitted'        => 0,
-			'unhashable'     => 0,
-			'unhashable_ids' => [],
-			'dup_groups'     => 0,
-			'dup_rows'       => 0,
+			'emitted'               => 0,
+			'rows'                  => 0,
+			'unhashable'            => 0,
+			'unhashable_ids'        => [],
+			'dup_groups'            => 0,
+			'dup_rows'              => 0,
+			'forms_not_written'     => 0,
+			'forms_not_written_ids' => [],
 		];
 
 		global $wpdb;
@@ -106,6 +114,8 @@ final class PoSync {
 
 		$strings      = Schema::table( 'strings' );
 		$translations = Schema::table( 'string_translations' );
+		$locale       = (string) $lang->locale;
+		$nplurals     = \PerfLocale\Strings\PluralRules::nplurals( $locale );
 
 		$where = '1=1';
 		$args  = [ (int) $lang->id ];
@@ -115,18 +125,30 @@ final class PoSync {
 			$args[] = $domain;
 		}
 
+		$pairs = self::plural_pairs( $strings, $domain );
+
+		if ( null === $pairs ) {
+			return false;
+		}
+
+		[ $plural_of, $singular_of ] = $pairs;
+		$written                     = [];
+
 		// The header through core's PO class, as every gettext consumer writes it.
 		$po = new \PO();
 
 		$po->set_header( 'Project-Id-Version', 'PerfLocale ' . ( defined( 'PERFLOCALE_VERSION' ) ? PERFLOCALE_VERSION : '0.0' ) );
-		$po->set_header( 'Language', (string) $lang->locale );
+		$po->set_header( 'Language', $locale );
 		$po->set_header( 'MIME-Version', '1.0' );
 		$po->set_header( 'Content-Type', 'text/plain; charset=UTF-8' );
 		$po->set_header( 'Content-Transfer-Encoding', '8bit' );
-		// The language's CLDR plural header; singular and plural are exported as separate entries (the JSON export keeps
-		// 3+ forms).
-		$po->set_header( 'Plural-Forms', \PerfLocale\Strings\PluralRules::header( (string) $lang->locale ) );
+		// Every plural entry carries exactly this nplurals of msgstr (msgfmt -c refuses any other count).
+		$po->set_header( 'Plural-Forms', \PerfLocale\Strings\PluralRules::header( $locale ) );
 		$po->set_header( 'X-Generator', 'PerfLocale' );
+
+		if ( ! self::plural_rule_known( $locale ) ) {
+			$po->set_comment_before_headers( sprintf( 'No plural rule is known for %s: nplurals=2 (n != 1) is assumed. Check Plural-Forms before translating.', $locale ) );
+		}
 
 		// Keyset batches written as produced (memory: one batch), into a sibling temp renamed over $path on success.
 		$tmp = $path . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
@@ -180,7 +202,7 @@ final class PoSync {
 			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$rows = (array) $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT s.id, s.original, s.original_hash, s.context, s.domain, COALESCE(t.translation, '') AS translation
+					"SELECT s.id, s.original, s.original_hash, s.context, s.domain, COALESCE(t.translation, '') AS translation, t.extra_forms
 				 FROM %i s
 				 LEFT JOIN %i t ON t.string_id = s.id AND t.language_id = %d
 				 WHERE {$where} AND s.id > %d
@@ -197,40 +219,85 @@ final class PoSync {
 				return $abort();
 			}
 
+			$page = [];
+
 			foreach ( $rows as $row ) {
-				$cursor = (int) $row->id;
+				$page[ (int) self::field( $row, 'id' ) ] = $row;
+			}
 
-				// Carriage returns out: core's PO::poify() does not escape \r, and one raw CR makes the whole file unparseable.
-				$entry = new \Translation_Entry(
-					[
-						'singular'           => self::normalise_newlines( (string) $row->original ),
-						'context'            => self::compose_context( (string) $row->domain, (string) $row->context ),
-						'translations'       => [ self::normalise_newlines( (string) $row->translation ) ],
-						'extracted_comments' => self::DOMAIN_PREFIX . (string) $row->domain,
-					]
-				);
+			foreach ( $rows as $row ) {
+				$cursor  = (int) self::field( $row, 'id' );
+				$partner = $plural_of[ $cursor ] ?? $singular_of[ $cursor ] ?? 0;
 
-				$serialized = \PO::export_entry( $entry );
-
-				if ( ! is_string( $serialized ) || $serialized === '' ) {
-					continue; // False for an entry core cannot serialise.
+				// A pair is written at its earlier row; the later one is skipped only then, so a partner deleted meanwhile
+				// leaves the other row as its own entry.
+				if ( $partner > 0 && $partner < $cursor && isset( $written[ $partner ] ) ) {
+					unset( $written[ $partner ] );
+					continue;
 				}
 
-				// One blank line between entries, as core's PO::export().
-				if ( ! $write( "\n\n" . $serialized ) ) {
+				$pair_row = $partner > $cursor ? ( $page[ $partner ] ?? self::export_row( $strings, $translations, self::language_id( $lang ), $partner ) ) : null;
+
+				if ( false === $pair_row ) {
 					return $abort();
 				}
-				++$report['emitted'];
+
+				$entry_rows = [ $row ];
+
+				if ( null !== $pair_row ) {
+					$written[ $cursor ]  = true;
+					[ $single, $plural ] = isset( $plural_of[ $cursor ] ) ? [ $row, $pair_row ] : [ $pair_row, $row ];
+					$entry_rows          = [ $single, $plural ];
+					$forms               = array_merge( [ self::field( $single, 'translation' ), self::field( $plural, 'translation' ) ], self::decode_extra_forms( self::field( $plural, 'extra_forms' ) ) );
+					$entries             = [ self::plural_entry( $single, $plural, array_pad( array_slice( $forms, 0, $nplurals ), $nplurals, '' ) ) ];
+
+					// A 1-form language has no msgstr[1]: the plural row's own text stays a flat entry.
+					if ( 1 === $nplurals && self::field( $plural, 'translation' ) !== '' ) {
+						$entries[] = self::flat_entry( $plural );
+					}
+
+					$unwritten = array_slice( $forms, max( 2, $nplurals ) );
+				} else {
+					$entries   = [ self::flat_entry( $row ) ];
+					$unwritten = self::decode_extra_forms( self::field( $row, 'extra_forms' ) );
+				}
+
+				// Stored forms the file has no msgstr for: a replace import of it removes them.
+				if ( [] !== array_filter( $unwritten, static fn( string $form ): bool => $form !== '' ) ) {
+					++$report['forms_not_written'];
+
+					if ( count( $report['forms_not_written_ids'] ) < 20 ) {
+						$report['forms_not_written_ids'][] = (int) self::field( $entry_rows[ count( $entry_rows ) - 1 ], 'id' );
+					}
+				}
+
+				foreach ( $entries as $entry ) {
+					$serialized = \PO::export_entry( $entry );
+
+					if ( ! is_string( $serialized ) || $serialized === '' ) {
+						continue; // False for an entry core cannot serialise.
+					}
+
+					// One blank line between entries, as core's PO::export().
+					if ( ! $write( "\n\n" . $serialized ) ) {
+						return $abort();
+					}
+					++$report['emitted'];
+				}
+
+				$report['rows'] += count( $entry_rows );
 
 				/*
 				 * A row whose stored original_hash is not the hash of its `original` would get a phantom twin on re-import (the
 				 * importer hashes the msgid it reads); counted per row, retaining nothing. The raw original is hashed.
 				 */
-				if ( StringRepository::compute_hash( (string) $row->domain, (string) $row->context, (string) $row->original ) !== (string) $row->original_hash ) {
-					++$report['unhashable'];
+				foreach ( $entry_rows as $entry_row ) {
+					if ( StringRepository::compute_hash( self::field( $entry_row, 'domain' ), self::field( $entry_row, 'context' ), self::field( $entry_row, 'original' ) ) !== self::field( $entry_row, 'original_hash' ) ) {
+						++$report['unhashable'];
 
-					if ( count( $report['unhashable_ids'] ) < 20 ) {
-						$report['unhashable_ids'][] = (int) $row->id;
+						if ( count( $report['unhashable_ids'] ) < 20 ) {
+							$report['unhashable_ids'][] = (int) self::field( $entry_row, 'id' );
+						}
 					}
 				}
 			}
@@ -279,6 +346,440 @@ final class PoSync {
 		}
 
 		return $bytes;
+	}
+
+	/**
+	 * One row as its own entry. Carriage returns out: core's PO::poify() does not escape \r, and one raw CR makes the
+	 * whole file unparseable.
+	 *
+	 * @param mixed $row Export row (original, context, domain, translation).
+	 * @return \Translation_Entry
+	 */
+	private static function flat_entry( $row ): \Translation_Entry {
+		return new \Translation_Entry(
+			[
+				'singular'           => self::normalise_newlines( self::field( $row, 'original' ) ),
+				'context'            => self::compose_context( self::field( $row, 'domain' ), self::field( $row, 'context' ) ),
+				'translations'       => [ self::normalise_newlines( self::field( $row, 'translation' ) ) ],
+				'extracted_comments' => self::DOMAIN_PREFIX . self::field( $row, 'domain' ),
+			]
+		);
+	}
+
+	/**
+	 * A singular and plural row as one gettext plural entry; the msgctxt is the base context entry_to_forms() reads back.
+	 *
+	 * @param mixed              $single Singular row.
+	 * @param mixed              $plural Plural row ('plural' or '<ctx> (plural)').
+	 * @param array<int, string> $forms  msgstr[0..nplurals-1].
+	 * @return \Translation_Entry
+	 */
+	private static function plural_entry( $single, $plural, array $forms ): \Translation_Entry {
+		$context = self::field( $plural, 'context' );
+		$base    = 'plural' === $context ? '' : substr( $context, 0, -strlen( ' (plural)' ) );
+		$msgctxt = self::compose_context( self::field( $single, 'domain' ), $base );
+		$args    = [
+			'singular'           => self::normalise_newlines( self::field( $single, 'original' ) ),
+			'plural'             => self::normalise_newlines( self::field( $plural, 'original' ) ),
+			'translations'       => array_values( array_map( static fn( string $form ): string => self::normalise_newlines( $form ), $forms ) ),
+			'extracted_comments' => self::DOMAIN_PREFIX . self::field( $single, 'domain' ),
+		];
+
+		if ( null !== $msgctxt ) {
+			$args['context'] = $msgctxt;
+		}
+
+		return new \Translation_Entry( $args );
+	}
+
+	/**
+	 * The database error of the last query; impure, so a check after a query is not answered by the one before it.
+	 *
+	 * @phpstan-impure
+	 *
+	 * @param \wpdb $wpdb Database.
+	 * @return string
+	 */
+	private static function db_error( \wpdb $wpdb ): string {
+		return (string) $wpdb->last_error;
+	}
+
+	/**
+	 * A column of a database row as a string ('' when missing or NULL).
+	 *
+	 * @param mixed  $row Row object.
+	 * @param string $key Column.
+	 * @return string
+	 */
+	private static function field( $row, string $key ): string {
+		$value = is_object( $row ) ? ( get_object_vars( $row )[ $key ] ?? null ) : null;
+
+		return is_scalar( $value ) ? (string) $value : '';
+	}
+
+	/**
+	 * Stored extra_forms JSON as a list of strings ([] for none or unreadable).
+	 *
+	 * @param string $json Column value.
+	 * @return array<int, string>
+	 */
+	private static function decode_extra_forms( string $json ): array {
+		$forms = $json !== '' ? json_decode( $json, true ) : null;
+
+		return is_array( $forms ) ? array_values( array_map( static fn( $form ): string => is_scalar( $form ) ? (string) $form : '', $forms ) ) : [];
+	}
+
+	/**
+	 * Whether PluralRules has a rule of its own for the locale (rule_for()'s lookup), not its 2-form fallback.
+	 *
+	 * @param string $locale Locale.
+	 * @return bool
+	 */
+	private static function plural_rule_known( string $locale ): bool {
+		$key  = strtolower( str_replace( '-', '_', $locale ) );
+		$base = strtok( $key, '_' );
+
+		return isset( \PerfLocale\Strings\PluralRules::RULES[ $key ] ) || ( is_string( $base ) && isset( \PerfLocale\Strings\PluralRules::RULES[ $base ] ) );
+	}
+
+	/**
+	 * One export row by id, for a pair whose other row is on a later page.
+	 *
+	 * @param string $strings      The strings table.
+	 * @param string $translations The string_translations table.
+	 * @param int    $language_id  Language id.
+	 * @param int    $id           String id.
+	 * @return object|null|false The row, null when gone, false on a read error.
+	 */
+	private static function export_row( string $strings, string $translations, int $language_id, int $id ) {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- A primary-key read during an export; tables bound with %i.
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT s.id, s.original, s.original_hash, s.context, s.domain, COALESCE(t.translation, '') AS translation, t.extra_forms
+				 FROM %i s
+				 LEFT JOIN %i t ON t.string_id = s.id AND t.language_id = %d
+				 WHERE s.id = %d",
+				$strings,
+				$translations,
+				$language_id,
+				$id
+			)
+		);
+
+		if ( '' !== self::db_error( $wpdb ) ) {
+			return false;
+		}
+
+		return is_object( $row ) ? $row : null;
+	}
+
+	/**
+	 * The singular row of each plural row, as one gettext entry needs them; nothing stores the link, so it is inferred.
+	 * Rules: docs-ai/03-features/import-export-and-cli.md, "PO plural entries".
+	 *
+	 * @param string $strings The strings table.
+	 * @param string $domain  Domain filter, '' for all.
+	 * @return array{0: array<int, int>, 1: array<int, int>}|null Singular id => plural id, plural id => singular id;
+	 *                                                         null on a read error.
+	 */
+	private static function plural_pairs( string $strings, string $domain ): ?array {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return null;
+		}
+
+		$plural_of   = [];
+		$singular_of = [];
+		$cursor      = 0;
+		$suffix      = ' (plural)';
+
+		do {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Keyset read of an export; the domain clause is a literal with a placeholder; the replacements arrive as one array.
+			$rows = (array) $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, domain, context, original, file_path, line_number FROM %i
+					 WHERE ( context = 'plural' OR context LIKE %s )" . ( '' !== $domain ? ' AND domain = %s' : '' ) . ' AND id > %d
+					 ORDER BY id
+					 LIMIT 1000',
+					array_merge( [ $strings, '%' . $suffix ], '' !== $domain ? [ $domain ] : [], [ $cursor ] )
+				)
+			);
+			// phpcs:enable
+
+			if ( '' !== self::db_error( $wpdb ) ) {
+				return null;
+			}
+
+			$full = count( $rows ) === 1000;
+			$page = [];
+
+			foreach ( $rows as $plural ) {
+				$cursor  = (int) self::field( $plural, 'id' );
+				$context = self::field( $plural, 'context' );
+				$text    = self::field( $plural, 'original' );
+
+				// Strict here: SQL compares case-insensitively. A plural of '' or '0' would not make a plural entry.
+				if ( 'plural' === $context ) {
+					$single_context = 'singular';
+				} elseif ( strlen( $context ) > strlen( $suffix ) && str_ends_with( $context, $suffix ) ) {
+					$single_context = substr( $context, 0, -strlen( $suffix ) );
+				} else {
+					continue;
+				}
+
+				if ( '' !== $text && '0' !== $text ) {
+					$page[ $cursor ] = [ $plural, $single_context ];
+				}
+			}
+
+			$found = self::singular_candidates( $wpdb, $strings, $page );
+
+			if ( null === $found ) {
+				return null;
+			}
+
+			[ $candidates, $twins ] = $found;
+
+			foreach ( $page as $plural_id => [ $plural, $single_context ] ) {
+				$single = self::singular_row( $plural, $single_context, $candidates[ $plural_id ], $plural_of );
+
+				if ( null === $single ) {
+					continue;
+				}
+
+				// Without its own context the entry's key is the msgid alone, which a context-free string may also use.
+				if ( 'singular' === $single_context && isset( $twins[ StringRepository::compute_hash( self::field( $plural, 'domain' ), '', self::field( $single, 'original' ) ) ] ) ) {
+					continue;
+				}
+
+				$single_id                 = (int) self::field( $single, 'id' );
+				$plural_of[ $single_id ]   = $plural_id;
+				$singular_of[ $plural_id ] = $single_id;
+			}
+		} while ( $full );
+
+		return [ $plural_of, $singular_of ];
+	}
+
+	/**
+	 * Every row one page of plural rows may pair with (same domain, singular context, file and line; else the row
+	 * just before), read in a few batched queries, and the twin hashes among them (see plural_pairs()).
+	 *
+	 * @param \wpdb                                  $wpdb    Database.
+	 * @param string                                 $strings The strings table.
+	 * @param array<int, array{0: mixed, 1: string}> $page    Plural id => [plural row, singular context], in id order.
+	 * @return array{0: array<int, array<int, object>>, 1: array<string, true>}|null Plural id => its candidates in id
+	 *                                                                             order, and the hashes that exist.
+	 */
+	private static function singular_candidates( \wpdb $wpdb, string $strings, array $page ): ?array {
+		$terms  = [];
+		$before = [];
+
+		foreach ( $page as $id => [ $plural, $single_context ] ) {
+			$file = self::field( $plural, 'file_path' );
+
+			if ( '' === $file ) {
+				$before[] = $id;
+				continue;
+			}
+
+			$key = self::field( $plural, 'domain' ) . "\0" . $single_context . "\0" . $file;
+
+			$terms[ $key ] ??= [ self::field( $plural, 'domain' ), $single_context, $file, [] ];
+			$terms[ $key ][3][ (int) self::field( $plural, 'line_number' ) ] = true;
+		}
+
+		$on_line = [];
+
+		// SQL matches by collation, so a row is kept under its own exact key; a row two queries return is kept once.
+		foreach ( self::line_queries( $strings, $terms ) as [ $sql, $values ] ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter -- One read per batch of an export; the clauses are placeholders only.
+			$rows = (array) $wpdb->get_results( $wpdb->prepare( $sql, $values ) );
+
+			if ( '' !== self::db_error( $wpdb ) ) {
+				return null;
+			}
+
+			foreach ( $rows as $row ) {
+				if ( is_object( $row ) ) {
+					$on_line[ self::line_key( $row, self::field( $row, 'context' ) ) ][ (int) self::field( $row, 'id' ) ] = $row;
+				}
+			}
+		}
+
+		$previous = self::rows_before( $wpdb, $strings, $before );
+
+		if ( null === $previous ) {
+			return null;
+		}
+
+		// Sorted once per line and shared by its plural rows: a copy per plural row would hold plurals times candidates.
+		foreach ( $on_line as $key => $rows ) {
+			ksort( $rows );
+			$on_line[ $key ] = array_values( $rows );
+		}
+
+		$candidates = [];
+		$hashes     = [];
+		$hashed     = [];
+
+		foreach ( $page as $id => [ $plural, $single_context ] ) {
+			$key = '' === self::field( $plural, 'file_path' ) ? '' : self::line_key( $plural, $single_context );
+
+			$candidates[ $id ] = '' === $key ? ( isset( $previous[ $id ] ) ? [ $previous[ $id ] ] : [] ) : ( $on_line[ $key ] ?? [] );
+
+			// A line's rows share the plural's domain (it is in the key): their hashes once per line.
+			if ( 'singular' !== $single_context || isset( $hashed[ $key ] ) ) {
+				continue;
+			}
+
+			if ( '' !== $key ) {
+				$hashed[ $key ] = true;
+			}
+
+			foreach ( $candidates[ $id ] as $row ) {
+				$hashes[ StringRepository::compute_hash( self::field( $plural, 'domain' ), '', self::field( $row, 'original' ) ) ] = true;
+			}
+		}
+
+		$twins = [];
+
+		foreach ( array_chunk( array_keys( $hashes ), self::PAIR_READ_VALUES ) as $chunk ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Unique-key read per batch of an export; one %s per hash.
+			$found = (array) $wpdb->get_col( $wpdb->prepare( 'SELECT original_hash FROM %i WHERE original_hash IN (' . implode( ', ', array_fill( 0, count( $chunk ), '%s' ) ) . ')', array_merge( [ $strings ], $chunk ) ) );
+
+			if ( '' !== self::db_error( $wpdb ) ) {
+				return null;
+			}
+
+			foreach ( $found as $hash ) {
+				$twins[ (string) $hash ] = true;
+			}
+		}
+
+		return [ $candidates, $twins ];
+	}
+
+	/**
+	 * The reads of the rows on the lines of file-backed plural rows: (domain, context, file, line IN ...) terms, at most
+	 * PAIR_READ_VALUES values per query (a SQLite driver may bind each one).
+	 *
+	 * @param string                                                                     $strings The strings table.
+	 * @param array<string, array{0: string, 1: string, 2: string, 3: array<int, true>}> $terms   Domain, context, file, lines.
+	 * @return array<int, array{0: string, 1: array<int, int|string>}> SQL and its values.
+	 */
+	private static function line_queries( string $strings, array $terms ): array {
+		$queries = [];
+		$clauses = [];
+		$values  = [];
+
+		foreach ( $terms as [ $domain, $context, $file, $lines ] ) {
+			foreach ( array_chunk( array_keys( $lines ), self::PAIR_READ_VALUES - 3 ) as $chunk ) {
+				if ( [] !== $clauses && count( $values ) + 3 + count( $chunk ) > self::PAIR_READ_VALUES ) {
+					$queries[] = [ 'SELECT id, domain, context, original, file_path, line_number FROM %i WHERE ' . implode( ' OR ', $clauses ), array_merge( [ $strings ], $values ) ];
+					$clauses   = [];
+					$values    = [];
+				}
+
+				$clauses[] = '( domain = %s AND context = %s AND file_path = %s AND line_number IN (' . implode( ', ', array_fill( 0, count( $chunk ), '%d' ) ) . ') )';
+				$values    = array_merge( $values, [ $domain, $context, $file ], $chunk );
+			}
+		}
+
+		if ( [] !== $clauses ) {
+			$queries[] = [ 'SELECT id, domain, context, original, file_path, line_number FROM %i WHERE ' . implode( ' OR ', $clauses ), array_merge( [ $strings ], $values ) ];
+		}
+
+		return $queries;
+	}
+
+	/**
+	 * The row just before each of these ids (none for the first row).
+	 *
+	 * @param \wpdb           $wpdb    Database.
+	 * @param string          $strings The strings table.
+	 * @param array<int, int> $ids     Plural ids.
+	 * @return array<int, object>|null Plural id => that row; null on a read error.
+	 */
+	private static function rows_before( \wpdb $wpdb, string $strings, array $ids ): ?array {
+		$previous = [];
+
+		foreach ( array_chunk( $ids, self::PAIR_READ_VALUES ) as $chunk ) {
+			$in = implode( ', ', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Primary-key reads per batch of an export; one %d per id, values in one array.
+			$ids_before = (array) $wpdb->get_results( $wpdb->prepare( "SELECT p.id AS plural_id, ( SELECT m.id FROM %i m WHERE m.id < p.id ORDER BY m.id DESC LIMIT 1 ) AS prev_id FROM %i p WHERE p.id IN ({$in})", array_merge( [ $strings, $strings ], $chunk ) ) );
+			$prev_ids   = array_values( array_unique( array_filter( array_map( static fn( $row ): int => (int) self::field( $row, 'prev_id' ), $ids_before ) ) ) );
+			$rows       = '' === self::db_error( $wpdb ) && [] !== $prev_ids
+				? (array) $wpdb->get_results( $wpdb->prepare( 'SELECT id, domain, context, original, file_path, line_number FROM %i WHERE id IN (' . implode( ', ', array_fill( 0, count( $prev_ids ), '%d' ) ) . ')', array_merge( [ $strings ], $prev_ids ) ) )
+				: [];
+			// phpcs:enable
+
+			if ( '' !== self::db_error( $wpdb ) ) {
+				return null;
+			}
+
+			$by_id = [];
+
+			foreach ( $rows as $row ) {
+				if ( is_object( $row ) ) {
+					$by_id[ (int) self::field( $row, 'id' ) ] = $row;
+				}
+			}
+
+			foreach ( $ids_before as $row ) {
+				$prev = $by_id[ (int) self::field( $row, 'prev_id' ) ] ?? null;
+
+				if ( is_object( $prev ) ) {
+					$previous[ (int) self::field( $row, 'plural_id' ) ] = $prev;
+				}
+			}
+		}
+
+		return $previous;
+	}
+
+	/**
+	 * A row's exact (domain, context, file, line) key.
+	 *
+	 * @param mixed  $row     Row.
+	 * @param string $context The context to key by.
+	 * @return string
+	 */
+	private static function line_key( $row, string $context ): string {
+		return self::field( $row, 'domain' ) . "\0" . $context . "\0" . self::field( $row, 'file_path' ) . "\0" . (int) self::field( $row, 'line_number' );
+	}
+
+	/**
+	 * The first unclaimed candidate that fits one plural row (see plural_pairs()).
+	 *
+	 * @param mixed              $plural         Plural row (id, domain, file_path, line_number).
+	 * @param string             $single_context The singular context to match.
+	 * @param array<int, object> $candidates     Its candidates (singular_candidates()), in id order.
+	 * @param array<int, int>    $claimed        Singular ids already paired.
+	 * @return object|null The row, or null when none fits.
+	 */
+	private static function singular_row( $plural, string $single_context, array $candidates, array $claimed ): ?object {
+		$domain = self::field( $plural, 'domain' );
+		$file   = self::field( $plural, 'file_path' );
+		$line   = self::field( $plural, 'line_number' );
+
+		// Several calls on one line pair in id order: the plural rows are visited in id order too.
+		foreach ( $candidates as $row ) {
+			if ( self::field( $row, 'domain' ) === $domain && self::field( $row, 'context' ) === $single_context && self::field( $row, 'file_path' ) === $file
+				&& (int) self::field( $row, 'line_number' ) === (int) $line && '' !== self::field( $row, 'original' ) && ! isset( $claimed[ (int) self::field( $row, 'id' ) ] ) ) {
+				return $row;
+			}
+		}
+
+		return null;
 	}
 
 	/**
@@ -576,8 +1077,8 @@ final class PoSync {
 				$raw_context = $entry->context !== null ? (string) $entry->context : '';
 				$domain      = self::extract_domain( (string) ( $entry->extracted_comments ?? '' ) );
 
-				// A gettext plural entry (msgid + msgid_plural, as in a translate.wordpress.org pack) becomes the two rows the
-				// scanner and loader expect; PerfLocale's own export writes them as two entries.
+				// A gettext plural entry (msgid + msgid_plural, as in a translate.wordpress.org pack or PerfLocale's export)
+				// becomes the two rows the scanner and loader expect.
 				$forms = self::entry_to_forms( $entry, $singular, $raw_context, $domain );
 
 				if ( ! self::forms_have_translation( $forms ) ) {
@@ -761,9 +1262,10 @@ final class PoSync {
 
 					// Upsert the value; updated_at moves by its ON UPDATE clause (SQLite: Schema::touch_write_time()). Only a genuine
 					// msgid_plural entry may write or clear extra_forms: a flat re-imported entry would erase stored forms.
+					// Stored as the Strings screen stores them (trailing empty forms dropped), so an export imported back is unchanged.
 					$authoritative = array_key_exists( 'extra_forms', $form );
-					$extra_json    = ( $authoritative && is_array( $form['extra_forms'] ) && $form['extra_forms'] !== [] )
-						? wp_json_encode( array_map( 'strval', $form['extra_forms'] ) )
+					$extra_json    = $authoritative && is_array( $form['extra_forms'] )
+						? \PerfLocale\Database\Repository\StringTranslationRepository::normalize_extra_forms( $form['extra_forms'] )
 						: null;
 
 					// IF(%d, VALUES(extra_forms), extra_forms) takes the value only when authoritative; NULLIF(%s, '') restores the NULL
@@ -814,6 +1316,20 @@ final class PoSync {
 						}
 
 						$held[ $string_id ] = $now_held;
+
+						// A skip-existing MT run may relabel the link between the link and value writes. Only a changed row (MySQL: 2)
+						// can have held that run's text; SQLite reports 1 for every upsert. Replace runs in one transaction.
+						if ( ! $replace && ( ( is_int( $upsert ) && $upsert > 1 ) || ! \PerfLocale\Database\ConnectionGuard::applies() ) ) {
+							$claim = static fn(): ?bool => \PerfLocale\Strings\StringLinkLabel::claim( $group_repo, $string_group_id, $string_id, self::language_id( $lang ), \PerfLocale\Enum\SourceType::Manual, $msgstr );
+
+							if ( null === ( $claim() ?? $claim() ) ) {
+								$result['errors'][] = sprintf(
+									/* translators: %s: the source string (msgid), shortened to 60 characters */
+									__( '%s: imported, but it could not be marked as a manual translation (a database error). Import the file again.', 'perflocale' ),
+									mb_substr( $singular, 0, 60 )
+								);
+							}
+						}
 					} else {
 						++$result['skipped'];
 						self::log_db_error( 'saving a translation', (string) $wpdb->last_error );

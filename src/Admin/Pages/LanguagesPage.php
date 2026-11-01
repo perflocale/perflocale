@@ -13,6 +13,7 @@ use PerfLocale\Admin\LanguagePacks;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Helper;
 use PerfLocale\Plugin;
+use PerfLocale\Util\LanguageForm;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -1013,7 +1014,7 @@ final class LanguagesPage {
 
 					if ( ! $is_edit ) {
 						// The form detector needs no region-qualified sibling yet: the user is about to add it.
-						$rename_candidates = Helper::bare_language_rename_candidates_for_form(
+						$rename_candidates = LanguageForm::bare_language_rename_candidates_for_form(
 							$this->repo->get_active()
 						);
 					}
@@ -1189,7 +1190,7 @@ final class LanguagesPage {
 	 * @return void
 	 */
 	private function render_bare_default_notice( array $languages ): void {
-		$candidates = Helper::detect_bare_languages_with_region_siblings( $languages );
+		$candidates = LanguageForm::detect_bare_languages_with_region_siblings( $languages );
 
 		if ( empty( $candidates ) ) {
 			return;

@@ -41,11 +41,23 @@ final class XliffImportErrors {
 	/** Saving the translated fields failed. */
 	public const SAVE_FAILED = 'save_failed';
 
+	/** A stopped import's translation was edited since: left as it is. */
+	public const RECOVERY_EDITED_TRANSLATION = 'recovery_edited_translation';
+
+	/** A stopped import's unlinked draft: kept for a person to review. */
+	public const RECOVERY_KEPT_DRAFT = 'recovery_kept_draft';
+
+	/** The user may not finish a stopped import's translation. */
+	public const RECOVERY_CANNOT_FINISH = 'recovery_cannot_finish';
+
 	/** Unit ids listed in full up to this many; a longer list is shortened. */
 	public const UNIT_LIST_MAX = 5;
 
 	/** Unit ids named before "and N more" in a shortened list. */
 	public const UNIT_LIST_SHOWN = 2;
+
+	/** Longest unit id shown, in characters, before it is cut (a valid id is at most 32). */
+	public const UNIT_ID_MAX = 40;
 
 	/** Longest title shown, in characters, before it is cut. */
 	public const TITLE_MAX = 60;
@@ -54,7 +66,7 @@ final class XliffImportErrors {
 	private const NO_TITLE = [ self::NOT_FOUND, self::CANNOT_EDIT ];
 
 	/**
-	 * One entry per post and cause, in the order first reported.
+	 * One entry per post, cause and other post, in the order first reported.
 	 *
 	 * @var array<string, array{cause: string, post_id: int, units: array<int, string>, other_id: int}>
 	 */
@@ -70,7 +82,7 @@ final class XliffImportErrors {
 	 * @return void
 	 */
 	public function add( string $cause, int $post_id, string $unit_id, int $other_id = 0 ): void {
-		$key = $cause . ':' . $post_id;
+		$key = $cause . ':' . $post_id . ':' . $other_id;
 
 		if ( ! isset( $this->groups[ $key ] ) ) {
 			$this->groups[ $key ] = [
@@ -87,7 +99,7 @@ final class XliffImportErrors {
 	}
 
 	/**
-	 * The messages, one per post and cause.
+	 * The messages, one per post, cause and other post.
 	 *
 	 * @param callable $title_for Returns the title to show for a post ID, or ''.
 	 * @phpstan-param callable(int): string $title_for
@@ -138,6 +150,18 @@ final class XliffImportErrors {
 				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */
 				return sprintf( __( '%s: you do not have permission to create translations of this content.', 'perflocale' ), $subject );
 
+			case self::RECOVERY_EDITED_TRANSLATION:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the post's translation. */
+				return sprintf( __( '%1$s: its translation (post %2$d) may have been edited since an earlier import stopped while creating it, so it was left as it is and may lack the original\'s custom fields, image and terms. To apply this file\'s text to it, import the file again.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_KEPT_DRAFT:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import stopped while creating its translation and left a draft (post %2$d), which was kept. If you do not need it, delete it, or ask an editor to, before you publish the new translation; otherwise the new translation\'s address may end in -2.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_CANNOT_FINISH:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the post's translation. */
+				return sprintf( __( '%1$s: an earlier import stopped while creating its translation (post %2$d), and you do not have permission to copy the original\'s custom fields, image and terms to it. Ask an editor of both posts to copy them.', 'perflocale' ), $subject, $other_id );
+
 			case self::CREATE_FAILED:
 				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */
 				return sprintf( __( '%s: the translation could not be created. Import the file again; if it keeps failing, check the PHP error log.', 'perflocale' ), $subject );
@@ -171,13 +195,14 @@ final class XliffImportErrors {
 	}
 
 	/**
-	 * Unit ids joined with commas; a list longer than UNIT_LIST_MAX names the first UNIT_LIST_SHOWN.
+	 * Unit ids, each cut to UNIT_ID_MAX, joined with commas; a list longer than UNIT_LIST_MAX names the first
+	 * UNIT_LIST_SHOWN.
 	 *
 	 * @param array<int, string> $units Unit ids.
 	 * @return string
 	 */
 	public static function unit_list( array $units ): string {
-		$units = array_values( $units );
+		$units = array_map( static fn( string $id ): string => strlen( $id ) > self::UNIT_ID_MAX ? substr( $id, 0, self::UNIT_ID_MAX - 3 ) . '...' : $id, array_values( $units ) );
 		$count = count( $units );
 
 		if ( $count <= self::UNIT_LIST_MAX ) {

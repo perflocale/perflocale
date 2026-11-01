@@ -79,9 +79,6 @@ final class SitemapIntegration {
 		// Core builds the blog-home entry outside wp_sitemaps_posts_entry; only this filter sees it.
 		add_filter( 'wp_sitemaps_posts_show_on_front_entry', [ $this, 'add_home_alternate_links' ] );
 
-		// No-op filter: index entries are returned unchanged.
-		add_filter( 'wp_sitemaps_index_entry', [ $this, 'pass_through' ] );
-
 		// Core's renderer drops the `xhtml:link` key, so it is replaced.
 		add_action( 'wp_sitemaps_init', [ $this, 'swap_renderer' ] );
 	}

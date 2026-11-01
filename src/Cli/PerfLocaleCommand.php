@@ -1945,8 +1945,18 @@ final class PerfLocaleCommand {
 				sprintf(
 					'%1$d of %2$d strings will not round-trip: their stored hash was not computed from the text now in the row, so re-importing creates a new row instead of updating theirs. Serving is unaffected. First ids: %3$s',
 					(int) $report['unhashable'],
-					(int) $report['emitted'],
+					(int) $report['rows'],
 					implode( ', ', array_map( 'intval', (array) $report['unhashable_ids'] ) )
+				)
+			);
+		}
+
+		if ( ! empty( $report['forms_not_written'] ) ) {
+			\WP_CLI::warning(
+				sprintf(
+					'%1$d plural string(s) have plural forms that are not in this file: their singular string could not be identified, or the language has fewer plural forms. A --replace import of this file removes those forms; a merge import keeps them. First ids: %2$s',
+					(int) $report['forms_not_written'],
+					implode( ', ', array_map( 'intval', (array) $report['forms_not_written_ids'] ) )
 				)
 			);
 		}
@@ -2040,7 +2050,7 @@ final class PerfLocaleCommand {
 	 * : Source plugin (wpml, polylang, translatepress).
 	 *
 	 * [--dry-run]
-	 * : Show what would be imported without making changes.
+	 * : Check the languages and whether the import would run, not each item. Makes no changes.
 	 *
 	 * [--yes]
 	 * : Skip the "this cannot be undone" confirmation prompt.
@@ -2247,6 +2257,8 @@ final class PerfLocaleCommand {
 		if ( $blocking ) {
 			\WP_CLI::error( ucfirst( $source ) . ' data detected, but the import would be refused. Fix the errors above, then run it again.' );
 		}
+
+		\WP_CLI::log( 'This check covers the languages and whether the import would run, not each item: the import reports what it leaves out.' );
 
 		// A catch-up import runs despite these: say what it would leave out.
 		if ( $has_errors ) {
@@ -2518,6 +2530,30 @@ final class PerfLocaleCommand {
 			\WP_CLI::log( ' Orphan links (missing group): 0 ✓' );
 		}
 
+		// 6. String links without a value (a save or run stopped between its link and value writes): reported only, as the
+		// cell shows blank and a typed translation or a skip-existing MT run fills it.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$valueless = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*)
+				FROM %i l
+				INNER JOIN %i g ON g.id = l.group_id AND g.type = 'string'
+				WHERE NOT EXISTS ( SELECT 1 FROM %i st WHERE st.string_id = l.object_id AND st.language_id = l.language_id AND LENGTH( st.translation ) > 0 )",
+				$links_table,
+				$groups_table,
+				Schema::table( 'string_translations' )
+			)
+		);
+
+		if ( $valueless > 0 ) {
+			\WP_CLI::warning( " String links without a translation: {$valueless}" );
+			\WP_CLI::log( '   Not removed: type the translation on the Strings screen, or run machine translation with skip existing.' );
+			$issues    += $valueless;
+			$unfixable += $valueless;
+		} else {
+			\WP_CLI::log( ' String links without a translation: 0 ✓' );
+		}
+
 		\WP_CLI::log( '' );
 
 		// 7. Strings whose `original` disagrees with `original_hash` (an old insert ran wp_kses_post() on it): a PO round trip
@@ -2573,7 +2609,7 @@ final class PerfLocaleCommand {
 
 		if ( $issues === 0 ) {
 			// Name what was checked rather than certifying the whole database.
-			\WP_CLI::success( 'All nine orphan, duplicate and string-integrity checks passed.' );
+			\WP_CLI::success( 'All ten orphan, duplicate and string-integrity checks passed.' );
 		} elseif ( $fix ) {
 			$this->refresh_after_fix( $regenerate );
 
@@ -3537,19 +3573,41 @@ final class PerfLocaleCommand {
 	 * @when after_wp_load
 	 */
 	public function db_migrate(): void {
-		$migrator = new \PerfLocale\Database\Migrator();
-
 		try {
-			$migrator->maybe_migrate();
-			$migrator->maybe_update();
-
-			// SQLite only, the engine read before the repair class is named (nothing loaded on MySQL or MariaDB).
-			$note = defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ? $this->sqlite_group_repair() : '';
-
-			\WP_CLI::success( 'PerfLocale database migrations completed successfully.' . $note );
+			// Every pending step at once, ignoring the retry backoff, and a re-check of the tables.
+			$result = \PerfLocale\Database\UpgradeRunner::retry();
 		} catch ( \Throwable $e ) {
 			\WP_CLI::error( 'Migration failed: ' . $e->getMessage() );
+			return;
 		}
+
+		if ( 'busy' === $result ) {
+			\WP_CLI::error( 'Another request is running the PerfLocale upgrade. Run this command again in a few minutes.' );
+			return;
+		}
+
+		if ( 'failed' === $result ) {
+			foreach ( \PerfLocale\Database\UpgradeRunner::failures() as $failure ) {
+				\WP_CLI::warning( (string) ( $failure['step'] ?? '' ) . ': ' . (string) ( $failure['error'] ?? '' ) );
+			}
+
+			if ( '' !== \PerfLocale\Database\UpgradeRunner::repair_error() ) {
+				\WP_CLI::warning( 'Database tables check: ' . \PerfLocale\Database\UpgradeRunner::repair_error() );
+			}
+
+			\WP_CLI::error( 'The PerfLocale upgrade did not finish. Fix the cause above, then run this command again.' );
+			return;
+		}
+
+		try {
+			// SQLite only, the engine read before the repair class is named (nothing loaded on MySQL or MariaDB).
+			$note = defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ? $this->sqlite_group_repair() : '';
+		} catch ( \Throwable $e ) {
+			\WP_CLI::error( 'Migration failed: ' . $e->getMessage() );
+			return;
+		}
+
+		\WP_CLI::success( 'PerfLocale database migrations completed successfully.' . $note );
 	}
 
 	/**
@@ -3607,13 +3665,17 @@ final class PerfLocaleCommand {
 	/**
 	 * Inspect and control background jobs.
 	 *
+	 * `run` runs one job in this WP-CLI process, without web time limits: a failed or canceled job is retried first.
+	 * While it runs, other workers (WP-Cron, Action Scheduler) leave the job to it, so no DISABLE_WP_CRON is needed;
+	 * should the process stop, the job goes back to them within 5 minutes.
+	 *
 	 * ## OPTIONS
 	 *
 	 * <subcommand>
-	 * : Subcommand (list, get, cancel, retry, delete, pause, unpause, gc, resume).
+	 * : Subcommand (list, get, run, cancel, retry, delete, pause, unpause, gc, resume).
 	 *
 	 * [<id>]
-	 * : Job ID (required for get, cancel, retry, delete).
+	 * : Job ID (required for get, run, cancel, retry, delete).
 	 *
 	 * [--status=<status>]
 	 * : Filter list by status (queued, running, complete, failed, canceled).
@@ -3631,6 +3693,9 @@ final class PerfLocaleCommand {
 	 *
 	 *     # Show full state of one job
 	 *     wp perflocale jobs get 5fc94964-29f6-4697-8c4e-64a8ffb5c72d
+	 *
+	 *     # Run (or retry and run) one job here until it ends
+	 *     wp perflocale jobs run 5fc94964-29f6-4697-8c4e-64a8ffb5c72d
 	 *
 	 *     # Cancel / retry / delete
 	 *     wp perflocale jobs cancel 5fc94964-29f6-4697-8c4e-64a8ffb5c72d
@@ -3678,6 +3743,9 @@ final class PerfLocaleCommand {
 			case 'retry':
 				$this->jobs_retry( $args[1] ?? '' );
 				break;
+			case 'run':
+				$this->jobs_run( $args[1] ?? '' );
+				break;
 			case 'delete':
 				$this->jobs_delete( $args[1] ?? '' );
 				break;
@@ -3694,7 +3762,7 @@ final class PerfLocaleCommand {
 				$this->jobs_resume();
 				break;
 			default:
-				\WP_CLI::error( "Unknown subcommand: {$subcommand}. Available: list, get, cancel, retry, delete, pause, unpause, gc, resume" );
+				\WP_CLI::error( "Unknown subcommand: {$subcommand}. Available: list, get, run, cancel, retry, delete, pause, unpause, gc, resume" );
 		}
 	}
 
@@ -3829,6 +3897,10 @@ final class PerfLocaleCommand {
 
 		\PerfLocale\Background\JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $job_id );
 
+		if ( 'xliff_import' === ( $state['type'] ?? null ) ) {
+			\PerfLocale\Background\Jobs\XliffImportJob::canceled( (array) ( $state['args'] ?? [] ) );
+		}
+
 		// Release both locks now, as the REST cancel: the type lock (30 min TTL) would hold every same-type dispatch in
 		// backoff.
 		\PerfLocale\Background\JobLock::release( $job_id );
@@ -3894,6 +3966,31 @@ final class PerfLocaleCommand {
 		\PerfLocale\Background\JobState::set_engine( $job_id, $runner->get_engine_name() );
 
 		\WP_CLI::success( "Retried job {$job_id}" );
+	}
+
+	/**
+	 * Run one job in this process until it ends (Background\CliLane); other workers leave it alone meanwhile.
+	 *
+	 * @param string $job_id Job ID.
+	 * @return void
+	 */
+	private function jobs_run( string $job_id ): void {
+		if ( $job_id === '' ) {
+			\WP_CLI::error( 'Job ID required.' );
+		}
+
+		[ $completed, $message ] = \PerfLocale\Background\CliLane::run(
+			$job_id,
+			static function ( string $line ): void {
+				\WP_CLI::log( $line );
+			}
+		);
+
+		if ( ! $completed ) {
+			\WP_CLI::error( $message );
+		}
+
+		\WP_CLI::success( $message );
 	}
 
 	/**

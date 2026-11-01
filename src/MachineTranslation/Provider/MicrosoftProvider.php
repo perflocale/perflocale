@@ -86,15 +86,15 @@ final class MicrosoftProvider extends AbstractProvider {
 			$fast_fail
 		);
 
-		$data = $this->parse_json_response( $response['body'] );
+		$data = $this->decode_json_response( is_string( $response['body'] ) ? $response['body'] : '' );
 
-		if ( ! isset( $data[0]['translations'][0]['text'] ) ) {
-			throw new \RuntimeException(
-				esc_html__( 'Microsoft Translator returned an unexpected response.', 'perflocale' )
-			);
+		$translated = self::text_at( $data, 0, 'translations', 0, 'text' );
+
+		if ( null === $translated ) {
+			$this->refuse_response( esc_html__( 'Microsoft Translator returned an unexpected response.', 'perflocale' ) );
 		}
 
-		$translated = $data[0]['translations'][0]['text'];
+		$this->accept_response();
 
 		$this->track_usage( $text );
 
@@ -117,6 +117,21 @@ final class MicrosoftProvider extends AbstractProvider {
 	 * @throws \RuntimeException When Microsoft Translator returns an unexpected batch response or all retries fail.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
+		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ) );
+	}
+
+	/**
+	 * One request for a list of texts that are not whitespace.
+	 *
+	 * @param array<int, string> $texts       Texts.
+	 * @param string             $source_lang Source language.
+	 * @param string             $target_lang Target language.
+	 * @param bool               $fast_fail   Fewer retries, shorter timeout.
+	 * @param string             $format      'html' or 'text'.
+	 * @return array<int, string>
+	 * @throws \RuntimeException When the request or its answer fails.
+	 */
+	private function send_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail, string $format ): array {
 		if ( empty( $texts ) ) {
 			return [];
 		}
@@ -189,31 +204,34 @@ final class MicrosoftProvider extends AbstractProvider {
 				$fast_fail
 			);
 
-			$data = $this->parse_json_response( $response['body'] );
+			$data = $this->decode_json_response( is_string( $response['body'] ) ? $response['body'] : '' );
 			$keys = array_keys( $chunk );
 
 			// One element per input, in order: any shape mismatch would scramble the mapping, so it fails.
-			if ( count( $data ) !== count( $keys ) ) {
-				throw new \RuntimeException(
-					esc_html__( 'Microsoft Translator returned an unexpected batch response.', 'perflocale' )
-				);
-			}
-
-			$pos = 0;
+			$answers = [];
 
 			foreach ( $data as $item ) {
-				if ( ! isset( $item['translations'][0]['text'] ) || ! is_string( $item['translations'][0]['text'] ) ) {
-					throw new \RuntimeException(
-						esc_html__( 'Microsoft Translator returned an unexpected batch response.', 'perflocale' )
-					);
+				$text = self::text_at( $item, 'translations', 0, 'text' );
+
+				if ( null === $text ) {
+					$this->refuse_response( esc_html__( 'Microsoft Translator returned an unexpected batch response.', 'perflocale' ) );
 				}
 
+				$answers[] = $text;
+			}
+
+			if ( count( $answers ) !== count( $keys ) ) {
+				$this->refuse_response( esc_html__( 'Microsoft Translator returned an unexpected batch response.', 'perflocale' ) );
+			}
+
+			$this->accept_response();
+
+			foreach ( $answers as $pos => $answer ) {
 				$orig_i = $keys[ $pos ];
-				++$pos;
 
 				$results[ $orig_i ] = (string) apply_filters(
 					'perflocale/machine_translation/result',
-					$item['translations'][0]['text'],
+					$answer,
 					(string) ( $values[ $orig_i ] ?? '' ),
 					'microsoft'
 				);

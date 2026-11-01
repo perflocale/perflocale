@@ -40,6 +40,24 @@ final class AbilitiesRegistrar {
 	}
 
 	/**
+	 * `wp_abilities_api_categories_init` callback; the class loads only when the Abilities API fires it.
+	 *
+	 * @return void
+	 */
+	public static function on_categories_init(): void {
+		( new self( Plugin::get_instance() ) )->register_category();
+	}
+
+	/**
+	 * `wp_abilities_api_init` callback.
+	 *
+	 * @return void
+	 */
+	public static function on_abilities_init(): void {
+		( new self( Plugin::get_instance() ) )->register_abilities();
+	}
+
+	/**
 	 * Register the PerfLocale ability category.
 	 *
 	 * Hooked to `wp_abilities_api_categories_init`.

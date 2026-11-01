@@ -64,7 +64,8 @@ final class Api {
 	 *
 	 * @param array{product_ids?: list<int>, limit?: int} $args `product_ids`: only the groups of these
 	 *        products (any language; 1-500, not variations; empty: every
-	 *        product). `limit`: stop after this many groups (0: all).
+	 *        product, a full scan). `limit`: stop after this many drifting groups (0: all); it limits
+	 *        the result, not the products scanned.
 	 * @return list<StockPublicGroup>|\WP_Error
 	 */
 	public function stock_drift( array $args = [] ): array|\WP_Error {

@@ -152,27 +152,12 @@ final class SiteHealth {
 	];
 
 	/**
-	 * Register hooks.
+	 * Register hooks: SiteHealthHooks forwards each to the `site_health` service.
 	 *
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		add_filter( 'site_status_tests', [ $this, 'register_tests' ] );
-		add_filter( 'debug_information', [ $this, 'register_info' ] );
-
-		// Settings changes can change the cached counts: drop them.
-		add_action( 'perflocale/settings/updated', [ $this, 'flush_counts_cache' ] );
-
-		// String edits, PO imports and bulk runs change the counts, hreflang and files cards: drop their caches (admin and
-		// background writes only).
-		add_action( 'perflocale/strings/changed', [ $this, 'flush_counts_cache' ] );
-
-		add_action( 'admin_notices', [ $this, 'render_leftover_notice' ] );
-
-		// The Status screen runs the language-pack test through this admin-ajax action.
-		if ( wp_doing_ajax() ) {
-			add_action( 'wp_ajax_health-check-' . self::LANGUAGE_PACKS_ACTION, [ $this, 'ajax_language_packs' ] );
-		}
+		SiteHealthHooks::register();
 	}
 
 	// Status tab: test registration.
@@ -196,6 +181,10 @@ final class SiteHealth {
 			'perflocale_db_version'        => [
 				'label' => __( 'PerfLocale database schema version', 'perflocale' ),
 				'test'  => [ $this, 'test_db_version' ],
+			],
+			'perflocale_upgrade'           => [
+				'label' => __( 'PerfLocale database upgrade', 'perflocale' ),
+				'test'  => [ $this, 'test_upgrade' ],
 			],
 			'perflocale_php_extensions'    => [
 				'label' => __( 'PerfLocale PHP extensions', 'perflocale' ),
@@ -293,6 +282,10 @@ final class SiteHealth {
 			'perflocale_webhook_failures'  => [
 				'label' => __( 'PerfLocale webhook delivery', 'perflocale' ),
 				'test'  => [ $this, 'test_webhook_failures' ],
+			],
+			'perflocale_db_charset'         => [
+				'label' => __( 'PerfLocale database connection charset', 'perflocale' ),
+				'test'  => [ DbCharsetHealth::class, 'test' ],
 			],
 		];
 
@@ -1915,6 +1908,17 @@ final class SiteHealth {
 				'<code>' . esc_html( str_replace( ABSPATH, '', $files_dir ) ) . '</code>'
 			)
 		);
+	}
+
+	/**
+	 * Recorded upgrade failures (step, attempts, cause, next try) and every table, column and index.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_upgrade(): array {
+		[ $status, $label, $desc, $actions ] = UpgradeNotice::site_health();
+
+		return $this->build( 'perflocale_upgrade', $status, $label, $desc, $actions );
 	}
 
 	/**

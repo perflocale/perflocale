@@ -205,7 +205,30 @@
 		};
 	}
 
-	function closeAllExcept( exceptNav, source ) {
+	// The click's pointer type; '' for a keyboard click (detail 0) or without pointerType (Safari before 17).
+	function pointerOf( e ) {
+		var p = e.detail === 0 || e.isTrusted === false ? '' : e.pointerType;
+
+		return p === 'mouse' || p === 'touch' || p === 'pen' ? p : '';
+	}
+
+	// The last real press [ type, target, time ]: a press outside closes on focusout before its click.
+	var lastDown = null;
+
+	document.addEventListener( 'pointerdown', function ( e ) {
+		lastDown = e.isTrusted ? [ e.pointerType, e.target, Date.now() ] : null;
+	}, { capture: true, passive: true } );
+
+	// The pointer of a press outside nav in the last second, used once; '' for Tab or a script.
+	function pressOutside( nav ) {
+		var d = lastDown;
+
+		lastDown = null;
+
+		return d && ! nav.contains( d[ 1 ] ) && Date.now() - d[ 2 ] < 1000 ? pointerOf( { detail: 1, pointerType: d[ 0 ] } ) : '';
+	}
+
+	function closeAllExcept( exceptNav, source, pointer ) {
 		var openPanels = document.querySelectorAll( PANEL_SELECTOR + '.' + OPEN_CLASS );
 
 		for ( var i = 0; i < openPanels.length; i++ ) {
@@ -222,11 +245,13 @@
 				continue;
 			}
 
-			close( nav, btn, panel, false, source );
+			close( nav, btn, panel, false, source, pointer );
 		}
 	}
 
-	function open( nav, btn, panel, focusFirstOption, source ) {
+	function open( nav, btn, panel, focusFirstOption, source, pointer ) {
+		pointer = pointer || '';
+
 		/**
 		 * @hook perflocale:switcher:beforeopen
 		 * @kind event
@@ -236,14 +261,15 @@
 		 * @fires Before the panel opens, before any change. preventDefault() leaves every switcher and the focus as they were.
 		 * @context {SwitcherDetail} detail
 		 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen) or 'keyboard' (Enter, Space or an arrow key).
+		 * @property {string} detail.pointer 'mouse', 'touch' or 'pen' for a pointer click; '' for a key, a script or a browser without pointerType (Safari before 17).
 		 * @example document.addEventListener( 'perflocale:switcher:beforeopen', ( e ) => e.preventDefault() );
 		 */
-		if ( ! dispatch( nav, 'perflocale:switcher:beforeopen', detail( nav, source ), true ) ) {
+		if ( ! dispatch( nav, 'perflocale:switcher:beforeopen', Object.assign( detail( nav, source ), { pointer: pointer } ), true ) ) {
 			return false;
 		}
 
 		removeOptionsFromTabOrder( panel );
-		closeAllExcept( nav, 'other-switcher' );
+		closeAllExcept( nav, 'other-switcher', pointer );
 		panel.classList.add( OPEN_CLASS );
 		btn.setAttribute( 'aria-expanded', 'true' );
 		positionPanel( btn, panel );
@@ -258,9 +284,10 @@
 		 * @fires After the panel opened.
 		 * @context {SwitcherDetail} detail
 		 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen) or 'keyboard' (Enter, Space or an arrow key).
+		 * @property {string} detail.pointer 'mouse', 'touch' or 'pen' for a pointer click; '' for a key, a script or a browser without pointerType (Safari before 17).
 		 * @example document.addEventListener( 'perflocale:switcher:open', ( e ) => console.log( e.detail.current.slug ) );
 		 */
-		dispatch( nav, 'perflocale:switcher:open', detail( nav, source ), false );
+		dispatch( nav, 'perflocale:switcher:open', Object.assign( detail( nav, source ), { pointer: pointer } ), false );
 
 		if ( focusFirstOption ) {
 			var first = panel.querySelector( OPTION_SELECTOR );
@@ -270,7 +297,7 @@
 		return true;
 	}
 
-	function close( nav, btn, panel, returnFocusToTrigger, source ) {
+	function close( nav, btn, panel, returnFocusToTrigger, source, pointer ) {
 		panel.classList.remove( OPEN_CLASS );
 		btn.setAttribute( 'aria-expanded', 'false' );
 		stopLivePositioning( nav );
@@ -284,9 +311,10 @@
 		 * @fires After the panel closed, on every path.
 		 * @context {SwitcherDetail} detail
 		 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen), 'escape', 'outside', 'focusout', 'other-switcher' or 'hidden'.
+		 * @property {string} detail.pointer 'mouse', 'touch' or 'pen' when a pointer press or click caused the close ('click', 'outside', 'other-switcher', or 'focusout' after a press outside); '' otherwise.
 		 * @example document.addEventListener( 'perflocale:switcher:close', ( e ) => console.log( e.detail.source ) );
 		 */
-		dispatch( nav, 'perflocale:switcher:close', detail( nav, source ), false );
+		dispatch( nav, 'perflocale:switcher:close', Object.assign( detail( nav, source ), { pointer: pointer || '' } ), false );
 
 		if ( returnFocusToTrigger ) {
 			btn.focus();
@@ -328,6 +356,7 @@
 			 * @fires Before the browser follows a chosen option. preventDefault() stays on the page.
 			 * @context {SwitcherDetail} detail
 			 * @property {string} detail.source 'click' (a mouse click or a tap on a touch screen) or 'keyboard' (Enter).
+			 * @property {string} detail.pointer 'mouse', 'touch' or 'pen' for a pointer click; '' for Enter, a script or a browser without pointerType (Safari before 17).
 			 * @property {Option} detail.target The chosen option.
 			 * @property {Language} detail.from = current.
 			 * @property {HTMLElement} detail.option The option element.
@@ -336,6 +365,7 @@
 			 * @example document.addEventListener( 'perflocale:switcher:navigate', ( e ) => gtag( 'event', 'lang', { to: e.detail.target.slug } ) );
 			 */
 			var allowed = dispatch( nav, 'perflocale:switcher:navigate', Object.defineProperties( detail( nav, e.detail === 0 ? 'keyboard' : 'click' ), {
+				pointer: { enumerable: true, value: pointerOf( e ) },
 				target: { enumerable: true, get: function () { return readOption( option ); } },
 				from:   { enumerable: true, get: function () { return this.current; } },
 				option: { enumerable: true, value: option },
@@ -349,11 +379,12 @@
 		} );
 
 		btn.addEventListener( 'click', function ( e ) {
-			var isOpen = panel.classList.contains( OPEN_CLASS );
+			var isOpen  = panel.classList.contains( OPEN_CLASS );
+			var pointer = pointerOf( e );
 
 			if ( isOpen ) {
-				close( nav, btn, panel, false, 'click' );
-			} else if ( open( nav, btn, panel, e.detail === 0, e.detail === 0 ? 'keyboard' : 'click' ) && e.detail ) {
+				close( nav, btn, panel, false, 'click', pointer );
+			} else if ( open( nav, btn, panel, e.detail === 0, e.detail === 0 ? 'keyboard' : 'click', pointer ) && e.detail ) {
 				// e.detail === 0 is keyboard activation (Enter/Space): open()
 				// focuses the first option. A pointer click focuses the trigger
 				// here, the focus change its mousedown held back.
@@ -373,6 +404,8 @@
 		} );
 
 		nav.addEventListener( 'keydown', function ( e ) {
+			// A key after a press moves focus by keyboard.
+			lastDown = null;
 			var t      = e.target;
 			var isOpen = panel.classList.contains( OPEN_CLASS );
 			var opts   = panel.querySelectorAll( OPTION_SELECTOR );
@@ -459,14 +492,14 @@
 
 			if ( to ) {
 				if ( ! nav.contains( to ) ) {
-					close( nav, btn, panel, false, 'focusout' );
+					close( nav, btn, panel, false, 'focusout', pressOutside( nav ) );
 				}
 				return;
 			}
 
 			( window.requestAnimationFrame || function ( cb ) { return setTimeout( cb, 0 ); } )( function () {
 				if ( panel.classList.contains( OPEN_CLASS ) && ! nav.contains( document.activeElement ) ) {
-					close( nav, btn, panel, false, 'focusout' );
+					close( nav, btn, panel, false, 'focusout', pressOutside( nav ) );
 				}
 			} );
 		} );
@@ -528,7 +561,7 @@
 		if ( e.target.closest( ROOT_SELECTOR ) ) {
 			return;
 		}
-		closeAllExcept( null, 'outside' );
+		closeAllExcept( null, 'outside', pointerOf( e ) );
 	} );
 
 	// Native <select> dropdown used by the switcher-dropdown.php template.

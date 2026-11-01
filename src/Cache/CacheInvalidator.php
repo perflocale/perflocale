@@ -52,59 +52,12 @@ final class CacheInvalidator {
 	}
 
 	/**
-	 * Register hooks for cache invalidation.
+	 * Register hooks for cache invalidation: InvalidatorHooks' static forwarders to the `cache_invalidator` service.
 	 *
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// The gated hooks below need a write context (WP-CLI included); a front-end GET changes no content.
-		$is_write_context = is_admin() || wp_doing_ajax() || wp_doing_cron()
-			|| ( isset( $_SERVER['REQUEST_METHOD'] ) && 'GET' !== $_SERVER['REQUEST_METHOD'] )
-			|| defined( 'REST_REQUEST' )
-			|| ( defined( 'WP_CLI' ) && WP_CLI );
-
-		// Delete cleanup runs in every context: a post or term can be deleted inside a front-end GET, and a
-		// missed cleanup orphans rows that reserve the translated slug. Idle unless a delete fires.
-		add_action( 'delete_post', [ $this, 'on_delete_post' ] );
-		add_action( 'delete_term', [ $this, 'on_delete_term' ], 10, 4 );
-
-		// Term edits in every context too: a cron event inside a GET can rename a term. Priority 999: after
-		// other plugins, so the cache reflects the final term.
-		add_action( 'edited_term', [ $this, 'on_edited_term' ], 999, 3 );
-
-		// Machine-translated meta lands after the translation's own save. Ungated: jobs also run from WP-Cron
-		// inside a visitor's GET.
-		add_action( 'perflocale/mt/meta_translated', [ $this, 'on_meta_translated' ], 10, 2 );
-
-		// A post link written outside a post save changes its groups' alternates. Ungated for the same reason;
-		// a migration import leaves it to the flush that ends the import.
-		add_action( 'perflocale/translation/linked', [ $this, 'on_translation_linked' ] );
-
-		// Ungated: a publication can happen in a front-end GET (a scheduled post on a visitor's request). The
-		// handler returns early unless public readability changed.
-		add_action( 'transition_post_status', [ $this, 'on_visibility_transition' ], 20, 3 );
-
-		if ( $is_write_context ) {
-			// Gated: a publication inside a front-end request is covered by on_visibility_transition(), which
-			// clears hreflang itself when this handler is absent. Priority 999: after other plugins.
-			add_action( 'save_post', [ $this, 'on_save_post' ], 999, 2 );
-
-			// The post a save_post run is for, until on_save_post() takes it:
-			// a group change inside that run leaves its hreflang to the save.
-			add_action( 'save_post', [ $this, 'open_save' ], PHP_INT_MIN, 2 );
-		}
-
-		// PerfLocale-specific hooks - always needed (fired programmatically).
-		add_action( 'perflocale/language/added', [ $this, 'on_language_changed' ] );
-		add_action( 'perflocale/language/updated', [ $this, 'on_language_changed' ] );
-		add_action( 'perflocale/language/deleted', [ $this, 'on_language_changed' ] );
-		// 2 accepted args: on_settings_changed() needs the new and the old settings to tell which keys changed.
-		add_action( 'perflocale/settings/updated', [ $this, 'on_settings_changed' ], 10, 2 );
-
-		// Multisite only: switch_to_blog() fires switch_blog on single-site too, so a same-blog switch would flush.
-		if ( is_multisite() ) {
-			add_action( 'switch_blog', [ $this, 'on_switch_blog' ] );
-		}
+		( new InvalidatorHooks() )->register_hooks();
 	}
 
 	/**
@@ -238,6 +191,15 @@ final class CacheInvalidator {
 	}
 
 	/**
+	 * Whether save_post reaches on_save_post(): its hook holds InvalidatorHooks' forwarder, not this object.
+	 *
+	 * @return bool
+	 */
+	private static function save_handler_attached(): bool {
+		return false !== has_action( 'save_post', [ InvalidatorHooks::class, 'on_save_post' ] );
+	}
+
+	/**
 	 * Whether the save_post run in progress is this post's and on_save_post()
 	 * will still clear the hreflang of the post and its group in it.
 	 *
@@ -248,7 +210,7 @@ final class CacheInvalidator {
 		return [] !== $this->open_saves
 			&& get_current_blog_id() . ':' . $post_id === $this->open_saves[ count( $this->open_saves ) - 1 ]
 			&& doing_action( 'save_post' )
-			&& false !== has_action( 'save_post', [ $this, 'on_save_post' ] )
+			&& self::save_handler_attached()
 			&& ! wp_is_post_revision( $post_id )
 			&& ! wp_is_post_autosave( $post_id );
 	}
@@ -710,7 +672,7 @@ final class CacheInvalidator {
 
 		// A public change alters every sibling's alternates. Where on_save_post() is hooked it clears them, so this
 		// covers only requests without it (a publication in a front-end GET). Block templates have no singular entry.
-		if ( false === has_action( 'save_post', [ $this, 'on_save_post' ] )
+		if ( ! self::save_handler_attached()
 			&& ! \PerfLocale\Translation\BlockTemplateSupport::is_template_type( (string) $post->post_type ) ) {
 			$this->clear_hreflang_for_post_and_siblings( (int) $post->ID );
 		}

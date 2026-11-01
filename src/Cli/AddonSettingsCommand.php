@@ -194,7 +194,20 @@ final class AddonSettingsCommand {
 
 			/** @var \PerfLocale\Settings $settings */
 			$settings = $plugin->get( 'settings' );
-			$settings->update( [ $key => $value ] );
+
+			// The settings screen's rule: a new agency URL must be https; the stored value stays, http or not.
+			if ( 'mt_agency_url' === $key && \PerfLocale\Util\OutboundUrl::refuses_new_plain_http( $value, $settings->get( 'mt_agency_url' ) ) ) {
+				\WP_CLI::error( 'mt_agency_url not saved: it must start with https:// (http:// only for a host added to the perflocale/mt/trusted_hosts filter). Run the command again with an https:// address.' );
+			}
+
+			if ( ! $settings->update( [ $key => $value ] ) && ! \PerfLocale\Settings::last_update_was_noop() ) {
+				\WP_CLI::error( self::refusal( $key ) );
+			}
+
+			// The same rule inside the settings lock: another save may have changed the stored URL since the check above.
+			if ( 'mt_agency_url' === $key && \PerfLocale\Util\OutboundUrl::refused_plain_http() ) {
+				\WP_CLI::error( 'mt_agency_url not saved: it must start with https:// (http:// only for a host added to the perflocale/mt/trusted_hosts filter). Run the command again with an https:// address.' );
+			}
 
 			$effective = $settings->get( $key );
 
@@ -213,7 +226,7 @@ final class AddonSettingsCommand {
 		$ok = AddonSettings::set( $addon_id, $key, $value );
 
 		if ( ! $ok ) {
-			\WP_CLI::error( "Could not save '{$addon_id}.{$key}'. The addon entry may exceed the 16 KiB per-addon cap; check the PHP error log under WP_DEBUG." );
+			\WP_CLI::error( self::addon_refusal( "{$addon_id}.{$key}" ) );
 		}
 
 		\WP_CLI::success( "Saved {$addon_id}.{$key}." );
@@ -363,5 +376,51 @@ final class AddonSettingsCommand {
 			return '';
 		}
 		return (string) $v;
+	}
+
+	/**
+	 * Why a global key's save stored nothing: the settings lock, or OptionWriter's reason for the perflocale_settings row.
+	 *
+	 * @param string $key Setting key.
+	 * @return string
+	 */
+	private static function refusal( string $key ): string {
+		$reason = \PerfLocale\Settings::last_update_was_busy() ? 'busy' : ( \PerfLocale\Database\OptionWriter::last_failure( 'perflocale_settings' )['reason'] ?? '' );
+
+		switch ( $reason ) {
+			case 'busy':
+				return "{$key} not saved: another settings save was running. Run the command again.";
+			case 'database':
+				return "{$key} not saved: the database refused to store the option perflocale_settings, so the value may be too long or hold characters it cannot store. Check the value, then run the command again. "
+					. ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? 'The database error is in the debug log.' : 'To log the database error, turn on WP_DEBUG_LOG and run the command again.' );
+			case 'changed':
+				return "{$key} not saved: another plugin or request kept changing the stored settings during this save. Run the command again.";
+			case 'unchanged':
+				return "{$key} not saved: a filter on the option perflocale_settings kept the stored value. Check the plugins that filter it, then run the command again.";
+		}
+
+		return "{$key} not saved; the stored settings are unchanged. Run the command again.";
+	}
+
+	/**
+	 * Why an add-on setting was not saved, from AddonSettings::last_failure().
+	 *
+	 * @param string $item "<addon id>.<key>".
+	 * @return string
+	 */
+	private static function addon_refusal( string $item ): string {
+		switch ( AddonSettings::last_failure() ) {
+			case 'busy':
+				return "Could not save '{$item}': another add-on settings save was running. Run the command again.";
+			case 'too_large':
+				return "Could not save '{$item}': the add-on's settings would be larger than the " . intdiv( AddonSettings::MAX_ADDON_BYTES, 1024 ) . ' KiB stored per add-on. Use a shorter value, then run the command again.';
+			case 'database':
+				return "Could not save '{$item}': the database refused to store the option perflocale_addon_settings, so the value may hold characters it cannot store. Check the value, then run the command again. "
+					. ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? 'The database error is in the debug log.' : 'To log the database error, turn on WP_DEBUG_LOG and run the command again.' );
+			case 'unchanged':
+				return "Could not save '{$item}': a filter on the option perflocale_addon_settings kept the stored value. Check the plugins that filter it, then run the command again.";
+		}
+
+		return "Could not save '{$item}'. Check the add-on id and key, then run the command again.";
 	}
 }

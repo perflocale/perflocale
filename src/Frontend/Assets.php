@@ -71,12 +71,7 @@ final class Assets {
 			return;
 		}
 
-		wp_enqueue_style(
-			'perflocale-frontend',
-			PERFLOCALE_URL . 'assets/css/frontend.css',
-			[],
-			PERFLOCALE_VERSION
-		);
+		VisitorAssets::enqueue_style();
 	}
 
 	/**

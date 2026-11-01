@@ -263,6 +263,47 @@ final class AddonsPage {
 	}
 
 	/**
+	 * The notice of an add-on settings save that stored nothing, by AddonSettings::last_failure(); also the Settings
+	 * screen's add-on subtabs.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string $reason 'busy', 'too_large', 'database', 'unchanged', or '' when unknown.
+	 * @param string $name   Add-on name.
+	 * @return string
+	 */
+	public static function save_failed_text( string $reason, string $name ): string {
+		switch ( $reason ) {
+			case 'busy':
+				/* translators: %s: add-on name */
+				return sprintf( __( 'Settings for %s not saved: another settings save was running at the same moment. Save again.', 'perflocale' ), $name );
+			case 'too_large':
+				/* translators: 1: add-on name, 2: a size, for example "16 KB" */
+				return sprintf( __( 'Settings for %1$s not saved: together they are larger than the %2$s one add-on may store. Shorten the longest values, then save again.', 'perflocale' ), $name, size_format( \PerfLocale\Addon\AddonSettings::MAX_ADDON_BYTES ) );
+			case 'database':
+				/* translators: %s: add-on name */
+				return sprintf( __( 'Settings for %s not saved: the database refused to store the option perflocale_addon_settings, so a value may hold characters it cannot store. Check the values you changed, then save again.', 'perflocale' ), $name ) . ' ' . self::debug_log_hint();
+			case 'unchanged':
+				/* translators: %s: add-on name */
+				return sprintf( __( 'Settings for %s not saved: a filter on the option perflocale_addon_settings kept the stored values. Check the plugins that filter it, then save again.', 'perflocale' ), $name );
+		}
+
+		/* translators: %s: add-on name */
+		return sprintf( __( 'Settings for %s not saved; the stored values are unchanged. Save again.', 'perflocale' ), $name );
+	}
+
+	/**
+	 * Where the database's own error is: the debug log, which only WP_DEBUG_LOG writes.
+	 *
+	 * @since 1.0.7.5
+	 */
+	public static function debug_log_hint(): string {
+		return defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG
+			? __( 'The database error is in the debug log.', 'perflocale' )
+			: __( 'To log the database error, turn on WP_DEBUG_LOG and save again.', 'perflocale' );
+	}
+
+	/**
 	 * Render the addons page.
 	 *
 	 * @return void
@@ -432,8 +473,8 @@ final class AddonsPage {
 				$flash_text = sprintf( __( 'Settings for %s saved.', 'perflocale' ), $flash_name );
 			} elseif ( $flash_msg === 'addon_save_failed' && $flash_addon !== '' ) {
 				$flash_name = $addons[ $flash_addon ]['name'] ?? $flash_addon;
-				/* translators: %s: addon display name */
-				$flash_text = sprintf( __( 'Could not save settings for %s. The values may exceed the per-addon size limit, or another save was in progress. Check the PHP error log under WP_DEBUG for the exact reason.', 'perflocale' ), $flash_name );
+				// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only flash param on a redirect.
+				$flash_text = self::save_failed_text( isset( $_GET['perflocale_reason'] ) ? sanitize_key( $_GET['perflocale_reason'] ) : '', (string) $flash_name );
 				$flash_kind = 'notice-error';
 			} elseif ( $flash_msg === 'addon_disabled' && $flash_addon !== '' ) {
 				$flash_name = $addons[ $flash_addon ]['name'] ?? $flash_addon;
@@ -738,7 +779,7 @@ final class AddonsPage {
 						</div>
 						<?php
 						// Built-in features have no registry instance but still toggle:
-						// AdminController's BUILTIN_FEATURE_TOGGLES maps the card to its Settings flag.
+						// AdminForms' BUILTIN_FEATURE_TOGGLES maps the card to its Settings flag.
 						$perflocale_card_toggleable = ( $addon_instance !== null || in_array( $addon_id, $builtin_feature_ids, true ) );
 						?>
 						<?php if ( $perflocale_card_toggleable && current_user_can( 'perflocale_manage_addons' ) ) : ?>

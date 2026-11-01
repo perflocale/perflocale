@@ -535,17 +535,7 @@ final class StringTranslation {
 
 				if ( is_string( $candidate ) && $candidate !== '' ) {
 					// The same filter as forms 0 and 1 in get_translation(), so listeners see every form.
-					if ( has_filter( 'perflocale/string/translate' ) ) {
-						$candidate = (string) apply_filters(
-							'perflocale/string/translate',
-							$candidate,
-							$original,
-							$domain,
-							$this->router->get_current_slug()
-						);
-					}
-
-					return $candidate;
+					return has_filter( 'perflocale/string/translate' ) ? \PerfLocale\Util\StringLookup::filtered( $candidate, $original, $domain, $this->router->get_current_slug() ) : $candidate;
 				}
 			}
 		}
@@ -594,26 +584,8 @@ final class StringTranslation {
 			return null;
 		}
 
-		// Hot path (hundreds of calls per page): apply the filter only when it has listeners.
-		if ( has_filter( 'perflocale/string/translate' ) ) {
-			/**
-			 * Filter a translated string before returning it.
-			 *
-			 * @param string $translated The translated text.
-			 * @param string $text The original text.
-			 * @param string $domain Text domain.
-			 * @param string $lang Current language slug.
-			 */
-			$translated = apply_filters(
-				'perflocale/string/translate',
-				$translated,
-				$text,
-				$domain,
-				$this->router->get_current_slug()
-			);
-		}
-
-		return $translated;
+		// Hot path (hundreds of calls per page): the filter only when it has listeners.
+		return has_filter( 'perflocale/string/translate' ) ? \PerfLocale\Util\StringLookup::filtered( $translated, $text, $domain, $this->router->get_current_slug() ) : $translated;
 	}
 
 	/**

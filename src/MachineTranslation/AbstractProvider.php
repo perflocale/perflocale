@@ -23,31 +23,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 abstract class AbstractProvider implements ProviderInterface {
 
 	/**
-	 * Public provider hosts that skip the SSRF lookup (gethostbyname() has no timeout and hangs on a broken resolver).
-	 *
-	 * @var array<int, string>
-	 */
-	private const TRUSTED_HOSTS = [
-		'translation.googleapis.com',
-		'api.deepl.com',
-		'api-free.deepl.com',
-		'api.cognitive.microsofttranslator.com',
-	];
-
-	/**
-	 * Provider id => the setting holding its credential, masked by exact value in error text.
-	 *
-	 * @var array<string, string>
-	 */
-	private const CREDENTIAL_SETTING = [
-		'deepl'           => 'mt_deepl_api_key',
-		'google'          => 'mt_google_api_key',
-		'microsoft'       => 'mt_microsoft_api_key',
-		'libretranslate'  => 'mt_libre_api_key',
-		'external_agency' => 'mt_agency_api_key',
-	];
-
-	/**
 	 * Plugin settings.
 	 *
 	 * @var Settings
@@ -110,13 +85,88 @@ abstract class AbstractProvider implements ProviderInterface {
 	 *   ProviderInterface: that would fatal third-party implementations, which ignore an extra argument.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
-		$results = [];
+		return $this->without_blank(
+			$texts,
+			function ( array $sent ) use ( $source_lang, $target_lang, $fast_fail, $format ): array {
+				$results = [];
 
-		foreach ( $texts as $text ) {
-			$results[] = $this->translate( $text, $source_lang, $target_lang, $fast_fail, $format );
+				foreach ( $sent as $i => $text ) {
+					try {
+						$results[] = $this->translate( $text, $source_lang, $target_lang, $fast_fail, $format );
+					} catch ( \RuntimeException $e ) {
+						throw ItemsFailedException::of( $e, $i, $i ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The provider's own exception, escaped where it was thrown.
+					}
+				}
+
+				return $results;
+			}
+		);
+	}
+
+	/**
+	 * Whether translate_batch() sends a list per request (false: one request per text).
+	 *
+	 * @since 1.0.7.5
+	 * @return bool
+	 */
+	public function batches_natively(): bool {
+		return ( new \ReflectionMethod( $this, 'translate_batch' ) )->getDeclaringClass()->getName() !== self::class;
+	}
+
+	/**
+	 * Send only the texts that are not whitespace; those come back unchanged and are not billed.
+	 *
+	 * @since 1.0.7.5
+	 * @param array<int, string> $texts Texts.
+	 * @param callable           $send  Translates a list of texts, answers in order.
+	 * @phpstan-param callable(array<int, string>): array<int, string> $send
+	 * @return array<int, string> Parallel to $texts.
+	 * @throws \RuntimeException When $send answers a different number of texts.
+	 * @throws ItemsFailedException With positions in $texts, when $send names failed texts.
+	 */
+	protected function without_blank( array $texts, callable $send ): array {
+		$texts = array_values( $texts );
+		$at    = [];
+
+		foreach ( $texts as $i => $text ) {
+			if ( '' !== trim( (string) $text ) ) {
+				$at[] = $i;
+			}
 		}
 
-		return $results;
+		if ( count( $at ) === count( $texts ) ) {
+			return $send( $texts );
+		}
+
+		if ( [] === $at ) {
+			return $texts;
+		}
+
+		try {
+			$out = array_values( $send( array_map( static fn( int $i ): string => (string) $texts[ $i ], $at ) ) );
+		} catch ( ItemsFailedException $e ) {
+			throw new ItemsFailedException( $e->failure, $at[ $e->first ] ?? $e->first, $at[ $e->last ] ?? $e->last ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The provider's own exception, escaped where it was thrown.
+		}
+
+		// Merged by position: a different count would shift every later answer.
+		if ( count( $out ) !== count( $at ) ) {
+			throw new \RuntimeException(
+				esc_html(
+					sprintf(
+						/* translators: 1: number of translations returned, 2: number sent */
+						__( 'Translation provider returned %1$d entries for a batch of %2$d; aborting to avoid overwriting source text with empty strings.', 'perflocale' ),
+						count( $out ),
+						count( $at )
+					)
+				)
+			);
+		}
+
+		foreach ( $at as $k => $i ) {
+			$texts[ $i ] = (string) $out[ $k ];
+		}
+
+		return $texts;
 	}
 
 	/**
@@ -247,10 +297,10 @@ abstract class AbstractProvider implements ProviderInterface {
 			$response = Helper::remote_request_pinned( $url, $call_args, $pinned_ip );
 
 			if ( is_wp_error( $response ) ) {
-				// A transport error message can carry the outgoing request (filters, custom transports, proxies) and ends up on
-				// the job row: masked like a response body.
-				$last_error     = $this->mask_error_text( $response->get_error_message() );
+				// Raw transport text can carry the request URL or headers: only its cURL error number is kept.
+				$last_error     = self::transport_error( $response->get_error_message() );
 				$failure_reason = 'transient';
+				$this->log_error( 1 === preg_match( '/cURL error (\d+)/', $response->get_error_message(), $m ) ? 'transport error (cURL error ' . (int) $m[1] . ')' : 'transport error', $failure_reason );
 
 				// The host may have moved: drop its cached DNS answers.
 				if ( '' !== $pinned_ip ) {
@@ -313,10 +363,8 @@ abstract class AbstractProvider implements ProviderInterface {
 				];
 			}
 
-			// Masked and truncated: error text reaches the client and the logs.
-			$error_body = mb_substr( $this->mask_configured_credential( wp_remote_retrieve_body( $response ) ), 0, 200 );
-			$error_body = self::mask_credentials( $error_body );
-			$last_error = sprintf( 'HTTP %d: %s', $code, $error_body );
+			// The body goes nowhere: a hostile endpoint can echo the sent text or secrets no mask knows.
+			$last_error = self::http_error( (int) $code );
 
 			// 401/403 trips the breaker on the first hit (retries cannot fix a bad key); 429 and 5xx use the sliding window.
 			if ( $code === 401 || $code === 403 ) {
@@ -328,6 +376,8 @@ abstract class AbstractProvider implements ProviderInterface {
 			} else {
 				$failure_reason = 'http_' . $code;
 			}
+
+			$this->log_error( 'HTTP ' . (int) $code, $failure_reason );
 
 			if ( $code >= 400 && $code < 500 && $code !== 429 ) {
 				// Client error: no retry.
@@ -366,6 +416,54 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
+	 * The shown text of a provider's HTTP error: its status and a fixed hint.
+	 *
+	 * @param int $code HTTP status.
+	 * @return string
+	 */
+	private static function http_error( int $code ): string {
+		$hint = match ( true ) {
+			401 === $code || 403 === $code => __( 'The provider refused the key or access: check the key under PerfLocale → Settings.', 'perflocale' ),
+			429 === $code => __( 'The provider is limiting requests: try again later.', 'perflocale' ),
+			$code >= 500 => __( 'The provider had a server error: try again later.', 'perflocale' ),
+			default => __( 'The provider refused this request.', 'perflocale' ),
+		};
+
+		/* translators: 1: HTTP status, 2: what happened and what to do */
+		return sprintf( __( 'HTTP %1$d. %2$s', 'perflocale' ), $code, $hint );
+	}
+
+	/**
+	 * The shown text of a transport error: its cURL error number, if any, and a fixed hint.
+	 *
+	 * @param string $raw Transport error message.
+	 * @return string
+	 */
+	private static function transport_error( string $raw ): string {
+		if ( 1 === preg_match( '/cURL error (\d+)/', $raw, $m ) ) {
+			/* translators: %d: cURL error number */
+			return sprintf( __( 'Could not reach the provider (cURL error %d). Check the network or try again later.', 'perflocale' ), (int) $m[1] );
+		}
+
+		return __( 'Could not reach the provider. Check the network or try again later.', 'perflocale' );
+	}
+
+	/**
+	 * A failed call to the PHP error log, only with WP_DEBUG_LOG on: its status and category, never the provider's text.
+	 *
+	 * @since 1.0.7.5
+	 * @param string $what     What failed, such as "HTTP 400".
+	 * @param string $category Failure category, such as "auth".
+	 * @return void
+	 */
+	protected function log_error( string $what, string $category ): void {
+		if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Opt-in diagnosis (WP_DEBUG_LOG).
+			error_log( sprintf( '[PerfLocale] %s %s: %s', $this->get_name(), $what, $category ) );
+		}
+	}
+
+	/**
 	 * No time left for a retry: stop the slice so the next one retries, unless this call (all attempts) had a long
 	 * window and failed on its own; then it fails, so a slow provider cannot loop.
 	 *
@@ -389,6 +487,23 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * @throws \RuntimeException If JSON is invalid.
 	 */
 	protected function parse_json_response( string $body ): array {
+		$data = $this->decode_json_response( $body );
+
+		$this->accept_response();
+
+		return $data;
+	}
+
+	/**
+	 * Decode a JSON body; a body that is not JSON counts as a failure. The caller settles success once the content is
+	 * usable ({@see accept_response()}, {@see reject_response()}).
+	 *
+	 * @since 1.0.7.5
+	 * @param string $body Raw response body.
+	 * @return array<int|string, mixed> Decoded JSON data.
+	 * @throws \RuntimeException If JSON is invalid.
+	 */
+	protected function decode_json_response( string $body ): array {
 		$data = json_decode( $body, true );
 
 		if ( json_last_error() !== JSON_ERROR_NONE ) {
@@ -413,8 +528,6 @@ abstract class AbstractProvider implements ProviderInterface {
 			);
 		}
 
-		$this->accept_response();
-
 		return $data;
 	}
 
@@ -433,6 +546,58 @@ abstract class AbstractProvider implements ProviderInterface {
 		$this->pending_success_key = '';
 
 		\PerfLocale\Concurrency\Breaker::record_success( $key );
+	}
+
+	/**
+	 * Whether every entry of an answer list is an array whose $key is a string.
+	 *
+	 * @since 1.0.7.5
+	 * @param array<int|string, mixed> $entries Answer entries.
+	 * @param string                   $key     Text key.
+	 * @return bool
+	 */
+	protected static function all_text( array $entries, string $key ): bool {
+		foreach ( $entries as $entry ) {
+			if ( null === self::text_at( $entry, $key ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * The string at a key path of a decoded answer; null when a step is missing or the value is not a string.
+	 *
+	 * @since 1.0.7.5
+	 * @param mixed      $data    Decoded answer.
+	 * @param int|string ...$path Keys, outermost first.
+	 * @return string|null
+	 */
+	protected static function text_at( mixed $data, int|string ...$path ): ?string {
+		foreach ( $path as $key ) {
+			if ( ! is_array( $data ) || ! array_key_exists( $key, $data ) ) {
+				return null;
+			}
+
+			$data = $data[ $key ];
+		}
+
+		return is_string( $data ) ? $data : null;
+	}
+
+	/**
+	 * Count the last 2xx answer as a breaker failure and throw: its content broke the provider's contract.
+	 *
+	 * @since 1.0.7.5
+	 * @param string $message Escaped message.
+	 * @return never
+	 * @throws \RuntimeException Always.
+	 */
+	protected function refuse_response( string $message ): never {
+		$this->reject_response( 'malformed' );
+
+		throw new \RuntimeException( $message ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Escaped by the caller.
 	}
 
 	/**
@@ -469,17 +634,7 @@ abstract class AbstractProvider implements ProviderInterface {
 
 		$host_lc = strtolower( $host );
 
-		/**
-		 * Filter the hosts that skip the SSRF address and DNS checks: the way to reach a provider on an internal network.
-		 *
-		 * A full exemption, IP literals included (add only hosts you control); localhost, 127.0.0.1, 0.0.0.0 and [::1]
-		 * only when listed exactly.
-		 *
-		 * @hook perflocale/mt/trusted_hosts
-		 * @param array<int, string> $hosts Lowercase trusted hostnames.
-		 */
-		$trusted = (array) apply_filters( 'perflocale/mt/trusted_hosts', self::TRUSTED_HOSTS );
-		$trusted = array_map( 'strtolower', array_filter( $trusted, 'is_string' ) );
+		$trusted = \PerfLocale\Util\OutboundUrl::mt_trusted_hosts();
 
 		// Loopback only as the URL's own listed host, never as an address another name resolves to.
 		if ( in_array( $host_lc, [ 'localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]' ], true ) && ( $resolved || ! in_array( $host_lc, $trusted, true ) ) ) {
@@ -669,53 +824,6 @@ abstract class AbstractProvider implements ProviderInterface {
 	 */
 	protected static function mask_credentials( string $body ): string {
 		return \PerfLocale\Util\SecretMasker::mask( $body );
-	}
-
-	/**
-	 * Error text with this provider's configured credential and credential-shaped runs masked.
-	 *
-	 * @param string $text Error text.
-	 * @return string
-	 */
-	private function mask_error_text( string $text ): string {
-		return self::mask_credentials( $this->mask_configured_credential( $text ) );
-	}
-
-	/**
-	 * Replace this provider's configured credential, as sent, trimmed or URL-encoded, with `[REDACTED]`.
-	 *
-	 * A key of 1-3 characters only as a whole token, so the words around it stay readable; a longer one anywhere.
-	 *
-	 * @param string $text Text.
-	 * @return string
-	 */
-	private function mask_configured_credential( string $text ): string {
-		$setting = self::CREDENTIAL_SETTING[ $this->get_id() ] ?? '';
-		$secret  = '' === $setting ? '' : $this->settings->get( $setting, '' );
-		$secret  = is_string( $secret ) ? $secret : '';
-		$trimmed = trim( $secret );
-
-		if ( '' === $trimmed ) {
-			return $text;
-		}
-
-		$short = mb_strlen( $trimmed ) <= 3;
-		$forms = array_unique( $short ? [ $trimmed, rawurlencode( $trimmed ) ] : [ $secret, $trimmed, rawurlencode( $trimmed ) ] );
-
-		// Longest first, so a form that contains another is replaced whole.
-		usort( $forms, static fn( string $a, string $b ): int => strlen( $b ) <=> strlen( $a ) );
-
-		if ( $short ) {
-			$quoted = array_map( static fn( string $f ): string => preg_quote( $f, '/' ), $forms );
-			$masked = preg_replace( '/(?<![\p{L}\p{N}_])(?:' . implode( '|', $quoted ) . ')(?![\p{L}\p{N}_])/u', '[REDACTED]', $text );
-
-			// Text that is not UTF-8 fails the match: masked everywhere instead.
-			if ( null !== $masked ) {
-				return $masked;
-			}
-		}
-
-		return str_replace( $forms, '[REDACTED]', $text );
 	}
 
 	/**

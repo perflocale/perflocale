@@ -3,7 +3,7 @@
  *
  * window.perflocaleBulkFetch( data, state ) posts `data` (a FormData) to
  * admin-ajax.php and resolves with the parsed JSON answer. When a tool answers
- * that imported data is still missing (Bootstrap::guard_bulk_tool(), code
+ * that imported data is still missing (BulkTools::guard_bulk_tool(), code
  * `perflocale_unimported_source`), it asks the operator once per click and
  * resends with `continue_unimported`, which the tool's follow-up requests keep
  * through `state.go`.

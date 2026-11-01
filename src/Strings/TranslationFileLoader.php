@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Strings;
 
 use PerfLocale\Router\LanguageRouter;
+use PerfLocale\Util\StringLookup;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -242,7 +243,9 @@ final class TranslationFileLoader {
 		$pick  = $forms[ $form_index - 1 ] ?? '';
 
 		// A missing or empty form falls back to form 1, as gettext does.
-		return ( is_string( $pick ) && $pick !== '' ) ? $pick : $forms[0];
+		$form = ( is_string( $pick ) && $pick !== '' ) ? $pick : $forms[0];
+
+		return has_filter( 'perflocale/string/translate' ) ? StringLookup::filtered( $form, $original, $domain, $this->router->get_current_slug() ) : $form;
 	}
 
 	/**
@@ -262,13 +265,17 @@ final class TranslationFileLoader {
 			return null;
 		}
 
-		return $this->translations[ self::map_key( $domain, $context, $text ) ] ?? null;
+		$translated = $this->translations[ self::map_key( $domain, $context, $text ) ] ?? null;
+
+		// As the database mode, per form (pick_plural_form() filters a NUL-joined plural's); hot path, so only with listeners.
+		return $translated !== null && has_filter( 'perflocale/string/translate' ) && ! str_contains( $translated, "\0" ) ? StringLookup::filtered( $translated, $text, $domain, $this->router->get_current_slug() ) : $translated;
 	}
 
 	/**
 	 * Build the translations-map key: the raw pre-image of StringRepository::compute_hash(), unhashed.
 	 *
-	 * Combined bundles persist these keys: a format change must bump TranslationFileGenerator::COMBINED_VERSION.
+	 * Combined bundles persist these keys: a format change bumps TranslationFileGenerator::COMBINED_VERSION and its
+	 * literal in load_translations().
 	 *
 	 * @param string $domain  Text domain.
 	 * @param string $context Gettext context ('' when none).
@@ -303,11 +310,12 @@ final class TranslationFileLoader {
 		// Built like the generator's file names, or free-text locales never match.
 		$suffix = '-' . sanitize_file_name( $locale ) . '.l10n.php';
 
-		// The generator's manifest (sole writer of the directory) replaces a glob; glob only when it is absent.
-		$manifest = get_option( TranslationFileGenerator::MANIFEST_OPTION );
+		// The generator's manifest (sole writer of the directory) replaces a glob; glob only when it is absent. The
+		// generator's MANIFEST_OPTION, COMBINED_PREFIX and COMBINED_VERSION are literals here: a page never loads it.
+		$manifest = get_option( 'perflocale_l10n_manifest' );
 
 		// Equals TranslationFileGenerator::combined_basename( $locale ).
-		$combined_name = TranslationFileGenerator::COMBINED_PREFIX . $suffix;
+		$combined_name = '_combined' . $suffix;
 
 		// Combined bundle: trusted only when the manifest lists it (written last, after a stale bundle is deleted).
 		// See docs-ai/11-code-rationale.md, "TranslationFileLoader: combined bundle trust".
@@ -327,7 +335,7 @@ final class TranslationFileLoader {
 
 				if (
 					is_array( $data )
-					&& TranslationFileGenerator::COMBINED_VERSION === (int) ( $data['v'] ?? 0 )
+					&& 1 === (int) ( $data['v'] ?? 0 )
 					&& isset( $data['map'] )
 					&& is_array( $data['map'] )
 					&& $data['map'] !== []

@@ -30,6 +30,7 @@ $perflocale_includes = [
 	// The whole closure of AddonUninstaller::purge(), dependencies first: a missing class throws inside SiteCleanup's
 	// catch and silently leaves addon data behind.
 	__DIR__ . '/src/Addon/AddonMigrationErrors.php',
+	__DIR__ . '/src/Addon/AddonId.php',
 	__DIR__ . '/src/Addon/AddonSchemaManager.php',
 	__DIR__ . '/src/Addon/AddonManifestWriter.php',
 	__DIR__ . '/src/Addon/PurgePlan.php',

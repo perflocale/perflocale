@@ -1241,11 +1241,20 @@ final class DataImporter {
 				$result['notes'][]       = self::kept_settings_notice( $kept );
 			}
 
+			// The settings screen's rule: a new agency URL must be https; this site's own value stays, http or not.
+			// Settings::update() judges it again against the row it locks.
+			$http_refused = array_key_exists( 'mt_agency_url', $incoming ) && \PerfLocale\Util\OutboundUrl::refuses_new_plain_http( $incoming['mt_agency_url'], $settings instanceof \PerfLocale\Settings ? $settings->get( 'mt_agency_url' ) : null );
+
+			if ( $http_refused ) {
+				unset( $incoming['mt_agency_url'] );
+			}
+
 			$saved = true;
 
 			if ( $incoming !== [] ) {
 				// False also for an unchanged save; only a held settings lock or a refused write leaves them unapplied.
-				$saved = $settings->update( $incoming ) || \PerfLocale\Settings::last_update_was_noop();
+				$saved        = $settings->update( $incoming ) || \PerfLocale\Settings::last_update_was_noop();
+				$http_refused = $http_refused || ( $saved && array_key_exists( 'mt_agency_url', $incoming ) && \PerfLocale\Util\OutboundUrl::refused_plain_http() );
 
 				// A provider address the update refused (multisite, key from outside the database, not a super admin) is named.
 				$refused = $saved ? \PerfLocale\Settings::last_update_refused_addresses() : [];
@@ -1256,10 +1265,16 @@ final class DataImporter {
 				}
 			}
 
+			if ( $http_refused ) {
+				/* translators: %s: filter name */
+				$result['notes'][] = sprintf( __( 'Not imported: Agency Endpoint URL, because it does not start with https:// (http:// only for a host added to the %s filter). This site keeps its own value; enter an https:// address under PerfLocale → Settings if needed.', 'perflocale' ), 'perflocale/mt/trusted_hosts' );
+			}
+
 			if ( $saved ) {
 				++$result['imported'];
 			} else {
-				$result['notes'][] = __( 'The settings from the file were not saved: another change to the settings was being saved at the same time. Import the file again to apply them.', 'perflocale' );
+				$cause             = \PerfLocale\Settings::last_update_was_busy() ? 'busy' : ( \PerfLocale\Database\OptionWriter::last_failure( 'perflocale_settings' )['reason'] ?? '' );
+				$result['notes'][] = self::refusal_note( 'settings', $cause );
 			}
 		}
 
@@ -1270,42 +1285,12 @@ final class DataImporter {
 			// phpcs:ignore Generic.Commenting.DocComment.MissingShort -- Inline type hint for static analysis; a short description would be noise.
 			/** @var array<string, mixed> $file_addons */
 			$file_addons = $data['addon_settings'];
-			$incoming    = DataExporter::redact_addon_credentials( $file_addons );
-			$current  = (array) get_option( 'perflocale_addon_settings', [] );
+			$cause       = self::write_addon_settings( DataExporter::redact_addon_credentials( $file_addons ) );
 
-			// Exports redact credential keys and password fields: writing an entry verbatim would blank the target's live
-			// credentials, so the ones it has are kept.
-			$merged = $current;
-
-			foreach ( $incoming as $addon => $entry ) {
-				if ( ! is_array( $entry ) ) {
-					$merged[ $addon ] = $entry;
-					continue;
-				}
-
-				$existing_entry = ( isset( $current[ $addon ] ) && is_array( $current[ $addon ] ) ) ? $current[ $addon ] : [];
-				$password_keys  = $existing_entry !== [] ? DataExporter::password_setting_keys( (string) $addon ) : [];
-
-				// The file's entry is authoritative except for the redacted credential keys restored below.
-				$base = $entry;
-
-				foreach ( $existing_entry as $key => $value ) {
-					if ( ! array_key_exists( $key, $entry ) && ( preg_match( DataExporter::CREDENTIAL_KEY_PATTERN, (string) $key ) || in_array( (string) $key, $password_keys, true ) ) ) {
-						$base[ $key ] = $value;
-					}
-				}
-
-				$merged[ $addon ] = $base;
-			}
-
-			// Also authoritative about which add-ons exist: drop those the file does not name.
-			$merged = array_intersect_key( $merged, $incoming );
-
-			// update_option() is false for an unchanged value and for a refused write; only the second fails.
-			if ( update_option( 'perflocale_addon_settings', $merged, false ) || $merged === $current ) {
+			if ( '' === $cause ) {
 				++$result['imported'];
 			} else {
-				$result['notes'][] = __( 'The add-on settings from the file were not saved: the database refused the change. Import the file again to apply them.', 'perflocale' );
+				$result['notes'][] = self::refusal_note( 'addon_settings', $cause );
 			}
 
 			\PerfLocale\Addon\AddonSettings::reset_static_caches();
@@ -1317,7 +1302,7 @@ final class DataImporter {
 			if ( \PerfLocale\Addon\AddonRegistry::set_disabled_list( $data['disabled_addons'] ) ) {
 				++$result['imported'];
 			} else {
-				$result['notes'][] = __( 'The add-on list from the file was not saved: the database refused the change. Import the file again to apply it.', 'perflocale' );
+				$result['notes'][] = self::refusal_note( 'disabled_addons', \PerfLocale\Addon\AddonDisabledList::last_failure() );
 			}
 		}
 
@@ -1359,18 +1344,19 @@ final class DataImporter {
 	 * @return array<int, string>
 	 */
 	public static function kept_setting_keys(): array {
-		$defaults = [ 'language_domains', 'mt_libre_url', 'mt_agency_url', 'delete_data_on_uninstall', 'background_paused' ];
+		$defaults = [ 'language_domains', 'mt_libre_url', 'mt_agency_url', 'mt_agency_batch', 'delete_data_on_uninstall', 'background_paused' ];
 
 		/**
 		 * Filters the settings a Replace import keeps as this site has them: those describing the site, not its data
 		 * (language domains, provider endpoints, uninstall choice, paused queue); the report names any the file had
-		 * differently. Return [] to apply them all; API keys are never in a file.
+		 * differently. Return [] to apply them all, except a new agency URL that is not https (or http:// to a
+		 * perflocale/mt/trusted_hosts host); API keys are never in a file.
 		 *
 		 * @hook  perflocale/import/keep_target_settings
 		 * @since 1.0.7.3
 		 *
 		 * @param array<int, string> $keys Setting keys. Default: language_domains,
-		 *                                 mt_libre_url, mt_agency_url,
+		 *                                 mt_libre_url, mt_agency_url, mt_agency_batch,
 		 *                                 delete_data_on_uninstall, background_paused.
 		 * @return array<int, string>
 		 */
@@ -1425,6 +1411,7 @@ final class DataImporter {
 			'language_domains'         => __( 'Per-language domain', 'perflocale' ),
 			'mt_libre_url'             => __( 'LibreTranslate URL', 'perflocale' ),
 			'mt_agency_url'            => __( 'Agency Endpoint URL', 'perflocale' ),
+			'mt_agency_batch'          => __( 'My endpoint accepts batches', 'perflocale' ),
 			'delete_data_on_uninstall' => __( 'Delete all plugin data when uninstalling', 'perflocale' ),
 			'background_paused'        => __( 'Pause queue', 'perflocale' ),
 		];
@@ -2417,10 +2404,122 @@ final class DataImporter {
 	}
 
 	/**
-	 * Log a database error's text when WP_DEBUG_LOG is on: it can carry prefixed table names and row values, so results
-	 * and job rows (shown to all Jobs users) say only that a database error happened.
+	 * Write the file's add-on settings over the committed row under the add-on settings lock, as AddonSettings writes.
 	 *
-	 * @param string $where What was running, for the log line.
+	 * @param array<string, mixed> $incoming The file's entries, credentials redacted.
+	 * @return string '' when stored or unchanged, else 'busy', 'database' or 'unchanged' (a filter kept the stored value).
+	 */
+	private static function write_addon_settings( array $incoming ): string {
+		$cause = \PerfLocale\Concurrency\Lock::with(
+			\PerfLocale\Addon\AddonSettings::LOCK_NAME,
+			\PerfLocale\Addon\AddonSettings::LOCK_TTL,
+			static function () use ( $incoming ): string {
+				// The committed row, not a cached copy or a stale `notoptions` entry.
+				wp_cache_delete( 'perflocale_addon_settings', 'options' );
+				\PerfLocale\Database\NotOptions::unlist( [ 'perflocale_addon_settings' ] );
+
+				$current = (array) get_option( 'perflocale_addon_settings', [] );
+				$merged  = self::merge_addon_settings( $current, $incoming );
+
+				// update_option() is false for an unchanged value too; only a changed one that did not commit is refused.
+				if ( update_option( 'perflocale_addon_settings', $merged, false ) || maybe_serialize( $merged ) === maybe_serialize( $current ) ) {
+					return '';
+				}
+
+				global $wpdb;
+
+				$error = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
+				self::log_db_error( 'saving the add-on settings', $error );
+
+				return '' !== $error ? 'database' : 'unchanged';
+			}
+		);
+
+		return is_string( $cause ) ? $cause : 'busy';
+	}
+
+	/**
+	 * The file's add-on settings over the stored ones: the file decides which add-ons exist and their values, except
+	 * the redacted credential keys, which keep this site's values (a verbatim write would blank them).
+	 *
+	 * @param array<array-key, mixed> $current  Stored entries.
+	 * @param array<string, mixed>    $incoming The file's entries.
+	 * @return array<array-key, mixed>
+	 */
+	private static function merge_addon_settings( array $current, array $incoming ): array {
+		$merged = $current;
+
+		foreach ( $incoming as $addon => $entry ) {
+			if ( ! is_array( $entry ) ) {
+				$merged[ $addon ] = $entry;
+				continue;
+			}
+
+			$existing_entry = ( isset( $current[ $addon ] ) && is_array( $current[ $addon ] ) ) ? $current[ $addon ] : [];
+			$password_keys  = $existing_entry !== [] ? DataExporter::password_setting_keys( (string) $addon ) : [];
+			$base           = $entry;
+
+			foreach ( $existing_entry as $key => $value ) {
+				if ( ! array_key_exists( $key, $entry ) && ( preg_match( DataExporter::CREDENTIAL_KEY_PATTERN, (string) $key ) || in_array( (string) $key, $password_keys, true ) ) ) {
+					$base[ $key ] = $value;
+				}
+			}
+
+			$merged[ $addon ] = $base;
+		}
+
+		return array_intersect_key( $merged, $incoming );
+	}
+
+	/**
+	 * The import note for settings, add-on settings or the add-on list the site did not store, naming the cause.
+	 *
+	 * @param string $part  'settings', 'addon_settings' or 'disabled_addons'.
+	 * @param string $cause 'busy', 'too_large', 'database', 'changed', 'unchanged', or '' when unknown.
+	 * @return string
+	 */
+	private static function refusal_note( string $part, string $cause ): string {
+		$settings = 'addon_settings' === $part;
+		$global   = 'settings' === $part;
+		$option   = $global ? 'perflocale_settings' : ( $settings ? 'perflocale_addon_settings' : 'perflocale_disabled_addons' );
+		$what     = $global ? __( 'The settings from the file were not saved', 'perflocale' ) : ( $settings ? __( 'The add-on settings from the file were not saved', 'perflocale' ) : __( 'The add-on list from the file was not saved', 'perflocale' ) );
+
+		switch ( $cause ) {
+			case 'busy':
+				$why = $global
+					? __( 'another change to the settings was being saved at the same time. Import the file again to apply them.', 'perflocale' )
+					: ( $settings
+						? __( 'another add-on settings save was running at the same moment. Import the file again to apply them.', 'perflocale' )
+						: __( 'another change to the add-on list was being saved at the same moment. Import the file again to apply it.', 'perflocale' ) );
+				break;
+			case 'changed':
+				$why = __( 'another plugin or request kept changing the stored settings during the import. Import the file again.', 'perflocale' );
+				break;
+			case 'too_large':
+				/* translators: %s: a size, for example "4 KB" */
+				$why = sprintf( __( 'the list is larger than the %s the site stores. Remove add-ons from the file\'s list, then import it again.', 'perflocale' ), size_format( \PerfLocale\Addon\AddonDisabledList::DISABLED_OPTION_MAX_BYTES ) );
+				break;
+			case 'database':
+				/* translators: %s: option name */
+				$why = sprintf( __( 'the database refused to store the option %s, so a value may hold characters it cannot store. Check them in the file, then import it again.', 'perflocale' ), $option )
+					. ' ' . ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? __( 'The database error is in the debug log.', 'perflocale' ) : __( 'To log the database error, turn on WP_DEBUG_LOG and import again.', 'perflocale' ) );
+				break;
+			case 'unchanged':
+				/* translators: %s: option name */
+				$why = sprintf( __( 'a filter on the option %s kept the stored values. Check the plugins that filter it, then import the file again.', 'perflocale' ), $option );
+				break;
+			default:
+				$why = __( 'the stored values are unchanged. Import the file again.', 'perflocale' );
+		}
+
+		return $what . ': ' . $why;
+	}
+
+	/**
+	 * Log a database error when WP_DEBUG_LOG is on: what was running and a fixed code, never the database's text, which
+	 * can quote imported values.
+	 *
+	 * @param string $where What was running (operation, table, export ID), for the log line.
 	 * @param string $error The database error.
 	 * @return void
 	 */
@@ -2430,7 +2529,42 @@ final class DataImporter {
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-		error_log( 'PerfLocale DataImporter: database error while ' . $where . ' - ' . $error );
+		error_log( 'PerfLocale DataImporter: database error while ' . $where . ' - code ' . self::db_error_code( $error ) );
+	}
+
+	/**
+	 * A fixed code for a database error, matched on the driver's own message only (MySQL's text, or the error_message
+	 * block of the SQLite integration's HTML): the rest quotes queries and values, so a value cannot pick the code.
+	 *
+	 * @param string $error The database error.
+	 * @return string
+	 */
+	private static function db_error_code( string $error ): string {
+		if ( 1 === preg_match( '~class="error_message"[^>]*>\s*(.*?)\s*</div>~s', $error, $m ) ) {
+			$error = (string) preg_replace( '~^Error occurred at line \d+ in Function .*?\. Error message was: ~s', '', $m[1] );
+		}
+
+		$error = (string) preg_replace( '~^SQLSTATE\[\w+\]: [^:]*: (?:\d+ )?~', '', ltrim( $error ) );
+		$codes = [
+			'duplicate_key'  => '~^(?:Duplicate entry|UNIQUE constraint failed)~',
+			'too_long'       => '~^Data too long~',
+			'bad_value'      => '~^(?:Incorrect \w+ value|Out of range value|Truncated incorrect)~',
+			'not_null'       => '~^(?:Column \'[^\']*\' cannot be null|Field \'[^\']*\' doesn\'t have a default|NOT NULL constraint failed)~',
+			'missing_table'  => '~^(?:Table \'[^\']*\' doesn\'t exist|no such table)~',
+			'missing_column' => '~^(?:Unknown column|no such column|table \S+ has no column named)~',
+			'deadlock'       => '~^Deadlock found~',
+			'lock_timeout'   => '~^(?:Lock wait timeout|database is locked)~',
+			'connection'     => '~^(?:MySQL server has gone away|Lost connection)~',
+			'syntax'         => '~^(?:You have an error in your SQL syntax|near "[^"]*": syntax error)~',
+		];
+
+		foreach ( $codes as $code => $pattern ) {
+			if ( 1 === preg_match( $pattern, $error ) ) {
+				return $code;
+			}
+		}
+
+		return 'other';
 	}
 
 	/**

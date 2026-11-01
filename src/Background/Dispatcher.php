@@ -36,7 +36,7 @@ final class Dispatcher {
 	 * @return string Hook name, e.g. 'perflocale_job_run_data_import'.
 	 */
 	public static function worker_hook( string $type ): string {
-		return 'perflocale_job_run_' . $type;
+		return WorkerRegistry::worker_hook( $type );
 	}
 
 	/**

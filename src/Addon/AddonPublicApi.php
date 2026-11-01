@@ -51,10 +51,10 @@ final class AddonPublicApi {
 	/**
 	 * AddonRegistry::public_api(): the kept object, or one created for a booted addon and kept for the request.
 	 *
-	 * @param string                        $id     Addon ID.
-	 * @param array<string, object|null>    $apis   The registry's objects handed out in this request (updated).
-	 * @param array<string, bool>           $booted The registry's booted ids.
-	 * @param array<string, AddonInterface> $addons The registry's addons.
+	 * @param string                             $id     Addon ID.
+	 * @param array<string, object|null>         $apis   The registry's objects handed out in this request (updated).
+	 * @param array<string, bool>                $booted The registry's booted ids.
+	 * @param array<string, AddonInterface|null> $addons The registry's addons (null: not loaded, never booted).
 	 * @return object|null
 	 */
 	public static function get( string $id, array &$apis, array $booted, array $addons ): ?object {

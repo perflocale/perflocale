@@ -9,6 +9,8 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Api;
 
+use PerfLocale\Background\Dispatcher;
+use PerfLocale\Background\Jobs\XliffImportJob;
 use PerfLocale\Xliff\XliffExporter;
 use PerfLocale\Xliff\XliffImporter;
 
@@ -224,7 +226,8 @@ final class XliffController extends RestController {
 	}
 
 	/**
-	 * Import translations from XLIFF.
+	 * Check an XLIFF document, then queue its import as a background job (202 with the job's id and links); a refused
+	 * document writes nothing (400, or 413 over a size limit).
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response|\WP_Error
@@ -232,21 +235,40 @@ final class XliffController extends RestController {
 	public function import( \WP_REST_Request $request ): \WP_REST_Response|\WP_Error {
 		$xliff_content = $request->get_param( 'xliff' );
 
-		if ( empty( $xliff_content ) ) {
+		if ( empty( $xliff_content ) || ! is_string( $xliff_content ) ) {
 			return $this->error( 'missing_xliff', __( 'XLIFF content is required.', 'perflocale' ) );
 		}
 
-		$importer = new XliffImporter();
-
 		try {
-			$result = $importer->import( $xliff_content, XliffImporter::WEB_MAX_UNITS );
-
-			return $this->success( $result );
+			( new XliffImporter() )->load( $xliff_content );
+			$file = XliffImportJob::stage( $xliff_content );
 		} catch ( \PerfLocale\Xliff\XliffFormatException $e ) {
-			// A document that can never parse is the client's error (400, or 413 over the size or unit limit), not a 500.
+			// A document that can never parse is the client's error (400, or 413 over a size or unit limit), not a 500.
 			return $this->error( 'invalid_xliff', $e->getMessage(), 413 === $e->getCode() ? 413 : 400 );
 		} catch ( \Throwable $e ) {
-			return $this->error( 'import_failed', $e->getMessage(), 500 );
+			// A full staging quota (429) or a busy staging lock (503) is retried later; anything else is the server's.
+			$status = in_array( $e->getCode(), [ 429, 503 ], true ) ? (int) $e->getCode() : 500;
+
+			return $this->error( 'import_failed', $e->getMessage(), $status );
 		}
+
+		$queued = Dispatcher::enqueue( new XliffImportJob(), [ 'file' => $file ] );
+		$job_id = is_string( $queued['job_id'] ?? null ) ? $queued['job_id'] : '';
+
+		if ( 'async' !== $queued['mode'] || '' === $job_id ) {
+			XliffImportJob::discard( $file );
+
+			return $this->error( 'import_failed', is_string( $queued['error'] ?? null ) ? $queued['error'] : '', 'denied' === $queued['mode'] ? 403 : 500 );
+		}
+
+		return $this->success(
+			[
+				'job_id'   => $job_id,
+				'status'   => 'queued',
+				'job_url'  => rest_url( 'perflocale/v1/jobs/' . $job_id ),
+				'jobs_url' => admin_url( 'admin.php?page=perflocale-jobs' ),
+			],
+			202
+		);
 	}
 }

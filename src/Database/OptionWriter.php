@@ -21,6 +21,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class OptionWriter {
 
 	/**
+	 * Why the last compare_and_set() of each option wrote nothing (see last_failure()); per option, so a listener's
+	 * write of another option does not replace the cause a caller reads after its own write.
+	 *
+	 * @var array<string, array{option: string, reason: string, error: string}>
+	 */
+	private static array $failures = [];
+
+	/**
 	 * Write $value to $option with a compare-and-set on the row, with update_option()'s filters, actions and cache updates in its order.
 	 *
 	 * The filters and the `update_option` action run on every call, so a caller retrying after a lost compare-and-set runs them again.
@@ -42,6 +50,8 @@ final class OptionWriter {
 			return null;
 		}
 
+		unset( self::$failures[ $option ] );
+
 		$value = sanitize_option( $option, $value );
 		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound, WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- core's own filter for this option.
 		$value = apply_filters( "pre_update_option_{$option}", $value, $old_value, $option );
@@ -49,6 +59,12 @@ final class OptionWriter {
 		$value = apply_filters( 'pre_update_option', $value, $option, $old_value );
 
 		if ( $value === $old_value || maybe_serialize( $value ) === maybe_serialize( $old_value ) ) {
+			self::$failures[ $option ] = [
+				'option' => $option,
+				'reason' => 'unchanged',
+				'error'  => '',
+			];
+
 			return false;
 		}
 
@@ -71,6 +87,8 @@ final class OptionWriter {
 		}
 
 		if ( 1 !== $affected ) {
+			self::failed( $option, $affected );
+
 			return null;
 		}
 
@@ -133,6 +151,7 @@ final class OptionWriter {
 		}
 
 		if ( 1 !== $inserted ) {
+			self::failed( $option, $inserted );
 			wp_cache_delete( $option, 'options' );
 
 			return null;
@@ -154,6 +173,40 @@ final class OptionWriter {
 		do_action( 'added_option', $option, $value );
 
 		return true;
+	}
+
+	/**
+	 * Why the last compare_and_set() of $option wrote nothing; null after a write. Reasons: 'unchanged' (the filtered
+	 * value is the stored one), 'changed' (the row no longer held the expected bytes), 'database' (the query failed).
+	 *
+	 * @param string $option Option name.
+	 * @return array{option: string, reason: string, error: string}|null The error is the database's text, for logs only.
+	 */
+	public static function last_failure( string $option ): ?array {
+		return self::$failures[ $option ] ?? null;
+	}
+
+	/**
+	 * Record a write that changed no row; a database error goes to the debug log (it can name tables and values).
+	 *
+	 * @param string $option Option name.
+	 * @param mixed  $result The query's result.
+	 * @return void
+	 */
+	private static function failed( string $option, mixed $result ): void {
+		global $wpdb;
+
+		$error                     = false === $result && $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
+		self::$failures[ $option ] = [
+			'option' => $option,
+			'reason' => false === $result ? 'database' : 'changed',
+			'error'  => $error,
+		];
+
+		if ( '' !== $error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
+			error_log( '[PerfLocale] option ' . $option . ' not written: database error - ' . $error );
+		}
 	}
 
 	/**

@@ -20,6 +20,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class LocaleDateFormat {
 
+	/**
+	 * True while FormatLocale reads the site option for another language: no override then.
+	 *
+	 * @var bool
+	 */
+	public static bool $raw = false;
+
 	private readonly LanguageRouter $router;
 
 	/**
@@ -70,7 +77,7 @@ final class LocaleDateFormat {
 	 * @return mixed
 	 */
 	public function filter_date_format( $value ) {
-		$override = $this->resolve()['date'] ?? '';
+		$override = self::$raw ? '' : $this->resolve()['date'];
 		return $override !== '' ? $override : $value;
 	}
 
@@ -79,7 +86,7 @@ final class LocaleDateFormat {
 	 * @return mixed
 	 */
 	public function filter_time_format( $value ) {
-		$override = $this->resolve()['time'] ?? '';
+		$override = self::$raw ? '' : $this->resolve()['time'];
 		return $override !== '' ? $override : $value;
 	}
 

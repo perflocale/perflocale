@@ -120,6 +120,7 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 * @return bool
 	 */
 	public function answer_object_permission( bool $can, string $action, int $post_id, string $post_type ): bool {
+		// A true $can returns first with no other work.
 		if ( $can || 'wpforms' !== $post_type ) {
 			return $can;
 		}

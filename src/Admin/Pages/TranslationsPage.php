@@ -44,6 +44,13 @@ final class TranslationsPage {
 	private bool $count_hidden = false;
 
 	/**
+	 * View checks run so far: reads taken before one are not used after it (its host code may have changed them).
+	 *
+	 * @var int
+	 */
+	private int $view_checks = 0;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings $settings Plugin settings instance.
@@ -274,7 +281,7 @@ final class TranslationsPage {
 				if ( $mt_first_warning ) {
 					delete_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id() );
 				}
-				$notice_class = ( $bulk_failed > 0 || $bulk_no_access > 0 || $bulk_kept > 0 ) ? 'notice-warning' : 'notice-success';
+				$notice_class = ( $bulk_failed > 0 || $bulk_no_access > 0 || $bulk_kept > 0 || $mt_first_warning ) ? 'notice-warning' : 'notice-success';
 				?>
 				<div class="notice <?php echo esc_attr( $notice_class ); ?> is-dismissible"><p>
 				<?php
@@ -305,9 +312,9 @@ final class TranslationsPage {
 							absint( $bulk_kept )
 						)
 					);
-					if ( $mt_first_warning ) {
-						echo ' <strong>' . esc_html__( 'First warning:', 'perflocale' ) . '</strong> ' . esc_html( (string) $mt_first_warning );
-					}
+				}
+				if ( $mt_first_warning ) {
+					echo ( $bulk_kept > 0 ? ' ' : '<br>' ) . '<strong>' . esc_html__( 'First warning:', 'perflocale' ) . '</strong> ' . esc_html( (string) $mt_first_warning );
 				}
 				?>
 				</p></div>
@@ -1079,6 +1086,7 @@ final class TranslationsPage {
 		global $wpdb;
 
 		$where = '';
+		$ahead = null;
 
 		foreach ( $post_types as $post_type ) {
 			$type_object = get_post_type_object( (string) $post_type );
@@ -1087,7 +1095,8 @@ final class TranslationsPage {
 				continue;
 			}
 
-			[ $viewable, $max, $ids ] = $this->non_mapped_view_set( (string) $post_type );
+			$ahead                  ??= $this->view_sets_ahead( $post_types );
+			[ $viewable, $max, $ids ] = $this->non_mapped_view_set( (string) $post_type, $ahead );
 
 			if ( $viewable && [] === $ids ) {
 				$where .= (string) $wpdb->prepare( ' AND %i.post_type <> %s', $wpdb->posts, (string) $post_type );
@@ -1127,22 +1136,25 @@ final class TranslationsPage {
 	 * The user's view of one type, kept 600 s: [ true, max, viewable ] or [ false, max, others ], stamped with the
 	 * user's caps and the type's rows; with a persistent cache prefixed `<last_changed>:<expiry>:` to skip the rows stamp.
 	 *
-	 * @param string $post_type Post type registered without map_meta_cap.
+	 * @param string               $post_type Post type registered without map_meta_cap.
+	 * @param array<string, mixed> $ahead     From view_sets_ahead(); its reads count only while no view check ran since.
+	 * @phpstan-param array{checks?: int, types?: array<string, array<string, mixed>>} $ahead
 	 * @return array{0: bool, 1: int, 2: array<int, int>} Ids newest first; max is the highest id the check read.
 	 */
-	private function non_mapped_view_set( string $post_type ): array {
+	private function non_mapped_view_set( string $post_type, array $ahead = [] ): array {
 		$user   = wp_get_current_user();
 		$ext    = wp_using_ext_object_cache();
 		$cache  = Plugin::get_instance()->cache();
 		$name   = $cache->derive_transient_key( 'translations_readable_' . (int) $user->ID . '_' . $post_type, 'perflocale' );
 		$sign   = [ get_current_blog_id(), (int) $user->ID, $user->allcaps, $post_type ];
-		$stored = $ext ? wp_cache_get( $name, 'perflocale' ) : get_transient( $name );
+		$read   = ( $ahead['checks'] ?? null ) === $this->view_checks && is_array( $ahead['types'][ $post_type ] ?? null ) ? $ahead['types'][ $post_type ] : [];
+		$stored = array_key_exists( 'stored', $read ) ? $read['stored'] : ( $ext ? wp_cache_get( $name, 'perflocale' ) : get_transient( $name ) );
 		$stored = is_string( $stored ) ? $stored : '';
 		$fast   = '';
 		$expiry = 0;
 
 		if ( $ext ) {
-			$fast                      = md5( (string) wp_json_encode( [ ...$sign, wp_cache_get_last_changed( 'posts' ) ] ) );
+			$fast                      = md5( (string) wp_json_encode( [ ...$sign, $read['last'] ?? wp_cache_get_last_changed( 'posts' ) ] ) );
 			[ $was, $expiry, $stored ] = array_pad( explode( ':', $stored, 3 ), 3, '' );
 			$expiry                    = (int) $expiry > time() ? (int) $expiry : 0;
 			$stored                    = $expiry > 0 ? $stored : '';
@@ -1153,7 +1165,7 @@ final class TranslationsPage {
 			}
 		}
 
-		$rows = $this->non_mapped_rows_stamp( $post_type );
+		$rows = array_key_exists( 'rows', $read ) ? $read['rows'] : $this->non_mapped_rows_stamp( $post_type );
 
 		if ( null === $rows ) {
 			return $this->check_non_mapped_ids( $post_type );
@@ -1178,6 +1190,80 @@ final class TranslationsPage {
 		}
 
 		return $set;
+	}
+
+	/**
+	 * One read for all non-mapped types of the list (two or more): their stored sets, or their transients primed,
+	 * and one rows-stamp query for the types without a current set.
+	 *
+	 * @param array<int, string> $post_types Post types the list queries.
+	 * @return array{checks: int, types: array<string, array<string, mixed>>}
+	 */
+	private function view_sets_ahead( array $post_types ): array {
+		$types = [];
+
+		foreach ( $post_types as $post_type ) {
+			$type_object = get_post_type_object( (string) $post_type );
+
+			if ( $type_object && ! $type_object->map_meta_cap ) {
+				$types[ (string) $post_type ] = (string) $post_type;
+			}
+		}
+
+		$ahead = [
+			'checks' => $this->view_checks,
+			'types'  => [],
+		];
+
+		if ( count( $types ) < 2 ) {
+			return $ahead;
+		}
+
+		$names = array_map( fn( string $type ): string => $this->view_set_name( $type ), $types );
+
+		if ( ! wp_using_ext_object_cache() ) {
+			wp_prime_option_caches( array_merge( ...array_map( static fn( string $name ): array => [ '_transient_' . $name, '_transient_timeout_' . $name ], array_values( $names ) ) ) );
+			$pending = array_values( $types );
+		} else {
+			$user    = wp_get_current_user();
+			$stored  = wp_cache_get_multiple( array_values( $names ), 'perflocale' );
+			$last    = wp_cache_get_last_changed( 'posts' );
+			$pending = [];
+
+			foreach ( $types as $type ) {
+				$value                   = $stored[ $names[ $type ] ] ?? false;
+				$ahead['types'][ $type ] = [
+					'stored' => $value,
+					'last'   => $last,
+				];
+				[ $was, $expiry ]        = array_pad( explode( ':', is_string( $value ) ? $value : '', 3 ), 2, '' );
+
+				// Likely current (non_mapped_view_set() decides): no stamp. A wrong guess costs its own stamp query.
+				if ( md5( (string) wp_json_encode( [ get_current_blog_id(), (int) $user->ID, $user->allcaps, $type, $last ] ) ) !== $was || (int) $expiry <= time() ) {
+					$pending[] = $type;
+				}
+			}
+		}
+
+		$stamps = count( $pending ) > 1 ? $this->non_mapped_rows_stamps( $pending ) : null;
+
+		foreach ( $pending as $i => $type ) {
+			if ( isset( $stamps[ $i ] ) ) {
+				$ahead['types'][ $type ]['rows'] = $stamps[ $i ];
+			}
+		}
+
+		return $ahead;
+	}
+
+	/**
+	 * The current user's view set key for one type.
+	 *
+	 * @param string $post_type Post type.
+	 * @return string
+	 */
+	private function view_set_name( string $post_type ): string {
+		return Plugin::get_instance()->cache()->derive_transient_key( 'translations_readable_' . (int) wp_get_current_user()->ID . '_' . $post_type, 'perflocale' );
 	}
 
 	/**
@@ -1296,6 +1382,8 @@ final class TranslationsPage {
 			}
 		}
 
+		++$this->view_checks;
+
 		foreach ( array_chunk( $live, 100 ) as $chunk ) {
 			_prime_post_caches( $chunk, false, false );
 
@@ -1337,6 +1425,55 @@ final class TranslationsPage {
 		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT post_status, COUNT(*) AS n, SUM(ID) AS ids, SUM(post_author) AS authors, MAX(post_modified_gmt) AS modified FROM %i WHERE post_type = %s AND post_status NOT IN ('trash', 'auto-draft') GROUP BY post_status ORDER BY post_status", $wpdb->posts, $post_type ), ARRAY_A );
 
 		return is_array( $rows ) && '' === $wpdb->last_error ? $rows : null;
+	}
+
+	/**
+	 * The rows stamps of several types in one query, by position in $post_types; null when the query fails
+	 * or returns a row it did not ask for. CASE matches as the single query's `=` does (same collation).
+	 *
+	 * @param array<int, string> $post_types Distinct post types.
+	 * @return array<int, array<int, array<mixed>>>|null
+	 */
+	private function non_mapped_rows_stamps( array $post_types ): ?array {
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		$when = [];
+		$args = [];
+
+		foreach ( array_values( $post_types ) as $i => $post_type ) {
+			$when[] = 'WHEN %s THEN %d';
+			array_push( $args, $post_type, $i );
+		}
+
+		$in = implode( ',', array_fill( 0, count( $post_types ), '%s' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- generated placeholder lists bound to $args; validates the stored lists on each view.
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT CASE post_type ' . implode( ' ', $when ) . " END AS pfl_type, post_status, COUNT(*) AS n, SUM(ID) AS ids, SUM(post_author) AS authors, MAX(post_modified_gmt) AS modified FROM %i WHERE post_type IN ({$in}) AND post_status NOT IN ('trash', 'auto-draft') GROUP BY pfl_type, post_status ORDER BY pfl_type, post_status", ...[ ...$args, $wpdb->posts, ...array_values( $post_types ) ] ), ARRAY_A );
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( ! is_array( $rows ) || '' !== $wpdb->last_error ) {
+			return null;
+		}
+
+		$out = array_fill( 0, count( $post_types ), [] );
+
+		foreach ( $rows as $row ) {
+			$tag = $row['pfl_type'] ?? null;
+
+			if ( ! is_numeric( $tag ) || ! isset( $out[ (int) $tag ] ) || (string) (int) $tag !== (string) $tag ) {
+				return null;
+			}
+
+			unset( $row['pfl_type'] );
+			$out[ (int) $tag ][] = $row;
+		}
+
+		return $out;
 	}
 
 	/**

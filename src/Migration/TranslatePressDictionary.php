@@ -11,6 +11,7 @@ namespace PerfLocale\Migration;
 
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Enum\SourceType;
+use PerfLocale\Frontend\OptionStrings;
 use PerfLocale\Translation\PostTranslationManager;
 use PerfLocale\Translation\TermTranslationManager;
 
@@ -55,6 +56,17 @@ final class TranslatePressDictionary {
 	];
 
 	/**
+	 * Writes that failed this run: how many, the first items named (e.g. "Site Title (fi)"), the last database error.
+	 *
+	 * @var array{count: int, items: list<string>, db_error: string}
+	 */
+	private array $failed = [
+		'count'    => 0,
+		'items'    => [],
+		'db_error' => '',
+	];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param \wpdb         $wpdb       Database.
@@ -87,6 +99,26 @@ final class TranslatePressDictionary {
 	 */
 	public function written(): array {
 		return $this->written;
+	}
+
+	/**
+	 * Writes that failed this run ({@see TranslatePressImporter::report_write_failures()}).
+	 *
+	 * @return array{count: int, items: list<string>, db_error: string}
+	 */
+	public function failed(): array {
+		return $this->failed;
+	}
+
+	/**
+	 * Record a failed write.
+	 *
+	 * @param string $db_error The write's last_error: the first argument, so it is read before the item's name is built.
+	 * @param string $item     The item, e.g. "Site Title (fi)".
+	 * @return void
+	 */
+	private function write_failed( string $db_error, string $item ): void {
+		TranslatePressImporter::add_failure( $this->failed, $item, $db_error );
 	}
 
 	/**
@@ -479,6 +511,7 @@ final class TranslatePressDictionary {
 			}
 
 			$new_ids = [];
+			$copied  = true;
 
 			foreach ( $items as $item ) {
 				$object_id = (int) $item->object_id;
@@ -520,13 +553,32 @@ final class TranslatePressDictionary {
 					)
 				);
 
-				if ( ! is_wp_error( $new_item ) ) {
-					$new_ids[ (int) $item->ID ] = (int) $new_item;
+				if ( is_wp_error( $new_item ) || (int) $new_item <= 0 ) {
+					$copied = false;
+					break;
 				}
+
+				$new_ids[ (int) $item->ID ] = (int) $new_item;
 			}
 
-			update_term_meta( (int) $copy_id, '_perflocale_language', $target_slug );
-			update_term_meta( $menu_id, '_perflocale_menu_' . $target_slug, (int) $copy_id );
+			$copied = $copied
+				&& self::meta_saved( update_term_meta( (int) $copy_id, '_perflocale_language', $target_slug ) )
+				&& self::meta_saved( update_term_meta( $menu_id, '_perflocale_menu_' . $target_slug, (int) $copy_id ) );
+
+			// A linked copy is never copied again, so a part copy is deleted and the next run copies the menu whole.
+			if ( ! $copied ) {
+				$this->write_failed(
+					$this->wpdb->last_error,
+					sprintf(
+						/* translators: 1: menu name, 2: language slug */
+						__( 'menu "%1$s" (%2$s)', 'perflocale' ),
+						$menu->name,
+						$target_slug
+					)
+				);
+				wp_delete_nav_menu( (int) $copy_id );
+				continue;
+			}
 
 			++$created;
 			++$this->written['menus'];
@@ -536,24 +588,38 @@ final class TranslatePressDictionary {
 	}
 
 	/**
+	 * Whether update_term_meta() wrote: false is a failure here, as every value written is new.
+	 *
+	 * @param mixed $result update_term_meta() result.
+	 * @return bool
+	 */
+	private static function meta_saved( mixed $result ): bool {
+		return false !== $result && ! is_wp_error( $result );
+	}
+
+	/**
 	 * Import the site title and tagline translations.
 	 *
-	 * An option that already has a translation in the language keeps it.
+	 * An option that already has a translation in the language keeps it; a failed write is recorded.
 	 *
 	 * @param string $table       Dictionary table.
 	 * @param int    $language_id Target PerfLocale language ID.
+	 * @param string $slug        Its language slug, for a failed item's name.
 	 * @return int Translations stored.
 	 * @throws TranslatePressSourceReadException When a dictionary read fails.
 	 */
-	public function import_option_strings( string $table, int $language_id ): int {
+	public function import_option_strings( string $table, int $language_id, string $slug ): int {
 		$stored = 0;
 
 		foreach ( ImportedOptionStrings::sources() as $option => $raw ) {
 			$translated = $this->translate( $table, $raw );
+			$saved      = $translated !== null ? ImportedOptionStrings::save( $option, $raw, $language_id, $translated, SourceType::ImportedTrp ) : false;
 
-			if ( $translated !== null && ImportedOptionStrings::save( $option, $raw, $language_id, $translated, SourceType::ImportedTrp ) ) {
+			if ( true === $saved ) {
 				++$stored;
 				++$this->written['strings'];
+			} elseif ( null === $saved ) {
+				$this->write_failed( $this->wpdb->last_error, sprintf( '%s (%s)', OptionStrings::context_label( $option, OptionStrings::DOMAIN ), $slug ) );
 			}
 		}
 

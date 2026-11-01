@@ -87,15 +87,15 @@ final class GoogleProvider extends AbstractProvider {
 			$fast_fail
 		);
 
-		$data = $this->parse_json_response( $response['body'] );
+		$data = $this->decode_json_response( is_string( $response['body'] ) ? $response['body'] : '' );
 
-		if ( ! isset( $data['data']['translations'][0]['translatedText'] ) ) {
-			throw new \RuntimeException(
-				esc_html__( 'Google Translate returned an unexpected response.', 'perflocale' )
-			);
+		$translated = self::text_at( $data, 'data', 'translations', 0, 'translatedText' );
+
+		if ( null === $translated ) {
+			$this->refuse_response( esc_html__( 'Google Translate returned an unexpected response.', 'perflocale' ) );
 		}
 
-		$translated = $data['data']['translations'][0]['translatedText'];
+		$this->accept_response();
 
 		$this->track_usage( $text );
 
@@ -112,6 +112,21 @@ final class GoogleProvider extends AbstractProvider {
 	 * @throws \RuntimeException When Google Translate batch returns an unexpected response or all retries fail.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
+		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ) );
+	}
+
+	/**
+	 * One request for a list of texts that are not whitespace.
+	 *
+	 * @param array<int, string> $texts       Texts.
+	 * @param string             $source_lang Source language.
+	 * @param string             $target_lang Target language.
+	 * @param bool               $fast_fail   Fewer retries, shorter timeout.
+	 * @param string             $format      'html' or 'text'.
+	 * @return array<int, string>
+	 * @throws \RuntimeException When the request or its answer fails.
+	 */
+	private function send_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail, string $format ): array {
 		if ( empty( $texts ) ) {
 			return [];
 		}
@@ -152,18 +167,16 @@ final class GoogleProvider extends AbstractProvider {
 			$fast_fail
 		);
 
-		$data = $this->parse_json_response( $response['body'] );
+		$data = $this->decode_json_response( is_string( $response['body'] ) ? $response['body'] : '' );
 
-		if ( ! isset( $data['data']['translations'] ) || ! is_array( $data['data']['translations'] ) ) {
-			throw new \RuntimeException(
-				esc_html__( 'Google Translate returned an unexpected batch response.', 'perflocale' )
-			);
+		if ( ! isset( $data['data']['translations'] ) || ! is_array( $data['data']['translations'] ) || ! self::all_text( $data['data']['translations'], 'translatedText' ) ) {
+			$this->refuse_response( esc_html__( 'Google Translate returned an unexpected batch response.', 'perflocale' ) );
 		}
 
 		// One translation per text, in order: mapped by index, a count mismatch shifts every later translation.
 		// Checked here too because a third party may call this public class directly.
 		if ( count( $data['data']['translations'] ) !== count( $filtered ) ) {
-			throw new \RuntimeException(
+			$this->refuse_response(
 				esc_html(
 					sprintf(
 						/* translators: 1: number of translations returned, 2: number of texts sent */
@@ -174,6 +187,8 @@ final class GoogleProvider extends AbstractProvider {
 				)
 			);
 		}
+
+		$this->accept_response();
 
 		$results = [];
 

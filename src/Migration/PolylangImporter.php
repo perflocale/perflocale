@@ -288,7 +288,7 @@ final class PolylangImporter {
 		$settings        = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 		$result['menus'] = $site_data->import_menus( $result['notices'] );
 		$this->beat( 'site', 1, 4 );
-		$result['strings'] = $site_data->import_strings( $result['notices'] );
+		$this->import_site_strings( $site_data, $result );
 		$this->beat( 'site', 2, 4 );
 
 		$site_data->import_translatable_types( $settings, $result['errors'], $result['notices'] );
@@ -738,6 +738,42 @@ final class PolylangImporter {
 				__( 'Some %s term data could not be read because of a database error and was not imported. Re-run the import.', 'perflocale' ),
 				'Polylang'
 			);
+	}
+
+	/**
+	 * Import Polylang's string translations into the result; a failed read or write leaves the run incomplete.
+	 *
+	 * @param PolylangSiteData     $site_data Site data reader.
+	 * @param array<string, mixed> $result    Import result (strings, notices).
+	 * @phpstan-param ImportResult $result
+	 * @return void
+	 */
+	private function import_site_strings( PolylangSiteData $site_data, array &$result ): void {
+		$failed   = [];
+		$db_error = '';
+		$stored   = $site_data->import_strings( $result['notices'], $failed, $db_error );
+
+		if ( null === $stored ) {
+			$this->incomplete = true;
+			self::log_db_error( 'reading string translations', $this->wpdb->last_error );
+			$this->read_errors[] = __( 'The Polylang string translations could not be read because of a database error and were not imported. Re-run the import.', 'perflocale' );
+			return;
+		}
+
+		$result['strings'] = $stored;
+
+		if ( $failed === [] ) {
+			return;
+		}
+
+		$this->incomplete = true;
+		self::log_db_error( 'saving string translations', $db_error );
+		$result['errors'][] = sprintf(
+			/* translators: 1: number of string translations, 2: comma-separated items, e.g. "Site Title (fi)" */
+			_n( '%1$d Polylang string translation could not be saved because of a database error: %2$s. Re-run the import.', '%1$d Polylang string translations could not be saved because of a database error: %2$s. Re-run the import.', count( $failed ), 'perflocale' ),
+			count( $failed ),
+			implode( ', ', array_slice( $failed, 0, self::SKIPPED_EXAMPLES ) )
+		);
 	}
 
 	/**
@@ -2065,7 +2101,7 @@ final class PolylangImporter {
 	 * Objects Polylang has in PerfLocale's default language that PerfLocale has in another language.
 	 *
 	 * A lone link no import wrote takes the default language (listed); any other is listed as
-	 * language_differs and kept under both policies. One keyset query per page.
+	 * language_differs and kept under both policies. One keyset query per page. Gone objects are counted after.
 	 *
 	 * @param object     $lang_term       Row of the language taxonomy (term_taxonomy_id).
 	 * @param ObjectType $type            Post or Term.
@@ -2133,7 +2169,59 @@ final class PolylangImporter {
 			$this->beat();
 		}
 
+		$this->count_missing_default_objects( $tt_id, $type, $slug, $batch_size );
+
 		return $imported;
+	}
+
+	/**
+	 * Count the objects Polylang lists in the default language that no longer exist, page by page.
+	 *
+	 * They hold no link, so the pass above never reads them; an existing one without a link needs none.
+	 *
+	 * @param int        $tt_id      The language's term_taxonomy_id.
+	 * @param ObjectType $type       Post or Term.
+	 * @param string     $slug       Polylang language slug.
+	 * @param int        $batch_size Page size.
+	 * @return void
+	 */
+	private function count_missing_default_objects( int $tt_id, ObjectType $type, string $slug, int $batch_size ): void {
+		$last = 0;
+		$full = true;
+
+		while ( $full ) {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Keyset page of one language's related ids with no object row; tables bound with %i.
+			$object_ids = ObjectType::Post === $type
+				? $this->wpdb->get_col( $this->wpdb->prepare( 'SELECT r.object_id FROM %i r LEFT JOIN %i o ON o.ID = r.object_id WHERE r.term_taxonomy_id = %d AND r.object_id > %d AND o.ID IS NULL ORDER BY r.object_id ASC LIMIT %d', $this->wpdb->term_relationships, $this->wpdb->posts, $tt_id, $last, $batch_size ) )
+				: $this->wpdb->get_col( $this->wpdb->prepare( 'SELECT r.object_id FROM %i r LEFT JOIN %i o ON o.term_id = r.object_id WHERE r.term_taxonomy_id = %d AND r.object_id > %d AND o.term_id IS NULL ORDER BY r.object_id ASC LIMIT %d', $this->wpdb->term_relationships, $this->wpdb->terms, $tt_id, $last, $batch_size ) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+			$read_error = $this->read_error( $object_ids );
+
+			if ( $read_error !== '' ) {
+				$this->record_read_error( $type, $read_error );
+				return;
+			}
+
+			if ( empty( $object_ids ) ) {
+				return;
+			}
+
+			$ids = [];
+
+			foreach ( $object_ids as $object_id ) {
+				$ids[] = is_numeric( $object_id ) ? (int) $object_id : 0;
+			}
+
+			$last = (int) end( $ids );
+			$full = count( $ids ) === $batch_size;
+
+			foreach ( $ids as $object_id ) {
+				$this->skip_missing( $type, $object_id, $slug );
+			}
+
+			$this->beat();
+		}
 	}
 
 	/**

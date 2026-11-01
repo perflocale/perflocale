@@ -71,6 +71,18 @@ final class SyncMeta {
 	}
 
 	/**
+	 * Whether a Sync Fields list can make ContentSync act on writes of this meta key.
+	 * ContentSync's field lookup starts with it and the first-write boot gate uses it, so the two cannot differ.
+	 *
+	 * @param string            $key         Meta key.
+	 * @param array<mixed>      $sync_fields The blog's Sync Fields list.
+	 * @return bool
+	 */
+	public static function may_sync_meta_key( string $key, array $sync_fields ): bool {
+		return ! self::is_never_synced( $key ) && in_array( '_thumbnail_id' === $key ? 'featured_image' : $key, $sync_fields, true );
+	}
+
+	/**
 	 * Whether this request is a front-end GET/HEAD page view.
 	 * Meta written during a view (a counter, a cache) is not an edit: it starts no sync and records no clear.
 	 *

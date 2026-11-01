@@ -101,34 +101,37 @@ function perflocale_get_languages(): array {
 /**
  * Get the translated permalink for a post in a specific language.
  *
- * Accepts what get_permalink() accepts; anything that does not resolve to a post yields ''.
+ * Takes a post ID, WP_Post or null (the current post); a numeric string is not an ID for strict_types callers.
+ * '' when nothing resolves to a post. A non-empty URL is no proof of a translation: without one the source URL is converted.
+ *
+ * @since 1.0.7.5 $lang_slug also takes a locale or BCP 47 tag; an unknown or inactive value is reported.
  *
  * @param int|WP_Post|null $post_id Post ID, post object, or null for the current post.
- * @param string           $lang_slug Target language slug.
+ * @param string           $lang_slug Target language slug, locale or BCP 47 tag.
  * @return string Translated permalink.
  */
 function perflocale_get_permalink( int|WP_Post|null $post_id, string $lang_slug ): string {
 	if ( perflocale_doing_it_wrong_too_early( __FUNCTION__ ) ) {
 		return '';
 	}
-	$plugin = PerfLocale\Plugin::get_instance();
-
-	if ( ! $plugin->has( 'url_converter' ) ) {
-		return get_permalink( $post_id ) ?: '';
-	}
-
+	$plugin    = PerfLocale\Plugin::get_instance();
 	$permalink = get_permalink( $post_id );
 
-	if ( ! $permalink ) {
-		return '';
+	if ( ! $permalink || ! $plugin->has( 'url_converter' ) ) {
+		return (string) $permalink;
 	}
+
+	$lang_slug = perflocale()->url_slug( $lang_slug );
 
 	// Prefer the translation's own permalink: a converted source URL keeps the source slug.
 	$post        = get_post( $post_id );
 	$groups      = $plugin->has( 'group_repo' ) ? $plugin->get( 'group_repo' ) : null;
 	$translation = 0;
 
-	if ( $post instanceof WP_Post && $groups instanceof PerfLocale\Database\Repository\TranslationGroupRepository ) {
+	// An unknown or inactive language ('') has no member to link, nor posts to prime.
+	if ( $lang_slug !== '' && $post instanceof WP_Post && $groups instanceof PerfLocale\Database\Repository\TranslationGroupRepository ) {
+		PerfLocale\Frontend\PermalinkLoopPrimer::prime( $post, $lang_slug );
+
 		foreach ( $groups->get_translations( (int) $post->ID, PerfLocale\Enum\ObjectType::Post ) as $member ) {
 			if ( isset( $member->language_slug ) && (string) $member->language_slug === $lang_slug ) {
 				$translation = (int) $member->object_id;
@@ -151,10 +154,12 @@ function perflocale_get_permalink( int|WP_Post|null $post_id, string $lang_slug 
 /**
  * Get the translated term link for a term in a specific language.
  *
- * Accepts a term ID or a WP_Term, as get_term_link() does; an unresolvable term yields ''.
+ * Takes a term ID or a WP_Term; '' for an unresolvable term. Without a translation the source link is converted.
+ *
+ * @since 1.0.7.5 As perflocale_get_permalink().
  *
  * @param int|WP_Term $term_id Term ID or term object.
- * @param string      $lang_slug Target language slug.
+ * @param string      $lang_slug Target language slug, locale or BCP 47 tag.
  * @return string Translated term link.
  */
 function perflocale_get_term_link( int|WP_Term $term_id, string $lang_slug ): string {
@@ -162,17 +167,17 @@ function perflocale_get_term_link( int|WP_Term $term_id, string $lang_slug ): st
 		return '';
 	}
 	$plugin = PerfLocale\Plugin::get_instance();
-
-	if ( ! $plugin->has( 'url_converter' ) ) {
-		$link = get_term_link( $term_id );
-		return is_wp_error( $link ) ? '' : $link;
-	}
-
-	$link = get_term_link( $term_id );
+	$link   = get_term_link( $term_id );
 
 	if ( is_wp_error( $link ) ) {
 		return '';
 	}
+
+	if ( ! $plugin->has( 'url_converter' ) ) {
+		return $link;
+	}
+
+	$lang_slug = perflocale()->url_slug( $lang_slug );
 
 	// As in perflocale_get_permalink(): the translated term's own link carries its own slug.
 	$term        = $term_id instanceof WP_Term ? $term_id : get_term( $term_id );
@@ -202,7 +207,9 @@ function perflocale_get_term_link( int|WP_Term $term_id, string $lang_slug ): st
 /**
  * Get the home URL for a specific language.
  *
- * @param string $lang_slug Language slug (empty = current language).
+ * @since 1.0.7.5 As perflocale_get_permalink().
+ *
+ * @param string $lang_slug Language slug, locale or BCP 47 tag (empty = current language).
  * @param string $path Optional path to append.
  * @return string Language-specific home URL.
  */
@@ -210,8 +217,10 @@ function perflocale_home_url( string $lang_slug = '', string $path = '' ): strin
 	if ( perflocale_doing_it_wrong_too_early( __FUNCTION__ ) ) {
 		return '';
 	}
-	$plugin = PerfLocale\Plugin::get_instance();
+	$plugin    = PerfLocale\Plugin::get_instance();
+	$lang_slug = $lang_slug === '' ? perflocale()->slug() : perflocale()->url_slug( $lang_slug );
 
+	// Converted even for the current language: query mode and admin leave core's home_url() without it.
 	if ( $lang_slug === '' || ! $plugin->has( 'url_converter' ) ) {
 		return home_url( $path );
 	}
@@ -298,8 +307,9 @@ function perflocale_t( string $key, string $context = '', $language = '' ): stri
 
 	$service = perflocale_string_translation_service();
 
+	// No string service (plain admin, CLI): a with_language() window still translates.
 	if ( $service === null ) {
-		return $key;
+		return perflocale()->translate( $key, '', [ 'context' => $context ] );
 	}
 
 	$translated = $service->get_translation( $key, 'perflocale', $context );
@@ -323,7 +333,7 @@ function perflocale_t( string $key, string $context = '', $language = '' ): stri
  */
 function perflocale_if_language( string|array $languages, bool $invert = false ): bool {
 	if ( perflocale_doing_it_wrong_too_early( __FUNCTION__ ) ) {
-		return $invert; // Matches inverted-default semantics (show when invert=true and no language matched).
+		return false; // Fail closed, as without a current language after plugins_loaded.
 	}
 	if ( is_string( $languages ) ) {
 		$languages = array_map( 'trim', explode( ',', $languages ) );
@@ -333,51 +343,66 @@ function perflocale_if_language( string|array $languages, bool $invert = false )
 }
 
 /**
- * Get the date format for the current language, else the site's `date_format` option.
+ * Get a language's date format, else the site's `date_format` option.
  *
+ * @since 1.0.7.5 $lang.
+ *
+ * @param string|null $lang Language slug or locale (de_DE, de-AT); null for the current language.
  * @return string PHP date format string (e.g. "j F Y").
  */
-function perflocale_date_format(): string {
-	return PerfLocale\Helper::get_instance()->date_format();
+function perflocale_date_format( ?string $lang = null ): string {
+	return PerfLocale\Helper::get_instance()->date_format( $lang );
 }
 
 /**
- * Get the time format for the current language, else the site default.
+ * Get a language's time format, else the site default.
  *
+ * @since 1.0.7.5 $lang.
+ *
+ * @param string|null $lang Language slug or locale; null for the current language.
  * @return string
  */
-function perflocale_time_format(): string {
-	return PerfLocale\Helper::get_instance()->time_format();
+function perflocale_time_format( ?string $lang = null ): string {
+	return PerfLocale\Helper::get_instance()->time_format( $lang );
 }
 
 /**
- * Render a timestamp using the current language's date format.
+ * Render a timestamp in a language's date format.
  *
- * @param int|string|null $timestamp Unix timestamp, parseable string, or null for now.
+ * @since 1.0.7.5 $lang.
+ *
+ * @param int|string|DateTimeInterface|null $timestamp Unix timestamp, date string (site time unless it has an offset), or null for now.
+ * @param string|null                       $lang      Language slug or locale; null for the current language.
  * @return string
  */
-function perflocale_format_date( $timestamp = null ): string {
-	return PerfLocale\Helper::get_instance()->format_date( $timestamp );
+function perflocale_format_date( $timestamp = null, ?string $lang = null ): string {
+	return PerfLocale\Helper::get_instance()->format_date( $timestamp, $lang );
 }
 
 /**
- * Render a timestamp using the current language's time format.
+ * Render a timestamp in a language's time format.
  *
- * @param int|string|null $timestamp
+ * @since 1.0.7.5 $lang.
+ *
+ * @param int|string|DateTimeInterface|null $timestamp See perflocale_format_date().
+ * @param string|null                       $lang      Language slug or locale; null for the current language.
  * @return string
  */
-function perflocale_format_time( $timestamp = null ): string {
-	return PerfLocale\Helper::get_instance()->format_time( $timestamp );
+function perflocale_format_time( $timestamp = null, ?string $lang = null ): string {
+	return PerfLocale\Helper::get_instance()->format_time( $timestamp, $lang );
 }
 
 /**
- * Render a timestamp using the current language's combined datetime format.
+ * Render a timestamp in a language's combined datetime format.
  *
- * @param int|string|null $timestamp
+ * @since 1.0.7.5 $lang.
+ *
+ * @param int|string|DateTimeInterface|null $timestamp See perflocale_format_date().
+ * @param string|null                       $lang      Language slug or locale; null for the current language.
  * @return string
  */
-function perflocale_format_datetime( $timestamp = null ): string {
-	return PerfLocale\Helper::get_instance()->format_datetime( $timestamp );
+function perflocale_format_datetime( $timestamp = null, ?string $lang = null ): string {
+	return PerfLocale\Helper::get_instance()->format_datetime( $timestamp, $lang );
 }
 
 /**
@@ -385,7 +410,9 @@ function perflocale_format_datetime( $timestamp = null ): string {
  *
  * Empty when the current singular page has no translation in that language.
  *
- * @param string $lang_slug Target language slug.
+ * @since 1.0.7.5 As perflocale_get_permalink().
+ *
+ * @param string $lang_slug Target language slug, locale or BCP 47 tag.
  * @return string
  */
 function perflocale_current_url( string $lang_slug ): string {
@@ -408,7 +435,7 @@ function perflocale_switcher_links(): array {
 }
 
 /**
- * Output hreflang tags manually (if automatic head injection is disabled).
+ * Output hreflang tags manually (if automatic head injection is disabled); once per request with wp_head's.
  *
  * @return void
  */
@@ -433,7 +460,9 @@ function perflocale_hreflang_tags(): void {
  * @since 1.0.7.4
  *
  * @param array{product_ids?: list<int>, limit?: int} $args `product_ids`: only these products (any
- *        language; empty: every product). `limit`: stop after this many groups (0: all).
+ *        language; 1-500 parent products, not variations; empty: every product, a full scan). `limit` (an int):
+ *        stop after this many drifting groups (0: all); it limits the result, not the products scanned. Other keys
+ *        are refused.
  * @return list<array{group: int, parent_id: int, members: list<array{product_id: int, parent_id: int, language: string, stock: float}>}>|WP_Error
  */
 function perflocale_stock_drift( array $args = [] ): array|WP_Error {

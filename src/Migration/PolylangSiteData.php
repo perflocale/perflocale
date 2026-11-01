@@ -12,6 +12,7 @@ namespace PerfLocale\Migration;
 use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Database\Schema;
 use PerfLocale\Enum\SourceType;
+use PerfLocale\Frontend\OptionStrings;
 use PerfLocale\Translation\MenuManager;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -172,10 +173,12 @@ final class PolylangSiteData {
 	/**
 	 * Import Polylang's string translations.
 	 *
-	 * @param array<int, string> $notices Import notices, appended to.
-	 * @return int Translations stored (option strings and language formats).
+	 * @param array<int, string> $notices  Import notices, appended to.
+	 * @param array<int, string> $failed   Items whose write failed, e.g. "Site Title (fi)", appended to.
+	 * @param string             $db_error The last failed write's database error, for the debug log only.
+	 * @return int|null Translations stored (option strings and language formats); null when the read failed.
 	 */
-	public function import_strings( array &$notices ): int {
+	public function import_strings( array &$notices, array &$failed = [], string &$db_error = '' ): ?int {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Values are bound through prepare(); table names through %i.
 		$rows = $this->wpdb->get_results(
 			$this->wpdb->prepare(
@@ -191,7 +194,12 @@ final class PolylangSiteData {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
 
-		if ( ! is_array( $rows ) || $rows === [] ) {
+		// A failed get_results() also returns [], so last_error tells it from "no strings".
+		if ( $this->wpdb->last_error !== '' || ! is_array( $rows ) ) {
+			return null;
+		}
+
+		if ( $rows === [] ) {
 			return 0;
 		}
 
@@ -223,6 +231,7 @@ final class PolylangSiteData {
 			}
 
 			$language  = $this->languages->find( (int) $lang_id );
+			$slug      = $language !== null ? (string) $language->slug : (string) $row->slug;
 			$unplaced  = 0;
 			$lang_data = [];
 
@@ -240,8 +249,13 @@ final class PolylangSiteData {
 				$option = array_search( $original, $options, true );
 
 				if ( $option !== false ) {
-					if ( ImportedOptionStrings::save( (string) $option, $original, (int) $lang_id, html_entity_decode( $translation, ENT_QUOTES | ENT_HTML5, 'UTF-8' ), SourceType::ImportedPolylang ) ) {
+					$saved = ImportedOptionStrings::save( (string) $option, $original, (int) $lang_id, html_entity_decode( $translation, ENT_QUOTES | ENT_HTML5, 'UTF-8' ), SourceType::ImportedPolylang );
+
+					if ( true === $saved ) {
 						++$stored;
+					} elseif ( null === $saved ) {
+						$db_error = $this->wpdb->last_error !== '' ? $this->wpdb->last_error : $db_error;
+						$failed[] = sprintf( '%s (%s)', OptionStrings::context_label( (string) $option, OptionStrings::DOMAIN ), $slug );
 					}
 					continue;
 				}
@@ -258,8 +272,17 @@ final class PolylangSiteData {
 				++$unplaced;
 			}
 
-			if ( $lang_data !== [] && $this->languages->update( (int) $lang_id, $lang_data ) ) {
-				$stored += count( $lang_data );
+			if ( $lang_data !== [] ) {
+				if ( $this->languages->update( (int) $lang_id, $lang_data ) ) {
+					$stored += count( $lang_data );
+				} else {
+					// The update re-reads the language, so last_error is often already cleared here.
+					$db_error = $this->wpdb->last_error !== '' ? $this->wpdb->last_error : $db_error;
+
+					foreach ( array_keys( $lang_data ) as $format ) {
+						$failed[] = sprintf( '%s (%s)', 'date_format' === $format ? __( 'Date Format', 'perflocale' ) : __( 'Time Format', 'perflocale' ), $slug );
+					}
+				}
 			}
 
 			if ( $unplaced > 0 ) {
@@ -267,7 +290,7 @@ final class PolylangSiteData {
 					/* translators: 1: number of strings, 2: language slug */
 					_n( '%1$d Polylang string translation in %2$s was not imported: PerfLocale has no place for it (widget titles and texts, and strings a theme or plugin registered with Polylang).', '%1$d Polylang string translations in %2$s were not imported: PerfLocale has no place for them (widget titles and texts, and strings a theme or plugin registered with Polylang).', $unplaced, 'perflocale' ),
 					$unplaced,
-					$language !== null ? (string) $language->slug : (string) $row->slug
+					$slug
 				);
 			}
 		}

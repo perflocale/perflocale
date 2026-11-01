@@ -193,6 +193,7 @@ final class LanguageSwitcherBlock {
 	 * Register the `perflocale-frontend` stylesheet handle.
 	 *
 	 * Hooked at priority 9 so the handle exists before `register_block_type` at default priority.
+	 * Picks .min inline: runs on every request, so VisitorAssets stays unloaded.
 	 *
 	 * @return void
 	 */
@@ -203,7 +204,7 @@ final class LanguageSwitcherBlock {
 
 		wp_register_style(
 			'perflocale-frontend',
-			PERFLOCALE_URL . 'assets/css/frontend.css',
+			PERFLOCALE_URL . ( defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG ? 'assets/css/frontend.css' : 'assets/css/frontend.min.css' ),
 			[],
 			PERFLOCALE_VERSION
 		);
@@ -473,13 +474,23 @@ final class LanguageSwitcherBlock {
 	}
 
 	/**
+	 * A language's BCP 47 tag for lang and hreflang: from its locale, as the head's hreflang tags; the slug is a route id.
+	 *
+	 * @param object $lang Language object.
+	 * @return string
+	 */
+	public static function lang_tag( object $lang ): string {
+		return \PerfLocale\Helper::format_locale_as_bcp47( (string) ( empty( $lang->locale ) ? ( $lang->slug ?? '' ) : $lang->locale ) );
+	}
+
+	/**
 	 * Build a ` lang="…" [dir="rtl"]` attribute pair (leading space).
 	 *
 	 * @param object $lang Language object.
 	 * @return string
 	 */
 	private static function language_attr_string( object $lang ): string {
-		$out = ' lang="' . esc_attr( \PerfLocale\Helper::format_locale_as_bcp47( (string) ( $lang->slug ?? '' ) ) ) . '"';
+		$out = ' lang="' . esc_attr( self::lang_tag( $lang ) ) . '"';
 
 		if ( ! empty( $lang->text_direction ) && $lang->text_direction === 'rtl' ) {
 			$out .= ' dir="rtl"';
@@ -555,35 +566,27 @@ final class LanguageSwitcherBlock {
 		unset( $content );
 
 		if ( ! is_admin() && ! wp_style_is( 'perflocale-frontend', 'enqueued' ) ) {
-			wp_enqueue_style(
-				'perflocale-frontend',
-				PERFLOCALE_URL . 'assets/css/frontend.css',
-				[],
-				PERFLOCALE_VERSION
-			);
+			VisitorAssets::enqueue_style();
 		}
 
 		static $languages    = null;
 		static $current_slug = null;
-		static $urls         = null;
 		static $memo_blog    = null;
 
-		// Function statics are out of reset_memos()' reach: key them by blog id for switch_to_blog().
-		$current_blog = function_exists( 'get_current_blog_id' ) ? get_current_blog_id() : 0;
+		// Function statics are out of reset_memos()' reach: keyed by blog and current language (with_language()).
+		$plugin = \PerfLocale\Plugin::get_instance();
+		/** @var \PerfLocale\Router\LanguageRouter|null $router */
+		$router       = $plugin->has( 'router' ) ? $plugin->get( 'router' ) : null;
+		$current_blog = ( function_exists( 'get_current_blog_id' ) ? get_current_blog_id() : 0 ) . '|' . $router?->get_current_slug();
 
 		if ( $languages === null || $memo_blog !== $current_blog ) {
 			$memo_blog = $current_blog;
-			$plugin    = \PerfLocale\Plugin::get_instance();
 
-			if ( ! $plugin->has( 'router' ) ) {
+			if ( $router === null ) {
 				$languages = [];
 			} else {
-				$router       = $plugin->get( 'router' );
 				$languages    = $router->get_active_languages();
 				$current_slug = $router->get_current_slug();
-				$urls         = $plugin->has( 'url_converter' )
-					? $plugin->get( 'url_converter' )->get_translations_for_current_page()
-					: [];
 			}
 
 			/**
@@ -595,7 +598,8 @@ final class LanguageSwitcherBlock {
 			 *
 			 * @param array $languages Active language objects.
 			 */
-			$languages = apply_filters( 'perflocale/switcher/languages', $languages );
+			$filtered  = apply_filters( 'perflocale/switcher/languages', $languages );
+			$languages = is_array( $filtered ) ? array_filter( $filtered, 'is_object' ) : \PerfLocale\Util\FilterReturn::rejected( 'perflocale/switcher/languages', $filtered, $languages );
 		}
 
 		if ( empty( $languages ) ) {
@@ -619,7 +623,7 @@ final class LanguageSwitcherBlock {
 		$hide_current         = (bool) ( $attributes['hideCurrent'] ?? $default_hide );
 		$show_untranslated    = (bool) ( $attributes['showUntranslated'] ?? $default_untrans );
 		$default_untrans_link = (string) $plugin_settings->get( 'switcher_untranslated_link', 'homepage' );
-		$untranslated_link    = sanitize_key( $attributes['untranslatedLink'] ?? $default_untrans_link );
+		$untranslated_link    = sanitize_key( $attributes['untranslatedLink'] ?? $attributes['untranslated_link'] ?? $default_untrans_link );
 		$default_arrow_style  = (string) $plugin_settings->get( 'switcher_arrow_style', 'single' );
 		$arrow_style          = sanitize_key( $attributes['arrowStyle'] ?? $default_arrow_style );
 		$default_trigger_fmt  = (string) $plugin_settings->get( 'switcher_trigger_format', 'inherit' );
@@ -658,12 +662,18 @@ final class LanguageSwitcherBlock {
 			'className'        => $class_name,
 		];
 
-		if ( count( $languages ) < 2 ) {
+		// include / exclude (switcher() and the shortcode) filter a copy: the memo stays whole.
+		$shown = isset( $attributes['include'] ) || isset( $attributes['exclude'] ) ? \PerfLocale\Util\LanguageValue::pick( $languages, $attributes ) : $languages;
+
+		if ( count( $shown ) < 2 ) {
 			return '';
 		}
 
+		// Asked on every render: UrlConverter keeps them per main query, and a later query is another page.
+		$urls = $plugin->has( 'url_converter' ) ? $plugin->get( 'url_converter' )->get_translations_for_current_page() : [];
+
 		if ( $display === 'dropdown' ) {
-			return $this->render_dropdown( $languages, $current_slug, $urls, $resolved, $block );
+			return $this->render_dropdown( $shown, $current_slug, $urls, $resolved, $block );
 		}
 
 		$is_simple   = ( $display === 'simple' );
@@ -693,7 +703,7 @@ final class LanguageSwitcherBlock {
 		// Counted in the loop: a second copy of the skip rules could drift.
 		$items = 0;
 
-		foreach ( $languages as $lang ) {
+		foreach ( $shown as $lang ) {
 			$is_current = ( $lang->slug === $current_slug );
 
 			if ( $is_current && $hide_current ) {
@@ -741,8 +751,8 @@ final class LanguageSwitcherBlock {
 				$base_attrs = [
 					'href'     => $url,
 					'class'    => 'perflocale-switcher-block__item',
-					'hreflang' => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
-					'lang'     => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
+					'hreflang' => self::lang_tag( $lang ),
+					'lang'     => self::lang_tag( $lang ),
 				];
 
 				if ( ! empty( $lang->text_direction ) && $lang->text_direction === 'rtl' ) {
@@ -952,8 +962,8 @@ final class LanguageSwitcherBlock {
 					'href'     => $url,
 					'class'    => $option_class,
 					'role'     => 'option',
-					'hreflang' => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
-					'lang'     => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
+					'hreflang' => self::lang_tag( $lang ),
+					'lang'     => self::lang_tag( $lang ),
 				];
 
 				if ( ! empty( $lang->text_direction ) && $lang->text_direction === 'rtl' ) {
@@ -1028,16 +1038,7 @@ final class LanguageSwitcherBlock {
 		$html .= '</nav>';
 
 		if ( ! wp_script_is( 'perflocale-switcher-dropdown', 'enqueued' ) ) {
-			wp_enqueue_script(
-				'perflocale-switcher-dropdown',
-				PERFLOCALE_URL . 'assets/js/language-switcher-dropdown.js',
-				[],
-				PERFLOCALE_VERSION,
-				[
-					'in_footer' => true,
-					'strategy'  => 'defer',
-				]
-			);
+			VisitorAssets::enqueue_switcher_script();
 		}
 
 		return $html;

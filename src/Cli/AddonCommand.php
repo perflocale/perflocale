@@ -319,7 +319,7 @@ final class AddonCommand {
 				AddonSchemaManager::forget( $id );
 				\WP_CLI::log( 'Reset stored version to 0 (--force).' );
 			}
-			$ok = AddonSchemaManager::migrate( $addon );
+			$ok = AddonSchemaManager::migrate( $addon, true );
 			$v  = AddonSchemaManager::get_stored_version( $id );
 			if ( $ok ) {
 				\WP_CLI::success( "Migrated '{$id}' to v{$v}." );

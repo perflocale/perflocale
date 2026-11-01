@@ -71,6 +71,8 @@ final class LanguageSwitcher {
 	/**
 	 * Render the language switcher: maps snake_case args to LanguageSwitcherBlock attributes.
 	 *
+	 * @since 1.0.7.5 untranslated_link (homepage, no_link, hide), include and exclude (slugs, locales or tags).
+	 *
 	 * @param array<string, mixed> $args Display arguments.
 	 * @return string HTML output.
 	 */
@@ -91,6 +93,11 @@ final class LanguageSwitcher {
 			'class'             => '',
 		];
 
+		// show_native, documented before name_format, picks native or English names when name_format is not given.
+		if ( isset( $args['show_native'] ) ) {
+			$args += [ 'name_format' => wp_validate_boolean( $args['show_native'] ) ? 'native' : 'english' ];
+		}
+
 		$args = wp_parse_args( $args, $defaults );
 
 		$block_attrs = [
@@ -109,7 +116,7 @@ final class LanguageSwitcher {
 			'flagSize'         => isset( $args['flag_size'] ) ? (int) $args['flag_size'] : 20,
 			'gap'              => isset( $args['gap'] ) ? (int) $args['gap'] : 8,
 			'className'        => $args['class'],
-		];
+		] + $args; // untranslated_link, include and exclude are read by the block render.
 
 		$block = new LanguageSwitcherBlock();
 		$html  = $block->render( $block_attrs );
@@ -227,6 +234,9 @@ final class LanguageSwitcher {
 				'show_names'        => '',
 				'hide_current'      => '',
 				'show_untranslated' => '',
+				'untranslated_link' => '',
+				'include'           => '',
+				'exclude'           => '', // phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_exclude -- Shortcode attribute (languages to hide), not a query argument.
 				'class'             => '',
 			],
 			(array) $atts,
@@ -341,7 +351,7 @@ final class LanguageSwitcher {
 				$items .= sprintf(
 					'<li class="%s perflocale-menu-item--disabled"><span lang="%s"%s aria-disabled="true">%s</span></li>',
 					esc_attr( $li_class ),
-					esc_attr( \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ) ),
+					esc_attr( LanguageSwitcherBlock::lang_tag( $lang ) ),
 					( ! empty( $lang->text_direction ) && $lang->text_direction === 'rtl' ) ? ' dir="rtl"' : '',
 					$label
 				);
@@ -351,8 +361,8 @@ final class LanguageSwitcher {
 
 			$base_attrs = [
 				'href'     => $url,
-				'hreflang' => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
-				'lang'     => \PerfLocale\Helper::format_locale_as_bcp47( $lang->slug ),
+				'hreflang' => LanguageSwitcherBlock::lang_tag( $lang ),
+				'lang'     => LanguageSwitcherBlock::lang_tag( $lang ),
 			];
 
 			if ( ! empty( $lang->text_direction ) && $lang->text_direction === 'rtl' ) {

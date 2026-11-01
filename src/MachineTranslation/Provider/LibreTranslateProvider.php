@@ -97,15 +97,15 @@ final class LibreTranslateProvider extends AbstractProvider {
 			$fast_fail
 		);
 
-		$data = $this->parse_json_response( $response['body'] );
+		$data = $this->decode_json_response( is_string( $response['body'] ) ? $response['body'] : '' );
 
-		if ( ! isset( $data['translatedText'] ) ) {
-			throw new \RuntimeException(
-				esc_html__( 'LibreTranslate returned an unexpected response.', 'perflocale' )
-			);
+		$translated = self::text_at( $data, 'translatedText' );
+
+		if ( null === $translated ) {
+			$this->refuse_response( esc_html__( 'LibreTranslate returned an unexpected response.', 'perflocale' ) );
 		}
 
-		$translated = $data['translatedText'];
+		$this->accept_response();
 
 		$this->track_usage( $text );
 

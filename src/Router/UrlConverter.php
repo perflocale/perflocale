@@ -1342,7 +1342,7 @@ final class UrlConverter {
 		 *
 		 * @param string $new_url      Converted URL.
 		 * @param string $target_slug  Target language slug.
-		 * @param string $current_slug Language slug the URL was converted FROM.
+		 * @param string $current_slug The request's current language slug, not necessarily the language of $url.
 		 */
 		return apply_filters( 'perflocale/url/convert', $new_url, $target_slug, $current_slug );
 	}
@@ -1355,14 +1355,20 @@ final class UrlConverter {
 	 * @return array<string, string> language_slug => URL map.
 	 */
 	public function get_translations_for_current_page(): array {
-		// Per-request cache keyed by blog: alternate URLs are per blog, and a function-local static is out of
-		// reach of any switch_blog reset.
+		// Kept per blog for one main query (a function static is out of reach of any switch_blog reset): not before
+		// the query ran, and a later query_posts() page is another context.
+		/** @var array<int, array{0: string|null, 1: array<string, string>}> $cached_by_blog */
 		static $cached_by_blog = [];
 
-		$blog_key = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
+		global $wp_query;
 
-		if ( isset( $cached_by_blog[ $blog_key ] ) ) {
-			return $cached_by_blog[ $blog_key ];
+		/** @var \WP_Query|null $wp_query */
+
+		$blog_key = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
+		$context  = isset( $wp_query->posts ) ? spl_object_id( $wp_query ) . ':' . get_queried_object_id() : null;
+
+		if ( $context !== null && ( $cached_by_blog[ $blog_key ][0] ?? null ) === $context ) {
+			return $cached_by_blog[ $blog_key ][1];
 		}
 
 		$languages = $this->router->get_active_languages();
@@ -1459,7 +1465,7 @@ final class UrlConverter {
 					}
 				}
 
-				$cached_by_blog[ $blog_key ] = $urls;
+				$cached_by_blog[ $blog_key ] = [ $context, $urls ];
 				return $urls;
 			}
 		}
@@ -1484,8 +1490,11 @@ final class UrlConverter {
 					_prime_term_caches( $sibling_ids, false );
 				}
 
+				// Active languages only, as the other branches: a disabled language's term is no alternate.
+				$active = array_column( $languages, 'slug', 'slug' );
+
 				foreach ( $links as $link ) {
-					if ( empty( $link->language_slug ) ) {
+					if ( ! isset( $active[ $link->language_slug ?? '' ] ) ) {
 						continue;
 					}
 
@@ -1501,7 +1510,7 @@ final class UrlConverter {
 				}
 
 				if ( $urls !== [] ) {
-					$cached_by_blog[ $blog_key ] = $urls;
+					$cached_by_blog[ $blog_key ] = [ $context, $urls ];
 					return $urls;
 				}
 			}
@@ -1524,7 +1533,7 @@ final class UrlConverter {
 			$urls[ $lang->slug ] = $this->convert( $current, $lang->slug );
 		}
 
-		$cached_by_blog[ $blog_key ] = $urls;
+		$cached_by_blog[ $blog_key ] = [ $context, $urls ];
 		return $urls;
 	}
 

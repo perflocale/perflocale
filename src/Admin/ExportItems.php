@@ -35,14 +35,15 @@ final class ExportItems {
 	private const EXPORT_BATCH = 1000;
 
 	/**
-	 * A machine translation's pending mark (TranslationService::PENDING_META_KEY): "<time>", or "<time>:c" while created.
+	 * A machine translation's pending mark (TranslationService::PENDING_META_KEY): "<time>", or "<time>:c" while created,
+	 * either with ":<row fingerprint>".
 	 */
 	private const PENDING_KEY = '_perflocale_mt_pending';
 
 	/**
 	 * The shape of a pending mark.
 	 */
-	private const PENDING_SHAPE = '/^[1-9][0-9]{0,18}(?::c)?$/D';
+	private const PENDING_SHAPE = '/^[1-9][0-9]{0,18}(?::c)?(?::[0-9a-f]{32})?$/D';
 
 	/**
 	 * The rows of one row list, for the exporter.

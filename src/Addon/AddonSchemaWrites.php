@@ -46,13 +46,15 @@ final class AddonSchemaWrites {
 			if ( ! is_string( $short_name ) || 1 !== preg_match( AddonSchemaManager::SHORT_NAME_PATTERN, $short_name ) ) {
 				// Escaped in case wp_die() renders the message.
 				throw new \InvalidArgumentException(
-					esc_html( "Invalid addon table short name '{$short_name}' - must match " . AddonSchemaManager::SHORT_NAME_PATTERN )
+					esc_html( "Invalid addon table short name '{$short_name}' - must match " . AddonSchemaManager::SHORT_NAME_PATTERN ),
+					\PerfLocale\Database\UpgradeRunner::OWN_ERROR // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int constant.
 				);
 			}
 
 			if ( ! is_string( $body ) || '' === trim( $body ) ) {
 				throw new \InvalidArgumentException(
-					esc_html( "Empty schema body for table '{$short_name}'" )
+					esc_html( "Empty schema body for table '{$short_name}'" ),
+					\PerfLocale\Database\UpgradeRunner::OWN_ERROR // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int constant.
 				);
 			}
 
@@ -62,7 +64,8 @@ final class AddonSchemaWrites {
 
 			if ( $length > $max ) {
 				throw new \InvalidArgumentException(
-					esc_html( "Addon table name {$full_name} is {$length} characters; the database allows 64. The addon needs a shorter id or table short name." )
+					esc_html( "Addon table name {$full_name} is {$length} characters; the database allows 64. The addon needs a shorter id or table short name." ),
+					\PerfLocale\Database\UpgradeRunner::OWN_ERROR // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int constant.
 				);
 			}
 

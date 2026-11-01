@@ -229,12 +229,12 @@ final class MtCreateNotice {
 	 * @return array<int, array<string, mixed>>
 	 */
 	public static function publish_warnings( array $result, object $language ): array {
-		$warning = $result['builder_warning'] ?? '';
+		$warning = self::warning_of( $result );
 		$vars    = get_object_vars( $language );
 		$name    = $vars['name'] ?? '';
 		$slug    = $vars['slug'] ?? '';
 
-		return is_string( $warning ) && '' !== $warning
+		return '' !== $warning
 			? [
 				[
 					'reason'   => $warning,
@@ -243,6 +243,27 @@ final class MtCreateNotice {
 				],
 			]
 			: [];
+	}
+
+	/**
+	 * The warnings a translate_post() result shows on the edit screen: the builder one, then the length one, or ''.
+	 * Each is capped at half the stored limit, so a long one never pushes the other out.
+	 *
+	 * @param array<string, mixed> $result translate_post() result.
+	 * @return string
+	 */
+	public static function warning_of( array $result ): string {
+		$warnings = [];
+		$half     = intdiv( self::MAX_REASON - 1, 2 );
+
+		foreach ( [ 'builder_warning', 'length_warning' ] as $key ) {
+			if ( is_string( $result[ $key ] ?? null ) && '' !== $result[ $key ] ) {
+				$text       = self::plain( $result[ $key ] );
+				$warnings[] = function_exists( 'mb_substr' ) ? mb_substr( $text, 0, $half ) : substr( $text, 0, $half );
+			}
+		}
+
+		return implode( ' ', $warnings );
 	}
 
 	/**

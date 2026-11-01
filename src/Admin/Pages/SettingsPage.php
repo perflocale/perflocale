@@ -11,6 +11,7 @@ namespace PerfLocale\Admin\Pages;
 
 use PerfLocale\Database\DataRegistry;
 use PerfLocale\Settings;
+use PerfLocale\Util\OutboundUrl;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -48,6 +49,13 @@ final class SettingsPage {
 	 * @var array<int, string>
 	 */
 	private static array $refused_sync_fields = [];
+
+	/**
+	 * Whether the last {@see extract_tab_values()} refused a new agency URL that is not https.
+	 *
+	 * @var bool
+	 */
+	private static bool $refused_agency_url = false;
 
 	/**
 	 * Constructor.
@@ -151,7 +159,13 @@ final class SettingsPage {
 		$message = isset( $_GET['settings-updated'] ) ? sanitize_text_field( wp_unslash( $_GET['settings-updated'] ) ) : '';
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$save_failed = isset( $_GET['save-failed'] ) ? sanitize_key( wp_unslash( $_GET['save-failed'] ) ) : '';
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
 		$address_refused = isset( $_GET['mt-address-refused'] );
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$agency_url_refused = isset( $_GET['mt-agency-http'] );
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
 		$sync_refused = isset( $_GET['sync-refused'] ) && is_string( $_GET['sync-refused'] ) ? array_filter( array_map( 'trim', explode( ',', sanitize_text_field( wp_unslash( $_GET['sync-refused'] ) ) ) ) ) : [];
@@ -166,9 +180,8 @@ final class SettingsPage {
 					<p><?php echo esc_html__( 'Settings saved successfully.', 'perflocale' ); ?></p>
 				</div>
 			<?php elseif ( $message === 'false' ) : ?>
-				<?php // A save that wpdb refused. ?>
 				<div class="notice notice-error is-dismissible">
-					<p><?php echo esc_html__( 'Settings could not be saved. The database refused the write, which usually means one value is too long for its column or contains characters it cannot store. Your previous settings are unchanged.', 'perflocale' ); ?></p>
+					<p><?php echo esc_html( self::save_failed_text( $save_failed ) ); ?></p>
 				</div>
 			<?php endif; ?>
 
@@ -184,6 +197,12 @@ final class SettingsPage {
 						);
 						?>
 					</p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $agency_url_refused ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p><?php echo esc_html( sprintf( /* translators: %s: filter name */ __( 'Agency Endpoint URL not saved: it must start with https:// (http:// only for a host added to the %s filter). Enter an https:// address and save again; the stored URL and API key are unchanged.', 'perflocale' ), 'perflocale/mt/trusted_hosts' ) ); ?></p>
 				</div>
 			<?php endif; ?>
 
@@ -263,14 +282,11 @@ final class SettingsPage {
 					</div>
 					<?php
 				} else {
+					// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only flash param on a redirect.
+					$perflocale_flash_reason = isset( $_GET['perflocale_reason'] ) ? sanitize_key( $_GET['perflocale_reason'] ) : '';
 					?>
 					<div class="notice notice-error is-dismissible">
-						<p>
-						<?php
-						/* translators: %s: addon display name */
-						echo esc_html( sprintf( __( 'Could not save settings for %s. The values may exceed the per-addon size limit, or another save was in progress. Check the PHP error log under WP_DEBUG for the exact reason.', 'perflocale' ), $perflocale_flash_name ) );
-						?>
-						</p>
+						<p><?php echo esc_html( AddonsPage::save_failed_text( $perflocale_flash_reason, (string) $perflocale_flash_name ) ); ?></p>
 					</div>
 					<?php
 				}
@@ -785,6 +801,7 @@ final class SettingsPage {
 				'mt_libre_api_key'             => isset( $_POST['mt_libre_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_libre_api_key'] ) ) : '',
 				'mt_agency_url'                => isset( $_POST['mt_agency_url'] ) ? esc_url_raw( wp_unslash( $_POST['mt_agency_url'] ) ) : '',
 				'mt_agency_api_key'            => isset( $_POST['mt_agency_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_agency_api_key'] ) ) : '',
+				'mt_agency_batch'              => isset( $_POST['mt_agency_batch'] ),
 				'mt_auto_translate_on_publish' => isset( $_POST['mt_auto_translate_on_publish'] ),
 				// Active slugs only; with every target checked store [] ("all"), so later languages are included.
 				'mt_auto_translate_languages'  => ( function (): array {
@@ -935,7 +952,36 @@ final class SettingsPage {
 			$values = (array) apply_filters( 'perflocale/settings/extract_addon_values', $values, $tab );
 		}
 
+		// A new agency URL must be https; a stored http URL stays. A key typed with a refused URL is dropped
+		// too, or it would go to the stored address.
+		self::$refused_agency_url = array_key_exists( 'mt_agency_url', $values ) && OutboundUrl::refuses_new_plain_http( $values['mt_agency_url'], $this->settings->get( 'mt_agency_url' ) );
+
+		if ( self::$refused_agency_url ) {
+			unset( $values['mt_agency_url'], $values['mt_agency_api_key'] );
+		}
+
 		return $values;
+	}
+
+	/**
+	 * The notice of a settings save that stored nothing, by the cause AdminForms passed.
+	 *
+	 * @param string $reason 'busy', 'database', 'changed', 'unchanged', or '' when unknown.
+	 * @return string
+	 */
+	private static function save_failed_text( string $reason ): string {
+		switch ( $reason ) {
+			case 'busy':
+				return __( 'Settings not saved: another settings save was running at the same moment. Save again.', 'perflocale' );
+			case 'database':
+				return __( 'Settings not saved: the database refused to store the option perflocale_settings, so a value may be too long or hold characters it cannot store. Check the values you changed, then save again.', 'perflocale' ) . ' ' . AddonsPage::debug_log_hint();
+			case 'changed':
+				return __( 'Settings not saved: another plugin or request kept changing the stored settings during this save. Save again.', 'perflocale' );
+			case 'unchanged':
+				return __( 'Settings not saved: a filter on the option perflocale_settings kept the stored values. Check the plugins that filter it, then save again.', 'perflocale' );
+		}
+
+		return __( 'Settings not saved; your previous settings are unchanged. Save again.', 'perflocale' );
 	}
 
 	/**
@@ -1826,6 +1872,15 @@ final class SettingsPage {
 	}
 
 	/**
+	 * Whether the last settings save refused a new agency URL that is not https.
+	 *
+	 * @since 1.0.7.5
+	 */
+	public static function last_refused_agency_url(): bool {
+		return self::$refused_agency_url;
+	}
+
+	/**
 	 * Keep `wp_template` and `wp_template_part` switched on together.
 	 *
 	 * One feature behind two types: a template without its parts renders a half-translated page.
@@ -2252,6 +2307,7 @@ final class SettingsPage {
 		$libre_key       = (string) $this->settings->get( 'mt_libre_api_key' );
 		$agency_url      = (string) $this->settings->get( 'mt_agency_url' );
 		$agency_key      = (string) $this->settings->get( 'mt_agency_api_key' );
+		$agency_batch    = (bool) $this->settings->get( 'mt_agency_batch', false );
 		?>
 		<tr>
 			<th scope="row">
@@ -2479,7 +2535,18 @@ final class SettingsPage {
 			</th>
 			<td>
 				<?php $this->render_api_key_field( 'mt_agency_url', 'perflocale-agency-url', $agency_url, 'url' ); ?>
-				<p class="description"><?php echo esc_html__( 'HTTPS URL of the external translation agency endpoint.', 'perflocale' ); ?></p>
+				<p class="description">
+					<?php
+					printf(
+						/* translators: %s: filter name */
+						esc_html__( 'HTTPS URL of the external translation agency endpoint. http:// only for a host added to the %s filter, such as a local or Docker endpoint.', 'perflocale' ),
+						'<code>perflocale/mt/trusted_hosts</code>'
+					);
+					?>
+				</p>
+				<?php if ( '' !== $agency_url && ! OutboundUrl::is_https_or_trusted( $agency_url ) ) : ?>
+					<div class="notice notice-warning inline"><p><?php echo esc_html__( 'This URL uses http://, so requests to the agency are not encrypted. Change it to an https:// address.', 'perflocale' ); ?></p></div>
+				<?php endif; ?>
 			</td>
 		</tr>
 		<tr>
@@ -2489,6 +2556,16 @@ final class SettingsPage {
 			<td>
 				<?php $this->render_api_key_field( 'mt_agency_api_key', 'perflocale-agency-key', $agency_key ); ?>
 				<p class="description"><?php echo esc_html__( 'Optional. Sent as a Bearer token in the Authorization header.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Batch Requests', 'perflocale' ); ?></th>
+			<td>
+				<label>
+					<input type="checkbox" name="mt_agency_batch" value="1" <?php checked( $agency_batch ); ?>>
+					<?php echo esc_html__( 'My endpoint accepts batches', 'perflocale' ); ?>
+				</label>
+				<p class="description"><?php echo esc_html__( 'Sends several texts per request as {"texts": [...]} and expects {"translations": [...]}: one string per text, in the same order. Leave it off for an endpoint that takes one text per request.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 		<?php

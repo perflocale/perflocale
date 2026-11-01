@@ -1473,6 +1473,13 @@ final class JobState {
 			);
 
 			if ( 1 === $deleted ) {
+				// A failed XLIFF import keeps its staged file for Retry until its job goes.
+				$file = is_array( $state['args'] ?? null ) ? ( $state['args']['file'] ?? null ) : null;
+
+				if ( 'xliff_import' === ( $state['type'] ?? '' ) && is_string( $file ) ) {
+					Jobs\XliffImportJob::discard( $file );
+				}
+
 				if ( ! self::delete_owned_artifact( $job_id, $state ) ) {
 					self::log_orphan_artifact( $job_id, $state );
 				}
@@ -1639,8 +1646,8 @@ final class JobState {
 
 	/**
 	 * Daily GC: prune terminal rows older than HISTORY_TTL and force-fail queued or running rows idle past
-	 * STUCK_TIMEOUT (both range scans on `status_updated`). Finished `data_export` rows go first, one by one with their
-	 * files.
+	 * STUCK_TIMEOUT (both range scans on `status_updated`). Finished `data_export` and `xliff_import` rows go first, one
+	 * by one with their files.
 	 *
 	 * @return int Rows removed.
 	 */
@@ -1719,9 +1726,9 @@ final class JobState {
 			}
 		}
 
-		// Finished exports first: the row is the only record of the file. Only a row this call deleted has its file
-		// removed; a row changed since the read stays, with its file.
-		$removed = self::gc_exports( $history_mysql );
+		// Rows that name a file first (exports, XLIFF imports): only a row this call deleted has its file removed; a row
+		// changed since the read stays, with its file.
+		$removed = self::gc_file_jobs( $history_mysql );
 
 		// Terminal-row pruning.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
@@ -1743,13 +1750,13 @@ final class JobState {
 	}
 
 	/**
-	 * Delete finished export jobs older than the cutoff, with their files: at most 500 per call; gc()'s bulk prune
-	 * takes the remaining rows and the daily age sweep the remaining files.
+	 * Delete finished export and XLIFF import jobs older than the cutoff, with their files: at most 500 per call; gc()'s
+	 * bulk prune takes the remaining rows and the daily sweeps the remaining files.
 	 *
 	 * @param string $cutoff GMT datetime; terminal rows last updated before it are deleted.
 	 * @return int Rows deleted.
 	 */
-	private static function gc_exports( string $cutoff ): int {
+	private static function gc_file_jobs( string $cutoff ): int {
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
 
@@ -1757,10 +1764,11 @@ final class JobState {
 		$ids = (array) $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT uuid FROM %i
-			 WHERE type = %s AND status IN ('complete', 'failed', 'canceled') AND updated_at < %s
+			 WHERE type IN (%s, %s) AND status IN ('complete', 'failed', 'canceled') AND updated_at < %s
 			 LIMIT 500",
 				$table,
 				'data_export',
+				'xliff_import',
 				$cutoff
 			)
 		);
@@ -1791,7 +1799,15 @@ final class JobState {
 			}
 
 			++$removed;
-			self::delete_owned_artifact( $uuid, $state );
+
+			// A failed XLIFF import keeps its staged file for Retry until its job goes.
+			$file = is_array( $state['args'] ?? null ) ? ( $state['args']['file'] ?? null ) : null;
+
+			if ( 'xliff_import' === ( $state['type'] ?? '' ) && is_string( $file ) ) {
+				Jobs\XliffImportJob::discard( $file );
+			} else {
+				self::delete_owned_artifact( $uuid, $state );
+			}
 		}
 
 		return $removed;

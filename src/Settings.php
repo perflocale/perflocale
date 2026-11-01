@@ -76,6 +76,7 @@ final class Settings {
 		'mt_libre_api_key'               => '',
 		'mt_agency_url'                  => '',
 		'mt_agency_api_key'              => '',
+		'mt_agency_batch'                => false,
 		'mt_auto_translate_on_publish'   => false,
 		// Both auto-translate flows; empty = every active language, including later ones.
 		'mt_auto_translate_languages'    => [],
@@ -473,6 +474,13 @@ final class Settings {
 	private static bool $last_update_was_noop = false;
 
 	/**
+	 * Set by {@see update()}: another save held the settings lock.
+	 *
+	 * @var bool
+	 */
+	private static bool $last_update_was_busy = false;
+
+	/**
 	 * Set by {@see update()}; read by {@see last_update_refused_addresses()}.
 	 *
 	 * @var array<int, string>
@@ -484,16 +492,10 @@ final class Settings {
 	 */
 	private const WRITE_ATTEMPTS = 5;
 
-	/**
-	 * Machine-translation provider address setting, mapped to the key setting sent to it.
-	 */
-	private const MT_KEY_FOR_URL = [
-		'mt_libre_url'  => 'mt_libre_api_key',
-		'mt_agency_url' => 'mt_agency_api_key',
-	];
-
 	public function update( array $values ): bool {
-		self::$last_update_refused = [];
+		self::$last_update_refused  = [];
+		self::$last_update_was_noop = false;
+		\PerfLocale\Util\OutboundUrl::forget_refusal();
 
 		$sanitized = $this->sanitize( $values );
 
@@ -511,7 +513,7 @@ final class Settings {
 					wp_cache_delete( 'alloptions', 'options' );
 
 					$current               = $this->load();
-					[ $applied, $refused ] = $this->apply_provider_address_rules( $current, $sanitized );
+					[ $applied, $refused ] = \PerfLocale\Util\OutboundUrl::provider_address_rules( $this, $current, $sanitized );
 					$merged                = array_merge( $current, $applied );
 
 					self::$last_update_refused = $refused;
@@ -549,6 +551,8 @@ final class Settings {
 				];
 			}
 		);
+
+		self::$last_update_was_busy = null === $result;
 
 		if ( $result === null ) {
 			// Another save holds the lock: report a failure so the caller can retry.
@@ -602,47 +606,12 @@ final class Settings {
 
 
 	/**
-	 * Provider address settings whose change the last update() refused (see apply_provider_address_rules()).
+	 * Provider address settings whose change the last update() refused (see OutboundUrl::provider_address_rules()).
 	 *
 	 * @return array<int, string>
 	 */
 	public static function last_update_refused_addresses(): array {
 		return self::$last_update_refused;
-	}
-
-	/**
-	 * Send a machine-translation key only to the provider address it was entered for.
-	 *
-	 * A changed address clears a stored key unless the update carries one; on multisite only a super
-	 * admin or WP-CLI may re-point an externally supplied key, so anyone else's change is refused.
-	 *
-	 * @param array<string, mixed> $current   Stored settings, read inside the update's lock.
-	 * @param array<string, mixed> $sanitized The update's sanitized values.
-	 * @return array{0: array<string, mixed>, 1: array<int, string>} The values to merge, and the refused address settings.
-	 */
-	private function apply_provider_address_rules( array $current, array $sanitized ): array {
-		$refused = [];
-
-		foreach ( self::MT_KEY_FOR_URL as $url_key => $secret_key ) {
-			if ( ! array_key_exists( $url_key, $sanitized ) || $sanitized[ $url_key ] === ( $current[ $url_key ] ?? '' ) ) {
-				continue;
-			}
-
-			if ( $this->is_overridden( $secret_key ) ) {
-				if ( is_multisite() && ! ( defined( 'WP_CLI' ) && WP_CLI ) && ! is_super_admin() ) {
-					unset( $sanitized[ $url_key ] );
-					$refused[] = $url_key;
-				}
-
-				continue;
-			}
-
-			if ( '' === ( $sanitized[ $secret_key ] ?? '' ) ) {
-				$sanitized[ $secret_key ] = '';
-			}
-		}
-
-		return [ $sanitized, $refused ];
 	}
 
 	/**
@@ -652,6 +621,13 @@ final class Settings {
 	 */
 	public static function last_update_was_noop(): bool {
 		return self::$last_update_was_noop;
+	}
+
+	/**
+	 * Whether the last update() saved nothing because another save held the settings lock.
+	 */
+	public static function last_update_was_busy(): bool {
+		return self::$last_update_was_busy;
 	}
 
 	/**

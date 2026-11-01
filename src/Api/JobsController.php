@@ -272,6 +272,10 @@ final class JobsController extends RestController {
 
 		JobRunnerFactory::for_engine( (string) ( $state['engine'] ?? '' ) )->cancel( $id );
 
+		if ( 'xliff_import' === ( $state['type'] ?? null ) ) {
+			\PerfLocale\Background\Jobs\XliffImportJob::canceled( (array) ( $state['args'] ?? [] ) );
+		}
+
 		// The job lock names this job only, so it is dropped although another request holds it. The type lock is shared:
 		// released only when this request owns it, else by the worker's finally or its TTL.
 		\PerfLocale\Background\JobLock::release( $id );

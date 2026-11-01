@@ -331,8 +331,16 @@ final class MachineTranslateController extends RestController {
 		try {
 			$default     = $plugin->get( 'lang_repo' )->get_default();
 			$source_lang = $default ? $default->slug : 'en';
-			$texts       = [ (string) $term->name, (string) $term->description ];
-			$translated  = $service->translate_batch_texts( $texts, $source_lang, $target_lang, $provider_id, true );
+			$translated  = $service->translate_term_fields(
+				[
+					'name'        => (string) $term->name,
+					'description' => (string) $term->description,
+				],
+				$source_lang,
+				$target_lang,
+				$provider_id,
+				true
+			);
 		} catch ( \Throwable $e ) {
 			return $this->error( 'mt_failed', $e->getMessage(), 500 );
 		}
@@ -359,11 +367,12 @@ final class MachineTranslateController extends RestController {
 		}
 
 		$update = [];
-		if ( ! empty( $translated[0] ) ) {
-			$update['name'] = wp_slash( (string) $translated[0] );
+		// A blank field comes back as given: nothing to write.
+		if ( '' !== trim( $translated['name'] ) ) {
+			$update['name'] = wp_slash( $translated['name'] );
 		}
-		if ( ! empty( $translated[1] ) ) {
-			$update['description'] = wp_slash( (string) $translated[1] );
+		if ( '' !== trim( $translated['description'] ) ) {
+			$update['description'] = wp_slash( $translated['description'] );
 		}
 
 		if ( $update !== [] ) {

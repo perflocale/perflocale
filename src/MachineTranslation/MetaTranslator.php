@@ -252,7 +252,9 @@ final class MetaTranslator {
 				}
 
 				// Brings the monthly cap, the count-mismatch failure and the format's sanitising.
-				$group_out = $this->service->translate_batch_texts( $group_batch, $source_lang, $target_lang, $provider_id, false, $fmt );
+				/* translators: %s: meta key */
+				$labels    = array_map( static fn( $key ): string => sprintf( __( 'meta key %s', 'perflocale' ), (string) $key ), $group_keys );
+				$group_out = $this->service->translate_batch_texts( $group_batch, $source_lang, $target_lang, $provider_id, false, $fmt, $labels );
 
 				foreach ( $group_keys as $gi => $key ) {
 					$translated[ $key_index[ $key ] ] = $group_out[ $gi ] ?? '';
@@ -450,6 +452,13 @@ final class MetaTranslator {
 	 *                'conflict' (someone else wrote the key first) or 'failed'.
 	 */
 	private function write( int $post_id, string $key, string $value, array $rows, array $snapshot ): string {
+		/**
+		 * WordPress database.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
 		// wp_slash: the meta API unslashes.
 		if ( $rows === [] ) {
 			// Absent at the snapshot: add only while it is still absent.
@@ -457,12 +466,73 @@ final class MetaTranslator {
 		} elseif ( $rows[0] === $value ) {
 			return 'unchanged';
 		} else {
-			// A non-empty $prev_value makes core's UPDATE conditional; an empty() one is ignored, so a '' or '0' snapshot relies
-			// on the re-read. The raw snapshot value: core never unslashes $prev_value.
-			$done = false !== update_post_meta( $post_id, $key, wp_slash( $value ), empty( $rows[0] ) ? '' : $rows[0] );
+			$stored = $snapshot[0] ?? null;
+
+			if ( null !== $stored && ! is_string( $stored ) ) {
+				return 'failed';
+			}
+
+			// On a charset ExpectedWrite cannot read, or a meta_value stored in another one, core's UPDATE is sent as is:
+			// conditional on a non-empty $prev_value only.
+			$hold = null === ExpectedWrite::unbound_charset() && ! ExpectedWrite::converts( $wpdb->postmeta, [ 'meta_value' ] ) ? self::hold( $post_id, $key, $rows[0], $stored ) : null;
+
+			if ( null !== $hold ) {
+				add_filter( 'query', $hold, PHP_INT_MAX, 1 );
+			}
+
+			try {
+				// The raw snapshot value: core never unslashes $prev_value.
+				$done = false !== update_post_meta( $post_id, $key, wp_slash( $value ), empty( $rows[0] ) ? '' : $rows[0] );
+			} finally {
+				if ( null !== $hold ) {
+					remove_filter( 'query', $hold, PHP_INT_MAX );
+				}
+			}
 		}
 
 		return $done ? 'written' : $this->settle_refused( $post_id, $key, $value, $snapshot );
+	}
+
+	/**
+	 * `query` filter for write()'s update_post_meta(): its UPDATE matches the row only while it holds $stored (also '' or
+	 * NULL, which core's $prev_value ignores); another write at this level is refused.
+	 *
+	 * @param int         $post_id Translation post ID.
+	 * @param string      $key     Meta key.
+	 * @param mixed       $prev    The row's value at the snapshot, as read.
+	 * @param string|null $stored  The same value as stored.
+	 * @return \Closure(mixed): mixed
+	 */
+	private static function hold( int $post_id, string $key, mixed $prev, ?string $stored ): \Closure {
+		/**
+		 * WordPress database.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		$level = ExpectedWrite::level();
+		$where = ' AND `meta_key` = ' . ExpectedWrite::literal( wp_unslash( $key ) ) . ( empty( $prev ) ? '' : ' AND `meta_value` = ' . ExpectedWrite::literal( (string) $stored ) );
+		$tails = [ ' WHERE `post_id` = ' . $post_id . $where, " WHERE `post_id` = '" . $post_id . "'" . $where ];
+		$head  = 'UPDATE `' . $wpdb->postmeta . '` SET `meta_value` = ';
+		$add   = 'INSERT INTO `' . $wpdb->postmeta . '`';
+		$seen  = false;
+
+		return static function ( $query ) use ( $post_id, $key, $stored, $level, $head, $tails, $add, &$seen ) {
+			if ( ! is_string( $query ) || '' === $query || ! ExpectedWrite::at( $level ) || ! ExpectedWrite::writes( $query ) ) {
+				return $query;
+			}
+
+			$bound = $seen ? null : ExpectedWrite::bind( $query, $head, $tails, ExpectedWrite::holds( 'meta_value', $stored ) );
+			$seen  = true;
+
+			// Any other write at this level is refused; core's add_metadata() INSERT means the person deleted the key.
+			if ( null === $bound && ! str_starts_with( ltrim( $query ), $add ) ) {
+				ExpectedWrite::refused( sprintf( 'meta key "%s" of post %d', $key, $post_id ) );
+			}
+
+			return $bound ?? '';
+		};
 	}
 
 	/**
@@ -499,7 +569,14 @@ final class MetaTranslator {
 			return 'written';
 		}
 
-		return $now === $snapshot ? 'failed' : 'conflict';
+		if ( $now === $snapshot ) {
+			return 'failed';
+		}
+
+		// Core returns before its cache delete when the UPDATE matched no row.
+		wp_cache_delete( $post_id, 'post_meta' );
+
+		return 'conflict';
 	}
 
 	/**

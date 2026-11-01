@@ -131,6 +131,13 @@ final class ProtectedBlockSave {
 	private ?string $kept_content = null;
 
 	/**
+	 * The armed save's other columns as written (unslashed, no post_content); null until it is consumed.
+	 *
+	 * @var array<string, mixed>|null
+	 */
+	private ?array $sent = null;
+
+	/**
 	 * Registered data filter.
 	 *
 	 * @var \Closure|null
@@ -246,7 +253,7 @@ final class ProtectedBlockSave {
 		// MySQL refuses a 4-byte character in the SQL comparison with those rows.
 		$source = self::stored_group_source( $post_id, self::encode_like_core( wp_unslash( $raw ) ) );
 
-		if ( null === $source || ! self::may_read_source( $source[0], $source[3] ) ) {
+		if ( null === $source || ! self::may_read_source( $source[0] ) ) {
 			return $data;
 		}
 
@@ -297,16 +304,15 @@ final class ProtectedBlockSave {
 
 
 	/**
-	 * Whether the saving user may have a source's bytes: a private one only for its readers or a save without a user.
+	 * Whether the saving user may have a source's bytes: one who may view it (host-aware), or a save without a user.
 	 *
-	 * The conditional write binds the status checked here, so a source that changes status before the write keeps nothing.
+	 * The answer depends on the status, so callers bind the status they read into the conditional write.
 	 *
-	 * @param int    $source_id Source post id.
-	 * @param string $status    Its stored status.
+	 * @param int $source_id Source post id.
 	 * @return bool
 	 */
-	public static function may_read_source( int $source_id, string $status ): bool {
-		return 'private' !== $status || 0 === get_current_user_id() || current_user_can( 'read_post', $source_id );
+	public static function may_read_source( int $source_id ): bool {
+		return 0 === get_current_user_id() || \PerfLocale\Helper::user_can_view_object( $source_id );
 	}
 
 	/**
@@ -609,12 +615,30 @@ final class ProtectedBlockSave {
 	}
 
 	/**
+	 * The content the armed save wrote with every placeholder replaced by its verified bytes, or null before that.
+	 *
+	 * @return string|null
+	 */
+	public function kept(): ?string {
+		return $this->kept_content;
+	}
+
+	/**
 	 * Whether the save was refused (nothing of it was written).
 	 *
 	 * @return bool
 	 */
 	public function refused(): bool {
 		return $this->refused;
+	}
+
+	/**
+	 * The columns besides post_content the armed save wrote, or null when it never reached the data filter.
+	 *
+	 * @return array<string, mixed>|null
+	 */
+	public function sent_fields(): ?array {
+		return $this->sent;
 	}
 
 	/**
@@ -634,6 +658,7 @@ final class ProtectedBlockSave {
 		$this->revision_done = false;
 		$this->writes        = [];
 		$this->kept_content  = null;
+		$this->sent          = null;
 		$this->data_filter   = fn( mixed $data, mixed $postarr = [], mixed $unsanitized = [] ): mixed => $this->on_data( $data, $postarr, $unsanitized );
 		$this->query_filter  = fn( mixed $query ): mixed => $this->stop( $query );
 
@@ -737,6 +762,13 @@ final class ProtectedBlockSave {
 		}
 
 		$this->consumed = true;
+		$this->sent     = [];
+
+		foreach ( wp_unslash( $data ) as $column => $value ) {
+			if ( is_string( $column ) && 'post_content' !== $column ) {
+				$this->sent[ $column ] = $value;
+			}
+		}
 
 		$content  = $data['post_content'] ?? null;
 		$restored = is_string( $content ) ? $this->verified( $content, $this->map ) : null;
@@ -849,7 +881,7 @@ final class ProtectedBlockSave {
 
 		$source = $this->stored_source();
 
-		if ( null === $source || ! self::may_read_source( $this->source_id, $source[1] ) ) {
+		if ( null === $source || ! self::may_read_source( $this->source_id ) ) {
 			return null;
 		}
 

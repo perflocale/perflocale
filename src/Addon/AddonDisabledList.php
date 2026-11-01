@@ -23,7 +23,7 @@ final class AddonDisabledList {
 	/**
 	 * Serialised size cap of the disabled list: the option is autoloaded, so every request deserialises it.
 	 */
-	private const DISABLED_OPTION_MAX_BYTES = 4096;
+	public const DISABLED_OPTION_MAX_BYTES = 4096;
 
 	/**
 	 * Lock around every write, or two concurrent toggles drop one commit; separate from AddonSettings' lock.
@@ -32,6 +32,13 @@ final class AddonDisabledList {
 
 	/** Short TTL - the work inside is a single update_option call. */
 	private const DISABLED_LOCK_TTL = 10;
+
+	/**
+	 * Why the last set_disabled_list() stored nothing (see last_failure()).
+	 *
+	 * @var string
+	 */
+	private static string $last_failure = '';
 
 	/**
 	 * Set the on/off state of one addon; asking for the state it is in succeeds without a write.
@@ -140,7 +147,8 @@ final class AddonDisabledList {
 	 * @return bool True when the stored list equals the normalised one; false for the cap, a held lock or a refused write.
 	 */
 	public static function set_disabled_list( array $ids ): bool {
-		$normalised = [];
+		self::$last_failure = '';
+		$normalised         = [];
 		foreach ( $ids as $value ) {
 			$candidate = is_scalar( $value ) ? (string) $value : '';
 			if ( $candidate !== '' && AddonSchemaManager::validate_addon_id( $candidate ) ) {
@@ -151,6 +159,8 @@ final class AddonDisabledList {
 
 		$serialised = (string) maybe_serialize( $normalised );
 		if ( strlen( $serialised ) > self::DISABLED_OPTION_MAX_BYTES ) {
+			self::$last_failure = 'too_large';
+
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				error_log(
@@ -175,9 +185,15 @@ final class AddonDisabledList {
 
 				// update_option() is false for an unchanged value too; only a refusal fails.
 				if ( ! update_option( AddonRegistry::DISABLED_OPTION, $normalised, true ) && $stored !== $normalised ) {
+					global $wpdb;
+
+					// No database error: a pre_update_option filter kept the stored value.
+					$error              = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
+					self::$last_failure = '' !== $error ? 'database' : 'unchanged';
+
 					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected - the options write was refused' );
+						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected - the options write was refused' . ( '' !== $error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? ' - ' . $error : '' ) );
 					}
 					return false;
 				}
@@ -185,11 +201,24 @@ final class AddonDisabledList {
 			}
 		);
 
+		if ( null === $result ) {
+			self::$last_failure = 'busy';
+		}
+
 		if ( $result !== true ) {
 			return false;
 		}
 
 		AddonRegistry::flush_bootable_cache();
 		return true;
+	}
+
+	/**
+	 * Why the last set_disabled_list() stored nothing: 'busy', 'too_large', 'database', 'unchanged', or ''.
+	 *
+	 * @since 1.0.7.5
+	 */
+	public static function last_failure(): string {
+		return self::$last_failure;
 	}
 }

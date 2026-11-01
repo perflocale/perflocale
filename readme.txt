@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.7.4
+Stable tag: 1.0.7.5
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -207,6 +207,14 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
 
+= 1.0.7.5 =
+* Security hardening.
+* Faster pages: visitor pages, Elementor page views, the login page, AJAX requests and admin screens load less PHP code, and the language switcher's script and stylesheet are minified (the full files load with SCRIPT_DEBUG).
+* Machine translation: External Agency can send several texts in one request (opt-in); a new agency address must use https://, or http:// for a host you add with the `perflocale/mt/trusted_hosts` filter (a local or Docker endpoint); whitespace-only text is never sent; resuming a stopped bulk run keeps a translation someone edited in the meantime and reports it; a failed call names the item and its length; a short Chinese, Japanese or Korean title or excerpt is saved with a warning.
+* Import, export and Strings: an XLIFF import over the REST API runs as a background job in short slices instead of being refused above 60 translation units (`POST /xliff/import` answers 202 with a job id), continues after an interruption, keeps a draft an interrupted import left and lists it in the import's messages instead of deleting it, and keeps a failed import's file so Retry works; the Strings screen saves only the cells you changed, a person's edit replaces a machine translation made since the page opened, and another person's change is reported instead of overwritten; a .po export includes every plural form, so exporting and importing a file keeps all translations.
+* Reliability and fixes: database upgrades that cannot finish retry on their own, show what failed with a Retry now button and a Site Health check, and never break the site; the protective .htaccess in PerfLocale's uploads folders works on Apache 2.2 and 2.4, and an upgrade replaces an old one safely and retries until it succeeds; a settings save that stores nothing names the cause; hreflang tags print once per page; a disabled language never appears as a public link; WooCommerce exchange rates refresh after a base currency change, and Store API answers in a visitor's cookie language are never stored by shared caches; Polylang and TranslatePress import failures are reported; `wp perflocale health-check` reports string links without a translation; creating a draft or pending post through the REST API with a slug no longer fails.
+* Developers: template tags and helper methods take a language slug, locale or BCP 47 tag, and an unknown or inactive language gets a `_doing_it_wrong` notice; `switcher()` and `[perflocale_switcher]` take include, exclude and untranslated_link; new `flag_emoji()`, `wp perflocale jobs run`, and filters for External Agency batches and XLIFF staging limits; `perflocale/updated` can run again after a failed update, so listeners must be idempotent; a filter that returns the wrong type is ignored and reported.
+
 = 1.0.7.4 =
 * Security hardening.
 * Background jobs: bulk machine translation continues where a stopped worker left off, bulk string translation runs in short slices, and work one web request cannot finish is refused with the WP-CLI command that runs it.
@@ -265,6 +273,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.7.5 =
+Security hardening. Less code on every page, large XLIFF imports as background jobs (the REST route answers 202 with a job id), a Strings screen that never overwrites changes made after you opened it, and database upgrades that retry on their own.
 
 = 1.0.7.4 =
 Security hardening. Background jobs that continue after a stopped worker, protected blocks that keep their markup, and less code on visitor pages.

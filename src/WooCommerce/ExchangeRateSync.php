@@ -92,49 +92,43 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Register hooks.
+	 * Register hooks, calling this instance (WcLazyHooks::rates_hooks()).
 	 *
 	 * @return void
 	 */
 	public function register_hooks(): void {
-		// Register custom cron schedules.
-		add_filter( 'cron_schedules', [ $this, 'register_schedules' ] );
+		WcLazyHooks::rates_hooks( $this->settings, $this );
+	}
 
-		// Void wrapper: sync_rates() returns the rates for the AJAX caller.
-		add_action( self::CRON_HOOK, [ $this, 'cron_sync_rates' ] );
-
-		// Reschedule when settings change.
-		add_action( 'perflocale/settings/updated', [ $this, 'maybe_reschedule' ] );
-
-		// The AJAX handler is registered in Bootstrap::init(), independent of add-on boot order.
-
-		// Stale-rates notice, hooked only while auto-sync is on.
-		if ( (bool) $this->settings->get( 'wc_exchange_rate_auto', false ) ) {
-			add_action( 'admin_notices', [ $this, 'maybe_render_stale_notice' ] );
-		}
-
-		// Write contexts only, at init 20: before action_scheduler_init BackgroundEvents cannot
-		// see Action Scheduler and picks WP-Cron. The settings-update hook is the main path.
-		if ( \PerfLocale\Helper::is_write_context() ) {
-			if ( did_action( 'init' ) && ! doing_action( 'init' ) ) {
-				$this->reconcile_on_boot();
-			} else {
-				add_action(
-					'init',
-					function (): void {
-						$this->reconcile_on_boot();
-					},
-					20
-				);
-			}
-
+	/**
+	 * Write-context hooks: the boot reconcile, Action Scheduler's recurring check and the new-base refresh.
+	 *
+	 * @return void
+	 */
+	public function register_write_hooks(): void {
+		// At init 20: before action_scheduler_init BackgroundEvents cannot see Action Scheduler and picks WP-Cron.
+		// The settings-update hook is the main path.
+		if ( did_action( 'init' ) && ! doing_action( 'init' ) ) {
+			$this->reconcile_on_boot();
+		} else {
 			add_action(
-				'action_scheduler_ensure_recurring_actions',
+				'init',
 				function (): void {
-					$this->ensure_scheduled();
-				}
+					$this->reconcile_on_boot();
+				},
+				20
 			);
 		}
+
+		add_action(
+			'action_scheduler_ensure_recurring_actions',
+			function (): void {
+				$this->ensure_scheduled();
+			}
+		);
+
+		// ExchangeRateRefresh::HOOK, written out: the refresh class loads only when its event runs.
+		add_action( 'perflocale_exchange_rate_refresh', [ ExchangeRateRefresh::class, 'run' ], 10, 2 );
 	}
 
 	/**
@@ -295,41 +289,7 @@ final class ExchangeRateSync {
 	 * @return array<string, array{interval: int, display: string}>
 	 */
 	public function register_schedules( array $schedules ): array {
-		// Prefixed: the registry is global. Setting slugs stay unprefixed (cron_schedule_name()).
-		$custom = [
-			'perflocale_every_2_hours'  => [
-				'interval' => 2 * HOUR_IN_SECONDS,
-				'display'  => __( 'Every 2 Hours', 'perflocale' ),
-			],
-			'perflocale_every_4_hours'  => [
-				'interval' => 4 * HOUR_IN_SECONDS,
-				'display'  => __( 'Every 4 Hours', 'perflocale' ),
-			],
-			'perflocale_every_6_hours'  => [
-				'interval' => 6 * HOUR_IN_SECONDS,
-				'display'  => __( 'Every 6 Hours', 'perflocale' ),
-			],
-			'perflocale_every_8_hours'  => [
-				'interval' => 8 * HOUR_IN_SECONDS,
-				'display'  => __( 'Every 8 Hours', 'perflocale' ),
-			],
-			'perflocale_every_12_hours' => [
-				'interval' => 12 * HOUR_IN_SECONDS,
-				'display'  => __( 'Every 12 Hours', 'perflocale' ),
-			],
-			'perflocale_monthly'        => [
-				'interval' => 30 * DAY_IN_SECONDS,
-				'display'  => __( 'Once Monthly', 'perflocale' ),
-			],
-		];
-
-		foreach ( $custom as $key => $schedule ) {
-			if ( ! isset( $schedules[ $key ] ) ) {
-				$schedules[ $key ] = $schedule;
-			}
-		}
-
-		return $schedules;
+		return RateSchedules::add( $schedules );
 	}
 
 	/**
@@ -522,12 +482,13 @@ final class ExchangeRateSync {
 	}
 
 	/**
-	 * Body of sync_rates(), run under the `exchange_rate_sync` lock.
+	 * Body of sync_rates(); the caller holds the `exchange_rate_sync` lock (sync_rates(), ExchangeRateRefresh::run()).
 	 *
+	 * @internal
 	 * @return array<string, float> Fetched rates (currency_code => rate),
 	 *                              empty on failure.
 	 */
-	private function do_sync_rates(): array {
+	public function do_sync_rates(): array {
 		$breaker_key = 'fx_sync';
 
 		// Track recurring-handler timing for the Jobs admin panel.

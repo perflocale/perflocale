@@ -245,7 +245,7 @@ final class CopiedContentSave {
 
 		$stored = $this->stored_copy();
 
-		if ( null === $stored || ! \PerfLocale\MachineTranslation\ProtectedBlockSave::may_read_source( $this->copy_id, $stored['post_status'] ) ) {
+		if ( null === $stored || ! \PerfLocale\MachineTranslation\ProtectedBlockSave::may_read_source( $this->copy_id ) ) {
 			return $data;
 		}
 

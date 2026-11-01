@@ -20,11 +20,11 @@ final class PluralRules {
 	 * gettext Plural-Forms expressions keyed by base language code.
 	 *
 	 * Value: [ nplurals, expression ], the set translate.wordpress.org uses. `pt_BR` falls back to `pt`,
-	 * an unknown language to the English 2-form rule.
+	 * an unknown language to the English 2-form rule. Public so the PO export can tell a fallback from a known rule.
 	 *
 	 * @var array<string, array{0:int,1:string}>
 	 */
-	private const RULES = array(
+	public const RULES = array(
 		// 1 form (no plural distinction).
 		'ja'  => array( 1, '0' ),
 		'zh'  => array( 1, '0' ),

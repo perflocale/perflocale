@@ -43,6 +43,18 @@ final class JobLock {
 	public const DEFAULT_TTL = 1800;
 
 	/**
+	 * Seconds a WP-CLI hold on a job lasts without a refresh (hold_cli_lane()).
+	 *
+	 * @since 1.0.7.5
+	 */
+	public const CLI_LANE_TTL = 300;
+
+	/**
+	 * Name part of a WP-CLI hold after PREFIX; no job uuid starts with it (l and i are not hex).
+	 */
+	private const CLI_LANE = 'cli-';
+
+	/**
 	 * Separator between expiry and token in the stored value.
 	 */
 	private const DELIMITER = '|';
@@ -435,6 +447,104 @@ final class JobLock {
 		unset( self::$owned[ $owned_key ] );
 
 		self::release_key( $key, $owned_value );
+	}
+
+	/**
+	 * Take or extend this process's WP-CLI hold on a job (`wp perflocale jobs run`); false while another process holds it.
+	 *
+	 * Workers that do not hold it leave the job alone (WorkerRunner), so a dead WP-CLI run frees it within the TTL.
+	 * Only a CLI process (the site operator) takes one: a web request never chooses a job's lane.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string $job_id Job identifier.
+	 * @param int    $ttl    Seconds; at least CLI_LANE_TTL.
+	 * @return bool
+	 */
+	public static function hold_cli_lane( string $job_id, int $ttl = self::CLI_LANE_TTL ): bool {
+		if ( 'cli' !== PHP_SAPI || ! JobState::is_safe_id( $job_id ) ) {
+			return false;
+		}
+
+		global $wpdb;
+
+		$key       = self::PREFIX . self::CLI_LANE . $job_id;
+		$owned_key = self::owned_key( $key );
+		$owned     = self::$owned[ $owned_key ] ?? null;
+		$expires   = time() + max( self::CLI_LANE_TTL, $ttl );
+
+		if ( null !== $owned && $wpdb instanceof \wpdb ) {
+			$value = self::format_value( $expires, self::parse_token( $owned ) );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$updated = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET option_value = %s WHERE option_name = %s AND option_value = %s', $wpdb->options, $value, $key, $owned ) );
+
+			if ( 1 === (int) $updated || self::current_value( $key ) === $value ) {
+				self::$owned[ $owned_key ] = $value;
+				self::forget_cached( $key );
+
+				return true;
+			}
+
+			unset( self::$owned[ $owned_key ] );
+		}
+
+		// Swept after expiry, or never held: taken again unless another process holds it now.
+		return self::cas_acquire( $key, $expires );
+	}
+
+	/**
+	 * Extend this process's WP-CLI hold on a job, if it has one, to $ttl: a slice keeps it as long as its job lock.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string $job_id Job identifier.
+	 * @param int    $ttl    Seconds.
+	 * @return void
+	 */
+	public static function extend_cli_lane( string $job_id, int $ttl ): void {
+		if ( isset( self::$owned[ self::owned_key( self::PREFIX . self::CLI_LANE . $job_id ) ] ) ) {
+			self::hold_cli_lane( $job_id, $ttl );
+		}
+	}
+
+	/**
+	 * Release this process's WP-CLI hold on a job; another process's hold is left alone.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string $job_id Job identifier.
+	 * @return void
+	 */
+	public static function release_cli_lane( string $job_id ): void {
+		$key       = self::PREFIX . self::CLI_LANE . $job_id;
+		$owned_key = self::owned_key( $key );
+		$owned     = self::$owned[ $owned_key ] ?? null;
+		unset( self::$owned[ $owned_key ] );
+
+		if ( null !== $owned ) {
+			self::release_key( $key, $owned );
+		}
+	}
+
+	/**
+	 * When another process's live WP-CLI hold on a job expires, read past the options cache; 0 when there is none.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string $job_id Job identifier.
+	 * @return int
+	 */
+	public static function cli_lane_elsewhere( string $job_id ): int {
+		$key = self::PREFIX . self::CLI_LANE . $job_id;
+
+		if ( ! JobState::is_safe_id( $job_id ) || isset( self::$owned[ self::owned_key( $key ) ] ) ) {
+			return 0;
+		}
+
+		$expires = self::parse_expiry( (string) self::current_value( $key ) );
+
+		return $expires > time() ? $expires : 0;
 	}
 
 	/**

@@ -57,6 +57,7 @@ final class JobAccess {
 		'template_refs_fanout'     => 'edit_theme_options',
 		'wc_stock_check'           => 'manage_woocommerce',
 		'wc_stock_align'           => 'manage_woocommerce',
+		'xliff_import'             => 'perflocale_import_export',
 	];
 
 	/**

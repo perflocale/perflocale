@@ -30,11 +30,11 @@ final class Helper {
 	/**
 	 * Per-request memo of current_language(); reset by reset_static_caches().
 	 *
-	 * Null = not asked yet, false = asked and there is no current language.
+	 * Only a found language: before parse_request detection there may be none yet.
 	 *
-	 * @var object|false|null
+	 * @var object|null
 	 */
-	private static $current_language_memo = null;
+	private static ?object $current_language_memo = null;
 
 	/**
 	 * Post meta flag ('yes') that removes a translation from hreflang and sitemap alternates.
@@ -42,22 +42,6 @@ final class Helper {
 	 * @var string
 	 */
 	public const SEO_EXCLUDE_META = '_perflocale_seo_exclude';
-
-	/**
-	 * Per-blog memo of the SEO-excluded post id set, keyed by blog id.
-	 *
-	 * @var array<int, array<int, true>>
-	 */
-	private static array $seo_excluded_memo = [];
-
-	/**
-	 * Per-request memo of a locale's [ decimal_point, thousands_sep ], or null without WP_Locale data.
-	 *
-	 * Not blog-keyed: the separators come from language files a network shares.
-	 *
-	 * @var array<string, array{0: string, 1: string}|null>
-	 */
-	private static array $number_separator_memo = [];
 
 	/**
 	 * Get the singleton instance.
@@ -79,7 +63,13 @@ final class Helper {
 	 */
 	public static function reset_static_caches(): void {
 		self::$current_language_memo = null;
-		self::$seo_excluded_memo     = [];
+
+		// Loaded classes only: a reset must not load them.
+		foreach ( [ Util\FormatLocale::class, Util\SeoExclusion::class, Util\LanguageValue::class ] as $class ) {
+			if ( class_exists( $class, false ) ) {
+				$class::reset();
+			}
+		}
 	}
 
 	/**
@@ -93,40 +83,13 @@ final class Helper {
 	}
 
 	/**
-	 * The set of post IDs carrying the SEO-exclude flag, as id => true.
-	 *
-	 * One query per blog per request: sitemaps do not meta-prime siblings, so get_post_meta() would query each.
-	 * Same-request writes are not seen; the flag changes only on admin saves, which render no hreflang.
+	 * The set of post IDs carrying the SEO-exclude flag, as id => true; read once per blog and request.
 	 *
 	 * @return array<int, true>
+	 * @see Util\SeoExclusion::ids()
 	 */
 	public static function seo_excluded_post_ids(): array {
-		$blog_id = get_current_blog_id();
-
-		if ( isset( self::$seo_excluded_memo[ $blog_id ] ) ) {
-			return self::$seo_excluded_memo[ $blog_id ];
-		}
-
-		global $wpdb;
-
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- single indexed lookup, memoised per request; WP has no batch "all posts with this meta" API short of WP_Query overhead.
-		$ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = 'yes'",
-				self::SEO_EXCLUDE_META
-			)
-		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-
-		$set = [];
-
-		foreach ( (array) $ids as $id ) {
-			$set[ (int) $id ] = true;
-		}
-
-		self::$seo_excluded_memo[ $blog_id ] = $set;
-
-		return $set;
+		return Util\SeoExclusion::ids();
 	}
 
 	/**
@@ -138,7 +101,7 @@ final class Helper {
 	 */
 	public function current_language(): ?object {
 		if ( self::$current_language_memo !== null ) {
-			return self::$current_language_memo === false ? null : self::$current_language_memo;
+			return self::$current_language_memo;
 		}
 
 		try {
@@ -148,7 +111,7 @@ final class Helper {
 			$lang = null;
 		}
 
-		self::$current_language_memo = $lang === null ? false : $lang;
+		self::$current_language_memo = $lang;
 
 		return $lang;
 	}
@@ -161,7 +124,9 @@ final class Helper {
 	 *
 	 * @api  Stable API surface - semver-bound.
 	 *
-	 * @param string|int|\WP_Post|object|null $language Slug, locale, post, language row, or null/'' for no change.
+	 * @since 1.0.7.5 BCP 47 tags (fr-FR) and locales in any case.
+	 *
+	 * @param string|int|\WP_Post|object|null $language Slug, locale or tag, post or post ID, language row, or null/'' for no change.
 	 * @param callable                        $callback Callback to run.
 	 * @return mixed Whatever the callback returns.
 	 */
@@ -188,12 +153,14 @@ final class Helper {
 			return $callback();
 		}
 
-		$previous = $router->override_current_language( $target );
+		$previous = $router->get_current_language();
 
 		try {
+			$router->override_current_language( $target );
+
 			return $callback();
 		} finally {
-			// In finally: a throw must not leave the rest of the request in the imposed language.
+			// In finally, entry included: a throw (a listener's too) must not leave the request in the imposed language.
 			$router->override_current_language( $previous );
 		}
 	}
@@ -206,14 +173,14 @@ final class Helper {
 	 *
 	 * @api  Stable API surface - semver-bound.
 	 *
+	 * @since 1.0.7.5 BCP 47 tags; an unknown slug or locale is reported (debug only).
+	 *
 	 * @param string                          $text     Source text, exactly as registered.
-	 * @param string|int|\WP_Post|object|null $language Slug, locale, post, language row, or ''/null for the current one.
+	 * @param string|int|\WP_Post|object|null $language Slug, locale or tag, post or post ID, language row, or ''/null for the current one.
 	 * @param array<string, mixed>            $args     Optional `domain`, `context`, and `default` (defaults to $text).
 	 * @return string The translation, or the fallback.
 	 */
 	public function translate( string $text, $language = '', array $args = [] ): string {
-		$domain   = isset( $args['domain'] ) ? (string) $args['domain'] : 'perflocale';
-		$context  = isset( $args['context'] ) ? (string) $args['context'] : '';
 		$fallback = array_key_exists( 'default', $args ) ? (string) $args['default'] : $text;
 
 		if ( $text === '' ) {
@@ -221,15 +188,10 @@ final class Helper {
 		}
 
 		try {
-			$language_row = $this->resolve_language( $language );
-
-			// The default language returns the source before any query: it is the common case.
-			if ( $language_row === null ) {
-				$language_row = $this->current_language();
-			}
-
+			$language_row     = $this->resolve_language( $language ) ?? $this->current_language();
 			$default_language = $this->default_language();
 
+			// The default language returns the source before any query: it is the common case.
 			if (
 				$language_row === null
 				|| ( $default_language !== null && ( $language_row->slug ?? null ) === ( $default_language->slug ?? null ) )
@@ -237,21 +199,12 @@ final class Helper {
 				return $fallback;
 			}
 
-			$plugin = Plugin::get_instance();
-
-			if ( ! $plugin->has( 'cache' ) ) {
-				return $fallback;
-			}
-
-			$strings = new \PerfLocale\Database\Repository\StringRepository( $plugin->get( 'cache' ) );
-			$string  = $strings->find_by_hash( $domain, $context, $text );
-
-			if ( $string === null || empty( $string->id ) ) {
-				return $fallback;
-			}
-
-			$values      = new \PerfLocale\Database\Repository\StringTranslationRepository( $plugin->get( 'cache' ) );
-			$translation = $values->get( (int) $string->id, (int) $language_row->id );
+			$translation = Util\StringLookup::find(
+				isset( $args['domain'] ) ? (string) $args['domain'] : 'perflocale',
+				isset( $args['context'] ) ? (string) $args['context'] : '',
+				$text,
+				$language_row
+			);
 
 			// '' means no translation stored, never an empty translation.
 			return $translation === '' ? $fallback : $translation;
@@ -305,9 +258,7 @@ final class Helper {
 			$repo = $plugin->get( 'lang_repo' );
 
 			// Slug first: it wins any collision with a locale.
-			$row = $repo->find_by_slug( $language );
-
-			return $row ?? $repo->find_by_locale( $language );
+			return $repo->find_by_slug( $language ) ?? Util\LanguageValue::by_locale( $repo, $language );
 		} catch ( \Throwable $e ) {
 			return null;
 		}
@@ -371,12 +322,24 @@ final class Helper {
 	}
 
 	/**
-	 * Get the current language flag (emoji or code).
+	 * Get the current language's stored flag code (e.g. "us"); {@see self::flag_emoji()} for the emoji.
 	 *
 	 * @return string
 	 */
 	public function flag(): string {
 		return $this->current_language()?->flag ?? '';
+	}
+
+	/**
+	 * A language's flag emoji, as the switcher shows it.
+	 *
+	 * @since 1.0.7.5
+	 *
+	 * @param string|null $lang Language slug or locale; null for the current language.
+	 * @return string Emoji, or '' for an unknown language.
+	 */
+	public function flag_emoji( ?string $lang = null ): string {
+		return Util\FormatLocale::flag_emoji( $lang );
 	}
 
 	/**
@@ -389,24 +352,40 @@ final class Helper {
 	}
 
 	/**
-	 * Check if the current language is RTL.
+	 * Check if the current language is RTL; without one, core's is_rtl() (as perflocale_is_rtl()).
 	 *
 	 * @return bool
 	 */
 	public function is_rtl(): bool {
 		$lang = $this->current_language();
 
-		return ( $lang?->text_direction ?? 'ltr' ) === 'rtl';
+		return $lang ? ( $lang->text_direction ?? 'ltr' ) === 'rtl' : is_rtl();
 	}
 
 	/**
-	 * Check if the current language matches a given slug.
+	 * Whether the current language is the one a slug, locale or BCP 47 tag names.
 	 *
-	 * @param string $slug Language slug to check.
+	 * @since 1.0.7.5 Locales and tags; $match_base.
+	 *
+	 * @param string $slug       Language slug, locale or BCP 47 tag (fr, fr_FR, fr-FR).
+	 * @param bool   $match_base Also match a language with the same base language ('fr' matches fr_CA).
 	 * @return bool
 	 */
-	public function is_language( string $slug ): bool {
-		return $this->slug() === $slug;
+	public function is_language( string $slug, bool $match_base = false ): bool {
+		$now = $this->slug();
+
+		return $now === $slug || ( $now && ( $match_base ? Util\LanguageValue::slug( $slug, true ) : $this->url_slug( $slug ) ) === $now );
+	}
+
+	/**
+	 * The active slug a slug, locale or BCP 47 tag names, else '' (reported once).
+	 *
+	 * @internal For the URL template tags; an active slug as written needs no other lookup.
+	 * @param string $value Language value.
+	 * @return string
+	 */
+	public function url_slug( string $value ): string {
+		return isset( Plugin::get_instance()->get( 'lang_repo' )->get_slug_map()[ $value ] ) ? $value : Util\LanguageValue::slug( $value );
 	}
 
 	/**
@@ -430,29 +409,29 @@ final class Helper {
 	/**
 	 * Get a translated post permalink.
 	 *
-	 * @param int    $post_id Post ID.
-	 * @param string $lang_slug Target language slug.
+	 * @param int|\WP_Post|null $post_id   Post ID, post object, or null for the current post.
+	 * @param string            $lang_slug Target language slug, locale or BCP 47 tag.
 	 * @return string
 	 */
-	public function permalink( int $post_id, string $lang_slug ): string {
+	public function permalink( int|\WP_Post|null $post_id, string $lang_slug ): string {
 		return perflocale_get_permalink( $post_id, $lang_slug );
 	}
 
 	/**
 	 * Get a translated term link.
 	 *
-	 * @param int    $term_id Term ID.
-	 * @param string $lang_slug Target language slug.
+	 * @param int|\WP_Term $term_id   Term ID or term object.
+	 * @param string       $lang_slug Target language slug, locale or BCP 47 tag.
 	 * @return string
 	 */
-	public function term_link( int $term_id, string $lang_slug ): string {
+	public function term_link( int|\WP_Term $term_id, string $lang_slug ): string {
 		return perflocale_get_term_link( $term_id, $lang_slug );
 	}
 
 	/**
 	 * Get a language-specific home URL.
 	 *
-	 * @param string $lang_slug Language slug (empty = current).
+	 * @param string $lang_slug Language slug, locale or BCP 47 tag (empty = current).
 	 * @param string $path Optional path.
 	 * @return string
 	 */
@@ -463,7 +442,9 @@ final class Helper {
 	/**
 	 * Render the language switcher.
 	 *
-	 * @param array<string, mixed> $args Display arguments.
+	 * @since 1.0.7.5 untranslated_link, include and exclude.
+	 *
+	 * @param array<string, mixed> $args Display arguments, as the [perflocale_switcher] shortcode's.
 	 * @return string HTML output.
 	 */
 	public function switcher( array $args = [] ): string {
@@ -491,23 +472,19 @@ final class Helper {
 	 *
 	 * Empty when a singular page has no translation in that language, or the plugin is not booted.
 	 *
-	 * @param string $lang_slug Target language slug.
+	 * @param string $lang_slug Target language slug, locale or BCP 47 tag; an unknown value is reported.
 	 * @return string Translated URL, or empty string when none is available.
 	 */
 	public function current_url( string $lang_slug ): string {
-		if ( $lang_slug === '' ) {
-			return '';
-		}
-
 		$plugin = Plugin::get_instance();
 
-		if ( ! $plugin->has( 'url_converter' ) ) {
+		if ( $lang_slug === '' || ! $plugin->has( 'url_converter' ) ) {
 			return '';
 		}
 
 		$urls = $plugin->get( 'url_converter' )->get_translations_for_current_page();
 
-		return (string) ( $urls[ $lang_slug ] ?? '' );
+		return (string) ( $urls[ $this->url_slug( $lang_slug ) ] ?? '' );
 	}
 
 	/**
@@ -571,12 +548,16 @@ final class Helper {
 	}
 
 	/**
-	 * Get all translations of a post.
+	 * Get all translations of a post, drafts and private posts included unless $public_only.
 	 *
-	 * @param int $post_id Post ID.
+	 * @since 1.0.7.5 $public_only.
+	 *
+	 * @param int  $post_id     Post ID.
+	 * @param bool $public_only Only published members of a viewable post type (core visibility: not passwords, other
+	 *                          plugins' access rules or the current user's rights).
 	 * @return array<string, int> [language_slug => post_id] map.
 	 */
-	public function translations( int $post_id ): array {
+	public function translations( int $post_id, bool $public_only = false ): array {
 		$plugin = Plugin::get_instance();
 
 		if ( ! $plugin->has( 'cache' ) || ! $plugin->has( 'settings' ) ) {
@@ -588,7 +569,9 @@ final class Helper {
 			$plugin->get( 'settings' )
 		);
 
-		return $manager->get_translations( $post_id );
+		$map = $manager->get_translations( $post_id );
+
+		return $public_only ? Util\PublicTranslations::filter( [ $map ] )[0] : $map;
 	}
 
 	/**
@@ -596,10 +579,13 @@ final class Helper {
 	 *
 	 * Every input id gets a key; an unresolvable post maps to an empty array.
 	 *
-	 * @param array<int, int> $post_ids List of post IDs.
+	 * @since 1.0.7.5 $public_only.
+	 *
+	 * @param array<int, int> $post_ids    List of post IDs.
+	 * @param bool            $public_only As in {@see self::translations()}; reads the members in one more query.
 	 * @return array<int, array<string, int>> source_id => [language_slug => post_id]
 	 */
-	public function translations_many( array $post_ids ): array {
+	public function translations_many( array $post_ids, bool $public_only = false ): array {
 		$out = [];
 		foreach ( $post_ids as $pid ) {
 			$out[ (int) $pid ] = [];
@@ -635,7 +621,7 @@ final class Helper {
 			$out[ (int) $source_id ] = $map;
 		}
 
-		return $out;
+		return $public_only ? Util\PublicTranslations::filter( $out ) : $out;
 	}
 
 	/**
@@ -718,88 +704,17 @@ final class Helper {
 	 * Locale-aware number formatting through intl NumberFormatter when available.
 	 *
 	 * Without intl the requested locale's WordPress separators are used, which needs its language pack.
+	 * intl output can hold no-break spaces (U+00A0, U+202F).
+	 *
+	 * @since 1.0.7.5 $lang_slug also takes a locale or BCP 47 tag.
 	 *
 	 * @param float|int   $value     Number to format.
-	 * @param string|null $lang_slug Optional language slug; defaults to current.
+	 * @param string|null $lang_slug Language slug or locale (de_DE, de-AT); null for the current language.
 	 * @param int|null    $decimals  Optional decimal-place override.
 	 * @return string Formatted number.
 	 */
 	public function format_number( $value, ?string $lang_slug = null, ?int $decimals = null ): string {
-		$locale = $this->resolve_locale_for_format( $lang_slug );
-
-		// Try/catch too: on PHP 8.4 the constructor throws for locales ICU rejects (me_ME, nah ship in data/).
-		if ( class_exists( '\\NumberFormatter' ) ) {
-			try {
-				$fmt = new \NumberFormatter( $locale, \NumberFormatter::DECIMAL );
-				if ( $decimals !== null ) {
-					$fmt->setAttribute( \NumberFormatter::FRACTION_DIGITS, max( 0, $decimals ) );
-				}
-				$formatted = $fmt->format( (float) $value );
-				if ( is_string( $formatted ) && $formatted !== '' ) {
-					return $formatted;
-				}
-			} catch ( \Throwable $e ) {
-				unset( $e );
-			}
-		}
-
-		// Derive the decimals (max 3, as intl's DECIMAL style) so both paths keep the fraction.
-		$float = (float) $value;
-
-		if ( $decimals === null ) {
-			$trimmed  = rtrim( rtrim( number_format( $float, 3, '.', '' ), '0' ), '.' );
-			$dot      = strpos( $trimmed, '.' );
-			$decimals = ( false === $dot ) ? 0 : strlen( $trimmed ) - $dot - 1;
-		}
-
-		return $this->number_format_for_locale( $float, max( 0, $decimals ), $locale );
-	}
-
-	/**
-	 * Format a number using a specific locale's separators, without intl.
-	 *
-	 * number_format_i18n() punctuates for the running locale; another locale switches once and is memoised.
-	 * Restore only when switch_to_locale() returned true: false pushed no frame.
-	 *
-	 * @param float  $value    Number.
-	 * @param int    $decimals Decimal places.
-	 * @param string $locale   Target locale, e.g. 'de_DE'.
-	 * @return string
-	 */
-	private function number_format_for_locale( float $value, int $decimals, string $locale ): string {
-		$current = function_exists( 'determine_locale' ) ? determine_locale() : get_locale();
-
-		if ( $locale === '' || $locale === $current || ! function_exists( 'switch_to_locale' ) ) {
-			return number_format_i18n( $value, $decimals );
-		}
-
-		if ( ! isset( self::$number_separator_memo[ $locale ] ) ) {
-			$switched = switch_to_locale( $locale );
-
-			global $wp_locale;
-
-			$separators = isset( $wp_locale->number_format['decimal_point'], $wp_locale->number_format['thousands_sep'] )
-				? [ (string) $wp_locale->number_format['decimal_point'], (string) $wp_locale->number_format['thousands_sep'] ]
-				: null;
-
-			if ( $switched ) {
-				restore_previous_locale();
-			}
-
-			// Store what was found either way, so a locale without a pack does not re-switch per call.
-			self::$number_separator_memo[ $locale ] = $separators;
-		}
-
-		$separators = self::$number_separator_memo[ $locale ];
-
-		if ( $separators === null ) {
-			return number_format_i18n( $value, $decimals );
-		}
-
-		$formatted = number_format( $value, $decimals, $separators[0], $separators[1] );
-
-		// Core's filter: this path stands in for number_format_i18n().
-		return (string) apply_filters( 'number_format_i18n', $formatted, $value, $decimals ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress core 'number_format_i18n' filter; this method stands in for number_format_i18n() on the cross-locale path, so dropping it would make format_number( $x ) and format_number( $x, 'de' ) disagree on a site that customises number punctuation.
+		return Util\FormatLocale::number( $value, $lang_slug, $decimals, __METHOD__ );
 	}
 
 	/**
@@ -807,63 +722,15 @@ final class Helper {
 	 *
 	 * Without intl: "{code} {number}" with two decimals, never a guessed symbol.
 	 *
+	 * @since 1.0.7.5 $lang_slug also takes a locale or BCP 47 tag.
+	 *
 	 * @param float|int   $value         Amount to format.
 	 * @param string      $currency_code ISO 4217 code (USD, EUR, JPY, …).
-	 * @param string|null $lang_slug     Optional language slug; defaults to current.
+	 * @param string|null $lang_slug     Language slug or locale (de_DE, de-AT); null for the current language.
 	 * @return string Formatted amount with currency symbol.
 	 */
 	public function format_currency( $value, string $currency_code, ?string $lang_slug = null ): string {
-		$locale = $this->resolve_locale_for_format( $lang_slug );
-		$code   = strtoupper( trim( $currency_code ) );
-
-		if ( $code === '' ) {
-			return (string) $value;
-		}
-
-		// See format_number(): the constructor throws on a locale ICU rejects.
-		if ( class_exists( '\\NumberFormatter' ) ) {
-			try {
-				$fmt       = new \NumberFormatter( $locale, \NumberFormatter::CURRENCY );
-				$formatted = $fmt->formatCurrency( (float) $value, $code );
-				if ( is_string( $formatted ) && $formatted !== '' ) {
-					return $formatted;
-				}
-			} catch ( \Throwable $e ) {
-				unset( $e );
-			}
-		}
-
-		// No intl: code + amount, punctuated for the requested locale.
-		return $code . ' ' . $this->number_format_for_locale( (float) $value, 2, $locale );
-	}
-
-	/**
-	 * Resolve a locale from a language slug, the current language, or get_locale(), in that order.
-	 *
-	 * @param string|null $lang_slug
-	 * @return string
-	 */
-	private function resolve_locale_for_format( ?string $lang_slug ): string {
-		if ( $lang_slug !== null && $lang_slug !== '' ) {
-			try {
-				$plugin = Plugin::get_instance();
-				if ( $plugin->has( 'lang_repo' ) ) {
-					$lang = $plugin->get( 'lang_repo' )->find_by_slug( $lang_slug );
-					if ( $lang && ! empty( $lang->locale ) ) {
-						return (string) $lang->locale;
-					}
-				}
-			} catch ( \Throwable $e ) {
-				// Fall through to current-language / get_locale().
-			}
-		}
-
-		$current = $this->current_language();
-		if ( $current && ! empty( $current->locale ) ) {
-			return (string) $current->locale;
-		}
-
-		return get_locale();
+		return Util\FormatLocale::currency( $value, $currency_code, $lang_slug, __METHOD__ );
 	}
 
 	/**
@@ -989,42 +856,12 @@ final class Helper {
 	/**
 	 * Whether outward-facing dispatches (webhooks) may fire from this environment.
 	 *
-	 * Fail-closed outside 'production': staging clones carry the production webhook URLs.
-	 *
 	 * @param string $feature Dispatch surface ('webhooks'), so a filter can allow one surface only.
 	 * @return bool True when dispatch may proceed.
+	 * @see Util\OutboundUrl::is_outbound_dispatch_allowed()
 	 */
 	public static function is_outbound_dispatch_allowed( string $feature ): bool {
-		$environment = wp_get_environment_type();
-
-		if ( $environment === 'production' ) {
-			return true;
-		}
-
-		/**
-		 * Allow outward-facing dispatches from non-production environments.
-		 *
-		 * @hook perflocale/dispatch/allow_non_production
-		 *
-		 * @param bool   $allow       Default false.
-		 * @param string $feature     Dispatch surface ('webhooks').
-		 * @param string $environment Current environment type.
-		 */
-		if ( (bool) apply_filters( 'perflocale/dispatch/allow_non_production', false, $feature, $environment ) ) {
-			return true;
-		}
-
-		/**
-		 * Fires when an outward-facing dispatch is blocked by the non-production environment gate.
-		 *
-		 * @hook perflocale/dispatch/blocked
-		 *
-		 * @param string $feature     Dispatch surface that was blocked.
-		 * @param string $environment Current environment type.
-		 */
-		do_action( 'perflocale/dispatch/blocked', $feature, $environment );
-
-		return false;
+		return Util\OutboundUrl::is_outbound_dispatch_allowed( $feature );
 	}
 
 	/**
@@ -1032,15 +869,10 @@ final class Helper {
 	 *
 	 * @param string $locale Locale string (`ar`, `he_IL`, `ckb-IR`, etc.).
 	 * @return string 'rtl' or 'ltr'.
+	 * @see Util\LanguageForm::default_text_direction()
 	 */
 	public static function default_text_direction( string $locale ): string {
-		$parts   = preg_split( '/[_\-]/', trim( $locale ), 2 );
-		$primary = strtolower( (string) ( $parts[0] ?? '' ) );
-
-		// RTL primary language subtags (mirrors data/languages.php RTL rows).
-		static $rtl = [ 'ar', 'arc', 'bal', 'ckb', 'dv', 'fa', 'he', 'ks', 'ps', 'sd', 'ug', 'ur', 'yi' ];
-
-		return in_array( $primary, $rtl, true ) ? 'rtl' : 'ltr';
+		return Util\LanguageForm::default_text_direction( $locale );
 	}
 
 	/**
@@ -1108,178 +940,60 @@ final class Helper {
 	/**
 	 * Ceiling for a "Rows per page" screen option: 40% of max_input_vars.
 	 *
-	 * PHP drops POST fields past max_input_vars, so a larger page bulk-acts on a prefix of the selection.
-	 *
 	 * @param string $option Screen-option name, for the filter.
 	 * @return int
+	 * @see Util\ListScreen::per_page_ceiling()
 	 */
 	public static function per_page_ceiling( string $option = '' ): int {
-		$max_input_vars = (int) ini_get( 'max_input_vars' );
-		$ceiling        = $max_input_vars > 0 ? max( 10, (int) floor( $max_input_vars * 0.4 ) ) : 400;
-
-		/**
-		 * Filter the maximum rows-per-page any PerfLocale list screen will use.
-		 *
-		 * @hook  perflocale/admin/per_page_ceiling
-		 * @since 1.0.5
-		 *
-		 * @param int    $ceiling Computed ceiling.
-		 * @param string $option  Screen-option name.
-		 * @return int
-		 */
-		$ceiling = (int) apply_filters( 'perflocale/admin/per_page_ceiling', $ceiling, $option );
-
-		return max( 1, $ceiling );
+		return Util\ListScreen::per_page_ceiling( $option );
 	}
 
 	/**
 	 * Clamp an effective rows-per-page value.
 	 *
-	 * Applied on read, not only on save, so an oversized stored value is capped; the stored value stays.
-	 *
 	 * @param int    $value   Raw stored value.
 	 * @param int    $default Fallback when unset/invalid.
 	 * @param string $option  Screen-option name, for the filter.
 	 * @return int
+	 * @see Util\ListScreen::normalize_per_page()
 	 */
 	public static function normalize_per_page( int $value, int $default = 20, string $option = '' ): int {
-		if ( $value < 1 ) {
-			$value = $default;
-		}
-
-		return min( max( 1, $value ), self::per_page_ceiling( $option ) );
+		return Util\ListScreen::normalize_per_page( $value, $default, $option );
 	}
 
 	/**
 	 * One line naming post counts by post type, e.g. "Products: 20, Posts: 4".
 	 *
-	 * Plain text: escape at the point of output.
-	 *
 	 * @param array<string, int> $counts Post type => count.
 	 * @return string
+	 * @see Util\ListScreen::post_type_counts_summary()
 	 */
 	public static function post_type_counts_summary( array $counts ): string {
-		$parts = [];
-
-		foreach ( $counts as $type => $count ) {
-			$object  = get_post_type_object( (string) $type );
-			$label   = ( $object instanceof \WP_Post_Type && is_string( $object->labels->name ?? null ) ) ? $object->labels->name : (string) $type;
-			$parts[] = sprintf( '%s: %s', $label, number_format_i18n( (int) $count ) );
-		}
-
-		return implode( ', ', $parts );
+		return Util\ListScreen::post_type_counts_summary( $counts );
 	}
 
 	/**
 	 * Shorten an already-sanitised slug to `$length` bytes without cutting inside a percent-escape.
 	 *
-	 * Walks the encoded slug, never decodes it (decoding breaks `%25`); see docs-ai/11-code-rationale.md.
-	 * The byte bound is load-bearing: force_insert_term()'s "-N" walk spins forever otherwise.
-	 *
 	 * @param string $slug   Slug, already sanitize_title()'d.
 	 * @param int    $length Maximum length to keep.
 	 * @return string Shortened slug, or the input when it already fits.
+	 * @see Util\WriteText::truncate_slug()
 	 */
 	public static function truncate_slug( string $slug, int $length ): string {
-		if ( $length < 1 || strlen( $slug ) <= $length ) {
-			return $slug;
-		}
-
-		$out = '';
-		$i   = 0;
-		$n   = strlen( $slug );
-
-		while ( $i < $n ) {
-			$char = $slug[ $i ];
-
-			$hex = $char === '%' && $i + 2 < $n ? substr( $slug, $i + 1, 2 ) : '';
-
-			// Strspn, not ctype_xdigit: the plugin does not require ext-ctype.
-			if ( $hex !== '' && strspn( $hex, '0123456789abcdefABCDEF' ) === 2 ) {
-				$byte = (int) hexdec( $hex );
-
-				// A lead byte >= 0xC0 makes all escapes of its character one indivisible atom.
-				if ( $byte >= 0xF0 ) {
-					$octets = 4;
-				} elseif ( $byte >= 0xE0 ) {
-					$octets = 3;
-				} elseif ( $byte >= 0xC0 ) {
-					$octets = 2;
-				} else {
-					$octets = 1;
-				}
-
-				$atom = substr( $slug, $i, 3 * $octets );
-			} elseif ( ord( $char ) >= 0x80 ) {
-				// Raw UTF-8 from a third-party `sanitize_title` filter: keep the character whole.
-				$lead   = ord( $char );
-				$octets = $lead >= 0xF0 ? 4 : ( $lead >= 0xE0 ? 3 : ( $lead >= 0xC0 ? 2 : 1 ) );
-				$atom   = substr( $slug, $i, $octets );
-			} else {
-				$atom = $char;
-			}
-
-			if ( strlen( $out ) + strlen( $atom ) > $length ) {
-				break;
-			}
-
-			$out .= $atom;
-			$i   += strlen( $atom );
-		}
-
-		return rtrim( $out, '-' );
+		return Util\WriteText::truncate_slug( $slug, $length );
 	}
 
 	/**
 	 * Sanitise plain text like sanitize_text_field() but without deleting percent-escapes ("100%25 off").
 	 *
-	 * The UTF-8 scrub is needed: wpdb refuses a whole write whose value strip_invalid_text() would change.
-	 * Takes mixed: REST sanitize_callbacks pass whatever the client sent, and strict_types would throw.
-	 *
-	 * @param mixed $str           Raw value; anything not a string yields ''.
+	 * @param mixed $str           Raw value; a scalar is cast to a string, anything else yields ''.
 	 * @param bool  $keep_newlines Keep line breaks (excerpt) or collapse them (title).
 	 * @return string Sanitised text.
+	 * @see Util\WriteText::sanitize_plain_text()
 	 */
 	public static function sanitize_plain_text( $str, bool $keep_newlines = false ): string {
-		if ( ! is_scalar( $str ) ) {
-			return '';
-		}
-
-		$str = (string) $str;
-
-		if ( $str === '' ) {
-			return '';
-		}
-
-		// One PCRE pass proves validity; a valid subject never enters the scrub.
-		if ( preg_match( '//u', $str ) !== 1 ) {
-			// Same alternation as wpdb::strip_invalid_text(): valid sequences kept, other bytes dropped.
-			$str = (string) preg_replace(
-				'/([\x00-\x7F]'
-				. '|[\xC2-\xDF][\x80-\xBF]'
-				. '|\xE0[\xA0-\xBF][\x80-\xBF]'
-				. '|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}'
-				. '|\xED[\x80-\x9F][\x80-\xBF]'
-				. '|\xF0[\x90-\xBF][\x80-\xBF]{2}'
-				. '|[\xF1-\xF3][\x80-\xBF]{3}'
-				. '|\xF4[\x80-\x8F][\x80-\xBF]{2})|./s',
-				'$1',
-				$str
-			);
-		}
-
-		// Core's tag handling verbatim, to match sanitize_text_field() on markup.
-		if ( str_contains( $str, '<' ) ) {
-			$str = wp_pre_kses_less_than( $str );
-			$str = wp_strip_all_tags( $str, false );
-			$str = str_replace( "<\n", '&lt;' . "\n", $str );
-		}
-
-		if ( ! $keep_newlines ) {
-			$str = (string) preg_replace( '/[\r\n\t ]+/', ' ', $str );
-		}
-
-		return trim( $str );
+		return Util\WriteText::sanitize_plain_text( $str, $keep_newlines );
 	}
 
 	/**
@@ -1291,7 +1005,7 @@ final class Helper {
 	 * @return string
 	 */
 	public static function sanitize_plain_text_field( $value ): string {
-		return self::sanitize_plain_text( $value, false );
+		return Util\WriteText::sanitize_plain_text( $value, false );
 	}
 
 	/**
@@ -1301,7 +1015,7 @@ final class Helper {
 	 * @return string
 	 */
 	public static function sanitize_plain_textarea_field( $value ): string {
-		return self::sanitize_plain_text( $value, true );
+		return Util\WriteText::sanitize_plain_text( $value, true );
 	}
 
 	/**
@@ -1336,436 +1050,68 @@ final class Helper {
 	/**
 	 * True when `$ip` is a syntactically valid IPv6 literal.
 	 *
-	 * @see is_ip()
-	 *
 	 * @param string $ip Candidate address.
+	 * @return bool
+	 * @see Util\OutboundUrl::is_ipv6()
 	 */
 	public static function is_ipv6( string $ip ): bool {
-		if ( ! function_exists( 'inet_pton' ) || $ip === '' || strpos( $ip, "\0" ) !== false ) {
-			return false;
-		}
-
-		$bin = inet_pton( $ip );
-
-		return $bin !== false && strlen( $bin ) === 16;
+		return Util\OutboundUrl::is_ipv6( $ip );
 	}
 
 	/**
 	 * True when `$ip` (IPv4 or IPv6) is public, as filter_var's NO_PRIV_RANGE | NO_RES_RANGE judges it.
 	 *
-	 * Do not add blocks: GeoRedirect uses it for visitors; outbound guards use is_public_outbound_address().
-	 * Rejecting dotted-quad IPv6 reproduces PHP's quirk: dropping it loosens an SSRF guard.
-	 *
 	 * @param string $ip Candidate address.
 	 */
 	public static function is_public_ipv4( string $ip ): bool {
-		if ( ! function_exists( 'inet_pton' ) || $ip === '' || strpos( $ip, "\0" ) !== false ) {
-			return false;
-		}
-
-		$bin = inet_pton( $ip );
-
-		if ( $bin === false ) {
-			return false;
-		}
-
-		if ( strlen( $bin ) === 4 ) {
-			$a = ord( $bin[0] );
-			$b = ord( $bin[1] );
-
-			// Unspecified, private class A, and loopback blocks.
-			if ( $a === 0 || $a === 10 || $a === 127 ) {
-				return false;
-			}
-
-			// Link-local, which is where the cloud metadata address lives.
-			if ( $a === 169 && $b === 254 ) {
-				return false;
-			}
-
-			// The private class B block.
-			if ( $a === 172 && ( $b & 0xF0 ) === 16 ) {
-				return false;
-			}
-
-			// The private class C block.
-			if ( $a === 192 && $b === 168 ) {
-				return false;
-			}
-
-			// Reserved space, which also covers the broadcast address.
-			if ( ( $a & 0xF0 ) === 240 ) {
-				return false;
-			}
-
-			return true;
-		}
-
-		// PHP rejects every IPv6 literal with an embedded dotted quad.
-		if ( strpos( $ip, '.' ) !== false ) {
-			return false;
-		}
-
-		// The unspecified address and loopback.
-		if ( $bin === str_repeat( "\x00", 16 ) || $bin === str_repeat( "\x00", 15 ) . "\x01" ) {
-			return false;
-		}
-
-		// IPv4-mapped ::ffff:0:0/96, checked in bytes: it also has a hex-only spelling.
-		if ( substr( $bin, 0, 10 ) === str_repeat( "\x00", 10 ) && substr( $bin, 10, 2 ) === "\xFF\xFF" ) {
-			return false;
-		}
-
-		$first = ord( $bin[0] );
-
-		// Unique-local addresses.
-		if ( ( $first & 0xFE ) === 0xFC ) {
-			return false;
-		}
-
-		// Link-local addresses.
-		if ( $first === 0xFE && ( ord( $bin[1] ) & 0xC0 ) === 0x80 ) {
-			return false;
-		}
-
-		return true;
+		return Util\IpAddress::is_public_ipv4( $ip );
 	}
 
 	/**
 	 * True when an outbound request (webhook, machine translation) may connect to `$ip`.
 	 *
-	 * Refuses what is_public_ipv4() refuses plus the IANA blocks that are not globally reachable, as core does.
-	 * Internal MT endpoints go through the `perflocale/mt/trusted_hosts` filter, never through this check.
-	 *
 	 * @param string $ip Candidate address.
+	 * @return bool
+	 * @see Util\OutboundUrl::is_public_outbound_address()
 	 */
 	public static function is_public_outbound_address( string $ip ): bool {
-		if ( ! self::is_public_ipv4( $ip ) ) {
-			return false;
-		}
-
-		$bin = inet_pton( $ip );
-
-		if ( $bin === false ) {
-			return false;
-		}
-
-		if ( strlen( $bin ) === 4 ) {
-			$a = ord( $bin[0] );
-			$b = ord( $bin[1] );
-			$c = ord( $bin[2] );
-
-			// Shared address space (carrier-grade NAT), 100.64.0.0/10.
-			if ( $a === 100 && ( $b & 0xC0 ) === 64 ) {
-				return false;
-			}
-
-			// IETF 192.0.0.0/24, documentation 192.0.2.0/24, 6to4 relay 192.88.99.0/24.
-			if ( $a === 192 && ( ( $b === 0 && ( $c === 0 || $c === 2 ) ) || ( $b === 88 && $c === 99 ) ) ) {
-				return false;
-			}
-
-			// Benchmarking 198.18.0.0/15 and documentation 198.51.100.0/24.
-			if ( $a === 198 && ( ( $b & 0xFE ) === 18 || ( $b === 51 && $c === 100 ) ) ) {
-				return false;
-			}
-
-			// Documentation 203.0.113.0/24.
-			if ( $a === 203 && $b === 0 && $c === 113 ) {
-				return false;
-			}
-
-			// Multicast 224.0.0.0/4.
-			if ( ( $a & 0xF0 ) === 224 ) {
-				return false;
-			}
-
-			return true;
-		}
-
-		// NAT64 64:ff9b::/96: judged by the IPv4 address in the last four bytes.
-		if ( substr( $bin, 0, 12 ) === "\x00\x64\xFF\x9B" . str_repeat( "\x00", 8 ) ) {
-			$embedded = inet_ntop( substr( $bin, 12, 4 ) );
-
-			return false !== $embedded && self::is_public_outbound_address( $embedded );
-		}
-
-		// 6to4 2002::/16: the IPv4 address is in bytes 2 to 5.
-		if ( substr( $bin, 0, 2 ) === "\x20\x02" ) {
-			$embedded = inet_ntop( substr( $bin, 2, 4 ) );
-
-			return false !== $embedded && self::is_public_outbound_address( $embedded );
-		}
-
-		// IPv4-compatible ::/96 (which also holds :: and ::1).
-		if ( substr( $bin, 0, 12 ) === str_repeat( "\x00", 12 ) ) {
-			return false;
-		}
-
-		// IPv4-translated ::ffff:0:0:0/96.
-		if ( substr( $bin, 0, 12 ) === str_repeat( "\x00", 8 ) . "\xFF\xFF\x00\x00" ) {
-			return false;
-		}
-
-		// Local-use NAT64 64:ff9b:1::/48.
-		if ( substr( $bin, 0, 6 ) === "\x00\x64\xFF\x9B\x00\x01" ) {
-			return false;
-		}
-
-		// Teredo 2001::/32, ORCHID 2001:10::/28 and 2001:20::/28, documentation 2001:db8::/32.
-		if ( substr( $bin, 0, 2 ) === "\x20\x01" ) {
-			$third  = ord( $bin[2] );
-			$fourth = ord( $bin[3] );
-
-			if ( $third === 0x00 && ( $fourth === 0x00 || ( $fourth & 0xF0 ) === 0x10 || ( $fourth & 0xF0 ) === 0x20 ) ) {
-				return false;
-			}
-
-			if ( $third === 0x0D && $fourth === 0xB8 ) {
-				return false;
-			}
-		}
-
-		// Documentation 3fff::/20.
-		if ( substr( $bin, 0, 2 ) === "\x3F\xFF" && ( ord( $bin[2] ) & 0xF0 ) === 0x00 ) {
-			return false;
-		}
-
-		// Discard-only 100::/64.
-		if ( substr( $bin, 0, 8 ) === "\x01\x00" . str_repeat( "\x00", 6 ) ) {
-			return false;
-		}
-
-		$first = ord( $bin[0] );
-
-		// Site-local fec0::/10.
-		if ( $first === 0xFE && ( ord( $bin[1] ) & 0xC0 ) === 0xC0 ) {
-			return false;
-		}
-
-		// Multicast ff00::/8.
-		if ( $first === 0xFF ) {
-			return false;
-		}
-
-		return true;
+		return Util\OutboundUrl::is_public_outbound_address( $ip );
 	}
 
 	/**
 	 * Run wp_remote_request() pinned to addresses the caller already judged, against DNS rebinding.
-	 *
-	 * cURL gets CURLOPT_RESOLVE; fsockopen https re-checks the lookup, since a rewritten socket breaks SNI.
-	 * Nothing is pinned without a valid `$ip` or behind a proxy; see docs-ai/11-code-rationale.md.
 	 *
 	 * @param string       $url  Request URL.
 	 * @param array<mixed> $args wp_remote_request() arguments.
 	 * @param string       $ip   Address to connect to; '' for none.
 	 * @param array<mixed> $more Further judged addresses of the same host, listed after `$ip`.
 	 * @return array<string, mixed>|\WP_Error wp_remote_request()'s result.
+	 * @see Util\OutboundUrl::remote_request_pinned()
 	 */
 	public static function remote_request_pinned( string $url, array $args, string $ip, array $more = [] ): array|\WP_Error {
-		$pins = self::connection_pins( $url, $ip, $more );
-
-		foreach ( $pins as $hook => $pin ) {
-			add_action( $hook, $pin, 10, 1 );
-		}
-
-		try {
-			return wp_remote_request( $url, $args );
-		} finally {
-			foreach ( $pins as $hook => $pin ) {
-				remove_action( $hook, $pin, 10 );
-			}
-		}
-	}
-
-	/**
-	 * The two transport callbacks {@see remote_request_pinned()} hooks for one
-	 * request, keyed by hook name; empty when nothing is pinned.
-	 *
-	 * @param string       $url  Request URL.
-	 * @param string       $ip   Address to connect to; '' for none.
-	 * @param array<mixed> $more Further judged addresses, listed after `$ip`.
-	 * @return array<string, \Closure>
-	 */
-	private static function connection_pins( string $url, string $ip, array $more = [] ): array {
-		$host = wp_parse_url( $url, PHP_URL_HOST );
-
-		if ( '' === $ip || ! is_string( $host ) || '' === $host || ! self::is_ip( $ip ) ) {
-			return [];
-		}
-
-		$proxy = new \WP_HTTP_Proxy();
-
-		if ( $proxy->is_enabled() && $proxy->send_through_proxy( $url ) ) {
-			return [];
-		}
-
-		$host    = strtolower( $host );
-		$https   = 'https' === strtolower( (string) wp_parse_url( $url, PHP_URL_SCHEME ) );
-		$port    = (int) wp_parse_url( $url, PHP_URL_PORT );
-		$port    = $port > 0 ? $port : ( $https ? 443 : 80 );
-		$address = self::is_ipv6( $ip ) ? '[' . $ip . ']' : $ip;
-		$list    = [ $address ];
-
-		foreach ( $more as $other ) {
-			if ( is_string( $other ) && self::is_ip( $other ) ) {
-				$list[] = self::is_ipv6( $other ) ? '[' . $other . ']' : $other;
-			}
-		}
-
-		$entry = $host . ':' . $port . ':' . implode( ',', array_unique( $list ) );
-
-		return [
-			'http_api_curl'                    => static function ( $handle ) use ( $entry ): void {
-				if ( $handle instanceof \CurlHandle ) {
-					// phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_setopt -- one option on the handle WP_Http created for this wp_remote_request().
-					curl_setopt( $handle, CURLOPT_RESOLVE, [ $entry ] );
-				}
-			},
-			'requests-fsockopen.remote_socket' => static function ( &$remote_socket ) use ( $host, $port, $address, $https ): void {
-				if ( ! is_string( $remote_socket ) ) {
-					return;
-				}
-
-				$socket = strtolower( $remote_socket );
-
-				if ( ! $https && 'tcp://' . $host . ':' . $port === $socket ) {
-					$remote_socket = 'tcp://' . $address . ':' . $port;
-
-					return;
-				}
-
-				if ( $https && 'ssl://' . $host . ':' . $port === $socket && ! self::is_public_outbound_address( gethostbyname( $host ) ) ) {
-					// The throw skips Requests' own restore of its connect error handler.
-					restore_error_handler();
-
-					throw new \WpOrg\Requests\Exception( 'The host resolves to a non-public address.', 'perflocale_pin' );
-				}
-			},
-		];
+		return Util\OutboundUrl::remote_request_pinned( $url, $args, $ip, $more );
 	}
 
 	/**
 	 * True when `$url` parses as a syntactically valid URL; uses filter_var when it exists.
 	 *
-	 * The fallback is stricter than filter_var, never looser (it guards SSRF checks); see docs-ai/11-code-rationale.md.
-	 *
 	 * @param string $url Candidate URL.
+	 * @return bool
+	 * @see Util\OutboundUrl::is_valid_url()
 	 */
 	public static function is_valid_url( string $url ): bool {
-		if ( function_exists( 'filter_var' ) ) {
-			return filter_var( $url, FILTER_VALIDATE_URL ) !== false;
-		}
-
-		$len = strlen( $url );
-
-		if ( $len === 0 || $len > 2048 ) {
-			return false;
-		}
-
-		// Printable ASCII only, as FILTER_VALIDATE_URL.
-		for ( $i = 0; $i < $len; $i++ ) {
-			$ord = ord( $url[ $i ] );
-
-			if ( $ord < 0x21 || $ord > 0x7E ) {
-				return false;
-			}
-		}
-
-		// Every per cent must introduce exactly two hex digits, as filter_var requires.
-		$pos = 0;
-
-		while ( ( $pos = strpos( $url, '%', $pos ) ) !== false ) {
-			if ( $pos + 2 >= $len || strspn( substr( $url, $pos + 1, 2 ), '0123456789abcdefABCDEF' ) !== 2 ) {
-				return false;
-			}
-
-			$pos += 3;
-		}
-
-		// phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- wp_parse_url() is deliberately NOT used: this branch runs only when ext-filter is absent, and it must stay loadable without WordPress so the gate can exercise it in a subprocess. The two differ only for protocol-relative and root-relative URLs, which the scheme test below rejects anyway.
-		$parts = parse_url( $url );
-
-		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
-			return false;
-		}
-
-		if ( ! in_array( strtolower( (string) ( $parts['scheme'] ?? '' ) ), [ 'http', 'https' ], true ) ) {
-			return false;
-		}
-
-		// Userinfo refused outright: filter_var's own userinfo rule cannot be matched without looser cases.
-		if ( isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
-			return false;
-		}
-
-		$host = (string) $parts['host'];
-
-		if ( $host[0] === '[' ) {
-			// Brackets only around IPv6: filter_var rejects a bracketed IPv4, hence the length test.
-			if ( substr( $host, -1 ) !== ']' || ! function_exists( 'inet_pton' ) ) {
-				return false;
-			}
-
-			$literal = substr( $host, 1, -1 );
-
-			if ( $literal === '' || strpos( $literal, "\0" ) !== false ) {
-				return false;
-			}
-
-			$packed = inet_pton( $literal );
-
-			return $packed !== false && strlen( $packed ) === 16;
-		}
-
-		$probe = substr( $host, -1 ) === '.' ? substr( $host, 0, -1 ) : $host;
-
-		if ( $probe === '' || strlen( $probe ) > 253 ) {
-			return false;
-		}
-
-		foreach ( explode( '.', $probe ) as $label ) {
-			$label_len = strlen( $label );
-
-			if ( $label_len === 0 || $label_len > 63 ) {
-				return false;
-			}
-
-			if ( $label[0] === '-' || $label[ $label_len - 1 ] === '-' ) {
-				return false;
-			}
-
-			if ( strspn( $label, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-' ) !== $label_len ) {
-				return false;
-			}
-		}
-
-		return true;
+		return Util\OutboundUrl::is_valid_url( $url );
 	}
 
 	/**
 	 * Exact native replacement for `filter_var( $v, FILTER_VALIDATE_BOOLEAN )`.
 	 *
-	 * Not wp_validate_boolean() or rest_sanitize_boolean(): both map "off" and "no" to true.
-	 *
 	 * @param mixed $value Candidate.
+	 * @return bool
+	 * @see Util\WriteText::to_bool()
 	 */
 	public static function to_bool( $value ): bool {
-		if ( is_bool( $value ) ) {
-			return $value;
-		}
-
-		if ( is_int( $value ) || is_float( $value ) ) {
-			return (float) $value === 1.0;
-		}
-
-		if ( ! is_string( $value ) ) {
-			return false;
-		}
-
-		// Explicit charlist: filter_var trims these, but not NUL as the default trim() does.
-		return in_array( strtolower( trim( $value, " \t\n\r\x0B" ) ), [ '1', 'true', 'on', 'yes' ], true );
+		return Util\WriteText::to_bool( $value );
 	}
 
 	/**
@@ -1870,156 +1216,6 @@ final class Helper {
 	}
 
 	/**
-	 * Suggest a region-qualified slug (`en` -> `en-us`) for a bare slug, from its locale or flag.
-	 *
-	 * Returns '' when the slug already has a region or none can be derived.
-	 *
-	 * @internal Admin-form helper for the Languages page. Not part of
-	 *           the @api surface - signature and heuristics may change.
-	 *
-	 * @param object $language Language row (`->slug`, `->locale`).
-	 * @return string Suggested slug, e.g. `en-us`, or empty string.
-	 */
-	public static function suggest_region_qualified_slug( object $language ): string {
-		$slug   = strtolower( (string) ( $language->slug ?? '' ) );
-		$locale = (string) ( $language->locale ?? '' );
-		$flag   = strtolower( (string) ( $language->flag ?? '' ) );
-
-		if ( $slug === '' || strpos( $slug, '-' ) !== false ) {
-			return '';
-		}
-
-		// Primary: derive region from the WP locale (`en_US` → `us`).
-		$region = '';
-		$parts  = explode( '_', $locale );
-
-		if ( count( $parts ) >= 2 && self::is_ascii_alpha( $parts[1] ) ) {
-			$region = strtolower( $parts[1] );
-		}
-
-		// Fallback for region-less locales (`ar`): the flag column holds an ISO code or a flag emoji.
-		if ( $region === '' && $flag !== '' ) {
-			if ( self::is_ascii_alpha( $flag ) && strlen( $flag ) === 2 ) {
-				$region = $flag;
-			} else {
-				$decoded = self::region_code_from_flag_emoji( $flag );
-
-				if ( $decoded !== '' ) {
-					$region = $decoded;
-				}
-			}
-		}
-
-		if ( $region === '' ) {
-			return '';
-		}
-
-		$suggested = $slug . '-' . $region;
-
-		return $suggested === $slug ? '' : $suggested;
-	}
-
-	/**
-	 * Active bare slugs whose own language family has a region-qualified member (`en` with `en-GB`).
-	 *
-	 * Same family only: a lone `de` beside `fr-FR` is intentional and is never flagged.
-	 *
-	 * @internal Admin-form helper for the Languages page rename-nudge UX.
-	 *           Not part of the @api surface.
-	 *
-	 * @param array<int, object> $languages All active languages.
-	 * @return array<int, array{language: object, suggested: string}>
-	 */
-	public static function detect_bare_languages_with_region_siblings( array $languages ): array {
-		// Group by family: the slug part before the first `-`.
-		$families = [];
-
-		foreach ( $languages as $lang ) {
-			$slug = strtolower( (string) ( $lang->slug ?? '' ) );
-
-			if ( $slug === '' ) {
-				continue;
-			}
-
-			$dash   = strpos( $slug, '-' );
-			$family = $dash === false ? $slug : substr( $slug, 0, $dash );
-
-			$families[ $family ][] = $lang;
-		}
-
-		$out = [];
-
-		foreach ( $families as $family => $members ) {
-			$bare           = null;
-			$has_region_var = false;
-
-			foreach ( $members as $m ) {
-				$slug = strtolower( (string) $m->slug );
-
-				if ( $slug === $family ) {
-					$bare = $m;
-				} elseif ( strpos( $slug, '-' ) !== false ) {
-					$has_region_var = true;
-				}
-			}
-
-			if ( $bare === null || ! $has_region_var ) {
-				// No bare member, or no region member: nothing asymmetric.
-				continue;
-			}
-
-			$suggested = self::suggest_region_qualified_slug( $bare );
-
-			if ( $suggested === '' ) {
-				continue; // No region target.
-			}
-
-			$out[] = [
-				'language'  => $bare,
-				'suggested' => $suggested,
-			];
-		}
-
-		return $out;
-	}
-
-	/**
-	 * Bare-slug rename candidates for the Add-Language form, with no region-sibling requirement.
-	 *
-	 * The form is where the sibling gets added, so waiting for one would nudge too late.
-	 *
-	 * @internal Admin-form helper for the Languages page. Not part of the
-	 *           @api surface.
-	 *
-	 * @param array<int, object> $languages All active languages.
-	 * @return array<int, array{language: object, suggested: string}>
-	 */
-	public static function bare_language_rename_candidates_for_form( array $languages ): array {
-		$out = [];
-
-		foreach ( $languages as $lang ) {
-			$slug = strtolower( (string) ( $lang->slug ?? '' ) );
-
-			if ( $slug === '' || strpos( $slug, '-' ) !== false ) {
-				continue;
-			}
-
-			$suggested = self::suggest_region_qualified_slug( $lang );
-
-			if ( $suggested === '' ) {
-				continue;
-			}
-
-			$out[] = [
-				'language'  => $lang,
-				'suggested' => $suggested,
-			];
-		}
-
-		return $out;
-	}
-
-	/**
 	 * Get the emoji flag for a language object.
 	 *
 	 * Tries the flag field first, then derives from locale or slug.
@@ -2077,28 +1273,10 @@ final class Helper {
 	 *
 	 * @param string $emoji Two regional-indicator codepoints.
 	 * @return string Lowercase 2-letter region code, or '' on no match.
+	 * @see Util\LanguageForm::region_code_from_flag_emoji()
 	 */
 	public static function region_code_from_flag_emoji( string $emoji ): string {
-		// Byte-level decode, not mb_ord(): core polyfills it only from WP 7.1 and mbstring is optional.
-		if ( strlen( $emoji ) !== 8 ) {
-			return '';
-		}
-
-		$prefix = "\xF0\x9F\x87";
-
-		if ( substr( $emoji, 0, 3 ) !== $prefix || substr( $emoji, 4, 3 ) !== $prefix ) {
-			return '';
-		}
-
-		$b1 = ord( $emoji[3] );
-		$b2 = ord( $emoji[7] );
-
-		// Trailing byte A6..BF maps to A..Z.
-		if ( $b1 < 0xA6 || $b1 > 0xBF || $b2 < 0xA6 || $b2 > 0xBF ) {
-			return '';
-		}
-
-		return chr( ord( 'a' ) + ( $b1 - 0xA6 ) ) . chr( ord( 'a' ) + ( $b2 - 0xA6 ) );
+		return Util\LanguageForm::region_code_from_flag_emoji( $emoji );
 	}
 
 	/**
@@ -2129,278 +1307,169 @@ final class Helper {
 	 * Get an initialized WP_Filesystem instance, or null on failure.
 	 *
 	 * @return \WP_Filesystem_Base|null Filesystem instance or null on failure.
+	 * @see Util\Uploads::filesystem()
 	 */
 	public static function filesystem(): ?\WP_Filesystem_Base {
-		global $wp_filesystem;
-
-		if ( $wp_filesystem instanceof \WP_Filesystem_Base ) {
-			return $wp_filesystem;
-		}
-
-		if ( ! function_exists( 'WP_Filesystem' ) ) {
-			require_once ABSPATH . 'wp-admin/includes/file.php';
-		}
-
-		if ( ! WP_Filesystem() ) {
-			return null;
-		}
-
-		/** @var \WP_Filesystem_Base|mixed $wp_filesystem */
-		return $wp_filesystem instanceof \WP_Filesystem_Base ? $wp_filesystem : null;
+		return Util\Uploads::filesystem();
 	}
 
 	/**
 	 * Absolute path of the plugin's per-blog uploads directory, `uploads/perflocale`.
 	 *
 	 * @return string Absolute path WITHOUT trailing slash.
+	 * @see Util\Uploads::uploads_base_dir()
 	 */
 	public static function uploads_base_dir(): string {
-		$upload = wp_upload_dir();
-		$base   = isset( $upload['basedir'] ) ? (string) $upload['basedir'] : '';
-		return $base === '' ? '' : trailingslashit( $base ) . 'perflocale';
+		return Util\Uploads::uploads_base_dir();
 	}
 
 	/**
 	 * Generated translation files dir, `uploads/perflocale/translations/`.
 	 *
 	 * @return string
+	 * @see Util\Uploads::uploads_translations_dir()
 	 */
 	public static function uploads_translations_dir(): string {
-		$base = self::uploads_base_dir();
-		return $base === '' ? '' : $base . '/translations';
+		return Util\Uploads::uploads_translations_dir();
 	}
 
 	/**
 	 * Scratch dir for in-flight imports, `uploads/perflocale/temp/`.
 	 *
 	 * @return string
+	 * @see Util\Uploads::uploads_temp_dir()
 	 */
 	public static function uploads_temp_dir(): string {
-		$base = self::uploads_base_dir();
-		return $base === '' ? '' : $base . '/temp';
+		return Util\Uploads::uploads_temp_dir();
 	}
 
 	/**
 	 * Export bundle dir, `uploads/perflocale/exports/`.
 	 *
 	 * @return string
+	 * @see Util\Uploads::uploads_exports_dir()
 	 */
 	public static function uploads_exports_dir(): string {
-		$base = self::uploads_base_dir();
-		return $base === '' ? '' : $base . '/exports';
+		return Util\Uploads::uploads_exports_dir();
 	}
 
 	/**
 	 * Daily backstop sweep of old temp and export files whose own delete event never ran.
 	 *
-	 * Never deletes the directory's hardening files.
-	 *
 	 * @param int $max_age_days Files older than this (default: 7) are removed.
 	 * @return int Number of files deleted.
+	 * @see Util\Uploads::gc_stale_upload_files()
 	 */
 	public static function gc_stale_upload_files( int $max_age_days = 7 ): int {
-		$cutoff  = time() - ( $max_age_days * DAY_IN_SECONDS );
-		$dirs    = [ self::uploads_temp_dir(), self::uploads_exports_dir() ];
-		$skip    = [ '.htaccess', 'index.php', 'web.config' ];
-		$removed = 0;
-
-		foreach ( $dirs as $dir ) {
-			if ( $dir === '' || ! is_dir( $dir ) ) {
-				continue;
-			}
-			// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- @ suppresses the warning when the dir is unreadable mid-sweep; the === false check on the next line skips that dir.
-			$dh = @opendir( $dir );
-			if ( $dh === false ) {
-				continue;
-			}
-			while ( ( $entry = readdir( $dh ) ) !== false ) {
-				if ( $entry === '.' || $entry === '..' || in_array( $entry, $skip, true ) ) {
-					continue;
-				}
-				$path = trailingslashit( $dir ) . $entry;
-				if ( ! is_file( $path ) ) {
-					continue;
-				}
-				// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- @ silences the stat warning when a file disappears between readdir() and this call; the === false check below skips it.
-				$mtime = @filemtime( $path );
-				if ( $mtime === false || $mtime > $cutoff ) {
-					continue;
-				}
-				if ( wp_delete_file( $path ) || ! file_exists( $path ) ) {
-					++$removed;
-				}
-			}
-			closedir( $dh );
-		}
-
-		return $removed;
+		return Util\Uploads::gc_stale_upload_files( $max_age_days );
 	}
 
 	/**
 	 * Ensure the plugin's base uploads dir exists and is hardened; subdirs harden themselves on creation.
 	 *
 	 * @return void
+	 * @see Util\Uploads::ensure_uploads_base_dir()
 	 */
 	public static function ensure_uploads_base_dir(): void {
-		$base = self::uploads_base_dir();
-		if ( $base === '' ) {
-			return;
-		}
-		if ( ! is_dir( $base ) ) {
-			wp_mkdir_p( $base );
-		}
-		self::harden_directory( $base );
+		Util\Uploads::ensure_uploads_base_dir();
 	}
 
 	/**
-	 * Write `.htaccess` (Deny from all) and `index.php` into a plugin-owned directory, once each.
-	 *
-	 * Defence in depth only (nginx ignores .htaccess): the random file names are the access control,
-	 * so never shorten those tokens on the strength of this file. No web.config, by WordPress convention.
+	 * Write `.htaccess` (Util\Uploads::HTACCESS) and `index.php` into a plugin-owned directory, once each.
 	 *
 	 * @param string $dir Absolute filesystem path to an existing directory.
 	 * @return void
+	 * @see Util\Uploads::harden_directory()
 	 */
 	public static function harden_directory( string $dir ): void {
-		if ( $dir === '' || ! is_dir( $dir ) ) {
-			return;
-		}
-
-		$mode = defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644;
-
-		// Without WP_Filesystem (ftpext, no credentials) write directly: this PHP user created the dir.
-		$fs    = self::filesystem();
-		$files = [
-			trailingslashit( $dir ) . '.htaccess' => "Deny from all\n",
-			trailingslashit( $dir ) . 'index.php' => "<?php\n// Silence is golden.\n",
-		];
-
-		foreach ( $files as $file => $contents ) {
-			if ( $fs instanceof \WP_Filesystem_Base ) {
-				if ( ! $fs->exists( $file ) ) {
-					$fs->put_contents( $file, $contents, $mode );
-				}
-				continue;
-			}
-
-			if ( file_exists( $file ) ) {
-				continue;
-			}
-
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents, WordPress.PHP.NoSilencedErrors.Discouraged -- WP_Filesystem being unavailable is the entire reason this branch exists, so there is nothing to route through; @ keeps an unwritable directory from emitting a warning into an AJAX/REST body, exactly as gc_stale_upload_files() does above.
-			@file_put_contents( $file, $contents );
-		}
+		Util\Uploads::harden_directory( $dir );
 	}
 
 	/**
-	 * Date format for the current language, with site-default fallback.
+	 * Date format for a language, with site-default fallback.
 	 *
+	 * @since 1.0.7.5 $lang.
+	 *
+	 * @param string|null $lang Language slug or locale (de_DE, de-AT); null for the current language.
 	 * @return string
 	 */
-	public function date_format(): string {
-		return self::date_format_for_language( $this->current_language() );
+	public function date_format( ?string $lang = null ): string {
+		return Util\FormatLocale::date_format( $lang, __METHOD__ );
 	}
 
 	/**
-	 * Time format for the current language. See {@see self::date_format()}.
+	 * Time format for a language. See {@see self::date_format()}.
 	 *
+	 * @since 1.0.7.5 $lang.
+	 *
+	 * @param string|null $lang Language slug or locale; null for the current language.
 	 * @return string
 	 */
-	public function time_format(): string {
-		return self::time_format_for_language( $this->current_language() );
+	public function time_format( ?string $lang = null ): string {
+		return Util\FormatLocale::time_format( $lang, __METHOD__ );
 	}
 
 	/**
-	 * Combined date+time format for the current language.
+	 * Combined date+time format for a language.
 	 *
+	 * @since 1.0.7.5 $lang.
+	 *
+	 * @param string|null $lang Language slug or locale; null for the current language.
 	 * @return string
 	 */
-	public function datetime_format(): string {
-		return self::datetime_format_for_language( $this->current_language() );
+	public function datetime_format( ?string $lang = null ): string {
+		return Util\FormatLocale::datetime_format( $lang, __METHOD__ );
 	}
 
 	/**
-	 * Render a timestamp with wp_date() in the current language's date format.
+	 * Render a timestamp with wp_date() in a language's date format and month names.
 	 *
-	 * @param int|string|null $timestamp Unix timestamp, parseable string, or null for now.
+	 * @since 1.0.7.5 $lang.
+	 *
+	 * @param int|string|\DateTimeInterface|null $timestamp Unix timestamp, date string (site time unless it has an offset), or null for now.
+	 * @param string|null                        $lang      Language slug or locale; null for the current language.
 	 * @return string Formatted date, or empty string on parse failure.
 	 */
-	public function format_date( $timestamp = null ): string {
-		$ts = $this->normalize_timestamp( $timestamp );
-		if ( $ts === null ) {
-			return '';
-		}
-		return (string) wp_date( $this->date_format(), $ts );
+	public function format_date( $timestamp = null, ?string $lang = null ): string {
+		return Util\FormatLocale::timestamp( $timestamp, $this->date_format( $lang ), $lang );
 	}
 
 	/**
-	 * Render a timestamp using the current language's time format.
+	 * Render a timestamp using a language's time format.
 	 *
-	 * @param int|string|null $timestamp
+	 * @since 1.0.7.5 $lang.
+	 *
+	 * @param int|string|\DateTimeInterface|null $timestamp See {@see self::format_date()}.
+	 * @param string|null                        $lang      Language slug or locale; null for the current language.
 	 * @return string
 	 */
-	public function format_time( $timestamp = null ): string {
-		$ts = $this->normalize_timestamp( $timestamp );
-		if ( $ts === null ) {
-			return '';
-		}
-		return (string) wp_date( $this->time_format(), $ts );
+	public function format_time( $timestamp = null, ?string $lang = null ): string {
+		return Util\FormatLocale::timestamp( $timestamp, $this->time_format( $lang ), $lang );
 	}
 
 	/**
-	 * Render a timestamp using the current language's combined datetime format.
+	 * Render a timestamp using a language's combined datetime format.
 	 *
-	 * @param int|string|null $timestamp
+	 * @since 1.0.7.5 $lang.
+	 *
+	 * @param int|string|\DateTimeInterface|null $timestamp See {@see self::format_date()}.
+	 * @param string|null                        $lang      Language slug or locale; null for the current language.
 	 * @return string
 	 */
-	public function format_datetime( $timestamp = null ): string {
-		$ts = $this->normalize_timestamp( $timestamp );
-		if ( $ts === null ) {
-			return '';
-		}
-		return (string) wp_date( $this->datetime_format(), $ts );
-	}
-
-	/**
-	 * Coerce a caller-supplied timestamp into a Unix int, or null on failure.
-	 *
-	 * @param int|string|null $timestamp
-	 * @return int|null
-	 */
-	private function normalize_timestamp( $timestamp ): ?int {
-		if ( $timestamp === null || $timestamp === '' ) {
-			return time();
-		}
-		if ( is_int( $timestamp ) ) {
-			return $timestamp;
-		}
-		if ( is_numeric( $timestamp ) ) {
-			return (int) $timestamp;
-		}
-		$parsed = strtotime( (string) $timestamp );
-		return $parsed === false ? null : $parsed;
+	public function format_datetime( $timestamp = null, ?string $lang = null ): string {
+		return Util\FormatLocale::timestamp( $timestamp, $this->datetime_format( $lang ), $lang );
 	}
 
 	/**
 	 * Resolve the date format for a language: its own column, else the site's date_format option.
 	 *
-	 * @param object|int|string|null $lang Language row, ID, slug, or null for the current language.
+	 * @since 1.0.7.5 $lang also takes a locale or BCP 47 tag.
+	 *
+	 * @param object|int|string|null $lang Language row, language ID (not a post ID), slug, locale, or null for the current language.
 	 * @return string A `wp_date()`-compatible format string.
 	 */
 	public static function date_format_for_language( $lang = null ): string {
-		$resolved = self::resolve_language_arg( $lang );
-		$override = $resolved && ! empty( $resolved->date_format ) ? (string) $resolved->date_format : '';
-		// A stored format holding markup ('<') is not used: the site option applies.
-		$format = $override !== '' && ! str_contains( $override, '<' ) ? $override : (string) get_option( 'date_format', 'F j, Y' );
-
-		/**
-		 * Filter the resolved date format for a language.
-		 *
-		 * @hook perflocale/date_format
-		 * @param string      $format The format string about to be returned.
-		 * @param object|null $lang   The language row, or null if none was found.
-		 */
-		return (string) apply_filters( 'perflocale/date_format', $format, $resolved );
+		return Util\FormatLocale::date_format( $lang, __METHOD__ );
 	}
 
 	/**
@@ -2410,19 +1479,7 @@ final class Helper {
 	 * @return string
 	 */
 	public static function time_format_for_language( $lang = null ): string {
-		$resolved = self::resolve_language_arg( $lang );
-		$override = $resolved && ! empty( $resolved->time_format ) ? (string) $resolved->time_format : '';
-		// A stored format holding markup ('<') is not used: the site option applies.
-		$format = $override !== '' && ! str_contains( $override, '<' ) ? $override : (string) get_option( 'time_format', 'g:i a' );
-
-		/**
-		 * Filter the resolved time format for a language.
-		 *
-		 * @hook perflocale/time_format
-		 * @param string      $format The format string about to be returned.
-		 * @param object|null $lang   The language row, or null if none was found.
-		 */
-		return (string) apply_filters( 'perflocale/time_format', $format, $resolved );
+		return Util\FormatLocale::time_format( $lang, __METHOD__ );
 	}
 
 	/**
@@ -2432,46 +1489,7 @@ final class Helper {
 	 * @return string
 	 */
 	public static function datetime_format_for_language( $lang = null ): string {
-		return trim( self::date_format_for_language( $lang ) . ' ' . self::time_format_for_language( $lang ) );
-	}
-
-	/**
-	 * Turn a language row, id, slug or null (current) into a language row.
-	 *
-	 * @param object|int|string|null $lang
-	 * @return object|null
-	 */
-	private static function resolve_language_arg( $lang ): ?object {
-		if ( is_object( $lang ) ) {
-			return $lang;
-		}
-
-		try {
-			$plugin = \PerfLocale\Plugin::get_instance();
-			$cache  = $plugin->has( 'cache' ) ? $plugin->get( 'cache' ) : null;
-			if ( ! $cache ) {
-				return null;
-			}
-			$repo = new \PerfLocale\Database\Repository\LanguageRepository( $cache );
-
-			if ( $lang === null || $lang === '' ) {
-				$current = self::get_instance()->current_language();
-				return $current ?: $repo->get_default();
-			}
-
-			if ( is_int( $lang ) ) {
-				return $repo->find( $lang );
-			}
-
-			if ( is_string( $lang ) ) {
-				return $repo->find_by_slug( $lang );
-			}
-		} catch ( \Throwable $e ) {
-			// Bootstrap not ready - fall through to global defaults.
-			unset( $e );
-		}
-
-		return null;
+		return Util\FormatLocale::datetime_format( $lang, __METHOD__ );
 	}
 
 	/**
@@ -2542,52 +1560,7 @@ final class Helper {
 			return;
 		}
 
-		$styles = wp_styles();
-
-		// Scheme-relative URL to path mapping; an unmappable host (CDN) just keeps the LTR sheet.
-		$content_rel = (string) preg_replace( '#^https?:#', '', content_url() );
-
-		// Map our own sheets via PERFLOCALE_URL to PERFLOCALE_DIR: correct when the plugins dir is relocated.
-		$plugin_rel = (string) preg_replace( '#^https?:#', '', PERFLOCALE_URL );
-
-		if ( $content_rel === '' && $plugin_rel === '' ) {
-			return;
-		}
-
-		foreach ( $styles->registered as $handle => $style ) {
-			if ( strpos( (string) $handle, 'perflocale' ) !== 0 || isset( $style->extra['rtl'] ) ) {
-				continue;
-			}
-
-			$src = (string) strtok( (string) $style->src, '?' );
-
-			if ( ! str_ends_with( $src, '.css' ) || str_ends_with( $src, '-rtl.css' ) ) {
-				continue;
-			}
-
-			$src_rel = (string) preg_replace( '#^https?:#', '', $src );
-
-			// Only claim a twin that shipped: a missing one 404s the whole stylesheet.
-			if ( $plugin_rel !== '' && str_starts_with( $src_rel, $plugin_rel ) ) {
-				$path = PERFLOCALE_DIR . substr( $src_rel, strlen( $plugin_rel ) );
-			} elseif ( $content_rel !== '' && str_starts_with( $src_rel, $content_rel ) ) {
-				$path = WP_CONTENT_DIR . substr( $src_rel, strlen( $content_rel ) );
-			} else {
-				continue;
-			}
-
-			if ( ! is_file( substr( $path, 0, -4 ) . '-rtl.css' ) ) {
-				continue;
-			}
-
-			if ( $core_swaps ) {
-				$styles->add_data( $handle, 'rtl', 'replace' );
-				continue;
-			}
-
-			// Core's swap is off here, so rewrite the source, keeping its cache-busting query string.
-			$style->src = substr( $src, 0, -4 ) . '-rtl.css' . substr( (string) $style->src, strlen( $src ) );
-		}
+		Util\RtlStyles::swap( $core_swaps );
 	}
 
 	/**
@@ -2603,7 +1576,7 @@ final class Helper {
 	 * @return bool
 	 */
 	public static function user_can_edit_object( int $post_id, ?int $user_id = null ): bool {
-		return self::object_permission( 'edit', 'edit_post', $post_id, $user_id );
+		return Util\ObjectPermission::check( 'edit', 'edit_post', $post_id, $user_id );
 	}
 
 	/**
@@ -2615,7 +1588,7 @@ final class Helper {
 	 * @return bool
 	 */
 	public static function user_can_delete_object( int $post_id ): bool {
-		return self::object_permission( 'delete', 'delete_post', $post_id );
+		return Util\ObjectPermission::check( 'delete', 'delete_post', $post_id );
 	}
 
 	/**
@@ -2627,8 +1600,8 @@ final class Helper {
 	 * @return bool
 	 */
 	public static function user_can_view_object( int $post_id ): bool {
-		return self::object_permission( 'read', 'read_post', $post_id )
-			|| self::object_permission( 'edit', 'edit_post', $post_id );
+		return Util\ObjectPermission::check( 'read', 'read_post', $post_id )
+			|| Util\ObjectPermission::check( 'edit', 'edit_post', $post_id );
 	}
 
 	/**
@@ -2640,96 +1613,29 @@ final class Helper {
 	 * @return bool
 	 */
 	public static function user_can_copy_translation_source( int $post_id ): bool {
-		return self::object_permission( 'edit', 'edit_post', $post_id )
-			&& self::object_permission( 'read', 'read_post', $post_id );
+		return Util\ObjectPermission::check( 'edit', 'edit_post', $post_id )
+			&& Util\ObjectPermission::check( 'read', 'read_post', $post_id );
 	}
 
 	/**
 	 * Whether the current user may create a new post of this post's type (its `create_posts`), host-aware.
 	 *
-	 * A non-string `create_posts` (Pods sets false) refuses everyone, super admins included.
-	 *
 	 * @param int $post_id Post the new translation would be copied from.
 	 * @return bool False when the type is not registered or has no create capability name.
+	 * @see Util\ObjectPermission::create_like()
 	 */
 	public static function user_can_create_like( int $post_id ): bool {
-		$type_object = get_post_type_object( (string) get_post_type( $post_id ) );
-		$capability  = $type_object instanceof \WP_Post_Type ? ( $type_object->cap->create_posts ?? null ) : null;
-
-		if ( ! is_string( $capability ) ) {
-			return false;
-		}
-
-		return self::object_permission( 'create', $capability, $post_id );
+		return Util\ObjectPermission::create_like( $post_id );
 	}
 
 	/**
 	 * Whether the current user may create a term in `$term_id`'s taxonomy, as core rules a new term.
 	 *
-	 * That is edit_terms, or for a flat taxonomy also assign_terms, never per-term edit_term; wp_insert_term() checks none.
-	 *
 	 * @param int $term_id Term the new translation would be copied from.
 	 * @return bool False when the term or its taxonomy does not exist.
+	 * @see Util\ObjectPermission::create_term_like()
 	 */
 	public static function user_can_create_term_like( int $term_id ): bool {
-		$term     = get_term( $term_id );
-		$taxonomy = $term instanceof \WP_Term ? get_taxonomy( $term->taxonomy ) : false;
-
-		if ( ! $taxonomy instanceof \WP_Taxonomy ) {
-			return false;
-		}
-
-		$caps = $taxonomy->hierarchical ? [ $taxonomy->cap->edit_terms ] : [ $taxonomy->cap->edit_terms, $taxonomy->cap->assign_terms ];
-
-		foreach ( $caps as $capability ) {
-			if ( is_string( $capability ) && current_user_can( $capability ) ) {
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	/**
-	 * Resolve one object-level permission, giving the host a say.
-	 *
-	 * Trash goes through here (it is a deletion), publish deliberately does not; see docs-ai/11-code-rationale.md.
-	 *
-	 * @param string   $action     Semantic action: 'edit', 'delete', 'read' or 'create'.
-	 * @param string   $capability Core capability checked by default.
-	 * @param int      $post_id    Post ID.
-	 * @param int|null $user_id    User asked about; null for the current user. Another user gets core's answer only.
-	 * @return bool
-	 */
-	private static function object_permission( string $action, string $capability, int $post_id, ?int $user_id = null ): bool {
-		if ( null !== $user_id && get_current_user_id() !== $user_id ) {
-			return user_can( $user_id, $capability, $post_id );
-		}
-
-		$can = current_user_can( $capability, $post_id );
-
-		// Only for the filter to switch on: a listener must answer for its own type only.
-		$post_type = (string) get_post_type( $post_id );
-
-		if ( $post_type === '' ) {
-			return $can;
-		}
-
-		/**
-		 * Filter whether the current user may act on one translatable object.
-		 *
-		 * Answer with the host's own authorization function for your own post type; return `$can` for others.
-		 * Returning true grants access; 'create' means a new post of this type. See docs-ai/11-code-rationale.md.
-		 *
-		 * @hook  perflocale/object/user_can
-		 * @since 1.0.5
-		 *
-		 * @param bool   $can       Whether core's capability check passed.
-		 * @param string $action    Semantic action: 'edit', 'delete', 'read' or 'create'.
-		 * @param int    $post_id   Object being acted on.
-		 * @param string $post_type Its post type.
-		 * @return bool
-		 */
-		return (bool) apply_filters( 'perflocale/object/user_can', $can, $action, $post_id, $post_type );
+		return Util\ObjectPermission::create_term_like( $term_id );
 	}
 }
